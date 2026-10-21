@@ -1,10 +1,10 @@
 //! The law timeline's OpenTimelineIO, against goldens predicted by hand
-//! before the export existed.
+//! before the export existed — and read back.
 #![cfg(any(feature = "std", feature = "alloc"))]
 
 mod common;
 
-use mediaio_timeline::otio::{Invalid, OtioTarget, to_otio, validate_json};
+use mediaio_timeline::otio::{Invalid, OtioTarget, from_otio, to_otio, validate_json};
 
 const GOLDEN_V0_15: &str = include_str!("golden/law.v0_15.otio");
 const GOLDEN_LEGACY: &str = include_str!("golden/law.legacy.otio");
@@ -49,4 +49,13 @@ fn the_goldens_pass_the_self_check_for_their_target() {
     validate_json(GOLDEN_V0_15, OtioTarget::Legacy),
     Err(Invalid::Shape(_))
   ));
+}
+
+/// **The goldens read back as the law timeline**, for both targets: every
+/// count, timebase and rate as the model held it, the markers among them.
+#[test]
+fn the_goldens_read_back_as_the_law_timeline() {
+  let law = common::law();
+  assert_eq!(from_otio(GOLDEN_V0_15), Ok(law.clone()));
+  assert_eq!(from_otio(GOLDEN_LEGACY), Ok(law));
 }

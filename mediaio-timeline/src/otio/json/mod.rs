@@ -1,11 +1,16 @@
-//! A small JSON value: written pretty for the export, read strictly for the
-//! self-check.
+//! A small JSON value: written pretty for the export, and read as
+//! OpenTimelineIO 0.17.0's parser reads it — its numbers by RapidJSON's
+//! verdict ([`number`]).
 
-use core::fmt::Write as _;
+use core::{cmp::Ordering, fmt::Write as _};
 use smol_bytes::{Utf8Bytes, Utf8BytesMut};
-use std::vec::Vec;
+use std::{collections::BTreeSet, vec::Vec};
 
 use super::Syntax;
+
+mod number;
+
+pub(crate) use number::{Held, Number, number, readings};
 
 /// A JSON value. A number is kept as the text that spells it, so the writer
 /// puts down exactly the digits it was handed and the reader keeps exactly
@@ -42,10 +47,11 @@ impl Value {
     }
   }
 
-  /// The number's value, read through `f64`.
+  /// The number's value as a member read as a `double` takes it
+  /// ([`double`]).
   pub(crate) fn as_f64(&self) -> Option<f64> {
     match self {
-      Self::Number(text) => text.parse().ok(),
+      Self::Number(text) => double(text),
       _ => None,
     }
   }
@@ -56,6 +62,36 @@ impl Value {
 /// newline.
 pub(crate) fn write_pretty(value: &Value, out: &mut Utf8BytesMut) {
   write_value(value, 0, out);
+}
+
+/// Writes `value` on one line, `", "` between members and items and `": "`
+/// after a key: a value named in a refusal.
+pub(crate) fn write_compact(value: &Value, out: &mut Utf8BytesMut) {
+  match value {
+    Value::Array(items) => {
+      out.push('[');
+      for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+          out.push_str(", ");
+        }
+        write_compact(item, out);
+      }
+      out.push(']');
+    }
+    Value::Object(members) => {
+      out.push('{');
+      for (index, (key, item)) in members.iter().enumerate() {
+        if index > 0 {
+          out.push_str(", ");
+        }
+        write_string(key, out);
+        out.push_str(": ");
+        write_compact(item, out);
+      }
+      out.push('}');
+    }
+    scalar => write_value(scalar, 0, out),
+  }
 }
 
 fn write_value(value: &Value, depth: usize, out: &mut Utf8BytesMut) {
@@ -125,13 +161,124 @@ fn write_string(text: &str, out: &mut Utf8BytesMut) {
   out.push('"');
 }
 
+/// The `double` OpenTimelineIO 0.17.0 reads `text` as where it fetches a
+/// member as one — a `RationalTime`'s rate and value among them: the
+/// number RapidJSON reads ([`number`]), an integer cast to the nearest
+/// double ([`Number::double`]) — or `None` where it reads no number, or its
+/// builds read different ones.
+pub(crate) fn double(text: &str) -> Option<f64> {
+  number(text).ok().map(Number::double)
+}
+
+/// The number `text` spells as OpenTimelineIO 0.17.0's handler keeps it,
+/// in a dictionary: an `int64_t` or a `double` ([`Number::held`]) — or
+/// `None` where RapidJSON reads no number, or its builds read different
+/// ones.
+pub(crate) fn held(text: &str) -> Option<Held> {
+  number(text).ok().map(Number::held)
+}
+
+/// The whole number OpenTimelineIO 0.17.0 keeps for `text` in a dictionary
+/// ([`held`]): its integer, or its double where that is a whole number
+/// within ±2^127 — `None` for a fraction, NaN or an infinity, and for a
+/// number RapidJSON refuses.
+pub(crate) fn whole(text: &str) -> Option<i128> {
+  match held(text)? {
+    Held::Integer(value) => Some(i128::from(value)),
+    Held::Double(value) => whole_double(value),
+  }
+}
+
+/// `value` as a whole number, where it is one within ±2^127: `-0.0` as
+/// zero, a fraction, NaN and an infinity `None`.
+pub(crate) fn whole_double(value: f64) -> Option<i128> {
+  /// 2^127.
+  const LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+  // NaN is within neither bound.
+  if !(value > -LIMIT && value < LIMIT) {
+    return None;
+  }
+  let whole = value as i128;
+  // Exact both ways for a whole number; a fraction truncated is another.
+  (whole as f64 == value).then_some(whole)
+}
+
+/// The `f32` the export writes back as `text` reads: the `f32` nearest the
+/// double OpenTimelineIO 0.17.0 reads `text` as ([`double`]), where it is
+/// finite and its shortest spelling — `{:?}`, as the export writes every
+/// `f32` — reads as that very double; else `None`. So `-3.0` and `-3e0`
+/// read as -3.0, `16777217`, which no `f32` holds, is `None`, and so is
+/// `0.10000000149011612`, the `f32` 0.1's own value, whose spelling `0.1`
+/// reads as another double.
+pub(crate) fn float(text: &str) -> Option<f32> {
+  let read = double(text)?;
+  let nearest = read as f32;
+  if !nearest.is_finite() {
+    return None;
+  }
+  let mut written = Spelled::default();
+  core::fmt::write(&mut written, format_args!("{nearest:?}")).ok()?;
+  double(written.as_str())
+    .filter(|back| back.to_bits() == read.to_bits())
+    .map(|_| nearest)
+}
+
+/// A float's shortest spelling, written on the stack: an `f32`'s is at
+/// most a minus, nine significant digits, a point and an exponent such as
+/// `e-38`, 15 bytes. Longer text is refused as an error, which no float
+/// writes.
+#[derive(Default)]
+struct Spelled {
+  bytes: [u8; 32],
+  len: usize,
+}
+
+impl Spelled {
+  fn as_str(&self) -> &str {
+    // Only whole `&str`s are copied in.
+    core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+  }
+}
+
+impl core::fmt::Write for Spelled {
+  fn write_str(&mut self, text: &str) -> core::fmt::Result {
+    let end = self.len + text.len();
+    let slot = self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?;
+    slot.copy_from_slice(text.as_bytes());
+    self.len = end;
+    Ok(())
+  }
+}
+
 /// How deep arrays and objects may nest before the reader refuses: deep
 /// enough for any timeline this crate writes, shallow enough that a hostile
 /// document cannot exhaust the stack.
 const MAX_DEPTH: usize = 128;
 
-/// Reads `text` as one JSON value (RFC 8259), refusing what the grammar
-/// does not admit, an object naming a key twice, and nesting past
+/// An object's key as the duplicate check orders it: by its text — and,
+/// in the laws with `std`, counted each time two are compared.
+#[derive(PartialEq, Eq)]
+struct Key(Utf8Bytes);
+
+impl PartialOrd for Key {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Ord for Key {
+  fn cmp(&self, other: &Self) -> Ordering {
+    #[cfg(all(test, feature = "std"))]
+    tests::compared();
+    self.0.as_str().cmp(other.0.as_str())
+  }
+}
+
+/// Reads `text` as one JSON value (RFC 8259) — and, as OpenTimelineIO
+/// 0.17.0's parser does under `kParseNanAndInfFlag`, `NaN`, `Inf` and
+/// `Infinity` as numbers — refusing what the grammar does not admit, a
+/// number RapidJSON refuses or OpenTimelineIO's builds read as different
+/// values ([`number::scan`]), an object naming a key twice, and nesting past
 /// [`MAX_DEPTH`].
 pub(crate) fn parse(text: &str) -> Result<Value, Syntax> {
   let mut reader = Reader {
@@ -191,7 +338,7 @@ impl Reader<'_> {
       Some(b't') => self.literal("true", Value::Bool(true)),
       Some(b'f') => self.literal("false", Value::Bool(false)),
       Some(b'n') => self.literal("null", Value::Null),
-      Some(b'-' | b'0'..=b'9') => self.number(),
+      Some(b'-' | b'0'..=b'9' | b'N' | b'I') => self.number(),
       _ => Err(self.refuse("expected a value")),
     }
   }
@@ -209,6 +356,10 @@ impl Reader<'_> {
   fn object(&mut self) -> Result<Value, Syntax> {
     self.at += 1;
     let mut members: Vec<(Utf8Bytes, Value)> = Vec::new();
+    // The keys read so far, for the check that none is named twice: in a
+    // set, so an object of n keys costs O(n log n) comparisons — a scan of
+    // the members before each key would cost n²/2.
+    let mut keys: BTreeSet<Key> = BTreeSet::new();
     self.skip_space();
     if self.peek() == Some(b'}') {
       self.at += 1;
@@ -221,7 +372,7 @@ impl Reader<'_> {
       }
       let key_at = self.at;
       let key = self.string()?;
-      if members.iter().any(|(seen, _)| *seen == key) {
+      if !keys.insert(Key(key.clone())) {
         return Err(Syntax {
           offset: key_at,
           reason: "a key named twice in one object",
@@ -276,42 +427,27 @@ impl Reader<'_> {
     }
   }
 
-  fn digits(&mut self) -> usize {
-    let start = self.at;
-    while let Some(b'0'..=b'9') = self.peek() {
-      self.at += 1;
-    }
-    self.at - start
-  }
-
+  /// A number, as far as RapidJSON reads one, kept as its text — or
+  /// RapidJSON's refusal where it stopped, at the number's first byte for
+  /// one too big or one the builds read differently ([`number::scan`]).
   fn number(&mut self) -> Result<Value, Syntax> {
     let start = self.at;
-    if self.peek() == Some(b'-') {
-      self.at += 1;
-    }
-    match self.peek() {
-      Some(b'0') => self.at += 1,
-      Some(b'1'..=b'9') => {
-        self.digits();
+    let scanned = number::scan(&self.bytes[start..]);
+    match scanned.settled() {
+      Ok(_) => {
+        self.at = start + scanned.end;
+        // A number's bytes are ASCII, so its ends are a character's.
+        Ok(Value::Number(Utf8Bytes::from(&self.text[start..self.at])))
       }
-      _ => return Err(self.refuse("expected a digit")),
+      Err(error) => Err(Syntax {
+        offset: if error.at_start() {
+          start
+        } else {
+          start + scanned.end
+        },
+        reason: error.reason(),
+      }),
     }
-    if self.peek() == Some(b'.') {
-      self.at += 1;
-      if self.digits() == 0 {
-        return Err(self.refuse("expected a digit after `.`"));
-      }
-    }
-    if let Some(b'e' | b'E') = self.peek() {
-      self.at += 1;
-      if let Some(b'+' | b'-') = self.peek() {
-        self.at += 1;
-      }
-      if self.digits() == 0 {
-        return Err(self.refuse("expected a digit in the exponent"));
-      }
-    }
-    Ok(Value::Number(Utf8Bytes::from(&self.text[start..self.at])))
   }
 
   fn string(&mut self) -> Result<Utf8Bytes, Syntax> {

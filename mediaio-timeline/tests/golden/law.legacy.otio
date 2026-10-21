@@ -2,9 +2,13 @@
     "OTIO_SCHEMA": "Timeline.1",
     "metadata": {
         "mediaio": {
-            "metadata": {
-                "project": "law"
-            }
+            "rate": "24000/1001",
+            "metadata": [
+                [
+                    "project",
+                    "law"
+                ]
+            ]
         }
     },
     "name": "law",
@@ -28,14 +32,39 @@
                 "name": "V1",
                 "source_range": null,
                 "effects": [],
-                "markers": [],
+                "markers": [
+                    {
+                        "OTIO_SCHEMA": "Marker.2",
+                        "metadata": {},
+                        "name": "act one",
+                        "color": "RED",
+                        "marked_range": {
+                            "OTIO_SCHEMA": "TimeRange.1",
+                            "duration": {
+                                "OTIO_SCHEMA": "RationalTime.1",
+                                "rate": 23.976023976023978,
+                                "value": 48.0
+                            },
+                            "start_time": {
+                                "OTIO_SCHEMA": "RationalTime.1",
+                                "rate": 23.976023976023978,
+                                "value": 0.0
+                            }
+                        },
+                        "comment": "the opening"
+                    }
+                ],
                 "enabled": true,
                 "children": [
                     {
                         "OTIO_SCHEMA": "Clip.1",
                         "metadata": {
                             "mediaio": {
-                                "id": "clip-1"
+                                "id": "clip-1",
+                                "source": {
+                                    "ruler": "24000/1001",
+                                    "timebase": "1/24000"
+                                }
                             }
                         },
                         "name": "a",
@@ -53,14 +82,46 @@
                             }
                         },
                         "effects": [],
-                        "markers": [],
+                        "markers": [
+                            {
+                                "OTIO_SCHEMA": "Marker.2",
+                                "metadata": {
+                                    "mediaio": {
+                                        "range": {
+                                            "ruler": "24000/1001",
+                                            "timebase": "1/24000"
+                                        }
+                                    }
+                                },
+                                "name": "slate",
+                                "color": "GREEN",
+                                "marked_range": {
+                                    "OTIO_SCHEMA": "TimeRange.1",
+                                    "duration": {
+                                        "OTIO_SCHEMA": "RationalTime.1",
+                                        "rate": 23.976023976023978,
+                                        "value": 24.0
+                                    },
+                                    "start_time": {
+                                        "OTIO_SCHEMA": "RationalTime.1",
+                                        "rate": 23.976023976023978,
+                                        "value": 48.0
+                                    }
+                                },
+                                "comment": ""
+                            }
+                        ],
                         "enabled": true,
                         "media_reference": {
                             "OTIO_SCHEMA": "ExternalReference.1",
                             "metadata": {
                                 "mediaio": {
                                     "rate": "24000/1001",
-                                    "reel": "A001"
+                                    "reel": "A001",
+                                    "available": {
+                                        "ruler": "24000/1001",
+                                        "timebase": "1/24000"
+                                    }
                                 }
                             },
                             "name": "",
@@ -100,7 +161,11 @@
                         "OTIO_SCHEMA": "Clip.1",
                         "metadata": {
                             "mediaio": {
-                                "id": "clip-2"
+                                "id": "clip-2",
+                                "source": {
+                                    "ruler": "24000/1001",
+                                    "timebase": "1/24000"
+                                }
                             }
                         },
                         "name": "b",
@@ -124,7 +189,11 @@
                             "OTIO_SCHEMA": "ExternalReference.1",
                             "metadata": {
                                 "mediaio": {
-                                    "rate": "24000/1001"
+                                    "rate": "24000/1001",
+                                    "available": {
+                                        "ruler": "24000/1001",
+                                        "timebase": "1/24000"
+                                    }
                                 }
                             },
                             "name": "",
@@ -245,7 +314,11 @@
                         "metadata": {
                             "mediaio": {
                                 "id": "clip-3",
-                                "gain_db": -6.0
+                                "gain_db": -6.0,
+                                "source": {
+                                    "ruler": "48000/1",
+                                    "timebase": "1/48000"
+                                }
                             }
                         },
                         "name": "a-sound",
@@ -269,7 +342,11 @@
                             "OTIO_SCHEMA": "ExternalReference.1",
                             "metadata": {
                                 "mediaio": {
-                                    "rate": "48000/1"
+                                    "rate": "48000/1",
+                                    "available": {
+                                        "ruler": "48000/1",
+                                        "timebase": "1/48000"
+                                    }
                                 }
                             },
                             "name": "",

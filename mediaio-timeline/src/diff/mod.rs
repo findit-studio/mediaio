@@ -49,8 +49,9 @@ use crate::{Clip, ClipAt, Fade, Fades, IdClash, Timeline};
 /// it answers, and every run over the same pair answers the same list.
 ///
 /// Only clips are compared. The timeline's own words (name, rate, start,
-/// notes), a track's words (kind, name, enabled), transitions, a clip's
-/// notes and its medium's words other than the locator are not.
+/// notes), a track's words (kind, name, enabled, markers), transitions, a
+/// clip's notes and markers, and its medium's words other than the locator
+/// are not.
 ///
 /// ```
 /// use core::num::NonZeroI32;

@@ -7,8 +7,8 @@ use smol_bytes::format_utf8bytes;
 
 use super::*;
 use crate::{
-  Clip, ClipId, Fade, FadeShape, Fades, MediaRef, Rate, TimeRange, Timeline, Track, TrackKind,
-  Transition,
+  Clip, ClipId, Fade, FadeShape, Fades, Marker, MediaRef, Rate, TimeRange, Timeline, Track,
+  TrackKind, Transition,
 };
 
 fn tb(num: i32, den: i32) -> Timebase {
@@ -644,5 +644,110 @@ fn refusals_name_what_they_refuse() {
       Edge::Out
     )))),
     "the fade at the end of track 1, clip 0 is not counted at the edit rate"
+  );
+}
+
+/// The baseline with a marker on V1 at the edit rate, and one on `m` in its
+/// medium's 48 kHz ticks.
+fn marked() -> Timeline {
+  let mut timeline = baseline();
+  timeline.tracks_mut()[0]
+    .markers_mut()
+    .push(Marker::new("act one", rec(0, 48)));
+  clip_mut(&mut timeline, 1, 0)
+    .markers_mut()
+    .push(Marker::new(
+      "breath",
+      TimeRange::new(60_000, 60_000, tb(1, 48_000)),
+    ));
+  timeline
+}
+
+#[test]
+fn markers_where_their_owners_count_time_are_valid() {
+  assert_eq!(validate(&marked()), Ok(()));
+  // Nothing holds a marker inside its owner's time: a point past the
+  // track's last record, and a stretch of the medium the clip does not
+  // play, are both notes the timeline may carry.
+  let mut timeline = marked();
+  timeline.tracks_mut()[0].markers_mut()[0].set_range(rec(500, 600));
+  clip_mut(&mut timeline, 1, 0).markers_mut()[0].set_range(TimeRange::new(0, 10, tb(1, 48_000)));
+  assert_eq!(validate(&timeline), Ok(()));
+}
+
+#[test]
+fn a_track_marker_off_the_edit_rate_is_refused() {
+  let mut timeline = marked();
+  timeline.tracks_mut()[0].markers_mut()[0].set_range(TimeRange::new(0, 2000, Timebase::MILLIS));
+  assert_eq!(
+    refusals(&timeline),
+    [Refusal::OffEditRate(Place::Marker(MarkerAt::Track {
+      track: 0,
+      marker: 0
+    }))]
+  );
+}
+
+#[test]
+fn a_clip_marker_in_a_degenerate_timebase_is_refused() {
+  let mut timeline = marked();
+  clip_mut(&mut timeline, 1, 0).markers_mut()[0].set_range(TimeRange::new(0, 10, tb(0, 1)));
+  assert_eq!(
+    refusals(&timeline),
+    [Refusal::MarkerRateUnstated(MarkerAt::Clip {
+      clip: ClipAt::new(1, 0),
+      marker: 0
+    })]
+  );
+}
+
+#[test]
+fn a_marker_longer_than_i64_max_ticks_is_refused() {
+  let mut timeline = marked();
+  timeline.tracks_mut()[0].markers_mut()[0].set_range(TimeRange::new(-1, i64::MAX, edit()));
+  clip_mut(&mut timeline, 1, 0).markers_mut()[0].set_range(TimeRange::new(
+    i64::MIN,
+    0,
+    tb(1, 48_000),
+  ));
+  // Track by track: V1's own marker, then A1's clip's.
+  assert_eq!(
+    refusals(&timeline),
+    [
+      Refusal::MarkerTooLong(MarkerAt::Track {
+        track: 0,
+        marker: 0
+      }),
+      Refusal::MarkerTooLong(MarkerAt::Clip {
+        clip: ClipAt::new(1, 0),
+        marker: 0
+      }),
+    ]
+  );
+}
+
+#[test]
+fn marker_refusals_name_their_marker() {
+  let shown = |refusal: Refusal| std::string::ToString::to_string(&refusal);
+  assert_eq!(
+    shown(Refusal::OffEditRate(Place::Marker(MarkerAt::Track {
+      track: 0,
+      marker: 1
+    }))),
+    "the marked range of track 0, marker 1 is not counted at the edit rate"
+  );
+  assert_eq!(
+    shown(Refusal::MarkerRateUnstated(MarkerAt::Clip {
+      clip: ClipAt::new(1, 0),
+      marker: 2
+    })),
+    "track 1, clip 0, marker 2: the marked range has no real ruler"
+  );
+  assert_eq!(
+    shown(Refusal::MarkerTooLong(MarkerAt::Track {
+      track: 2,
+      marker: 0
+    })),
+    "track 2, marker 0: the marked range runs longer than i64::MAX ticks"
   );
 }

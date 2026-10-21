@@ -23,7 +23,7 @@ through, and adapters that implement them.
 | [`mediadecode-ffmpeg`](mediadecode-ffmpeg/README.md) | read adapter | the FFmpeg decoders and demuxer, with hardware-acceleration probing |
 | [`mediaencode-ffmpeg`](mediaencode-ffmpeg/README.md) | write adapter | the encoder-by-name catalogue and its GPL gate; the muxer and the encoders follow |
 | [`mediadecode-webcodecs`](mediadecode-webcodecs/README.md) | read adapter, `wasm32` | the WebCodecs decoders |
-| [`mediaio-timeline`](mediaio-timeline/README.md) | pure model | the editing timeline as data, with OpenTimelineIO export |
+| [`mediaio-timeline`](mediaio-timeline/README.md) | pure model | the editing timeline as data, with OpenTimelineIO export and its exact read-back |
 | [`mediaio`](mediaio/README.md) | umbrella | the family in one dependency, by feature; pure Rust by default |
 
 `mediaspine` and `mediaio-timeline` are versioned on their own; the

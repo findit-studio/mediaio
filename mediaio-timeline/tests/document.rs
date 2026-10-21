@@ -5,8 +5,8 @@
 use core::num::NonZeroI32;
 
 use mediaio_timeline::{
-  Clip, ClipId, Duration, Fade, FadeShape, Fades, Gain, MediaRef, Metadata, Rate, Schema,
-  TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind, Transition,
+  Clip, ClipId, Duration, Fade, FadeShape, Fades, Gain, Marker, MarkerColor, MediaRef, Metadata,
+  Rate, Schema, TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind, Transition,
 };
 
 fn tb(num: i32, den: i32) -> Timebase {
@@ -25,8 +25,9 @@ fn read(text: &str) -> serde_json::Result<Timeline> {
   serde_json::from_reader(text.as_bytes())
 }
 
-/// Every word of the model, present once. The document need not validate:
-/// it pins the wire names, not an edit.
+/// Every word of the model, present once — a marker on a track and one on
+/// a clip among them. The document need not validate: it pins the wire
+/// names, not an edit.
 fn sample() -> Timeline {
   let edit = tb(1001, 24_000);
   let media = tb(1, 24_000);
@@ -50,13 +51,19 @@ fn sample() -> Timeline {
           .with_fades(Fades::new().with_out(Some(Fade::new(
             Duration::new(24, edit),
             FadeShape::EqualPower,
-          )))),
+          ))))
+          .with_marker(Marker::new("slate", TimeRange::new(48_048, 72_072, media))),
         )
         .with_transition(Transition::dissolve(
           Timestamp::new(96, edit),
           Duration::new(12, edit),
           Duration::new(12, edit),
-        )),
+        ))
+        .with_marker(
+          Marker::new("act one", TimeRange::new(0, 48, edit))
+            .with_color(MarkerColor::Red)
+            .with_comment("the opening"),
+        ),
     )
 }
 
@@ -134,7 +141,22 @@ const SAMPLE_PRETTY: &str = r#"{
               "shape": "equal_power"
             }
           },
-          "metadata": {}
+          "metadata": {},
+          "markers": [
+            {
+              "name": "slate",
+              "range": {
+                "start": 48048,
+                "end": 72072,
+                "timebase": {
+                  "numerator": 1,
+                  "denominator": 24000
+                }
+              },
+              "color": "green",
+              "comment": ""
+            }
+          ]
         }
       ],
       "transitions": [
@@ -161,6 +183,21 @@ const SAMPLE_PRETTY: &str = r#"{
               "denominator": 24000
             }
           }
+        }
+      ],
+      "markers": [
+        {
+          "name": "act one",
+          "range": {
+            "start": 0,
+            "end": 48,
+            "timebase": {
+              "numerator": 1001,
+              "denominator": 24000
+            }
+          },
+          "color": "red",
+          "comment": "the opening"
         }
       ]
     }
@@ -232,7 +269,7 @@ fn a_word_inside_a_record_this_reader_does_not_know_is_refused_by_name() {
 
 /// Every time value the sample carries, by JSON pointer, its timebase among
 /// them.
-const TIME_VALUES: [&str; 18] = [
+const TIME_VALUES: [&str; 22] = [
   "/rate",
   "/start",
   "/start/timebase",
@@ -251,6 +288,10 @@ const TIME_VALUES: [&str; 18] = [
   "/tracks/0/transitions/0/in_offset/timebase",
   "/tracks/0/transitions/0/out_offset",
   "/tracks/0/transitions/0/out_offset/timebase",
+  "/tracks/0/clips/0/markers/0/range",
+  "/tracks/0/clips/0/markers/0/range/timebase",
+  "/tracks/0/markers/0/range",
+  "/tracks/0/markers/0/range/timebase",
 ];
 
 #[test]
@@ -376,6 +417,8 @@ fn a_range_longer_than_i64_max_ticks_is_refused_by_the_reader() {
     ("record", "/tracks/0/clips/0/record"),
     ("source_range", "/tracks/0/clips/0/source_range"),
     ("available_range", "/tracks/0/clips/0/media/available_range"),
+    ("a clip's marker", "/tracks/0/clips/0/markers/0/range"),
+    ("a track's marker", "/tracks/0/markers/0/range"),
   ] {
     let mut doc = serde_json::to_value(sample()).unwrap();
     let end = doc.pointer(path).unwrap()["end"].clone();
@@ -424,4 +467,36 @@ fn a_new_timeline_counts_its_start_at_the_edit_rate() {
   let zero = Timeline::new("t", Rate::hz(0));
   assert_eq!(zero.edit_timebase(), None);
   assert_eq!(zero.start().timebase(), Timebase::default());
+}
+
+#[test]
+fn markers_left_out_read_as_none_and_a_marker_reads_strictly() {
+  // A document from before markers — none written — reads with none, and
+  // a timeline without markers writes no `markers` word at all.
+  let mut doc = serde_json::to_value(sample()).unwrap();
+  doc["tracks"][0].as_object_mut().unwrap().remove("markers");
+  doc["tracks"][0]["clips"][0]
+    .as_object_mut()
+    .unwrap()
+    .remove("markers");
+  let back: Timeline = serde_json::from_value(doc).unwrap();
+  assert!(back.tracks()[0].markers().is_empty());
+  assert!(back.tracks()[0].clips()[0].markers().is_empty());
+  let text = serde_json::to_string(&back).unwrap();
+  assert!(!text.contains("markers"), "{text}");
+
+  // A word a marker does not know is refused by name, and so is a color
+  // outside OpenTimelineIO's eleven.
+  let mut doc = serde_json::to_value(sample()).unwrap();
+  doc["tracks"][0]["markers"][0]["speed"] = serde_json::json!(2.0);
+  let error = serde_json::from_value::<Timeline>(doc)
+    .unwrap_err()
+    .to_string();
+  assert!(error.contains("unknown field `speed`"), "{error}");
+  let mut doc = serde_json::to_value(sample()).unwrap();
+  doc["tracks"][0]["markers"][0]["color"] = serde_json::json!("lilac");
+  let error = serde_json::from_value::<Timeline>(doc)
+    .unwrap_err()
+    .to_string();
+  assert!(error.contains("unknown variant `lilac`"), "{error}");
 }

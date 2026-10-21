@@ -7,6 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The family releases in lockstep.
 
+## [Unreleased]
+
+### Changed
+
+- **BREAKING: `timeline` is `mediaio-timeline` 0.3** (`mediaio::timeline`):
+  markers, `otio::from_otio`, and an OpenTimelineIO export that now carries
+  the exact-readback metadata.
+
 ## [0.19.0] - 2026-10-16
 
 ### Added

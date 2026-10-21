@@ -8,7 +8,7 @@ use smol_bytes::Utf8Bytes;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::{Clip, Metadata, Schema, Transition};
+use crate::{Clip, Marker, Metadata, Schema, Transition};
 
 /// An edit: tracks of clips at explicit positions, counted at one edit rate.
 ///
@@ -163,7 +163,12 @@ impl Timeline {
 }
 
 /// One layer of a timeline: clips of one kind of medium, in record order,
-/// and the transitions between them.
+/// the transitions between them, and the markers noted on it.
+///
+/// A track's [`markers`](Self::markers) are counted as its records are: at
+/// the edit rate, from the timeline's zero. On the wire they are written
+/// only when there are some, so a track without any writes the document
+/// it wrote before markers existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
@@ -173,10 +178,15 @@ pub struct Track {
   enabled: bool,
   clips: Vec<Clip>,
   transitions: Vec<Transition>,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Vec::is_empty")
+  )]
+  markers: Vec<Marker>,
 }
 
 impl Track {
-  /// An empty, enabled track of `kind`.
+  /// An empty, enabled track of `kind`, with no marker.
   pub fn new(kind: TrackKind, name: impl Into<Utf8Bytes>) -> Self {
     Self {
       kind,
@@ -184,6 +194,7 @@ impl Track {
       enabled: true,
       clips: Vec::new(),
       transitions: Vec::new(),
+      markers: Vec::new(),
     }
   }
 
@@ -223,6 +234,17 @@ impl Track {
     &mut self.transitions
   }
 
+  /// The markers noted on the track, counted at the edit rate from the
+  /// timeline's zero.
+  pub const fn markers(&self) -> &[Marker] {
+    self.markers.as_slice()
+  }
+
+  /// The markers, for editing in place.
+  pub const fn markers_mut(&mut self) -> &mut Vec<Marker> {
+    &mut self.markers
+  }
+
   /// Renames the track in place.
   pub fn set_name(&mut self, name: impl Into<Utf8Bytes>) -> &mut Self {
     self.name = name.into();
@@ -253,6 +275,13 @@ impl Track {
   #[must_use]
   pub fn with_transition(mut self, transition: Transition) -> Self {
     self.transitions.push(transition);
+    self
+  }
+
+  /// Appends `marker` (consuming builder).
+  #[must_use]
+  pub fn with_marker(mut self, marker: Marker) -> Self {
+    self.markers.push(marker);
     self
   }
 }
