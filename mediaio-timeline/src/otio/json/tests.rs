@@ -330,6 +330,53 @@ fn every_number_is_read_as_rapidjson_compiled_either_way_reads_it() {
 }
 
 #[test]
+fn an_int_operation_of_the_reader_that_overflows_is_unsettled_where_rapidjson_makes_it() {
+  use number::{
+    NumberError::{TooBig, Unsettled},
+    power,
+  };
+  // Each `expFrac` below is a fraction of that many leading zeros: too long
+  // a text for a law, so the exponent is read beside it. Every case was
+  // checked against RapidJSON 06d58b9e itself, built with UBSan's
+  // signed-overflow check, both builds.
+  //
+  // `int p = exp + expFrac` (1713): -98 meets INT_MIN beside 2147483550
+  // places, -99 passes it, and so does -1 beside 2^31.
+  assert_eq!(power(b"e-98", -2_147_483_550), Ok((4, i32::MIN)));
+  assert_eq!(power(b"e-99", -2_147_483_550), Err((0, Unsettled)));
+  assert_eq!(power(b"e-0", i32::MIN), Ok((3, i32::MIN)));
+  assert_eq!(power(b"e-1", i32::MIN), Err((0, Unsettled)));
+  // Past `maxExp` a negative exponent's digits are consumed, not added
+  // (1660–1663): `e-100` beside a bound of 8 is 10.
+  assert_eq!(power(b"e-100", -2_147_483_550), Ok((5, -2_147_483_560)));
+  // `308 - expFrac` (1667): INT_MAX at -2147483339, past it below.
+  assert_eq!(power(b"e0", -2_147_483_339), Ok((2, -2_147_483_339)));
+  assert_eq!(power(b"e2147483647", -2_147_483_339), Ok((11, 308)));
+  assert_eq!(power(b"e0", -2_147_483_340), Err((0, Unsettled)));
+  assert_eq!(power(b"e0", i32::MIN), Err((0, Unsettled)));
+  // `exp * 10 + digit` (1669) under a bound of 214748364: 2147483647 passes
+  // the bound without overflowing, 2147483648 overflows first. And the long
+  // run alone is no refusal: `0.` and 214748056 zeros, then `e0`, reads.
+  assert_eq!(power(b"e0", -214_748_056), Ok((2, -214_748_056)));
+  assert_eq!(power(b"e214748364", -214_748_056), Ok((10, 308)));
+  assert_eq!(power(b"e214748365", -214_748_056), Err((10, TooBig)));
+  assert_eq!(power(b"e2147483647", -214_748_056), Err((11, TooBig)));
+  assert_eq!(power(b"e2147483648", -214_748_056), Err((0, Unsettled)));
+  // A short text at the `int`'s edges reads, or is refused as too big, with
+  // no overflow on the way.
+  for (text, read) in [
+    ("1e2147483647", "Err(TooBig)"),
+    ("0e2147483648", "Err(TooBig)"),
+    ("1e-2147483648", "Ok(Double(0.0))"),
+    ("1e-2147483649", "Ok(Double(0.0))"),
+    ("-1e-2147483647", "Ok(Double(-0.0))"),
+    ("1.5e-2147483648", "Ok(Double(0.0))"),
+  ] {
+    assert_eq!(std::format!("{:?}", number(text)), read, "{text}");
+  }
+}
+
+#[test]
 fn a_whole_number_is_the_integer_or_the_whole_double_a_dictionary_keeps() {
   for (text, value) in [
     ("86400.0", Some(86_400)),

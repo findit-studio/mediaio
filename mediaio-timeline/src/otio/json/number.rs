@@ -57,6 +57,32 @@
 //! significand of 17 digits or more whose first 16 reach 2^53, or an
 //! integer past 64 bits, can differ.
 //!
+//! # The reader's integer arithmetic
+//!
+//! `ParseNumber` counts in C++ `unsigned`, `uint64_t` and `int`. The
+//! unsigned types wrap, which is defined, and RapidJSON's own cuts keep
+//! every one of their sums from wrapping. An `int` that overflows is
+//! undefined behaviour, after which no build's reading can be claimed. So
+//! [`scan`] makes every `int` operation as a checked 32-bit one, at the
+//! place RapidJSON makes it, and an overflow is [`NumberError::Unsettled`],
+//! never a reading. The operations, at `06d58b9e`:
+//!
+//! | `reader.h` | operation | C++ type | overflows? | [`scan`] |
+//! |---|---|---|---|---|
+//! | 1496, 1507, 1519 | `i = i * 10 + digit` | `unsigned` | no: cut at 214748364 with a minus, 429496729 without, first (1500, 1512) | `u32`, under the same cuts |
+//! | 1508, 1520, 1562, 1573, 1606, 1623 | `significandDigit++` | `int` | no: at most 20 digits of an integer, and 17 counted in a fraction | checked |
+//! | 1561, 1572, 1603 | `i64 = i64 * 10 + digit` | `uint64_t` | no: cut at 2^63 with a minus, 2^64 − 1 without (1555, 1566), and at 2^53 − 1 in a fraction (1600), first | `u64`, under the same cuts |
+//! | 1604, 1621 | `--expFrac` | `int` | yes: a fraction's leading zeros keep the significand at 0 (1600), so its 2^31 + 1st place passes `INT_MIN` | checked: `Unsettled` |
+//! | 1647 | `exp = s.Take() - '0'` | `int` | no: one digit, before either loop's guard | — |
+//! | 1656 | `(expFrac + 2147483639) / 10` | `int` | no: `expFrac` is at most 0 | checked |
+//! | 1659 | `exp = exp * 10 + digit`, a negative exponent | `int` | no: past `maxExp`, the digits are consumed, not added (1660–1663) | checked |
+//! | 1667 | `308 - expFrac` | `int` | yes: for `expFrac` below −2147483339 | checked: `Unsettled` |
+//! | 1669 | `exp = exp * 10 + digit`, a positive exponent | `int` | yes: where `308 − expFrac` reaches 214748364, the exponent's digits can pass `INT_MAX` before they pass `maxExp` (1670) | checked: `Unsettled` |
+//! | 1679 | `exp = -exp` | `int` | no: `exp` is at most 2147483639 | checked |
+//! | 1713 | `int p = exp + expFrac` | `int` | yes: below `INT_MIN`, a negative exponent beside a fraction's long run of zeros | checked: `Unsettled` |
+//! | `strtod.h` 34, 41 | `-exp`, `p + 308` | `int` | no: `exp` is within −308..−1 there, and `p` below −308 | — |
+//! | 1734, 1740 | `~i64 + 1`, `~i + 1` | `uint64_t`, `unsigned` | no: wraps, which is defined, before the conversion | `wrapping_neg` |
+//!
 //! # The table
 //!
 //! | text | RapidJSON at `06d58b9e` (`reader.h`) | callback | in a dictionary | read as a `double` |
@@ -173,8 +199,10 @@ pub(crate) enum NumberError {
   /// or a value past the largest double.
   TooBig,
   /// Not RapidJSON's: a number a build that fuses its multiply-add reads
-  /// otherwise than one that does not, or so long that RapidJSON's `int`
-  /// arithmetic on it would overflow — no build's reading can be claimed.
+  /// otherwise than one that does not, or one on which an `int` operation
+  /// of RapidJSON's overflows, which is undefined behaviour (the module's
+  /// table of the reader's integer arithmetic) — no build's reading can be
+  /// claimed.
   Unsettled,
 }
 
@@ -248,16 +276,23 @@ pub(crate) fn readings(text: &str) -> [Result<Number, NumberError>; 2] {
   }
 }
 
-/// The largest `expFrac` RapidJSON's `int`s carry through a positive
-/// exponent: `308 − expFrac` and ten times an exponent within it must not
-/// overflow (`reader.h:1667–1669`).
-const POSITIVE_EXPONENT_FLOOR: i64 = 308 - (i32::MAX as i64 - 9) / 10;
-
 /// Reads the number at the start of `bytes` as RapidJSON's `ParseNumber`
 /// does at `06d58b9e` (`reader.h:1467–1748`), in a 64-bit build, under
 /// `kParseNanAndInfFlag`: as far as it reads, and the callback each kind of
 /// build makes ([`Scanned`]).
 pub(crate) fn scan(bytes: &[u8]) -> Scanned {
+  // One of `ParseNumber`'s C++ `int` operations, checked where RapidJSON
+  // makes it: past an `int` it is undefined behaviour, and no build's
+  // reading can be claimed (the module's table of the reader's integer
+  // arithmetic).
+  macro_rules! int {
+    ($operation:expr) => {
+      match $operation {
+        Some(value) => value,
+        None => return Scanned::refused(0, NumberError::Unsettled),
+      }
+    };
+  }
   let peek = |at: usize| bytes.get(at).copied().unwrap_or(0);
   let digit = |at: usize| peek(at).is_ascii_digit();
   let value = |at: usize| peek(at).wrapping_sub(b'0');
@@ -295,7 +330,7 @@ pub(crate) fn scan(bytes: &[u8]) -> Scanned {
         }
         i = i * 10 + u32::from(value(at));
         at += 1;
-        significant += 1;
+        significant = int!(significant.checked_add(1));
       }
     }
     // NaN and the infinities (1523–1548).
@@ -361,7 +396,7 @@ pub(crate) fn scan(bytes: &[u8]) -> Scanned {
       }
       i64 = i64 * 10 + u64::from(value(at));
       at += 1;
-      significant += 1;
+      significant = int!(significant.checked_add(1));
     }
   }
   if use_double {
@@ -372,7 +407,7 @@ pub(crate) fn scan(bytes: &[u8]) -> Scanned {
   }
 
   // The fraction (1584–1630).
-  let mut exp_frac: i64 = 0;
+  let mut exp_frac: i32 = 0;
   if peek(at) == b'.' {
     at += 1;
     if !digit(at) {
@@ -389,9 +424,9 @@ pub(crate) fn scan(bytes: &[u8]) -> Scanned {
         }
         i64 = i64 * 10 + u64::from(value(at));
         at += 1;
-        exp_frac -= 1;
+        exp_frac = int!(exp_frac.checked_sub(1));
         if i64 != 0 {
-          significant += 1;
+          significant = int!(significant.checked_add(1));
         }
       }
       d = [i64 as f64; 2];
@@ -400,80 +435,37 @@ pub(crate) fn scan(bytes: &[u8]) -> Scanned {
     while digit(at) {
       if significant < 17 {
         d = tenfold(d, value(at));
-        exp_frac -= 1;
+        exp_frac = int!(exp_frac.checked_sub(1));
         // Both builds' significands are zero alike, until a digit is not.
         if d[0] > 0.0 {
-          significant += 1;
+          significant = int!(significant.checked_add(1));
         }
       }
       at += 1;
     }
-    // Past an `int`, RapidJSON's count of the fraction's places has
-    // overflowed.
-    if exp_frac < i64::from(i32::MIN) {
-      return Scanned::refused(0, NumberError::Unsettled);
-    }
   }
 
-  // The exponent (1632–1680).
-  let mut exp: i64 = 0;
+  // The exponent (1632–1680), and the power of ten it makes with the
+  // fraction's places. Without one `exp` is 0, and `exp + expFrac` (1713)
+  // is `expFrac`.
+  let mut p = exp_frac;
   if matches!(peek(at), b'e' | b'E') {
-    at += 1;
     if !use_double {
       d = [(if use_64 { i64 } else { u64::from(i) }) as f64; 2];
       use_double = true;
     }
-    let exp_minus = match peek(at) {
-      b'+' => {
-        at += 1;
-        false
+    match power(&bytes[at..], exp_frac) {
+      Ok((read, power)) => {
+        at += read;
+        p = power;
       }
-      b'-' => {
-        at += 1;
-        true
-      }
-      _ => false,
-    };
-    if !digit(at) {
-      return Scanned::refused(at, NumberError::MissExponent);
-    }
-    exp = i64::from(value(at));
-    at += 1;
-    if exp_minus {
-      // RapidJSON's `int` division, which truncates toward zero as an
-      // `i64`'s does; within an `int`, as `exp_frac` is.
-      let max_exp = (exp_frac + 2_147_483_639) / 10;
-      while digit(at) {
-        exp = exp * 10 + i64::from(value(at));
-        at += 1;
-        if exp > max_exp {
-          while digit(at) {
-            at += 1;
-          }
-        }
-      }
-      exp = -exp;
-    } else {
-      // Below this, `308 − expFrac` or ten times the exponent overflows an
-      // `int` before RapidJSON refuses the number.
-      if exp_frac < POSITIVE_EXPONENT_FLOOR {
-        return Scanned::refused(0, NumberError::Unsettled);
-      }
-      let max_exp = 308 - exp_frac;
-      while digit(at) {
-        exp = exp * 10 + i64::from(value(at));
-        at += 1;
-        if exp > max_exp {
-          return Scanned::refused(at, NumberError::TooBig);
-        }
-      }
+      Err((_, NumberError::Unsettled)) => return Scanned::refused(0, NumberError::Unsettled),
+      Err((stopped, error)) => return Scanned::refused(at + stopped, error),
     }
   }
 
   // The callback (1682–1748).
   let readings = if use_double {
-    // Within an `int`: at most 308, and no less than −2^31.
-    let p = exp + exp_frac;
     d.map(|d| {
       let d = normal_precision(d, p);
       if d > f64::MAX {
@@ -494,6 +486,74 @@ pub(crate) fn scan(bytes: &[u8]) -> Scanned {
     [Ok(number); 2]
   };
   Scanned { end: at, readings }
+}
+
+/// The exponent at the start of `bytes`, its `e` or `E` included
+/// (`reader.h:1632–1680` at `06d58b9e`), and the power of ten it makes with
+/// a fraction of `exp_frac` places, `exp + expFrac` (1713). Each of the
+/// reader's `int` operations is checked where it makes it, and an overflow is
+/// [`NumberError::Unsettled`] (the module's table of the reader's integer
+/// arithmetic). Returns the bytes read and the power, or the refusal and
+/// where it stopped.
+pub(super) fn power(bytes: &[u8], exp_frac: i32) -> Result<(usize, i32), (usize, NumberError)> {
+  const UNSETTLED: (usize, NumberError) = (0, NumberError::Unsettled);
+  let peek = |at: usize| bytes.get(at).copied().unwrap_or(0);
+  let digit = |at: usize| peek(at).is_ascii_digit();
+  let value = |at: usize| i32::from(peek(at).wrapping_sub(b'0'));
+  // `exp = exp * 10 + digit` (1659, 1669).
+  let more = |exp: i32, at: usize| {
+    exp
+      .checked_mul(10)
+      .and_then(|exp| exp.checked_add(value(at)))
+      .ok_or(UNSETTLED)
+  };
+  // Past the `e` or `E`.
+  let mut at = 1;
+  let minus = match peek(at) {
+    b'+' => {
+      at += 1;
+      false
+    }
+    b'-' => {
+      at += 1;
+      true
+    }
+    _ => false,
+  };
+  if !digit(at) {
+    return Err((at, NumberError::MissExponent));
+  }
+  // The first digit, before either loop's guard (1647).
+  let mut exp = value(at);
+  at += 1;
+  if minus {
+    // `(expFrac + 2147483639) / 10` (1656), an `int` division, which
+    // truncates toward zero as an `i32`'s does.
+    let max_exp = exp_frac.checked_add(2_147_483_639).ok_or(UNSETTLED)? / 10;
+    while digit(at) {
+      exp = more(exp, at)?;
+      at += 1;
+      if exp > max_exp {
+        while digit(at) {
+          at += 1;
+        }
+      }
+    }
+    exp = exp.checked_neg().ok_or(UNSETTLED)?;
+  } else {
+    // `308 - expFrac` (1667).
+    let max_exp = 308_i32.checked_sub(exp_frac).ok_or(UNSETTLED)?;
+    while digit(at) {
+      exp = more(exp, at)?;
+      at += 1;
+      if exp > max_exp {
+        return Err((at, NumberError::TooBig));
+      }
+    }
+  }
+  // `int p = exp + expFrac` (1713).
+  let p = exp.checked_add(exp_frac).ok_or(UNSETTLED)?;
+  Ok((at, p))
 }
 
 /// `d * 10 + digit`, each build's way: rounded twice, and fused.
@@ -544,7 +604,7 @@ fn fused(d: f64, digit: u8) -> f64 {
 
 /// `StrtodNormalPrecision` (`strtod.h:37–46` at `06d58b9e`): `d` scaled by
 /// `10^p`, through 10^−308 first below it.
-fn normal_precision(d: f64, p: i64) -> f64 {
+fn normal_precision(d: f64, p: i32) -> f64 {
   if p < -308 {
     fast_path(fast_path(d, -308), p + 308)
   } else {
@@ -554,8 +614,8 @@ fn normal_precision(d: f64, p: i64) -> f64 {
 
 /// `FastPath` (`strtod.h:28–35`): one multiplication or division by the
 /// double nearest `10^exp`, or zero below 10^−308.
-fn fast_path(significand: f64, exp: i64) -> f64 {
-  let power = |n: i64| {
+fn fast_path(significand: f64, exp: i32) -> f64 {
+  let power = |n: i32| {
     usize::try_from(n)
       .ok()
       .and_then(|n| POW10.get(n).copied())
