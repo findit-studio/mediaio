@@ -28,8 +28,10 @@ The backend-agnostic core it adapts has its own log at
   is cleared there too.** **More packets are marked DISPOSABLE on H.264
   and HEVC, so a consumer that drops them decodes fewer pictures**: two in
   three of a Sony XAVC original, which carries no `sdtp` and was marked
-  nowhere before. The flag's contract is unchanged — absent means
-  unknown.
+  nowhere before. An H.264 stream whose sequence parameter set codes
+  fields, lets `frame_num` jump, or leaves the reorder depth to FFmpeg's
+  guess (no `bitstream_restriction_flag`) is marked nowhere. The flag's
+  contract is unchanged — absent means unknown.
 
 ### Added
 

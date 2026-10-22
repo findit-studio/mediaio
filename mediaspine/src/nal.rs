@@ -229,31 +229,87 @@
 //! still reads in a framing of its own, is read in every framing one may
 //! read it in: Annex B, and lengths of one to four bytes. A unit of a
 //! sub-layer no parameter set has declared raises the highest sub-layer to
-//! its own. An H.264 sequence parameter set is read to its
-//! `frame_mbs_only_flag` in each of the three readings FFmpeg's decoder may
-//! adopt of one: as its RBSP, as its bytes, and as the bytes FFmpeg writes
-//! when it escapes an `avcC` entry to read it again. One that any reading
-//! does not prove to code frames only lets fields in. All of it only raises
-//! what later packets are held to, so reading more can only fail to mark.
+//! its own. An H.264 sequence parameter set is read through its VUI's
+//! `bitstream_restriction_flag`, as FFmpeg's decoder reads one, in each of
+//! the three readings it may adopt: as its RBSP, as its bytes, and as the
+//! bytes FFmpeg writes when it escapes an `avcC` entry to read it again;
+//! where its RBSP reads whole, FFmpeg adopts that reading alone. What an
+//! adopted reading does not prove — frames only, no gaps in `frame_num`, a
+//! reorder depth fixed at 15 or less — stays unproven for good. All of it
+//! only raises what later packets are held to, so reading more can only
+//! fail to mark.
 //!
-//! # What a decoder keeps from one packet to the next
+//! # What a non-reference picture writes
 //!
-//! A packet is disposable only where dropping it changes no other
-//! picture's decoding, so every state FFmpeg's decoders carry from one
-//! packet to a later one is accounted for:
+//! A packet is disposable only where dropping it changes no later
+//! picture's pixels, order or timestamps. The census of the state FFmpeg
+//! 9.0.1 writes while it decodes a picture nothing references, under any
+//! threading and `skip_frame` (at `nonref` and above FFmpeg skips such a
+//! picture itself, `h264dec.c` 626–628, `hevc/hevcdec.c` 3766–3767):
 //!
-//! | state | carried by | here |
-//! |---|---|---|
-//! | the framing, `is_avc` / `is_nalff` and `nal_length_size` | a record, an H.264 `avcC` packet, the four-byte probe (`h264dec.c` 602–607, 1038–1050; `hevc/hevcdec.c` 3854–3860) | a packet that moves it is kept ([Framing](#framing)) |
-//! | parameter sets | VPS, SPS, PPS (both codecs) | kept ([`KeptReason::Companion`]) |
-//! | a frame awaiting its second field | an H.264 field (`h264_slice.c` 1397–1500) | nothing marked unless every SPS codes frames only ([`KeptReason::MaybeField`]) |
-//! | references, and the reference marking | slices of `nal_ref_idc` above 0, IDR; HEVC reference and IRAP pictures, the RPS of later pictures | kept ([`KeptReason::Referenced`], [`KeptReason::RandomAccess`]); an SLNR picture below the highest sub-layer ([`KeptReason::BelowHighestSubLayer`]) |
-//! | picture order counts | H.264's previous reference picture and frame-number offset (8.2.1); HEVC's previous TemporalId-0 picture that is not RASL, RADL or SLNR (8.3.1) | none from a picture marked here: H.264's offset reads alike with a non-reference picture dropped, and HEVC never counts an SLNR picture |
-//! | SEI state | H.264 clears it before each access unit (`h264dec.c` 593–598); HEVC keeps it (`hevc/sei.c`, `hevc/refs.c` 183–187), but clears the picture hash at a frame's end (`hevc/hevcdec.c` 3505–3512) | only what no decoder carries rides ([SEI](#sei)) |
-//! | an x264 version, a recovery point, a Dolby Vision RPU, an end of sequence | user data unregistered SEI (`h2645_sei.c` 92–99), recovery point SEI, HEVC unspecified type 62, EOS / EOB | kept ([`KeptReason::Companion`]) |
-//! | the output order and its timing | the decoded picture buffer and its reorder heuristics | a dropped picture leaves the buffer as FFmpeg's own `AVDISCARD_NONREF` leaves it: no other picture's samples change |
-//! | the next frame's interlaced flag, where its `pic_struct` is a field order on a frame | H.264's previous frame (`h264_slice.c` 1196–1235) | as under `AVDISCARD_NONREF`: a flag of the output, no samples |
-//! | a hardware probe awaiting its first picture | `mediadecode-ffmpeg`'s unpinned decoders | not a bitstream's: under a skip policy that may leave a stream with no picture (`nonintra`, `nonkey`, `all`), an end with none is the stream's, and `all` runs no probe |
+//! | state | written at | dropping the picture changes a later picture | the rule |
+//! |---|---|---|---|
+//! | H.264 `prev_frame_num`, `prev_frame_num_offset` | every picture, `h264_picture.c` 202–203 | through the frame-number offset (POC types 1, 2) and the gap fill, `h264_slice.c` 1432–1530: not where `frame_num` cannot jump, a non-reference picture's then being the next picture's (7.4.3) | every SPS: no gaps ([`KeptReason::FrameNumGaps`]) |
+//! | H.264 `prev_poc_lsb`, where a flush left it unset | the first picture after the decoder opens or is flushed, `h264_parse.c` 293–294 | the picture order count of every later picture, the film grain seed among its uses | a slice of a reference picture the decoder decodes, NAL unit type 1 or 5, read since the opening or the last seek: it passes over slice data partitions, `h264dec.c` 682–686 ([`KeptReason::AwaitingReference`]) |
+//! | H.264 `prev_poc_msb` / `prev_poc_lsb` otherwise | reference pictures only, `h264_picture.c` 197–201 | no | — |
+//! | H.264 `poc_offset` | an intra-only picture under frame threading, `h264_slice.c` 1427–1430 (`picture_intra_only`, `h264dec.c` 501–551) | the H.274 film grain seed, `h264_slice.c` 1258–1260 | not intra only ([`KeptReason::IntraOnly`]) |
+//! | H.264 `has_b_frames`, `last_pocs` | every picture, `h264_slice.c` 1305–1333 | output order: with no `bitstream_restriction_flag` FFmpeg grows the reorder depth from the pictures it sees, and a later picture can be output too late and dropped; and a picture that follows 16 it precedes in output order resets the record (1310–1328), which a `max_num_reorder_frames` of 16 allows | every SPS: `bitstream_restriction_flag` with a `max_num_reorder_frames` of 15 at most ([`KeptReason::ReorderUnfixed`]); the depth is then the SPS's (1305–1307, 1411–1414) and the output stays in picture order |
+//! | H.264 `delayed_pic`, `next_outputed_poc`, `next_output_pic` | every picture, `h264_slice.c` 1345–1390 | with the depth fixed, only when each picture comes out, not its order | — |
+//! | H.264 `mmco_reset`, which the picture after an MMCO 5 picture or a flush takes as an output barrier | `h264_slice.c` 1302–1303 | no: the barrier falls on the next picture decoded, whichever it is, and the output on either side of it stays in picture order | — |
+//! | H.264 `non_gray` | any intra slice, `h264_slice.c` 2032–2034; cleared by a flush, `h264dec.c` 492 | whether a later picture that references a gray frame filling a gap uses another, `h264_refs.c` 410–419 | where a slice may be intra, an intra slice in a packet kept since the opening or the last seek ([`KeptReason::AwaitingIntraSlice`]) |
+//! | H.264 `frame_recovered`, `recovery_frame` | `h264_slice.c` 1645–1677, 1374–1376 | no: only a reference picture or IDR moves them, and a recovery point SEI keeps its packet | — |
+//! | H.264 field pairing: `first_field`, `droppable`, `picture_structure` | `h264_slice.c` 1397–1520 | the second field's frame | every SPS: frames only ([`KeptReason::MaybeField`]) |
+//! | H.264 `prev_interlaced_frame` | `h264_slice.c` 1196–1235 | a later frame's interlaced flag, not its pixels, order or timestamps | — |
+//! | H.264 SEI state | reset per access unit, `h264dec.c` 593–598 | no: a riding SEI is one the picture alone takes up ([SEI](#sei)) | — |
+//! | HEVC `poc_tid0` | TemporalId-0 pictures but SLNR, RASL, RADL, `hevc/hevcdec.c` 3297–3306 | no | — |
+//! | HEVC `no_rasl_output_flag`, which skips RASL pictures | IRAP pictures, `hevc/hevcdec.c` 3283–3287, 3545–3546 | no | — |
+//! | HEVC `recovery_poc` | any picture of the recovery's count, `hevc/hevcdec.c` 3289–3294 | whether the pictures decoded before it are output, `hevc/refs.c` 239–242 | no recovery point SEI since the last IRAP picture the decoder decodes, of types 16–21 ([`KeptReason::Recovering`]) |
+//! | HEVC reference marking | every picture's RPS, `hevc/refs.c` | no: a later picture's RPS holds no picture an earlier one dropped (8.3.2) | — |
+//! | HEVC output and bumping | `hevc/refs.c`, by the SPS's reorder and DPB sizes | only when each picture comes out | — |
+//! | HEVC SEI state and the Dolby Vision RPU that a picture takes up: captions, AFD, LCEVC, time codes, film grain that does not persist, user data, the decoded picture hash, the RPU | the next picture decoded, `hevc/hevcdec.c` 3068–3151, 3505–3512, 3723–3760; `h2645_sei.c` 518–695 | that picture's side data, its film grain and its hash check, where a packet whose picture the decoder does not decode — a RASL picture it skips, a reserved type, none at all — left them | nothing pending: since such a packet, a picture of a type the decoder always decodes has been read ([`KeptReason::CarriedOver`]); beside a picture, only filler payload rides ([SEI](#sei)) |
+//! | HEVC `eos`, `last_eos` | set by an EOS or EOB unit, a flush and the decoder's opening, and taken up by the next packet read, `hevc/hevcdec.c` 3687–3720, 4161, 4194 | whether the next CRA picture starts a sequence, its RASL pictures skipped (3283–3287, 786–787) | not the first packet after the opening, a seek, or a packet that may hold an EOS or EOB unit ([`KeptReason::SequenceStart`]) |
+//! | the framing, parameter sets | [Framing](#framing); VPS, SPS, PPS | yes: their packets are kept | — |
+//!
+//! # The rule
+//!
+//! From that census, an H.264 packet is marked only where all of these
+//! hold, and kept otherwise:
+//!
+//! - the framing is known, and the packet reads whole as it frames it;
+//! - it holds a slice, every slice of `nal_ref_idc` 0 and none an IDR, and
+//!   nothing beside them but access unit delimiters, filler data and SEI
+//!   units of picture timing and filler payload alone;
+//! - some slice is not intra, as FFmpeg reads a slice's type, or none is of
+//!   a type the decoder decodes (1, 5), so that it starts no picture;
+//! - a sequence parameter set has been read, and every one the decoder may
+//!   read codes frames only, lets `frame_num` jump nowhere and fixes the
+//!   reorder depth at 15 or less, under every reading of it FFmpeg may
+//!   adopt;
+//! - a slice of a reference picture, of NAL unit type 1 or 5, has been
+//!   read since the reading opened or was sought;
+//! - where some slice may be intra, a packet kept since then has held an
+//!   intra slice.
+//!
+//! An HEVC packet is marked only where all of these hold:
+//!
+//! - the framing is known, and the packet reads whole as it frames it;
+//! - every slice is TRAIL_N, TSA_N, STSA_N, RADL_N or RASL_N, of layer 0,
+//!   at the highest sub-layer any parameter set or unit has declared, a
+//!   sequence parameter set having been read, and nothing rides beside
+//!   them but delimiters, filler data and SEI units of filler payload
+//!   alone;
+//! - it is not the first packet after the reading opened or was sought,
+//!   nor the first after a packet that may hold an end of sequence or of
+//!   bitstream;
+//! - no recovery point SEI has been read since the last IRAP picture of
+//!   layer 0 the decoder decodes (types 16–21);
+//! - nothing is pending for it to take up: after every prefix SEI unit
+//!   other than one of filler payload alone, a picture of a type the
+//!   decoder always decodes (TRAIL, TSA, STSA, RADL, IRAP) has begun, and
+//!   every such suffix SEI unit, and every RPU, had one in its own packet.
+//!
+//! `mediadecode-ffmpeg`'s demuxer adds two: no side data that persists
+//! past the packet, and no `CORRUPT` flag.
 //!
 //! # What is never marked
 //!
@@ -408,6 +464,51 @@ pub enum KeptReason {
   /// sequence parameter set has been read, or one lets a picture be a field
   /// (`frame_mbs_only_flag` 0).
   MaybeField,
+  /// An H.264 picture of `nal_ref_idc` 0 whose every slice is intra, which
+  /// FFmpeg's decoder under frame threading reads as `picture_intra_only`
+  /// and lets reset the `poc_offset` later pictures' film grain is seeded
+  /// from (`h264dec.c` 501–551, `h264_slice.c` 1427–1430, 1258–1260).
+  IntraOnly,
+  /// An H.264 picture where `frame_num` may jump: a sequence parameter set
+  /// the decoder may read allows gaps, and FFmpeg fills a gap counting from
+  /// the picture before, reference or not (`h264_slice.c` 1432–1530,
+  /// `h264_picture.c` 202–203).
+  FrameNumGaps,
+  /// An H.264 picture where the decoder's reorder depth is not fixed: a
+  /// sequence parameter set the decoder may read sets no
+  /// `bitstream_restriction_flag`, or a `max_num_reorder_frames` of 16.
+  /// FFmpeg grows the depth from the pictures it sees in the first case,
+  /// and may reset its record of them in the second, so that dropping one
+  /// can cost a later picture its output (`h264_slice.c` 1305–1333).
+  ReorderUnfixed,
+  /// An H.264 picture before the first reference picture since the decoder
+  /// opened or was sought: FFmpeg's decoder takes its picture order count
+  /// up from the first picture it decodes after a flush (`h264_parse.c`
+  /// 293–294; `h264dec.c` 421, 438–467).
+  AwaitingReference,
+  /// An H.264 picture holding an intra slice before any packet kept since
+  /// the decoder opened or was sought has held one: FFmpeg's first intra
+  /// slice after a flush stops later pictures referencing the gray frames
+  /// it fills gaps with (`non_gray`, `h264_slice.c` 2032–2034;
+  /// `h264_refs.c` 410–419; `h264dec.c` 492).
+  AwaitingIntraSlice,
+  /// An HEVC picture while a recovery point may be pending: FFmpeg ends the
+  /// recovery at the first picture of its count, which may be this one, and
+  /// holds back the pictures decoded before it ends (`hevc/hevcdec.c`
+  /// 3289–3294, `hevc/refs.c` 239–242).
+  Recovering,
+  /// An HEVC packet the decoder reads first after it opens or is flushed,
+  /// or after a packet holding an end of sequence or of bitstream: FFmpeg
+  /// takes its `eos` flag up with whatever packet comes next, and the flag
+  /// decides whether the CRA picture it meets starts a sequence of its own
+  /// (`hevc/hevcdec.c` 3687–3720, 3283–3287, 786–787, 4161, 4194).
+  SequenceStart,
+  /// An HEVC picture that may take up SEI state or a Dolby Vision RPU an
+  /// earlier packet left, its own picture skipped or absent: FFmpeg hands
+  /// such state to the next picture it decodes, as side data, film grain
+  /// or a picture hash to check (`hevc/hevcdec.c` 3068–3151, 3505–3512,
+  /// 3723–3760; `h2645_sei.c` 518–695).
+  CarriedOver,
 }
 
 impl fmt::Display for KeptReason {
@@ -431,6 +532,14 @@ impl fmt::Display for KeptReason {
       Self::FramingChange => f.write_str("a packet that switches the framing"),
       Self::FramingUnknown => f.write_str("a framing a decoder may read otherwise"),
       Self::MaybeField => f.write_str("a picture that may be one field of a pair"),
+      Self::IntraOnly => f.write_str("a picture of intra slices alone"),
+      Self::FrameNumGaps => f.write_str("a picture where frame_num may jump"),
+      Self::ReorderUnfixed => f.write_str("a picture where the reorder depth is not fixed"),
+      Self::AwaitingReference => f.write_str("a picture before the first reference picture"),
+      Self::AwaitingIntraSlice => f.write_str("an intra slice before the first one kept"),
+      Self::Recovering => f.write_str("a picture while a recovery point may be pending"),
+      Self::SequenceStart => f.write_str("the first packet a sequence may start at"),
+      Self::CarriedOver => f.write_str("a picture that may take up what an earlier packet left"),
     }
   }
 }
@@ -478,6 +587,30 @@ pub struct NalStream {
   /// a picture be a field — `frame_mbs_only_flag` 0, or one this module
   /// cannot read so. It never clears.
   fields_possible: bool,
+  /// For H.264: whether a sequence parameter set the decoder may read lets
+  /// `frame_num` jump (`gaps_in_frame_num_value_allowed_flag` 1, or not
+  /// read so). It never clears.
+  gaps_possible: bool,
+  /// For H.264: whether a sequence parameter set the decoder may read
+  /// leaves the reorder depth to FFmpeg's guess (no
+  /// `bitstream_restriction_flag`, or not read so). It never clears.
+  reorder_unfixed: bool,
+  /// For H.264: whether a reference picture has been read since the
+  /// reading opened or was sought.
+  reference_seen: bool,
+  /// For H.264: whether a packet kept since the reading opened or was
+  /// sought has held an intra slice.
+  intra_seen: bool,
+  /// For HEVC: whether a recovery point SEI may have been read since the
+  /// last IRAP picture.
+  recovering: bool,
+  /// For HEVC: whether the next packet is the first the decoder reads
+  /// after it opens or is flushed, or after an end of sequence or of
+  /// bitstream.
+  sequence_start: bool,
+  /// For HEVC: whether SEI state or a Dolby Vision RPU may be pending for
+  /// the next picture the decoder decodes.
+  carried: bool,
 }
 
 impl NalStream {
@@ -494,6 +627,14 @@ impl NalStream {
       highest_sub_layer: 0,
       sps_seen: false,
       fields_possible: false,
+      gaps_possible: false,
+      reorder_unfixed: false,
+      reference_seen: false,
+      intra_seen: false,
+      recovering: false,
+      // FFmpeg's HEVC decoder opens with `eos` set (`hevc/hevcdec.c` 4161).
+      sequence_start: true,
+      carried: false,
     };
     stream.record(extradata, true);
     stream.opened = (stream.lengths, stream.length_size);
@@ -519,10 +660,10 @@ impl NalStream {
   /// reads as the stream's end (`libavcodec/h264dec.c` 1034–1036); HEVC's
   /// takes it from any (`libavcodec/hevc/hevcdec.c` 3854–3860).
   pub fn read_with_record(&mut self, packet: &[u8], record: Option<&[u8]>) -> Verdict {
-    if let Some(record) = record {
-      if self.codec == NalCodec::Hevc || !packet.is_empty() {
-        self.reconfigure(record);
-      }
+    if let Some(record) = record
+      && (self.codec == NalCodec::Hevc || !packet.is_empty())
+    {
+      self.reconfigure(record);
     }
     self.read(packet)
   }
@@ -534,6 +675,12 @@ impl NalStream {
   /// starts from the stream's — so nothing is marked again
   /// ([`KeptReason::FramingUnknown`]).
   pub fn seeked(&mut self) {
+    // A decoder flushed for the seek takes its picture order count up again
+    // from the first picture it decodes (`h264dec.c` 438–473), forgets its
+    // intra slices (492), and, for HEVC, sets `eos` (`hevc/hevcdec.c` 4194).
+    self.reference_seen = false;
+    self.intra_seen = false;
+    self.sequence_start = true;
     if (self.lengths, self.length_size) != self.opened {
       self.lost = true;
     }
@@ -628,34 +775,127 @@ impl NalStream {
     }
     let Some(framing) = self.framing() else {
       self.learn_unframed(packet);
+      // What a decoder reads in a packet the reading cannot frame is not
+      // known: it may end a sequence, or leave SEI state behind.
+      if !packet.is_empty() {
+        self.sequence_start = true;
+      }
+      self.carried = true;
       return Verdict::Kept(KeptReason::Unframed);
     };
-    let verdict = self.judge(packet, framing);
+    let judged = self.judge(packet, framing);
+    if judged.reference {
+      self.reference_seen = true;
+    }
+    // A packet marked may not reach the decoder.
+    if judged.intra && !judged.verdict.is_disposable() {
+      self.intra_seen = true;
+    }
+    // FFmpeg's HEVC decoder takes `eos` up with every packet it reads
+    // (`hevc/hevcdec.c` 3687–3720), and a packet of no bytes is none.
+    if !packet.is_empty() {
+      self.sequence_start = judged.ends;
+    }
+    self.carried = judged.carried;
     self.learn(packet, framing);
-    verdict
+    // An IRAP picture ends any recovery, one a recovery point in its own
+    // packet would start among them: FFmpeg's decoder starts none after it
+    // before an end of sequence or a flush (`hevc/hevcdec.c` 3283–3294,
+    // 3675–3692).
+    if judged.irap {
+      self.recovering = false;
+    }
+    judged.verdict
   }
 
   /// One packet's verdict, read in `framing` against what earlier packets
   /// taught; it learns nothing.
-  fn judge(&self, packet: &[u8], framing: Framing) -> Verdict {
+  fn judge(&self, packet: &[u8], framing: Framing) -> Judged {
+    // A packet that does not parse proves nothing: it may end a sequence,
+    // or leave SEI state behind.
+    let malformed = Judged {
+      verdict: Verdict::Kept(KeptReason::Malformed),
+      reference: false,
+      intra: false,
+      irap: false,
+      ends: true,
+      carried: true,
+    };
     let mut kept = None;
     let mut pictures = 0_usize;
+    let mut reference = false;
+    let mut intra = false;
+    let mut irap = false;
+    let mut ends = false;
+    // H.264: FFmpeg's `picture_intra_only`, every slice NAL unit (1, 2, 5)
+    // intra; whether the packet holds a slice the decoder decodes (1, 5),
+    // the only kind it starts a picture at; and whether such a slice may
+    // be intra.
+    let mut intra_only = true;
+    let mut decoded_slice = false;
+    let mut some_intra = false;
+    // HEVC: whether state is pending for the next picture decoded, whether
+    // this packet decodes a picture, and whether it holds a suffix SEI or
+    // an RPU, which only a picture of its own takes up.
+    let mut carried = self.carried;
+    let mut decodes = false;
+    let mut tail = false;
     let mut units = Units::new(packet, framing);
     loop {
       match units.next() {
         Unit::End => break,
-        Unit::Broken => return Verdict::Kept(KeptReason::Malformed),
+        Unit::Broken => return malformed,
         Unit::Nal(nal) => {
           let read = match self.codec {
-            NalCodec::H264 => self.h264_unit(nal),
-            NalCodec::Hevc => self.hevc_unit(nal),
+            NalCodec::H264 => {
+              if let Some(&header) = nal.first() {
+                let nal_unit_type = header & 0x1F;
+                // The decoder decodes slices of types 1 and 5 alone, passing
+                // over slice data partitions (`h264dec.c` 636–685).
+                if nal_unit_type == 5 || (nal_unit_type == 1 && header & 0x60 != 0) {
+                  reference = true;
+                }
+                if matches!(nal_unit_type, 1 | 2 | 5) {
+                  let parsed = slice_type(&nal[1..]);
+                  intra_only &= parsed.is_none_or(is_intra);
+                  decoded_slice |= nal_unit_type != 2;
+                  some_intra |= nal_unit_type == 1 && parsed.is_none_or(is_intra);
+                  intra |= nal_unit_type != 2 && parsed.is_some_and(is_intra);
+                }
+              }
+              self.h264_unit(nal)
+            }
+            NalCodec::Hevc => {
+              if let &[first, second, ..] = nal {
+                let nal_unit_type = (first >> 1) & 0x3F;
+                let base = first & 1 == 0 && second >> 3 == 0;
+                // The IRAP types the decoder decodes; it skips RSV_IRAP_VCL22
+                // and 23.
+                irap |= base && (16..=21).contains(&nal_unit_type);
+                ends |= matches!(nal_unit_type, 36 | 37);
+                match nal_unit_type {
+                  // The first slice segment of a picture the decoder decodes
+                  // whatever came before (every type but RASL and the
+                  // reserved ones): it takes what is pending up.
+                  0..=7 | 16..=21 if base && nal.get(2).is_some_and(|&byte| byte & 0x80 != 0) => {
+                    carried = false;
+                    decodes = true;
+                  }
+                  39 if !sei_rides(&nal[2..], hevc_sei_rides) => carried = true,
+                  40 if !sei_rides(&nal[2..], hevc_sei_rides) => tail = true,
+                  // An RPU, which the decoder takes from the packet's last
+                  // units before any other (`hevc/hevcdec.c` 3723–3760).
+                  62 => tail = true,
+                  _ => {}
+                }
+              }
+              self.hevc_unit(nal)
+            }
           };
           match read {
             Read::Picture => pictures += 1,
             Read::Beside => {}
-            Read::Keeps(KeptReason::Malformed) => {
-              return Verdict::Kept(KeptReason::Malformed);
-            }
+            Read::Keeps(KeptReason::Malformed) => return malformed,
             Read::Keeps(reason) => {
               kept.get_or_insert(reason);
             }
@@ -663,10 +903,31 @@ impl NalStream {
         }
       }
     }
-    match kept {
+    if tail && !decodes {
+      carried = true;
+    }
+    let verdict = match kept {
       Some(reason) => Verdict::Kept(reason),
       None if pictures == 0 => Verdict::Kept(KeptReason::NoPicture),
+      // Under frame threading FFmpeg resets `poc_offset` at such a picture
+      // (`h264dec.c` 501–551, `h264_slice.c` 1427–1430).
+      None if self.codec == NalCodec::H264 && intra_only && decoded_slice => {
+        Verdict::Kept(KeptReason::IntraOnly)
+      }
+      // The first intra slice decoded after a flush sets `non_gray`
+      // (`h264_slice.c` 2032–2034).
+      None if self.codec == NalCodec::H264 && some_intra && !self.intra_seen => {
+        Verdict::Kept(KeptReason::AwaitingIntraSlice)
+      }
       None => Verdict::Disposable,
+    };
+    Judged {
+      verdict,
+      reference,
+      intra,
+      irap,
+      ends,
+      carried,
     }
   }
 
@@ -894,6 +1155,12 @@ impl NalStream {
           // No parameter set declares the sub-layer: not as the stream
           // says it is.
           Read::Keeps(KeptReason::Malformed)
+        } else if self.sequence_start {
+          Read::Keeps(KeptReason::SequenceStart)
+        } else if self.recovering {
+          Read::Keeps(KeptReason::Recovering)
+        } else if self.carried {
+          Read::Keeps(KeptReason::CarriedOver)
         } else {
           Read::Picture
         }
@@ -932,12 +1199,11 @@ impl NalStream {
     }
   }
 
-  /// Learns from one H.264 NAL unit: whether a sequence parameter set
-  /// codes frames only. One that does not, or that this module cannot
-  /// read so under every reading FFmpeg may make of it
-  /// ([`sps_codes_frames_only`]), lets fields in for good. A unit whose
-  /// forbidden bit is set, which FFmpeg's splitter passes over
-  /// (`h2645_parse.c` 646–660), teaches nothing.
+  /// Learns from one H.264 NAL unit: what a sequence parameter set proves
+  /// under every reading FFmpeg may make of it ([`sps_proof`]). What one
+  /// does not prove stays unproven for good. A unit whose forbidden bit is
+  /// set, which FFmpeg's splitter passes over (`h2645_parse.c` 646–660),
+  /// teaches nothing.
   fn h264_learn(&mut self, nal: &[u8]) {
     let Some(&header) = nal.first() else {
       return;
@@ -946,8 +1212,15 @@ impl NalStream {
       return;
     }
     self.sps_seen = true;
-    if !sps_codes_frames_only(&nal[1..]) {
+    let proof = sps_proof(&nal[1..]);
+    if !proof.frames_only {
       self.fields_possible = true;
+    }
+    if !proof.no_gaps {
+      self.gaps_possible = true;
+    }
+    if !proof.reorder_fixed {
+      self.reorder_unfixed = true;
     }
   }
 
@@ -961,6 +1234,9 @@ impl NalStream {
       Read::Picture if !self.sps_seen || self.fields_possible => {
         Read::Keeps(KeptReason::MaybeField)
       }
+      Read::Picture if self.gaps_possible => Read::Keeps(KeptReason::FrameNumGaps),
+      Read::Picture if self.reorder_unfixed => Read::Keeps(KeptReason::ReorderUnfixed),
+      Read::Picture if !self.reference_seen => Read::Keeps(KeptReason::AwaitingReference),
       read => read,
     }
   }
@@ -987,12 +1263,16 @@ impl NalStream {
     // A unit of a sub-layer no parameter set has declared: one the reading
     // has not read declares it.
     self.raise(temporal_id);
-    if let Some(declared) = hevc_declared(nal_unit_type, nal) {
-      if declared <= 6 {
-        self.raise(declared);
-        if nal_unit_type == 33 {
-          self.sps_seen = true;
-        }
+    // A recovery point (D.3.8), or an SEI unit that does not read so.
+    if matches!(nal_unit_type, 39 | 40) && sei_may_hold(&nal[2..], 6) {
+      self.recovering = true;
+    }
+    if let Some(declared) = hevc_declared(nal_unit_type, nal)
+      && declared <= 6
+    {
+      self.raise(declared);
+      if nal_unit_type == 33 {
+        self.sps_seen = true;
       }
     }
   }
@@ -1012,10 +1292,27 @@ fn hevc_declared(nal_unit_type: u8, nal: &[u8]) -> Option<u8> {
   nal.get(at).map(|&byte| (byte >> 1) & 7)
 }
 
-/// Whether an H.264 sequence parameter set — `payload`, its bytes after the
-/// header — codes frames only (`frame_mbs_only_flag` 1, 7.4.2.1.1), under
-/// every reading of it FFmpeg's decoder may adopt
-/// (`ff_h264_decode_seq_parameter_set`, `h264_ps.c` 284–451):
+/// What an H.264 sequence parameter set proves, under every reading of it
+/// FFmpeg's decoder may adopt: each `true` only where every reading reads
+/// it so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpsProof {
+  /// `frame_mbs_only_flag` 1: no picture is a field (7.4.2.1.1).
+  frames_only: bool,
+  /// `gaps_in_frame_num_value_allowed_flag` 0: `frame_num` never jumps
+  /// (7.4.3).
+  no_gaps: bool,
+  /// The VUI's `bitstream_restriction_flag` 1, its `max_num_reorder_frames`
+  /// read and 15 at most: FFmpeg's reorder depth is the stream's (E.2.1;
+  /// `h264_slice.c` 1305–1307, 1411–1414), not a guess grown from the
+  /// pictures it sees, and no picture follows enough pictures it precedes
+  /// in output order to reset its record of them (1310–1328).
+  reorder_fixed: bool,
+}
+
+/// What an H.264 sequence parameter set — `payload`, its bytes after the
+/// header — proves under every reading of it FFmpeg's decoder may adopt
+/// (`ff_h264_decode_seq_parameter_set`, `h264_ps.c` 284–590):
 ///
 /// | reading | where FFmpeg makes it |
 /// |---|---|
@@ -1025,51 +1322,90 @@ fn hevc_declared(nal_unit_type: u8, nal: &[u8]) -> Option<u8> {
 ///
 /// Each reading is read only up to the first `00 00 00`, `00 00 01` or
 /// `00 00 02`, at or before where FFmpeg's splitter ends the unit
-/// (`h2645_parse.c` 44–52, 101–132), so it reads no more of the unit than
-/// FFmpeg does. Up to the flag the readings differ only where the unit
-/// holds `00 00 03`.
+/// (`h2645_parse.c` 44–52, 101–132), and within that only up to its stop
+/// bit, where FFmpeg's own reading of the RBSP ends (`h2645_parse.c`
+/// 348–376): so it reads no more of the unit than FFmpeg does.
 ///
-/// A reading that does not reach the flag, or that FFmpeg refuses on the
-/// way — a value outside the range it accepts, separate colour planes —
-/// is not proof, and answers `false`: the reading cannot tell which
-/// parameter set the decoder is left with.
-fn sps_codes_frames_only(payload: &[u8]) -> bool {
+/// Where the first reading, of the RBSP, reads the whole parameter set as
+/// FFmpeg's strict reading does — every value in range and nothing past
+/// its end — FFmpeg adopts that reading and makes no other (`h264dec.c`
+/// 707–708, `h264_parse.c` 385–387), so its facts alone prove. Otherwise
+/// every reading must prove a fact.
+///
+/// A reading that does not reach a fact, or that FFmpeg refuses on the way
+/// — a value outside the range it accepts, separate colour planes, a
+/// picture or cropping it rejects — proves nothing.
+fn sps_proof(payload: &[u8]) -> SpsProof {
   let end = payload
     .windows(3)
     .position(|window| window[0] == 0 && window[1] == 0 && window[2] <= 2)
     .unwrap_or(payload.len());
   let unit = &payload[..end];
-  [Reading::Rbsp, Reading::Bytes, Reading::Reescaped]
-    .into_iter()
-    .all(|reading| sps_frame_mbs_only(BitReader::new(unit, reading)) == Some(true))
+  let proves = |facts: &SpsFacts| SpsProof {
+    frames_only: facts.frames_only == Some(true),
+    no_gaps: facts.gaps == Some(false),
+    reorder_fixed: facts.reorder_fixed == Some(true),
+  };
+  let rbsp = sps_facts(BitReader::new(unit, Reading::Rbsp));
+  let mut proof = proves(&rbsp);
+  if rbsp.whole {
+    return proof;
+  }
+  for reading in [Reading::Bytes, Reading::Reescaped] {
+    let other = proves(&sps_facts(BitReader::new(unit, reading)));
+    proof.frames_only &= other.frames_only;
+    proof.no_gaps &= other.no_gaps;
+    proof.reorder_fixed &= other.reorder_fixed;
+  }
+  proof
 }
 
-/// `frame_mbs_only_flag`, read from a sequence parameter set as FFmpeg
-/// reads it (`h264_ps.c` 284–420), with the bounds it refuses on; `None`
-/// where the bits run out first or a bound fails.
-fn sps_frame_mbs_only(mut bits: BitReader<'_>) -> Option<bool> {
-  /// What `get_ue_golomb_31` reads: values to 30 alone (`golomb.h`).
-  fn ue31(bits: &mut BitReader<'_>) -> Option<u32> {
+/// What one reading of a sequence parameter set says: `None` where it does
+/// not reach the fact, or FFmpeg refuses it first.
+#[derive(Default)]
+struct SpsFacts {
+  gaps: Option<bool>,
+  frames_only: Option<bool>,
+  reorder_fixed: Option<bool>,
+  /// Whether the reading reads the whole parameter set, every value one
+  /// FFmpeg accepts and nothing past its end: FFmpeg's strict reading of
+  /// it succeeds.
+  whole: bool,
+}
+
+/// A sequence parameter set read as FFmpeg reads it (`h264_ps.c` 284–590,
+/// VUI 104–196; `h2645_vui.c` 37–98), with the bounds it refuses on, as
+/// far as it reads.
+fn sps_facts(mut bits: BitReader<'_>) -> SpsFacts {
+  let mut facts = SpsFacts::default();
+  facts.whole = sps_read(&mut bits, &mut facts).is_some();
+  facts
+}
+
+fn sps_read(bits: &mut BitReader<'_>, facts: &mut SpsFacts) -> Option<()> {
+  /// What `get_ue_golomb_31` reads where FFmpeg refuses past 30.
+  fn ue30(bits: &mut BitReader<'_>) -> Option<u32> {
     bits.ue().filter(|&value| value <= 30)
   }
   let profile_idc = bits.bits(8)?;
   // The constraint flags and `reserved_zero_2bits`, then `level_idc`.
   bits.bits(16)?;
   // `seq_parameter_set_id`, below `MAX_SPS_COUNT` (32).
-  ue31(&mut bits)?;
+  ue30(bits)?;
+  let mut chroma_format_idc = 1;
   // FFmpeg's own list of the profiles that code chroma format, bit depths
   // and scaling matrices (`h264_ps.c` 343–354).
   if matches!(
     profile_idc,
     100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 144
   ) {
-    let chroma_format_idc = ue31(&mut bits).filter(|&value| value <= 3)?;
+    chroma_format_idc = ue30(bits).filter(|&value| value <= 3)?;
     // FFmpeg refuses separate colour planes.
     if chroma_format_idc == 3 && bits.bits(1)? != 0 {
       return None;
     }
-    let luma = ue31(&mut bits)?;
-    let chroma = ue31(&mut bits)?;
+    let luma = ue30(bits)?;
+    let chroma = ue30(bits)?;
     // Equal depths, of 8 to 14 bits.
     if luma != chroma || luma > 6 {
       return None;
@@ -1082,17 +1418,17 @@ fn sps_frame_mbs_only(mut bits: BitReader<'_>) -> Option<bool> {
       let lists = if chroma_format_idc == 3 { 12 } else { 8 };
       for list in 0..lists {
         if bits.bits(1)? == 1 {
-          scaling_list(&mut bits, if list < 6 { 16 } else { 64 })?;
+          scaling_list(bits, if list < 6 { 16 } else { 64 })?;
         }
       }
     }
   }
   // `log2_max_frame_num_minus4`, 0 to 12.
-  ue31(&mut bits).filter(|&value| value <= 12)?;
-  match ue31(&mut bits)? {
+  ue30(bits).filter(|&value| value <= 12)?;
+  match ue30(bits)? {
     // `log2_max_pic_order_cnt_lsb_minus4`, to 12.
     0 => {
-      ue31(&mut bits).filter(|&value| value <= 12)?;
+      ue30(bits).filter(|&value| value <= 12)?;
     }
     1 => {
       // `delta_pic_order_always_zero_flag`, `offset_for_non_ref_pic`,
@@ -1110,13 +1446,166 @@ fn sps_frame_mbs_only(mut bits: BitReader<'_>) -> Option<bool> {
     _ => return None,
   }
   // `max_num_ref_frames`, to `H264_MAX_DPB_FRAMES` (16).
-  ue31(&mut bits).filter(|&value| value <= 16)?;
-  // `gaps_in_frame_num_value_allowed_flag`, `pic_width_in_mbs_minus1`,
-  // `pic_height_in_map_units_minus1`.
+  ue30(bits).filter(|&value| value <= 16)?;
+  facts.gaps = Some(bits.bits(1)? == 1);
+  // `pic_width_in_mbs_minus1`, `pic_height_in_map_units_minus1`.
+  let width = bits.ue()?;
+  let height = bits.ue()?;
+  let frames_only = bits.bits(1)? == 1;
+  facts.frames_only = Some(frames_only);
+  if !frames_only {
+    // `mb_adaptive_frame_field_flag`.
+    bits.bits(1)?;
+  }
+  // FFmpeg reads the two by `get_ue_golomb`, an error past 8190, and
+  // refuses a picture `av_image_check_size` refuses: (8w + 1024)(h + 128)
+  // at or past `INT_MAX` (`h264_ps.c` 446–470; `imgutils.c`).
+  if width > 8190 || height > 8190 {
+    return None;
+  }
+  let picture_width = 16 * (u64::from(width) + 1);
+  let picture_height = 16 * (u64::from(height) + 1) * if frames_only { 1 } else { 2 };
+  if (8 * picture_width + 1024) * (picture_height + 128) >= i32::MAX as u64 {
+    return None;
+  }
+  // `direct_8x8_inference_flag`, then the cropping offsets, read by
+  // `get_ue_golomb` and refused where they leave no picture (`h264_ps.c`
+  // 474–512).
   bits.bits(1)?;
+  if bits.bits(1)? == 1 {
+    let mut crop = [0_u64; 4];
+    for offset in &mut crop {
+      *offset = u64::from(bits.ue().filter(|&value| value <= 8190)?);
+    }
+    let step_x = if matches!(chroma_format_idc, 1 | 2) {
+      2
+    } else {
+      1
+    };
+    let step_y = if frames_only { 1 } else { 2 } << u64::from(chroma_format_idc == 1);
+    if (crop[0] + crop[1]) * step_x >= picture_width
+      || (crop[2] + crop[3]) * step_y >= picture_height
+    {
+      return None;
+    }
+  }
+  facts.reorder_fixed = Some(bits.bits(1)? == 1 && vui_fixes_reorder(bits)?);
+  Some(())
+}
+
+/// Whether a VUI sets `bitstream_restriction_flag` with a
+/// `max_num_reorder_frames` of 15 at most, as `decode_vui_parameters` reads
+/// it (`h264_ps.c` 129–196; `h2645_vui.c` 37–98). `false` where FFmpeg
+/// leaves it unset or the depth is 16, `None` where FFmpeg refuses the
+/// parameter set first.
+fn vui_fixes_reorder(bits: &mut BitReader<'_>) -> Option<bool> {
+  // `aspect_ratio_info_present_flag`, `aspect_ratio_idc`, an extended SAR.
+  if bits.bits(1)? == 1 && bits.bits(8)? == 255 {
+    bits.bits(32)?;
+  }
+  // `overscan_info_present_flag`, `overscan_appropriate_flag`.
+  if bits.bits(1)? == 1 {
+    bits.bits(1)?;
+  }
+  // `video_signal_type_present_flag`: the format, the range, and the
+  // colour description.
+  if bits.bits(1)? == 1 {
+    bits.bits(4)?;
+    if bits.bits(1)? == 1 {
+      bits.bits(24)?;
+    }
+  }
+  // `chroma_loc_info_present_flag`, its two sites.
+  if bits.bits(1)? == 1 {
+    bits.ue_31()?;
+    bits.ue_31()?;
+  }
+  // "Truncated VUI": FFmpeg reads no further.
+  if bits.peek()? == 1 && bits.left() < 10 {
+    return Some(false);
+  }
+  // `timing_info_present_flag`: `num_units_in_tick`, `time_scale`,
+  // `fixed_frame_rate_flag`.
+  if bits.bits(1)? == 1 {
+    bits.bits(32)?;
+    bits.bits(32)?;
+    bits.bits(1)?;
+  }
+  let nal_hrd = bits.bits(1)? == 1;
+  if nal_hrd {
+    hrd_parameters(bits)?;
+  }
+  let vcl_hrd = bits.bits(1)? == 1;
+  if vcl_hrd {
+    hrd_parameters(bits)?;
+  }
+  if nal_hrd || vcl_hrd {
+    // `low_delay_hrd_flag`.
+    bits.bits(1)?;
+  }
+  // `pic_struct_present_flag`; with nothing after it FFmpeg reads no
+  // further.
+  bits.bits(1)?;
+  if bits.left() == 0 || bits.bits(1)? == 0 {
+    return Some(false);
+  }
+  // `motion_vectors_over_pic_boundaries_flag`, `max_bytes_per_pic_denom`,
+  // `max_bits_per_mb_denom` and the two motion vector lengths.
+  bits.bits(1)?;
+  for _ in 0..4 {
+    bits.ue_31()?;
+  }
+  // `max_num_reorder_frames`, refused past 16, and
+  // `max_dec_frame_buffering`. The reading ends at FFmpeg's end, so a
+  // restriction it reads whole is one FFmpeg keeps (`h264_ps.c` 182–185).
+  let reorder = bits.ue_31()?;
+  bits.ue_31()?;
+  if reorder > 16 {
+    return None;
+  }
+  // At 16, a picture may follow 16 pictures it precedes in output order,
+  // and FFmpeg then resets its record of them (`last_pocs`, `h264_slice.c`
+  // 1310–1328), which a picture dropped from them changes.
+  Some(reorder <= 15)
+}
+
+/// `hrd_parameters` (E.1.2), as `decode_hrd_parameters` reads it
+/// (`h264_ps.c` 104–127).
+fn hrd_parameters(bits: &mut BitReader<'_>) -> Option<()> {
+  let cpb_count = bits.ue_31()? + 1;
+  if cpb_count > 32 {
+    return None;
+  }
+  // `bit_rate_scale`, `cpb_size_scale`.
+  bits.bits(8)?;
+  for _ in 0..cpb_count {
+    bits.ue()?;
+    bits.ue()?;
+    bits.bits(1)?;
+  }
+  // The three delay lengths and `time_offset_length`.
+  bits.bits(20)?;
+  Some(())
+}
+
+/// The `slice_type` FFmpeg reads of an H.264 slice NAL unit — `payload`,
+/// its bytes after the header — as `get_last_needed_nal` and the slice
+/// header's parse both read it (`h264dec.c` 501–551, `h264_slice.c`
+/// 1709–1727): `first_mb_in_slice` by `get_ue_golomb_long`, then
+/// `slice_type` by `get_ue_golomb_31`. `None` where the header does not
+/// read so; each caller then assumes what keeps its packet.
+fn slice_type(payload: &[u8]) -> Option<u32> {
+  let mut bits = BitReader::whole(payload, Reading::Rbsp);
   bits.ue()?;
-  bits.ue()?;
-  Some(bits.bits(1)? == 1)
+  bits.ue_31()
+}
+
+/// Whether FFmpeg reads `slice_type` as an intra slice, I or SI: 2 or 4,
+/// or 7 or 9, its value for every slice of the picture. A value past 9 is
+/// P to `get_last_needed_nal` (`h264dec.c` 537–543) and refused by the
+/// slice header's parse (`h264_slice.c` 1711–1717).
+const fn is_intra(slice_type: u32) -> bool {
+  matches!(slice_type, 2 | 4 | 7 | 9)
 }
 
 /// One scaling list of `size` deltas (7.3.2.1.1.1), each in `-128..=127`
@@ -1155,6 +1644,7 @@ enum Reading {
 
 /// Bits of a NAL unit's payload, most significant first, in one
 /// [`Reading`].
+#[derive(Clone)]
 struct BitReader<'a> {
   reading: Reading,
   rbsp: Rbsp<'a>,
@@ -1163,10 +1653,34 @@ struct BitReader<'a> {
   pending: &'static [u8],
   byte: u8,
   left: u32,
+  /// The bits read.
+  position: u64,
+  /// The bits there are to read.
+  end: u64,
 }
 
 impl<'a> BitReader<'a> {
-  const fn new(bytes: &'a [u8], reading: Reading) -> Self {
+  /// The reading's bits up to its stop bit: the lowest set bit of its last
+  /// byte that is not zero, where FFmpeg's reading of an RBSP ends
+  /// (`h2645_parse.c` 348–376).
+  fn new(bytes: &'a [u8], reading: Reading) -> Self {
+    let mut probe = Self::whole(bytes, reading);
+    let (mut index, mut last) = (0_u64, None);
+    while let Some(byte) = probe.next_byte() {
+      if byte != 0 {
+        last = Some((index, byte));
+      }
+      index += 1;
+    }
+    let mut reader = Self::whole(bytes, reading);
+    reader.end = last.map_or(0, |(at, byte)| {
+      at * 8 + 7 - u64::from(byte.trailing_zeros())
+    });
+    reader
+  }
+
+  /// The reading's every bit.
+  const fn whole(bytes: &'a [u8], reading: Reading) -> Self {
     Self {
       reading,
       rbsp: Rbsp::new(bytes),
@@ -1174,6 +1688,8 @@ impl<'a> BitReader<'a> {
       pending: &[],
       byte: 0,
       left: 0,
+      position: 0,
+      end: u64::MAX,
     }
   }
 
@@ -1208,12 +1724,26 @@ impl<'a> BitReader<'a> {
   }
 
   fn bit(&mut self) -> Option<u32> {
+    if self.position >= self.end {
+      return None;
+    }
     if self.left == 0 {
       self.byte = self.next_byte()?;
       self.left = 8;
     }
     self.left -= 1;
+    self.position += 1;
     Some(u32::from(self.byte >> self.left) & 1)
+  }
+
+  /// The next bit, not read.
+  fn peek(&self) -> Option<u32> {
+    self.clone().bit()
+  }
+
+  /// The bits left before the end.
+  const fn left(&self) -> u64 {
+    self.end.saturating_sub(self.position)
   }
 
   /// `n` bits, at most 32.
@@ -1239,6 +1769,30 @@ impl<'a> BitReader<'a> {
   fn se(&mut self) -> Option<i64> {
     let k = i64::from(self.ue()?);
     Some(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) })
+  }
+
+  /// What `get_ue_golomb_31` reads, value and bits alike (`golomb.h`
+  /// 120–141, its tables in `golomb.c`): a code of up to four leading zeros
+  /// its value; five, 31 where its next three bits are zero and else 32; six
+  /// to eight, 32; nine or more, 32, having taken 19 bits.
+  fn ue_31(&mut self) -> Option<u32> {
+    let mut zeros = 0;
+    while zeros < 9 {
+      if self.bit()? == 1 {
+        break;
+      }
+      zeros += 1;
+    }
+    if zeros == 9 {
+      self.bits(10)?;
+      return Some(32);
+    }
+    let info = self.bits(zeros)?;
+    Some(match zeros {
+      0..=4 => (1 << zeros) - 1 + info,
+      5 if info >> 2 == 0 => 31,
+      _ => 32,
+    })
   }
 }
 
@@ -1494,9 +2048,35 @@ fn sei_rides(payload: &[u8], rides: fn(u32) -> bool) -> bool {
   messages > 0
 }
 
+/// Whether an SEI unit — `payload`, its bytes after the header — may hold a
+/// message of `payload_type`: one of its messages is, or it does not read
+/// as [`sei_rides`] reads one.
+fn sei_may_hold(payload: &[u8], payload_type: u32) -> bool {
+  let Some(last) = payload.iter().rposition(|&byte| byte != 0) else {
+    return true;
+  };
+  if payload[last] != 0x80 {
+    return true;
+  }
+  let mut rbsp = Rbsp::new(&payload[..last]);
+  while let Some(first) = rbsp.byte() {
+    let Some(found) = rbsp.coded(first) else {
+      return true;
+    };
+    let Some(size) = rbsp.byte().and_then(|first| rbsp.coded(first)) else {
+      return true;
+    };
+    if found == payload_type || !rbsp.skip(size) {
+      return true;
+    }
+  }
+  false
+}
+
 /// A NAL unit's bytes as its RBSP: each emulation prevention byte — a 3
 /// after two zero bytes — dropped, as `ff_h2645_extract_rbsp` drops it
 /// (`h2645_parse.c` 37–147).
+#[derive(Clone)]
 struct Rbsp<'a> {
   raw: &'a [u8],
   zeros: u8,
@@ -1541,6 +2121,26 @@ impl<'a> Rbsp<'a> {
   fn skip(&mut self, count: u32) -> bool {
     (0..count).all(|_| self.byte().is_some())
   }
+}
+
+/// A packet's verdict, with what the decoder learns from it.
+struct Judged {
+  verdict: Verdict,
+  /// For H.264: whether the packet, read whole, holds a slice of a
+  /// reference picture the decoder decodes (types 1 and 5).
+  reference: bool,
+  /// For H.264: whether the packet, read whole, holds a slice the decoder
+  /// decodes that reads as intra.
+  intra: bool,
+  /// For HEVC: whether the packet, read whole, holds an IRAP picture of
+  /// layer 0 the decoder decodes (types 16–21).
+  irap: bool,
+  /// For HEVC: whether the packet may hold an end of sequence or of
+  /// bitstream.
+  ends: bool,
+  /// For HEVC: whether SEI state or an RPU may be pending after the packet
+  /// for the next picture decoded.
+  carried: bool,
 }
 
 /// What one NAL unit says about its packet.

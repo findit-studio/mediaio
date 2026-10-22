@@ -9,8 +9,13 @@ fn avc(nal_ref_idc: u8, nal_unit_type: u8, payload: &[u8]) -> Vec<u8> {
   nal
 }
 
-/// A non-reference H.264 slice.
+/// A non-reference H.264 slice: `first_mb_in_slice` 0, `slice_type` 6, B.
 fn b_slice() -> Vec<u8> {
+  avc(0, 1, &[0x9C, 0x84, 0x21])
+}
+
+/// A non-reference H.264 slice of `slice_type` 7, I.
+fn i_slice() -> Vec<u8> {
   avc(0, 1, &[0x88, 0x84, 0x21])
 }
 
@@ -96,6 +101,23 @@ struct Sps {
   max_num_ref_frames: u32,
   width_in_mbs_minus1: u32,
   height_in_map_units_minus1: u32,
+  gaps: bool,
+  vui: Vui,
+}
+
+/// What an [`Sps`] writes for its VUI.
+#[derive(Clone, Copy)]
+enum Vui {
+  /// No VUI.
+  Absent,
+  /// A VUI that sets `bitstream_restriction_flag` and nothing else, with
+  /// `max_num_reorder_frames` of the given count.
+  Restricted(u32),
+  /// The same, after a SAR, a colour description, chroma sites, timing and
+  /// NAL HRD parameters of one CPB.
+  RestrictedAfterAll,
+  /// A VUI without the restriction.
+  Unrestricted,
 }
 
 impl Sps {
@@ -112,6 +134,8 @@ impl Sps {
     max_num_ref_frames: 1,
     width_in_mbs_minus1: 119,
     height_in_map_units_minus1: 67,
+    gaps: false,
+    vui: Vui::Restricted(1),
   };
 
   /// The same at High profile, with a scaling matrix written.
@@ -156,7 +180,7 @@ impl Sps {
     }
     bits
       .ue(self.max_num_ref_frames)
-      .bit(0)
+      .bit(u32::from(self.gaps))
       .ue(self.width_in_mbs_minus1)
       .ue(self.height_in_map_units_minus1)
       .bit(u32::from(self.frames_only));
@@ -164,12 +188,68 @@ impl Sps {
       // `mb_adaptive_frame_field_flag`.
       bits.bit(1);
     }
-    // `direct_8x8_inference_flag`, no cropping, no VUI.
-    bits.bit(1).bit(0).bit(0);
+    // `direct_8x8_inference_flag`, no cropping.
+    bits.bit(1).bit(0);
+    match self.vui {
+      Vui::Absent => {
+        bits.bit(0);
+      }
+      Vui::Restricted(reorder) => {
+        // No SAR, overscan, signal type, chroma sites, timing or HRD, no
+        // `pic_struct`; then the restriction.
+        bits.bit(1).bits(0, 8);
+        restriction(&mut bits, reorder);
+      }
+      Vui::RestrictedAfterAll => {
+        // An extended SAR, overscan, a signal type with its colour
+        // description, chroma sites, timing, NAL HRD of one CPB, no VCL
+        // HRD, `low_delay_hrd_flag`, `pic_struct_present_flag`.
+        bits.bit(1).bit(1).bits(255, 8).bits(4, 16).bits(3, 16);
+        bits.bit(1).bit(0);
+        bits
+          .bit(1)
+          .bits(5, 3)
+          .bit(0)
+          .bit(1)
+          .bits(9, 8)
+          .bits(16, 8)
+          .bits(9, 8);
+        bits.bit(1).ue(0).ue(0);
+        bits.bit(1).bits(1001, 32).bits(60_000, 32).bit(1);
+        bits
+          .bit(1)
+          .ue(0)
+          .bits(4, 4)
+          .bits(6, 4)
+          .ue(62_499)
+          .ue(124_999)
+          .bit(0);
+        bits.bits(23, 5).bits(23, 5).bits(23, 5).bits(24, 5);
+        bits.bit(0).bit(0).bit(1);
+        restriction(&mut bits, 2);
+      }
+      Vui::Unrestricted => {
+        bits.bit(1).bits(0, 8).bit(0);
+      }
+    }
     let mut unit = vec![0x67];
     unit.extend_from_slice(&bits.finish());
     unit
   }
+}
+
+/// `bitstream_restriction_flag` 1 and its fields, `max_num_reorder_frames`
+/// `reorder`.
+fn restriction(bits: &mut Bits, reorder: u32) {
+  bits
+    .bit(1)
+    .bit(1)
+    .ue(2)
+    .ue(1)
+    .ue(16)
+    .ue(16)
+    .ue(reorder)
+    .ue(4);
 }
 
 /// An H.264 sequence parameter set coding frames only.
@@ -323,12 +403,30 @@ fn kept(reason: KeptReason) -> Verdict {
   Verdict::Kept(reason)
 }
 
+/// An H.264 reading of `extradata` past a reference picture and an intra
+/// slice, as a stream's reading is past its first IDR picture: the laws
+/// below read the packets after it.
+fn h264(extradata: &[u8]) -> NalStream {
+  let mut stream = NalStream::new(NalCodec::H264, extradata);
+  stream.reference_seen = true;
+  stream.intra_seen = true;
+  stream
+}
+
+/// An HEVC reading of `extradata` past its first packet, which takes up the
+/// `eos` the decoder opens with: the laws below read the packets after it.
+fn hevc_stream(extradata: &[u8]) -> NalStream {
+  let mut stream = NalStream::new(NalCodec::Hevc, extradata);
+  stream.sequence_start = false;
+  stream
+}
+
 #[test]
 fn an_avc_record_frames_lengths_of_one_to_four_bytes() {
   // ISO/IEC 14496-15 allows 1, 2 and 4; FFmpeg reads 3 as it reads the
   // others.
   for (minus_one, size) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
-    let mut stream = NalStream::new(NalCodec::H264, &avcc(minus_one));
+    let mut stream = h264(&avcc(minus_one));
     let framing = match size {
       1 => Framing::Length(LengthSize::One),
       2 => Framing::Length(LengthSize::Two),
@@ -350,13 +448,13 @@ fn an_avc_record_frames_lengths_of_one_to_four_bytes() {
   // A record that ends before its parameter sets do sets lengths and no
   // size: FFmpeg splits nothing.
   let record = avcc(3);
-  let mut short = NalStream::new(NalCodec::H264, &record[..record.len() - 1]);
+  let mut short = h264(&record[..record.len() - 1]);
   assert_eq!(short.framing(), None);
   assert_eq!(
     short.read(&lengths(4, &[b_slice()])),
     kept(KeptReason::Unframed)
   );
-  assert_eq!(NalStream::new(NalCodec::H264, &record[..6]).framing(), None);
+  assert_eq!(h264(&record[..6]).framing(), None);
 }
 
 #[test]
@@ -364,7 +462,7 @@ fn annex_b_reads_three_and_four_byte_start_codes_and_leading_and_trailing_zeros(
   // No extradata, or extradata that is no `avcC`, is Annex B; without one
   // the sequence parameter set arrives in-band.
   for extradata in [&[][..], &annex_b(&[avc_sps()])[..]] {
-    let mut stream = NalStream::new(NalCodec::H264, extradata);
+    let mut stream = h264(extradata);
     assert_eq!(stream.framing(), Some(Framing::AnnexB));
     if extradata.is_empty() {
       assert_eq!(
@@ -382,7 +480,7 @@ fn annex_b_reads_three_and_four_byte_start_codes_and_leading_and_trailing_zeros(
       kept(KeptReason::Referenced)
     );
   }
-  let mut stream = NalStream::new(NalCodec::H264, &[]);
+  let mut stream = h264(&[]);
   // A byte other than zero before the first start code, no start code at
   // all, and a start code with nothing after it.
   assert_eq!(
@@ -398,7 +496,7 @@ fn annex_b_reads_three_and_four_byte_start_codes_and_leading_and_trailing_zeros(
 
 #[test]
 fn an_h264_packet_is_disposable_only_where_every_slice_is_non_reference_and_none_is_idr() {
-  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let mut stream = h264(&avcc(3));
   let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
   // An access unit delimiter, filler data and an SEI unit of picture
   // timing ride beside the slices.
@@ -423,11 +521,11 @@ fn an_h264_packet_is_disposable_only_where_every_slice_is_non_reference_and_none
   );
   // Slice data partitions are slices too.
   assert_eq!(
-    read(&mut stream, &[avc(0, 2, &[0x88]), avc(0, 3, &[0x88])]),
+    read(&mut stream, &[avc(0, 2, &[0x9C]), avc(0, 3, &[0x88])]),
     Verdict::Disposable
   );
   assert_eq!(
-    read(&mut stream, &[avc(0, 2, &[0x88]), avc(1, 4, &[0x88])]),
+    read(&mut stream, &[avc(0, 2, &[0x9C]), avc(1, 4, &[0x88])]),
     kept(KeptReason::Referenced)
   );
   // An IDR slice, whatever its `nal_ref_idc`.
@@ -445,7 +543,7 @@ fn an_h264_packet_is_disposable_only_where_every_slice_is_non_reference_and_none
 
 #[test]
 fn a_parameter_set_an_sei_unit_or_an_end_beside_a_non_reference_slice_keeps_the_packet() {
-  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let mut stream = h264(&avcc(3));
   for nal_unit_type in [7, 8, 6, 10, 11, 13, 15, 16, 19, 0, 23, 31] {
     assert_eq!(
       stream.read(&lengths(4, &[avc(3, nal_unit_type, &[0x42]), b_slice()])),
@@ -465,7 +563,7 @@ fn a_parameter_set_an_sei_unit_or_an_end_beside_a_non_reference_slice_keeps_the_
 
 #[test]
 fn an_h264_sei_unit_rides_only_where_every_message_is_picture_timing_or_filler() {
-  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let mut stream = h264(&avcc(3));
   let mut read = |sei: Vec<u8>| stream.read(&lengths(4, &[sei, b_slice()]));
   // The picture timing message holds `00 00 00`, so the unit holds an
   // emulation prevention byte the reading drops.
@@ -507,7 +605,7 @@ fn an_h264_sei_unit_rides_only_where_every_message_is_picture_timing_or_filler()
 
 #[test]
 fn a_packet_that_does_not_parse_is_kept() {
-  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let mut stream = h264(&avcc(3));
   // A length of 0, one past the end, and bytes too few for a length.
   assert_eq!(
     stream.read(&[0, 0, 0, 0, 0x01, 0x88]),
@@ -547,7 +645,7 @@ fn a_four_byte_length_track_switches_its_framing_where_ffmpeg_does_and_keeps_the
   // bytes are no length that fits is Annex B, and so are the packets after
   // it until one begins with a length that fits. A packet that switches
   // the framing is kept; the packets after it are read in the new one.
-  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let mut stream = h264(&avcc(3));
   let annex = annex_b(&[avc(0, 9, &[0xF0]), b_slice()]);
   assert_eq!(stream.read(&annex), kept(KeptReason::FramingChange));
   assert_eq!(stream.framing(), Some(Framing::AnnexB));
@@ -559,7 +657,7 @@ fn a_four_byte_length_track_switches_its_framing_where_ffmpeg_does_and_keeps_the
   assert_eq!(stream.framing(), Some(Framing::Length(LengthSize::Four)));
   assert_eq!(stream.read(&lengths(4, &[b_slice()])), Verdict::Disposable);
   // Two-byte lengths are read as declared.
-  let mut two = NalStream::new(NalCodec::H264, &avcc(1));
+  let mut two = h264(&avcc(1));
   assert_eq!(two.read(&annex), kept(KeptReason::Malformed));
 }
 
@@ -567,7 +665,7 @@ fn a_four_byte_length_track_switches_its_framing_where_ffmpeg_does_and_keeps_the
 fn the_four_byte_size_outlives_an_annex_b_record_and_a_length_of_257_is_read_as_one() {
   // An Annex B record makes the stream one of start codes and keeps the
   // four-byte size (`h264_parse.c` 517–519), so the probe still runs.
-  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let mut stream = h264(&avcc(3));
   stream.reconfigure(&annex_b(&[avc_sps()]));
   assert_eq!(stream.framing(), Some(Framing::AnnexB));
   // `00 00 01 01 41 …`: as Annex B, a start code and a non-reference
@@ -582,13 +680,13 @@ fn the_four_byte_size_outlives_an_annex_b_record_and_a_length_of_257_is_read_as_
   assert_eq!(stream.read(&packet), kept(KeptReason::Referenced));
   // The same bytes on a track no record gave a size: start codes, and a
   // non-reference slice — what the four-byte track must not read.
-  let mut annex = NalStream::new(NalCodec::H264, &annex_b(&[avc_sps()]));
+  let mut annex = h264(&annex_b(&[avc_sps()]));
   assert_eq!(annex.read(&packet), Verdict::Disposable);
 }
 
 #[test]
 fn a_record_moves_only_what_ffmpeg_moves() {
-  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let mut stream = h264(&avcc(3));
   stream.reconfigure(&avcc(1));
   assert_eq!(stream.framing(), Some(Framing::Length(LengthSize::Two)));
   // An empty record moves nothing (`h264_parse.c` 472–473).
@@ -609,7 +707,7 @@ fn a_record_moves_only_what_ffmpeg_moves() {
 
   // HEVC: an empty record moves nothing; one of start codes keeps the
   // size; an `hvcC` that fails part way stops at two.
-  let mut hevc_stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 3, &[hevc_sps(0)]));
+  let mut hevc_stream = hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
   hevc_stream.reconfigure(&[]);
   assert_eq!(
     hevc_stream.framing(),
@@ -629,12 +727,12 @@ fn a_record_moves_only_what_ffmpeg_moves() {
 fn a_packet_that_is_an_avcc_configures_the_track_and_is_kept() {
   // `h264dec.c` 1045–1050: while lengths are read, a packet that is an
   // `avcC` is read as one, and holds no picture.
-  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let mut stream = h264(&avcc(3));
   assert_eq!(stream.read(&avcc(1)), kept(KeptReason::Configuration));
   assert_eq!(stream.framing(), Some(Framing::Length(LengthSize::Two)));
   assert_eq!(stream.read(&lengths(2, &[b_slice()])), Verdict::Disposable);
   // While start codes are read, the same bytes are no record.
-  let mut annex = NalStream::new(NalCodec::H264, &[]);
+  let mut annex = h264(&[]);
   assert_eq!(annex.read(&avcc(1)), kept(KeptReason::Malformed));
   assert_eq!(annex.framing(), Some(Framing::AnnexB));
 }
@@ -643,7 +741,7 @@ fn a_packet_that_is_an_avcc_configures_the_track_and_is_kept() {
 fn a_record_on_a_packet_of_no_bytes_is_read_by_hevc_and_not_by_h264() {
   // FFmpeg's H.264 decoder reads a packet of no bytes as the stream's end,
   // before the record it carries (`h264dec.c` 1034–1036).
-  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let mut stream = h264(&avcc(3));
   assert_eq!(
     stream.read_with_record(&[], Some(&avcc(1))),
     kept(KeptReason::NoPicture)
@@ -656,16 +754,25 @@ fn a_record_on_a_packet_of_no_bytes_is_read_by_hevc_and_not_by_h264() {
   );
   assert_eq!(stream.framing(), Some(Framing::Length(LengthSize::Two)));
   // HEVC's reads the record whatever the packet (`hevcdec.c` 3854–3860).
-  let mut hevc_stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 3, &[hevc_sps(0)]));
+  let mut hevc_stream = hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
   let _ = hevc_stream.read_with_record(&[], Some(&annex_b(&[hevc_sps(0)])));
   assert_eq!(hevc_stream.framing(), Some(Framing::AnnexB));
 }
 
 #[test]
 fn a_seek_after_the_framing_moved_marks_nothing_again() {
-  // Nothing moved: a seek changes nothing.
-  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  // Nothing moved: the framing is the same after the seek, and the
+  // reading awaits a reference picture again.
+  let mut stream = h264(&avcc(3));
   stream.seeked();
+  assert_eq!(
+    stream.read(&lengths(4, &[b_slice()])),
+    kept(KeptReason::AwaitingReference)
+  );
+  assert_eq!(
+    stream.read(&lengths(4, &[p_slice()])),
+    kept(KeptReason::Referenced)
+  );
   assert_eq!(stream.read(&lengths(4, &[b_slice()])), Verdict::Disposable);
   // Moved, then sought: a decoder that kept its framing and one opened
   // afresh read the next packet otherwise.
@@ -688,10 +795,14 @@ fn a_seek_after_the_framing_moved_marks_nothing_again() {
   );
   // Moved and moved back before the seek: the framing is the one the
   // stream opened in, which both decoders read.
-  let mut back = NalStream::new(NalCodec::H264, &avcc(3));
+  let mut back = h264(&avcc(3));
   back.reconfigure(&annex_b(&[avc_sps()]));
   back.reconfigure(&avcc(3));
   back.seeked();
+  assert_eq!(
+    back.read(&lengths(4, &[p_slice()])),
+    kept(KeptReason::Referenced)
+  );
   assert_eq!(back.read(&lengths(4, &[b_slice()])), Verdict::Disposable);
 }
 
@@ -705,7 +816,7 @@ fn a_parameter_set_of_21802_bytes_or_more_leaves_the_size_unknown() {
     sps
   };
   // 21,800 bytes and its two-byte length: 21,802.
-  let mut stream = NalStream::new(NalCodec::H264, &avcc_of(3, &big(21_800)));
+  let mut stream = h264(&avcc_of(3, &big(21_800)));
   assert_eq!(stream.framing(), None);
   assert_eq!(
     stream.read(&lengths(4, &[b_slice()])),
@@ -718,14 +829,14 @@ fn a_parameter_set_of_21802_bytes_or_more_leaves_the_size_unknown() {
   stream.reconfigure(&avcc_of(3, &big(21_800)));
   assert_eq!(stream.framing(), Some(Framing::Length(LengthSize::Four)));
   // One byte less is read whole.
-  let whole = NalStream::new(NalCodec::H264, &avcc_of(3, &big(21_799)));
+  let whole = h264(&avcc_of(3, &big(21_799)));
   assert_eq!(whole.framing(), Some(Framing::Length(LengthSize::Four)));
 }
 
 #[test]
 fn a_mid_stream_hvcc_of_other_than_two_byte_lengths_marks_nothing_again() {
   // At the opening an `hvcC` is read whole or leaves no decoder.
-  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 3, &[hevc_sps(0)]));
+  let mut stream = hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
   assert_eq!(stream.framing(), Some(Framing::Length(LengthSize::Four)));
   // Mid-stream, one of two-byte lengths is two whether or not its
   // parameter sets decode.
@@ -750,7 +861,7 @@ fn a_mid_stream_hvcc_of_other_than_two_byte_lengths_marks_nothing_again() {
 #[test]
 fn an_hevc_slnr_picture_is_disposable_only_at_the_highest_sub_layer() {
   // Three sub-layers, from the SPS in the record.
-  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 3, &[hevc_sps(2)]));
+  let mut stream = hevc_stream(&hvcc(0, 3, &[hevc_sps(2)]));
   assert_eq!(stream.highest_sub_layer(), Some(2));
   let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
   let aud = hevc(35, 0, 2, &[0x50]);
@@ -807,7 +918,7 @@ fn an_hevc_slnr_picture_is_disposable_only_at_the_highest_sub_layer() {
 
 #[test]
 fn a_unit_of_a_sub_layer_no_parameter_set_declared_raises_the_highest() {
-  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 3, &[hevc_sps(0)]));
+  let mut stream = hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
   assert_eq!(stream.highest_sub_layer(), Some(0));
   // A reference slice at TemporalId 2: kept as one, and learned from.
   assert_eq!(
@@ -823,7 +934,7 @@ fn a_unit_of_a_sub_layer_no_parameter_set_declared_raises_the_highest() {
 
 #[test]
 fn a_single_sub_layer_stream_marks_its_slnr_pictures() {
-  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(1, 3, &[hevc_sps(0)]));
+  let mut stream = hevc_stream(&hvcc(1, 3, &[hevc_sps(0)]));
   assert_eq!(stream.highest_sub_layer(), Some(0));
   assert_eq!(
     stream.read(&lengths(4, &[hevc(0, 0, 0, &[0xAF])])),
@@ -835,7 +946,7 @@ fn a_single_sub_layer_stream_marks_its_slnr_pictures() {
 fn the_highest_sub_layer_is_learned_from_every_parameter_set_and_only_rises() {
   // No SPS yet: nothing is disposable, whatever the record's
   // `numTemporalLayers` says.
-  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(1, 3, &[]));
+  let mut stream = hevc_stream(&hvcc(1, 3, &[]));
   assert_eq!(stream.highest_sub_layer(), None);
   assert_eq!(
     stream.read(&lengths(4, &[hevc(0, 0, 0, &[0xAF])])),
@@ -862,7 +973,7 @@ fn the_highest_sub_layer_is_learned_from_every_parameter_set_and_only_rises() {
     kept(KeptReason::BelowHighestSubLayer)
   );
   // The record's `numTemporalLayers` raises it too, once an SPS is known.
-  let mut record = NalStream::new(NalCodec::Hevc, &hvcc(4, 3, &[hevc_sps(0)]));
+  let mut record = hevc_stream(&hvcc(4, 3, &[hevc_sps(0)]));
   assert_eq!(record.highest_sub_layer(), Some(3));
   assert_eq!(
     record.read(&lengths(4, &[hevc(0, 0, 0, &[0xAF])])),
@@ -881,7 +992,7 @@ fn every_parameter_set_ffmpegs_splitter_may_read_is_learned() {
   // A malformed unit before a VPS of three: the packet does not parse, and
   // the VPS is read, as FFmpeg's splitter passes over the unit
   // (`h2645_parse.c` 646–660).
-  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 3, &[hevc_sps(0)]));
+  let mut stream = hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
   assert_eq!(
     stream.read(&lengths(4, &[vec![0x80, 0x01], hevc_vps(2)])),
     kept(KeptReason::Malformed)
@@ -889,7 +1000,7 @@ fn every_parameter_set_ffmpegs_splitter_may_read_is_learned() {
   assert_eq!(stream.highest_sub_layer(), Some(2));
   // A start code within a length-framed unit: the splitter reads the
   // bytes after it as a unit of its own (`h2645_parse.c` 44–52, 559–584).
-  let mut within = NalStream::new(NalCodec::Hevc, &hvcc(0, 3, &[hevc_sps(0)]));
+  let mut within = hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
   let mut unit = hevc(0, 0, 0, &[0xAF, 0, 0, 1]);
   unit.extend_from_slice(&hevc_sps(2));
   assert_eq!(
@@ -899,7 +1010,7 @@ fn every_parameter_set_ffmpegs_splitter_may_read_is_learned() {
   assert_eq!(within.highest_sub_layer(), Some(2));
   // Annex B: bytes before the first start code, which the splitter passes
   // over to the units after it (`h2645_parse.c` 565–580).
-  let mut annex = NalStream::new(NalCodec::Hevc, &annex_b(&[hevc_sps(0)]));
+  let mut annex = hevc_stream(&annex_b(&[hevc_sps(0)]));
   let mut packet = vec![7];
   packet.extend_from_slice(&annex_b(&[hevc_vps(2), hevc(0, 0, 0, &[0xAF])]));
   assert_eq!(annex.read(&packet), kept(KeptReason::Malformed));
@@ -907,14 +1018,14 @@ fn every_parameter_set_ffmpegs_splitter_may_read_is_learned() {
   // And a record of start codes holding bytes that frame nothing.
   let mut extradata = vec![9, 9];
   extradata.extend_from_slice(&annex_b(&[hevc_sps(1)]));
-  let record = NalStream::new(NalCodec::Hevc, &extradata);
+  let record = hevc_stream(&extradata);
   assert_eq!(record.highest_sub_layer(), Some(1));
 }
 
 #[test]
 fn hevc_annex_b_extradata_and_in_band_sets_are_read() {
   let extradata = annex_b(&[hevc_vps(0), hevc_sps(1), hevc(34, 0, 0, &[0xC1])]);
-  let mut stream = NalStream::new(NalCodec::Hevc, &extradata);
+  let mut stream = hevc_stream(&extradata);
   assert_eq!(stream.framing(), Some(Framing::AnnexB));
   assert_eq!(stream.highest_sub_layer(), Some(1));
   assert_eq!(
@@ -925,10 +1036,12 @@ fn hevc_annex_b_extradata_and_in_band_sets_are_read() {
 
 #[test]
 fn an_hevc_layer_above_0_or_a_companion_unit_keeps_the_packet() {
-  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 3, &[hevc_sps(0)]));
+  // Each on a reading of its own: an end of sequence, an SEI unit or an
+  // RPU moves what the next packet is held to.
+  let fresh = || hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
   let slnr = hevc(0, 0, 0, &[0xAF]);
   assert_eq!(
-    stream.read(&lengths(4, &[slnr.clone(), hevc(0, 1, 0, &[0xAF])])),
+    fresh().read(&lengths(4, &[slnr.clone(), hevc(0, 1, 0, &[0xAF])])),
     kept(KeptReason::Extension)
   );
   for nal_unit_type in [32, 33, 34, 36, 37, 39, 40, 24, 31, 41, 47, 48, 62, 63] {
@@ -938,14 +1051,14 @@ fn an_hevc_layer_above_0_or_a_companion_unit_keeps_the_packet() {
       other => hevc(other, 0, 0, &[0x42, 0x42]),
     };
     assert_eq!(
-      stream.read(&lengths(4, &[slnr.clone(), unit])),
+      fresh().read(&lengths(4, &[slnr.clone(), unit])),
       kept(KeptReason::Companion(nal_unit_type)),
       "{nal_unit_type}"
     );
   }
   for beside in [35, 38] {
     assert_eq!(
-      stream.read(&lengths(4, &[hevc(beside, 0, 0, &[0x50]), slnr.clone()])),
+      fresh().read(&lengths(4, &[hevc(beside, 0, 0, &[0x50]), slnr.clone()])),
       Verdict::Disposable,
       "{beside}"
     );
@@ -954,7 +1067,7 @@ fn an_hevc_layer_above_0_or_a_companion_unit_keeps_the_packet() {
 
 #[test]
 fn an_hevc_sei_unit_rides_only_where_every_message_is_filler() {
-  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 3, &[hevc_sps(0)]));
+  let mut stream = hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
   let slnr = hevc(0, 0, 0, &[0xAF]);
   // A prefix unit of filler before the picture and a suffix one after it.
   assert_eq!(
@@ -986,20 +1099,22 @@ fn an_hevc_sei_unit_rides_only_where_every_message_is_filler() {
   // Every other message keeps the packet — picture timing among them, whose
   // field structure FFmpeg keeps for later pictures (`hevc/refs.c`
   // 183–187).
+  // A prefix unit before its picture, a suffix one after it.
   for payload_type in [0, 1, 4, 5, 6, 129, 132, 136, 137, 144, 147] {
     for nal_unit_type in [39, 40] {
+      let sei = hevc_sei(
+        nal_unit_type,
+        0,
+        &[filler(), sei_message(payload_type, &[0x42])],
+      );
+      let nals = if nal_unit_type == 39 {
+        [sei, slnr.clone()]
+      } else {
+        [slnr.clone(), sei]
+      };
+      let mut stream = hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
       assert_eq!(
-        stream.read(&lengths(
-          4,
-          &[
-            slnr.clone(),
-            hevc_sei(
-              nal_unit_type,
-              0,
-              &[filler(), sei_message(payload_type, &[0x42])]
-            )
-          ]
-        )),
+        stream.read(&lengths(4, &nals)),
         kept(KeptReason::Companion(nal_unit_type)),
         "{payload_type} in {nal_unit_type}"
       );
@@ -1013,32 +1128,29 @@ fn an_hevc_record_is_detected_as_ffmpeg_detects_it() {
   // or a third above 1 — else Annex B.
   let sps = [hevc_sps(0)];
   assert_eq!(
-    NalStream::new(NalCodec::Hevc, &hvcc(0, 1, &sps)).framing(),
+    hevc_stream(&hvcc(0, 1, &sps)).framing(),
     Some(Framing::Length(LengthSize::Two))
   );
   let mut legacy = hvcc(0, 0, &sps);
   legacy[0] = 0;
   legacy[1] = 1;
   assert_eq!(
-    NalStream::new(NalCodec::Hevc, &legacy).framing(),
+    hevc_stream(&legacy).framing(),
     Some(Framing::Length(LengthSize::One))
   );
   legacy[1] = 0;
   legacy[2] = 1;
-  assert_eq!(
-    NalStream::new(NalCodec::Hevc, &legacy).framing(),
-    Some(Framing::AnnexB)
-  );
+  assert_eq!(hevc_stream(&legacy).framing(), Some(Framing::AnnexB));
   // A length of three bytes, read as FFmpeg reads it; and a record that
   // ends inside an array, which stops at two (the decoder then does not
   // open, `hevcdec.c` 4169–4172).
   assert_eq!(
-    NalStream::new(NalCodec::Hevc, &hvcc(0, 2, &sps)).framing(),
+    hevc_stream(&hvcc(0, 2, &sps)).framing(),
     Some(Framing::Length(LengthSize::Three))
   );
   let whole = hvcc(0, 3, &sps);
   assert_eq!(
-    NalStream::new(NalCodec::Hevc, &whole[..whole.len() - 1]).framing(),
+    hevc_stream(&whole[..whole.len() - 1]).framing(),
     Some(Framing::Length(LengthSize::Two))
   );
 }
@@ -1046,7 +1158,7 @@ fn an_hevc_record_is_detected_as_ffmpeg_detects_it() {
 #[test]
 fn an_h264_packet_is_marked_only_while_every_sps_codes_frames_only() {
   // Before any sequence parameter set, nothing.
-  let mut stream = NalStream::new(NalCodec::H264, &[]);
+  let mut stream = h264(&[]);
   assert_eq!(stream.frames_only(), None);
   assert_eq!(
     stream.read(&annex_b(&[b_slice()])),
@@ -1078,7 +1190,7 @@ fn an_h264_packet_is_marked_only_while_every_sps_codes_frames_only() {
   );
   // A record's: an `avcC` of a PAFF/MBAFF-capable SPS marks nothing, and
   // reference and IDR slices keep their own reasons.
-  let mut record = NalStream::new(NalCodec::H264, &avcc_of(3, &interlaced.unit()));
+  let mut record = h264(&avcc_of(3, &interlaced.unit()));
   assert_eq!(record.frames_only(), Some(false));
   assert_eq!(
     record.read(&lengths(4, &[b_slice()])),
@@ -1101,19 +1213,13 @@ fn an_h264_packet_is_marked_only_while_every_sps_codes_frames_only() {
   mixed.push(1);
   mixed.extend_from_slice(&(interlaced.unit().len() as u16).to_be_bytes());
   mixed.extend_from_slice(&interlaced.unit());
-  assert_eq!(
-    NalStream::new(NalCodec::H264, &mixed).frames_only(),
-    Some(false)
-  );
-  assert_eq!(
-    NalStream::new(NalCodec::H264, &avcc_of(3, &progressive)).frames_only(),
-    Some(true)
-  );
+  assert_eq!(h264(&mixed).frames_only(), Some(false));
+  assert_eq!(h264(&avcc_of(3, &progressive)).frames_only(), Some(true));
 }
 
 #[test]
 fn an_sps_codes_frames_only_only_where_every_reading_ffmpeg_makes_proves_it() {
-  let reads = |unit: &[u8]| NalStream::new(NalCodec::H264, &avcc_of(3, unit)).frames_only();
+  let reads = |unit: &[u8]| h264(&avcc_of(3, unit)).frames_only();
   // Baseline and Main, and High through its scaling matrix, at 4:2:0 and
   // 4:4:4.
   assert_eq!(reads(&Sps::BASELINE.unit()), Some(true));
@@ -1195,11 +1301,11 @@ fn an_sps_codes_frames_only_only_where_every_reading_ffmpeg_makes_proves_it() {
   .unit();
   assert!(wide.windows(3).any(|w| w == [0, 0, 3]), "{wide:x?}");
   assert_eq!(
-    sps_frame_mbs_only(BitReader::new(&wide[1..], Reading::Rbsp)),
+    sps_facts(BitReader::new(&wide[1..], Reading::Rbsp)).frames_only,
     Some(true)
   );
   assert_ne!(
-    sps_frame_mbs_only(BitReader::new(&wide[1..], Reading::Bytes)),
+    sps_facts(BitReader::new(&wide[1..], Reading::Bytes)).frames_only,
     Some(true)
   );
   assert_eq!(reads(&wide), Some(false));
@@ -1210,7 +1316,7 @@ fn the_reescaped_reading_writes_what_decode_extradata_ps_mp4_writes() {
   // `h264_parse.c` 446–453: where three bytes are left and they read
   // `00 00 0x`, x at most 3, `00 00 03` is written for the two zeros.
   let read = |bytes: &[u8]| {
-    let mut bits = BitReader::new(bytes, Reading::Reescaped);
+    let mut bits = BitReader::whole(bytes, Reading::Reescaped);
     let mut out = Vec::new();
     while let Some(byte) = bits.bits(8) {
       out.push(byte as u8);
@@ -1229,7 +1335,7 @@ fn the_reescaped_reading_writes_what_decode_extradata_ps_mp4_writes() {
   for (bytes, reescaped) in cases {
     assert_eq!(read(bytes), reescaped, "{bytes:x?}");
     // Its RBSP is the bytes again, as FFmpeg means it to be.
-    let mut rbsp = BitReader::new(reescaped, Reading::Rbsp);
+    let mut rbsp = BitReader::whole(reescaped, Reading::Rbsp);
     let mut back = Vec::new();
     while let Some(byte) = rbsp.bits(8) {
       back.push(byte as u8);
@@ -1251,6 +1357,7 @@ fn an_sps_is_no_proof_where_the_bytes_ffmpeg_escapes_it_to_read_otherwise() {
     max_num_ref_frames: 0,
     width_in_mbs_minus1: 0,
     height_in_map_units_minus1: 8_355_838,
+    vui: Vui::Absent,
     ..Sps::BASELINE
   }
   .unit();
@@ -1261,12 +1368,12 @@ fn an_sps_is_no_proof_where_the_bytes_ffmpeg_escapes_it_to_read_otherwise() {
     ]
   );
   let payload = &unit[1..];
-  let reads = |reading: Reading| sps_frame_mbs_only(BitReader::new(payload, reading));
+  let reads = |reading: Reading| sps_facts(BitReader::new(payload, reading)).frames_only;
   assert_eq!(reads(Reading::Rbsp), Some(true));
   assert_eq!(reads(Reading::Bytes), Some(true));
   assert_eq!(reads(Reading::Reescaped), Some(false));
-  assert!(!sps_codes_frames_only(payload));
-  let stream = NalStream::new(NalCodec::H264, &avcc_of(3, &unit));
+  assert!(!sps_proof(payload).frames_only);
+  let stream = h264(&avcc_of(3, &unit));
   assert_eq!(stream.frames_only(), Some(false));
 }
 
@@ -1279,7 +1386,7 @@ fn a_packet_the_reading_cannot_frame_still_teaches_its_sequence_parameter_sets()
   .unit();
   // A packet that switches the framing: the decoder reads it in the one it
   // switches to.
-  let mut switched = NalStream::new(NalCodec::H264, &avcc(3));
+  let mut switched = h264(&avcc(3));
   assert_eq!(
     switched.read(&annex_b(&[interlaced.clone(), b_slice()])),
     kept(KeptReason::FramingChange)
@@ -1301,7 +1408,7 @@ fn a_packet_the_reading_cannot_frame_still_teaches_its_sequence_parameter_sets()
     lengths(3, &[interlaced.clone()]),
     lengths(4, &[interlaced.clone()]),
   ] {
-    let mut unknown = NalStream::new(NalCodec::H264, &avcc_of(3, &big));
+    let mut unknown = h264(&avcc_of(3, &big));
     assert_eq!(unknown.framing(), None);
     assert_eq!(unknown.frames_only(), Some(true));
     assert_eq!(unknown.read(&packet), kept(KeptReason::FramingUnknown));
@@ -1314,7 +1421,7 @@ fn a_packet_the_reading_cannot_frame_still_teaches_its_sequence_parameter_sets()
   }
   // Unframed: a record that ends before its parameter sets do.
   let record = avcc(3);
-  let mut short = NalStream::new(NalCodec::H264, &record[..record.len() - 1]);
+  let mut short = h264(&record[..record.len() - 1]);
   assert_eq!(
     short.read(&lengths(4, &[interlaced.clone()])),
     kept(KeptReason::Unframed)
@@ -1330,7 +1437,7 @@ fn a_packet_the_reading_cannot_frame_still_teaches_its_sequence_parameter_sets()
 #[test]
 fn a_reserved_slnr_type_keeps_its_packet() {
   // FFmpeg's decoder skips RSV_VCL_N10, N12 and N14 without a picture.
-  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 3, &[hevc_sps(0)]));
+  let mut stream = hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
   for reserved in [10, 12, 14] {
     assert_eq!(
       stream.read(&lengths(4, &[hevc(reserved, 0, 0, &[0xAF])])),
@@ -1346,6 +1453,387 @@ fn a_reserved_slnr_type_keeps_its_packet() {
       "{reserved} beside a picture"
     );
   }
+}
+
+#[test]
+fn an_h264_picture_of_intra_slices_alone_is_kept() {
+  // FFmpeg's decoder, under frame threading, resets the `poc_offset` later
+  // pictures' film grain is seeded from at a picture of intra slices alone
+  // (`h264dec.c` 501–551, `h264_slice.c` 1427–1430).
+  let mut stream = h264(&avcc(3));
+  let mut read = |nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  let slice = |payload: &[u8]| avc(0, 1, payload);
+  // I and SI, of either range: `slice_type` 2, 7, 4 and 9.
+  for payload in [
+    &[0xB4, 0x84, 0x21][..],
+    &[0x88, 0x84, 0x21][..],
+    &[0x94, 0x84, 0x21][..],
+    &[0x8A, 0x84, 0x21][..],
+  ] {
+    assert_eq!(
+      read(&[slice(payload)]),
+      kept(KeptReason::IntraOnly),
+      "{payload:x?}"
+    );
+  }
+  // P, B, SP of either range, and past 9, which FFmpeg reads as P: 0, 1,
+  // 3, 8, 10 and 30.
+  for payload in [
+    &[0xC0, 0x84][..],
+    &[0xA0, 0x84][..],
+    &[0x90, 0x84][..],
+    &[0x89, 0x84, 0x21][..],
+    &[0x8B, 0x84, 0x21][..],
+    &[0x87, 0xE0][..],
+  ] {
+    assert_eq!(read(&[slice(payload)]), Verdict::Disposable, "{payload:x?}");
+  }
+  // A picture of intra and inter slices.
+  assert_eq!(read(&[i_slice(), b_slice()]), Verdict::Disposable);
+  // A header that does not read counts as intra.
+  assert_eq!(read(&[slice(&[])]), kept(KeptReason::IntraOnly));
+  assert_eq!(read(&[slice(&[]), b_slice()]), Verdict::Disposable);
+  // An intra slice data partition A counts as FFmpeg counts it; beside no
+  // slice the decoder decodes, the decoder starts no picture to reset.
+  assert_eq!(
+    read(&[avc(0, 2, &[0x88]), i_slice()]),
+    kept(KeptReason::IntraOnly)
+  );
+  assert_eq!(
+    read(&[avc(0, 2, &[0x88]), avc(0, 3, &[0x42])]),
+    Verdict::Disposable
+  );
+}
+
+#[test]
+fn an_h264_sps_that_lets_frame_num_jump_marks_nothing() {
+  // FFmpeg fills a gap in `frame_num` counting from the picture before,
+  // reference or not (`h264_slice.c` 1432–1530, `h264_picture.c` 202–203).
+  let gaps = Sps {
+    gaps: true,
+    ..Sps::BASELINE
+  }
+  .unit();
+  let mut record = h264(&avcc_of(3, &gaps));
+  assert_eq!(
+    record.read(&lengths(4, &[b_slice()])),
+    kept(KeptReason::FrameNumGaps)
+  );
+  // In-band, for good.
+  let mut stream = h264(&avcc(3));
+  assert_eq!(stream.read(&lengths(4, &[b_slice()])), Verdict::Disposable);
+  assert_eq!(
+    stream.read(&lengths(4, &[gaps])),
+    kept(KeptReason::Companion(7))
+  );
+  assert_eq!(
+    stream.read(&lengths(4, &[b_slice()])),
+    kept(KeptReason::FrameNumGaps)
+  );
+  let _ = stream.read(&lengths(4, &[avc_sps()]));
+  assert_eq!(
+    stream.read(&lengths(4, &[b_slice()])),
+    kept(KeptReason::FrameNumGaps)
+  );
+}
+
+#[test]
+fn an_h264_packet_is_marked_only_where_every_sps_fixes_the_reorder_depth_at_15_or_less() {
+  let reads = |vui: Vui| {
+    let unit = Sps {
+      vui,
+      ..Sps::BASELINE
+    }
+    .unit();
+    h264(&avcc_of(3, &unit)).read(&lengths(4, &[b_slice()]))
+  };
+  // No VUI, a VUI without the restriction, a depth of 16 — where a picture
+  // may follow 16 it precedes in output order and FFmpeg resets its record
+  // of them (`h264_slice.c` 1310–1328) — and one of 17, which FFmpeg
+  // refuses.
+  for vui in [
+    Vui::Absent,
+    Vui::Unrestricted,
+    Vui::Restricted(16),
+    Vui::Restricted(17),
+  ] {
+    assert_eq!(reads(vui), kept(KeptReason::ReorderUnfixed));
+  }
+  // Depths of 0 and 15, and a restriction past every field before it.
+  for vui in [
+    Vui::Restricted(0),
+    Vui::Restricted(15),
+    Vui::RestrictedAfterAll,
+  ] {
+    assert_eq!(reads(vui), Verdict::Disposable);
+  }
+  // A restriction the unit ends inside.
+  let whole = Sps::BASELINE.unit();
+  let cut = &whole[..whole.len() - 2];
+  assert_eq!(
+    h264(&avcc_of(3, cut)).read(&lengths(4, &[b_slice()])),
+    kept(KeptReason::ReorderUnfixed)
+  );
+  // In-band, for good.
+  let mut stream = h264(&avcc(3));
+  let unrestricted = Sps {
+    vui: Vui::Unrestricted,
+    ..Sps::BASELINE
+  }
+  .unit();
+  let _ = stream.read(&lengths(4, &[unrestricted]));
+  let _ = stream.read(&lengths(4, &[avc_sps()]));
+  assert_eq!(
+    stream.read(&lengths(4, &[b_slice()])),
+    kept(KeptReason::ReorderUnfixed)
+  );
+}
+
+#[test]
+fn an_h264_reading_awaits_a_reference_picture_after_its_opening_and_every_seek() {
+  // FFmpeg's decoder takes its picture order count up from the first
+  // picture it decodes after it opens or is flushed (`h264_parse.c`
+  // 293–294).
+  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  assert_eq!(
+    read(&mut stream, &[b_slice()]),
+    kept(KeptReason::AwaitingReference)
+  );
+  // A slice data partition of a reference picture does not end the wait:
+  // the decoder passes over partitions (`h264dec.c` 682–686).
+  assert_eq!(
+    read(&mut stream, &[avc(2, 2, &[0x9A])]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read(&mut stream, &[b_slice()]),
+    kept(KeptReason::AwaitingReference)
+  );
+  // A reference slice does.
+  assert_eq!(
+    read(&mut stream, &[p_slice()]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(read(&mut stream, &[b_slice()]), Verdict::Disposable);
+  // A seek starts the wait again, and an IDR slice ends it.
+  stream.seeked();
+  assert_eq!(
+    read(&mut stream, &[b_slice()]),
+    kept(KeptReason::AwaitingReference)
+  );
+  assert_eq!(
+    read(&mut stream, &[avc(3, 5, &[0x88])]),
+    kept(KeptReason::RandomAccess)
+  );
+  assert_eq!(read(&mut stream, &[b_slice()]), Verdict::Disposable);
+}
+
+#[test]
+fn an_intra_slice_waits_for_one_in_a_packet_kept_since_the_opening_or_a_seek() {
+  // FFmpeg's first intra slice after a flush stops later pictures
+  // referencing the gray frames it fills gaps with (`h264_slice.c`
+  // 2032–2034, `h264_refs.c` 410–419, `h264dec.c` 492).
+  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  // A reference picture of P slices: the wait for a reference ends, the
+  // one for an intra slice does not.
+  assert_eq!(
+    read(&mut stream, &[p_slice()]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(read(&mut stream, &[b_slice()]), Verdict::Disposable);
+  assert_eq!(
+    read(&mut stream, &[i_slice(), b_slice()]),
+    kept(KeptReason::AwaitingIntraSlice)
+  );
+  // That packet, kept, held one.
+  assert_eq!(
+    read(&mut stream, &[i_slice(), b_slice()]),
+    Verdict::Disposable
+  );
+  // After a seek: a header that does not read may be intra, and is no
+  // intra slice kept.
+  stream.seeked();
+  assert_eq!(
+    read(&mut stream, &[p_slice()]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read(&mut stream, &[avc(0, 1, &[]), b_slice()]),
+    kept(KeptReason::AwaitingIntraSlice)
+  );
+  assert_eq!(
+    read(&mut stream, &[avc(0, 1, &[])]),
+    kept(KeptReason::IntraOnly)
+  );
+  assert_eq!(
+    read(&mut stream, &[i_slice(), b_slice()]),
+    kept(KeptReason::AwaitingIntraSlice)
+  );
+  assert_eq!(
+    read(&mut stream, &[i_slice(), b_slice()]),
+    Verdict::Disposable
+  );
+  // An IDR picture's slices are intra.
+  stream.seeked();
+  assert_eq!(
+    read(&mut stream, &[avc(3, 5, &[0x88])]),
+    kept(KeptReason::RandomAccess)
+  );
+  assert_eq!(
+    read(&mut stream, &[i_slice(), b_slice()]),
+    Verdict::Disposable
+  );
+}
+
+#[test]
+fn the_first_hevc_packet_after_the_opening_a_seek_or_an_end_of_sequence_is_kept() {
+  // FFmpeg's HEVC decoder takes its `eos` flag up with whatever packet it
+  // reads next, and the flag decides whether the next CRA picture starts a
+  // sequence (`hevc/hevcdec.c` 3687–3720, 3283–3287).
+  let slnr = || lengths(4, &[hevc(0, 0, 0, &[0xAF])]);
+  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 3, &[hevc_sps(0)]));
+  // A packet of no bytes is none the decoder reads.
+  assert_eq!(stream.read(&[]), kept(KeptReason::NoPicture));
+  assert_eq!(stream.read(&slnr()), kept(KeptReason::SequenceStart));
+  assert_eq!(stream.read(&slnr()), Verdict::Disposable);
+  // A flush sets it again.
+  stream.seeked();
+  assert_eq!(stream.read(&slnr()), kept(KeptReason::SequenceStart));
+  assert_eq!(stream.read(&slnr()), Verdict::Disposable);
+  // So does an end of sequence or of bitstream, for the packet after it.
+  for end in [36, 37] {
+    assert_eq!(
+      stream.read(&lengths(4, &[hevc(0, 0, 0, &[0xAF]), hevc(end, 0, 0, &[])])),
+      kept(KeptReason::Companion(end))
+    );
+    assert_eq!(
+      stream.read(&slnr()),
+      kept(KeptReason::SequenceStart),
+      "{end}"
+    );
+    assert_eq!(stream.read(&slnr()), Verdict::Disposable, "{end}");
+  }
+  // And so does a packet that does not parse, which may hold one.
+  assert_eq!(
+    stream.read(&lengths(4, &[vec![0x80, 0x01]])),
+    kept(KeptReason::Malformed)
+  );
+  assert_eq!(stream.read(&slnr()), kept(KeptReason::SequenceStart));
+  assert_eq!(stream.read(&slnr()), Verdict::Disposable);
+}
+
+#[test]
+fn an_hevc_recovery_point_keeps_every_slnr_picture_until_an_irap_picture_the_decoder_decodes() {
+  // FFmpeg ends a recovery at the first picture of its count and holds back
+  // the pictures before it (`hevc/hevcdec.c` 3289–3294, `hevc/refs.c`
+  // 239–242); an IRAP picture ends it (3283–3287).
+  let slnr = || hevc(0, 0, 0, &[0xAF]);
+  let recovery = || hevc_sei(39, 0, &[sei_message(6, &[0x80])]);
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  let mut stream = hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
+  assert_eq!(
+    read(&mut stream, &[recovery(), hevc(1, 0, 0, &[0xAF])]),
+    kept(KeptReason::Companion(39))
+  );
+  assert_eq!(read(&mut stream, &[slnr()]), kept(KeptReason::Recovering));
+  assert_eq!(read(&mut stream, &[slnr()]), kept(KeptReason::Recovering));
+  // Past an IRAP type the decoder skips, and an IRAP picture of a layer
+  // above 0.
+  assert_eq!(
+    read(&mut stream, &[hevc(22, 0, 0, &[0xAF])]),
+    kept(KeptReason::RandomAccess)
+  );
+  assert_eq!(read(&mut stream, &[slnr()]), kept(KeptReason::Recovering));
+  assert_eq!(
+    read(&mut stream, &[hevc(19, 1, 0, &[0xAF])]),
+    kept(KeptReason::Extension)
+  );
+  assert_eq!(read(&mut stream, &[slnr()]), kept(KeptReason::Recovering));
+  // Up to an IRAP picture it decodes.
+  assert_eq!(
+    read(&mut stream, &[hevc(21, 0, 0, &[0xAF])]),
+    kept(KeptReason::RandomAccess)
+  );
+  assert_eq!(read(&mut stream, &[slnr()]), Verdict::Disposable);
+  // A recovery point in an IRAP picture's own packet starts none.
+  assert_eq!(
+    read(&mut stream, &[recovery(), hevc(19, 0, 0, &[0xAF])]),
+    kept(KeptReason::Companion(39))
+  );
+  assert_eq!(read(&mut stream, &[slnr()]), Verdict::Disposable);
+}
+
+#[test]
+fn an_hevc_picture_that_may_take_up_what_an_earlier_packet_left_is_kept() {
+  // FFmpeg hands SEI state and a Dolby Vision RPU to the next picture it
+  // decodes (`hevc/hevcdec.c` 3068–3151, 3505–3512, 3723–3760).
+  let slnr = || hevc(0, 0, 0, &[0xAF]);
+  let user_data = || hevc_sei(39, 0, &[sei_message(5, &[0x42; 16])]);
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  let fresh = || hevc_stream(&hvcc(0, 3, &[hevc_sps(0)]));
+  // A prefix SEI unit in a packet whose picture the decoder may skip — a
+  // RASL picture, a reserved type, a reserved IRAP type — or that holds
+  // none.
+  for picture in [
+    vec![hevc(9, 0, 0, &[0xAF])],
+    vec![hevc(8, 0, 0, &[0xAF])],
+    vec![hevc(11, 0, 0, &[0xAF])],
+    vec![hevc(22, 0, 0, &[0xAF])],
+    vec![],
+  ] {
+    let mut stream = fresh();
+    let mut nals = vec![user_data()];
+    nals.extend(picture.iter().cloned());
+    assert!(!read(&mut stream, &nals).is_disposable(), "{picture:x?}");
+    assert_eq!(
+      read(&mut stream, &[slnr()]),
+      kept(KeptReason::CarriedOver),
+      "{picture:x?}"
+    );
+    // That picture, kept, took it up.
+    assert_eq!(
+      read(&mut stream, &[slnr()]),
+      Verdict::Disposable,
+      "{picture:x?}"
+    );
+  }
+  // A suffix SEI unit, a picture hash, and an RPU: only a picture of their
+  // own packet takes them up.
+  for tail in [
+    hevc_sei(40, 0, &[picture_hash()]),
+    hevc(62, 0, 0, &[0x01, 0x02, 0x03]),
+  ] {
+    let mut stream = fresh();
+    assert!(!read(&mut stream, &[hevc(9, 0, 0, &[0xAF]), tail.clone()]).is_disposable());
+    assert_eq!(read(&mut stream, &[slnr()]), kept(KeptReason::CarriedOver));
+    let mut stream = fresh();
+    assert!(!read(&mut stream, &[hevc(1, 0, 0, &[0xAF]), tail.clone()]).is_disposable());
+    assert_eq!(read(&mut stream, &[slnr()]), Verdict::Disposable);
+  }
+  // A prefix SEI unit after its packet's picture waits for the next one;
+  // one before it does not.
+  let mut stream = fresh();
+  assert!(!read(&mut stream, &[hevc(1, 0, 0, &[0xAF]), user_data()]).is_disposable());
+  assert_eq!(read(&mut stream, &[slnr()]), kept(KeptReason::CarriedOver));
+  let mut stream = fresh();
+  assert!(!read(&mut stream, &[user_data(), hevc(1, 0, 0, &[0xAF])]).is_disposable());
+  assert_eq!(read(&mut stream, &[slnr()]), Verdict::Disposable);
+  // Only a picture's first slice segment starts it.
+  let mut stream = fresh();
+  assert!(!read(&mut stream, &[user_data(), hevc(1, 0, 0, &[0x2F])]).is_disposable());
+  assert_eq!(read(&mut stream, &[slnr()]), kept(KeptReason::CarriedOver));
+  // Filler payload leaves nothing.
+  let mut stream = fresh();
+  assert_eq!(
+    read(
+      &mut stream,
+      &[hevc_sei(39, 0, &[filler()]), hevc(9, 0, 0, &[0xAF])]
+    ),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(read(&mut stream, &[slnr()]), Verdict::Disposable);
 }
 
 /// SplitMix64, for the property below: fixed seeds, the same draws on
@@ -1439,7 +1927,7 @@ fn a_packet_holding_anything_that_may_be_needed_is_never_marked() {
         }
         let nal = match nal_unit_type {
           RIDING_SEI => avc_sei(&[picture_timing()]),
-          other => avc(nal_ref_idc, other, &[0x88, 0x13]),
+          other => avc(nal_ref_idc, other, &[0x9C, 0x13]),
         };
         nals.push(nal);
       }
@@ -1458,7 +1946,11 @@ fn a_packet_holding_anything_that_may_be_needed_is_never_marked() {
     } else {
       NalCodec::H264
     };
-    let verdict = NalStream::new(codec, &extradata).read(&packet);
+    let mut stream = NalStream::new(codec, &extradata);
+    stream.reference_seen = true;
+    stream.intra_seen = true;
+    stream.sequence_start = false;
+    let verdict = stream.read(&packet);
     assert_eq!(
       verdict.is_disposable(),
       !needed,
@@ -1492,5 +1984,17 @@ fn a_kept_reason_says_why() {
   assert_eq!(
     shown(KeptReason::MaybeField),
     "a picture that may be one field of a pair"
+  );
+  assert_eq!(
+    shown(KeptReason::AwaitingIntraSlice),
+    "an intra slice before the first one kept"
+  );
+  assert_eq!(
+    shown(KeptReason::SequenceStart),
+    "the first packet a sequence may start at"
+  );
+  assert_eq!(
+    shown(KeptReason::CarriedOver),
+    "a picture that may take up what an earlier packet left"
   );
 }

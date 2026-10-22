@@ -286,19 +286,40 @@ fn delivered(mut decoder: mediadecode_ffmpeg::VideoDecoder, packets: &[VideoPack
   pictures
 }
 
+/// The presentation times of the packets that hold a slice of a reference
+/// picture — `nal_ref_idc` above 0 — sorted.
+#[cfg(target_vendor = "apple")]
+fn reference_pictures(packets: &[VideoPacket]) -> Vec<i64> {
+  let mut pts: Vec<i64> = packets
+    .iter()
+    .filter(|packet| {
+      nal_units(packet.data().as_ref())
+        .into_iter()
+        .any(|unit| matches!(unit[0] & 0x1F, 1 | 5) && unit[0] & 0x60 != 0)
+    })
+    .map(|packet| packet.pts().expect("a packet's pts").pts())
+    .collect();
+  pts.sort_unstable();
+  pts
+}
+
 /// The standalone decoder takes the options too. Opened with
 /// `skip_frame` = `noref` through its open request, on the probe and on a
-/// pinned backend, it keeps exactly the pictures of the packets the
-/// bitstream leaves unmarked.
+/// pinned backend, it keeps exactly the reference pictures.
 ///
 /// The standalone decoder is hardware-only, and FFmpeg asks VideoToolbox
 /// for a hardware H.264 decoder (`libavcodec/videotoolbox.c` 848–854 in
 /// 9.0.1). On the machines this was written on, that decoder fails every
 /// picture of the Sony clips. So the clip is `01_pandas_muted.mp4`, Main
 /// 4:2:0 with non-reference B pictures, and the target is an Apple one.
+///
+/// The bitstream marks none of this clip's packets: its sequence parameter
+/// set sets no `bitstream_restriction_flag`, so FFmpeg grows the reorder
+/// depth from the pictures it sees, and a picture dropped may cost a later
+/// one its output.
 #[cfg(target_vendor = "apple")]
 #[test]
-fn the_standalone_decoder_skipping_non_references_keeps_the_admitted_pictures() {
+fn the_standalone_decoder_skipping_non_references_keeps_the_reference_pictures() {
   use mediadecode_ffmpeg::{Backend, VideoDecoder, VideoDecoderOpen};
 
   let Some(path) = fixture("01_pandas_muted.mp4") else {
@@ -306,16 +327,13 @@ fn the_standalone_decoder_skipping_non_references_keeps_the_admitted_pictures() 
   };
   let (timebase, parameters, packets) = video_packets(&path);
   assert_eq!(packets.len(), 300);
-  let admitted: Vec<i64> = {
-    let mut pts: Vec<i64> = packets
-      .iter()
-      .filter(|packet| !disposable(packet))
-      .map(|packet| packet.pts().expect("a packet's pts").pts())
-      .collect();
-    pts.sort_unstable();
-    pts
-  };
-  assert_eq!(admitted.len(), 155, "145 of the 300 marked");
+  assert_eq!(
+    packets.iter().filter(|packet| disposable(packet)).count(),
+    0,
+    "the reorder depth is not fixed"
+  );
+  let admitted = reference_pictures(&packets);
+  assert_eq!(admitted.len(), 155, "145 of the 300 non-reference");
 
   // libavcodec's defaults decode every picture: the decoder can decode
   // this clip.
@@ -342,15 +360,14 @@ fn the_standalone_decoder_skipping_non_references_keeps_the_admitted_pictures() 
 }
 
 /// The stream decoder takes the options on every path. Opened through
-/// its request with `skip_frame` = `noref`, it keeps exactly the pictures
-/// of the packets the bitstream leaves unmarked, on `Auto`, `AnyHardware`,
-/// the VideoToolbox pin, and software.
+/// its request with `skip_frame` = `noref`, it keeps exactly the reference
+/// pictures, on `Auto`, `AnyHardware`, the VideoToolbox pin, and software.
 ///
 /// The target is an Apple one, on `01_pandas_muted.mp4`, for the reason
 /// the standalone law above gives.
 #[cfg(target_vendor = "apple")]
 #[test]
-fn the_session_skipping_non_references_keeps_the_admitted_pictures_on_every_path() {
+fn the_session_skipping_non_references_keeps_the_reference_pictures_on_every_path() {
   use mediadecode_ffmpeg::Backend;
 
   let Some(path) = fixture("01_pandas_muted.mp4") else {
@@ -358,16 +375,8 @@ fn the_session_skipping_non_references_keeps_the_admitted_pictures_on_every_path
   };
   let (timebase, parameters, packets) = video_packets(&path);
   let every: Vec<&VideoPacket> = packets.iter().collect();
-  let admitted: Vec<i64> = {
-    let mut pts: Vec<i64> = packets
-      .iter()
-      .filter(|packet| !disposable(packet))
-      .map(|packet| packet.pts().expect("a packet's pts").pts())
-      .collect();
-    pts.sort_unstable();
-    pts
-  };
-  assert_eq!(admitted.len(), 155, "145 of the 300 marked");
+  let admitted = reference_pictures(&packets);
+  assert_eq!(admitted.len(), 155, "145 of the 300 non-reference");
   let skipping = DecoderOptions::new().with_skip_frame(Discard::NonReference);
   for path in [
     DecodePath::Auto,

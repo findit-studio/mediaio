@@ -20,15 +20,26 @@ Its versions are its own: they do not move with the rest of the family's.
     IDR, and nothing beside them but access unit delimiters, filler data
     and SEI units of picture timing and filler payload alone — and only
     while every sequence parameter set FFmpeg's decoder may read codes
-    frames only (`frame_mbs_only_flag` 1, in each of the three readings it
-    may adopt of one), since FFmpeg joins a frame's two fields across
-    packets: before one is read, and from the first that lets fields in,
-    nothing is marked (`frames_only` says which);
+    frames only (`frame_mbs_only_flag` 1), since FFmpeg joins a frame's two
+    fields across packets, lets `frame_num` jump nowhere
+    (`gaps_in_frame_num_value_allowed_flag` 0) and fixes the reorder depth
+    (`bitstream_restriction_flag`, a `max_num_reorder_frames` of 15 at
+    most), in each of the three readings it may adopt of one: before one is
+    read, and from the first that does not, nothing is marked
+    (`frames_only` says whether fields are let in). Not a picture of intra
+    slices alone, at which FFmpeg's frame threads reset the film grain
+    seed's offset; and, since the opening or the last seek, only after a
+    reference picture the decoder decodes and, for a picture holding an
+    intra slice, a kept packet holding one;
   - HEVC: every slice a sub-layer non-reference type FFmpeg decodes
     (TRAIL_N, TSA_N, STSA_N, RADL_N, RASL_N) of layer 0 at the highest
     temporal sub-layer, learned from every SPS and VPS FFmpeg's splitter
     may read and from the record's `numTemporalLayers`, and nothing beside
-    them but delimiters, filler data and SEI units of filler payload alone.
+    them but delimiters, filler data and SEI units of filler payload alone;
+    not in the first packet after the opening, a seek or an end of
+    sequence, which takes up FFmpeg's `eos`, while a recovery point may be
+    pending, or while SEI state or a Dolby Vision RPU that an earlier
+    packet left may be pending for the next picture decoded.
     Unlike FFmpeg's own `AVDISCARD_NONREF`, which skips sub-layer
     non-reference pictures at every sub-layer, it never marks one a higher
     sub-layer may reference.
@@ -52,10 +63,14 @@ Its versions are its own: they do not move with the rest of the family's.
   reference or random-access picture, a parameter set, an SEI unit of any
   other message, or an end, an extension's NAL unit, a picture below the
   highest sub-layer or before any SPS, an H.264 picture that may be a
-  field, a packet that does not parse — a length-framed unit holding a
-  start code among them — a configuration record, a switch of framing, and
-  a framing unknown or unset. `NalCodec`
-  names the two codecs read; every other codec is unclassified.
+  field, where `frame_num` may jump or the reorder depth is not fixed, of
+  intra slices alone, or before the reference picture or the intra slice
+  it awaits; an HEVC packet a sequence may start at, or a picture while a
+  recovery point or what an earlier packet left may be pending; a packet
+  that does not parse — a length-framed unit holding a start code among
+  them — a configuration record, a switch of framing, and a framing
+  unknown or unset. `NalCodec` names the two codecs read; every other
+  codec is unclassified.
 
 ### Changed
 

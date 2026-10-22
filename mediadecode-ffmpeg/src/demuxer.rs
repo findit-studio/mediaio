@@ -3191,12 +3191,12 @@ const RIDING_SIDE_DATA: [AVPacketSideDataType; 27] = [
 ];
 
 /// Whether packet side data of `kind`, the raw `AVPacketSideDataType` it
-/// arrives as, may be taken up past its own packet: every kind but those
-/// of [`RIDING_SIDE_DATA`], a kind this build has no name for among them.
+/// arrives as, may be taken up past its own packet: a kind of
+/// [`PERSISTING_SIDE_DATA`], and a kind of neither list, which a later
+/// FFmpeg names — every kind but those of [`RIDING_SIDE_DATA`].
 fn side_data_persists(kind: c_int) -> bool {
-  !RIDING_SIDE_DATA
-    .iter()
-    .any(|&riding| riding as c_int == kind)
+  let listed = |table: &[AVPacketSideDataType]| table.iter().any(|&named| named as c_int == kind);
+  listed(&PERSISTING_SIDE_DATA) || !listed(&RIDING_SIDE_DATA)
 }
 
 /// `packet`, its [`PacketFlags::DISPOSABLE`] set where its track's
@@ -5148,7 +5148,7 @@ mod tests {
   }
 
   /// An H.264 packet of length-framed NAL units: an access unit
-  /// delimiter, then a slice of `nal_ref_idc` `reference`.
+  /// delimiter, then a B slice of `nal_ref_idc` `reference`.
   fn avc_packet(reference: u8) -> Vec<u8> {
     vec![
       0,
@@ -5162,20 +5162,28 @@ mod tests {
       0,
       4,
       (reference << 5) | 1,
-      0x88,
+      0x9C,
       0x84,
       0x21,
     ]
   }
 
   /// A minimal `avcC` of four-byte lengths: a Baseline sequence parameter
-  /// set coding frames only (`frame_mbs_only_flag` 1), and a picture
-  /// parameter set.
+  /// set of one macroblock coding frames only (`frame_mbs_only_flag` 1),
+  /// without gaps in `frame_num`, its VUI fixing a reorder depth of one
+  /// (`bitstream_restriction_flag` 1); and a picture parameter set.
   fn avcc() -> Vec<u8> {
     vec![
-      1, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0, 6, 0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x79, 1, 0, 4, 0x68,
-      0xEE, 0x3C, 0x80,
+      1, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0, 12, 0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x7A, 0x01, 0xB4, 0x11,
+      0x08, 0xA2, 0xC0, 1, 0, 4, 0x68, 0xEE, 0x3C, 0x80,
     ]
+  }
+
+  /// Reads a reference packet, which the reading awaits after its opening
+  /// before it marks anything.
+  fn past_a_reference(bitstream: &mut Option<NalStream>) {
+    let read = marked_from_bitstream(Some(bitstream), video_packet(avc_packet(2), vec![]));
+    assert!(!read.flags().contains(PacketFlags::DISPOSABLE));
   }
 
   fn video_packet(
@@ -5191,10 +5199,10 @@ mod tests {
   #[test]
   fn a_non_reference_h264_packet_is_marked_and_a_reference_one_is_not() {
     let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
-    let marked = marked_from_bitstream(Some(&mut bitstream), video_packet(avc_packet(0), vec![]));
-    assert!(marked.flags().contains(PacketFlags::DISPOSABLE));
     let kept = marked_from_bitstream(Some(&mut bitstream), video_packet(avc_packet(2), vec![]));
     assert!(!kept.flags().contains(PacketFlags::DISPOSABLE));
+    let marked = marked_from_bitstream(Some(&mut bitstream), video_packet(avc_packet(0), vec![]));
+    assert!(marked.flags().contains(PacketFlags::DISPOSABLE));
     // The marks the packet already carries stay.
     let keyed = video_packet(avc_packet(0), vec![]).with_flags(PacketFlags::KEY);
     let keyed = marked_from_bitstream(Some(&mut bitstream), keyed);
@@ -5206,7 +5214,7 @@ mod tests {
     // A corrupt packet that switches the framing: the decoder reads it, so
     // the reading follows, and nothing corrupt is marked.
     let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
-    let annex = vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x01, 0x88, 0x84, 0x21];
+    let annex = vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x01, 0x9C, 0x84, 0x21];
     let corrupt = video_packet(annex.clone(), vec![]).with_flags(PacketFlags::CORRUPT);
     let corrupt = marked_from_bitstream(Some(&mut bitstream), corrupt);
     assert_eq!(corrupt.flags(), PacketFlags::CORRUPT);
@@ -5217,6 +5225,10 @@ mod tests {
     let corrupt = video_packet(annex.clone(), vec![]).with_flags(PacketFlags::CORRUPT);
     let corrupt = marked_from_bitstream(Some(&mut bitstream), corrupt);
     assert_eq!(corrupt.flags(), PacketFlags::CORRUPT);
+    // Past a reference picture, the same packet uncorrupted is marked.
+    let reference = vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x41, 0x9C, 0x84, 0x21];
+    let read = marked_from_bitstream(Some(&mut bitstream), video_packet(reference, vec![]));
+    assert!(!read.flags().contains(PacketFlags::DISPOSABLE));
     let read = marked_from_bitstream(Some(&mut bitstream), video_packet(annex, vec![]));
     assert!(read.flags().contains(PacketFlags::DISPOSABLE));
     // No reading: the packet keeps what the container said.
@@ -5256,7 +5268,8 @@ mod tests {
         mediadecode::nal::LengthSize::Four
       ))
     );
-    // The next packet carries none, and is marked.
+    // The next packets carry none: past a reference picture, one is marked.
+    past_a_reference(&mut bitstream);
     let marked = marked_from_bitstream(Some(&mut bitstream), video_packet(avc_packet(0), vec![]));
     assert!(marked.flags().contains(PacketFlags::DISPOSABLE));
   }
@@ -5274,6 +5287,7 @@ mod tests {
     for kind in persisting {
       // The bitstream's mark is not set...
       let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
+      past_a_reference(&mut bitstream);
       let read = marked_from_bitstream(
         Some(&mut bitstream),
         video_packet(avc_packet(0), vec![side_data(kind, &[1])]),
@@ -5293,6 +5307,7 @@ mod tests {
     // bitstream.
     for kind in RIDING_SIDE_DATA {
       let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
+      past_a_reference(&mut bitstream);
       let read = marked_from_bitstream(
         Some(&mut bitstream),
         video_packet(avc_packet(0), vec![side_data(kind as c_int, &[1])]),
