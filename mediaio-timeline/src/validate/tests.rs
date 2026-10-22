@@ -861,3 +861,55 @@ fn namespace_refusals_name_their_namespace() {
   let at = NamespaceAt::new(MetadataAt::Track(3), 1);
   assert_eq!((at.owner(), at.namespace()), (MetadataAt::Track(3), 1));
 }
+
+#[test]
+fn the_timelines_markers_are_held_as_a_tracks_are_before_every_tracks() {
+  // Q813: the timeline's own markers, at the edit rate from its zero.
+  let mut timeline = marked()
+    .with_marker(Marker::new("scene", rec(0, 96)))
+    .with_marker(Marker::new("point", rec(500, 500)));
+  assert_eq!(validate(&timeline), Ok(()));
+  timeline.markers_mut()[0].set_range(TimeRange::new(0, 2000, Timebase::MILLIS));
+  timeline.markers_mut()[1].set_range(TimeRange::new(-1, i64::MAX, edit()));
+  timeline.tracks_mut()[0].markers_mut()[0].set_range(TimeRange::new(0, 2000, Timebase::MILLIS));
+  assert_eq!(
+    refusals(&timeline),
+    [
+      Refusal::OffEditRate(Place::Marker(MarkerAt::Timeline { marker: 0 })),
+      Refusal::MarkerTooLong(MarkerAt::Timeline { marker: 1 }),
+      Refusal::OffEditRate(Place::Marker(MarkerAt::Track {
+        track: 0,
+        marker: 0
+      })),
+    ]
+  );
+  // A marker's namespaces follow it, and the timeline's own come after
+  // its markers'.
+  let timeline = marked()
+    .with_readers(ReaderMetadata::new().with("OTIO_SCHEMA", Metadata::new()))
+    .with_marker(
+      Marker::new("scene", rec(0, 96))
+        .with_readers(ReaderMetadata::new().with("mediaio", Metadata::new())),
+    );
+  assert_eq!(
+    refusals(&timeline),
+    [
+      Refusal::ReservedNamespace(NamespaceAt::new(
+        MetadataAt::Marker(MarkerAt::Timeline { marker: 0 }),
+        0
+      )),
+      Refusal::ReservedNamespace(NamespaceAt::new(MetadataAt::Timeline, 0)),
+    ]
+  );
+  let shown = |refusal: Refusal| std::string::ToString::to_string(&refusal);
+  assert_eq!(
+    shown(Refusal::OffEditRate(Place::Marker(MarkerAt::Timeline {
+      marker: 0
+    }))),
+    "the marked range of the timeline, marker 0 is not counted at the edit rate"
+  );
+  assert_eq!(
+    shown(Refusal::MarkerTooLong(MarkerAt::Timeline { marker: 1 })),
+    "the timeline, marker 1: the marked range runs longer than i64::MAX ticks"
+  );
+}

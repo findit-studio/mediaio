@@ -21,7 +21,7 @@ and OpenTimelineIO export with its exact read-back. Pure Rust, `no_std` +
 
 | type | what it is |
 |---|---|
-| `Timeline` | an edit: `name`, the edit `rate`, the timecode `start` its zero carries, `metadata`, `tracks` stacked bottom first, and its `readers` — a `schema 1` document |
+| `Timeline` | an edit: `name`, the edit `rate`, the timecode `start` its zero carries, `metadata`, `tracks` stacked bottom first, its own `markers` and its `readers` — a `schema 1` document |
 | `Track` | one layer: `kind` (`Video` or `Audio`), `name`, `enabled`, `clips` in record order, the `transitions` between them, its `markers` and its `readers` |
 | `Clip` | a stretch of one medium at an explicit position: its `id`, `name`, `media`, `source_range` (in the medium's timebase), `record` (at the edit rate), `enabled`, `gain`, `fades`, `metadata`, `markers`, `readers` |
 | `ClipId` | a clip's identity: a string its creator mints, once per placement, unique in the timeline |
@@ -29,7 +29,7 @@ and OpenTimelineIO export with its exact read-back. Pure Rust, `no_std` +
 | `Transition` | a `Dissolve` across the cut `at`, reaching `in_offset` before it and `out_offset` after it — OpenTimelineIO's offsets |
 | `Fades`, `Fade` | a fade at a clip's start (`in`) and end (`out`): a `duration` at the edit rate and a `shape`, `Linear` or `EqualPower` |
 | `Gain` | decibels, finite by construction |
-| `Marker`, `MarkerColor` | a named point or stretch of time: a `name`, the `range` it marks, a `color` (OpenTimelineIO's eleven, green by default), a `comment` and its `readers` — on a track at the edit rate from the timeline's zero, on a clip in its medium's time |
+| `Marker`, `MarkerColor` | a named point or stretch of time: a `name`, the `range` it marks, a `color` (OpenTimelineIO's eleven, green by default), a `comment` and its `readers` — on the timeline or a track at the edit rate from the timeline's zero, on a clip in its medium's time |
 | `Metadata` | an ordered map of strings — notes the model carries and never reads |
 | `ReaderMetadata` | other readers' own metadata on the timeline, a track, a clip or a marker: under each reader's namespace — `Resolve_OTIO`, say — a `Metadata` of that reader's words, which the export writes where that reader reads them and the model never reads |
 
@@ -82,7 +82,7 @@ transition, marker or reader's namespace it is about:
 | refusal | the defect |
 |---|---|
 | `RateUnstated` | the edit rate is zero |
-| `OffEditRate` | the start, a record, a fade, a transition or a track's marker not counted at the edit rate |
+| `OffEditRate` | the start, a record, a fade, a transition, or the timeline's marker or a track's, not counted at the edit rate |
 | `MediaRateUnstated` | a stated media rate of zero, or a source or available range in a degenerate timebase |
 | `RangeTooLong` | a record, source range or available range longer than `i64::MAX` ticks — no timeline needs one, and its length has no exact count |
 | `RecordBeforeZero` | a record starting before the timeline's zero |
@@ -145,7 +145,7 @@ is refused by name (`Refused::NotRepresentable`, below).
 | a gap between records | `Gap.1`, derived by `layout` |
 | `Transition` | `Transition.1`, `SMPTE_Dissolve`, offsets at the edit rate |
 | a fade | `Transition.1`, `SMPTE_Dissolve` against a gap — of no length where the clip abuts a clip or the track's end |
-| `Marker` | `Marker.2` in its track's or clip's `markers`: `name`, `color` in OpenTimelineIO's capitals, `marked_range`, `comment` — a track's at the edit rate, a clip's in its medium's time |
+| `Marker` | `Marker.2` in the stack's, its track's or its clip's `markers`: `name`, `color` in OpenTimelineIO's capitals, `marked_range`, `comment` — the timeline's on the stack and a track's at the edit rate, a clip's in its medium's time |
 | a clip's `id`, gain, reel, the medium's rate, a fade's curve, `Metadata` | `metadata.mediaio`: `id`, `gain_db`, `reel`, `rate`, `fade` and `shape`, `metadata` |
 | `ReaderMetadata`, on the timeline, a track, a clip or a marker | the object's `metadata`, beside `mediaio`: each namespace under its own key, an object of strings, written whole — `{}` for one holding no entry — every key in byte order; an object with no namespace writes none |
 
@@ -310,6 +310,12 @@ through `mediadecode` starts at zero until the read side exposes the
 container's timecode, so its available range does not yet carry the
 camera's.
 
+DaVinci Resolve 21.1 imports the stack's markers alone as its timeline's:
+it drops a track's, and attaches a clip's to its item
+(findit-studio/application#265). So the timeline's own markers are written
+there, at the edit rate from the stack's zero, as a track's are on the
+track.
+
 Other readers' own metadata rides in the same `metadata`, each namespace
 under its own key, where its reader reads it: DaVinci Resolve 21.1 reads a
 marker's note from `Resolve_OTIO`'s `Note` alone, not from OpenTimelineIO's
@@ -405,8 +411,9 @@ and read through the crate's strict shapes of them. An optional word left
 out reads as absent. A track's and a clip's `markers` are written only
 where there are some, so a timeline without markers writes the document
 0.2.0 wrote, and a reader before markers refuses one with them by name. So
-are the timeline's, a track's, a clip's and a marker's `readers`: a
-timeline without them writes the document 0.3.0 wrote.
+are the timeline's own `markers`, and the timeline's, a track's, a clip's
+and a marker's `readers`: a timeline without them writes the document 0.3.0
+wrote.
 
 ## Time
 

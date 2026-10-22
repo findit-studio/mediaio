@@ -22,10 +22,16 @@ use crate::{Clip, Marker, Metadata, ReaderMetadata, Schema, Transition};
 /// [`validate`](fn@crate::validate) is where a timeline is judged. Tracks stack
 /// in order, the first at the bottom.
 ///
+/// Its own [`markers`](Self::markers) are counted as a track's are: at the
+/// edit rate, from the timeline's zero. OpenTimelineIO writes them on its
+/// stack, from the stack's zero, and the stack's markers are the ones
+/// DaVinci Resolve 21.1 imports as its timeline's: it drops a track's, and
+/// attaches a clip's to its item (findit-studio/application#265).
+///
 /// On the wire the document's first field is [`schema`](Self::schema), and
 /// a field this reader does not know is refused by name. Its
-/// [`readers`](Self::readers), other readers' own metadata, are written only
-/// when there are some.
+/// [`markers`](Self::markers), and its [`readers`](Self::readers) — other
+/// readers' own metadata — are written only when there are some.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
@@ -40,6 +46,11 @@ pub struct Timeline {
   tracks: Vec<Track>,
   #[cfg_attr(
     feature = "serde",
+    serde(default, skip_serializing_if = "Vec::is_empty")
+  )]
+  markers: Vec<Marker>,
+  #[cfg_attr(
+    feature = "serde",
     serde(default, skip_serializing_if = "ReaderMetadata::is_empty")
   )]
   readers: ReaderMetadata,
@@ -47,7 +58,7 @@ pub struct Timeline {
 
 impl Timeline {
   /// An empty timeline at the edit rate `rate`, its zero labelled with the
-  /// timecode zero.
+  /// timecode zero: no track, no marker.
   ///
   /// The start is counted at `rate`; for a rate of zero, which
   /// [`validate`](fn@crate::validate) refuses, it is counted in `1/1`.
@@ -60,6 +71,7 @@ impl Timeline {
       start: Timestamp::new(0, ruler),
       metadata: Metadata::new(),
       tracks: Vec::new(),
+      markers: Vec::new(),
       readers: ReaderMetadata::new(),
     }
   }
@@ -125,6 +137,17 @@ impl Timeline {
     &mut self.tracks
   }
 
+  /// The markers noted on the timeline itself, counted at the edit rate
+  /// from its zero.
+  pub const fn markers(&self) -> &[Marker] {
+    self.markers.as_slice()
+  }
+
+  /// The timeline's markers, for editing in place.
+  pub const fn markers_mut(&mut self) -> &mut Vec<Marker> {
+    &mut self.markers
+  }
+
   /// Renames the timeline in place.
   pub fn set_name(&mut self, name: impl Into<Utf8Bytes>) -> &mut Self {
     self.name = name.into();
@@ -184,6 +207,13 @@ impl Timeline {
   /// Sets the tracks, replacing any existing ones, in place.
   pub fn set_tracks(&mut self, tracks: impl Into<Vec<Track>>) -> &mut Self {
     self.tracks = tracks.into();
+    self
+  }
+
+  /// Appends `marker` to the timeline's own (consuming builder).
+  #[must_use]
+  pub fn with_marker(mut self, marker: Marker) -> Self {
+    self.markers.push(marker);
     self
   }
 }

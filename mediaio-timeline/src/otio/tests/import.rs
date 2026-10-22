@@ -3322,3 +3322,68 @@ fn a_namespace_validation_refuses_is_read_and_refused_and_never_written() {
     );
   }
 }
+
+#[test]
+fn the_stacks_markers_are_the_timelines_own_held_as_a_tracks_are() {
+  // Q813: the stack's markers read back as the timeline's, at the edit rate
+  // from the stack's zero, and are held as a track's are.
+  let timeline = sample().with_marker(
+    Marker::new("scene", TimeRange::new(0, 24, edit()))
+      .with_color(MarkerColor::Blue)
+      .with_readers(resolve("scene")),
+  );
+  for &target in TARGETS {
+    let text = to_otio(&timeline, target).unwrap();
+    assert_eq!(from_otio(&text), Ok(timeline.clone()), "{target:?}");
+  }
+  // A document's stack marker reads where the export writes one: the
+  // track's marker moved onto the stack.
+  let onto_the_stack = |root: &mut Value| {
+    let marker = at(root, &format!("{TRACK}.markers.0")).clone();
+    set(root, "tracks", "markers", Value::Array(vec![marker]));
+    set(root, TRACK, "markers", Value::Array(vec![]));
+  };
+  let mut moved = sample();
+  let marker = moved.tracks_mut()[0].markers_mut().remove(0);
+  *moved.markers_mut() = vec![marker];
+  assert_eq!(read(onto_the_stack), Ok(moved));
+  // Refused by name as a track's is: another schema, a word the reader
+  // does not know there, and a timebase off the edit rate.
+  assert_eq!(
+    read(|root| {
+      onto_the_stack(root);
+      set(root, "tracks.markers.0", "OTIO_SCHEMA", text("Marker.3"));
+    }),
+    Err(schema("Marker.3", "tracks.markers.0")),
+  );
+  assert_eq!(
+    read(|root| {
+      onto_the_stack(root);
+      set(
+        root,
+        "tracks.markers.0.metadata",
+        "mediaio",
+        object(vec![("range", text("24/1"))]),
+      );
+    }),
+    Err(feature(
+      Feature::Word("range".into()),
+      "tracks.markers.0.metadata.mediaio.range"
+    )),
+  );
+  assert_eq!(
+    read(|root| {
+      onto_the_stack(root);
+      set(
+        root,
+        "tracks.markers.0.metadata",
+        "mediaio",
+        object(vec![("timebase", text("1/25"))]),
+      );
+    }),
+    Err(shape(
+      "tracks.markers.0.metadata.mediaio.timebase",
+      "the edit rate's timebase, written num/den"
+    )),
+  );
+}

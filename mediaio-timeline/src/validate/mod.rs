@@ -53,10 +53,10 @@ use crate::{
 ///   part of a transition inside it — fit inside it
 ///   ([`Refusal::BlendsOverrunClip`]): in particular, no fade runs longer
 ///   than its clip;
-/// - each marker is counted where its owner counts time — a track's at the
-///   edit rate ([`Refusal::OffEditRate`]), a clip's in a real ruler
-///   ([`Refusal::MarkerRateUnstated`]) — over a range no longer than
-///   `i64::MAX` ticks ([`Refusal::MarkerTooLong`]);
+/// - each marker is counted where its owner counts time — the timeline's
+///   and a track's at the edit rate ([`Refusal::OffEditRate`]), a clip's in
+///   a real ruler ([`Refusal::MarkerRateUnstated`]) — over a range no
+///   longer than `i64::MAX` ticks ([`Refusal::MarkerTooLong`]);
 /// - each reader's namespace — on the timeline, a track, a clip or a
 ///   marker ([`ReaderMetadata`]) — is named neither `mediaio`, the key the
 ///   export writes the crate's own words under, nor `OTIO_SCHEMA`
@@ -65,11 +65,11 @@ use crate::{
 ///   carrying that key as an object of the schema it names, so either would
 ///   turn the object's metadata, or the namespace, into another object.
 ///
-/// Refusals come back in a fixed order: the timeline's own, its namespaces'
-/// last, then track by track — each clip's, its namespaces' and its
-/// markers' among them, then each transition's, then each clip's blends,
-/// then the track's markers', then the track's namespaces'. Each marker's
-/// namespaces' follow its own.
+/// Refusals come back in a fixed order: the timeline's own, then its
+/// markers', then its namespaces', then track by track — each clip's, its
+/// namespaces' and its markers' among them, then each transition's, then
+/// each clip's blends, then the track's markers', then the track's
+/// namespaces'. Each marker's namespaces' follow its own.
 /// The checks that need the edit rate are skipped while it is unstated,
 /// those that read a clip's media ruler are skipped for a clip whose medium
 /// has none, and those that measure a range are skipped for a range too long
@@ -89,6 +89,14 @@ pub fn validate(timeline: &Timeline) -> Result<(), Vec<Refusal>> {
         refusals.push(Refusal::OffEditRate(Place::Start));
       }
     }
+  }
+  for (index, marker) in timeline.markers().iter().enumerate() {
+    judge_edit_marker(
+      marker,
+      MarkerAt::Timeline { marker: index },
+      edit,
+      &mut refusals,
+    );
   }
   judge_readers(timeline.readers(), MetadataAt::Timeline, &mut refusals);
   for (index, track) in timeline.tracks().iter().enumerate() {
@@ -300,15 +308,27 @@ fn judge_track<'a>(
       track: track_index,
       marker: index,
     };
-    if let Some(edit) = edit
-      && marker.range().timebase() != edit
-    {
-      out.push(Refusal::OffEditRate(Place::Marker(at)));
-    }
-    judge_marker_length(marker, at, out);
-    judge_readers(marker.readers(), MetadataAt::Marker(at), out);
+    judge_edit_marker(marker, at, edit, out);
   }
   judge_readers(track.readers(), MetadataAt::Track(track_index), out);
+}
+
+/// Refuses the timeline's marker or a track's, at `at`: counted otherwise
+/// than at the edit rate, where that is stated; a range too long to
+/// measure; and its namespaces, as [`judge_readers`] does.
+fn judge_edit_marker(
+  marker: &Marker,
+  at: MarkerAt,
+  edit: Option<Timebase>,
+  out: &mut Vec<Refusal>,
+) {
+  if let Some(edit) = edit
+    && marker.range().timebase() != edit
+  {
+    out.push(Refusal::OffEditRate(Place::Marker(at)));
+  }
+  judge_marker_length(marker, at, out);
+  judge_readers(marker.readers(), MetadataAt::Marker(at), out);
 }
 
 /// Refuses `marker`, at `at`, for a range too long to measure.
@@ -816,7 +836,7 @@ pub enum Place {
   Fade(EdgeAt),
   /// A transition's cut or one of its offsets.
   Transition(TransitionAt),
-  /// A track's marker: its marked range.
+  /// The timeline's marker or a track's: its marked range.
   Marker(MarkerAt),
 }
 
@@ -839,6 +859,11 @@ impl fmt::Display for Place {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum MarkerAt {
+  /// The timeline's own marker, which OpenTimelineIO writes on its stack.
+  Timeline {
+    /// The marker's index among the timeline's markers.
+    marker: usize,
+  },
   /// A track's marker.
   Track {
     /// The track's index in the timeline.
@@ -855,10 +880,12 @@ pub enum MarkerAt {
   },
 }
 
-/// Writes `track 0, marker 1`, or `track 0, clip 2, marker 1`.
+/// Writes `the timeline, marker 0`, `track 0, marker 1`, or `track 0,
+/// clip 2, marker 1`.
 impl fmt::Display for MarkerAt {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
+      Self::Timeline { marker } => write!(f, "the timeline, marker {marker}"),
       Self::Track { track, marker } => write!(f, "track {track}, marker {marker}"),
       Self::Clip { clip, marker } => write!(f, "{clip}, marker {marker}"),
     }

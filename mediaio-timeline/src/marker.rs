@@ -1,4 +1,5 @@
-//! A marker: a named point or stretch of time on a track or a clip.
+//! A marker: a named point or stretch of time on the timeline, a track or a
+//! clip.
 
 use mediatime::TimeRange;
 #[cfg(feature = "serde")]
@@ -7,21 +8,22 @@ use smol_bytes::Utf8Bytes;
 
 use crate::ReaderMetadata;
 
-/// A named point or stretch of time noted on a [`Track`](crate::Track) or
-/// a [`Clip`](crate::Clip): OpenTimelineIO's `Marker`.
+/// A named point or stretch of time noted on the
+/// [`Timeline`](crate::Timeline), a [`Track`](crate::Track) or a
+/// [`Clip`](crate::Clip): OpenTimelineIO's `Marker`.
 ///
 /// Its [`range`](Self::range) is counted where its owner counts time:
 ///
-/// - a track's marker at the timeline's edit rate, from the timeline's
-///   zero, as the track's records are;
+/// - the timeline's marker and a track's at the timeline's edit rate, from
+///   the timeline's zero, as a track's records are;
 /// - a clip's marker in its medium's time, as the clip's source range is —
 ///   OpenTimelineIO's `marked_range` on an item, in the item's own time.
 ///
 /// A range of no length marks a point. [`validate`](fn@crate::validate)
-/// holds a track's marker to the edit rate, a clip's to a real ruler, and
-/// either to a range no longer than `i64::MAX` ticks. Nothing holds a
-/// marker inside its owner's time: a clip's marker past its source range
-/// notes media the clip does not play.
+/// holds the timeline's marker and a track's to the edit rate, a clip's to
+/// a real ruler, and each to a range no longer than `i64::MAX` ticks.
+/// Nothing holds a marker inside its owner's time: a clip's marker past its
+/// source range notes media the clip does not play.
 ///
 /// Its [`readers`](Self::readers) are other readers' own metadata, written
 /// in OpenTimelineIO's `metadata` beside this crate's words: DaVinci

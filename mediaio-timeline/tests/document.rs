@@ -32,10 +32,10 @@ fn resolve(note: &str) -> ReaderMetadata {
   ReaderMetadata::new().with("Resolve_OTIO", Metadata::new().with("Note", note))
 }
 
-/// Every word of the model, present once — a marker on a track and one on
-/// a clip among them, and readers' namespaces on the timeline, the track,
-/// the clip and the track's marker. The document need not validate: it
-/// pins the wire names, not an edit.
+/// Every word of the model, present once — a marker on the timeline, one
+/// on a track and one on a clip among them, and readers' namespaces on the
+/// timeline, the track, the clip and the track's marker. The document need
+/// not validate: it pins the wire names, not an edit.
 fn sample() -> Timeline {
   let edit = tb(1001, 24_000);
   let media = tb(1, 24_000);
@@ -76,6 +76,7 @@ fn sample() -> Timeline {
         )
         .with_readers(resolve("picture")),
     )
+    .with_marker(Marker::new("scene 1", TimeRange::new(0, 96, edit)).with_color(MarkerColor::Blue))
     .with_readers(resolve("the cut"))
 }
 
@@ -227,6 +228,21 @@ const SAMPLE_PRETTY: &str = r#"{
           "Note": "picture"
         }
       }
+    }
+  ],
+  "markers": [
+    {
+      "name": "scene 1",
+      "range": {
+        "start": 0,
+        "end": 96,
+        "timebase": {
+          "numerator": 1001,
+          "denominator": 24000
+        }
+      },
+      "color": "blue",
+      "comment": ""
     }
   ],
   "readers": {
@@ -506,12 +522,14 @@ fn markers_left_out_read_as_none_and_a_marker_reads_strictly() {
   // A document from before markers — none written — reads with none, and
   // a timeline without markers writes no `markers` word at all.
   let mut doc = serde_json::to_value(sample()).unwrap();
+  doc.as_object_mut().unwrap().remove("markers");
   doc["tracks"][0].as_object_mut().unwrap().remove("markers");
   doc["tracks"][0]["clips"][0]
     .as_object_mut()
     .unwrap()
     .remove("markers");
   let back: Timeline = serde_json::from_value(doc).unwrap();
+  assert!(back.markers().is_empty());
   assert!(back.tracks()[0].markers().is_empty());
   assert!(back.tracks()[0].clips()[0].markers().is_empty());
   let text = serde_json::to_string(&back).unwrap();

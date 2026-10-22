@@ -15,9 +15,9 @@
 //! | [`Transition`](crate::Transition) | `Transition.1`, `SMPTE_Dissolve`, its offsets at the edit rate |
 //! | a [`Fade`](crate::Fade) | `Transition.1`, `SMPTE_Dissolve` against a gap — a gap of no length where the clip abuts a clip or a track's end |
 //! | a clip's [`id`](crate::Clip::id), gain, reel, the medium's rate, a fade's curve, [`Metadata`](crate::Metadata) | `metadata.mediaio`: `id`, `gain_db`, `reel`, `rate`, `fade` and `shape`, and `metadata` — the notes as an array of `[key, value]` pairs, never an object, so no key of the model's is a key a reader takes for a schema word (`OTIO_SCHEMA`) |
-//! | a [`Marker`](crate::Marker), on a track or a clip | `Marker.2` among the item's `markers`: `name`, `color` (OpenTimelineIO's capitals), `marked_range`, `comment` — a track's at the edit rate, a clip's in its medium's time |
+//! | a [`Marker`](crate::Marker), on the timeline, a track or a clip | `Marker.2` among the stack's or the item's `markers`: `name`, `color` (OpenTimelineIO's capitals), `marked_range`, `comment` — the timeline's on the stack and a track's, at the edit rate from the timeline's zero; a clip's in its medium's time. DaVinci Resolve 21.1 imports the stack's alone as its timeline's markers: it drops a track's, and attaches a clip's to its item (findit-studio/application#265) |
 //! | other readers' [`ReaderMetadata`](crate::ReaderMetadata), on the timeline, a track, a clip or a marker | the object's `metadata`, beside `mediaio`: each namespace under its own key, an object of strings, written whole — `{}` for one holding no entry — every key in byte order, as OpenTimelineIO's own writer orders a dictionary's; an object with no namespace writes none |
-//! | the exact words a reader needs | `metadata.mediaio`: the edit rate (`rate`, `num/den`) on the timeline; on a clip, its reference and a clip's marker, the exact ruler a media-side range's counts are written in and the timebase the model counts it in (`source`, `available`, `range`); on a dissolve, its place among its track's transitions where the track keeps them out of their cuts' order (`order`); and the timebase of an edit-side value spelled otherwise than the edit rate's reciprocal — the timeline's `start`, a clip's `record`, a fade's or a track marker's `timebase`, a dissolve's `at`, `in_offset`, `out_offset` — so `1/24` beside a rate of `48/2` reads back as `1/24` |
+//! | the exact words a reader needs | `metadata.mediaio`: the edit rate (`rate`, `num/den`) on the timeline; on a clip, its reference and a clip's marker, the exact ruler a media-side range's counts are written in and the timebase the model counts it in (`source`, `available`, `range`); on a dissolve, its place among its track's transitions where the track keeps them out of their cuts' order (`order`); and the timebase of an edit-side value spelled otherwise than the edit rate's reciprocal — the timeline's `start`, a clip's `record`, a fade's, a stack marker's or a track marker's `timebase`, a dissolve's `at`, `in_offset`, `out_offset` — so `1/24` beside a rate of `48/2` reads back as `1/24` |
 //!
 //! Every position on the record side is a whole count at the edit rate. A
 //! media-side range (a source range, an available range) is written whole in
@@ -269,8 +269,8 @@ impl core::error::Error for Refused {}
 /// its own cannot: every whole rate that lands on a range is a multiple of
 /// its coarsest whole ruler, one of its own, which counts it in the smallest
 /// counts. Those refusals say what the search tried too: its bands, and no
-/// walk. A track's marker is counted at the edit rate, as a count the
-/// export writes there, and refused with no search.
+/// walk. The timeline's marker and a track's are counted at the edit rate,
+/// as a count the export writes there, and refused with no search.
 ///
 /// Last, a ruler's rate none of whose spellings the export tries
 /// OpenTimelineIO 0.17 reads back exactly is refused, with no search
@@ -643,9 +643,9 @@ pub enum Spot {
   /// track ([`AbsoluteEnd`](Self::AbsoluteEnd)).
   TimelineEnd,
   /// A marker's range — its start, its length or its end — refused as the
-  /// timeline holds it, before any walk: a track's marker counted at the
-  /// edit rate; a clip's in none of its own rulers, nor of the rulers the
-  /// timeline's operands are counted in, held whole.
+  /// timeline holds it, before any walk: the timeline's marker or a track's
+  /// counted at the edit rate; a clip's in none of its own rulers, nor of
+  /// the rulers the timeline's operands are counted in, held whole.
   Marker(MarkerAt),
 }
 

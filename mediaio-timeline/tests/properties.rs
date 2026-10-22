@@ -102,8 +102,9 @@ fn timeline(seed: u64) -> Timeline {
   let mut rng = Seeded(seed);
   let mut extra = Seeded(!seed);
   // Other readers' metadata, from a stream of its own: every other word is
-  // drawn as before it existed.
+  // drawn as before it existed; so are the timeline's own markers.
   let mut other = Seeded(seed.rotate_left(32) ^ 0xA5A5_A5A5_A5A5_A5A5);
+  let mut stacked = Seeded(seed.rotate_left(16) ^ 0x5A5A_5A5A_5A5A_5A5A);
   let rate = rng.pick(&RATES);
   let edit = rate.checked_to_timebase().unwrap();
   let frames = |n: u64| Duration::new(n, edit);
@@ -278,6 +279,32 @@ fn timeline(seed: u64) -> Timeline {
       track.transitions_mut().reverse();
     }
     timeline.tracks_mut().push(track);
+  }
+  // The timeline's own markers, at the edit rate from zero, anywhere about
+  // its tracks, now and then past their ends; now and then a point.
+  let end = timeline
+    .tracks()
+    .iter()
+    .filter_map(|track| track.clips().last())
+    .map(|clip| clip.record().end_pts())
+    .max()
+    .unwrap_or(0);
+  for marker in 0..stacked.within(0, 2) {
+    let at = stacked.within(0, end as u64 + 48) as i64;
+    let length = if stacked.one_in(4) {
+      0
+    } else {
+      stacked.within(1, 96) as i64
+    };
+    timeline.markers_mut().push(
+      Marker::new(
+        format_utf8bytes!("s{marker}"),
+        TimeRange::new(at, at + length, edit),
+      )
+      .with_color(stacked.pick(&MarkerColor::ALL))
+      .with_comment(if stacked.one_in(2) { "a scene" } else { "" })
+      .with_readers(readers(&mut other, "a timeline's marker")),
+    );
   }
   timeline
 }
@@ -629,6 +656,7 @@ fn the_generator_reaches_every_word() {
     reordered: usize,
     namespaces: usize,
     empty_namespaces: usize,
+    timeline_markers: usize,
   }
   let mut seen = Seen::default();
   let namespaces = |seen: &mut Seen, readers: &ReaderMetadata| {
@@ -642,6 +670,13 @@ fn the_generator_reaches_every_word() {
     seen.rates.insert(timeline.rate().to_string());
     seen.notes += usize::from(!timeline.metadata().is_empty());
     namespaces(&mut seen, timeline.readers());
+    seen.timeline_markers += timeline.markers().len();
+    for marker in timeline.markers() {
+      namespaces(&mut seen, marker.readers());
+      seen.colors.insert(marker.color().to_string());
+      seen.comments += usize::from(!marker.comment().is_empty());
+      seen.marker_points += usize::from(marker.range().start() == marker.range().end());
+    }
     for (track, laid) in timeline
       .tracks()
       .iter()
@@ -730,6 +765,7 @@ fn the_generator_reaches_every_word() {
   enough(seen.disabled_tracks, "disabled tracks");
   enough(seen.namespaces, "readers' namespaces");
   enough(seen.empty_namespaces, "empty namespaces");
+  enough(seen.timeline_markers, "timeline markers");
   assert!(seen.reordered >= 10, "reordered tracks: {seen:?}");
   assert_eq!(seen.colors.len(), MarkerColor::ALL.len(), "{seen:?}");
   assert_eq!(seen.rulers.len(), media_rulers().len(), "{seen:?}");

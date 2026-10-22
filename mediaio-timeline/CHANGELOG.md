@@ -11,6 +11,16 @@ Its versions are its own: they do not move with `mediadecode`'s.
 
 ### Added
 
+- **Markers on the timeline: `Timeline::markers`** (`markers`,
+  `markers_mut`, `with_marker`), counted as a track's are, at the edit rate
+  from the timeline's zero. `to_otio` writes them on the OpenTimelineIO
+  stack, from the stack's zero, and `from_otio` reads them back: DaVinci
+  Resolve 21.1 imports the stack's markers alone as its timeline's, dropping
+  a track's and attaching a clip's to its item
+  (findit-studio/application#265). `validate` holds them as it holds a
+  track's, at `MarkerAt::Timeline`. With `serde`, they are written only
+  where there are some.
+
 - **Other readers' own metadata: `ReaderMetadata`**, on the timeline, a
   track, a clip and a marker (`readers`, `readers_mut`, `with_readers`).
   Under each reader's namespace — `Resolve_OTIO`, say — it holds a
@@ -31,6 +41,8 @@ Its versions are its own: they do not move with `mediadecode`'s.
 
 ### Changed
 
+- **`from_otio` reads the stack's markers** as the timeline's, where 0.3.0
+  refused one as a schema the timeline does not model there.
 - **`from_otio` reads a reader's namespace** where 0.3.0 refused it: a key
   of the timeline's, a track's, a clip's or a marker's `metadata` beside
   `mediaio` whose value is an object. It still refuses such a key by name

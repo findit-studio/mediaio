@@ -4,10 +4,10 @@
 //! The reader walks the document the export writes — `Timeline.1`, one
 //! `Stack.1`, its `Track.1`s, their `Gap.1`s, `Clip.1`s or `Clip.2`s and
 //! `Transition.1`s, each clip's `ExternalReference.1`, and `Marker.2`s on
-//! tracks and clips — and nothing else: a schema the timeline does not
-//! model, or models elsewhere, is refused with its name and where it sits
-//! ([`Unreadable::Schema`]); a key, a value or a note of a modelled schema
-//! the timeline has no word for is refused by name too
+//! the stack, tracks and clips — and nothing else: a schema the timeline
+//! does not model, or models elsewhere, is refused with its name and where
+//! it sits ([`Unreadable::Schema`]); a key, a value or a note of a modelled
+//! schema the timeline has no word for is refused by name too
 //! ([`Unreadable::Feature`]). On the timeline, a track, a clip and a
 //! marker, each key of the `metadata` beside `mediaio` is another reader's
 //! namespace, read whole into the object's [`ReaderMetadata`]: an object
@@ -283,8 +283,8 @@ impl<'a> Object<'a> {
     self.no_schemas("effects")
   }
 
-  /// Markers where the timeline keeps none — on the stack or a gap: none,
-  /// each refused as a schema the timeline does not model there.
+  /// Markers where the timeline keeps none — on a gap: none, each refused
+  /// as a schema the timeline does not model there.
   fn no_markers(&self) -> Result<(), Unreadable> {
     self.no_schemas("markers")
   }
@@ -731,27 +731,29 @@ pub(crate) fn timeline(root: &Value) -> Result<Timeline, Unreadable> {
     edit,
   )?;
   let stack = Object::of(object.required("tracks")?, object.at.key("tracks"))?;
-  let tracks = self::stack(&stack, edit, ticks, written(start, edit))?;
-  Ok(
-    Timeline::new(object.name()?, rate)
-      .with_start(Timestamp::new(start, start_timebase))
-      .with_metadata(words.notes()?)
-      .with_tracks(tracks)
-      .with_readers(readers),
-  )
+  let (tracks, markers) = self::stack(&stack, edit, ticks, written(start, edit))?;
+  let mut timeline = Timeline::new(object.name()?, rate)
+    .with_start(Timestamp::new(start, start_timebase))
+    .with_metadata(words.notes()?)
+    .with_tracks(tracks)
+    .with_readers(readers);
+  *timeline.markers_mut() = markers;
+  Ok(timeline)
 }
 
 /// The one `Stack.1`, named `tracks` as OpenTimelineIO names it, holding
-/// the tracks and nothing the timeline does not keep. Each track is walked
-/// as the export walks it, from the global start `global`, and then the
-/// stack ([`derive::track`], [`derive::stack`]): what OpenTimelineIO's
-/// `f64` arithmetic rounds there is refused ([`rounded`]).
+/// the tracks and the timeline's markers — read as a track's are, at the
+/// edit rate from the stack's zero — and nothing the timeline does not
+/// keep. Each track is walked as the export walks it, from the global start
+/// `global`, and then the stack ([`derive::track`], [`derive::stack`]):
+/// what OpenTimelineIO's `f64` arithmetic rounds there is refused
+/// ([`rounded`]).
 fn stack(
   stack: &Object<'_>,
   edit: Ruler,
   ticks: Timebase,
   global: Time,
-) -> Result<Vec<Track>, Unreadable> {
+) -> Result<(Vec<Track>, Vec<Marker>), Unreadable> {
   stack.schema(&["Stack.1"])?;
   stack.keys(&[
     "OTIO_SCHEMA",
@@ -768,7 +770,7 @@ fn stack(
   stack.no_name(&["tracks"])?;
   stack.no_trim()?;
   stack.no_effects()?;
-  stack.no_markers()?;
+  let markers = markers(stack, Placed::Edit(edit, ticks))?;
   stack.never_disabled()?;
   stack.no_color()?;
   let at = stack.at.key("children");
@@ -783,7 +785,7 @@ fn stack(
     durations.push(duration);
   }
   derive::stack(&durations, global).map_err(|refusal| rounded(&refusal, &stack.at))?;
-  Ok(tracks)
+  Ok((tracks, markers))
 }
 
 /// A `Track.1`, and its children as OpenTimelineIO's walk reads them.
@@ -1349,13 +1351,15 @@ fn reference(value: &Value, at: At) -> Result<MediaRef, Unreadable> {
 /// Where a marker's range is counted.
 #[derive(Clone, Copy)]
 enum Placed {
-  /// A track's: at the edit rate, whose exact rate and timebase are these.
+  /// The stack's or a track's: at the edit rate, whose exact rate and
+  /// timebase are these.
   Edit(Ruler, Timebase),
   /// A clip's: in the exact ruler its words name, then in its timebase.
   Exact,
 }
 
-/// The `Marker.2`s of an item: a track's, or a clip's.
+/// The `Marker.2`s of an item: the stack's — the timeline's own — a
+/// track's, or a clip's.
 fn markers(object: &Object<'_>, placed: Placed) -> Result<Vec<Marker>, Unreadable> {
   let Some(value) = object.get("markers") else {
     return Ok(Vec::new());

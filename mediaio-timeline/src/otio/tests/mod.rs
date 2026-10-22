@@ -832,8 +832,9 @@ fn every_count_in_the_goldens_is_one_an_f64_holds_exactly() {
     let mut times = Vec::new();
     named(&root, "RationalTime.1", &mut times);
     // The start; per clip its source and available ranges; per gap its range;
-    // per transition its two offsets; per marker its range.
-    assert_eq!(times.len(), 1 + 3 * 4 + 2 * 2 + 3 * 2 + 2 * 2);
+    // per transition its two offsets; per marker — the timeline's, a
+    // track's and a clip's — its range.
+    assert_eq!(times.len(), 1 + 3 * 4 + 2 * 2 + 3 * 2 + 3 * 2);
     for time in &times {
       // A whole count within ±2^53, written as `<digits>.0`, which an f64
       // reads back as exactly that count — and OpenTimelineIO 0.17's reader
@@ -858,7 +859,7 @@ fn every_count_in_the_goldens_is_one_an_f64_holds_exactly() {
     }
     let mut ranges = Vec::new();
     named(&root, "TimeRange.1", &mut ranges);
-    assert_eq!(ranges.len(), 3 * 2 + 2 + 2);
+    assert_eq!(ranges.len(), 3 * 2 + 2 + 3);
     for range in ranges {
       let time = |key: &str| match range.iter().find(|(k, _)| k == key) {
         Some((_, Value::Object(members))) => members.as_slice(),
@@ -1531,9 +1532,71 @@ fn a_dissolve_says_its_place_only_where_its_track_keeps_transitions_out_of_order
 }
 
 #[test]
+fn the_timelines_markers_are_written_on_the_stack_at_the_edit_rate() {
+  // Q813. DaVinci Resolve 21.1 imports the stack's markers alone as its
+  // timeline's — it drops a track's, and attaches a clip's to its item
+  // (findit-studio/application#265) — so the timeline's own are written
+  // there, at the edit rate from the stack's zero, as a track's are on the
+  // track.
+  let timeline = marked()
+    .with_marker(
+      Marker::new("scene 1", TimeRange::new(0, 12, edit()))
+        .with_color(MarkerColor::Blue)
+        .with_comment("the opening"),
+    )
+    .with_marker(Marker::new("cut", TimeRange::new(12, 12, tb(2, 48))));
+  assert_eq!(validate(&timeline), Ok(()));
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let text = to_otio(&timeline, target).unwrap();
+    assert_eq!(validate_json(&text, target), Ok(()), "{target:?}");
+    assert_eq!(from_otio(&text), Ok(timeline.clone()), "{target:?}");
+  }
+  let root = json::parse(&to_otio(&timeline, OtioTarget::V0_15Plus).unwrap()).unwrap();
+  let stack = member(&root, "tracks");
+  let markers = member(&stack, "markers").as_array().unwrap().to_vec();
+  let [scene, cut] = &markers[..] else {
+    panic!("two markers on the stack: {markers:?}")
+  };
+  assert_eq!(member(scene, "OTIO_SCHEMA").as_str(), Some("Marker.2"));
+  assert_eq!(member(scene, "metadata"), Value::Object(Vec::new()));
+  assert_eq!(member(scene, "name").as_str(), Some("scene 1"));
+  assert_eq!(member(scene, "color").as_str(), Some("BLUE"));
+  assert_eq!(member(scene, "comment").as_str(), Some("the opening"));
+  assert_eq!(
+    rate_start_duration(&member(scene, "marked_range")),
+    (24.0, 0.0, 12.0)
+  );
+  // A point, its timebase spelled otherwise than the edit rate's
+  // reciprocal: that spelling, as a track's marker says it.
+  assert_eq!(member(cut, "color").as_str(), Some("GREEN"));
+  assert_eq!(
+    rate_start_duration(&member(cut, "marked_range")),
+    (24.0, 12.0, 0.0)
+  );
+  assert_eq!(
+    words(cut),
+    [(String::from("timebase"), String::from("\"2/48\""))]
+  );
+  // The track's own stays on the track.
+  let track = member(&stack, "children").as_array().unwrap()[0].clone();
+  assert_eq!(member(&track, "markers").as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn a_marker_no_ruler_holds_whole_is_refused_by_name() {
-  // A track's marker is counted at the edit rate: past 2^53 there, refused
-  // with no search.
+  // The timeline's marker and a track's are counted at the edit rate: past
+  // 2^53 there, refused with no search — the timeline's before any
+  // track's.
+  let mut timeline =
+    marked().with_marker(Marker::new("scene", TimeRange::new(0, TWO_53 + 1, edit())));
+  timeline.tracks_mut()[0].markers_mut()[0].set_range(TimeRange::new(0, TWO_53 + 1, edit()));
+  assert_eq!(
+    not_representable(&timeline),
+    (
+      Spot::Marker(MarkerAt::Timeline { marker: 0 }),
+      i128::from(TWO_53 + 1)
+    )
+  );
   let mut timeline = marked();
   timeline.tracks_mut()[0].markers_mut()[0].set_range(TimeRange::new(0, TWO_53 + 1, edit()));
   assert_eq!(

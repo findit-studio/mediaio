@@ -10,16 +10,16 @@
 //! it, or else in the first ruler the timeline's operands are counted in
 //! that does ([`source_plan`]); its medium's available range likewise, in the
 //! first that holds it whole, its end with it ([`whole_plan`]), and each of
-//! its markers the same way; a track's markers at the edit rate — and the
-//! walk, [`mod@derive`], forms what OpenTimelineIO derives from those counts,
-//! in its own arithmetic, holding each: a source range's end among them,
-//! which the plan leaves to the walk. Where the walk refuses a value, a
-//! search ([`settle`]) writes the clips it is formed from in other rulers
-//! that hold their source ranges — every ruler the timeline's own operands
-//! are counted in, and the finest and the coarsest whole ones below a clip's
-//! plan's — one clip one ruler at a time, and walks again; what no plan it
-//! tries holds is refused, with the last walk's refusal and what the search
-//! tried.
+//! its markers the same way; the timeline's markers and a track's at the
+//! edit rate — and the walk, [`mod@derive`], forms what OpenTimelineIO
+//! derives from those counts, in its own arithmetic, holding each: a source
+//! range's end among them, which the plan leaves to the walk. Where the
+//! walk refuses a value, a search ([`settle`]) writes the clips it is formed
+//! from in other rulers that hold their source ranges — every ruler the
+//! timeline's own operands are counted in, and the finest and the coarsest
+//! whole ones below a clip's plan's — one clip one ruler at a time, and
+//! walks again; what no plan it tries holds is refused, with the last
+//! walk's refusal and what the search tried.
 //!
 //! Last, every number the document would carry is spelled so that
 //! OpenTimelineIO 0.17.0's reader reads it back as the value meant. That
@@ -84,6 +84,12 @@ pub(crate) fn timeline(
   let edit = Ruler::new(timeline.rate());
   let start = i128::from(timeline.start().pts());
   held(start, edit, Spot::Start)?;
+  let stacked = timeline
+    .markers()
+    .iter()
+    .enumerate()
+    .map(|(marker, placed)| edit_marker(placed, edit, Spot::Marker(MarkerAt::Timeline { marker })))
+    .collect::<Result<Vec<_>, _>>()?;
   let operands = operands(laid, edit);
   let planned = laid
     .tracks()
@@ -98,7 +104,7 @@ pub(crate) fn timeline(
     .map(|(index, laid)| markers_planned(index, laid.track(), edit, &operands))
     .collect::<Result<Vec<_>, _>>()?;
   let settled = settle(planned, edit, &operands, Time::written(start, edit))?;
-  spellings(start, edit, &settled, &marked)?;
+  spellings(start, edit, &stacked, &settled, &marked)?;
   // A valid timeline states its rate, and the reciprocal of a rate above
   // zero is a timebase.
   let ticks = timeline.rate().checked_to_timebase().unwrap_or_default();
@@ -132,7 +138,10 @@ pub(crate) fn timeline(
         ("name", text("tracks")),
         ("source_range", Value::Null),
         ("effects", Value::Array(Vec::new())),
-        ("markers", Value::Array(Vec::new())),
+        (
+          "markers",
+          Value::Array(edit_markers(timeline.markers(), &stacked, ticks)),
+        ),
         ("enabled", Value::Bool(true)),
         ("children", Value::Array(tracks)),
       ]),
@@ -691,15 +700,7 @@ fn track(
       }
     })
     .collect();
-  let markers = track
-    .markers()
-    .iter()
-    .zip(&marked.track)
-    .map(|(marker, &range)| {
-      let word = spelled(marker.range().timebase(), ticks).map(|timebase| ("timebase", timebase));
-      self::marker(marker, range, word)
-    })
-    .collect();
+  let markers = edit_markers(track.markers(), &marked.track, ticks);
   object(vec![
     ("OTIO_SCHEMA", text("Track.1")),
     (
@@ -879,11 +880,25 @@ fn reordered(track: &Track) -> bool {
     .any(|pair| pair[1].at() <= pair[0].at())
 }
 
+/// The timeline's markers or a track's, each as [`marker`] writes one at
+/// the edit rate, as `counted`, its timebase spelled where it is spelled
+/// otherwise than the edit rate's reciprocal, `ticks` (`timebase`).
+fn edit_markers(markers: &[Marker], counted: &[Counted], ticks: Timebase) -> Vec<Value> {
+  markers
+    .iter()
+    .zip(counted)
+    .map(|(marker, &range)| {
+      let word = spelled(marker.range().timebase(), ticks).map(|timebase| ("timebase", timebase));
+      self::marker(marker, range, word)
+    })
+    .collect()
+}
+
 /// A marker as `Marker.2`: its `range` counted in one ruler — the edit
-/// rate's, for a track's marker, with its timebase spelled where it is
-/// spelled otherwise than the edit rate's reciprocal (`timebase`); for a
-/// clip's, the ruler its plan chose, with its exact words (`range`) — and
-/// its readers' namespaces beside those words.
+/// rate's, for the timeline's marker or a track's, with its timebase
+/// spelled where it is spelled otherwise than the edit rate's reciprocal
+/// (`timebase`); for a clip's, the ruler its plan chose, with its exact
+/// words (`range`) — and its readers' namespaces beside those words.
 fn marker(marker: &Marker, range: Counted, word: Option<(&'static str, Value)>) -> Value {
   let words = word.into_iter().collect();
   object(vec![
@@ -937,12 +952,11 @@ fn markers_planned(
     .iter()
     .enumerate()
     .map(|(marker, placed)| {
-      let range = placed.range();
       let at = Spot::Marker(MarkerAt::Track {
         track: index,
         marker,
       });
-      Counted::new(edit, range.start_pts(), range.span().ticks()).within(true, at, None)
+      edit_marker(placed, edit, at)
     })
     .collect::<Result<Vec<_>, _>>()?;
   let on_clips = track
@@ -968,6 +982,14 @@ fn markers_planned(
     track: on_track,
     clips: on_clips,
   })
+}
+
+/// The timeline's marker or a track's, counted at the edit rate and held
+/// whole there — its start, its length and its end within ±2^53 — or
+/// refused at `at`, with no search, as any count the export writes there.
+fn edit_marker(marker: &Marker, edit: Ruler, at: Spot) -> Result<Counted, NotRepresentable> {
+  let range = marker.range();
+  Counted::new(edit, range.start_pts(), range.span().ticks()).within(true, at, None)
 }
 
 fn transition(metadata: Value, in_offset: Value, out_offset: Value) -> Value {
@@ -1397,10 +1419,14 @@ fn near_integers(scaled: f64) -> Option<Vec<u64>> {
 fn spellings(
   start: i128,
   edit: Ruler,
+  stacked: &[Counted],
   tracks: &[Vec<Planned<'_>>],
   marked: &[Marked],
 ) -> Result<(), NotRepresentable> {
   read_back(start, edit, Spot::Start)?;
+  for (marker, range) in stacked.iter().enumerate() {
+    range.read_back(Spot::Marker(MarkerAt::Timeline { marker }))?;
+  }
   for (track, (children, marked)) in tracks.iter().zip(marked).enumerate() {
     for (marker, range) in marked.track.iter().enumerate() {
       range.read_back(Spot::Marker(MarkerAt::Track { track, marker }))?;
