@@ -21,17 +21,20 @@
 //! tries holds is refused, with the last walk's refusal and what the search
 //! tried.
 //!
-//! Last, every number the document would carry is read as OpenTimelineIO
-//! 0.17.0's reader reads it ([`spellings`]). That reader, RapidJSON in its
-//! normal precision, reads a count written `<digits>.0` exactly up to
-//! 1 801 439 850 948 198, ⌊2^54 / 10⌋, and past it not always — the
-//! fraction's `0` joins the significand, which converts to a double rounded
-//! past 2^53 before it is divided by ten — and the shortest spelling of the
-//! `f64` of most rates exactly, but not of every one: 96000/1001's it reads
-//! as a neighbouring `f64`, while every common rate reads exactly. A count
-//! or a rate that a build rounding its multiply-adds twice, or one fusing
-//! them, would read as another value is refused there, with no search
-//! ([`read_back`]).
+//! Last, every number the document would carry is spelled so that
+//! OpenTimelineIO 0.17.0's reader reads it back as the value meant. That
+//! reader, RapidJSON in its normal precision, reads a count written
+//! `<digits>.0` exactly up to 1 801 439 850 948 198, ⌊2^54 / 10⌋, and past
+//! it not always — the fraction's `0` joins the significand, which converts
+//! to a double rounded past 2^53 before it is divided by ten — so a count
+//! past it is written as its integer, which it hands over whole
+//! ([`number`]). It reads the shortest spelling of the `f64` of most rates
+//! exactly, but not of every one: 96000/1001's it reads as a neighbouring
+//! `f64`, while every common rate reads exactly. Such a rate is written in
+//! another spelling of the same `f64` that a build rounding its
+//! multiply-adds twice and one fusing them both read exactly
+//! ([`rate_spelling`]); a rate none of those spellings writes is refused,
+//! with no search ([`spellings`], [`read_back`]).
 //!
 //! OpenTimelineIO keeps a rate as an `f64`, which names many rationals, and
 //! a range as two counts in one ruler, which says nothing of the timebase
@@ -1226,23 +1229,135 @@ fn rational_time(ruler: Ruler, count: i128) -> Value {
   ])
 }
 
-/// A ruler's rate, written as the `f64` nearest it in its shortest spelling
-/// — the one `{:?}` writes, which reads back as that `f64` where a reader
-/// rounds to nearest, as OpenTimelineIO 0.17's does not always
-/// ([`read_back`]).
+/// A ruler's rate: the `f64` nearest it, in the spelling
+/// [`rate_spelling`] finds — its shortest wherever OpenTimelineIO 0.17's
+/// reader reads that back exactly, as it reads every common rate's — or,
+/// where none it tries reads back exactly, the shortest, which
+/// [`read_back`] refuses.
 fn rate(ruler: Ruler) -> Value {
-  Value::Number(format_utf8bytes!("{:?}", ruler.otio()))
+  let value = ruler.otio();
+  Value::Number(rate_spelling(value).unwrap_or_else(|| format_utf8bytes!("{value:?}")))
 }
 
-/// Refuses the first number the document would carry — a count or a
-/// ruler's rate, in the order it writes them — that OpenTimelineIO 0.17's
-/// reader reads as another value ([`read_back`]): the global start; then
-/// per track its markers, then its children — a gap's length, a clip's
+/// The powers of ten an `f64` holds exactly, 10^0 to 10^22: RapidJSON's
+/// table holds these exactly too (`pow10.h` 28–50 at `06d58b9e`), so a
+/// division by one is rounded once.
+const TEN: [f64; 23] = [
+  1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17,
+  1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// 2^64: RapidJSON reads an integer below it whole, into a `uint64_t`.
+const TWO_64: f64 = 18_446_744_073_709_551_616.0;
+
+/// The spelling of `value`, a ruler's rate, positive and finite, that
+/// OpenTimelineIO 0.17's reader reads back as `value`, bit for bit, in a
+/// build that rounds RapidJSON's multiply-adds twice and in one that fuses
+/// them ([`json::readings`]): the first of
+///
+/// 1. its shortest spelling, `{:?}`'s — every common rate's;
+/// 2. `{D}e-{K}`, for `K` from 1 to 22 and `D` an integer below 2^64 that
+///    an `f64` holds: RapidJSON reads `D` whole into its 64-bit integer and
+///    converts it exactly, and its table holds `10^K` exactly, so it reads
+///    `D / 10^K` by one division, rounded once, as both kinds of build do,
+///    and as every reader that rounds to nearest does;
+/// 3. `{D}`, `z` zeros, then `e-{K + z}`, for `z` from 1 to 24: past 2^64
+///    RapidJSON carries the integer on in a `double`, each zero a
+///    multiplication by ten rounded once with nothing added, which no
+///    build fuses, then one division by its table's power of ten;
+///
+/// the smallest `K` first, then the smallest `z`, then the `D` nearest
+/// `value × 10^K`, the lower of two as near. `None` where none of them
+/// reads back as `value`.
+///
+/// Of the rates `num/1001` for `num` from 1 to 200 000, the shortest
+/// spelling of 26 050 reads as another `f64`; the second form spells
+/// 25 750 of them and the third 297 of the other 300, each read exactly by
+/// RapidJSON at `06d58b9e` compiled either way. Three have none:
+/// 29195/1001, 31264/1001 and 31799/1001. Nor does any of the 15 626
+/// spellings tried around each — every integer within 300 of `value ×
+/// 10^E` over `10^E`, for `E` from 15 to 35, and as many written with a
+/// point — read exactly in both builds: the export refuses these three.
+fn rate_spelling(value: f64) -> Option<Utf8Bytes> {
+  let exact = |text: &str| {
+    json::readings(text)
+      .iter()
+      .all(|reading| reading.is_ok_and(|number| number.double().to_bits() == value.to_bits()))
+  };
+  let shortest = format_utf8bytes!("{value:?}");
+  if exact(&shortest) {
+    return Some(shortest);
+  }
+  // Each `K`'s integers near `value × 10^K` that an `f64` holds, while the
+  // product stays below 2^64.
+  let near: Vec<(usize, Vec<u64>)> = (1..TEN.len())
+    .map_while(|k| near_integers(value * TEN[k]).map(|integers| (k, integers)))
+    .collect();
+  for (k, integers) in &near {
+    for d in integers {
+      let text = format_utf8bytes!("{d}e-{k}");
+      if exact(&text) {
+        return Some(text);
+      }
+    }
+  }
+  for (k, integers) in &near {
+    for z in 1..=24 {
+      for d in integers {
+        let text = format_utf8bytes!("{d}{:0>z$}e-{}", "", k + z);
+        if exact(&text) {
+          return Some(text);
+        }
+      }
+    }
+  }
+  None
+}
+
+/// The integers near `scaled` that an `f64` holds, below 2^64 and above
+/// zero, the nearest first and the lower of two as near: within three of it
+/// below 2^52, where every integer is an `f64`, and past it the four
+/// `f64`s either side of it, which are integers there. `None` for a
+/// `scaled` past 2^64.
+fn near_integers(scaled: f64) -> Option<Vec<u64>> {
+  if scaled.is_nan() || scaled >= TWO_64 {
+    return None;
+  }
+  let mut near: Vec<f64> = if scaled < 4_503_599_627_370_496.0 {
+    let floor = scaled.floor();
+    (-2..=3).map(|step| floor + f64::from(step)).collect()
+  } else {
+    let mut around = vec![scaled];
+    let (mut up, mut down) = (scaled, scaled);
+    for _ in 0..4 {
+      up = up.next_up();
+      down = down.next_down();
+      around.extend([up, down]);
+    }
+    around
+  };
+  near.retain(|&d| d > 0.0 && d < TWO_64 && d.fract() == 0.0);
+  near.sort_by(|a, b| {
+    (a - scaled)
+      .abs()
+      .total_cmp(&(b - scaled).abs())
+      .then(a.total_cmp(b))
+  });
+  near.dedup();
+  // An integer-valued `f64` below 2^64 converts to `u64` exactly.
+  Some(near.into_iter().map(|d| d as u64).collect())
+}
+
+/// Refuses the first rate the document would carry, in the order it writes
+/// them, that no spelling [`rate_spelling`] tries makes OpenTimelineIO
+/// 0.17's reader read exactly ([`read_back`]): the global start's; then per
+/// track its markers', then its children's — a gap's length, a clip's
 /// source range, its markers and its medium's available range, a fade's
-/// length, a dissolve's two offsets. Every count among them the plan holds
-/// within ±2^53 already; this holds each to its spelling. A gap's start
-/// and a fade's offset of zero are zeros, which read exactly, and every
-/// rate written beside them is the edit rate's, read with the start's.
+/// length, a dissolve's two offsets — each named by the count written
+/// beside it. Every count among them the plan holds within ±2^53 already,
+/// where every one is spelled exactly ([`number`]). A gap's start and a
+/// fade's offset of zero are zeros, and every rate written beside them is
+/// the edit rate's, read with the start's.
 fn spellings(
   start: i128,
   edit: Ruler,
@@ -1301,38 +1416,29 @@ fn spellings(
   Ok(())
 }
 
-/// Refuses `count` ticks of `ruler`, at `at`, where OpenTimelineIO 0.17's
-/// reader reads a number the export writes there — the ruler's rate
-/// ([`rate`]), then the count ([`number`]) — as another value: in a build
-/// that rounds RapidJSON's multiply-adds twice, or in one that fuses them
-/// ([`json::readings`]). Named as [`NotRepresentable::misread`] with the
-/// value meant and what each reads.
+/// Refuses `count` ticks of `ruler`, at `at`, where no spelling of the
+/// ruler's rate [`rate_spelling`] tries makes OpenTimelineIO 0.17's reader
+/// read it back exactly — in a build that rounds RapidJSON's multiply-adds
+/// twice, or in one that fuses them ([`json::readings`]) — so that the
+/// export would write its shortest, which a build reads as another value.
+/// Named as [`NotRepresentable::misread`] with the value meant and what
+/// each build reads of the shortest. The count itself is spelled exactly
+/// ([`number`]).
 fn read_back(count: i128, ruler: Ruler, at: Spot) -> Result<(), NotRepresentable> {
-  let misread = |number: MisreadNumber, written: Value, meant: f64| -> Option<Misread> {
-    let Value::Number(text) = written else {
-      return None;
-    };
-    // A refused reading is no value at all: NaN, which is no number meant.
-    let read = json::readings(&text).map(|reading| reading.map_or(f64::NAN, Number::double));
-    read
-      .iter()
-      .any(|read| read.to_bits() != meant.to_bits())
-      .then(|| Misread::new(number, meant, read))
-  };
-  // Within ±2^53, which the plan holds every written count to, a count's
-  // `f64` is exact.
-  let found = misread(MisreadNumber::Rate, rate(ruler), ruler.otio())
-    .or_else(|| misread(MisreadNumber::Count, number(count), count as f64));
-  match found {
-    None => Ok(()),
-    Some(misread) => Err(NotRepresentable {
-      at,
-      value: count,
-      rate: ruler.exact(),
-      searched: None,
-      misread: Some(misread),
-    }),
+  let meant = ruler.otio();
+  if rate_spelling(meant).is_some() {
+    return Ok(());
   }
+  // A refused reading is no value at all: NaN, which is no number meant.
+  let read = json::readings(format_utf8bytes!("{meant:?}").as_str())
+    .map(|reading| reading.map_or(f64::NAN, Number::double));
+  Err(NotRepresentable {
+    at,
+    value: count,
+    rate: ruler.exact(),
+    searched: None,
+    misread: Some(Misread::new(MisreadNumber::Rate, meant, read)),
+  })
 }
 
 fn time_range(duration: Value, start_time: Value) -> Value {
@@ -1364,9 +1470,23 @@ fn held(value: i128, ruler: Ruler, at: Spot) -> Result<(), NotRepresentable> {
   }
 }
 
-/// A whole count written as `86400.0`, from the integer's own digits.
+/// ⌊2^54 / 10⌋: OpenTimelineIO 0.17's reader reads every count written
+/// `<digits>.0` exactly up to it, either way from zero.
+const POINT_ZERO_EXACT: u128 = 1_801_439_850_948_198;
+
+/// A whole count, within ±2^53, which the plan holds every written count
+/// to: `86400.0`, its digits and `.0`, as OpenTimelineIO's own writer spells
+/// a `double`, up to ⌊2^54 / 10⌋ either way, where OpenTimelineIO 0.17's
+/// reader reads that back exactly in every build; past it its digits alone,
+/// `1801439850948199`, which RapidJSON hands over as an integer and a
+/// `double` member takes exactly within ±2^53 — as every reader from 0.12
+/// takes one (`deserialization.cpp` 418–454 in 0.17.0).
 fn number(value: i128) -> Value {
-  Value::Number(format_utf8bytes!("{value}.0"))
+  if value.unsigned_abs() <= POINT_ZERO_EXACT {
+    Value::Number(format_utf8bytes!("{value}.0"))
+  } else {
+    Value::Number(format_utf8bytes!("{value}"))
+  }
 }
 
 fn text(value: &str) -> Value {

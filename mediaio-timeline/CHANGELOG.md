@@ -7,6 +7,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with `mediadecode`'s.
 
+## [0.4.0] - unreleased
+
+### Changed
+
+- **BREAKING: `MisreadNumber::Count` is gone.** `to_otio` writes every
+  count within ±2^53 in a spelling OpenTimelineIO 0.17's reader reads
+  exactly: `<digits>.0` up to ⌊2^54 / 10⌋ as before, and past it the
+  integer alone, which RapidJSON hands over whole and a `double` member
+  takes exactly — as every reader from 0.12 takes one. No count is refused
+  as misread any more; 0.3.0 refused one past ⌊2^54 / 10⌋ whose
+  `<digits>.0` the reader read as another.
+- **`to_otio` writes a rate whose shortest spelling OpenTimelineIO 0.17
+  misreads in another spelling of the same `f64`** that a build fusing one
+  of RapidJSON's multiply-adds and one that does not both read exactly: an
+  integer an `f64` holds over a power of ten, which the reader converts
+  exactly and divides once (`95904095904095904e-15` for 96000/1001), or,
+  where none is, the same with zeros the reader multiplies in, each rounded
+  once with nothing added. 0.3.0 refused every such rate — about 13 % of
+  the rates num/1001. Of the rates num/1001 up to 200 000/1001, three have
+  no such spelling, nor any of the 15 626 tried around each, and are still
+  refused by name: 29195/1001, 31264/1001 and 31799/1001. Every common rate
+  keeps its shortest spelling, so the goldens are unchanged.
+
 ## [0.3.0] - 2026-10-22
 
 ### Changed

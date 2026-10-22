@@ -187,15 +187,19 @@ export holds both:
   refused.
 - **how it reads back.** OpenTimelineIO 0.17.0 reads numbers with RapidJSON
   in its normal precision, which does not always round to the nearest
-  double: it reads every count written `<digits>.0` up to
+  double. It reads every count written `<digits>.0` up to
   1 801 439 850 948 198 (⌊2^54 / 10⌋) exactly, but past it not every one —
-  `9007199254740991.0` as 9007199254740990 — and the shortest spelling of
-  every common rate exactly (24, 25, 30, 48, 50, 60, the NTSC rates over
+  `9007199254740991.0` as 9007199254740990 — so a count past it is written
+  as its integer, which it hands over whole. It reads the shortest spelling
+  of every common rate exactly (24, 25, 30, 48, 50, 60, the NTSC rates over
   1001, the audio rates, 90 kHz), but of some others a neighbouring `f64`
-  (96000/1001's). The export reads every count and rate it writes as that
-  reader does, in a build that fuses one of its multiply-adds and in one
-  that does not, and refuses by name one either reads as another value
-  (`NotRepresentable::misread`).
+  (96000/1001's), so such a rate is written in another spelling of the same
+  `f64` that it reads exactly, in a build that fuses one of its
+  multiply-adds and in one that does not: an integer an `f64` holds over a
+  power of ten (`95904095904095904e-15`), or the same with zeros the reader
+  multiplies in. A rate no such spelling writes is refused by name
+  (`NotRepresentable::misread`); of the rates num/1001 up to
+  200 000/1001, three: 29195/1001, 31264/1001 and 31799/1001.
 - **what OpenTimelineIO derives from it**, computed operation for operation
   and branch for branch as OpenTimelineIO computes it, beside its exact
   value: the end of each clip's source range; each child's place on its
@@ -485,7 +489,7 @@ and the tests on every combination of the three features.
 Without `std`:
 
 ```toml
-mediaio-timeline = { version = "0.3", default-features = false, features = ["alloc"] }
+mediaio-timeline = { version = "0.4", default-features = false, features = ["alloc"] }
 ```
 
 ## Requirements

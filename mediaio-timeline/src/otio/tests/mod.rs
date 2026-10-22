@@ -382,11 +382,11 @@ fn a_count_past_2_53_is_refused_rather_than_read_rounded() {
   // The start, at the edit rate.
   let early = at_one_fps(0, 1).with_start(Timestamp::new(-TWO_53 - 1, tb(1, 1)));
   assert_eq!(not_representable(&early), (Spot::Start, -past));
-  // Within 2^53 a count OpenTimelineIO 0.17's reader reads back exactly is
-  // written, and reads back whole: 2^53 - 2. (2^53 - 1 it misreads, below.)
+  // Within 2^53 every count is written, in a spelling OpenTimelineIO 0.17's
+  // reader reads back exactly (below), and reads back whole: 2^53 - 1.
   assert_eq!(
-    children(&at_one_fps(TWO_53 - 2, TWO_53 - 1)),
-    ["Gap(9007199254740990)", "a"]
+    children(&at_one_fps(TWO_53 - 1, TWO_53)),
+    ["Gap(9007199254740991)", "a"]
   );
 }
 
@@ -402,84 +402,150 @@ fn misread(timeline: &Timeline) -> (NotRepresentable, Misread) {
   }
 }
 
-#[test]
-fn a_count_opentimelineio_0_17_reads_as_another_is_refused_by_name() {
-  // OpenTimelineIO 0.17's reader takes `<digits>.0`'s zero into the
-  // significand, which converts to a double rounded past 2^53 before it is
-  // divided by ten: every count up to 1 801 439 850 948 198, ⌊2^54 / 10⌋,
-  // reads back exactly — the last the export writes before the first it
-  // refuses.
-  const LAST: i64 = 1_801_439_850_948_198;
-  assert_eq!(
-    children(&at_one_fps(LAST, LAST + 1)),
-    ["Gap(1801439850948198)", "a"]
-  );
-  // The next it reads as 1 801 439 850 948 199.25: refused by name, with no
-  // search, the place and both values named.
-  let (refusal, read) = misread(&at_one_fps(LAST + 1, LAST + 2));
-  assert_eq!(
-    (refusal.at(), refusal.value(), refusal.searched()),
-    (Spot::Record(ClipAt::new(0, 0)), i128::from(LAST + 1), None)
-  );
-  assert_eq!(read.number(), MisreadNumber::Count);
-  assert_eq!(read.meant(), (LAST + 1) as f64);
-  // A quarter more: the doubles there are a quarter apart.
-  assert_eq!(read.read(), [(LAST + 1) as f64 + 0.25; 2]);
-  assert_eq!(
-    std::string::ToString::to_string(&refusal),
-    "the gap before track 0, clip 0 counts 1801439850948199 ticks of 1/1 s, written \
-     1801439850948199.0: OpenTimelineIO 0.17 reads this spelling as another value, \
-     1801439850948199.3"
-  );
-  // 2^53 - 1 it reads as 2^53 - 2, a whole number: a reader would place the
-  // clip a second early, and say nothing.
-  let (refusal, read) = misread(&at_one_fps(TWO_53 - 1, TWO_53));
-  assert_eq!(refusal.value(), i128::from(TWO_53 - 1));
-  assert_eq!(read.read(), [(TWO_53 - 2) as f64; 2]);
-  // At the start, at the edit rate, as much.
-  let start = at_one_fps(0, 1).with_start(Timestamp::new(TWO_53 - 1, tb(1, 1)));
-  assert_eq!(misread(&start).0.at(), Spot::Start);
+/// Whether OpenTimelineIO 0.17's reader reads `text` as `meant`, bit for
+/// bit, in a build that rounds RapidJSON's multiply-adds twice and in one
+/// that fuses them.
+fn reads_back(text: &str, meant: f64) -> bool {
+  json::readings(text)
+    .iter()
+    .all(|reading| reading.is_ok_and(|number| number.double().to_bits() == meant.to_bits()))
+}
+
+/// The spellings of every `RationalTime.1`'s two numbers in `text`: its
+/// value, then its rate.
+fn times(text: &str) -> Vec<(String, String)> {
+  let root = json::parse(text).unwrap();
+  let mut found = Vec::new();
+  named(&root, "RationalTime.1", &mut found);
+  found
+    .into_iter()
+    .map(|time| {
+      (
+        String::from(spelled(time, "value")),
+        String::from(spelled(time, "rate")),
+      )
+    })
+    .collect()
 }
 
 #[test]
-fn a_rate_opentimelineio_0_17_reads_as_another_is_refused_by_name() {
-  let at = |num: i32| {
-    let rate = Rate::fps(num, core::num::NonZeroI32::new(1001).unwrap());
-    let frame = rate.checked_to_timebase().unwrap();
-    one_track_at(
-      rate,
-      Clip::new(
-        ClipId::new("a"),
-        "a",
-        MediaRef::new("file:///a.mov"),
-        TimeRange::new(0, 24, frame),
-        TimeRange::new(0, 24, frame),
-      ),
-    )
-  };
-  // 96000/1001's f64 is written 95.90409590409591, which OpenTimelineIO
-  // 0.17's reader reads as the next f64 up: refused where it is first
-  // written, at the start.
-  let (refusal, read) = misread(&at(96_000));
-  assert_eq!((refusal.at(), refusal.value()), (Spot::Start, 0));
-  assert_eq!(read.number(), MisreadNumber::Rate);
-  assert_eq!(read.meant(), 96_000.0 / 1001.0);
-  assert_eq!(
-    read.read().map(f64::to_bits),
-    [0x4057_F9DC_B511_2288; 2],
-    "the next f64 up from {:#x}",
-    (96_000.0_f64 / 1001.0).to_bits()
-  );
+fn a_count_past_the_last_one_its_point_zero_spells_exactly_is_written_as_its_integer() {
+  // OpenTimelineIO 0.17's reader takes `<digits>.0`'s zero into the
+  // significand, which converts to a double rounded past 2^53 before it is
+  // divided by ten: every count up to 1 801 439 850 948 198, ⌊2^54 / 10⌋,
+  // reads back exactly so, and the next as 1 801 439 850 948 199.25.
+  const LAST: i64 = 1_801_439_850_948_198;
+  let past = (LAST + 1) as f64;
+  assert!(reads_back("1801439850948198.0", LAST as f64));
+  assert!(!reads_back("1801439850948199.0", past));
+  // Its integer it hands over whole, which a `double` member takes exactly.
+  assert!(reads_back("1801439850948199", past));
+  for (gap, spelling) in [
+    (LAST, "1801439850948198.0"),
+    (LAST + 1, "1801439850948199"),
+    (TWO_53 - 1, "9007199254740991"),
+  ] {
+    let timeline = at_one_fps(gap, gap + 1);
+    let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+    // The gap's length is the document's first count past the start.
+    let written = times(&text);
+    assert!(
+      written.iter().any(|(value, _)| value == spelling),
+      "{gap}: {written:?}"
+    );
+    for (value, _) in &written {
+      let count: i128 = value.strip_suffix(".0").unwrap_or(value).parse().unwrap();
+      assert!(reads_back(value, count as f64), "{gap}: {value}");
+    }
+    validate_json(&text, OtioTarget::V0_15Plus).unwrap();
+    assert_eq!(from_otio(&text), Ok(timeline), "{gap}");
+  }
+  // Negative counts alike: a start at the edit rate, before the zero.
+  let early = at_one_fps(0, 1).with_start(Timestamp::new(-LAST - 1, tb(1, 1)));
+  let text = to_otio(&early, OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(times(&text)[0].0, "-1801439850948199");
+  assert_eq!(from_otio(&text), Ok(early));
+}
+
+/// One clip of 24 frames at the edit rate `num/1001`, on a medium at it.
+fn at_1001(num: i32) -> Timeline {
+  let rate = Rate::fps(num, NonZeroI32::new(1001).unwrap());
+  let frame = rate.checked_to_timebase().unwrap();
+  one_track_at(
+    rate,
+    Clip::new(
+      ClipId::new("a"),
+      "a",
+      MediaRef::new("file:///a.mov"),
+      TimeRange::new(0, 24, frame),
+      TimeRange::new(0, 24, frame),
+    ),
+  )
+}
+
+#[test]
+fn a_rate_whose_shortest_spelling_reads_as_another_is_written_in_one_that_reads_exactly() {
+  // 96000/1001's f64 is shortest `95.90409590409591`, which OpenTimelineIO
+  // 0.17's reader reads as the next f64 up; 11000/1001's `10.989010989010989`
+  // as the next down. Each is written as an integer an f64 holds over a
+  // power of ten: one exact conversion, one division, rounded once.
+  // 28863/1001 has no such spelling, and is written with zeros, which the
+  // reader multiplies in, each rounded once with nothing added, before it
+  // divides. Every common rate keeps its shortest.
+  for (num, shortest, spelling) in [
+    (96_000, "95.90409590409591", "95904095904095904e-15"),
+    (11_000, "10.989010989010989", "109890109890109888e-16"),
+    (
+      28_863,
+      "28.834165834165834",
+      "2883416583416583600000000000000000e-32",
+    ),
+    (24_000, "23.976023976023978", "23.976023976023978"),
+    (30_000, "29.97002997002997", "29.97002997002997"),
+    (48_000, "47.952047952047955", "47.952047952047955"),
+  ] {
+    let meant = f64::from(num) / 1001.0;
+    assert_eq!(format!("{meant:?}"), shortest);
+    assert_eq!(reads_back(shortest, meant), shortest == spelling, "{num}");
+    assert!(reads_back(spelling, meant), "{num}");
+    let timeline = at_1001(num);
+    let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+    for (_, rate) in times(&text) {
+      assert_eq!(rate, spelling, "{num}");
+    }
+    validate_json(&text, OtioTarget::V0_15Plus).unwrap();
+    assert_eq!(from_otio(&text), Ok(timeline), "{num}");
+  }
+}
+
+#[test]
+fn a_rate_no_spelling_of_which_reads_back_exactly_is_refused_by_name() {
+  // Of the rates num/1001 up to 200000/1001, three read as another f64 in
+  // every spelling the export tries — and in each of the 15 626 tried
+  // around them, against RapidJSON 06d58b9e compiled either way. Each is
+  // refused where it is first written, at the start, with no search.
+  for (num, read) in [
+    (29_195, 0x403D_2A74_1B9E_D134_u64),
+    (31_264, 0x403F_3B96_A224_50D0),
+    (31_799, 0x403F_C469_5DDB_AF30),
+  ] {
+    let (refusal, misread) = misread(&at_1001(num));
+    assert_eq!(
+      (refusal.at(), refusal.value(), refusal.searched()),
+      (Spot::Start, 0, None),
+      "{num}"
+    );
+    assert_eq!(misread.number(), MisreadNumber::Rate);
+    assert_eq!(misread.meant(), f64::from(num) / 1001.0);
+    assert_eq!(misread.read().map(f64::to_bits), [read; 2], "{num}");
+  }
+  let (refusal, _) = misread(&at_1001(29_195));
   assert_eq!(
     std::string::ToString::to_string(&refusal),
-    "the start counts 0 ticks of 1001/96000 s, its rate written 95.90409590409591: \
-     OpenTimelineIO 0.17 reads this spelling as another value, 95.90409590409593"
+    "the start counts 0 ticks of 1001/29195 s, its rate written 29.165834165834166: \
+     OpenTimelineIO 0.17 reads this spelling as another value, and every other the export \
+     tries, 29.16583416583417"
   );
-  // 24000/1001's, written 23.976023976023978, reads back exactly: written,
-  // and read back as the very timeline.
-  let ntsc = at(24_000);
-  let text = to_otio(&ntsc, OtioTarget::V0_15Plus).unwrap();
-  assert_eq!(from_otio(&text), Ok(ntsc));
 }
 
 /// SplitMix64: a fixed seed gives a fixed sequence, on every platform.
@@ -505,9 +571,9 @@ fn every_number_an_accepted_export_writes_reads_back_exactly_in_either_build() {
   // Rates common and exotic, and gaps from a few frames to 2^53, from fixed
   // seeds. Whatever `to_otio` writes, OpenTimelineIO 0.17's reader reads
   // back as the value meant — each count as its whole number, each rate as
-  // the f64 its shortest spelling names — in a build that rounds RapidJSON's
-  // multiply-adds twice and in one that fuses them; whatever it refuses as
-  // misread, either build does read otherwise.
+  // the f64 nearest the exact rate — in a build that rounds RapidJSON's
+  // multiply-adds twice and in one that fuses them; a rate it refuses as
+  // misread, either build does read otherwise in its shortest spelling.
   const COMMON: [(i32, i32); 12] = [
     (24, 1),
     (25, 1),
@@ -522,20 +588,10 @@ fn every_number_an_accepted_export_writes_reads_back_exactly_in_either_build() {
     (96_000, 1001),
     (25, 2),
   ];
-  let reads_back = |text: &str, meant: f64| {
-    json::readings(text)
-      .iter()
-      .all(|reading| reading.is_ok_and(|number| number.double().to_bits() == meant.to_bits()))
-  };
   // Fewer under Miri, which interprets slowly: the first eight seeds, which
-  // between them draw every kind of rate and of gap, written, misread and
-  // refused.
-  let (seeds, many) = if cfg!(miri) {
-    (8, (0, 0))
-  } else {
-    (256, (64, 16))
-  };
-  let (mut written, mut misread) = (0, 0);
+  // between them draw every kind of rate and of gap.
+  let (seeds, many) = if cfg!(miri) { (8, 0) } else { (256, 128) };
+  let (mut written, mut respelled) = (0, 0);
   for seed in 0..seeds {
     let mut draw = Seeded(seed);
     let (num, den) = match draw.within(0, 2) {
@@ -564,29 +620,26 @@ fn every_number_an_accepted_export_writes_reads_back_exactly_in_either_build() {
         TimeRange::new(gap, gap + length, frame),
       ),
     );
+    let meant = rate.as_f64();
     match to_otio(&timeline, OtioTarget::V0_15Plus) {
       Ok(text) => {
         written += 1;
-        let root = json::parse(&text).unwrap();
-        let mut times = Vec::new();
-        named(&root, "RationalTime.1", &mut times);
-        for time in times {
-          let value = spelled(time, "value");
-          let count: i128 = value.strip_suffix(".0").unwrap().parse().unwrap();
-          assert!(reads_back(value, count as f64), "seed {seed}: {value}");
-          let rate = spelled(time, "rate");
-          assert!(
-            reads_back(rate, rate.parse().unwrap()),
-            "seed {seed}: {rate}"
-          );
+        for (value, spelling) in times(&text) {
+          let count: i128 = value.strip_suffix(".0").unwrap_or(&value).parse().unwrap();
+          assert!(reads_back(&value, count as f64), "seed {seed}: {value}");
+          // Every rate the document carries is the edit rate's.
+          assert!(reads_back(&spelling, meant), "seed {seed}: {spelling}");
+          if spelling != format!("{meant:?}") {
+            respelled += 1;
+          }
         }
       }
+      // A count past 2^53, or a rate none of whose spellings reads back.
       Err(Refused::NotRepresentable(refusal)) => {
         if let Some(read) = refusal.misread() {
-          misread += 1;
-          let meant = read.meant().to_bits();
+          assert_eq!(read.number(), MisreadNumber::Rate, "seed {seed}");
           assert!(
-            read.read().iter().any(|read| read.to_bits() != meant),
+            !reads_back(&format!("{meant:?}"), meant),
             "seed {seed}: {refusal}"
           );
         }
@@ -594,10 +647,11 @@ fn every_number_an_accepted_export_writes_reads_back_exactly_in_either_build() {
       Err(other) => panic!("seed {seed}: {other}"),
     }
   }
-  // Both sides drawn, many times; under Miri, at least once.
+  // Most drawn are written, some in a spelling other than their shortest;
+  // under Miri, at least one.
   assert!(
-    written > many.0 && misread > many.1,
-    "{written} written, {misread} misread"
+    written > many && (cfg!(miri) || respelled > 0),
+    "{written} written, {respelled} respelled"
   );
 }
 
