@@ -12,9 +12,10 @@ The family releases in lockstep.
 ### Changed
 
 - **BREAKING: `timeline` is `mediaio-timeline` 0.4** (`mediaio::timeline`):
-  markers, `otio::from_otio`, and an OpenTimelineIO export that now carries
-  the exact-readback metadata and spells every number so OpenTimelineIO
-  0.17's reader reads it exactly.
+  markers, `otio::from_otio`, other readers' own metadata
+  (`ReaderMetadata`), and an OpenTimelineIO export that now carries the
+  exact-readback metadata and spells every number so OpenTimelineIO 0.17's
+  reader reads it exactly.
 
 ## [0.19.0] - 2026-10-16
 

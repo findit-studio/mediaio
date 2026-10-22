@@ -8,7 +8,13 @@
 //! model, or models elsewhere, is refused with its name and where it sits
 //! ([`Unreadable::Schema`]); a key, a value or a note of a modelled schema
 //! the timeline has no word for is refused by name too
-//! ([`Unreadable::Feature`]). Nothing is dropped: a member is read only
+//! ([`Unreadable::Feature`]). On the timeline, a track, a clip and a
+//! marker, each key of the `metadata` beside `mediaio` is another reader's
+//! namespace, read whole into the object's [`ReaderMetadata`]: an object
+//! of strings, any other value inside one refused by name
+//! ([`Feature::NamespaceValue`]); on every other object, and where its
+//! value is no object, such a key is another writer's note, refused by
+//! name ([`Feature::Metadata`]). Nothing is dropped: a member is read only
 //! where the timeline keeps it, or where OpenTimelineIO 0.17.0 holds it as
 //! it holds the member's absence — and the export writes it back so (the
 //! backstop, below). A member OpenTimelineIO keeps and the timeline does not
@@ -92,8 +98,8 @@ use super::{
   json::{self, Held, Value},
 };
 use crate::{
-  Clip, ClipId, Edge, Fade, FadeShape, Gain, Marker, MarkerColor, MediaRef, Metadata, Timeline,
-  Track, TrackKind, Transition, layout::layout_valid,
+  Clip, ClipId, Edge, Fade, FadeShape, Gain, Marker, MarkerColor, MediaRef, Metadata,
+  ReaderMetadata, Timeline, Track, TrackKind, Transition, layout::layout_valid,
 };
 
 type Members = [(Utf8Bytes, Value)];
@@ -304,30 +310,72 @@ impl<'a> Object<'a> {
 }
 
 /// This crate's words in an object's `metadata`: the `mediaio` object. Any
-/// other key of the metadata is another writer's note, which the timeline
-/// does not keep, and is refused by name; so is a word this reader does
-/// not know.
+/// other key of the metadata is another reader's namespace, on the objects
+/// that keep one ([`Words::with_readers`]), and otherwise another writer's
+/// note, which the timeline does not keep, refused by name; so is a word
+/// this reader does not know.
 struct Words<'a> {
   words: Option<Object<'a>>,
   at: At,
 }
 
 impl<'a> Words<'a> {
-  /// The words of `owner`, refusing any but `known`.
+  /// The words of `owner`, an object that keeps no reader's namespace,
+  /// refusing any but `known`, and every other key of its metadata by name.
   fn of(owner: &Object<'a>, known: &[&str]) -> Result<Self, Unreadable> {
-    let at = owner.at.key("metadata");
-    let ours = at.key(OURS);
-    let Some(metadata) = owner.get("metadata") else {
-      return Ok(Self {
-        words: None,
-        at: ours,
-      });
-    };
-    let metadata = Object::of(metadata, at.clone())?;
-    if let Some((key, _)) = metadata.members.iter().find(|(key, _)| key != OURS) {
-      return Err(feature(&at.key(key), Feature::Metadata(key.clone())));
+    let metadata = metadata(owner)?;
+    if let Some(metadata) = &metadata
+      && let Some((key, _)) = metadata.members.iter().find(|(key, _)| key != OURS)
+    {
+      return Err(feature(
+        &metadata.at.key(key),
+        Feature::Metadata(key.clone()),
+      ));
     }
-    let Some(words) = metadata.get(OURS) else {
+    Self::ours(owner, metadata.as_ref(), known)
+  }
+
+  /// The words of `owner`, refusing any but `known`, and every other key of
+  /// its metadata as another reader's namespace, whole: an object of
+  /// strings — any other value inside one refused by name
+  /// ([`Feature::NamespaceValue`]) — and, as a key whose value is no
+  /// object, another writer's note ([`Feature::Metadata`]). An empty
+  /// object is an empty namespace, as the export writes one.
+  fn with_readers(
+    owner: &Object<'a>,
+    known: &[&str],
+  ) -> Result<(Self, ReaderMetadata), Unreadable> {
+    let metadata = metadata(owner)?;
+    let mut readers = ReaderMetadata::new();
+    if let Some(metadata) = &metadata {
+      for (namespace, value) in metadata.members.iter().filter(|(key, _)| key != OURS) {
+        let at = metadata.at.key(namespace);
+        let Some(entries) = value.as_object() else {
+          return Err(feature(&at, Feature::Metadata(namespace.clone())));
+        };
+        let mut words = Metadata::new();
+        for (key, value) in entries {
+          let Value::String(entry) = value else {
+            return Err(feature(&at.key(key), Feature::NamespaceValue(key.clone())));
+          };
+          // The parser refuses an object naming a key twice.
+          words.insert(key.clone(), entry.clone());
+        }
+        readers.insert(namespace.clone(), words);
+      }
+    }
+    Ok((Self::ours(owner, metadata.as_ref(), known)?, readers))
+  }
+
+  /// The `mediaio` object of `owner`'s `metadata`, refusing any word but
+  /// `known`.
+  fn ours(
+    owner: &Object<'a>,
+    metadata: Option<&Object<'a>>,
+    known: &[&str],
+  ) -> Result<Self, Unreadable> {
+    let ours = owner.at.key("metadata").key(OURS);
+    let Some(words) = metadata.and_then(|metadata| metadata.get(OURS)) else {
       return Ok(Self {
         words: None,
         at: ours,
@@ -472,6 +520,14 @@ impl<'a> Words<'a> {
         )
       })
   }
+}
+
+/// `owner`'s `metadata`, an object, if it states one.
+fn metadata<'a>(owner: &Object<'a>) -> Result<Option<Object<'a>>, Unreadable> {
+  owner
+    .get("metadata")
+    .map(|metadata| Object::of(metadata, owner.at.key("metadata")))
+    .transpose()
 }
 
 /// A rate written `num/den`, above zero.
@@ -662,7 +718,7 @@ pub(crate) fn timeline(root: &Value) -> Result<Timeline, Unreadable> {
     "global_start_time",
     "tracks",
   ])?;
-  let words = Words::of(&object, &["rate", "start", "metadata"])?;
+  let (words, readers) = Words::with_readers(&object, &["rate", "start", "metadata"])?;
   let rate = words
     .rate("rate")?
     .ok_or_else(|| shape(&words.at.key("rate"), "a required word"))?;
@@ -680,7 +736,8 @@ pub(crate) fn timeline(root: &Value) -> Result<Timeline, Unreadable> {
     Timeline::new(object.name()?, rate)
       .with_start(Timestamp::new(start, start_timebase))
       .with_metadata(words.notes()?)
-      .with_tracks(tracks),
+      .with_tracks(tracks)
+      .with_readers(readers),
   )
 }
 
@@ -748,7 +805,7 @@ fn track(
     "children",
     "kind",
   ])?;
-  Words::of(object, &[])?;
+  let (_, readers) = Words::with_readers(object, &[])?;
   object.no_trim()?;
   object.no_effects()?;
   object.no_color()?;
@@ -763,7 +820,9 @@ fn track(
     }
     None => return Err(shape(&object.at.key("kind"), "a required key")),
   };
-  let mut track = Track::new(kind, object.name()?).with_enabled(object.enabled()?);
+  let mut track = Track::new(kind, object.name()?)
+    .with_enabled(object.enabled()?)
+    .with_readers(readers);
   let Children {
     clips,
     transitions,
@@ -1162,7 +1221,8 @@ fn clip(
   ];
   known.extend_from_slice(references);
   object.keys(&known)?;
-  let words = Words::of(object, &["id", "gain_db", "source", "record", "metadata"])?;
+  let (words, readers) =
+    Words::with_readers(object, &["id", "gain_db", "source", "record", "metadata"])?;
   let id = words.required_text("id")?;
   let record = words.timebase("record", ticks)?;
   let exact = words.required_exact("source")?;
@@ -1197,7 +1257,8 @@ fn clip(
   )
   .with_enabled(object.enabled()?)
   .with_gain(words.gain("gain_db")?)
-  .with_metadata(words.notes()?);
+  .with_metadata(words.notes()?)
+  .with_readers(readers);
   *clip.markers_mut() = markers(object, Placed::Exact)?;
   Ok((clip, length, walked))
 }
@@ -1314,7 +1375,7 @@ fn markers(object: &Object<'_>, placed: Placed) -> Result<Vec<Marker>, Unreadabl
         "marked_range",
         "comment",
       ])?;
-      let words = Words::of(
+      let (words, readers) = Words::with_readers(
         &marker,
         match placed {
           Placed::Edit(..) => &["timebase"],
@@ -1346,7 +1407,8 @@ fn markers(object: &Object<'_>, placed: Placed) -> Result<Vec<Marker>, Unreadabl
       Ok(
         Marker::new(marker.name()?, range)
           .with_color(color)
-          .with_comment(marker.string("comment")?.unwrap_or("")),
+          .with_comment(marker.string("comment")?.unwrap_or(""))
+          .with_readers(readers),
       )
     })
     .collect()
@@ -1560,78 +1622,84 @@ const ITEMS: &[&str] = &["Stack.1", "Track.1", "Gap.1", "Clip.1", "Clip.2"];
 /// may leave out, as OpenTimelineIO 0.17.0 reads each one's absence as the
 /// value written — it builds every object by its default constructor and
 /// reads such a member only if present. Each row cites the export's write
-/// (`export.rs`), the read and the default (`src/opentimelineio/` at
-/// `v0.17.0`). Nothing else the export writes may be missing.
+/// (the function of `export.rs` that writes it), the read and the default
+/// (`src/opentimelineio/` at `v0.17.0`). Nothing else the export writes may
+/// be missing.
 pub(crate) const WRITTEN_DEFAULTS: [Row; 10] = [
-  // `metadata` `{}`: the stack's, a track's, a gap's, and any object's with
-  // no words (`export.rs` 112, 686, 789, 1191); read only if present
-  // (`serializableObjectWithMetadata.cpp` 21) over `AnyDictionary()`
-  // (`serializableObjectWithMetadata.h` 24, each schema's constructor).
+  // `metadata` `{}`: the stack's and a gap's, and any object's with neither
+  // words nor a reader's namespace (`timeline`, `gap`, `metadata`); read
+  // only if present (`serializableObjectWithMetadata.cpp` 21) over
+  // `AnyDictionary()` (`serializableObjectWithMetadata.h` 24, each schema's
+  // constructor).
   Row {
     schemas: WITH_METADATA,
     key: "metadata",
     value: Plain::EmptyObject,
   },
   // `name` `""`: a gap's, a transition's, a reference's, and whatever the
-  // timeline names nothing (772, 790, 948; 106, 687, 741, 866); read only
-  // if present (`serializableObjectWithMetadata.cpp` 22) over
-  // `std::string()` (`.h` 23).
+  // timeline names nothing (`gap`, `transition`, `external_reference`;
+  // `timeline`, `track`, `clip`, `marker`); read only if present
+  // (`serializableObjectWithMetadata.cpp` 22) over `std::string()` (`.h`
+  // 23).
   Row {
     schemas: WITH_METADATA,
     key: "name",
     value: Plain::Text(""),
   },
-  // `source_range` `null` on the stack and a track (114, 688): read only if
-  // present (`item.cpp` 175) over `std::nullopt` (`stack.h` 26, `track.h`
-  // 38).
+  // `source_range` `null` on the stack and a track (`timeline`, `track`):
+  // read only if present (`item.cpp` 175) over `std::nullopt` (`stack.h`
+  // 26, `track.h` 38).
   Row {
     schemas: &["Stack.1", "Track.1"],
     key: "source_range",
     value: Plain::Null,
   },
-  // `effects` `[]` (115, 689, 743, 798): `item.cpp` 176 over `item.h` 31.
+  // `effects` `[]` (`timeline`, `track`, `clip`, `gap`): `item.cpp` 176
+  // over `item.h` 31.
   Row {
     schemas: ITEMS,
     key: "effects",
     value: Plain::EmptyArray,
   },
-  // `markers` `[]` where an item has none (116, 690, 744, 799): `item.cpp`
-  // 177 over `item.h` 32.
+  // `markers` `[]` where an item has none (`timeline`, `track`, `clip`,
+  // `gap`): `item.cpp` 177 over `item.h` 32.
   Row {
     schemas: ITEMS,
     key: "markers",
     value: Plain::EmptyArray,
   },
-  // `enabled` `true` (117, 691, 745, 800): `item.cpp` 178 over `item.h` 33.
+  // `enabled` `true` (`timeline`, `track`, `clip`, `gap`): `item.cpp` 178
+  // over `item.h` 33.
   Row {
     schemas: ITEMS,
     key: "enabled",
     value: Plain::True,
   },
-  // A reference's `available_range` `null` where it states none (774–777):
-  // `mediaReference.cpp` 30 over `std::nullopt` (`externalReference.h` 24).
+  // A reference's `available_range` `null` where it states none
+  // (`external_reference`): `mediaReference.cpp` 30 over `std::nullopt`
+  // (`externalReference.h` 24).
   Row {
     schemas: &["ExternalReference.1"],
     key: "available_range",
     value: Plain::Null,
   },
-  // A reference's `available_image_bounds` `null`, for `V0_15Plus` (779):
-  // `mediaReference.cpp` 31–33 over `std::nullopt` (`externalReference.h`
-  // 26–27).
+  // A reference's `available_image_bounds` `null`, for `V0_15Plus`
+  // (`external_reference`): `mediaReference.cpp` 31–33 over `std::nullopt`
+  // (`externalReference.h` 26–27).
   Row {
     schemas: &["ExternalReference.1"],
     key: "available_image_bounds",
     value: Plain::Null,
   },
-  // A marker's `color` `GREEN` (867): `marker.cpp` 27 over `Color::green`
-  // (`marker.h` 40), which is `"GREEN"` (20).
+  // A marker's `color` `GREEN` (`marker`): `marker.cpp` 27 over
+  // `Color::green` (`marker.h` 40), which is `"GREEN"` (20).
   Row {
     schemas: &["Marker.2"],
     key: "color",
     value: Plain::Text("GREEN"),
   },
-  // A marker's `comment` `""` (869): `marker.cpp` 29 over `std::string()`
-  // (`marker.h` 42).
+  // A marker's `comment` `""` (`marker`): `marker.cpp` 29 over
+  // `std::string()` (`marker.h` 42).
   Row {
     schemas: &["Marker.2"],
     key: "comment",
@@ -1648,9 +1716,9 @@ pub(crate) const WRITTEN_DEFAULTS: [Row; 10] = [
 /// transition among them.
 pub(crate) const STATED_DEFAULTS: [Row; 1] = [
   // A reference's `available_image_bounds` `null`, which the `Legacy` export
-  // does not write (`export.rs` 778–780): read into its optional as
-  // `std::nullopt` (`mediaReference.cpp` 31–33), its value when absent
-  // (`externalReference.h` 26–27).
+  // does not write (`export.rs`, `external_reference`): read into its
+  // optional as `std::nullopt` (`mediaReference.cpp` 31–33), its value when
+  // absent (`externalReference.h` 26–27).
   Row {
     schemas: &["ExternalReference.1"],
     key: "available_image_bounds",

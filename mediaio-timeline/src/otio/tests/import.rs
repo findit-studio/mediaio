@@ -18,12 +18,12 @@ use super::{
   json::{self, Value},
 };
 use crate::{
-  Clip, ClipAt, ClipId, Duration, Fade, FadeShape, Fades, Gain, IdClash, Marker, MarkerColor,
-  MediaRef, Metadata, Rate, Refusal, TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind,
-  Transition,
+  Clip, ClipAt, ClipId, Duration, Fade, FadeShape, Fades, Gain, IdClash, Marker, MarkerAt,
+  MarkerColor, MediaRef, Metadata, MetadataAt, NamespaceAt, Rate, ReaderMetadata, Refusal,
+  TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind, Transition,
   otio::{
-    Feature, Inexact, Invalid, OtioTarget, Shape, UnmodelledFeature, UnmodelledSchema, Unreadable,
-    from_otio, to_otio, validate_json,
+    Feature, Inexact, Invalid, OtioTarget, Refused, Shape, UnmodelledFeature, UnmodelledSchema,
+    Unreadable, from_otio, to_otio, validate_json,
   },
 };
 
@@ -1625,17 +1625,18 @@ fn a_feature_the_timeline_has_no_word_for_is_refused_by_name() {
       feature(Feature::Key("speed".into()), &format!("{A}.speed")),
     ),
     (
+      // A gap keeps no reader's namespace (the namespaces' laws below).
       Box::new(|root| {
         set(
           root,
-          &format!("{A}.metadata"),
+          &format!("{GAP}.metadata"),
           "Resolve_OTIO",
           object(vec![]),
         )
       }),
       feature(
         Feature::Metadata("Resolve_OTIO".into()),
-        &format!("{A}.metadata.Resolve_OTIO"),
+        &format!("{GAP}.metadata.Resolve_OTIO"),
       ),
     ),
     (
@@ -3038,4 +3039,286 @@ fn an_items_color_and_an_effects_or_transitions_enabled_are_held_to_the_types_ne
       "the schema Color.1"
     )),
   );
+}
+
+/// A reader's namespace, as a writer puts a marker's note where DaVinci
+/// Resolve reads it (findit-studio/application#265).
+fn resolve(note: &str) -> ReaderMetadata {
+  ReaderMetadata::new().with("Resolve_OTIO", Metadata::new().with("Note", note))
+}
+
+/// The keys of the object `value`, in the order written.
+fn keys(value: &Value) -> Vec<String> {
+  value
+    .as_object()
+    .expect("an object")
+    .iter()
+    .map(|(key, _)| String::from(key.as_str()))
+    .collect()
+}
+
+/// The sample with readers' namespaces on every object that keeps them:
+/// the timeline — beside `zeta`, which byte order puts after `mediaio`, its
+/// keys given out of that order — its track, the track's marker, `a` and
+/// `a`'s marker; and on `b` a namespace holding no entry.
+fn with_readers() -> Timeline {
+  let zeta = Metadata::new().with("b", "2").with("a", "3").with("B", "1");
+  let mut timeline = sample().with_readers(resolve("the cut").with("zeta", zeta));
+  let track = &mut timeline.tracks_mut()[0];
+  *track.readers_mut() = resolve("picture");
+  *track.markers_mut()[0].readers_mut() = resolve("act one");
+  *track.clips_mut()[0].readers_mut() = resolve("a");
+  *track.clips_mut()[0].markers_mut()[0].readers_mut() = resolve("n");
+  *track.clips_mut()[1].readers_mut() = ReaderMetadata::new().with("Resolve_OTIO", Metadata::new());
+  timeline
+}
+
+#[test]
+fn other_readers_namespaces_are_written_beside_the_crates_words_and_read_back_exactly() {
+  // Q752: each namespace in the object's `metadata`, beside `mediaio`,
+  // where its reader reads it, and read back into the model whole.
+  let timeline = with_readers();
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let written = to_otio(&timeline, target).unwrap();
+    assert_eq!(validate_json(&written, target), Ok(()), "{target:?}");
+    assert!(
+      plain_where_it_should_be(&json::parse(&written).unwrap(), false),
+      "{target:?}: {written}"
+    );
+    assert_eq!(from_otio(&written), Ok(timeline.clone()), "{target:?}");
+  }
+  // As written: every key of a metadata object in byte order, as
+  // OpenTimelineIO's own writer orders a dictionary's — `Resolve_OTIO`,
+  // `mediaio`, `zeta` — and every key of a namespace too.
+  let mut root = json::parse(&to_otio(&timeline, OtioTarget::V0_15Plus).unwrap()).unwrap();
+  assert_eq!(
+    keys(at(&mut root, "metadata")),
+    ["Resolve_OTIO", "mediaio", "zeta"]
+  );
+  assert_eq!(keys(at(&mut root, "metadata.zeta")), ["B", "a", "b"]);
+  assert_eq!(
+    *at(&mut root, "metadata.Resolve_OTIO"),
+    object(vec![("Note", text("the cut"))])
+  );
+  // A track and a track's marker write no word of the crate's here: the
+  // namespace alone.
+  for (owner, note) in [
+    (String::from(TRACK), "picture"),
+    (format!("{TRACK}.markers.0"), "act one"),
+  ] {
+    assert_eq!(
+      *at(&mut root, &format!("{owner}.metadata")),
+      object(vec![("Resolve_OTIO", object(vec![("Note", text(note))]))]),
+      "{owner}"
+    );
+  }
+  // A clip and a clip's marker write the namespace before the crate's
+  // words.
+  for owner in [String::from(A), format!("{A}.markers.0")] {
+    assert_eq!(
+      keys(at(&mut root, &format!("{owner}.metadata"))),
+      ["Resolve_OTIO", "mediaio"],
+      "{owner}"
+    );
+  }
+}
+
+#[test]
+fn an_empty_namespace_is_written_as_an_empty_object_and_reads_back_as_one() {
+  // Q752, as ruled: an object with no namespace writes none — the sample's
+  // track writes `{}` — while a namespace the model holds is written whole,
+  // `{}` where it holds no entry, so `from_otio` reads it back: the exact
+  // inverse both ways.
+  let mut root = written(OtioTarget::V0_15Plus);
+  assert_eq!(*at(&mut root, &format!("{TRACK}.metadata")), object(vec![]));
+  let mut root = json::parse(&to_otio(&with_readers(), OtioTarget::V0_15Plus).unwrap()).unwrap();
+  assert_eq!(
+    *at(&mut root, &format!("{B}.metadata.Resolve_OTIO")),
+    object(vec![])
+  );
+  // On each object that keeps namespaces, alone, for both targets.
+  let empty = || ReaderMetadata::new().with("Avid", Metadata::new());
+  let placed: [fn(&mut Timeline); 5] = [
+    |timeline| *timeline.readers_mut() = ReaderMetadata::new().with("Avid", Metadata::new()),
+    |timeline| {
+      *timeline.tracks_mut()[0].readers_mut() = ReaderMetadata::new().with("Avid", Metadata::new());
+    },
+    |timeline| {
+      *timeline.tracks_mut()[0].markers_mut()[0].readers_mut() =
+        ReaderMetadata::new().with("Avid", Metadata::new());
+    },
+    |timeline| {
+      *timeline.tracks_mut()[0].clips_mut()[1].readers_mut() =
+        ReaderMetadata::new().with("Avid", Metadata::new());
+    },
+    |timeline| {
+      *timeline.tracks_mut()[0].clips_mut()[0].markers_mut()[0].readers_mut() =
+        ReaderMetadata::new().with("Avid", Metadata::new());
+    },
+  ];
+  for (index, place) in placed.into_iter().enumerate() {
+    let mut timeline = sample();
+    place(&mut timeline);
+    for &target in TARGETS {
+      let written = to_otio(&timeline, target).unwrap();
+      assert_eq!(
+        from_otio(&written),
+        Ok(timeline.clone()),
+        "{index} {target:?}: {written}"
+      );
+    }
+  }
+  // A document stating one reads it as one, and writes it back.
+  let mut expected = sample();
+  *expected.tracks_mut()[0].readers_mut() = empty();
+  assert_eq!(
+    read(|root| set(root, &format!("{TRACK}.metadata"), "Avid", object(vec![]))),
+    Ok(expected),
+  );
+}
+
+#[test]
+fn a_namespace_holding_anything_but_strings_is_refused_by_name() {
+  // Q752, as ruled: a namespace holds strings, and any other value inside
+  // one is refused by name — so no number reaches the backstop's
+  // classifier there.
+  let owners = [
+    String::new(),
+    String::from(TRACK),
+    format!("{TRACK}.markers.0"),
+    String::from(A),
+    format!("{A}.markers.0"),
+  ];
+  let values = [
+    number("3"),
+    number("-0.0"),
+    Value::Bool(true),
+    Value::Null,
+    Value::Array(vec![text("a")]),
+    object(vec![("OTIO_SCHEMA", text("Marker.2"))]),
+  ];
+  for value in alike(values) {
+    for owner in &owners {
+      let namespace = object(vec![("Note", text("n")), ("Color", value.clone())]);
+      assert_eq!(
+        read(|root| set(
+          root,
+          &format!("{owner}.metadata"),
+          "Resolve_OTIO",
+          namespace
+        )),
+        Err(feature(
+          Feature::NamespaceValue("Color".into()),
+          &format!("{owner}.metadata.Resolve_OTIO.Color")
+        )),
+        "{owner}: {value:?}",
+      );
+    }
+  }
+  // A key beside `mediaio` whose value is no object is no namespace:
+  // another writer's note, refused by name.
+  for value in alike([
+    text("a note"),
+    number("3"),
+    Value::Array(vec![]),
+    Value::Null,
+  ]) {
+    assert_eq!(
+      read(|root| set(
+        root,
+        &format!("{A}.metadata"),
+        "Resolve_OTIO",
+        value.clone()
+      )),
+      Err(feature(
+        Feature::Metadata("Resolve_OTIO".into()),
+        &format!("{A}.metadata.Resolve_OTIO")
+      )),
+      "{value:?}",
+    );
+  }
+  // An object that keeps no namespace refuses any such key by name: the
+  // stack, a gap, a fade, a dissolve and a reference.
+  for owner in ["tracks", GAP, FADE_IN, DISSOLVE, A_MEDIA] {
+    assert_eq!(
+      read(|root| set(
+        root,
+        &format!("{owner}.metadata"),
+        "Resolve_OTIO",
+        object(vec![("Note", text("n"))])
+      )),
+      Err(feature(
+        Feature::Metadata("Resolve_OTIO".into()),
+        &format!("{owner}.metadata.Resolve_OTIO")
+      )),
+      "{owner}",
+    );
+  }
+  assert_eq!(
+    std::string::ToString::to_string(&feature(
+      Feature::NamespaceValue("Color".into()),
+      &format!("{A}.metadata.Resolve_OTIO.Color")
+    )),
+    "$.tracks.children[0].children[2].metadata.Resolve_OTIO.Color: the entry Color, which is no \
+     string: a reader's namespace holds strings alone"
+  );
+}
+
+#[test]
+fn a_namespace_validation_refuses_is_read_and_refused_and_never_written() {
+  // A namespace named `OTIO_SCHEMA`, or one holding that key — which
+  // OpenTimelineIO reads as a schema word — reads, and the timeline read
+  // does not validate; `mediaio` is the crate's own words, never one.
+  let a = MetadataAt::Clip(ClipAt::new(0, 0));
+  assert_eq!(
+    read(|root| set(
+      root,
+      &format!("{A}.metadata"),
+      "OTIO_SCHEMA",
+      object(vec![])
+    )),
+    Err(Unreadable::Validation(vec![Refusal::ReservedNamespace(
+      NamespaceAt::new(a, 0)
+    )])),
+  );
+  assert_eq!(
+    read(|root| set(
+      root,
+      &format!("{A}.metadata"),
+      "Resolve_OTIO",
+      object(vec![("OTIO_SCHEMA", text("Marker.2"))])
+    )),
+    Err(Unreadable::Validation(vec![Refusal::SchemaKeyInNamespace(
+      NamespaceAt::new(a, 0)
+    )])),
+  );
+  // And `to_otio` writes none of them, `mediaio` among them.
+  let at = NamespaceAt::new(
+    MetadataAt::Marker(MarkerAt::Track {
+      track: 0,
+      marker: 0,
+    }),
+    0,
+  );
+  for (readers, refusal) in [
+    (
+      ReaderMetadata::new().with("mediaio", Metadata::new()),
+      Refusal::ReservedNamespace(at),
+    ),
+    (
+      ReaderMetadata::new().with("OTIO_SCHEMA", Metadata::new()),
+      Refusal::ReservedNamespace(at),
+    ),
+    (
+      ReaderMetadata::new().with("Avid", Metadata::new().with("OTIO_SCHEMA", "Marker.2")),
+      Refusal::SchemaKeyInNamespace(at),
+    ),
+  ] {
+    let mut timeline = sample();
+    *timeline.tracks_mut()[0].markers_mut()[0].readers_mut() = readers;
+    assert_eq!(
+      to_otio(&timeline, OtioTarget::V0_15Plus),
+      Err(Refused::Validation(vec![refusal])),
+    );
+  }
 }

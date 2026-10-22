@@ -16,6 +16,7 @@
 //! | a [`Fade`](crate::Fade) | `Transition.1`, `SMPTE_Dissolve` against a gap — a gap of no length where the clip abuts a clip or a track's end |
 //! | a clip's [`id`](crate::Clip::id), gain, reel, the medium's rate, a fade's curve, [`Metadata`](crate::Metadata) | `metadata.mediaio`: `id`, `gain_db`, `reel`, `rate`, `fade` and `shape`, and `metadata` — the notes as an array of `[key, value]` pairs, never an object, so no key of the model's is a key a reader takes for a schema word (`OTIO_SCHEMA`) |
 //! | a [`Marker`](crate::Marker), on a track or a clip | `Marker.2` among the item's `markers`: `name`, `color` (OpenTimelineIO's capitals), `marked_range`, `comment` — a track's at the edit rate, a clip's in its medium's time |
+//! | other readers' [`ReaderMetadata`](crate::ReaderMetadata), on the timeline, a track, a clip or a marker | the object's `metadata`, beside `mediaio`: each namespace under its own key, an object of strings, written whole — `{}` for one holding no entry — every key in byte order, as OpenTimelineIO's own writer orders a dictionary's; an object with no namespace writes none |
 //! | the exact words a reader needs | `metadata.mediaio`: the edit rate (`rate`, `num/den`) on the timeline; on a clip, its reference and a clip's marker, the exact ruler a media-side range's counts are written in and the timebase the model counts it in (`source`, `available`, `range`); on a dissolve, its place among its track's transitions where the track keeps them out of their cuts' order (`order`); and the timebase of an edit-side value spelled otherwise than the edit rate's reciprocal — the timeline's `start`, a clip's `record`, a fade's or a track marker's `timebase`, a dissolve's `at`, `in_offset`, `out_offset` — so `1/24` beside a rate of `48/2` reads back as `1/24` |
 //!
 //! Every position on the record side is a whole count at the edit rate. A
@@ -846,7 +847,13 @@ impl core::error::Error for Shape {}
 /// one it models elsewhere is refused with its name and where it sits
 /// ([`Unreadable::Schema`]); a key, value or note of a modelled schema the
 /// timeline has no word for is refused by name too
-/// ([`Unreadable::Feature`]). A member is read only where the timeline keeps
+/// ([`Unreadable::Feature`]). On the timeline, a track, a clip and a
+/// marker, each key of the `metadata` beside `mediaio` is another reader's
+/// namespace, read whole into the object's
+/// [`ReaderMetadata`](crate::ReaderMetadata) — `{}` as an empty one — and
+/// refused by name where it is no object ([`Feature::Metadata`]) or holds a
+/// value that is no string ([`Feature::NamespaceValue`]); on every other
+/// object such a key is refused by name ([`Feature::Metadata`]). A member is read only where the timeline keeps
 /// it, or where OpenTimelineIO 0.17.0 holds it as it holds its absence:
 /// nothing is dropped — a `color` on an item and an `enabled` on a
 /// transition, which OpenTimelineIO keeps as dynamic fields, are refused by
@@ -1039,8 +1046,16 @@ pub enum Feature {
   /// A key the reader does not know on its object.
   Key(Utf8Bytes),
   /// A note in an object's `metadata` under a key other than this crate's
-  /// `mediaio`: another writer's, which the timeline does not keep.
+  /// `mediaio`: another writer's, which the timeline does not keep — on
+  /// an object that keeps no reader's namespace (the stack, a gap, a
+  /// transition, a media reference), or, on one that does (the timeline, a
+  /// track, a clip, a marker), one whose value is no object, which no
+  /// namespace is.
   Metadata(Utf8Bytes),
+  /// An entry of a reader's namespace whose value is no string: a
+  /// namespace holds strings alone ([`ReaderMetadata`](crate::ReaderMetadata)),
+  /// and the timeline keeps no other value there.
+  NamespaceValue(Utf8Bytes),
   /// A word under `mediaio` the reader does not know there.
   Word(Utf8Bytes),
   /// A name where the timeline keeps none: the stack's, other than
@@ -1102,6 +1117,10 @@ impl fmt::Display for Feature {
       Self::Metadata(key) => write!(
         f,
         "the note {key}, another writer's, which the timeline does not keep"
+      ),
+      Self::NamespaceValue(key) => write!(
+        f,
+        "the entry {key}, which is no string: a reader's namespace holds strings alone"
       ),
       Self::Word(word) => write!(f, "the word {word}, which this reader does not know there"),
       Self::Name(name) => write!(f, "the name {name:?}, where the timeline keeps none"),

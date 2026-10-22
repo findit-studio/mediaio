@@ -5,6 +5,8 @@ use mediatime::TimeRange;
 use serde::{Deserialize, Serialize};
 use smol_bytes::Utf8Bytes;
 
+use crate::ReaderMetadata;
+
 /// A named point or stretch of time noted on a [`Track`](crate::Track) or
 /// a [`Clip`](crate::Clip): OpenTimelineIO's `Marker`.
 ///
@@ -20,6 +22,11 @@ use smol_bytes::Utf8Bytes;
 /// either to a range no longer than `i64::MAX` ticks. Nothing holds a
 /// marker inside its owner's time: a clip's marker past its source range
 /// notes media the clip does not play.
+///
+/// Its [`readers`](Self::readers) are other readers' own metadata, written
+/// in OpenTimelineIO's `metadata` beside this crate's words: DaVinci
+/// Resolve reads a marker's note from `Resolve_OTIO`'s `Note`. On the wire
+/// they are written only when there are some.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
@@ -29,17 +36,23 @@ pub struct Marker {
   range: TimeRange,
   color: MarkerColor,
   comment: Utf8Bytes,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "ReaderMetadata::is_empty")
+  )]
+  readers: ReaderMetadata,
 }
 
 impl Marker {
   /// A marker named `name` over `range`: green, as OpenTimelineIO's are
-  /// by default, with no comment.
+  /// by default, with no comment and no reader's metadata.
   pub fn new(name: impl Into<Utf8Bytes>, range: TimeRange) -> Self {
     Self {
       name: name.into(),
       range,
       color: MarkerColor::Green,
       comment: Utf8Bytes::new(),
+      readers: ReaderMetadata::new(),
     }
   }
 
@@ -61,6 +74,16 @@ impl Marker {
   /// Its comment; empty when it has none.
   pub fn comment(&self) -> &str {
     self.comment.as_str()
+  }
+
+  /// Other readers' own metadata on the marker.
+  pub const fn readers(&self) -> &ReaderMetadata {
+    &self.readers
+  }
+
+  /// Other readers' own metadata on the marker, for editing in place.
+  pub const fn readers_mut(&mut self) -> &mut ReaderMetadata {
+    &mut self.readers
   }
 
   /// Renames the marker in place.
@@ -98,6 +121,13 @@ impl Marker {
   /// Sets the comment in place.
   pub fn set_comment(&mut self, comment: impl Into<Utf8Bytes>) -> &mut Self {
     self.comment = comment.into();
+    self
+  }
+
+  /// Replaces other readers' own metadata (consuming builder).
+  #[must_use]
+  pub fn with_readers(mut self, readers: ReaderMetadata) -> Self {
+    self.readers = readers;
     self
   }
 }

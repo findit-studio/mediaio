@@ -50,8 +50,9 @@ use crate::{Clip, ClipAt, Fade, Fades, IdClash, Timeline};
 ///
 /// Only clips are compared. The timeline's own words (name, rate, start,
 /// notes), a track's words (kind, name, enabled, markers), transitions, a
-/// clip's notes and markers, and its medium's words other than the locator
-/// are not.
+/// clip's notes and markers, its medium's words other than the locator, and
+/// other readers' metadata on any of them
+/// ([`ReaderMetadata`](crate::ReaderMetadata)) are not.
 ///
 /// ```
 /// use core::num::NonZeroI32;

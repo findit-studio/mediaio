@@ -47,7 +47,9 @@
 //! on a track whose transitions are kept out of their cuts' order, each
 //! dissolve's place among them (`order`). OpenTimelineIO's own fields stay
 //! the authority for every count; a reader holds each written rate to its
-//! exact word.
+//! exact word. Beside those words, in the same `metadata`, it writes each
+//! other reader's namespace the timeline, a track, a clip or a marker holds
+//! ([`ReaderMetadata`]), whole ([`metadata`]).
 
 use core::cmp::Reverse;
 use std::{collections::BTreeSet, vec, vec::Vec};
@@ -62,12 +64,10 @@ use super::{
 };
 use crate::{
   Clip, ClipAt, Edge, EdgeAt, Fade, FadeShape, Item, Layout, Marker, MarkerAt, MediaRef, Metadata,
-  Timeline, Track, TrackKind, TrackLayout, Transition, TransitionAt,
+  ReaderMetadata, Timeline, Track, TrackKind, TrackLayout, Transition, TransitionAt,
 };
 
-/// The key under which this crate's own words ride in an object's
-/// `metadata`.
-pub(super) const OURS: &str = "mediaio";
+pub(super) use crate::metadata::OURS;
 
 /// The key a `Clip.2` keeps its one media reference under.
 pub(super) const DEFAULT_MEDIA: &str = "DEFAULT_MEDIA";
@@ -118,7 +118,10 @@ pub(crate) fn timeline(
   rate.extend(spelled(timeline.start().timebase(), ticks).map(|start| ("start", start)));
   Ok(object(vec![
     ("OTIO_SCHEMA", text("Timeline.1")),
-    ("metadata", metadata(rate, timeline.metadata())),
+    (
+      "metadata",
+      metadata(rate, timeline.metadata(), timeline.readers()),
+    ),
     ("name", text(timeline.name())),
     ("global_start_time", rational_time(edit, start)),
     (
@@ -699,7 +702,10 @@ fn track(
     .collect();
   object(vec![
     ("OTIO_SCHEMA", text("Track.1")),
-    ("metadata", Value::Object(Vec::new())),
+    (
+      "metadata",
+      metadata(Vec::new(), &Metadata::new(), track.readers()),
+    ),
     ("name", text(track.name())),
     ("source_range", Value::Null),
     ("effects", Value::Array(Vec::new())),
@@ -753,7 +759,7 @@ fn clip(
         OtioTarget::Legacy => "Clip.1",
       }),
     ),
-    ("metadata", metadata(words, clip.metadata())),
+    ("metadata", metadata(words, clip.metadata(), clip.readers())),
     ("name", text(clip.name())),
     ("source_range", source.time_range()),
     ("effects", Value::Array(Vec::new())),
@@ -784,7 +790,10 @@ fn external_reference(media: &MediaRef, available: Option<Counted>, target: Otio
   }
   let mut members = vec![
     ("OTIO_SCHEMA", text("ExternalReference.1")),
-    ("metadata", metadata(words, &Metadata::new())),
+    (
+      "metadata",
+      metadata(words, &Metadata::new(), &ReaderMetadata::new()),
+    ),
     ("name", text("")),
     (
       "available_range",
@@ -832,7 +841,7 @@ fn fade_transition(fade: Fade, edge: Edge, Edit { edit, ticks }: Edit) -> Value 
   let mut words = vec![("fade", text(word)), ("shape", text(shape))];
   words.extend(spelled(fade.duration().timebase(), ticks).map(|timebase| ("timebase", timebase)));
   transition(
-    metadata(words, &Metadata::new()),
+    metadata(words, &Metadata::new(), &ReaderMetadata::new()),
     rational_time(edit, i128::from(in_offset)),
     rational_time(edit, i128::from(out_offset)),
   )
@@ -854,7 +863,7 @@ fn dissolve(transition: &Transition, Edit { edit, ticks }: Edit, order: Option<u
     words.extend(spelled(timebase, ticks).map(|spelled| (word, spelled)));
   }
   self::transition(
-    metadata(words, &Metadata::new()),
+    metadata(words, &Metadata::new(), &ReaderMetadata::new()),
     rational_time(edit, i128::from(transition.in_offset().ticks())),
     rational_time(edit, i128::from(transition.out_offset().ticks())),
   )
@@ -873,12 +882,16 @@ fn reordered(track: &Track) -> bool {
 /// A marker as `Marker.2`: its `range` counted in one ruler — the edit
 /// rate's, for a track's marker, with its timebase spelled where it is
 /// spelled otherwise than the edit rate's reciprocal (`timebase`); for a
-/// clip's, the ruler its plan chose, with its exact words (`range`).
+/// clip's, the ruler its plan chose, with its exact words (`range`) — and
+/// its readers' namespaces beside those words.
 fn marker(marker: &Marker, range: Counted, word: Option<(&'static str, Value)>) -> Value {
   let words = word.into_iter().collect();
   object(vec![
     ("OTIO_SCHEMA", text("Marker.2")),
-    ("metadata", metadata(words, &Metadata::new())),
+    (
+      "metadata",
+      metadata(words, &Metadata::new(), marker.readers()),
+    ),
     ("name", text(marker.name())),
     ("color", text(marker.color().otio_name())),
     ("marked_range", range.time_range()),
@@ -1196,15 +1209,28 @@ fn recount(range: TimeRange, length: Duration, rate: Rate) -> Option<Counted> {
 }
 
 /// The metadata object: this crate's own `words` and the model's `notes`
-/// under [`OURS`], or nothing when there are neither.
+/// under [`OURS`], where there are either, and beside them each other
+/// reader's namespace in `readers`, whole — `{}` for one holding no entry,
+/// as the model holds it — every key in byte order, as OpenTimelineIO's own
+/// writer orders a dictionary's; an empty object where there are none of
+/// them, so an object with no namespace writes what it wrote before
+/// namespaces existed.
 ///
 /// The notes are an array of `[key, value]` pairs, never an object: a
 /// note's key is anything the model was given, and OpenTimelineIO reads a
 /// dictionary carrying `OTIO_SCHEMA` as an object of that schema
 /// (`deserialization.cpp` 561–573 in 0.17.0) — a note keyed so would make
 /// the export a document OpenTimelineIO refuses. As strings in an array,
-/// keys are values, which no reader takes for a schema.
-fn metadata(mut words: Vec<(&'static str, Value)>, notes: &Metadata) -> Value {
+/// keys are values, which no reader takes for a schema. A namespace is
+/// written as its reader reads it, an object of strings: validation holds
+/// `OTIO_SCHEMA` out of its keys, and `mediaio` and `OTIO_SCHEMA` out of
+/// the namespaces' names, so no namespace is read as an object of a schema
+/// or takes the place of this crate's words.
+fn metadata(
+  mut words: Vec<(&'static str, Value)>,
+  notes: &Metadata,
+  readers: &ReaderMetadata,
+) -> Value {
   if !notes.is_empty() {
     let notes = notes
       .iter()
@@ -1212,11 +1238,21 @@ fn metadata(mut words: Vec<(&'static str, Value)>, notes: &Metadata) -> Value {
       .collect();
     words.push(("metadata", Value::Array(notes)));
   }
-  if words.is_empty() {
-    Value::Object(Vec::new())
-  } else {
-    object(vec![(OURS, object(words))])
+  let mut members: Vec<(Utf8Bytes, Value)> = readers
+    .iter()
+    .map(|(namespace, entries)| {
+      let entries = entries
+        .iter()
+        .map(|(key, value)| (Utf8Bytes::from(key), text(value)))
+        .collect();
+      (Utf8Bytes::from(namespace), Value::Object(entries))
+    })
+    .collect();
+  if !words.is_empty() {
+    let place = members.partition_point(|(namespace, _)| namespace.as_str() < OURS);
+    members.insert(place, (Utf8Bytes::from_static(OURS), object(words)));
   }
+  Value::Object(members)
 }
 
 /// `count` ticks of `ruler`: its rate as [`rate`] writes one, and the count

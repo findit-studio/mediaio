@@ -9,7 +9,33 @@ Its versions are its own: they do not move with `mediadecode`'s.
 
 ## [0.4.0] - unreleased
 
+### Added
+
+- **Other readers' own metadata: `ReaderMetadata`**, on the timeline, a
+  track, a clip and a marker (`readers`, `readers_mut`, `with_readers`).
+  Under each reader's namespace — `Resolve_OTIO`, say — it holds a
+  `Metadata` of that reader's words, which `to_otio` writes in the object's
+  OpenTimelineIO `metadata` beside the crate's own `mediaio` — whole, `{}`
+  for a namespace with no entry, every key in byte order — and `from_otio`
+  reads back exactly. DaVinci Resolve 21.1 reads a marker's note from
+  `Resolve_OTIO`'s `Note` alone, not from `comment`
+  (findit-studio/application#265); the crate interprets no namespace. A
+  namespace holds strings alone: `from_otio` refuses any other value inside
+  one by name (`Feature::NamespaceValue`). `validate` refuses a namespace
+  named `mediaio` or `OTIO_SCHEMA` (`Refusal::ReservedNamespace`) and a key
+  `OTIO_SCHEMA` inside one (`Refusal::SchemaKeyInNamespace`), which
+  OpenTimelineIO reads as a schema word, each at a `NamespaceAt` of a
+  `MetadataAt`. An object with no namespace writes the document 0.3.0
+  wrote, and with `serde` the `readers` are written only where there are
+  some.
+
 ### Changed
+
+- **`from_otio` reads a reader's namespace** where 0.3.0 refused it: a key
+  of the timeline's, a track's, a clip's or a marker's `metadata` beside
+  `mediaio` whose value is an object. It still refuses such a key by name
+  (`Feature::Metadata`) on every other object, and where its value is no
+  object.
 
 - **BREAKING: `MisreadNumber::Count` is gone.** `to_otio` writes every
   count within ±2^53 in a spelling OpenTimelineIO 0.17's reader reads
