@@ -2290,6 +2290,43 @@ fn h264_parameters() -> codec::Parameters {
   parameters
 }
 
+/// **Under `skip_frame = all` the probe never runs**: no picture will come
+/// to prove a backend by, so the open commits the first backend that opens,
+/// before any packet, with nothing held for a replay. Under every other
+/// skip the probe runs from the open, those that may leave a stream with no
+/// picture among them, until a picture or an end with none.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn skipping_every_picture_commits_the_backend_at_open() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let open = |skip: crate::Discard| {
+    VideoDecoder::open_probing(
+      h264_parameters(),
+      crate::limits::DecoderLimits::default(),
+      crate::DecoderOptions::new().with_skip_frame(skip),
+      None,
+      backend::probe_order(),
+    )
+    .expect("the decoder opens")
+  };
+  let all = open(crate::Discard::All);
+  assert_eq!(all.phase(), SessionPhase::Streaming, "committed at open");
+  assert!(all.probe.is_none(), "nothing held for a replay");
+  assert_eq!(all.backend(), Backend::VideoToolbox);
+  for skip in [
+    crate::Discard::Default,
+    crate::Discard::NonReference,
+    crate::Discard::NonIntra,
+    crate::Discard::NonKey,
+  ] {
+    assert_eq!(
+      open(skip).phase(),
+      SessionPhase::Auditioning,
+      "{skip}: the probe runs"
+    );
+  }
+}
+
 /// What a decoder opened as, read the way the two laws below read it:
 /// whether it probes, its backend and its limits; the packet timebase and
 /// the three skips its context holds, as raw integers; and the options it
