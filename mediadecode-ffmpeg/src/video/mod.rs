@@ -543,6 +543,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let hw_scratch = Frame::empty()?;
     let sw_scratch = alloc_av_video_frame()?;
     let state = match path {
+      // **Under `skip_frame = all` no picture comes**: none to prove a
+      // hardware backend by, and none hardware would speed. `Auto` opens
+      // software at once, where its probe would end up after exhausting
+      // every backend on a stream that never gives a picture.
+      DecodePath::Auto if options.skip_frame() == crate::Discard::All => DecodeState::Sw(
+        open_sw_decoder(&owned_parameters, limits, options, Some(time_base))?,
+      ),
       DecodePath::Auto => match VideoDecoder::open_probing(
         try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
         limits,
@@ -550,7 +557,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         Some(time_base),
         order,
       ) {
-        Ok(hw) => DecodeState::Hw(Box::new(hw)),
+        // A clean end with no picture, under a skip policy that may leave
+        // a stream with none, comes back as the probe's exhaustion, so
+        // `Auto` replays the history through software and ends there, as
+        // it opens there under `skip_frame = all`.
+        Ok(mut hw) => {
+          hw.hand_back_an_empty_end();
+          DecodeState::Hw(Box::new(hw))
+        }
         Err(Error::AllBackendsFailed(_)) => {
           // Open-time HW exhaustion: no rescued packets (open didn't
           // see any). Just open SW directly from our owned copy.

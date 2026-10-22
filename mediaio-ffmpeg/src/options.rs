@@ -138,6 +138,19 @@ impl FromStr for Discard {
 /// this is what it does. The defaults are libavcodec's: [`Discard::Default`]
 /// for each.
 ///
+/// **`skip_frame` = [`Discard::All`] decodes no picture**, so
+/// `mediadecode-ffmpeg`'s decoders run no hardware probe under it — a probe
+/// commits a backend on its first picture, and none comes. An unpinned
+/// stream decoder (`DecodePath::Auto`) opens software at once; one held to
+/// hardware (`DecodePath::AnyHardware`), and the standalone decoder's probe,
+/// commit to the first backend that opens; a pinned backend opens as asked.
+/// Each drains to its end with no picture, cleanly. Under
+/// [`Discard::NonIntra`] and [`Discard::NonKey`] a stream may give no
+/// picture too — one with no intra, or no key, picture — so the probe runs
+/// while pictures come, and a clean end, or a probe that fills, with none is
+/// the stream's end: the backend that opened is committed, and an unpinned
+/// stream decoder ends on software.
+///
 /// Marked `#[non_exhaustive]`: a later setting joins as a field, read and
 /// set through its own methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

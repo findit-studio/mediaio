@@ -18,14 +18,24 @@ Its versions are its own: they do not move with the rest of the family's.
   later:
   - H.264: at least one slice, every slice of `nal_ref_idc` 0, none an
     IDR, and nothing beside them but access unit delimiters, filler data
-    and SEI units of picture timing and filler payload alone;
-  - HEVC: every slice a sub-layer non-reference type of layer 0 at the
-    highest temporal sub-layer, learned from every SPS and VPS FFmpeg's
-    splitter may read and from the record's `numTemporalLayers`, and
-    nothing beside them but delimiters, filler data and SEI units of
-    filler payload and decoded picture hash alone. Unlike FFmpeg's own
-    `AVDISCARD_NONREF`, which skips sub-layer non-reference pictures at
-    every sub-layer, it never marks one a higher sub-layer may reference.
+    and SEI units of picture timing and filler payload alone — and only
+    while every sequence parameter set FFmpeg's decoder may read codes
+    frames only (`frame_mbs_only_flag` 1, in each of the three readings it
+    may adopt of one), since FFmpeg joins a frame's two fields across
+    packets: before one is read, and from the first that lets fields in,
+    nothing is marked (`frames_only` says which);
+  - HEVC: every slice a sub-layer non-reference type FFmpeg decodes
+    (TRAIL_N, TSA_N, STSA_N, RADL_N, RASL_N) of layer 0 at the highest
+    temporal sub-layer, learned from every SPS and VPS FFmpeg's splitter
+    may read and from the record's `numTemporalLayers`, and nothing beside
+    them but delimiters, filler data and SEI units of filler payload alone.
+    Unlike FFmpeg's own `AVDISCARD_NONREF`, which skips sub-layer
+    non-reference pictures at every sub-layer, it never marks one a higher
+    sub-layer may reference.
+
+  Parameter sets are learned from every packet a decoder reads, one the
+  reading cannot frame included: that one in every framing a decoder may
+  read it in.
 
   The framing is FFmpeg's decoder's own state — whether lengths are read,
   and their size, kept apart — moved where FFmpeg moves it: by the
@@ -41,9 +51,10 @@ Its versions are its own: they do not move with the rest of the family's.
   Anything else keeps the packet, with the reason (`KeptReason`): a
   reference or random-access picture, a parameter set, an SEI unit of any
   other message, or an end, an extension's NAL unit, a picture below the
-  highest sub-layer or before any SPS, a packet that does not parse — a
-  length-framed unit holding a start code among them — a configuration
-  record, a switch of framing, and a framing unknown or unset. `NalCodec`
+  highest sub-layer or before any SPS, an H.264 picture that may be a
+  field, a packet that does not parse — a length-framed unit holding a
+  start code among them — a configuration record, a switch of framing, and
+  a framing unknown or unset. `NalCodec`
   names the two codecs read; every other codec is unclassified.
 
 ### Changed

@@ -41,7 +41,16 @@ The backend-agnostic core it adapts has its own log at
   software decoder and a fallback's — and read back by `options()`. On a
   temporally scalable HEVC stream `Discard::NonReference` also skips
   pictures a higher sub-layer references, which the bitstream's
-  `DISPOSABLE` never marks.
+  `DISPOSABLE` never marks. Under `skip_frame` = `Discard::All`, which
+  decodes no picture, no hardware probe runs, since a probe commits on its
+  first picture: an unpinned session (`DecodePath::Auto`) opens software at
+  once, `DecodePath::AnyHardware` and the standalone decoder's probe commit
+  to the first backend that opens, and a pinned backend opens as asked.
+  Each drains to its end with no picture. Under `Discard::NonIntra` and
+  `Discard::NonKey` a stream may give no picture too (one with no intra or
+  no key picture): the probe runs as ever while pictures come, and a clean
+  end, or a probe that fills, with none is the stream's end. The backend
+  that opened is committed, and `DecodePath::Auto` ends on software.
 - **One open road per video decoder, through an open request.** Each
   request holds every optional of its decoder's construction, with a
   getter, a consuming `with_*` and an in-place `set_*`, and is

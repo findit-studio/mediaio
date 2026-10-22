@@ -23,6 +23,9 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   behaviour, and `mediadecode-ffmpeg` writes them into every video
   `AVCodecContext` a decoder opened with them opens, through each video
   decoder's open request (`VideoStreamDecoderOpen`, `VideoDecoderOpen`).
+  Under `skip_frame` = `all` those decoders run no hardware probe: no
+  picture comes to commit one on. Under `nonintra` and `nonkey`, where a
+  stream may give none either, an end with no picture is the stream's.
 
 ## [0.19.0] - 2026-10-16
 
