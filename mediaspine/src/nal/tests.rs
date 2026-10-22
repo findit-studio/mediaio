@@ -341,6 +341,13 @@ fn picture_hash() -> Vec<u8> {
   sei_message(132, &[0; 17])
 }
 
+/// A film grain characteristics message that does not persist: no
+/// component, `film_grain_characteristics_persistence_flag` 0, then the
+/// payload's alignment bits (H.265 D.2.21, D.2.1).
+fn film_grain() -> Vec<u8> {
+  sei_message(19, &[0x00, 0x02])
+}
+
 /// `nals` each after a big-endian length of `size` bytes.
 fn lengths(size: usize, nals: &[Vec<u8>]) -> Vec<u8> {
   let mut out = Vec::new();
@@ -408,8 +415,8 @@ fn kept(reason: KeptReason) -> Verdict {
 /// below read the packets after it.
 fn h264(extradata: &[u8]) -> NalStream {
   let mut stream = NalStream::new(NalCodec::H264, extradata);
-  stream.reference_seen = true;
-  stream.intra_seen = true;
+  stream.pending.reference_seen = true;
+  stream.pending.intra_seen = true;
   stream
 }
 
@@ -417,7 +424,7 @@ fn h264(extradata: &[u8]) -> NalStream {
 /// `eos` the decoder opens with: the laws below read the packets after it.
 fn hevc_stream(extradata: &[u8]) -> NalStream {
   let mut stream = NalStream::new(NalCodec::Hevc, extradata);
-  stream.sequence_start = false;
+  stream.pending.sequence_start = false;
   stream
 }
 
@@ -1836,6 +1843,308 @@ fn an_hevc_picture_that_may_take_up_what_an_earlier_packet_left_is_kept() {
   assert_eq!(read(&mut stream, &[slnr()]), Verdict::Disposable);
 }
 
+/// HEVC NAL units of two-byte lengths, as the records of the laws below
+/// frame them.
+fn read2(stream: &mut NalStream, nals: &[Vec<u8>]) -> Verdict {
+  stream.read(&lengths(2, nals))
+}
+
+/// The first slice segment of an HEVC picture of `nal_unit_type`, layer 0,
+/// TemporalId 0.
+fn hevc_slice(nal_unit_type: u8) -> Vec<u8> {
+  hevc(nal_unit_type, 0, 0, &[0xAF])
+}
+
+#[test]
+fn an_hevc_record_mid_stream_leaves_its_sei_for_the_next_picture_decoded() {
+  // FFmpeg reads a packet's `AV_PKT_DATA_NEW_EXTRADATA` before the packet,
+  // its SEI units into the state the next picture it decodes takes up
+  // (`hevc/hevcdec.c` 3855–3860, `hevc/parse.c` 59–64). After a CRA that
+  // starts a sequence its RASL pictures are skipped (`hevc/hevcdec.c`
+  // 3542–3547), so a record riding on one leaves its film grain for the
+  // picture after: that picture is not disposable.
+  for sei in [
+    hevc_sei(39, 0, &[film_grain()]),
+    hevc_sei(40, 0, &[picture_hash()]),
+    // User data, of layer 1.
+    hevc(
+      39,
+      1,
+      0,
+      &escaped(&sei_rbsp(&[sei_message(5, &[0x42; 16])])),
+    ),
+  ] {
+    let record = hvcc(0, 1, &[hevc_sps(0), sei.clone()]);
+    let mut stream = hevc_stream(&hvcc(0, 1, &[hevc_sps(0)]));
+    assert_eq!(
+      read2(&mut stream, &[hevc_slice(21)]),
+      kept(KeptReason::RandomAccess)
+    );
+    assert_eq!(
+      stream.read_with_record(&lengths(2, &[hevc_slice(9)]), Some(&record)),
+      kept(KeptReason::Referenced)
+    );
+    assert_eq!(
+      read2(&mut stream, &[hevc_slice(0)]),
+      kept(KeptReason::CarriedOver),
+      "{sei:x?}"
+    );
+    // That picture, kept, took it up.
+    assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+    // A record read apart from its packet is pending for the packet after.
+    let mut stream = hevc_stream(&hvcc(0, 1, &[hevc_sps(0)]));
+    stream.reconfigure(&record);
+    assert_eq!(
+      read2(&mut stream, &[hevc_slice(9)]),
+      kept(KeptReason::Referenced)
+    );
+    assert_eq!(
+      read2(&mut stream, &[hevc_slice(0)]),
+      kept(KeptReason::CarriedOver),
+      "{sei:x?}"
+    );
+  }
+  // A record of start codes, too.
+  let mut stream = hevc_stream(&annex_b(&[hevc_sps(0)]));
+  stream.reconfigure(&annex_b(&[hevc_sps(0), hevc_sei(39, 0, &[film_grain()])]));
+  assert_eq!(
+    stream.read(&annex_b(&[hevc_slice(9)])),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    stream.read(&annex_b(&[hevc_slice(0)])),
+    kept(KeptReason::CarriedOver)
+  );
+  // A record whose SEI is filler payload alone leaves nothing.
+  let mut stream = hevc_stream(&hvcc(0, 1, &[hevc_sps(0)]));
+  let filled = hvcc(0, 1, &[hevc_sps(0), hevc_sei(39, 0, &[filler()])]);
+  assert_eq!(
+    stream.read_with_record(&lengths(2, &[hevc_slice(9)]), Some(&filled)),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+}
+
+#[test]
+fn an_hevc_opening_record_leaves_its_sei_for_the_first_picture_decoded() {
+  // FFmpeg's decoder reads the record it opens with, its SEI units into the
+  // state the first picture it decodes takes up (`hevc/hevcdec.c`
+  // 4168–4174, `hevc/parse.c` 59–64).
+  for sei in [
+    hevc_sei(39, 0, &[film_grain()]),
+    hevc_sei(40, 0, &[picture_hash()]),
+  ] {
+    let record = hvcc(0, 1, &[hevc_sps(0), sei.clone()]);
+    // A first packet that holds no picture leaves it for the next.
+    let mut stream = NalStream::new(NalCodec::Hevc, &record);
+    assert_eq!(
+      read2(&mut stream, &[hevc(35, 0, 0, &[0x50])]),
+      kept(KeptReason::NoPicture)
+    );
+    assert_eq!(
+      read2(&mut stream, &[hevc_slice(0)]),
+      kept(KeptReason::CarriedOver),
+      "{sei:x?}"
+    );
+    assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+    // A first picture takes it up.
+    let mut stream = NalStream::new(NalCodec::Hevc, &record);
+    assert_eq!(
+      read2(&mut stream, &[hevc_slice(21)]),
+      kept(KeptReason::RandomAccess)
+    );
+    assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+  }
+  // A record with no SEI leaves nothing.
+  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 1, &[hevc_sps(0)]));
+  assert_eq!(
+    read2(&mut stream, &[hevc(35, 0, 0, &[0x50])]),
+    kept(KeptReason::NoPicture)
+  );
+  assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+}
+
+#[test]
+fn a_decoder_opened_afresh_at_a_seek_reads_the_opening_record_s_sei_again() {
+  let record = hvcc(0, 1, &[hevc_sps(0), hevc_sei(39, 0, &[film_grain()])]);
+  let mut stream = NalStream::new(NalCodec::Hevc, &record);
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(21)]),
+    kept(KeptReason::RandomAccess)
+  );
+  assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+  stream.seeked();
+  assert_eq!(
+    read2(&mut stream, &[hevc(35, 0, 0, &[0x50])]),
+    kept(KeptReason::NoPicture)
+  );
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(0)]),
+    kept(KeptReason::CarriedOver)
+  );
+  assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+  // A stream that opened with none has none pending after a seek.
+  let mut stream = NalStream::new(NalCodec::Hevc, &hvcc(0, 1, &[hevc_sps(0)]));
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(21)]),
+    kept(KeptReason::RandomAccess)
+  );
+  stream.seeked();
+  assert_eq!(
+    read2(&mut stream, &[hevc(35, 0, 0, &[0x50])]),
+    kept(KeptReason::NoPicture)
+  );
+  assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+}
+
+#[test]
+fn the_packet_after_an_hevc_record_may_go_unread() {
+  // A record the HEVC decoder reads mid-stream may fail — one whose array
+  // runs past its end always (`hevc/parse.c` 115–118), and under
+  // `AV_EF_EXPLODE` one a parameter set or SEI unit of which does not
+  // decode (71–74) — and it then returns before the packet
+  // (`hevc/hevcdec.c` 3855–3860). Whatever is pending before the packet
+  // stays pending after it.
+  let plain = hvcc(0, 1, &[hevc_sps(0)]);
+  let short = &plain[..plain.len() - 1];
+  let user_data = hevc_sei(39, 0, &[sei_message(5, &[0x42; 16])]);
+  for record in [&plain[..], short] {
+    // SEI state a RASL picture the decoder skips leaves, which a picture the
+    // decoder may not read cannot take up.
+    let mut stream = hevc_stream(&plain);
+    assert_eq!(
+      read2(&mut stream, &[user_data.clone(), hevc_slice(9)]),
+      kept(KeptReason::Companion(39))
+    );
+    assert_eq!(
+      stream.read_with_record(&lengths(2, &[hevc_slice(1)]), Some(record)),
+      kept(KeptReason::Referenced)
+    );
+    assert_eq!(
+      read2(&mut stream, &[hevc_slice(0)]),
+      kept(KeptReason::CarriedOver),
+      "{record:x?}"
+    );
+    assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+  }
+  // Nor can it take up the record's own SEI.
+  let grain = hvcc(0, 1, &[hevc_sps(0), hevc_sei(39, 0, &[film_grain()])]);
+  let mut stream = hevc_stream(&plain);
+  assert_eq!(
+    stream.read_with_record(&lengths(2, &[hevc_slice(1)]), Some(&grain)),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(0)]),
+    kept(KeptReason::CarriedOver)
+  );
+  assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+  // The `eos` an end of sequence left waits past a packet that may go
+  // unread.
+  let mut stream = hevc_stream(&plain);
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(0), hevc(36, 0, 0, &[])]),
+    kept(KeptReason::Companion(36))
+  );
+  assert_eq!(
+    stream.read_with_record(&lengths(2, &[hevc_slice(0)]), Some(&plain)),
+    kept(KeptReason::SequenceStart)
+  );
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(0)]),
+    kept(KeptReason::SequenceStart)
+  );
+  assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+  // So does a recovery, past an IRAP picture that may go unread.
+  let recovery = hevc_sei(39, 0, &[sei_message(6, &[0x80])]);
+  let mut stream = hevc_stream(&plain);
+  assert_eq!(
+    read2(&mut stream, &[recovery.clone(), hevc_slice(1)]),
+    kept(KeptReason::Companion(39))
+  );
+  assert_eq!(
+    stream.read_with_record(&lengths(2, &[hevc_slice(21)]), Some(&plain)),
+    kept(KeptReason::RandomAccess)
+  );
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(0)]),
+    kept(KeptReason::Recovering)
+  );
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(21)]),
+    kept(KeptReason::RandomAccess)
+  );
+  assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+  // A record of no bytes the decoder does not read (`hevc/hevcdec.c`
+  // 3856): its packet is read.
+  let mut stream = hevc_stream(&plain);
+  assert_eq!(
+    read2(&mut stream, &[recovery, hevc_slice(1)]),
+    kept(KeptReason::Companion(39))
+  );
+  assert_eq!(
+    stream.read_with_record(&lengths(2, &[hevc_slice(21)]), Some(&[])),
+    kept(KeptReason::RandomAccess)
+  );
+  assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+}
+
+#[test]
+fn a_recovery_point_of_any_layer_starts_a_recovery() {
+  // FFmpeg's decoder reads an SEI unit of every layer into its SEI state
+  // (`hevc/hevcdec.c` 3587–3631), a recovery point of a layer above 0
+  // among them.
+  let recovery = hevc(39, 1, 0, &escaped(&sei_rbsp(&[sei_message(6, &[0x80])])));
+  let mut stream = hevc_stream(&hvcc(0, 1, &[hevc_sps(0)]));
+  assert_eq!(
+    read2(&mut stream, &[recovery.clone(), hevc_slice(1)]),
+    kept(KeptReason::Extension)
+  );
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(0)]),
+    kept(KeptReason::Recovering)
+  );
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(21)]),
+    kept(KeptReason::RandomAccess)
+  );
+  assert_eq!(read2(&mut stream, &[hevc_slice(0)]), Verdict::Disposable);
+  // A record's, of any layer.
+  let mut stream = hevc_stream(&hvcc(0, 1, &[hevc_sps(0)]));
+  stream.reconfigure(&hvcc(0, 1, &[hevc_sps(0), recovery]));
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(1)]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read2(&mut stream, &[hevc_slice(0)]),
+    kept(KeptReason::Recovering)
+  );
+}
+
+#[test]
+fn an_h264_record_s_sei_is_read_by_no_decoder() {
+  // FFmpeg's H.264 decoder reads a record's parameter sets alone
+  // (`h264_parse.c` 380–409) — the one it opens with, a packet's
+  // `AV_PKT_DATA_NEW_EXTRADATA` and a packet that is an `avcC` alike
+  // (`h264dec.c` 399–412, 1038–1050) — and its SEI state lasts one access
+  // unit (593–598): an SEI unit in a record leaves nothing pending.
+  let record = annex_b(&[
+    avc_sps(),
+    avc(3, 8, &[0xEE, 0x3C, 0x80]),
+    avc_sei(&[sei_message(5, &[0x42; 16])]),
+  ]);
+  let mut stream = h264(&record);
+  assert_eq!(stream.read(&annex_b(&[b_slice()])), Verdict::Disposable);
+  assert_eq!(
+    stream.read_with_record(&annex_b(&[p_slice()]), Some(&record)),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(stream.read(&annex_b(&[b_slice()])), Verdict::Disposable);
+  stream.reconfigure(&record);
+  assert_eq!(stream.read(&annex_b(&[b_slice()])), Verdict::Disposable);
+}
+
 /// SplitMix64, for the property below: fixed seeds, the same draws on
 /// every platform.
 struct Seeded(u64);
@@ -1947,9 +2256,9 @@ fn a_packet_holding_anything_that_may_be_needed_is_never_marked() {
       NalCodec::H264
     };
     let mut stream = NalStream::new(codec, &extradata);
-    stream.reference_seen = true;
-    stream.intra_seen = true;
-    stream.sequence_start = false;
+    stream.pending.reference_seen = true;
+    stream.pending.intra_seen = true;
+    stream.pending.sequence_start = false;
     let verdict = stream.read(&packet);
     assert_eq!(
       verdict.is_disposable(),

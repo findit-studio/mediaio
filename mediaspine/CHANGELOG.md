@@ -37,9 +37,14 @@ Its versions are its own: they do not move with the rest of the family's.
     may read and from the record's `numTemporalLayers`, and nothing beside
     them but delimiters, filler data and SEI units of filler payload alone;
     not in the first packet after the opening, a seek or an end of
-    sequence, which takes up FFmpeg's `eos`, while a recovery point may be
-    pending, or while SEI state or a Dolby Vision RPU that an earlier
-    packet left may be pending for the next picture decoded.
+    sequence, which takes up FFmpeg's `eos`, while a recovery point (of
+    any layer) may be pending, or while SEI state or a Dolby Vision RPU
+    may be pending for the next picture decoded — left by an earlier
+    packet, or by a configuration record: the one the decoder opens with,
+    which a decoder opened afresh at a seek reads again, and one a packet
+    carries, read before it. A packet that follows an HEVC record leaves
+    pending whatever was pending before it, since a record that fails
+    returns before the decoder reads its packet.
     Unlike FFmpeg's own `AVDISCARD_NONREF`, which skips sub-layer
     non-reference pictures at every sub-layer, it never marks one a higher
     sub-layer may reference.

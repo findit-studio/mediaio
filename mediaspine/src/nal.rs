@@ -263,12 +263,35 @@
 //! | H.264 SEI state | reset per access unit, `h264dec.c` 593–598 | no: a riding SEI is one the picture alone takes up ([SEI](#sei)) | — |
 //! | HEVC `poc_tid0` | TemporalId-0 pictures but SLNR, RASL, RADL, `hevc/hevcdec.c` 3297–3306 | no | — |
 //! | HEVC `no_rasl_output_flag`, which skips RASL pictures | IRAP pictures, `hevc/hevcdec.c` 3283–3287, 3545–3546 | no | — |
-//! | HEVC `recovery_poc` | any picture of the recovery's count, `hevc/hevcdec.c` 3289–3294 | whether the pictures decoded before it are output, `hevc/refs.c` 239–242 | no recovery point SEI since the last IRAP picture the decoder decodes, of types 16–21 ([`KeptReason::Recovering`]) |
+//! | HEVC `recovery_poc` | any picture of the recovery's count, `hevc/hevcdec.c` 3289–3294 | whether the pictures decoded before it are output, `hevc/refs.c` 239–242 | no recovery point SEI — of any layer, a packet's or a record's — since the last IRAP picture the decoder decodes, of types 16–21 ([`KeptReason::Recovering`]) |
 //! | HEVC reference marking | every picture's RPS, `hevc/refs.c` | no: a later picture's RPS holds no picture an earlier one dropped (8.3.2) | — |
 //! | HEVC output and bumping | `hevc/refs.c`, by the SPS's reorder and DPB sizes | only when each picture comes out | — |
-//! | HEVC SEI state and the Dolby Vision RPU that a picture takes up: captions, AFD, LCEVC, time codes, film grain that does not persist, user data, the decoded picture hash, the RPU | the next picture decoded, `hevc/hevcdec.c` 3068–3151, 3505–3512, 3723–3760; `h2645_sei.c` 518–695 | that picture's side data, its film grain and its hash check, where a packet whose picture the decoder does not decode — a RASL picture it skips, a reserved type, none at all — left them | nothing pending: since such a packet, a picture of a type the decoder always decodes has been read ([`KeptReason::CarriedOver`]); beside a picture, only filler payload rides ([SEI](#sei)) |
+//! | HEVC SEI state and the Dolby Vision RPU that a picture takes up: captions, AFD, LCEVC, time codes, film grain that does not persist, user data, the decoded picture hash, the RPU | the next picture decoded, `hevc/hevcdec.c` 3068–3151, 3505–3512, 3723–3760; `h2645_sei.c` 518–695 | that picture's side data, its film grain and its hash check, where a packet whose picture the decoder does not decode — a RASL picture it skips, a reserved type, none at all — left them, or a configuration record did, whose SEI the decoder reads before the packet that carries it ([the census](#one-census-every-road)) | nothing pending: since such a packet or record, a picture of a type the decoder always decodes has been read ([`KeptReason::CarriedOver`]); beside a picture, only filler payload rides ([SEI](#sei)) |
 //! | HEVC `eos`, `last_eos` | set by an EOS or EOB unit, a flush and the decoder's opening, and taken up by the next packet read, `hevc/hevcdec.c` 3687–3720, 4161, 4194 | whether the next CRA picture starts a sequence, its RASL pictures skipped (3283–3287, 786–787) | not the first packet after the opening, a seek, or a packet that may hold an EOS or EOB unit ([`KeptReason::SequenceStart`]) |
 //! | the framing, parameter sets | [Framing](#framing); VPS, SPS, PPS | yes: their packets are kept | — |
+//!
+//! # One census, every road
+//!
+//! What is pending for later pictures — the SEI state and the RPU the next
+//! picture decoded takes up, a recovery point, the `eos` the next packet
+//! takes up, and what H.264 awaits after a flush — is moved by one census of
+//! the NAL units the decoder reads, whatever road they come by, H.264's and
+//! HEVC's alike:
+//!
+//! | road | the units the census takes up | what the decoder takes up of them |
+//! |---|---|---|
+//! | the record the decoder opens with ([`NalStream::new`]); again at a seek, where a decoder opened afresh reads it ([`NalStream::seeked`]) | every unit its splitter may read in the record | H.264: the parameter sets alone (`h264_parse.c` 380–409). HEVC: the parameter sets, and the SEI units, prefix and suffix, of any layer, which wait for the first picture it decodes (`hevc/parse.c` 39–67, `hevc/hevcdec.c` 4161–4174) |
+//! | a record mid-stream ([`NalStream::reconfigure`]): a packet's `AV_PKT_DATA_NEW_EXTRADATA` ([`NalStream::read_with_record`]), an H.264 packet that is an `avcC` | the same | the same, before the packet that carries it (`h264dec.c` 1038–1050, `hevc/hevcdec.c` 3855–3860) |
+//! | a packet the reading reads whole | its units, in order | each as its type says |
+//! | a packet it does not: one that does not parse, that switches the framing, or that comes while the framing is unknown, unset or lost | every unit a decoder's splitter may read in it, in each framing one may read it in | anything: SEI state, an end of sequence or a recovery point may be left behind, and nothing the packet would take up or prove counts |
+//!
+//! An HEVC record mid-stream that fails — an array that runs past the
+//! record's end (`hevc/parse.c` 115–118), or under `AV_EF_EXPLODE` a
+//! parameter set or SEI unit that does not decode (71–74) — returns before
+//! the decoder reads the packet that carries it (`hevc/hevcdec.c`
+//! 3855–3860). The reading cannot know the decoder's `err_recognition`, so
+//! whatever was pending before a packet that follows an HEVC record stays
+//! pending after it.
 //!
 //! # The rule
 //!
@@ -300,13 +323,16 @@
 //!   alone;
 //! - it is not the first packet after the reading opened or was sought,
 //!   nor the first after a packet that may hold an end of sequence or of
-//!   bitstream;
-//! - no recovery point SEI has been read since the last IRAP picture of
-//!   layer 0 the decoder decodes (types 16–21);
-//! - nothing is pending for it to take up: after every prefix SEI unit
-//!   other than one of filler payload alone, a picture of a type the
-//!   decoder always decodes (TRAIL, TSA, STSA, RADL, IRAP) has begun, and
-//!   every such suffix SEI unit, and every RPU, had one in its own packet.
+//!   bitstream, or that the decoder may not have read;
+//! - no recovery point SEI, of any layer, a packet's or a record's, has
+//!   been read since the last IRAP picture of layer 0 the decoder decodes
+//!   (types 16–21) in a packet it reads for certain;
+//! - nothing is pending for it to take up: after every SEI unit other than
+//!   one of filler payload alone — a prefix unit of a packet, any unit of a
+//!   record the decoder has read, and a suffix unit or an RPU of a packet
+//!   whose own picture did not take it up — a picture of a type the
+//!   decoder always decodes (TRAIL, TSA, STSA, RADL, IRAP) has begun in a
+//!   packet it reads for certain.
 //!
 //! `mediadecode-ffmpeg`'s demuxer adds two: no side data that persists
 //! past the packet, and no `CORRUPT` flag.
@@ -595,22 +621,17 @@ pub struct NalStream {
   /// leaves the reorder depth to FFmpeg's guess (no
   /// `bitstream_restriction_flag`, or not read so). It never clears.
   reorder_unfixed: bool,
-  /// For H.264: whether a reference picture has been read since the
-  /// reading opened or was sought.
-  reference_seen: bool,
-  /// For H.264: whether a packet kept since the reading opened or was
-  /// sought has held an intra slice.
-  intra_seen: bool,
-  /// For HEVC: whether a recovery point SEI may have been read since the
-  /// last IRAP picture.
-  recovering: bool,
-  /// For HEVC: whether the next packet is the first the decoder reads
-  /// after it opens or is flushed, or after an end of sequence or of
-  /// bitstream.
-  sequence_start: bool,
-  /// For HEVC: whether SEI state or a Dolby Vision RPU may be pending for
-  /// the next picture the decoder decodes.
-  carried: bool,
+  /// What is pending for later pictures, as the census of every NAL unit
+  /// read so far leaves it ([`Census`]).
+  pending: Pending,
+  /// For HEVC: whether the record the stream opened with leaves SEI state
+  /// pending for the first picture a decoder decodes, which a decoder
+  /// opened afresh at a seek reads again.
+  opened_carried: bool,
+  /// For HEVC: whether the decoder may not read the next packet: a record
+  /// read mid-stream may fail, and the decoder then returns before the
+  /// packet that carries it (`hevc/hevcdec.c` 3855–3860).
+  record_may_fail: bool,
 }
 
 impl NalStream {
@@ -629,15 +650,13 @@ impl NalStream {
       fields_possible: false,
       gaps_possible: false,
       reorder_unfixed: false,
-      reference_seen: false,
-      intra_seen: false,
-      recovering: false,
-      // FFmpeg's HEVC decoder opens with `eos` set (`hevc/hevcdec.c` 4161).
-      sequence_start: true,
-      carried: false,
+      pending: Pending::OPENING,
+      opened_carried: false,
+      record_may_fail: false,
     };
     stream.record(extradata, true);
     stream.opened = (stream.lengths, stream.length_size);
+    stream.opened_carried = stream.pending.carried;
     stream
   }
 
@@ -645,6 +664,12 @@ impl NalStream {
   /// track's extradata, as `AV_PKT_DATA_NEW_EXTRADATA` brings one — as the
   /// decoder reads it, and learns from its parameter sets. What earlier
   /// parameter sets declared is kept: the highest sub-layer only rises.
+  /// What the record leaves pending — HEVC's SEI, which the decoder reads
+  /// into the state the next picture it decodes takes up — is pending for
+  /// the next packet read, and for HEVC that packet may go unread: a record
+  /// that fails returns before the decoder reads the packet that carries it
+  /// (`hevc/hevcdec.c` 3855–3860), so what is pending before that packet
+  /// stays pending after it.
   ///
   /// [`Self::read_with_record`] reads a packet together with the record it
   /// carries, as the decoder takes the two.
@@ -677,10 +702,15 @@ impl NalStream {
   pub fn seeked(&mut self) {
     // A decoder flushed for the seek takes its picture order count up again
     // from the first picture it decodes (`h264dec.c` 438–473), forgets its
-    // intra slices (492), and, for HEVC, sets `eos` (`hevc/hevcdec.c` 4194).
-    self.reference_seen = false;
-    self.intra_seen = false;
-    self.sequence_start = true;
+    // intra slices (492), and, for HEVC, sets `eos` (`hevc/hevcdec.c` 4194)
+    // and keeps what its flush leaves of its SEI state, a picture hash
+    // among it (4191; `ff_hevc_reset_sei`, `hevc/sei.h` 128–133). One opened
+    // afresh reads the record the stream opened with again, its SEI pending
+    // for the first picture it decodes.
+    self.pending.reference_seen = false;
+    self.pending.intra_seen = false;
+    self.pending.sequence_start = true;
+    self.pending.carried |= self.opened_carried;
     if (self.lengths, self.length_size) != self.opened {
       self.lost = true;
     }
@@ -740,18 +770,32 @@ impl NalStream {
   /// later packets are held to, and a packet that moves the framing
   /// moves it for the packets after.
   pub fn read(&mut self, packet: &[u8]) -> Verdict {
+    // After an HEVC record that may fail, the decoder may read nothing of
+    // this packet: what is pending before it stays pending after it.
+    let unread = core::mem::take(&mut self.record_may_fail).then_some(self.pending);
+    let verdict = self.read_packet(packet);
+    if let Some(unread) = unread {
+      self.pending = self.pending.either(unread);
+    }
+    verdict
+  }
+
+  /// [`Self::read`], the packet read by the decoder.
+  fn read_packet(&mut self, packet: &[u8]) -> Verdict {
     if self.lost {
+      self.unread(packet, None);
       return Verdict::Kept(KeptReason::FramingUnknown);
     }
     if self.codec == NalCodec::H264 {
       // A packet that is an `avcC` itself configures the decoder and holds
       // no picture (`h264dec.c` 1045–1050).
       if self.lengths && is_avcc_packet(packet) {
-        self.h264_record(packet);
+        self.record(packet, false);
         return Verdict::Kept(KeptReason::Configuration);
       }
       match self.length_size {
         None => {
+          self.unread(packet, None);
           self.learn_unframed(packet);
           return Verdict::Kept(KeptReason::FramingUnknown);
         }
@@ -764,7 +808,9 @@ impl NalStream {
           if lengths != self.lengths {
             self.lengths = lengths;
             // The decoder reads this packet in the framing it switches to.
-            if let Some(framing) = self.framing() {
+            let framing = self.framing();
+            self.unread(packet, framing);
+            if let Some(framing) = framing {
               self.learn(packet, framing);
             }
             return Verdict::Kept(KeptReason::FramingChange);
@@ -774,59 +820,35 @@ impl NalStream {
       }
     }
     let Some(framing) = self.framing() else {
+      self.unread(packet, None);
       self.learn_unframed(packet);
-      // What a decoder reads in a packet the reading cannot frame is not
-      // known: it may end a sequence, or leave SEI state behind.
-      if !packet.is_empty() {
-        self.sequence_start = true;
-      }
-      self.carried = true;
       return Verdict::Kept(KeptReason::Unframed);
     };
     let judged = self.judge(packet, framing);
-    if judged.reference {
-      self.reference_seen = true;
-    }
-    // A packet marked may not reach the decoder.
-    if judged.intra && !judged.verdict.is_disposable() {
-      self.intra_seen = true;
-    }
-    // FFmpeg's HEVC decoder takes `eos` up with every packet it reads
-    // (`hevc/hevcdec.c` 3687–3720), and a packet of no bytes is none.
-    if !packet.is_empty() {
-      self.sequence_start = judged.ends;
-    }
-    self.carried = judged.carried;
+    self.pending = judged.pending;
     self.learn(packet, framing);
-    // An IRAP picture ends any recovery, one a recovery point in its own
-    // packet would start among them: FFmpeg's decoder starts none after it
-    // before an end of sequence or a flush (`hevc/hevcdec.c` 3283–3294,
-    // 3675–3692).
-    if judged.irap {
-      self.recovering = false;
-    }
     judged.verdict
   }
 
+  /// The census of a packet the reading does not read whole
+  /// ([`Census::unread`]), in `framing` or, for `None`, in every framing a
+  /// decoder may read it in.
+  fn unread(&mut self, packet: &[u8], framing: Option<Framing>) {
+    self.pending = Census::new(self.codec, Road::Unread, self.pending).unread(packet, framing);
+  }
+
   /// One packet's verdict, read in `framing` against what earlier packets
-  /// taught; it learns nothing.
+  /// taught, and the census of its units; it learns nothing.
   fn judge(&self, packet: &[u8], framing: Framing) -> Judged {
-    // A packet that does not parse proves nothing: it may end a sequence,
-    // or leave SEI state behind.
-    let malformed = Judged {
+    // A packet that does not parse proves nothing: whatever it holds may be
+    // left pending.
+    let malformed = |census: Census| Judged {
       verdict: Verdict::Kept(KeptReason::Malformed),
-      reference: false,
-      intra: false,
-      irap: false,
-      ends: true,
-      carried: true,
+      pending: census.unread(packet, Some(framing)),
     };
+    let mut census = Census::new(self.codec, Road::Packet, self.pending);
     let mut kept = None;
     let mut pictures = 0_usize;
-    let mut reference = false;
-    let mut intra = false;
-    let mut irap = false;
-    let mut ends = false;
     // H.264: FFmpeg's `picture_intra_only`, every slice NAL unit (1, 2, 5)
     // intra; whether the packet holds a slice the decoder decodes (1, 5),
     // the only kind it starts a picture at; and whether such a slice may
@@ -834,77 +856,38 @@ impl NalStream {
     let mut intra_only = true;
     let mut decoded_slice = false;
     let mut some_intra = false;
-    // HEVC: whether state is pending for the next picture decoded, whether
-    // this packet decodes a picture, and whether it holds a suffix SEI or
-    // an RPU, which only a picture of its own takes up.
-    let mut carried = self.carried;
-    let mut decodes = false;
-    let mut tail = false;
     let mut units = Units::new(packet, framing);
     loop {
       match units.next() {
         Unit::End => break,
-        Unit::Broken => return malformed,
+        Unit::Broken => return malformed(census),
         Unit::Nal(nal) => {
+          census.unit(nal);
           let read = match self.codec {
             NalCodec::H264 => {
               if let Some(&header) = nal.first() {
                 let nal_unit_type = header & 0x1F;
-                // The decoder decodes slices of types 1 and 5 alone, passing
-                // over slice data partitions (`h264dec.c` 636–685).
-                if nal_unit_type == 5 || (nal_unit_type == 1 && header & 0x60 != 0) {
-                  reference = true;
-                }
                 if matches!(nal_unit_type, 1 | 2 | 5) {
                   let parsed = slice_type(&nal[1..]);
                   intra_only &= parsed.is_none_or(is_intra);
                   decoded_slice |= nal_unit_type != 2;
                   some_intra |= nal_unit_type == 1 && parsed.is_none_or(is_intra);
-                  intra |= nal_unit_type != 2 && parsed.is_some_and(is_intra);
                 }
               }
               self.h264_unit(nal)
             }
-            NalCodec::Hevc => {
-              if let &[first, second, ..] = nal {
-                let nal_unit_type = (first >> 1) & 0x3F;
-                let base = first & 1 == 0 && second >> 3 == 0;
-                // The IRAP types the decoder decodes; it skips RSV_IRAP_VCL22
-                // and 23.
-                irap |= base && (16..=21).contains(&nal_unit_type);
-                ends |= matches!(nal_unit_type, 36 | 37);
-                match nal_unit_type {
-                  // The first slice segment of a picture the decoder decodes
-                  // whatever came before (every type but RASL and the
-                  // reserved ones): it takes what is pending up.
-                  0..=7 | 16..=21 if base && nal.get(2).is_some_and(|&byte| byte & 0x80 != 0) => {
-                    carried = false;
-                    decodes = true;
-                  }
-                  39 if !sei_rides(&nal[2..], hevc_sei_rides) => carried = true,
-                  40 if !sei_rides(&nal[2..], hevc_sei_rides) => tail = true,
-                  // An RPU, which the decoder takes from the packet's last
-                  // units before any other (`hevc/hevcdec.c` 3723–3760).
-                  62 => tail = true,
-                  _ => {}
-                }
-              }
-              self.hevc_unit(nal)
-            }
+            NalCodec::Hevc => self.hevc_unit(nal),
           };
           match read {
             Read::Picture => pictures += 1,
             Read::Beside => {}
-            Read::Keeps(KeptReason::Malformed) => return malformed,
+            Read::Keeps(KeptReason::Malformed) => return malformed(census),
             Read::Keeps(reason) => {
               kept.get_or_insert(reason);
             }
           }
         }
       }
-    }
-    if tail && !decodes {
-      carried = true;
     }
     let verdict = match kept {
       Some(reason) => Verdict::Kept(reason),
@@ -916,79 +899,55 @@ impl NalStream {
       }
       // The first intra slice decoded after a flush sets `non_gray`
       // (`h264_slice.c` 2032–2034).
-      None if self.codec == NalCodec::H264 && some_intra && !self.intra_seen => {
+      None if self.codec == NalCodec::H264 && some_intra && !self.pending.intra_seen => {
         Verdict::Kept(KeptReason::AwaitingIntraSlice)
       }
       None => Verdict::Disposable,
     };
     Judged {
       verdict,
-      reference,
-      intra,
-      irap,
-      ends,
-      carried,
+      // A packet marked may not reach the decoder.
+      pending: census.close(packet.is_empty(), !verdict.is_disposable()),
     }
   }
 
   /// Learns from every NAL unit FFmpeg's splitter may read in `packet`
-  /// (`h2645_parse.c` 527–664), and more: in Annex B the bytes after each
-  /// start code, past bytes that frame nothing; after lengths each unit,
-  /// up to a length that does not fit — where the splitter refuses the
-  /// packet whole — and the bytes after each start code within a unit.
+  /// framed by `framing`, and more ([`each_unit`]).
   fn learn(&mut self, packet: &[u8], framing: Framing) {
-    match framing {
-      Framing::AnnexB => {
-        for nal in AfterStartCodes::new(packet) {
-          self.learn_unit(nal);
-        }
-      }
-      Framing::Length(size) => self.learn_after_lengths(packet, size.bytes()),
-    }
+    each_unit(packet, framing, &mut |nal| self.learn_unit(nal));
   }
 
   /// Learns from a packet the reading cannot frame, which a decoder still
-  /// reads in a framing of its own: in every framing one may read it in,
-  /// Annex B and lengths of one to four bytes (FFmpeg's `nal_length_size`,
-  /// set from a record's two bits plus one).
+  /// reads in a framing of its own: in every framing one may read it in
+  /// ([`each_unit_in_any_framing`]).
   fn learn_unframed(&mut self, packet: &[u8]) {
-    self.learn(packet, Framing::AnnexB);
-    for size in 1..=4 {
-      self.learn_after_lengths(packet, size);
-    }
-  }
-
-  /// [`Self::learn`] for NAL units after lengths of `size` bytes.
-  fn learn_after_lengths(&mut self, mut bytes: &[u8], size: usize) {
-    while let Some((prefix, rest)) = bytes.split_at_checked(size) {
-      let length = prefix
-        .iter()
-        .fold(0_usize, |length, &byte| (length << 8) | usize::from(byte));
-      if length == 0 {
-        return;
-      }
-      let Some((nal, rest)) = rest.split_at_checked(length) else {
-        return;
-      };
-      // The splitter reads a unit to its first start code, and then the
-      // bytes after each start code in it as units of their own
-      // (`h2645_parse.c` 44–52, 559–584).
-      let first = find_start_code(nal).unwrap_or(nal.len());
-      self.learn_unit(trim_trailing_zeros(&nal[..first]));
-      for piece in AfterStartCodes::new(nal) {
-        self.learn_unit(piece);
-      }
-      bytes = rest;
-    }
+    each_unit_in_any_framing(packet, &mut |nal| self.learn_unit(nal));
   }
 
   /// A configuration record, read as the codec's decoder reads one, when
-  /// it opens or mid-stream.
+  /// it opens or mid-stream: every unit of it learned, and taken into the
+  /// census, before the packet that carries it is read.
   fn record(&mut self, extradata: &[u8], opening: bool) {
+    let mut census = Census::new(self.codec, Road::Record, self.pending);
     match self.codec {
-      NalCodec::H264 => self.h264_record(extradata),
-      NalCodec::Hevc => self.hevc_record(extradata, opening),
+      NalCodec::H264 => self.h264_record(extradata, &mut census),
+      NalCodec::Hevc => self.hevc_record(extradata, opening, &mut census),
     }
+    self.pending = census.pending;
+    // A record the HEVC decoder reads mid-stream may fail, and it then
+    // returns before the packet (`hevc/hevcdec.c` 3855–3860); it reads no
+    // record of no bytes (3856), and one it opens with that fails leaves no
+    // decoder at all (4169–4172).
+    if self.codec == NalCodec::Hevc && !opening && !extradata.is_empty() {
+      self.record_may_fail = true;
+    }
+  }
+
+  /// One NAL unit of a configuration record: learned, and taken into the
+  /// record's census.
+  fn record_unit(&mut self, nal: &[u8], census: &mut Census) {
+    self.learn_unit(nal);
+    census.unit(nal);
   }
 
   /// `ff_h264_decode_extradata` (`h264_parse.c` 466–524): no record
@@ -996,9 +955,9 @@ impl NalStream {
   /// before anything else is checked, and the size moves only when the
   /// `avcC` is read whole — or becomes unknown where reading it whole
   /// turns on whether a parameter set decodes; any other record makes it
-  /// one of start codes, its size kept. Either way every sequence parameter
-  /// set the decoder may read in it is learned.
-  fn h264_record(&mut self, extradata: &[u8]) {
+  /// one of start codes, its size kept. Either way every unit the decoder
+  /// may read in it is learned and taken into `census`.
+  fn h264_record(&mut self, extradata: &[u8], census: &mut Census) {
     let Some(&first) = extradata.first() else {
       return;
     };
@@ -1007,7 +966,7 @@ impl NalStream {
       // `decode_extradata_ps` splits the record as Annex B
       // (`h264_parse.c` 517–519).
       for nal in AfterStartCodes::new(extradata) {
-        self.learn_unit(nal);
+        self.record_unit(nal, census);
       }
       return;
     }
@@ -1018,11 +977,11 @@ impl NalStream {
     // either array as its own type says (`h264_parse.c` 486–513, 367–413).
     let mut at = 6;
     let sps_count = extradata.get(5).map_or(0, |&count| count & 0x1F);
-    if self.learn_avcc_entries(extradata, &mut at, sps_count)
+    if self.avcc_entries(extradata, &mut at, sps_count, census)
       && let Some(&pps_count) = extradata.get(at)
     {
       at += 1;
-      self.learn_avcc_entries(extradata, &mut at, pps_count);
+      self.avcc_entries(extradata, &mut at, pps_count, census);
     }
     match read_avcc(extradata) {
       AvccRead::Whole(size) => self.length_size = Some(size),
@@ -1037,10 +996,16 @@ impl NalStream {
     }
   }
 
-  /// Learns from `count` entries of an `avcC` from `*at`, each a two-byte
-  /// length and its bytes, split as `decode_extradata_ps_mp4` splits one;
-  /// whether all `count` fit.
-  fn learn_avcc_entries(&mut self, record: &[u8], at: &mut usize, count: u8) -> bool {
+  /// Reads `count` entries of an `avcC` from `*at`, each a two-byte length
+  /// and its bytes, split as `decode_extradata_ps_mp4` splits one, every
+  /// unit learned and taken into `census`; whether all `count` fit.
+  fn avcc_entries(
+    &mut self,
+    record: &[u8],
+    at: &mut usize,
+    count: u8,
+    census: &mut Census,
+  ) -> bool {
     for _ in 0..count {
       let (Some(&high), Some(&low)) = (record.get(*at), record.get(*at + 1)) else {
         return false;
@@ -1049,7 +1014,7 @@ impl NalStream {
       let Some(entry) = record.get(*at..*at + size) else {
         return false;
       };
-      self.learn_after_lengths(entry, 2);
+      each_after_lengths(entry, 2, &mut |nal| self.record_unit(nal, census));
       *at += size;
     }
     true
@@ -1062,12 +1027,13 @@ impl NalStream {
   /// read; any other record makes it one of start codes, its size kept.
   /// No record — the decoder reads one only of at least a byte
   /// (`hevc/hevcdec.c` 3856) — changes nothing. Either way the parameter
-  /// sets declare the stream's sub-layers.
+  /// sets declare the stream's sub-layers, and every unit the decoder may
+  /// read in it is taken into `census`.
   ///
   /// Mid-stream, an `hvcC` of a size other than two leaves the framing
   /// unknown for good: under `AV_EF_EXPLODE` a parameter set that does not
   /// decode stops it at two (`hevc/parse.c` 72–76, 121–129).
-  fn hevc_record(&mut self, extradata: &[u8], opening: bool) {
+  fn hevc_record(&mut self, extradata: &[u8], opening: bool, census: &mut Census) {
     if extradata.is_empty() {
       return;
     }
@@ -1076,7 +1042,7 @@ impl NalStream {
     if !hvcc {
       self.lengths = false;
       for nal in AfterStartCodes::new(extradata) {
-        self.learn_unit(nal);
+        self.record_unit(nal, census);
       }
       return;
     }
@@ -1105,7 +1071,9 @@ impl NalStream {
         }
         // The decoder splits each unit after its two-byte length, as a
         // packet (`hevc/parse.c` 121–123, 24–37).
-        self.learn_after_lengths(record.take(size), 2);
+        each_after_lengths(record.take(size), 2, &mut |nal| {
+          self.record_unit(nal, census)
+        });
       }
     }
     let size = (byte21 & 3) + 1;
@@ -1155,11 +1123,11 @@ impl NalStream {
           // No parameter set declares the sub-layer: not as the stream
           // says it is.
           Read::Keeps(KeptReason::Malformed)
-        } else if self.sequence_start {
+        } else if self.pending.sequence_start {
           Read::Keeps(KeptReason::SequenceStart)
-        } else if self.recovering {
+        } else if self.pending.recovering {
           Read::Keeps(KeptReason::Recovering)
-        } else if self.carried {
+        } else if self.pending.carried {
           Read::Keeps(KeptReason::CarriedOver)
         } else {
           Read::Picture
@@ -1236,7 +1204,7 @@ impl NalStream {
       }
       Read::Picture if self.gaps_possible => Read::Keeps(KeptReason::FrameNumGaps),
       Read::Picture if self.reorder_unfixed => Read::Keeps(KeptReason::ReorderUnfixed),
-      Read::Picture if !self.reference_seen => Read::Keeps(KeptReason::AwaitingReference),
+      Read::Picture if !self.pending.reference_seen => Read::Keeps(KeptReason::AwaitingReference),
       read => read,
     }
   }
@@ -1263,10 +1231,6 @@ impl NalStream {
     // A unit of a sub-layer no parameter set has declared: one the reading
     // has not read declares it.
     self.raise(temporal_id);
-    // A recovery point (D.3.8), or an SEI unit that does not read so.
-    if matches!(nal_unit_type, 39 | 40) && sei_may_hold(&nal[2..], 6) {
-      self.recovering = true;
-    }
     if let Some(declared) = hevc_declared(nal_unit_type, nal)
       && declared <= 6
     {
@@ -2123,24 +2087,302 @@ impl<'a> Rbsp<'a> {
   }
 }
 
-/// A packet's verdict, with what the decoder learns from it.
+/// A packet's verdict, with what is pending after it.
 struct Judged {
   verdict: Verdict,
-  /// For H.264: whether the packet, read whole, holds a slice of a
-  /// reference picture the decoder decodes (types 1 and 5).
-  reference: bool,
-  /// For H.264: whether the packet, read whole, holds a slice the decoder
-  /// decodes that reads as intra.
-  intra: bool,
-  /// For HEVC: whether the packet, read whole, holds an IRAP picture of
-  /// layer 0 the decoder decodes (types 16–21).
-  irap: bool,
-  /// For HEVC: whether the packet may hold an end of sequence or of
+  /// The census of the packet's units ([`Census::close`]).
+  pending: Pending,
+}
+
+/// What FFmpeg's decoder holds for later pictures that the packets and
+/// records around a picture move ([the census](self#one-census-every-road)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Pending {
+  /// For H.264: whether a reference picture has been read since the
+  /// reading opened or was sought.
+  reference_seen: bool,
+  /// For H.264: whether a packet kept since the reading opened or was
+  /// sought has held an intra slice.
+  intra_seen: bool,
+  /// For HEVC: whether a recovery point SEI may have been read since the
+  /// last IRAP picture.
+  recovering: bool,
+  /// For HEVC: whether the next packet is the first the decoder reads
+  /// after it opens or is flushed, or after an end of sequence or of
   /// bitstream.
-  ends: bool,
-  /// For HEVC: whether SEI state or an RPU may be pending after the packet
-  /// for the next picture decoded.
+  sequence_start: bool,
+  /// For HEVC: whether SEI state or a Dolby Vision RPU may be pending for
+  /// the next picture the decoder decodes.
   carried: bool,
+}
+
+impl Pending {
+  /// The decoder as it opens: FFmpeg's HEVC decoder sets `eos`
+  /// (`hevc/hevcdec.c` 4161), and nothing is pending or seen.
+  const OPENING: Self = Self {
+    reference_seen: false,
+    intra_seen: false,
+    recovering: false,
+    sequence_start: true,
+    carried: false,
+  };
+
+  /// What is pending after a packet the decoder may have read, leaving
+  /// `self`, or may not have, leaving `unread`: whatever either leaves
+  /// pending, and as seen only what both have seen.
+  const fn either(self, unread: Self) -> Self {
+    Self {
+      reference_seen: self.reference_seen && unread.reference_seen,
+      intra_seen: self.intra_seen && unread.intra_seen,
+      recovering: self.recovering || unread.recovering,
+      sequence_start: self.sequence_start || unread.sequence_start,
+      carried: self.carried || unread.carried,
+    }
+  }
+}
+
+/// The road a NAL unit comes to the decoder by, which decides what the
+/// decoder takes up of it ([the census](self#one-census-every-road)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Road {
+  /// A unit of a packet the reading reads whole, in the packet's order:
+  /// the decoder takes it up as its type says.
+  Packet,
+  /// A unit of a configuration record, which the decoder reads before the
+  /// packet that carries it: H.264 takes up its parameter sets alone
+  /// (`h264_parse.c` 380–409), HEVC its parameter sets and its SEI units,
+  /// prefix and suffix, of any layer (`hevc/parse.c` 39–67).
+  Record,
+  /// A unit the decoder's splitter may read in a packet the reading does
+  /// not read whole: it may leave state behind, and takes none up.
+  Unread,
+}
+
+/// The census of one run of NAL units the decoder reads together — a
+/// packet's, or a record's — taken up unit by unit ([`Self::unit`]) against
+/// what was pending before them. Every NAL unit the reading reads, on every
+/// road, H.264's and HEVC's alike, goes through [`Self::unit`], and nothing
+/// else moves what is pending but a seek ([`NalStream::seeked`]) and a
+/// record that may fail ([`NalStream::read`]).
+#[derive(Debug, Clone, Copy)]
+struct Census {
+  codec: NalCodec,
+  road: Road,
+  /// What is pending, as the units so far leave it.
+  pending: Pending,
+  /// HEVC: a suffix SEI unit or an RPU of the packet, which only a picture
+  /// of the packet takes up.
+  tail: bool,
+  /// HEVC: a picture the decoder decodes whatever came before has begun in
+  /// the packet.
+  decodes: bool,
+  /// HEVC: the packet holds an IRAP picture of layer 0 the decoder decodes
+  /// (types 16–21).
+  irap: bool,
+  /// HEVC: the packet may hold an end of sequence or of bitstream.
+  ends: bool,
+  /// H.264: the packet holds a slice of a reference picture the decoder
+  /// decodes (types 1 and 5).
+  reference: bool,
+  /// H.264: the packet holds a slice the decoder decodes that reads as
+  /// intra.
+  intra: bool,
+}
+
+impl Census {
+  /// The census of a run of units that come by `road`, against `pending`.
+  const fn new(codec: NalCodec, road: Road, pending: Pending) -> Self {
+    Self {
+      codec,
+      road,
+      pending,
+      tail: false,
+      decodes: false,
+      irap: false,
+      ends: false,
+      reference: false,
+      intra: false,
+    }
+  }
+
+  /// Takes one NAL unit up, as FFmpeg's decoder takes it up on the
+  /// census's road: what it leaves pending for a later picture, and what
+  /// pending state it takes up.
+  fn unit(&mut self, nal: &[u8]) {
+    match self.codec {
+      NalCodec::H264 => {
+        // The decoder takes nothing pending from a record, whose parameter
+        // sets alone it reads (`h264_parse.c` 380–409), and its SEI state
+        // lasts one access unit (`h264dec.c` 593–598): what H.264 awaits is
+        // met only in a packet read whole.
+        if self.road != Road::Packet {
+          return;
+        }
+        let Some(&header) = nal.first() else {
+          return;
+        };
+        let nal_unit_type = header & 0x1F;
+        // The decoder decodes slices of types 1 and 5 alone, passing over
+        // slice data partitions (`h264dec.c` 636–685).
+        if nal_unit_type == 5 || (nal_unit_type == 1 && header & 0x60 != 0) {
+          self.reference = true;
+        }
+        if matches!(nal_unit_type, 1 | 5) && slice_type(&nal[1..]).is_some_and(is_intra) {
+          self.intra = true;
+        }
+      }
+      NalCodec::Hevc => {
+        let &[first, second, ..] = nal else {
+          return;
+        };
+        let nal_unit_type = (first >> 1) & 0x3F;
+        // The decoder reads an SEI unit of any layer, a packet's or a
+        // record's, into the state the pictures after it take up
+        // (`hevc/hevcdec.c` 3626–3631, `hevc/parse.c` 59–64).
+        if matches!(nal_unit_type, 39 | 40) {
+          // A recovery point (D.3.8), or a unit that does not read so.
+          if sei_may_hold(&nal[2..], 6) {
+            self.pending.recovering = true;
+          }
+          if !sei_rides(&nal[2..], hevc_sei_rides) {
+            // A packet's suffix unit waits for a picture of its own packet,
+            // after it; any other — a prefix unit, or a record's, read
+            // before the packet — for the next picture decoded.
+            if nal_unit_type == 40 && self.road == Road::Packet {
+              self.tail = true;
+            } else {
+              self.pending.carried = true;
+            }
+          }
+        }
+        // Of a record the decoder reads nothing else that a picture takes up
+        // (`hevc/parse.c` 65–67), and of a packet not read whole nothing
+        // counts but what it may leave behind.
+        if self.road != Road::Packet {
+          return;
+        }
+        let base = first & 1 == 0 && second >> 3 == 0;
+        // The IRAP types the decoder decodes; it skips RSV_IRAP_VCL22 and 23.
+        self.irap |= base && (16..=21).contains(&nal_unit_type);
+        self.ends |= matches!(nal_unit_type, 36 | 37);
+        match nal_unit_type {
+          // The first slice segment of a picture the decoder decodes
+          // whatever came before (every type but RASL and the reserved
+          // ones): it takes what is pending up.
+          0..=7 | 16..=21 if base && nal.get(2).is_some_and(|&byte| byte & 0x80 != 0) => {
+            self.pending.carried = false;
+            self.decodes = true;
+          }
+          // An RPU, which the decoder takes from the packet's last units
+          // before any other (`hevc/hevcdec.c` 3723–3760).
+          62 => self.tail = true,
+          _ => {}
+        }
+      }
+    }
+  }
+
+  /// What is pending after the packet whose units the census has taken up:
+  /// `empty` for a packet of no bytes, `kept` where the packet is kept —
+  /// one marked may not reach the decoder.
+  fn close(mut self, empty: bool, kept: bool) -> Pending {
+    // A suffix SEI unit or an RPU no picture of its own packet took up
+    // waits for the next picture.
+    if self.tail && !self.decodes {
+      self.pending.carried = true;
+    }
+    // An IRAP picture ends any recovery, one a recovery point in its own
+    // packet would start among them: FFmpeg's decoder starts none after it
+    // before an end of sequence or a flush (`hevc/hevcdec.c` 3283–3294,
+    // 3675–3692).
+    if self.irap {
+      self.pending.recovering = false;
+    }
+    // FFmpeg's HEVC decoder takes `eos` up with every packet it reads
+    // (`hevc/hevcdec.c` 3687–3720), and a packet of no bytes is none.
+    if !empty {
+      self.pending.sequence_start = self.ends;
+    }
+    if self.reference {
+      self.pending.reference_seen = true;
+    }
+    if self.intra && kept {
+      self.pending.intra_seen = true;
+    }
+    self.pending
+  }
+
+  /// What is pending after `packet`, which the reading does not read whole
+  /// — framed by `framing`, or for `None` by any framing a decoder may read
+  /// it in — with whatever units of it the census has taken up already:
+  /// SEI state, an end of sequence or a recovery point may be left behind,
+  /// in any unit the decoder's splitter may read, and nothing the packet
+  /// would take up or prove counts.
+  fn unread(mut self, packet: &[u8], framing: Option<Framing>) -> Pending {
+    self.road = Road::Unread;
+    self.pending.carried = true;
+    self.ends = true;
+    self.tail = false;
+    self.decodes = false;
+    self.irap = false;
+    self.reference = false;
+    self.intra = false;
+    match framing {
+      Some(framing) => each_unit(packet, framing, &mut |nal| self.unit(nal)),
+      None => each_unit_in_any_framing(packet, &mut |nal| self.unit(nal)),
+    }
+    self.close(packet.is_empty(), true)
+  }
+}
+
+/// Every NAL unit FFmpeg's splitter may read in `packet` framed by
+/// `framing` (`h2645_parse.c` 527–664), and more: in Annex B the bytes after
+/// each start code, past bytes that frame nothing; after lengths each unit,
+/// up to a length that does not fit — where the splitter refuses the packet
+/// whole — and the bytes after each start code within a unit.
+fn each_unit(packet: &[u8], framing: Framing, visit: &mut impl FnMut(&[u8])) {
+  match framing {
+    Framing::AnnexB => {
+      for nal in AfterStartCodes::new(packet) {
+        visit(nal);
+      }
+    }
+    Framing::Length(size) => each_after_lengths(packet, size.bytes(), visit),
+  }
+}
+
+/// [`each_unit`] in every framing a decoder may read `packet` in: Annex B,
+/// and lengths of one to four bytes (FFmpeg's `nal_length_size`, set from a
+/// record's two bits plus one).
+fn each_unit_in_any_framing(packet: &[u8], visit: &mut impl FnMut(&[u8])) {
+  each_unit(packet, Framing::AnnexB, visit);
+  for size in 1..=4 {
+    each_after_lengths(packet, size, visit);
+  }
+}
+
+/// [`each_unit`] for NAL units after lengths of `size` bytes.
+fn each_after_lengths(mut bytes: &[u8], size: usize, visit: &mut impl FnMut(&[u8])) {
+  while let Some((prefix, rest)) = bytes.split_at_checked(size) {
+    let length = prefix
+      .iter()
+      .fold(0_usize, |length, &byte| (length << 8) | usize::from(byte));
+    if length == 0 {
+      return;
+    }
+    let Some((nal, rest)) = rest.split_at_checked(length) else {
+      return;
+    };
+    // The splitter reads a unit to its first start code, and then the bytes
+    // after each start code in it as units of their own (`h2645_parse.c`
+    // 44–52, 559–584).
+    let first = find_start_code(nal).unwrap_or(nal.len());
+    visit(trim_trailing_zeros(&nal[..first]));
+    for piece in AfterStartCodes::new(nal) {
+      visit(piece);
+    }
+    bytes = rest;
+  }
 }
 
 /// What one NAL unit says about its packet.
