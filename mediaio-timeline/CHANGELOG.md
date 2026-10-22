@@ -7,6 +7,123 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with `mediadecode`'s.
 
+## [0.3.0] - 2026-10-22
+
+### Changed
+
+- **BREAKING: the OpenTimelineIO export now carries the exact-readback
+  metadata.** Beside OpenTimelineIO's fields, every document `to_otio`
+  writes carries under `metadata.mediaio` the words `from_otio` reads the
+  timeline back by: the edit rate (`rate`), each media-side range's exact
+  ruler and timebase (`source`, `available`, `range`), a dissolve's place
+  among its track's transitions where the track keeps them out of their
+  cuts' order (`order`), and the timebase of an edit-side value spelled
+  otherwise than the edit rate's reciprocal (`start`, `record`,
+  `timebase`, `at`, `in_offset`, `out_offset`). They are always written,
+  as the read-back needs them: no document is 0.2.0's byte for byte, with
+  markers or without. OpenTimelineIO's readers keep them as metadata.
+- **BREAKING: the model's notes are an array of `[key, value]` pairs**
+  under `metadata.mediaio.metadata`, never an object: a note's key is
+  anything, and OpenTimelineIO 0.17 reads an object carrying `OTIO_SCHEMA`
+  as an object of that schema, so a note keyed so made the export a
+  document it refuses.
+- **BREAKING: `to_otio` refuses a count or a rate OpenTimelineIO 0.17's
+  reader would read as another value.** OpenTimelineIO 0.17.0 reads
+  numbers with RapidJSON in its normal precision, which does not always
+  round to the nearest double: a count written `<digits>.0` past
+  1 801 439 850 948 198 (⌊2^54 / 10⌋) can read as another —
+  `9007199254740991.0` as 9007199254740990 — and so can the shortest
+  spelling of some rates' `f64`s — 96000/1001's — while every common rate
+  reads exactly. The export reads every count and rate it writes as both
+  kinds of build read it — one that fuses a multiply-add of RapidJSON's
+  and one that does not — and refuses one either misreads, naming the
+  place and both values (`NotRepresentable::misread`). 0.2.0 wrote them.
+- **BREAKING: `validate_json` reads every number as OpenTimelineIO 0.17's
+  parser does** — RapidJSON at the commit the release pins, step for step:
+  `NaN`, `Inf` and `Infinity` are numbers, read where a reader reads a
+  number; `0e309`, `2e308` and an integer of 400 digits, which RapidJSON
+  refuses, refuse the document as syntax, and so does a number
+  OpenTimelineIO's builds read as different values; an `int64_t` member
+  takes every integer RapidJSON reads as one — `-0`, and up to 2^64 − 1,
+  which OpenTimelineIO keeps cut to its low 63 bits — and nothing written
+  with a fraction or an exponent.
+
+### Added
+
+- **Markers.** `Marker` — a name, the range it marks, a `MarkerColor`
+  (OpenTimelineIO's eleven, green by default) and a comment — on tracks
+  (`Track::markers`, at the edit rate from the timeline's zero) and clips
+  (`Clip::markers`, in the medium's time), with `markers_mut` and
+  `with_marker`. `validate` refuses a track's marker off the edit rate
+  (`OffEditRate` with the new `Place::Marker`), a clip's in a degenerate
+  timebase (`MarkerRateUnstated`) and either longer than `i64::MAX` ticks
+  (`MarkerTooLong`), naming it by `MarkerAt`. The stored document writes
+  markers only where there are some: a timeline without them writes 0.2.0's
+  document byte for byte.
+- **`otio::from_otio`, the exact inverse of `to_otio`**: for every timeline
+  `to_otio` writes, for either target, it reads that very timeline back,
+  every count, timebase and rate as the model held it. What the timeline
+  does not model is refused by name with where it sits — `Unreadable`, with
+  `UnmodelledSchema`, `UnmodelledFeature` and its `Feature`, `Inexact`, and
+  the self-check's `Shape` and `Syntax` — never dropped: a gap of some
+  length after a track's last clip, which OpenTimelineIO counts in the
+  track's duration, among them (`Feature::TrailingGap`), and a gap of no
+  length anywhere but where the export writes one, on a fade's gap side,
+  which OpenTimelineIO counts all the same (`Feature::StandaloneGap`).
+  Every number is
+  read as OpenTimelineIO 0.17.0's parser reads it — RapidJSON in its
+  normal precision, the readings of a build that fuses one of its
+  multiply-adds and of one that does not alike, or refused — and held to
+  the model exactly: a count of NaN, of an infinity or of `-0.0` is
+  refused by name. What OpenTimelineIO derives from the document in its own
+  `f64` arithmetic — both ends of every range, and each track's walk and
+  the stack's — is held as `to_otio` holds it; each is refused as
+  `Inexact` where it rounds. A member OpenTimelineIO lets a document leave
+  out reads as OpenTimelineIO 0.17.0's reader reads it — an empty name, a
+  GREEN marker — or is refused by name where that is no value and the
+  timeline needs one, or a value it does not keep: a gap's absent range,
+  OpenTimelineIO's `TimeRange()`, is nothing at rate 1, a rate the track's
+  duration takes and the timeline loses, so a gap states its range at the
+  edit rate, as the export writes it. Last, the export writes the timeline
+  read, and every value it writes must be the one the document states at
+  the same path, as OpenTimelineIO 0.17.0's reader holds it — strings byte
+  for byte, booleans exactly, a `RationalTime`'s numbers as doubles, a
+  dictionary's as the integers or doubles RapidJSON reads them as, two
+  doubles bit for bit, so `-0.0` is not `0.0` — or the read
+  is refused as `Inexact` there, naming both values (`Inexact::written`,
+  `Inexact::stated`): a medium's range counted in a ruler the export would
+  not choose, a marker's color in another case, among them. A member may
+  be left out only where OpenTimelineIO reads its absence as the value the
+  export writes, and stated unwritten only where OpenTimelineIO holds it as
+  its absence; each is a row of one of two tables, cited by source. The
+  reader takes exactly the documents the export reproduces. A marker's
+  color is one of the eleven names exactly, in capitals; a `color` on an
+  item and an `enabled` on a transition, which OpenTimelineIO 0.17.0 keeps
+  as dynamic fields, are refused by name, `null` and `true` among them. The
+  item `color` is OpenTimelineIO 0.18's item color, which 0.18 writes on
+  every item: a document 0.18 writes is refused by name until it is
+  modelled.
+- `otio::NotRepresentable::misread`, with `otio::Misread` and
+  `otio::MisreadNumber`: the count or rate OpenTimelineIO 0.17's reader
+  would read as another value, what was meant and what each kind of build
+  reads.
+- The export writes markers as `Marker.2`, refusing one no ruler holds
+  whole as `Spot::Marker`.
+- `validate_json` holds every marker to `Marker.2`, with the
+  `marked_range` every reader requires.
+- `validate_json` walks every dictionary, metadata included, as
+  OpenTimelineIO's readers decode them: one carrying `OTIO_SCHEMA` —
+  in metadata, under a key no reader reads, or nested in either — is held
+  to that schema's rules, and a schema whose rules the check does not know
+  is refused by name. Every schema it accepts is held to its 0.17.0
+  reader's required and optional members and their types — a generator's
+  kind and parameters, an image sequence's eight members, an effect's
+  name and a time warp's scalar among them. Metadata, a clip's media
+  references and a generator's parameters must each be a plain
+  dictionary; every effect one of the four effect schemas; every object's
+  `OTIO_REF_ID` a string, and a nonempty one unique in the document; and,
+  for `V0_15Plus`, a media reference's image bounds a `Box2d.1`.
+
 ## [0.2.0] - 2026-10-15
 
 ### Changed

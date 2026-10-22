@@ -8,7 +8,7 @@ use std::{
 
 use mediatime::{Duration, ExactSeconds, Rounding, Timebase, Timestamp};
 
-use crate::{Clip, Timeline, Track, Transition, time::span};
+use crate::{Clip, Marker, Timeline, Track, Transition, time::span};
 
 /// Judges `timeline`, answering every refusal it earns, or `Ok` when there
 /// is none.
@@ -48,10 +48,15 @@ use crate::{Clip, Timeline, Track, Transition, time::span};
 ///   ([`Refusal::FadeMeetsTransition`]), and a clip's blends — a fade, or the
 ///   part of a transition inside it — fit inside it
 ///   ([`Refusal::BlendsOverrunClip`]): in particular, no fade runs longer
-///   than its clip.
+///   than its clip;
+/// - each marker is counted where its owner counts time — a track's at the
+///   edit rate ([`Refusal::OffEditRate`]), a clip's in a real ruler
+///   ([`Refusal::MarkerRateUnstated`]) — over a range no longer than
+///   `i64::MAX` ticks ([`Refusal::MarkerTooLong`]).
 ///
 /// Refusals come back in a fixed order: the timeline's own, then track by
-/// track — each clip's, then each transition's, then each clip's blends.
+/// track — each clip's, its markers' among them, then each transition's,
+/// then each clip's blends, then the track's markers'.
 /// The checks that need the edit rate are skipped while it is unstated,
 /// those that read a clip's media ruler are skipped for a clip whose medium
 /// has none, and those that measure a range are skipped for a range too long
@@ -195,6 +200,16 @@ fn judge_track<'a>(
         }
       }
     }
+    for (index, marker) in clip.markers().iter().enumerate() {
+      let at = MarkerAt::Clip {
+        clip: at,
+        marker: index,
+      };
+      if marker.range().timebase().num() == 0 {
+        out.push(Refusal::MarkerRateUnstated(at));
+      }
+      judge_marker_length(marker, at, out);
+    }
   }
 
   let transitions = track.transitions();
@@ -262,6 +277,26 @@ fn judge_track<'a>(
     {
       out.push(Refusal::BlendsOverrunClip(at));
     }
+  }
+
+  for (index, marker) in track.markers().iter().enumerate() {
+    let at = MarkerAt::Track {
+      track: track_index,
+      marker: index,
+    };
+    if let Some(edit) = edit
+      && marker.range().timebase() != edit
+    {
+      out.push(Refusal::OffEditRate(Place::Marker(at)));
+    }
+    judge_marker_length(marker, at, out);
+  }
+}
+
+/// Refuses `marker`, at `at`, for a range too long to measure.
+fn judge_marker_length(marker: &Marker, at: MarkerAt, out: &mut Vec<Refusal>) {
+  if span(marker.range()).is_none() {
+    out.push(Refusal::MarkerTooLong(at));
   }
 }
 
@@ -395,6 +430,12 @@ pub enum Refusal {
   /// A clip's blends — its fades, and the parts of transitions inside it —
   /// together run longer than its record.
   BlendsOverrunClip(ClipAt),
+  /// A clip's marker is counted in a degenerate (`0/den`) timebase: it
+  /// marks no time in the clip's medium.
+  MarkerRateUnstated(MarkerAt),
+  /// A marker's range runs longer than `i64::MAX` ticks of its timebase,
+  /// as [`Refusal::RangeTooLong`] refuses a clip's range.
+  MarkerTooLong(MarkerAt),
 }
 
 impl fmt::Display for Refusal {
@@ -462,6 +503,12 @@ impl fmt::Display for Refusal {
           f,
           "{at}: its fades and transitions run longer than its record"
         )
+      }
+      Self::MarkerRateUnstated(at) => {
+        write!(f, "{at}: the marked range has no real ruler")
+      }
+      Self::MarkerTooLong(at) => {
+        write!(f, "{at}: the marked range runs longer than i64::MAX ticks")
       }
     }
   }
@@ -720,6 +767,8 @@ pub enum Place {
   Fade(EdgeAt),
   /// A transition's cut or one of its offsets.
   Transition(TransitionAt),
+  /// A track's marker: its marked range.
+  Marker(MarkerAt),
 }
 
 /// Writes `the start`, `the record of track 0, clip 2`, and so on.
@@ -730,6 +779,39 @@ impl fmt::Display for Place {
       Self::Record(at) => write!(f, "the record of {at}"),
       Self::Fade(at) => write!(f, "the fade at the {} of {}", at.edge.side(), at.clip),
       Self::Transition(at) => write!(f, "{at}"),
+      Self::Marker(at) => write!(f, "the marked range of {at}"),
+    }
+  }
+}
+
+/// A marker, by its owner and its index among the owner's markers.
+///
+/// Marked `#[non_exhaustive]`: a later owner joins as a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum MarkerAt {
+  /// A track's marker.
+  Track {
+    /// The track's index in the timeline.
+    track: usize,
+    /// The marker's index among the track's markers.
+    marker: usize,
+  },
+  /// A clip's marker.
+  Clip {
+    /// The clip.
+    clip: ClipAt,
+    /// The marker's index among the clip's markers.
+    marker: usize,
+  },
+}
+
+/// Writes `track 0, marker 1`, or `track 0, clip 2, marker 1`.
+impl fmt::Display for MarkerAt {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Track { track, marker } => write!(f, "track {track}, marker {marker}"),
+      Self::Clip { clip, marker } => write!(f, "{clip}, marker {marker}"),
     }
   }
 }

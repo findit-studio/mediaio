@@ -29,6 +29,8 @@ mod diff;
 #[cfg(any(feature = "std", feature = "alloc"))]
 mod layout;
 #[cfg(any(feature = "std", feature = "alloc"))]
+mod marker;
+#[cfg(any(feature = "std", feature = "alloc"))]
 mod metadata;
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
@@ -57,6 +59,9 @@ pub use diff::{Ambiguous, Change, ChangeKind, Delta, Side, diff};
 pub use layout::{Item, Layout, TrackLayout, layout};
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+pub use marker::{Marker, MarkerColor};
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub use metadata::Metadata;
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
@@ -70,7 +75,7 @@ pub use transition::{Transition, TransitionKind};
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub use validate::{
-  ClipAt, ClipPair, ClipRange, Edge, EdgeAt, IdClash, Mismatch, Place, RangeAt, Refusal,
+  ClipAt, ClipPair, ClipRange, Edge, EdgeAt, IdClash, MarkerAt, Mismatch, Place, RangeAt, Refusal,
   TransitionAt, validate,
 };
 
