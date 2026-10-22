@@ -15,8 +15,9 @@
 //! | [`Transition`](crate::Transition) | `Transition.1`, `SMPTE_Dissolve`, its offsets at the edit rate |
 //! | a [`Fade`](crate::Fade) | `Transition.1`, `SMPTE_Dissolve` against a gap — a gap of no length where the clip abuts a clip or a track's end |
 //! | a clip's [`id`](crate::Clip::id), gain, reel, the medium's rate, a fade's curve, [`Metadata`](crate::Metadata) | `metadata.mediaio`: `id`, `gain_db`, `reel`, `rate`, `fade` and `shape`, and `metadata` — the notes as an array of `[key, value]` pairs, never an object, so no key of the model's is a key a reader takes for a schema word (`OTIO_SCHEMA`) |
-//! | a [`Marker`](crate::Marker), on a track or a clip | `Marker.2` among the item's `markers`: `name`, `color` (OpenTimelineIO's capitals), `marked_range`, `comment` — a track's at the edit rate, a clip's in its medium's time |
-//! | the exact words a reader needs | `metadata.mediaio`: the edit rate (`rate`, `num/den`) on the timeline; on a clip, its reference and a clip's marker, the exact ruler a media-side range's counts are written in and the timebase the model counts it in (`source`, `available`, `range`); on a dissolve, its place among its track's transitions where the track keeps them out of their cuts' order (`order`); and the timebase of an edit-side value spelled otherwise than the edit rate's reciprocal — the timeline's `start`, a clip's `record`, a fade's or a track marker's `timebase`, a dissolve's `at`, `in_offset`, `out_offset` — so `1/24` beside a rate of `48/2` reads back as `1/24` |
+//! | a [`Marker`](crate::Marker), on the timeline, a track or a clip | `Marker.2` among the stack's or the item's `markers`: `name`, `color` (OpenTimelineIO's capitals), `marked_range`, `comment` — the timeline's on the stack and a track's, at the edit rate from the timeline's zero; a clip's in its medium's time. DaVinci Resolve 21.1 imports the stack's alone as its timeline's markers: it drops a track's, and attaches a clip's to its item (findit-studio/application#265) |
+//! | other readers' [`ReaderMetadata`](crate::ReaderMetadata), on the timeline, a track, a clip or a marker | the object's `metadata`, beside `mediaio`: each namespace under its own key, an object of strings, written whole — `{}` for one holding no entry — every key in byte order, as OpenTimelineIO's own writer orders a dictionary's; an object with no namespace writes none |
+//! | the exact words a reader needs | `metadata.mediaio`: the edit rate (`rate`, `num/den`) on the timeline; on a clip, its reference and a clip's marker, the exact ruler a media-side range's counts are written in and the timebase the model counts it in (`source`, `available`, `range`); on a dissolve, its place among its track's transitions where the track keeps them out of their cuts' order (`order`); and the timebase of an edit-side value spelled otherwise than the edit rate's reciprocal — the timeline's `start`, a clip's `record`, a fade's, a stack marker's or a track marker's `timebase`, a dissolve's `at`, `in_offset`, `out_offset` — so `1/24` beside a rate of `48/2` reads back as `1/24` |
 //!
 //! Every position on the record side is a whole count at the edit rate. A
 //! media-side range (a source range, an available range) is written whole in
@@ -50,18 +51,23 @@
 //!   coarsest, which counts it in the smallest counts; and a range none of
 //!   them writes — or, an available range, ends within ±2^53 — is refused;
 //! - every number it writes reads back, in OpenTimelineIO 0.17.0's reader,
-//!   as the value meant. That reader is RapidJSON in its normal precision,
-//!   which does not always round to the nearest double: it reads a count
-//!   written `<digits>.0` exactly up to 1 801 439 850 948 198, ⌊2^54 / 10⌋,
-//!   but past it may read another — `1801439850948199.0` as
-//!   1801439850948199.25, `9007199254740991.0` as 9007199254740990 — and it
-//!   reads the shortest spelling of the `f64` of every common rate exactly —
-//!   24, 25, 30, 48, 50 and 60, the NTSC rates over 1001, the audio rates,
-//!   90 kHz — but of some others a neighbouring `f64`, 96000/1001's among
-//!   them. So the export reads every count and every rate it writes as that
-//!   reader does, in a build that rounds its multiply-adds twice and in one
-//!   that fuses them, and refuses one either reads as another value
-//!   ([`NotRepresentable::misread`]);
+//!   as the value meant, in a build that rounds its multiply-adds twice and
+//!   in one that fuses them. That reader is RapidJSON in its normal
+//!   precision, which does not always round to the nearest double. It reads
+//!   a count written `<digits>.0` exactly up to 1 801 439 850 948 198,
+//!   ⌊2^54 / 10⌋, but past it may read another — `1801439850948199.0` as
+//!   1801439850948199.25, `9007199254740991.0` as 9007199254740990 — so a
+//!   count past it is written as its integer, `1801439850948199`, which it
+//!   hands over whole. It reads the shortest spelling of the `f64` of every
+//!   common rate exactly — 24, 25, 30, 48, 50 and 60, the NTSC rates over
+//!   1001, the audio rates, 90 kHz — but of some others a neighbouring
+//!   `f64`, 96000/1001's among them, so such a rate is written in another
+//!   spelling of the same `f64` that both builds read exactly:
+//!   `95904095904095904e-15`, an integer an `f64` holds over a power of ten
+//!   its table holds, which the reader divides once. A rate no such
+//!   spelling writes is refused ([`NotRepresentable::misread`]): of the
+//!   rates `num/1001` up to 200 000/1001, three — 29195/1001, 31264/1001
+//!   and 31799/1001;
 //! - every count OpenTimelineIO derives from the document — the end of each
 //!   clip's source range, its start plus its length; each child's place on
 //!   its track, from zero in the child's own rate with every item before it
@@ -182,8 +188,8 @@ pub enum OtioTarget {
 ///   or derive rounded in every plan of rulers the export's bounded search
 ///   tries ([`RulerSearch`]): one past 2^53, where its `f64` no longer holds
 ///   every whole number, or one its arithmetic would land half a tick off
-///   or more (see [the module's docs](self)); and for a count or a rate
-///   whose spelling OpenTimelineIO 0.17's reader reads as another value
+///   or more (see [the module's docs](self)); and for a rate no spelling of
+///   which the export tries OpenTimelineIO 0.17's reader reads back exactly
 ///   ([`NotRepresentable::misread`]).
 pub fn to_otio(timeline: &Timeline, target: OtioTarget) -> Result<Utf8Bytes, Refused> {
   validate(timeline).map_err(Refused::Validation)?;
@@ -210,9 +216,9 @@ pub enum Refused {
   /// by its arithmetic: the count the last plan tried could not hold, and,
   /// for a count OpenTimelineIO derives, a source range no ruler of the
   /// search's bands writes or an available range none holds whole, what the
-  /// search tried ([`NotRepresentable::searched`]); or a count or a rate the
-  /// export would write whose spelling OpenTimelineIO 0.17's reader reads as
-  /// another value ([`NotRepresentable::misread`]).
+  /// search tried ([`NotRepresentable::searched`]); or a rate no spelling
+  /// of which the export tries OpenTimelineIO 0.17's reader reads back
+  /// exactly ([`NotRepresentable::misread`]).
   NotRepresentable(NotRepresentable),
 }
 
@@ -263,23 +269,25 @@ impl core::error::Error for Refused {}
 /// its own cannot: every whole rate that lands on a range is a multiple of
 /// its coarsest whole ruler, one of its own, which counts it in the smallest
 /// counts. Those refusals say what the search tried too: its bands, and no
-/// walk. A track's marker is counted at the edit rate, as a count the
-/// export writes there, and refused with no search.
+/// walk. The timeline's marker and a track's are counted at the edit rate,
+/// as a count the export writes there, and refused with no search.
 ///
-/// Last, a number the export would write — a count, or a ruler's rate —
-/// that OpenTimelineIO 0.17 reads as another value is refused, with no
-/// search ([`misread`](Self::misread)). OpenTimelineIO 0.17.0 reads numbers
-/// with RapidJSON in its normal precision, which does not always round to
-/// the nearest double: a count written `<digits>.0` past
-/// 1 801 439 850 948 198, ⌊2^54 / 10⌋, can read as another —
-/// `1801439850948199.0` as 1801439850948199.25, `9007199254740991.0` as
-/// 9007199254740990, a whole number — and the shortest spelling of the
-/// `f64` of some rates as a neighbouring `f64`, 96000/1001's among them,
-/// while every common rate reads exactly. A build that fuses one of
-/// RapidJSON's multiply-adds may also read a long number otherwise than one
-/// that does not. The export reads every count and every rate it writes as
-/// both kinds of build read it, and refuses the first, in the order the
-/// document writes them, that either reads as another value.
+/// Last, a ruler's rate none of whose spellings the export tries
+/// OpenTimelineIO 0.17 reads back exactly is refused, with no search
+/// ([`misread`](Self::misread)). OpenTimelineIO 0.17.0 reads numbers with
+/// RapidJSON in its normal precision, which does not always round to the
+/// nearest double: it reads the shortest spelling of the `f64` of some
+/// rates as a neighbouring `f64`, 96000/1001's among them, while every
+/// common rate reads exactly; and a build that fuses one of RapidJSON's
+/// multiply-adds may read a long number otherwise than one that does not.
+/// The export writes such a rate in another spelling of the same `f64` that
+/// both kinds of build read exactly, where one of those it tries does — an
+/// integer an `f64` holds over a power of ten, which the reader divides
+/// once — and refuses the first rate, in the order the document writes
+/// them, that none does: of the rates `num/1001` up to 200 000/1001,
+/// 29195/1001, 31264/1001 and 31799/1001. Every count it writes reads back
+/// exactly: `<digits>.0` up to ⌊2^54 / 10⌋, which the reader reads exactly,
+/// and its integer past that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NotRepresentable {
   at: Spot,
@@ -328,17 +336,18 @@ impl NotRepresentable {
     self.searched
   }
 
-  /// The number OpenTimelineIO 0.17 reads as another value where the
-  /// export would write it: the count, written `<digits>.0`, or the rate
-  /// of [`rate`](Self::rate)'s ruler, and what it reads. `None` for a count
-  /// past 2^53, or one OpenTimelineIO derives rounded.
+  /// The rate of [`rate`](Self::rate)'s ruler, where none of its spellings
+  /// the export tries reads back exactly in OpenTimelineIO 0.17, and what
+  /// that reader reads of its shortest. `None` for a count past 2^53, or
+  /// one OpenTimelineIO derives rounded.
   pub const fn misread(&self) -> Option<Misread> {
     self.misread
   }
 }
 
 /// A number the export would write that OpenTimelineIO 0.17 reads as
-/// another value: what [`NotRepresentable::misread`] carries.
+/// another value, whatever spelling of it the export tries: what
+/// [`NotRepresentable::misread`] carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Misread {
   number: MisreadNumber,
@@ -360,33 +369,33 @@ impl Misread {
     self.number
   }
 
-  /// The value meant: the count, or the `f64` nearest the exact rate.
+  /// The value meant: the `f64` nearest the exact rate.
   pub const fn meant(&self) -> f64 {
     f64::from_bits(self.meant)
   }
 
-  /// What OpenTimelineIO 0.17 reads the spelling as: in a build that
-  /// rounds RapidJSON's `d * 10 + digit` twice, then in one that fuses it —
-  /// one value twice where the two agree.
+  /// What OpenTimelineIO 0.17 reads the shortest spelling as: in a build
+  /// that rounds RapidJSON's `d * 10 + digit` twice, then in one that fuses
+  /// it — one value twice where the two agree.
   pub const fn read(&self) -> [f64; 2] {
     [f64::from_bits(self.read[0]), f64::from_bits(self.read[1])]
   }
 }
 
-/// Writes `written 1801439850948199.0: OpenTimelineIO 0.17 reads this
-/// spelling as another value, 1801439850948199.3` — the read value in its
-/// shortest spelling, 1801439850948199.25's — or for a rate `its rate
-/// written 95.90409590409591: …`, both readings where two builds differ.
+/// Writes `its rate written 29.165834165834166: OpenTimelineIO 0.17 reads
+/// this spelling as another value, and every other the export tries,
+/// 29.16583416583417` — the read value in its shortest spelling — with both
+/// readings where two builds differ.
 impl fmt::Display for Misread {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let meant = self.meant();
     match self.number {
-      // A count the export writes lies within ±2^53, where its `f64` is
-      // whole and exact.
-      MisreadNumber::Count => write!(f, "written {}.0", meant as i128)?,
       MisreadNumber::Rate => write!(f, "its rate written {meant:?}")?,
     }
-    f.write_str(": OpenTimelineIO 0.17 reads this spelling as another value, ")?;
+    f.write_str(
+      ": OpenTimelineIO 0.17 reads this spelling as another value, and every other the export \
+       tries, ",
+    )?;
     let [twice, fused] = self.read();
     if twice.to_bits() == fused.to_bits() {
       write!(f, "{twice:?}")
@@ -401,16 +410,16 @@ impl fmt::Display for Misread {
 }
 
 /// Which number of a `RationalTime` OpenTimelineIO 0.17 would read as
-/// another value ([`Misread::number`]).
+/// another value ([`Misread::number`]). Its count it never does: the export
+/// writes every count in a spelling that reader reads exactly.
 ///
 /// Marked `#[non_exhaustive]`: a later number joins as a variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum MisreadNumber {
-  /// Its count, `value`, written as its digits and `.0`.
-  Count,
-  /// Its rate, written as the shortest spelling of the `f64` nearest the
-  /// exact rate.
+  /// Its rate: the `f64` nearest the exact rate, which OpenTimelineIO 0.17
+  /// reads as another value in its shortest spelling and in every other
+  /// the export tries.
   Rate,
 }
 
@@ -420,12 +429,12 @@ pub enum MisreadNumber {
 /// `…, in the last of 3 plans the bounded search walked, …` — or, for a
 /// source range no ruler of the bands writes or an available range none
 /// holds whole, `…, in any of the range's own rulers or of the bounded
-/// search's bands, so the search walked no plan`. For a number
-/// OpenTimelineIO 0.17 reads as another value, the spelling and what it
-/// reads instead ([`Misread`]): `the gap before track 0, clip 0 counts
-/// 1801439850948199 ticks of 1/1 s, written 1801439850948199.0:
-/// OpenTimelineIO 0.17 reads this spelling as another value,
-/// 1801439850948199.3`.
+/// search's bands, so the search walked no plan`. For a rate
+/// OpenTimelineIO 0.17 reads as another value whatever spelling the export
+/// tries, the shortest and what it reads instead ([`Misread`]): `the start
+/// counts 0 ticks of 1001/29195 s, its rate written 29.165834165834166:
+/// OpenTimelineIO 0.17 reads this spelling as another value, and every
+/// other the export tries, 29.16583416583417`.
 impl fmt::Display for NotRepresentable {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "{} counts {} ticks", self.at, self.value)?;
@@ -634,9 +643,9 @@ pub enum Spot {
   /// track ([`AbsoluteEnd`](Self::AbsoluteEnd)).
   TimelineEnd,
   /// A marker's range — its start, its length or its end — refused as the
-  /// timeline holds it, before any walk: a track's marker counted at the
-  /// edit rate; a clip's in none of its own rulers, nor of the rulers the
-  /// timeline's operands are counted in, held whole.
+  /// timeline holds it, before any walk: the timeline's marker or a track's
+  /// counted at the edit rate; a clip's in none of its own rulers, nor of
+  /// the rulers the timeline's operands are counted in, held whole.
   Marker(MarkerAt),
 }
 
@@ -838,7 +847,13 @@ impl core::error::Error for Shape {}
 /// one it models elsewhere is refused with its name and where it sits
 /// ([`Unreadable::Schema`]); a key, value or note of a modelled schema the
 /// timeline has no word for is refused by name too
-/// ([`Unreadable::Feature`]). A member is read only where the timeline keeps
+/// ([`Unreadable::Feature`]). On the timeline, a track, a clip and a
+/// marker, each key of the `metadata` beside `mediaio` is another reader's
+/// namespace, read whole into the object's
+/// [`ReaderMetadata`](crate::ReaderMetadata) — `{}` as an empty one — and
+/// refused by name where it is no object ([`Feature::Metadata`]) or holds a
+/// value that is no string ([`Feature::NamespaceValue`]); on every other
+/// object such a key is refused by name ([`Feature::Metadata`]). A member is read only where the timeline keeps
 /// it, or where OpenTimelineIO 0.17.0 holds it as it holds its absence:
 /// nothing is dropped — a `color` on an item and an `enabled` on a
 /// transition, which OpenTimelineIO keeps as dynamic fields, are refused by
@@ -1031,8 +1046,16 @@ pub enum Feature {
   /// A key the reader does not know on its object.
   Key(Utf8Bytes),
   /// A note in an object's `metadata` under a key other than this crate's
-  /// `mediaio`: another writer's, which the timeline does not keep.
+  /// `mediaio`: another writer's, which the timeline does not keep — on
+  /// an object that keeps no reader's namespace (the stack, a gap, a
+  /// transition, a media reference), or, on one that does (the timeline, a
+  /// track, a clip, a marker), one whose value is no object, which no
+  /// namespace is.
   Metadata(Utf8Bytes),
+  /// An entry of a reader's namespace whose value is no string: a
+  /// namespace holds strings alone ([`ReaderMetadata`](crate::ReaderMetadata)),
+  /// and the timeline keeps no other value there.
+  NamespaceValue(Utf8Bytes),
   /// A word under `mediaio` the reader does not know there.
   Word(Utf8Bytes),
   /// A name where the timeline keeps none: the stack's, other than
@@ -1094,6 +1117,10 @@ impl fmt::Display for Feature {
       Self::Metadata(key) => write!(
         f,
         "the note {key}, another writer's, which the timeline does not keep"
+      ),
+      Self::NamespaceValue(key) => write!(
+        f,
+        "the entry {key}, which is no string: a reader's namespace holds strings alone"
       ),
       Self::Word(word) => write!(f, "the word {word}, which this reader does not know there"),
       Self::Name(name) => write!(f, "the name {name:?}, where the timeline keeps none"),

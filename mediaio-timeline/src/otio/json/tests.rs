@@ -325,7 +325,7 @@ fn every_number_is_read_as_rapidjson_compiled_either_way_reads_it() {
       wrong.push(text);
     }
   }
-  assert_eq!(rows, 225);
+  assert_eq!(rows, 236);
   assert!(wrong.is_empty(), "read otherwise than RapidJSON: {wrong:?}");
 }
 

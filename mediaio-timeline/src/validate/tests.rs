@@ -7,8 +7,8 @@ use smol_bytes::format_utf8bytes;
 
 use super::*;
 use crate::{
-  Clip, ClipId, Fade, FadeShape, Fades, Marker, MediaRef, Rate, TimeRange, Timeline, Track,
-  TrackKind, Transition,
+  Clip, ClipId, Fade, FadeShape, Fades, Marker, MediaRef, Metadata, Rate, TimeRange, Timeline,
+  Track, TrackKind, Transition,
 };
 
 fn tb(num: i32, den: i32) -> Timebase {
@@ -749,5 +749,167 @@ fn marker_refusals_name_their_marker() {
       marker: 0
     })),
     "track 2, marker 0: the marked range runs longer than i64::MAX ticks"
+  );
+}
+
+/// A reader's namespace, as a writer puts a marker's note where DaVinci
+/// Resolve reads it.
+fn resolve(note: &str) -> ReaderMetadata {
+  ReaderMetadata::new().with("Resolve_OTIO", Metadata::new().with("Note", note))
+}
+
+#[test]
+fn readers_namespaces_on_every_object_that_keeps_them_are_valid() {
+  // Any name but the two the export keeps — an empty one, `metadata`, a
+  // key the crate's words use — and any key but `OTIO_SCHEMA` inside one,
+  // `OTIO_REF_ID` among them; a namespace holding no entry too.
+  let mut timeline = marked().with_readers(
+    resolve("the cut")
+      .with("", Metadata::new().with("OTIO_REF_ID", "r"))
+      .with("metadata", Metadata::new()),
+  );
+  *timeline.tracks_mut()[0].readers_mut() = resolve("picture");
+  *timeline.tracks_mut()[0].markers_mut()[0].readers_mut() = resolve("act one");
+  *clip_mut(&mut timeline, 1, 0).readers_mut() = resolve("sound");
+  *clip_mut(&mut timeline, 1, 0).markers_mut()[0].readers_mut() = resolve("breath");
+  assert_eq!(validate(&timeline), Ok(()));
+}
+
+#[test]
+fn a_namespace_the_export_keeps_or_one_holding_a_schema_word_is_refused_where_it_sits() {
+  // In key order: `OTIO_SCHEMA` (0), `Resolve_OTIO` (1), `mediaio` (2).
+  let reserved = || {
+    ReaderMetadata::new()
+      .with("mediaio", Metadata::new())
+      .with(
+        "Resolve_OTIO",
+        Metadata::new()
+          .with("Note", "n")
+          .with("OTIO_SCHEMA", "Marker.2"),
+      )
+      .with("OTIO_SCHEMA", Metadata::new())
+  };
+  let mut timeline = marked().with_readers(reserved());
+  *timeline.tracks_mut()[0].readers_mut() = reserved();
+  *timeline.tracks_mut()[0].markers_mut()[0].readers_mut() = reserved();
+  *clip_mut(&mut timeline, 1, 0).readers_mut() = reserved();
+  *clip_mut(&mut timeline, 1, 0).markers_mut()[0].readers_mut() = reserved();
+  let three = |owner| {
+    [
+      Refusal::ReservedNamespace(NamespaceAt::new(owner, 0)),
+      Refusal::SchemaKeyInNamespace(NamespaceAt::new(owner, 1)),
+      Refusal::ReservedNamespace(NamespaceAt::new(owner, 2)),
+    ]
+  };
+  // In the documented order: the timeline's own; then V1's marker's and
+  // V1's own; then A1's clip's, and its marker's after them.
+  let expected = [
+    three(MetadataAt::Timeline),
+    three(MetadataAt::Marker(MarkerAt::Track {
+      track: 0,
+      marker: 0,
+    })),
+    three(MetadataAt::Track(0)),
+    three(MetadataAt::Clip(ClipAt::new(1, 0))),
+    three(MetadataAt::Marker(MarkerAt::Clip {
+      clip: ClipAt::new(1, 0),
+      marker: 0,
+    })),
+  ]
+  .concat();
+  assert_eq!(refusals(&timeline), expected);
+}
+
+#[test]
+fn namespace_refusals_name_their_namespace() {
+  let shown = |refusal: Refusal| std::string::ToString::to_string(&refusal);
+  assert_eq!(
+    shown(Refusal::ReservedNamespace(NamespaceAt::new(
+      MetadataAt::Timeline,
+      0
+    ))),
+    "the timeline, namespace 0: a reader's namespace named mediaio or OTIO_SCHEMA, which the \
+     export keeps"
+  );
+  assert_eq!(
+    shown(Refusal::ReservedNamespace(NamespaceAt::new(
+      MetadataAt::Track(3),
+      1
+    ))),
+    "track 3, namespace 1: a reader's namespace named mediaio or OTIO_SCHEMA, which the export \
+     keeps"
+  );
+  assert_eq!(
+    shown(Refusal::SchemaKeyInNamespace(NamespaceAt::new(
+      MetadataAt::Clip(ClipAt::new(1, 0)),
+      2
+    ))),
+    "track 1, clip 0, namespace 2: the key OTIO_SCHEMA, which OpenTimelineIO reads as a schema \
+     word"
+  );
+  assert_eq!(
+    shown(Refusal::SchemaKeyInNamespace(NamespaceAt::new(
+      MetadataAt::Marker(MarkerAt::Clip {
+        clip: ClipAt::new(0, 2),
+        marker: 1
+      }),
+      0
+    ))),
+    "track 0, clip 2, marker 1, namespace 0: the key OTIO_SCHEMA, which OpenTimelineIO reads as \
+     a schema word"
+  );
+  let at = NamespaceAt::new(MetadataAt::Track(3), 1);
+  assert_eq!((at.owner(), at.namespace()), (MetadataAt::Track(3), 1));
+}
+
+#[test]
+fn the_timelines_markers_are_held_as_a_tracks_are_before_every_tracks() {
+  // Q813: the timeline's own markers, at the edit rate from its zero.
+  let mut timeline = marked()
+    .with_marker(Marker::new("scene", rec(0, 96)))
+    .with_marker(Marker::new("point", rec(500, 500)));
+  assert_eq!(validate(&timeline), Ok(()));
+  timeline.markers_mut()[0].set_range(TimeRange::new(0, 2000, Timebase::MILLIS));
+  timeline.markers_mut()[1].set_range(TimeRange::new(-1, i64::MAX, edit()));
+  timeline.tracks_mut()[0].markers_mut()[0].set_range(TimeRange::new(0, 2000, Timebase::MILLIS));
+  assert_eq!(
+    refusals(&timeline),
+    [
+      Refusal::OffEditRate(Place::Marker(MarkerAt::Timeline { marker: 0 })),
+      Refusal::MarkerTooLong(MarkerAt::Timeline { marker: 1 }),
+      Refusal::OffEditRate(Place::Marker(MarkerAt::Track {
+        track: 0,
+        marker: 0
+      })),
+    ]
+  );
+  // A marker's namespaces follow it, and the timeline's own come after
+  // its markers'.
+  let timeline = marked()
+    .with_readers(ReaderMetadata::new().with("OTIO_SCHEMA", Metadata::new()))
+    .with_marker(
+      Marker::new("scene", rec(0, 96))
+        .with_readers(ReaderMetadata::new().with("mediaio", Metadata::new())),
+    );
+  assert_eq!(
+    refusals(&timeline),
+    [
+      Refusal::ReservedNamespace(NamespaceAt::new(
+        MetadataAt::Marker(MarkerAt::Timeline { marker: 0 }),
+        0
+      )),
+      Refusal::ReservedNamespace(NamespaceAt::new(MetadataAt::Timeline, 0)),
+    ]
+  );
+  let shown = |refusal: Refusal| std::string::ToString::to_string(&refusal);
+  assert_eq!(
+    shown(Refusal::OffEditRate(Place::Marker(MarkerAt::Timeline {
+      marker: 0
+    }))),
+    "the marked range of the timeline, marker 0 is not counted at the edit rate"
+  );
+  assert_eq!(
+    shown(Refusal::MarkerTooLong(MarkerAt::Timeline { marker: 1 })),
+    "the timeline, marker 1: the marked range runs longer than i64::MAX ticks"
   );
 }

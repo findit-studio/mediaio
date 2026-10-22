@@ -542,8 +542,7 @@ fn handles(outgoing: i64, incoming: i64, into: u64, out: u64) -> Timeline {
 fn a_visible_range_a_transitions_handle_widens_past_2_53_is_refused() {
   // The outgoing source [2^53 - 1, 2^53) plays on a second past its end:
   // OpenTimelineIO's visible range of `a` ends at 2^53 + 1, read as 2^53 —
-  // refused before its start, which OpenTimelineIO 0.17's reader would
-  // misread besides.
+  // refused.
   let past = i128::from(TWO_53) + 1;
   assert_eq!(
     refused(&handles(TWO_53 - 1, 0, 0, 1)),
@@ -560,8 +559,7 @@ fn a_visible_range_a_transitions_handle_widens_past_2_53_is_refused() {
 fn a_visible_range_inside_the_bound_is_written_and_read_back_exactly() {
   // One second earlier the handle ends `a`'s visible range at 2^53 itself,
   // and the incoming one starts at 1 - 2^53, its source from 2 - 2^53: both
-  // read back exactly. A source from 1 - 2^53, whose handle would start at
-  // -2^53, OpenTimelineIO 0.17's reader misreads.
+  // read back exactly.
   let text = to_otio(&handles(TWO_53 - 2, 0, 0, 1), OtioTarget::V0_15Plus).unwrap();
   let seconds = |value: i64| Read {
     value: value as f64,
@@ -612,8 +610,7 @@ fn a_place_from_the_global_start_past_2_53_is_refused() {
 
 #[test]
 fn a_global_start_whose_end_stays_within_2_53_is_written_and_read_back_exactly() {
-  // From 2^53 - 2 a clip two seconds long ends at 2^53. (A start of
-  // 2^53 - 1 OpenTimelineIO 0.17's reader misreads.)
+  // From 2^53 - 2 a clip two seconds long ends at 2^53.
   let text = to_otio(&seconds_long_from(TWO_53 - 2, 2), OtioTarget::V0_15Plus).unwrap();
   let root = json::parse(&text).unwrap();
   let start = read(&member(&root, "global_start_time"));
@@ -1509,27 +1506,22 @@ fn after_a_gap_ends(start: i64) -> i128 {
 #[test]
 fn a_childs_range_from_the_global_start_opentimelineio_ends_more_than_half_a_tick_off_is_written_in_the_edit_rate()
  {
-  // Codex round 7's case, 66 frames earlier: from Codex's own start,
-  // -9 007 199 254 444 572, a count OpenTimelineIO 0.17's reader misreads,
-  // the export refuses the timeline by name. Planned in 1 582ths, `a`'s
-  // place from the global start by `operator+` is exact at both ends. But
-  // OpenTimelineIO moves a child's range with its own duration kept
-  // (`composition.cpp` 357–359), and ends it at that duration plus the
-  // moved start rescaled to 1 582ths (`timeRange.h` 105–108): a product past
-  // 2^63, rounded, then divided — 1 907/2 753 of a tick off. The edit rate,
-  // a ruler the timeline counts in, holds `a`: written in it, nothing is
-  // rescaled, and the range reads back exactly.
+  // Codex round 7's case. From Codex's own start, -9 007 199 254 444 572,
+  // which OpenTimelineIO 0.17's reader misreads written `<digits>.0`, the
+  // export writes the start as its integer, which that reader reads exactly,
+  // and the timeline reads back. Planned in 1 582ths, `a`'s place from the
+  // global start by `operator+` is exact at both ends. But OpenTimelineIO
+  // moves a child's range with its own duration kept (`composition.cpp`
+  // 357–359), and ends it at that duration plus the moved start rescaled to
+  // 1 582ths (`timeRange.h` 105–108): a product past 2^63, rounded, then
+  // divided — 1 907/2 753 of a tick off. The edit rate, a ruler the timeline
+  // counts in, holds `a`: written in it, nothing is rescaled, and the range
+  // reads back exactly. 66 frames earlier, below, as from Codex's.
   let codex = -9_007_199_254_444_572;
-  match to_otio(&after_a_gap_from(codex), OtioTarget::V0_15Plus) {
-    Err(Refused::NotRepresentable(refusal)) => {
-      assert_eq!(
-        (refusal.at(), refusal.value()),
-        (Spot::Start, i128::from(codex))
-      );
-      assert!(refusal.misread().is_some(), "{refusal}");
-    }
-    other => panic!("{other:?}"),
-  }
+  let text = to_otio(&after_a_gap_from(codex), OtioTarget::V0_15Plus).unwrap();
+  assert!(text.contains("\"value\": -9007199254444572\n"), "{text}");
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  assert_eq!(from_otio(&text), Ok(after_a_gap_from(codex)));
   let start = -9_007_199_254_444_638;
   let text = to_otio(&after_a_gap_from(start), OtioTarget::V0_15Plus).unwrap();
   assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
