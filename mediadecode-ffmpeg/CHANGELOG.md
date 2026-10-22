@@ -32,6 +32,14 @@ The backend-agnostic core it adapts has its own log at
   fields, lets `frame_num` jump, or leaves the reorder depth to FFmpeg's
   guess (no `bitstream_restriction_flag`) is marked nowhere. The flag's
   contract is unchanged — absent means unknown.
+- **The FFmpeg this crate builds against is still 5.1 or later.** The
+  side-data kinds FFmpeg 7.0 to 9.0 added are named only where the linked
+  FFmpeg names them: the build script reads the linked release from
+  `ffmpeg-sys-next`'s `links` metadata — now a direct dependency, for that
+  alone, adding no feature — and gates each kind on it as `ffmpeg-next`
+  gates the same kinds. A kind this build does not name persists, so its
+  packet is never `DISPOSABLE`. `MEDIADECODE_FFMPEG_GATE_CEILING=6.1`
+  (any `<major>.<minor>`) builds the gates as for an older release.
 
 ### Added
 

@@ -48,6 +48,12 @@ mediaio-ffmpeg = { workspace = true }
 # `mediadecode` pin above.
 mediaframe  = { workspace = true, features = ["alloc"] }
 ffmpeg-next = { workspace = true }
+# For its `links` metadata alone, which the build script reads for the
+# linked FFmpeg's release: a packet side-data kind a release after 5.1
+# added is named only where the linked FFmpeg names it. No code uses it;
+# the bindings come through `ffmpeg-next`, and this enables no feature of
+# them.
+ffmpeg-sys-next = { workspace = true }
 derive_more = { workspace = true, features = ["is_variant", "try_unwrap", "unwrap"] }
 smol-bytes  = { workspace = true }
 triomphe    = { workspace = true }

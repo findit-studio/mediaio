@@ -39,6 +39,10 @@ thiserror   = { version = "2", default-features = false }
 smol-bytes  = { version = "0.1", default-features = false, features = ["std"] }
 triomphe    = { version = "0.1", default-features = false, features = ["std"] }
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format"] }
+# The bindings `ffmpeg-next` builds on, depended on directly only for their
+# `links` metadata: Cargo hands a build script `DEP_FFMPEG_*`, the linked
+# FFmpeg's release among it, only from a direct dependency.
+ffmpeg-sys-next = { version = "9", default-features = false }
 tracing     = { version = "0.1", default-features = false }
 libc        = "0.2"
 
@@ -81,6 +85,17 @@ unexpected_cfgs         = { level = "warn", check-cfg = [
   # decides whether `AVVTFramesContext` reaches the bindings at all.
   # `src/vtscale` compiles its VideoToolbox body only then.
   'cfg(ffmpeg_videotoolbox)',
+  # Emitted by `mediadecode-ffmpeg/build.rs` for each FFmpeg release the
+  # linked FFmpeg is, or is newer than, as `ffmpeg-sys-next` reports it:
+  # the packet side-data kinds a release added are named only then.
+  # `ffmpeg_gate_ceiling` marks a build whose gates
+  # `MEDIADECODE_FFMPEG_GATE_CEILING` lowered below the linked release.
+  'cfg(ffmpeg_7_0)',
+  'cfg(ffmpeg_7_1)',
+  'cfg(ffmpeg_8_0)',
+  'cfg(ffmpeg_8_1)',
+  'cfg(ffmpeg_9_0)',
+  'cfg(ffmpeg_gate_ceiling)',
   # Set by `.cargo/config.toml` for `wasm32-*` targets and by
   # CI's `RUSTFLAGS`. `web-sys` gates WebCodecs APIs behind it.
   'cfg(web_sys_unstable_apis)',
