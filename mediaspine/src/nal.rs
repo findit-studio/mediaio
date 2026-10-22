@@ -2,17 +2,32 @@
 //! anything references it, so that dropping the packet loses that picture
 //! and no other.
 //!
-//! [`NalStream::read`] reads one packet's NAL unit headers and answers
-//! [`Verdict::Disposable`] only where the bitstream itself proves that
-//! nothing references the packet's picture, and that nothing else the
-//! packet carries is needed later. Anything it cannot prove keeps the
-//! packet ([`Verdict::Kept`]), with the reason. A demuxer ORs the verdict
-//! into [`PacketFlags::DISPOSABLE`](crate::packet::PacketFlags::DISPOSABLE)
+//! [`NalStream::read`] reads one packet and answers [`Verdict::Disposable`]
+//! only where the bitstream itself proves that nothing references the
+//! packet's picture and that nothing else the packet carries is needed
+//! later. Anything it cannot prove keeps the packet ([`Verdict::Kept`]),
+//! with the reason. A demuxer ORs the verdict into
+//! [`PacketFlags::DISPOSABLE`](crate::packet::PacketFlags::DISPOSABLE)
 //! beside the container's own mark, so the fact is the same whichever
 //! container carried the stream.
 //!
-//! It reads nothing but headers — a byte for H.264, two for HEVC, and the
-//! first bytes of an HEVC parameter set — and allocates nothing.
+//! It reads NAL unit headers, the first bytes of an HEVC parameter set, the
+//! message headers of an SEI unit, and the bytes of each NAL unit of a
+//! length-framed packet, for a start code. It allocates nothing.
+//!
+//! # The decoder
+//!
+//! The question is FFmpeg's, asked of its own H.264 and HEVC decoders as
+//! libavcodec opens them: fed a track's packets in decoding order — every
+//! packet the reading reads but those it marks — as a demuxer delivers
+//! them, whole access units and never in chunks (`AV_CODEC_FLAG2_CHUNKS`),
+//! with the H.264 decoder's private `is_avc` and `nal_length_size` options
+//! left to the configuration record (`libavcodec/h264dec.c` 1093–1094). A
+//! decoder opened afresh at a seek is answered for too
+//! ([`NalStream::seeked`]). A decoder's frame threads hand its framing on
+//! from packet to packet (`libavcodec/h264_slice.c` 419–421,
+//! `libavcodec/hevc/hevcdec.c` 4051–4052), so a threaded decoder reads as
+//! one thread does.
 //!
 //! # H.264
 //!
@@ -24,18 +39,17 @@
 //! (NAL unit types 1–5, Table 7-1), every slice has `nal_ref_idc` equal to
 //! 0, and none is an IDR slice (type 5). Every slice is checked, so a
 //! packet that carries a field pair is disposable only where both fields
-//! are. Beside the slices, only SEI (6), access unit delimiters (9) and
-//! filler data (12) may ride: a parameter set (7, 8, 13, 15), an end of
-//! sequence or of stream (10, 11), and any type this module does not read
-//! keep the packet, because a later picture may need them; and a NAL unit
-//! of the scalable, multiview or 3-D extensions (14, 20, 21) keeps it too,
-//! because a multiview view component of `nal_ref_idc` 0 whose
-//! `inter_view_flag` is 1 "may be used for inter-view prediction by other
-//! view components in the current access unit" (G.7.4.1.1).
-//!
-//! FFmpeg's `skip_frame = AVDISCARD_NONREF` skips every NAL unit of
-//! `nal_ref_idc` 0 but SEI, one at a time (`libavcodec/h264dec.c` 626–628
-//! in 9.0.1); this decides for the whole packet, the unit a consumer drops.
+//! are. Beside the slices, only access unit delimiters (9), filler data
+//! (12) and an SEI unit whose every message its own picture alone takes up
+//! ([SEI](#sei)) may ride. A parameter set (7, 8, 13, 15), any other SEI
+//! unit, an end of sequence or of stream (10, 11), and any type this module
+//! does not read keep the packet, because a later picture, or what is
+//! output after it, may need them. A NAL unit of the scalable, multiview or
+//! 3-D extensions (14, 20, 21) keeps the packet too, because a multiview
+//! view component of `nal_ref_idc` 0 whose `inter_view_flag` is 1 "may be
+//! used for inter-view prediction by other view components in the current
+//! access unit" (G.7.4.1.1). This decides for the whole packet, the unit a
+//! consumer drops.
 //!
 //! # HEVC
 //!
@@ -52,14 +66,16 @@
 //! `sps_max_sub_layers_minus1` (7.4.3.2.1), `vps_max_sub_layers_minus1`,
 //! which bounds it, and a configuration record's `numTemporalLayers` less
 //! one where it is not 0. It only ever rises, so a reading that is off can
-//! only fail to mark. Nothing is disposable before a sequence parameter set
-//! has been seen, in the configuration record or in the stream.
+//! only fail to mark ([what the reading learns](#what-the-reading-learns)).
+//! Nothing is disposable before a sequence parameter set has been seen, in
+//! the configuration record or in the stream.
 //!
 //! Beside the slices, only access unit delimiters (35), filler data (38)
-//! and SEI (39, 40) may ride: a parameter set (32–34), an end of sequence
-//! or of bitstream (36, 37), a reserved or unspecified type, and any NAL
-//! unit of a layer above 0 keep the packet. An IRAP picture is never
-//! disposable.
+//! and an SEI unit whose every message its own picture alone takes up
+//! ([SEI](#sei)) may ride. A parameter set (32–34), any other prefix or
+//! suffix SEI unit (39, 40), an end of sequence or of bitstream (36, 37), a
+//! reserved or unspecified type, and any NAL unit of a layer above 0 keep
+//! the packet. An IRAP picture is never disposable.
 //!
 //! **FFmpeg's own `AVDISCARD_NONREF` has no temporal guard**: it skips
 //! every SLNR NAL unit at every sub-layer (`libavcodec/hevc/hevcdec.c`
@@ -68,35 +84,140 @@
 //! it can drop a picture a higher sub-layer references; this module does
 //! not.
 //!
+//! # SEI
+//!
+//! An SEI unit rides beside a disposable picture only where every message
+//! in it is one FFmpeg's decoder takes up for that picture alone, leaving
+//! nothing behind for a later one. The unit is read as FFmpeg reads it
+//! (`libavcodec/h264_sei.c` 229–300, `libavcodec/hevc/sei.c` 264–317): the
+//! bytes after its header, emulation prevention bytes dropped, are
+//! messages, each a `payloadType` and a `payloadSize` coded in runs of
+//! `0xFF` and then that many bytes, up to the unit's `rbsp_trailing_bits`,
+//! a last byte of `0x80`. A unit that does not read so keeps the packet.
+//!
+//! | codec | `payloadType` (`libavcodec/sei.h`) | why it rides |
+//! |---|---|---|
+//! | H.264 | 1, picture timing | FFmpeg clears it before every access unit (`h264dec.c` 593–598, `h264_sei.c` 48–61) and applies it to its own picture (`h264_slice.c` 1185–1235) |
+//! | H.264, HEVC | 3, filler payload | no decoder reads it: it falls to `ff_h2645_sei_message_decode`, which has no case for it (`h2645_sei.c` 286–317; `h264_sei.c` 282–286, `hevc/sei.c` 242–248, 251–262) |
+//! | HEVC | 132, decoded picture hash | FFmpeg checks its own picture against it and clears it (`hevc/hevcdec.c` 3505–3512) |
+//!
+//! Every other message keeps the packet: a persistent one — film grain,
+//! tone mapping, mastering display, a recovery point, user data whose
+//! content FFmpeg keeps (an x264 version, `h2645_sei.c` 92–99) — and every
+//! type this module does not read. HEVC's picture timing is among them:
+//! FFmpeg keeps its field structure for every later picture that carries
+//! none (`hevc/sei.c` 52–75, `hevc/refs.c` 183–187), clearing it only at
+//! the decoder's opening (`hevc/hevcdec.c` 4160). FFmpeg's own
+//! `skip_frame = AVDISCARD_NONREF` never skips an H.264 SEI unit for the
+//! same reason (`h264dec.c` 626–628).
+//!
 //! # Framing
 //!
 //! A track's packets carry their NAL units either each after a big-endian
-//! length or each after a start code (Annex B). The configuration record
-//! decides, as FFmpeg decides it: an `avcC` is extradata whose first byte
-//! is 1 (`libavcodec/h264_parse.c` 466–516), an `hvcC` extradata of at
-//! least 23 bytes whose first byte is 1, or 0 with a nonzero second byte
-//! or a third above 1 (`libavcodec/hevc/parse.c` 79–136); each gives the
-//! length's size, its `lengthSizeMinusOne` plus one. Anything else, and no
-//! extradata at all, is Annex B. A record whose length size is 3, or which
-//! ends before its own parameter sets do, frames nothing this module
-//! reads, and every packet is kept ([`KeptReason::Unframed`]).
+//! length or each after a start code (Annex B). The framing is FFmpeg's
+//! decoder's own state, two fields kept apart: whether lengths are read
+//! (`is_avc` for H.264, `is_nalff` for HEVC) and the length's size
+//! (`nal_length_size`), 0 until a record sets it. [`NalStream`] holds both
+//! and moves them where FFmpeg does:
 //!
-//! Where the length is four bytes, FFmpeg's H.264 decoder also reads a
-//! packet that begins with a four-byte start code, and whose next four
-//! bytes are no length that fits, as Annex B, and reads it so until a
-//! packet's first four bytes are a length that fits again
-//! (`libavcodec/h264dec.c` 602–607). This module follows the same rule.
+//! | event | H.264 (`h264_parse.c`, `h264dec.c`) | HEVC (`hevc/parse.c`, `hevc/hevcdec.c`) |
+//! |---|---|---|
+//! | no record, or an empty one | nothing moves (`h264_parse.c` 472–473, `h264dec.c` 399) | nothing moves (`hevcdec.c` 3856, 4168) |
+//! | a record whose first byte is 1 (H.264), or of 23 bytes or more whose first is 1, or 0 with a nonzero second or a third above 1 (HEVC) | lengths read, before anything is checked (`h264_parse.c` 475–479) | lengths read (`parse.c` 93–97), of two bytes while the record's arrays are read (103–105) |
+//! | that record read whole | the size is its `lengthSizeMinusOne` plus one (515–516) | the same (134–136) |
+//! | that record failing part way: too short, or a count past its end | the size stays (481–514) | the size stays two (112–119) |
+//! | any other record | start codes read, the size kept (517–522) | start codes read, the size kept (137–143) |
+//! | a record on a packet of no bytes | not read: the decoder takes the packet for the stream's end (`h264dec.c` 1034–1036) | read (`hevcdec.c` 3854–3860) |
+//! | a packet that is an `avcC` itself, while lengths are read | read as a record (`h264dec.c` 1045–1050) | — |
+//! | a packet while the size is four | start codes for one that begins with a four-byte start code whose next four bytes are a length past it, lengths for one whose first four bytes are a length that fits (`h264dec.c` 602–607) | — |
+//!
+//! A size of 0 while lengths are read frames nothing FFmpeg splits
+//! (`libavcodec/h2645_parse.h` 130–148), and every packet is kept
+//! ([`KeptReason::Unframed`]). A size of three is read as FFmpeg reads it,
+//! though ISO/IEC 14496-15 allows only 1, 2 and 4. A packet that is an
+//! `avcC` is kept ([`KeptReason::Configuration`]), and so is one that
+//! switches the framing ([`KeptReason::FramingChange`]), so that a decoder
+//! which drops every packet marked disposable still sees each packet that
+//! moves its framing.
+//!
+//! **Where the record's reading turns on its parameter sets.** FFmpeg
+//! decodes a record's parameter sets as well; this module does not. Where
+//! whether one decodes moves the size, the size is unknown, and no packet
+//! is marked ([`KeptReason::FramingUnknown`]):
+//!
+//! - H.264 retries a parameter set that does not decode, escaped, and
+//!   refuses there one of 21,802 bytes or more (`h264_parse.c` 436–437),
+//!   ending the record: an `avcC` holding one moves the size only if it
+//!   decodes. The size is known again when a record sets it.
+//! - Under `AV_EF_EXPLODE`, an HEVC record a parameter set of which does
+//!   not decode stops with a size of two (`hevc/parse.c` 72–76, 121–129).
+//!   The reading cannot know the decoder's `err_recognition`, so after a
+//!   mid-stream `hvcC` of any other size nothing is marked again. At the
+//!   decoder's opening the same record leaves no decoder at all
+//!   (`hevcdec.c` 4169–4172).
+//!
+//! Otherwise a record's reading is FFmpeg's, an allocation that fails
+//! aside: H.264 swallows any other parameter set that does not decode
+//! (`h264_parse.c` 421–464), and HEVC every one without `AV_EF_EXPLODE`
+//! (`hevc/parse.c` 72–76).
+//!
+//! **Seeks.** A seek leaves the framing a decoder reads the next packets in
+//! unknown wherever the framing differs from the one the stream opened in:
+//! a decoder keeps its own across a seek, and one opened afresh starts from
+//! the stream's. After such a seek nothing is marked again
+//! ([`NalStream::seeked`]).
+//!
+//! # The NAL unit types
+//!
+//! | codec | `nal_unit_type` | in a packet | why (clause) |
+//! |---|---|---|---|
+//! | H.264 | 1–4, `nal_ref_idc` 0 | a picture nothing references | 3.104, 7.4.1 |
+//! | H.264 | 1–4, `nal_ref_idc` above 0 | kept: [`KeptReason::Referenced`] | 7.4.1 |
+//! | H.264 | 5, IDR | kept: [`KeptReason::RandomAccess`] | 7.4.1 |
+//! | H.264 | 6, SEI of picture timing and filler payload alone | rides beside | [SEI](#sei) |
+//! | H.264 | 6, any other SEI | kept: [`KeptReason::Companion`] | Annex D; [SEI](#sei) |
+//! | H.264 | 9, 12: AUD, filler | rides beside | Table 7-1 |
+//! | H.264 | 7, 8, 13, 15: parameter sets | kept: [`KeptReason::Companion`] | 7.4.1 |
+//! | H.264 | 10, 11: end of sequence, of stream | kept: [`KeptReason::Companion`] | Table 7-1 |
+//! | H.264 | 14, 20, 21: extensions | kept: [`KeptReason::Extension`] | G.7.4.1.1 |
+//! | H.264 | 0, 16–19, 22–31: auxiliary, reserved, unspecified | kept: [`KeptReason::Companion`] | Table 7-1 |
+//! | HEVC | 0, 2, 4, 6, 8, 10, 12, 14: SLNR, at the highest sub-layer | a picture nothing references | 3.162, 7.4.2.2, 8.3.2 |
+//! | HEVC | the same, below the highest sub-layer | kept: [`KeptReason::BelowHighestSubLayer`] | 3.162, note |
+//! | HEVC | the same, before any SPS | kept: [`KeptReason::SubLayersUnknown`] | 7.4.3.2.1 |
+//! | HEVC | 1, 3, 5, 7, 9, 11, 13, 15: sub-layer reference | kept: [`KeptReason::Referenced`] | 7.4.2.2 |
+//! | HEVC | 16–23: IRAP | kept: [`KeptReason::RandomAccess`] | 7.4.2.2 |
+//! | HEVC | 32–34: parameter sets | kept: [`KeptReason::Companion`] | Table 7-1 |
+//! | HEVC | 35, 38: AUD, filler | rides beside | Table 7-1 |
+//! | HEVC | 36, 37: end of sequence, of bitstream | kept: [`KeptReason::Companion`] | Table 7-1 |
+//! | HEVC | 39, 40: SEI of filler payload and decoded picture hash alone | rides beside | [SEI](#sei) |
+//! | HEVC | 39, 40: any other SEI | kept: [`KeptReason::Companion`] | Annex D; [SEI](#sei) |
+//! | HEVC | 24–31, 41–63: reserved, unspecified | kept: [`KeptReason::Companion`] | Table 7-1 |
+//! | HEVC | any type of a layer above 0 | kept: [`KeptReason::Extension`] | Annex F |
+//!
+//! # What the reading learns
+//!
+//! An HEVC picture is disposable only at the highest sub-layer, so the
+//! reading must have read every parameter set the decoder may have. It
+//! reads more than FFmpeg's splitter does, never less: every NAL unit of a
+//! packet the framing frames, a malformed packet's too; in Annex B, the
+//! bytes after every start code, past bytes that frame nothing, where
+//! FFmpeg's splitter takes up the stream again (`h2645_parse.c` 559–584);
+//! and within a length-framed NAL unit, the bytes after each start code in
+//! it, which the splitter reads as units of their own (`h2645_parse.c`
+//! 44–52, 559–584). A unit of a sub-layer no parameter set has declared
+//! raises the highest sub-layer to its own. All of it only raises what
+//! later packets are held to, so reading more can only fail to mark.
 //!
 //! # What is never marked
 //!
 //! A codec other than H.264 and HEVC is never read: its packets carry the
-//! container's mark alone. And a packet that does not parse — a NAL unit
-//! whose forbidden bit is set, a length of 0 or one past the packet's end
-//! (which FFmpeg refuses too, `libavcodec/h2645_parse.h` 130–148), bytes
-//! that form no NAL unit, an HEVC TemporalId of −1 or past the highest
-//! sub-layer, a parameter set too short to read — is kept as
-//! [`KeptReason::Malformed`]: a packet this module cannot read is one it
-//! cannot prove disposable.
+//! container's mark alone. A packet that does not parse is kept as
+//! [`KeptReason::Malformed`]: a NAL unit whose forbidden bit is set, a
+//! length of 0 or one past the packet's end (which FFmpeg refuses too,
+//! `h2645_parse.h` 130–148), a length-framed NAL unit holding a start code,
+//! bytes that form no NAL unit, an HEVC TemporalId of −1 or past the highest
+//! sub-layer, a parameter set too short to read. A packet this module
+//! cannot read is one it cannot prove disposable.
 //!
 //! The citations are FFmpeg 9.0.1's sources, and Rec. ITU-T H.264 (V16,
 //! 06/2026) and H.265 (V11, 01/2026) by clause.
@@ -133,14 +254,17 @@ pub enum Framing {
 }
 
 /// The size of the length before each NAL unit: a configuration record's
-/// `lengthSizeMinusOne` plus one. A record of 3 frames nothing a decoder
-/// reads.
+/// `lengthSizeMinusOne` plus one. ISO/IEC 14496-15 allows one, two and
+/// four bytes; FFmpeg reads three as it reads the others
+/// (`libavcodec/h2645_parse.h` 130–148), and so does this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LengthSize {
   /// One byte.
   One,
   /// Two bytes.
   Two,
+  /// Three bytes.
+  Three,
   /// Four bytes.
   Four,
 }
@@ -151,17 +275,19 @@ impl LengthSize {
     match self {
       Self::One => 1,
       Self::Two => 2,
+      Self::Three => 3,
       Self::Four => 4,
     }
   }
 
-  /// From a record's `lengthSizeMinusOne` field, its low two bits; `None`
-  /// for 2, a length of three bytes.
-  const fn from_minus_one(bits: u8) -> Option<Self> {
-    match bits & 3 {
-      0 => Some(Self::One),
-      1 => Some(Self::Two),
-      3 => Some(Self::Four),
+  /// From FFmpeg's `nal_length_size`; `None` for 0, a size no record has
+  /// set, and for anything past four.
+  const fn from_bytes(bytes: u8) -> Option<Self> {
+    match bytes {
+      1 => Some(Self::One),
+      2 => Some(Self::Two),
+      3 => Some(Self::Three),
+      4 => Some(Self::Four),
       _ => None,
     }
   }
@@ -198,10 +324,11 @@ pub enum KeptReason {
   Referenced,
   /// A random-access picture: an H.264 IDR slice, or an HEVC IRAP one.
   RandomAccess,
-  /// A NAL unit beside the picture that a later picture may need, of this
-  /// `nal_unit_type`: a parameter set, an end of sequence or of stream, a
-  /// reserved type, or any other than SEI, an access unit delimiter or
-  /// filler data.
+  /// A NAL unit beside the picture that a later picture, or what is
+  /// output after it, may need, of this `nal_unit_type`: a parameter set,
+  /// an SEI unit holding a message its picture alone does not take up, an
+  /// end of sequence or of stream, a reserved type, or any other than an
+  /// access unit delimiter or filler data.
   Companion(u8),
   /// A NAL unit of an extension: H.264's scalable, multiview or 3-D slices
   /// and prefixes (14, 20, 21), or any HEVC NAL unit of a layer above 0.
@@ -214,9 +341,21 @@ pub enum KeptReason {
   SubLayersUnknown,
   /// The packet does not parse as its track's framing says.
   Malformed,
-  /// The track's configuration record frames nothing this module reads: a
-  /// length of three bytes, or a record that ends early.
+  /// The track's NAL units follow lengths of a size no record has set:
+  /// FFmpeg splits none of its packets.
   Unframed,
+  /// An H.264 packet that is an `avcC` itself, which configures the decoder
+  /// and holds no picture.
+  Configuration,
+  /// An H.264 packet whose first bytes switch the framing FFmpeg reads the
+  /// stream in: a decoder that never saw it would read the packets after it
+  /// otherwise.
+  FramingChange,
+  /// A packet the framing of which a decoder may read otherwise than the
+  /// reading can know: after a seek that followed a change of framing, or
+  /// after a record whose reading turns on whether its parameter sets
+  /// decode.
+  FramingUnknown,
 }
 
 impl fmt::Display for KeptReason {
@@ -235,29 +374,50 @@ impl fmt::Display for KeptReason {
       Self::BelowHighestSubLayer => f.write_str("a picture below the highest temporal sub-layer"),
       Self::SubLayersUnknown => f.write_str("a picture before any sequence parameter set"),
       Self::Malformed => f.write_str("a packet that does not parse"),
-      Self::Unframed => f.write_str("a configuration record that frames nothing"),
+      Self::Unframed => f.write_str("lengths of a size no record has set"),
+      Self::Configuration => f.write_str("a configuration record"),
+      Self::FramingChange => f.write_str("a packet that switches the framing"),
+      Self::FramingUnknown => f.write_str("a framing a decoder may read otherwise"),
     }
   }
 }
 
-/// One track's reading of its H.264 or HEVC bitstream: its codec, its
-/// framing, and for HEVC the highest temporal sub-layer any parameter set
-/// has declared so far.
+/// One track's reading of its H.264 or HEVC bitstream: its codec, the
+/// framing FFmpeg's decoder reads it in, and for HEVC the highest temporal
+/// sub-layer any parameter set has declared so far.
 ///
-/// Built from the track's configuration record ([`Self::new`]), rebuilt
-/// where the configuration changes mid-stream ([`Self::reconfigure`]), and
+/// The framing is FFmpeg's own state, held as its decoder holds it: whether
+/// each NAL unit follows a length (`is_avc` in `libavcodec/h264dec.h`,
+/// `is_nalff` in `hevc/hevcdec.h`) and the length's size
+/// (`nal_length_size`), the two kept apart. A configuration record moves
+/// them exactly as `ff_h264_decode_extradata` (`h264_parse.c` 466–524) and
+/// `ff_hevc_decode_extradata` (`hevc/parse.c` 79–146) move them: the first
+/// byte decides whether lengths are read, and the size moves only when the
+/// record is read whole, so a four-byte size outlives a record of start
+/// codes. An empty record changes nothing.
+///
+/// Built from the track's configuration record ([`Self::new`]), moved where
+/// the configuration changes mid-stream ([`Self::reconfigure`],
+/// [`Self::read_with_record`]), told of every seek ([`Self::seeked`]), and
 /// fed each of the track's packets in decoding order ([`Self::read`]),
 /// which learns from every parameter set it reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NalStream {
   codec: NalCodec,
-  /// `None` where the configuration record frames nothing this module
-  /// reads.
-  framing: Option<Framing>,
-  /// What the configuration record declared, before FFmpeg's H.264
-  /// per-packet reading moves [`Self::framing`].
-  configured: Option<Framing>,
-  /// The most any parameter set or configuration record has declared.
+  /// FFmpeg's `is_avc` or `is_nalff`: whether each NAL unit follows a
+  /// length; a start code otherwise.
+  lengths: bool,
+  /// FFmpeg's `nal_length_size`: the bytes of each length, 0 before a
+  /// record has set it; `None` where a record's reading turns on whether
+  /// its parameter sets decode.
+  length_size: Option<u8>,
+  /// The framing the stream opened in, `(lengths, length_size)`.
+  opened: (bool, Option<u8>),
+  /// Whether the framing a decoder reads the next packets in is no longer
+  /// known: nothing is marked again.
+  lost: bool,
+  /// The most any parameter set, configuration record or NAL unit has
+  /// declared.
   highest_sub_layer: u8,
   /// Whether a sequence parameter set has been read.
   sps_seen: bool,
@@ -265,29 +425,60 @@ pub struct NalStream {
 
 impl NalStream {
   /// The reading of a track of `codec` whose configuration record — its
-  /// extradata — is `extradata`, empty for none.
+  /// extradata — is `extradata`, empty for none, as the decoder reads it
+  /// when it opens.
   pub fn new(codec: NalCodec, extradata: &[u8]) -> Self {
     let mut stream = Self {
       codec,
-      framing: None,
-      configured: None,
+      lengths: false,
+      length_size: Some(0),
+      opened: (false, Some(0)),
+      lost: false,
       highest_sub_layer: 0,
       sps_seen: false,
     };
-    stream.reconfigure(extradata);
+    stream.record(extradata, true);
+    stream.opened = (stream.lengths, stream.length_size);
     stream
   }
 
   /// Reads a new configuration record — a mid-stream change of the
-  /// track's extradata — for its framing, and learns from its parameter
-  /// sets. What earlier parameter sets declared is kept: the highest
-  /// sub-layer only rises.
+  /// track's extradata, as `AV_PKT_DATA_NEW_EXTRADATA` brings one — as the
+  /// decoder reads it, and learns from its parameter sets. What earlier
+  /// parameter sets declared is kept: the highest sub-layer only rises.
+  ///
+  /// [`Self::read_with_record`] reads a packet together with the record it
+  /// carries, as the decoder takes the two.
   pub fn reconfigure(&mut self, extradata: &[u8]) {
-    self.framing = match self.codec {
-      NalCodec::H264 => avc_record(extradata),
-      NalCodec::Hevc => self.hevc_record(extradata),
-    };
-    self.configured = self.framing;
+    self.record(extradata, false);
+  }
+
+  /// Reads one packet that carries `record` — its first
+  /// `AV_PKT_DATA_NEW_EXTRADATA` entry, as `av_packet_get_side_data`
+  /// answers, or `None` — as the decoder takes the two: the record first
+  /// ([`Self::reconfigure`]), then the packet ([`Self::read`]). FFmpeg's
+  /// H.264 decoder takes no record from a packet of no bytes, which it
+  /// reads as the stream's end (`libavcodec/h264dec.c` 1034–1036); HEVC's
+  /// takes it from any (`libavcodec/hevc/hevcdec.c` 3854–3860).
+  pub fn read_with_record(&mut self, packet: &[u8], record: Option<&[u8]>) -> Verdict {
+    if let Some(record) = record {
+      if self.codec == NalCodec::Hevc || !packet.is_empty() {
+        self.reconfigure(record);
+      }
+    }
+    self.read(packet)
+  }
+
+  /// Tells the reading that the track was sought, or that a seek was
+  /// attempted. Where the framing differs from the one the stream opened
+  /// in, the framing a decoder reads the next packets in is no longer
+  /// known — a decoder keeps its own across a seek, and one opened afresh
+  /// starts from the stream's — so nothing is marked again
+  /// ([`KeptReason::FramingUnknown`]).
+  pub fn seeked(&mut self) {
+    if (self.lengths, self.length_size) != self.opened {
+      self.lost = true;
+    }
   }
 
   /// The codec read.
@@ -295,15 +486,33 @@ impl NalStream {
     self.codec
   }
 
-  /// The framing the next packet is read in; `None` where the
-  /// configuration record frames nothing this module reads.
+  /// The framing the next packet is read in; `None` where the reading
+  /// cannot read one — lengths of a size no record has set, or a framing
+  /// a decoder may read otherwise ([`KeptReason::FramingUnknown`]).
   pub const fn framing(&self) -> Option<Framing> {
-    self.framing
+    if self.lost {
+      return None;
+    }
+    match (self.lengths, self.length_size) {
+      // H.264 reads its four-byte probe whatever `is_avc` says
+      // (`h264dec.c` 602–607): a size the reading cannot know leaves even
+      // its start codes unknown.
+      (false, None) => match self.codec {
+        NalCodec::H264 => None,
+        NalCodec::Hevc => Some(Framing::AnnexB),
+      },
+      (false, Some(_)) => Some(Framing::AnnexB),
+      (true, Some(bytes)) => match LengthSize::from_bytes(bytes) {
+        Some(size) => Some(Framing::Length(size)),
+        None => None,
+      },
+      (true, None) => None,
+    }
   }
 
-  /// For HEVC, the highest temporal sub-layer any parameter set has
-  /// declared so far; `None` before a sequence parameter set has been read,
-  /// and for H.264.
+  /// For HEVC, the highest temporal sub-layer any parameter set,
+  /// configuration record or NAL unit has declared so far; `None` before
+  /// a sequence parameter set has been read, and for H.264.
   pub const fn highest_sub_layer(&self) -> Option<u8> {
     match self.codec {
       NalCodec::Hevc if self.sps_seen => Some(self.highest_sub_layer),
@@ -311,17 +520,50 @@ impl NalStream {
     }
   }
 
-  /// Reads one packet's NAL unit headers: whether nothing references its
-  /// picture. Packets are read in decoding order; every parameter set read
-  /// raises what later packets are held to.
+  /// Reads one packet: whether nothing references its picture. Packets
+  /// are read in decoding order; every parameter set read raises what
+  /// later packets are held to, and a packet that moves the framing
+  /// moves it for the packets after.
   pub fn read(&mut self, packet: &[u8]) -> Verdict {
-    let Some(mut framing) = self.framing else {
+    if self.lost {
+      return Verdict::Kept(KeptReason::FramingUnknown);
+    }
+    if self.codec == NalCodec::H264 {
+      // A packet that is an `avcC` itself configures the decoder and holds
+      // no picture (`h264dec.c` 1045–1050).
+      if self.lengths && is_avcc_packet(packet) {
+        self.h264_record(packet);
+        return Verdict::Kept(KeptReason::Configuration);
+      }
+      match self.length_size {
+        None => return Verdict::Kept(KeptReason::FramingUnknown),
+        // With four-byte lengths a packet's first bytes may switch the
+        // framing (`h264dec.c` 602–607), whatever the record said: a packet
+        // that switches it is kept, so a decoder that sees it reads every
+        // later packet in the framing the reading does.
+        Some(4) => {
+          let lengths = h264_packet_lengths(packet, self.lengths);
+          if lengths != self.lengths {
+            self.lengths = lengths;
+            return Verdict::Kept(KeptReason::FramingChange);
+          }
+        }
+        Some(_) => {}
+      }
+    }
+    let Some(framing) = self.framing() else {
       return Verdict::Kept(KeptReason::Unframed);
     };
-    if self.codec == NalCodec::H264 && self.configured == Some(Framing::Length(LengthSize::Four)) {
-      framing = h264_packet_framing(packet, framing);
-      self.framing = Some(framing);
+    let verdict = self.judge(packet, framing);
+    if self.codec == NalCodec::Hevc {
+      self.learn(packet, framing);
     }
+    verdict
+  }
+
+  /// One packet's verdict, read in `framing` against what earlier packets
+  /// taught; it learns nothing.
+  fn judge(&self, packet: &[u8], framing: Framing) -> Verdict {
     let mut kept = None;
     let mut pictures = 0_usize;
     let mut units = Units::new(packet, framing);
@@ -354,50 +596,146 @@ impl NalStream {
     }
   }
 
-  /// An HEVC configuration record's framing, FFmpeg's test, learning the
-  /// sub-layers its parameter sets and `numTemporalLayers` declare.
-  fn hevc_record(&mut self, extradata: &[u8]) -> Option<Framing> {
-    let record = extradata.len() >= 23
-      && (extradata[0] == 1 || (extradata[0] == 0 && (extradata[1] != 0 || extradata[2] > 1)));
-    if !record {
-      // Annex B extradata: its parameter sets are read as a packet's are.
-      if !extradata.is_empty() {
-        let mut units = Units::new(extradata, Framing::AnnexB);
-        while let Unit::Nal(nal) = units.next() {
-          let _ = self.hevc_unit(nal);
+  /// Learns from every NAL unit FFmpeg's splitter may read in `packet`
+  /// (`h2645_parse.c` 527–664), and more: in Annex B the bytes after each
+  /// start code, past bytes that frame nothing; after lengths each unit,
+  /// up to a length that does not fit — where the splitter refuses the
+  /// packet whole — and the bytes after each start code within a unit.
+  fn learn(&mut self, packet: &[u8], framing: Framing) {
+    match framing {
+      Framing::AnnexB => {
+        for nal in AfterStartCodes::new(packet) {
+          self.hevc_learn(nal);
         }
       }
-      return Some(Framing::AnnexB);
+      Framing::Length(size) => self.learn_after_lengths(packet, size.bytes()),
     }
+  }
+
+  /// [`Self::learn`] for NAL units after lengths of `size` bytes.
+  fn learn_after_lengths(&mut self, mut bytes: &[u8], size: usize) {
+    while let Some((prefix, rest)) = bytes.split_at_checked(size) {
+      let length = prefix
+        .iter()
+        .fold(0_usize, |length, &byte| (length << 8) | usize::from(byte));
+      if length == 0 {
+        return;
+      }
+      let Some((nal, rest)) = rest.split_at_checked(length) else {
+        return;
+      };
+      // The splitter reads a unit to its first start code, and then the
+      // bytes after each start code in it as units of their own
+      // (`h2645_parse.c` 44–52, 559–584).
+      let first = find_start_code(nal).unwrap_or(nal.len());
+      self.hevc_learn(trim_trailing_zeros(&nal[..first]));
+      for piece in AfterStartCodes::new(nal) {
+        self.hevc_learn(piece);
+      }
+      bytes = rest;
+    }
+  }
+
+  /// A configuration record, read as the codec's decoder reads one, when
+  /// it opens or mid-stream.
+  fn record(&mut self, extradata: &[u8], opening: bool) {
+    match self.codec {
+      NalCodec::H264 => self.h264_record(extradata),
+      NalCodec::Hevc => self.hevc_record(extradata, opening),
+    }
+  }
+
+  /// `ff_h264_decode_extradata` (`h264_parse.c` 466–524): no record
+  /// changes nothing; a first byte of 1 makes the stream one of lengths
+  /// before anything else is checked, and the size moves only when the
+  /// `avcC` is read whole — or becomes unknown where reading it whole
+  /// turns on whether a parameter set decodes; any other record makes it
+  /// one of start codes, its size kept.
+  fn h264_record(&mut self, extradata: &[u8]) {
+    let Some(&first) = extradata.first() else {
+      return;
+    };
+    if first != 1 {
+      self.lengths = false;
+      return;
+    }
+    self.lengths = true;
+    match read_avcc(extradata) {
+      AvccRead::Whole(size) => self.length_size = Some(size),
+      AvccRead::Fails => {}
+      // The size moves to the record's only if the parameter set
+      // decodes: a size that is the record's already is known either way.
+      AvccRead::Undecided(size) => {
+        if self.length_size != Some(size) {
+          self.length_size = None;
+        }
+      }
+    }
+  }
+
+  /// `ff_hevc_decode_extradata` (`hevc/parse.c` 79–146): an `hvcC` — 23
+  /// bytes or more, its first byte 1, or 0 with a nonzero second byte or a
+  /// third above 1 — makes the stream one of lengths, of two bytes while
+  /// its arrays are read and of the record's size once every unit has been
+  /// read; any other record makes it one of start codes, its size kept.
+  /// No record — the decoder reads one only of at least a byte
+  /// (`hevc/hevcdec.c` 3856) — changes nothing. Either way the parameter
+  /// sets declare the stream's sub-layers.
+  ///
+  /// Mid-stream, an `hvcC` of a size other than two leaves the framing
+  /// unknown for good: under `AV_EF_EXPLODE` a parameter set that does not
+  /// decode stops it at two (`hevc/parse.c` 72–76, 121–129).
+  fn hevc_record(&mut self, extradata: &[u8], opening: bool) {
+    if extradata.is_empty() {
+      return;
+    }
+    let hvcc = extradata.len() >= 23
+      && (extradata[0] == 1 || (extradata[0] == 0 && (extradata[1] != 0 || extradata[2] > 1)));
+    if !hvcc {
+      self.lengths = false;
+      for nal in AfterStartCodes::new(extradata) {
+        self.hevc_learn(nal);
+      }
+      return;
+    }
+    self.lengths = true;
+    // "nal units in the hvcC always have length coded with 2 bytes, so put
+    // a fake nal_length_size = 2 while parsing them" (`hevc/parse.c`
+    // 103–105): a record that fails part way leaves it so.
+    self.length_size = Some(2);
+    // Read as FFmpeg's `GetByteContext` reads (`bytestream.h`): past the
+    // end a read gives 0.
+    let mut record = Bytes::new(extradata);
+    record.skip(21);
     // Byte 21: `constantFrameRate` (2), `numTemporalLayers` (3),
     // `temporalIdNested` (1), `lengthSizeMinusOne` (2)
     // (`libavformat/hevc.c` 1159–1167).
-    let layers = (extradata[21] >> 3) & 7;
-    let length = LengthSize::from_minus_one(extradata[21])?;
-    // The arrays, from byte 23: each a type byte, a 16-bit count, then
-    // that many NAL units, each after a 16-bit length.
-    let count = usize::from(extradata[22]);
-    let mut at = 23;
-    for _ in 0..count {
-      let units = u16::from_be_bytes([*extradata.get(at + 1)?, *extradata.get(at + 2)?]);
-      at += 3;
-      for _ in 0..units {
-        let size = usize::from(u16::from_be_bytes([
-          *extradata.get(at)?,
-          *extradata.get(at + 1)?,
-        ]));
-        at += 2;
-        let nal = extradata.get(at..at + size)?;
-        at += size;
-        if self.hevc_unit(nal) == Read::Keeps(KeptReason::Malformed) {
-          return None;
+    let byte21 = record.byte();
+    let arrays = record.byte();
+    for _ in 0..arrays {
+      let _type = record.byte();
+      let count = record.be16();
+      for _ in 0..count {
+        // "+2 for the nal size field" (`hevc/parse.c` 113–119).
+        let size = usize::from(record.peek_be16()) + 2;
+        if record.left() < size {
+          return;
         }
+        // The decoder splits each unit after its two-byte length, as a
+        // packet (`hevc/parse.c` 121–123, 24–37).
+        self.learn_after_lengths(record.take(size), 2);
       }
     }
+    let size = (byte21 & 3) + 1;
+    if opening || size == 2 {
+      self.length_size = Some(size);
+    } else {
+      self.lost = true;
+    }
+    let layers = (byte21 >> 3) & 7;
     if layers > 0 {
       self.raise(layers - 1);
     }
-    Some(Framing::Length(length))
   }
 
   /// Raises the highest sub-layer to `declared`; it never falls.
@@ -407,8 +745,8 @@ impl NalStream {
     }
   }
 
-  /// One HEVC NAL unit, read and learned from.
-  fn hevc_unit(&mut self, nal: &[u8]) -> Read {
+  /// One HEVC NAL unit, read against what earlier packets taught.
+  fn hevc_unit(&self, nal: &[u8]) -> Read {
     let &[first, second, ..] = nal else {
       return Read::Keeps(KeptReason::Malformed);
     };
@@ -443,102 +781,246 @@ impl NalStream {
       1 | 3 | 5 | 7 | 9 | 11 | 13 | 15 => Read::Keeps(KeptReason::Referenced),
       // IRAP: BLA, IDR, CRA, and the reserved IRAP types 22 and 23.
       16..=23 => Read::Keeps(KeptReason::RandomAccess),
-      // VPS: `vps_max_sub_layers_minus1`, three bits of the second byte
-      // after the header.
-      32 => match nal.get(3) {
-        Some(&byte) => self.declare((byte >> 1) & 7, false),
-        None => Read::Keeps(KeptReason::Malformed),
+      // A VPS or SPS whose `max_sub_layers_minus1` is past 6 does not
+      // parse (7.4.3.1, 7.4.3.2.1).
+      32 | 33 => match hevc_declared(nal_unit_type, nal) {
+        Some(declared) if declared <= 6 => Read::Keeps(KeptReason::Companion(nal_unit_type)),
+        _ => Read::Keeps(KeptReason::Malformed),
       },
-      // SPS: `sps_max_sub_layers_minus1`, three bits of the first byte
-      // after the header (7.3.2.2.1).
-      33 => match nal.get(2) {
-        Some(&byte) => self.declare((byte >> 1) & 7, true),
-        None => Read::Keeps(KeptReason::Malformed),
-      },
-      // AUD, FD, prefix and suffix SEI.
-      35 | 38 | 39 | 40 => Read::Beside,
-      // PPS, EOS, EOB, the reserved VCL types 24–31, the reserved non-VCL
-      // types 41–47 and the unspecified 48–63.
+      // AUD, FD.
+      35 | 38 => Read::Beside,
+      // Prefix and suffix SEI: beside the picture only where every message
+      // its picture alone takes up.
+      39 | 40 if sei_rides(&nal[2..], hevc_sei_rides) => Read::Beside,
+      // PPS, EOS, EOB, any other SEI, the reserved VCL types 24–31, the
+      // reserved non-VCL types 41–47 and the unspecified 48–63.
       other => Read::Keeps(KeptReason::Companion(other)),
     }
   }
 
-  /// A parameter set's declared `max_sub_layers_minus1`, learned; the
-  /// unit keeps its packet as the parameter set it is.
-  fn declare(&mut self, max_sub_layers_minus1: u8, sps: bool) -> Read {
-    // The field lies in 0..=6 (7.4.3.1, 7.4.3.2.1).
-    if max_sub_layers_minus1 > 6 {
-      return Read::Keeps(KeptReason::Malformed);
+  /// Learns from one HEVC NAL unit: a parameter set's
+  /// `max_sub_layers_minus1`, and the sub-layer of any unit of layer 0. A
+  /// unit FFmpeg's splitter passes over — its forbidden bit set, or a
+  /// TemporalId of −1 (`h2645_parse.c` 646–660) — teaches nothing.
+  fn hevc_learn(&mut self, nal: &[u8]) {
+    let &[first, second, ..] = nal else {
+      return;
+    };
+    if first & 0x80 != 0 {
+      return;
     }
-    self.raise(max_sub_layers_minus1);
-    if sps {
-      self.sps_seen = true;
+    let nal_unit_type = (first >> 1) & 0x3F;
+    let layer = ((first & 1) << 5) | (second >> 3);
+    let Some(temporal_id) = (second & 7).checked_sub(1) else {
+      return;
+    };
+    if layer != 0 {
+      return;
     }
-    Read::Keeps(KeptReason::Companion(if sps { 33 } else { 32 }))
+    // A unit of a sub-layer no parameter set has declared: one the reading
+    // has not read declares it.
+    self.raise(temporal_id);
+    if let Some(declared) = hevc_declared(nal_unit_type, nal) {
+      if declared <= 6 {
+        self.raise(declared);
+        if nal_unit_type == 33 {
+          self.sps_seen = true;
+        }
+      }
+    }
   }
 }
 
-/// An H.264 configuration record's framing, FFmpeg's test.
-fn avc_record(extradata: &[u8]) -> Option<Framing> {
-  if extradata.first() != Some(&1) {
-    return Some(Framing::AnnexB);
-  }
-  // `avcC`: version, profile, compatibility, level, then six reserved bits
-  // and `lengthSizeMinusOne`, then the parameter sets.
-  if !avc_record_whole(extradata) {
-    return None;
-  }
-  LengthSize::from_minus_one(extradata[4]).map(Framing::Length)
+/// A VPS's or an SPS's `max_sub_layers_minus1`: three bits of the second
+/// byte after a VPS's header, of the first after an SPS's (7.3.2.1,
+/// 7.3.2.2.1). No emulation prevention byte can come before either, the
+/// header's two bytes being nonzero. `None` for any other unit, and for
+/// one too short to hold it.
+fn hevc_declared(nal_unit_type: u8, nal: &[u8]) -> Option<u8> {
+  let at = match nal_unit_type {
+    32 => 3,
+    33 => 2,
+    _ => return None,
+  };
+  nal.get(at).map(|&byte| (byte >> 1) & 7)
 }
 
-/// Whether an `avcC` holds every parameter set it counts, as FFmpeg reads
-/// it: at least seven bytes, then each count's units within the record
-/// (`libavcodec/h264_parse.c` 482–513).
-fn avc_record_whole(record: &[u8]) -> bool {
+/// The size of the parameter set — its two-byte length counted — from
+/// which `decode_extradata_ps_mp4` refuses one that does not decode, with
+/// `ERANGE`, ending the record: `buf_size / 2 >= (INT16_MAX -
+/// AV_INPUT_BUFFER_PADDING_SIZE) / 3` (`h264_parse.c` 436–437).
+const ESCAPED_LIMIT: usize = 2 * ((i16::MAX as usize - 64) / 3);
+
+/// How `ff_h264_decode_extradata` ends on an `avcC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AvccRead {
+  /// Read whole: the size is the record's, in bytes.
+  Whole(u8),
+  /// Refused part way: the size stays as it was.
+  Fails,
+  /// Read whole only if a parameter set of [`ESCAPED_LIMIT`] bytes or
+  /// more decodes; the record's size, in bytes, if it does.
+  Undecided(u8),
+}
+
+/// How FFmpeg reads `record`, an `avcC` (`h264_parse.c` 475–516): at least
+/// seven bytes, then each count's parameter sets within the record — a
+/// count FFmpeg reads past the record's end reads as 0, the zero padding
+/// every FFmpeg buffer carries.
+fn read_avcc(record: &[u8]) -> AvccRead {
   if record.len() < 7 {
-    return false;
+    return AvccRead::Fails;
   }
   let mut at = 6;
-  let sets = |count: usize, at: &mut usize| -> bool {
+  let mut undecided = false;
+  if !avcc_sets(
+    record,
+    usize::from(record[5] & 0x1F),
+    &mut at,
+    &mut undecided,
+  ) {
+    return AvccRead::Fails;
+  }
+  let count = record.get(at).copied().unwrap_or(0);
+  at += 1;
+  if !avcc_sets(record, usize::from(count), &mut at, &mut undecided) {
+    return AvccRead::Fails;
+  }
+  let size = (record[4] & 3) + 1;
+  if undecided {
+    AvccRead::Undecided(size)
+  } else {
+    AvccRead::Whole(size)
+  }
+}
+
+/// `count` parameter sets of an `avcC` from `at`, each a two-byte size and
+/// that many bytes within the record; whether all are, and whether any is
+/// one of [`ESCAPED_LIMIT`] bytes or more.
+fn avcc_sets(record: &[u8], count: usize, at: &mut usize, undecided: &mut bool) -> bool {
+  for _ in 0..count {
+    let (Some(&high), Some(&low)) = (record.get(*at), record.get(*at + 1)) else {
+      return false;
+    };
+    let size = usize::from(u16::from_be_bytes([high, low])) + 2;
+    if size > record.len() - *at {
+      return false;
+    }
+    if size >= ESCAPED_LIMIT {
+      *undecided = true;
+    }
+    *at += size;
+  }
+  true
+}
+
+/// Whether FFmpeg's H.264 decoder reads `packet` as an `avcC` of its own
+/// (`h264dec.c` 1045–1046 and `is_avcc_extradata`, 899–921): at least nine
+/// bytes, a first byte of 1, a third of 0 and a fifth whose high six bits
+/// are set, then one or more sequence parameter sets and one or more
+/// picture parameter sets, each within the packet.
+fn is_avcc_packet(packet: &[u8]) -> bool {
+  if packet.len() < 9 || packet[0] != 1 || packet[2] != 0 || packet[4] & 0xFC != 0xFC {
+    return false;
+  }
+  // FFmpeg's padding: a byte past the packet reads as 0.
+  let at_or_zero = |at: usize| packet.get(at).copied().unwrap_or(0);
+  let sets = |count: usize, kind: u8, at: &mut usize| -> bool {
+    if count == 0 {
+      return false;
+    }
     for _ in 0..count {
-      let (Some(&high), Some(&low)) = (record.get(*at), record.get(*at + 1)) else {
-        return false;
-      };
-      let size = usize::from(u16::from_be_bytes([high, low])) + 2;
-      if size > record.len() - *at {
+      let size = usize::from(u16::from_be_bytes([at_or_zero(*at), at_or_zero(*at + 1)])) + 2;
+      if size > packet.len().saturating_sub(*at) || at_or_zero(*at + 2) & 0x9F != kind {
         return false;
       }
       *at += size;
     }
     true
   };
-  if !sets(usize::from(record[5] & 0x1F), &mut at) {
+  let mut at = 6;
+  if !sets(usize::from(packet[5] & 0x1F), 7, &mut at) {
     return false;
   }
-  let Some(&count) = record.get(at) else {
-    return false;
-  };
+  let count = at_or_zero(at);
   at += 1;
-  sets(usize::from(count), &mut at)
+  sets(usize::from(count), 8, &mut at)
 }
 
-/// The framing FFmpeg's H.264 decoder reads a packet in where the record
-/// declares four-byte lengths (`libavcodec/h264dec.c` 602–607): Annex B for
-/// a packet that begins with a four-byte start code whose next four bytes
-/// are a length past the packet; lengths again for one whose first four
-/// bytes are a length that fits; else as the packet before it.
-fn h264_packet_framing(packet: &[u8], current: Framing) -> Framing {
+/// Whether FFmpeg's H.264 decoder reads `packet` after lengths where its
+/// `nal_length_size` is 4 (`h264dec.c` 602–607): start codes for a packet
+/// that begins with a four-byte start code whose next four bytes are a
+/// length past the packet; lengths for one whose first four bytes are a
+/// length that fits; else as the packet before it.
+fn h264_packet_lengths(packet: &[u8], lengths: bool) -> bool {
   let word = |at: usize| -> Option<u32> {
     let bytes = packet.get(at..at + 4)?;
     Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
   };
   let size = packet.len();
   if size > 8 && word(0) == Some(1) && word(5).is_some_and(|next| next as usize > size) {
-    Framing::AnnexB
+    false
   } else if size > 3 && word(0).is_some_and(|first| first > 1 && first as usize <= size) {
-    Framing::Length(LengthSize::Four)
+    true
   } else {
-    current
+    lengths
+  }
+}
+
+/// A record read as FFmpeg's `GetByteContext` reads one (`bytestream.h`):
+/// a read past the end gives 0 and leaves the reader at the end.
+struct Bytes<'a> {
+  rest: &'a [u8],
+}
+
+impl<'a> Bytes<'a> {
+  const fn new(bytes: &'a [u8]) -> Self {
+    Self { rest: bytes }
+  }
+
+  const fn left(&self) -> usize {
+    self.rest.len()
+  }
+
+  fn skip(&mut self, count: usize) {
+    self.rest = &self.rest[count.min(self.rest.len())..];
+  }
+
+  fn byte(&mut self) -> u8 {
+    match self.rest.split_first() {
+      Some((&byte, rest)) => {
+        self.rest = rest;
+        byte
+      }
+      None => 0,
+    }
+  }
+
+  fn be16(&mut self) -> u16 {
+    match self.rest.split_first_chunk::<2>() {
+      Some((&bytes, rest)) => {
+        self.rest = rest;
+        u16::from_be_bytes(bytes)
+      }
+      None => {
+        self.rest = &self.rest[self.rest.len()..];
+        0
+      }
+    }
+  }
+
+  fn peek_be16(&self) -> u16 {
+    match self.rest.first_chunk::<2>() {
+      Some(&bytes) => u16::from_be_bytes(bytes),
+      None => 0,
+    }
+  }
+
+  /// The next `count` bytes, which the caller has checked are left.
+  fn take(&mut self, count: usize) -> &'a [u8] {
+    let (taken, rest) = self.rest.split_at(count);
+    self.rest = rest;
+    taken
   }
 }
 
@@ -557,15 +1039,110 @@ fn h264_unit(nal: &[u8]) -> Read {
     // A slice, or a slice data partition A, B or C.
     1..=4 if nal_ref_idc != 0 => Read::Keeps(KeptReason::Referenced),
     1..=4 => Read::Picture,
-    // SEI, an access unit delimiter, filler data.
-    6 | 9 | 12 => Read::Beside,
+    // An access unit delimiter, filler data.
+    9 | 12 => Read::Beside,
+    // SEI whose every message its picture alone takes up.
+    6 if sei_rides(&nal[1..], h264_sei_rides) => Read::Beside,
     // A prefix NAL unit, a coded slice extension (scalable or multiview),
     // a 3-D AVC slice extension.
     14 | 20 | 21 => Read::Keeps(KeptReason::Extension),
-    // SPS, PPS, the end of a sequence or of the stream, an SPS extension, a
-    // subset SPS, a depth parameter set, an auxiliary slice, and every
-    // reserved or unspecified type.
+    // SPS, PPS, any other SEI, the end of a sequence or of the stream, an
+    // SPS extension, a subset SPS, a depth parameter set, an auxiliary
+    // slice, and every reserved or unspecified type.
     other => Read::Keeps(KeptReason::Companion(other)),
+  }
+}
+
+/// The H.264 SEI messages a picture alone takes up ([SEI](self#sei)):
+/// picture timing, filler payload.
+const fn h264_sei_rides(payload_type: u32) -> bool {
+  matches!(payload_type, 1 | 3)
+}
+
+/// The HEVC SEI messages a picture alone takes up ([SEI](self#sei)):
+/// filler payload, decoded picture hash.
+const fn hevc_sei_rides(payload_type: u32) -> bool {
+  matches!(payload_type, 3 | 132)
+}
+
+/// Whether an SEI unit — `payload`, its bytes after the header — holds one
+/// message or more, every one of a type `rides` admits, read as FFmpeg
+/// reads them (`h264_sei.c` 229–300, `hevc/sei.c` 264–317): emulation
+/// prevention bytes dropped, each message a `payloadType` and a
+/// `payloadSize` coded in runs of `0xFF`, then that many bytes, up to the
+/// unit's last byte, `rbsp_trailing_bits`, which is `0x80`. Trailing zero
+/// bytes are dropped first, as FFmpeg drops them (`h2645_parse.c`
+/// 348–376). A unit that does not read so rides nowhere.
+fn sei_rides(payload: &[u8], rides: fn(u32) -> bool) -> bool {
+  let Some(last) = payload.iter().rposition(|&byte| byte != 0) else {
+    return false;
+  };
+  if payload[last] != 0x80 {
+    return false;
+  }
+  let mut rbsp = Rbsp::new(&payload[..last]);
+  let mut messages = 0_usize;
+  while let Some(first) = rbsp.byte() {
+    let Some(payload_type) = rbsp.coded(first) else {
+      return false;
+    };
+    let Some(size) = rbsp.byte().and_then(|first| rbsp.coded(first)) else {
+      return false;
+    };
+    if !rides(payload_type) || !rbsp.skip(size) {
+      return false;
+    }
+    messages += 1;
+  }
+  messages > 0
+}
+
+/// A NAL unit's bytes as its RBSP: each emulation prevention byte — a 3
+/// after two zero bytes — dropped, as `ff_h2645_extract_rbsp` drops it
+/// (`h2645_parse.c` 37–147).
+struct Rbsp<'a> {
+  raw: &'a [u8],
+  zeros: u8,
+}
+
+impl<'a> Rbsp<'a> {
+  const fn new(raw: &'a [u8]) -> Self {
+    Self { raw, zeros: 0 }
+  }
+
+  fn byte(&mut self) -> Option<u8> {
+    loop {
+      let (&byte, rest) = self.raw.split_first()?;
+      self.raw = rest;
+      if self.zeros >= 2 && byte == 3 {
+        self.zeros = 0;
+        continue;
+      }
+      self.zeros = if byte == 0 {
+        self.zeros.saturating_add(1)
+      } else {
+        0
+      };
+      return Some(byte);
+    }
+  }
+
+  /// A value coded as SEI codes `payloadType` and `payloadSize`: each
+  /// `0xFF` byte adds 255 and one more, `first` among them, ends it
+  /// (7.3.2.3.1 in H.264, 7.3.5 in H.265).
+  fn coded(&mut self, first: u8) -> Option<u32> {
+    let mut value = u32::from(first);
+    let mut byte = first;
+    while byte == 0xFF {
+      byte = self.byte()?;
+      value = value.checked_add(u32::from(byte))?;
+    }
+    Some(value)
+  }
+
+  /// Passes over `count` bytes; whether there were that many.
+  fn skip(&mut self, count: u32) -> bool {
+    (0..count).all(|_| self.byte().is_some())
   }
 }
 
@@ -580,7 +1157,8 @@ enum Read {
   Keeps(KeptReason),
 }
 
-/// The NAL units of a packet, one at a time.
+/// The NAL units of a packet, one at a time, read strictly: any byte the
+/// framing does not account for is [`Unit::Broken`].
 struct Units<'a> {
   rest: &'a [u8],
   framing: Framing,
@@ -619,7 +1197,9 @@ impl<'a> Units<'a> {
   }
 
   /// The next NAL unit after its length: a length of 0, one past the
-  /// packet, or bytes too few for a length are broken.
+  /// packet, bytes too few for a length, and a unit holding a start code
+  /// — which FFmpeg's splitter reads as more than one unit
+  /// (`h2645_parse.c` 44–52, 559–584) — are broken.
   fn next_after_length(&mut self, size: usize) -> Unit<'a> {
     if self.rest.is_empty() {
       return Unit::End;
@@ -636,6 +1216,9 @@ impl<'a> Units<'a> {
     let Some((nal, rest)) = rest.split_at_checked(length) else {
       return Unit::Broken;
     };
+    if find_start_code(nal).is_some() {
+      return Unit::Broken;
+    }
     self.rest = rest;
     Unit::Nal(nal)
   }
@@ -672,13 +1255,50 @@ impl<'a> Units<'a> {
       }
     };
     self.rest = rest;
-    let trailing = unit.iter().rev().take_while(|&&byte| byte == 0).count();
-    let nal = &unit[..unit.len() - trailing];
+    let nal = trim_trailing_zeros(unit);
     if nal.is_empty() {
       return Unit::Broken;
     }
     Unit::Nal(nal)
   }
+}
+
+/// The bytes after each start code in a run of bytes that one byte or more
+/// follows, each to the next start code or the end, its trailing zero
+/// bytes dropped: every NAL unit FFmpeg's splitter may find there by
+/// searching for start codes (`find_next_start_code`, `h2645_parse.c`
+/// 465–478), whatever comes between.
+struct AfterStartCodes<'a> {
+  rest: &'a [u8],
+}
+
+impl<'a> AfterStartCodes<'a> {
+  const fn new(bytes: &'a [u8]) -> Self {
+    Self { rest: bytes }
+  }
+}
+
+impl<'a> Iterator for AfterStartCodes<'a> {
+  type Item = &'a [u8];
+
+  fn next(&mut self) -> Option<&'a [u8]> {
+    loop {
+      let at = find_start_code(self.rest)?;
+      let after = &self.rest[at + 3..];
+      let end = find_start_code(after).unwrap_or(after.len());
+      self.rest = &after[end..];
+      let unit = trim_trailing_zeros(&after[..end]);
+      if !unit.is_empty() {
+        return Some(unit);
+      }
+    }
+  }
+}
+
+/// `bytes` without its trailing zero bytes.
+fn trim_trailing_zeros(bytes: &[u8]) -> &[u8] {
+  let trailing = bytes.iter().rev().take_while(|&&byte| byte == 0).count();
+  &bytes[..bytes.len() - trailing]
 }
 
 /// Where the next `00 00 01` begins in `bytes`.

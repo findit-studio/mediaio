@@ -58,6 +58,11 @@ bitflags! {
     /// ([`nal::NalStream`](crate::nal::NalStream)) — in any container. No
     /// other codec's bitstream is read.
     ///
+    /// **Never with side data a decoder takes up past the packet** — a
+    /// new configuration, a parameter change: dropping such a packet
+    /// loses more than its picture, so a demuxer clears the bit there,
+    /// whoever set it.
+    ///
     /// The bit's ABSENCE means unknown, never "referenced": that is the
     /// rule a consumer must honour, because a container may never mark
     /// it, a codec's bitstream may not be read, and a packet without it

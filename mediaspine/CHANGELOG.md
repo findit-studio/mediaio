@@ -12,27 +12,39 @@ Its versions are its own: they do not move with the rest of the family's.
 ### Added
 
 - **`nal`: what an H.264 or HEVC packet's NAL units say about its
-  picture.** `NalStream`, built from a track's configuration record —
-  FFmpeg's own test for an `avcC` or `hvcC` and its length size, else
-  Annex B — reads each packet's NAL unit headers (`read`) and answers
-  `Verdict::Disposable` only where the bitstream proves that nothing
-  references the packet's picture and nothing beside it is needed later:
+  picture.** `NalStream` reads each of a track's packets (`read`) and
+  answers `Verdict::Disposable` only where the bitstream proves that
+  nothing references the packet's picture and nothing beside it is needed
+  later:
   - H.264: at least one slice, every slice of `nal_ref_idc` 0, none an
-    IDR, and nothing beside them but SEI, access unit delimiters and
-    filler data;
+    IDR, and nothing beside them but access unit delimiters, filler data
+    and SEI units of picture timing and filler payload alone;
   - HEVC: every slice a sub-layer non-reference type of layer 0 at the
-    highest temporal sub-layer any parameter set has declared, learned
-    from every SPS and VPS and the record's `numTemporalLayers`, and
-    nothing beside them but delimiters, filler data and SEI. Unlike
-    FFmpeg's own `AVDISCARD_NONREF`, which skips sub-layer non-reference
-    pictures at every sub-layer, it never marks one a higher sub-layer
-    may reference.
+    highest temporal sub-layer, learned from every SPS and VPS FFmpeg's
+    splitter may read and from the record's `numTemporalLayers`, and
+    nothing beside them but delimiters, filler data and SEI units of
+    filler payload and decoded picture hash alone. Unlike FFmpeg's own
+    `AVDISCARD_NONREF`, which skips sub-layer non-reference pictures at
+    every sub-layer, it never marks one a higher sub-layer may reference.
+
+  The framing is FFmpeg's decoder's own state — whether lengths are read,
+  and their size, kept apart — moved where FFmpeg moves it: by the
+  configuration record at the opening (`new`) and mid-stream
+  (`reconfigure`, and `read_with_record`, which takes a packet's record
+  as the decoder takes it), by an H.264 packet that is an `avcC`, and by
+  H.264's four-byte probe; a packet that moves it is kept. A seek after the
+  framing moved (`seeked`), an `avcC` whose reading turns on whether a
+  parameter set decodes, and a mid-stream `hvcC` of other than two-byte
+  lengths leave the framing unknown, and nothing is marked. `LengthSize`
+  is one to four bytes, as FFmpeg reads them.
 
   Anything else keeps the packet, with the reason (`KeptReason`): a
-  reference or random-access picture, a parameter set or an end, an
-  extension's NAL unit, a picture below the highest sub-layer or before
-  any SPS, and a packet that does not parse. `NalCodec` names the two
-  codecs read; every other codec is unclassified.
+  reference or random-access picture, a parameter set, an SEI unit of any
+  other message, or an end, an extension's NAL unit, a picture below the
+  highest sub-layer or before any SPS, a packet that does not parse — a
+  length-framed unit holding a start code among them — a configuration
+  record, a switch of framing, and a framing unknown or unset. `NalCodec`
+  names the two codecs read; every other codec is unclassified.
 
 ### Changed
 

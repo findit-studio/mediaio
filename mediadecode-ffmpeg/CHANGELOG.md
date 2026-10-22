@@ -18,14 +18,18 @@ The backend-agnostic core it adapts has its own log at
   H.264 or HEVC track is marked where its NAL units prove that nothing
   references its picture (`mediadecode::nal`): a non-reference H.264
   picture, or an HEVC sub-layer non-reference picture at the highest
-  temporal sub-layer, with nothing beside it but SEI, access unit
-  delimiters and filler data — in any container, and read in the
-  configuration an `AV_PKT_DATA_NEW_EXTRADATA` entry brings. A packet
-  known to be corrupt is not marked. **More packets are marked
-  DISPOSABLE on H.264 and HEVC, so a consumer that drops them decodes
-  fewer pictures**: two in three of a Sony XAVC original, which carries
-  no `sdtp` and was marked nowhere before. The flag's contract is
-  unchanged — absent means unknown.
+  temporal sub-layer, with nothing beside it a later picture needs — in
+  any container, read with the `AV_PKT_DATA_NEW_EXTRADATA` it carries as
+  the decoder takes the two, and told of every seek. Every packet is
+  read, a corrupt one too, as the decoder reads it; a corrupt one is never
+  marked. **A packet carrying side data that persists past it — a new
+  configuration, a parameter change, a palette, captions, and any type
+  this build does not name — is never `DISPOSABLE`: the container's mark
+  is cleared there too.** **More packets are marked DISPOSABLE on H.264
+  and HEVC, so a consumer that drops them decodes fewer pictures**: two in
+  three of a Sony XAVC original, which carries no `sdtp` and was marked
+  nowhere before. The flag's contract is unchanged — absent means
+  unknown.
 
 ### Added
 

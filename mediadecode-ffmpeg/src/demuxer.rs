@@ -99,8 +99,8 @@ use ffmpeg_next::{
   Dictionary, Packet, Rational,
   ffi::{
     AV_DISPOSITION_ATTACHED_PIC, AV_DISPOSITION_TIMED_THUMBNAILS, AV_NOPTS_VALUE, AVDictionary,
-    AVDurationEstimationMethod, AVFMT_FLAG_CUSTOM_IO, AVFormatContext, AVStream, av_dict_get,
-    avformat_alloc_context, avformat_find_stream_info, avformat_open_input,
+    AVDurationEstimationMethod, AVFMT_FLAG_CUSTOM_IO, AVFormatContext, AVPacketSideDataType,
+    AVStream, av_dict_get, avformat_alloc_context, avformat_find_stream_info, avformat_open_input,
   },
   format::context::{Input, StreamIo},
 };
@@ -286,8 +286,10 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// [`Self::next_packet_impl`] marks a video packet
   /// [`DISPOSABLE`](mediadecode::packet::PacketFlags::DISPOSABLE) where
   /// its NAL units prove that nothing references its picture
-  /// ([`mediadecode::nal`]), in any container. Built at open from each
-  /// stream's codec and extradata ([`bitstreams`]).
+  /// ([`mediadecode::nal`]), in any container, and clears the mark where
+  /// the packet carries side data that persists past it
+  /// ([`marked_from_bitstream`]). Built at open from each stream's codec
+  /// and extradata ([`bitstreams`]); told of every seek ([`sought`]).
   bitstreams: Vec<Option<NalStream>>,
   /// Reads that answer in place of libavformat's next ones. Test only:
   /// see [`Self::read_into`].
@@ -1277,6 +1279,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     // Any seek ends the claim to be one unbroken walk — a failed one
     // too, since where the container sits afterwards is unspecified.
     self.measured.break_walk();
+    // So every reading of a bitstream hears of it, for the same reason:
+    // the packets after it may meet a decoder that kept its framing or
+    // one opened afresh.
+    sought(&mut self.bitstreams);
     let ts = target.rescale_to(av_time_base_q()).pts();
     // Only our own EOF latch is cleared, and only before the seek —
     // the seek machinery gates on `eof_reached`, so clearing it
@@ -3039,6 +3045,11 @@ unsafe fn packet_is_parked_picture(stream: *const AVStream, packet: &Packet) -> 
 /// `TIMED_THUMBNAILS` constant at all — its `from_bits_truncate` drops
 /// every bit this build of the wrapper has no name for, which is how
 /// the distinction went missing in the first place.
+const fn is_attachment_disposition(disposition: c_int) -> bool {
+  disposition & AV_DISPOSITION_ATTACHED_PIC != 0
+    && disposition & AV_DISPOSITION_TIMED_THUMBNAILS == 0
+}
+
 /// Each stream's reading of its H.264 or HEVC bitstream, by stream
 /// index: a [`NalStream`] for a video stream of either codec, built from
 /// its extradata, and `None` for every other stream, whose packets carry
@@ -3089,47 +3100,156 @@ fn bitstreams(input: &Input) -> Result<Vec<Option<NalStream>>, DemuxError> {
   Ok(out)
 }
 
-/// `packet`, marked [`PacketFlags::DISPOSABLE`] where its track's
-/// bitstream proves that nothing references its picture
-/// ([`NalStream::read`]) — and, where the packet carries
-/// `AV_PKT_DATA_NEW_EXTRADATA`, read in the configuration it brings, as a
-/// decoder would take it (the first such entry, as
-/// `av_packet_get_side_data` answers).
+/// The packet side data a decoder may take up past its own packet: a
+/// packet carrying any is never
+/// [`DISPOSABLE`](PacketFlags::DISPOSABLE), whoever marked it, because
+/// dropping it would lose what the decoder, or a later picture, needs. Every
+/// `AVPacketSideDataType` FFmpeg 9.0.1 names (`libavcodec/packet.h` 41–394)
+/// is in this list or in [`RIDING_SIDE_DATA`], never both; a type in
+/// neither — one a later FFmpeg adds — persists ([`side_data_persists`]).
 ///
-/// A packet known to be corrupt is neither read nor marked: its NAL units
-/// say nothing the reading may learn from. A track without a reading — a
-/// codec other than H.264 and HEVC — passes its packets through.
+/// | type | why it persists |
+/// |---|---|
+/// | `PALETTE` | "a new palette is present" (`packet.h` 43–47), which a decoder keeps (`libavcodec/decode.c` 2321–2334) |
+/// | `NEW_EXTRADATA` | a new configuration (`h264dec.c` 1038–1044, `hevc/hevcdec.c` 3854–3860) |
+/// | `PARAM_CHANGE` | new dimensions or a new rate (`decode.c` 117–176) |
+/// | `FALLBACK_TRACK`, `CPB_PROPERTIES` | a description of the stream, not of the packet |
+/// | `MATROSKA_BLOCKADDITIONAL` | a block addition of any kind, which nothing here reads |
+/// | `METADATA_UPDATE` | the stream's metadata from the packet on |
+/// | `A53_CC` | caption bytes a caption decoder reads across pictures |
+/// | `ENCRYPTION_INIT_INFO` | a key system's initialization, for the packets after |
+/// | `AFD` | an active format a receiver may hold until the next |
+/// | `DOVI_CONF` | a Dolby Vision configuration the decoder keeps (`hevc/hevcdec.c` 3862–3869) |
+/// | `IAMF_MIX_GAIN_PARAM`, `IAMF_DEMIXING_INFO_PARAM`, `IAMF_RECON_GAIN_INFO_PARAM` | a parameter that applies for a duration |
+/// | `LCEVC` | an enhancement whose decoder keeps state across pictures (`decode.c` 1640–1666, 1704–1775) |
+/// | `HEVC_CONF` | an enhancement layer's decoder configuration |
+const PERSISTING_SIDE_DATA: [AVPacketSideDataType; 16] = [
+  AVPacketSideDataType::AV_PKT_DATA_PALETTE,
+  AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+  AVPacketSideDataType::AV_PKT_DATA_PARAM_CHANGE,
+  AVPacketSideDataType::AV_PKT_DATA_FALLBACK_TRACK,
+  AVPacketSideDataType::AV_PKT_DATA_CPB_PROPERTIES,
+  AVPacketSideDataType::AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
+  AVPacketSideDataType::AV_PKT_DATA_METADATA_UPDATE,
+  AVPacketSideDataType::AV_PKT_DATA_A53_CC,
+  AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO,
+  AVPacketSideDataType::AV_PKT_DATA_AFD,
+  AVPacketSideDataType::AV_PKT_DATA_DOVI_CONF,
+  AVPacketSideDataType::AV_PKT_DATA_IAMF_MIX_GAIN_PARAM,
+  AVPacketSideDataType::AV_PKT_DATA_IAMF_DEMIXING_INFO_PARAM,
+  AVPacketSideDataType::AV_PKT_DATA_IAMF_RECON_GAIN_INFO_PARAM,
+  AVPacketSideDataType::AV_PKT_DATA_LCEVC,
+  AVPacketSideDataType::AV_PKT_DATA_HEVC_CONF,
+];
+
+/// The packet side data that rides with its own packet and no further:
+/// what FFmpeg's decoding copies onto the packet's own frame alone
+/// (`ff_sd_global_map`, `libavcodec/avcodec.c` 57–70; the packet map and
+/// the metadata of `ff_decode_frame_props_from_pkt`, `decode.c` 1492–1596),
+/// and what nothing decoding reads, about the packet itself.
+///
+/// | type | why it rides |
+/// |---|---|
+/// | `REPLAYGAIN`, `DISPLAYMATRIX`, `STEREO3D`, `AUDIO_SERVICE_TYPE`, `MASTERING_DISPLAY_METADATA`, `SPHERICAL`, `CONTENT_LIGHT_LEVEL`, `ICC_PROFILE`, `AMBIENT_VIEWING_ENVIRONMENT`, `3D_REFERENCE_DISPLAYS`, `EXIF` | copied onto the packet's frame alone (`avcodec.c` 57–70) |
+/// | `SKIP_SAMPLES`, `S12M_TIMECODE`, `DYNAMIC_HDR10_PLUS`, `DYNAMIC_HDR_SMPTE_2094_APP5` | the packet's frame's own, copied onto it alone (`decode.c` 1550–1596) |
+/// | `STRINGS_METADATA` | metadata of the packet's frame alone (`decode.c` 1538–1548) |
+/// | `H263_MB_INFO`, `QUALITY_STATS` | an encoder's account of the packet |
+/// | `JP_DUALMONO` | which channel of the packet's audio to use |
+/// | `SUBTITLE_POSITION`, `WEBVTT_IDENTIFIER`, `WEBVTT_SETTINGS` | the packet's own subtitle event or cue |
+/// | `MPEGTS_STREAM_ID` | the packet's PES stream id, for a muxer (`libavformat/mpegts.c` 1119) |
+/// | `ENCRYPTION_INFO` | how to decrypt the packet itself |
+/// | `PRFT`, `RTCP_SR` | the time the packet was produced, or the last sender report at it |
+/// | `FRAME_CROPPING` | the packet's frame's cropping, which no decoder reads from a packet |
+const RIDING_SIDE_DATA: [AVPacketSideDataType; 27] = [
+  AVPacketSideDataType::AV_PKT_DATA_H263_MB_INFO,
+  AVPacketSideDataType::AV_PKT_DATA_REPLAYGAIN,
+  AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX,
+  AVPacketSideDataType::AV_PKT_DATA_STEREO3D,
+  AVPacketSideDataType::AV_PKT_DATA_AUDIO_SERVICE_TYPE,
+  AVPacketSideDataType::AV_PKT_DATA_QUALITY_STATS,
+  AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES,
+  AVPacketSideDataType::AV_PKT_DATA_JP_DUALMONO,
+  AVPacketSideDataType::AV_PKT_DATA_STRINGS_METADATA,
+  AVPacketSideDataType::AV_PKT_DATA_SUBTITLE_POSITION,
+  AVPacketSideDataType::AV_PKT_DATA_WEBVTT_IDENTIFIER,
+  AVPacketSideDataType::AV_PKT_DATA_WEBVTT_SETTINGS,
+  AVPacketSideDataType::AV_PKT_DATA_MPEGTS_STREAM_ID,
+  AVPacketSideDataType::AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
+  AVPacketSideDataType::AV_PKT_DATA_SPHERICAL,
+  AVPacketSideDataType::AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
+  AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INFO,
+  AVPacketSideDataType::AV_PKT_DATA_PRFT,
+  AVPacketSideDataType::AV_PKT_DATA_ICC_PROFILE,
+  AVPacketSideDataType::AV_PKT_DATA_S12M_TIMECODE,
+  AVPacketSideDataType::AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
+  AVPacketSideDataType::AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT,
+  AVPacketSideDataType::AV_PKT_DATA_FRAME_CROPPING,
+  AVPacketSideDataType::AV_PKT_DATA_3D_REFERENCE_DISPLAYS,
+  AVPacketSideDataType::AV_PKT_DATA_RTCP_SR,
+  AVPacketSideDataType::AV_PKT_DATA_EXIF,
+  AVPacketSideDataType::AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5,
+];
+
+/// Whether packet side data of `kind`, the raw `AVPacketSideDataType` it
+/// arrives as, may be taken up past its own packet: every kind but those
+/// of [`RIDING_SIDE_DATA`], a kind this build has no name for among them.
+fn side_data_persists(kind: c_int) -> bool {
+  !RIDING_SIDE_DATA
+    .iter()
+    .any(|&riding| riding as c_int == kind)
+}
+
+/// `packet`, its [`PacketFlags::DISPOSABLE`] set where its track's
+/// bitstream proves that nothing references its picture
+/// ([`NalStream::read_with_record`]) and cleared, whoever set it, where it
+/// carries side data that persists past it ([`PERSISTING_SIDE_DATA`]). The
+/// reading takes the packet with the `AV_PKT_DATA_NEW_EXTRADATA` it
+/// carries — the first such entry, as `av_packet_get_side_data` answers —
+/// as the decoder takes the two.
+///
+/// Every packet of a track is read, a corrupt one too, because the decoder
+/// reads it, and what it moves — the framing, the sub-layers its parameter
+/// sets declare — moves for the packets after; a corrupt packet is never
+/// marked. A track without a reading — a codec other than H.264 and HEVC —
+/// keeps the container's mark, unless side data persists.
 fn marked_from_bitstream<D: AsRef<[u8]>>(
   bitstream: Option<&mut Option<NalStream>>,
   packet: mediadecode::packet::VideoPacket<crate::extras::VideoPacketExtra, D>,
 ) -> mediadecode::packet::VideoPacket<crate::extras::VideoPacketExtra, D> {
-  let Some(Some(bitstream)) = bitstream else {
-    return packet;
-  };
-  const NEW_EXTRADATA: i32 =
-    ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
-  if let Some(entry) = packet
-    .extra()
-    .side_data()
+  const NEW_EXTRADATA: c_int = AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as c_int;
+  let side_data = packet.extra().side_data();
+  let persists = side_data
+    .iter()
+    .any(|entry| side_data_persists(entry.kind()));
+  let record = side_data
     .iter()
     .find(|entry| entry.kind() == NEW_EXTRADATA)
-  {
-    bitstream.reconfigure(entry.data());
+    .map(crate::extras::SideDataEntry::data);
+  let proven = match bitstream {
+    Some(Some(bitstream)) => bitstream
+      .read_with_record(packet.data().as_ref(), record)
+      .is_disposable(),
+    _ => false,
+  };
+  let mut flags = packet.flags();
+  if persists {
+    flags.remove(PacketFlags::DISPOSABLE);
+  } else if proven && !flags.contains(PacketFlags::CORRUPT) {
+    flags.insert(PacketFlags::DISPOSABLE);
   }
-  if packet.flags().contains(PacketFlags::CORRUPT) {
-    return packet;
-  }
-  if bitstream.read(packet.data().as_ref()).is_disposable() {
-    let flags = packet.flags() | PacketFlags::DISPOSABLE;
-    packet.with_flags(flags)
-  } else {
+  if flags == packet.flags() {
     packet
+  } else {
+    packet.with_flags(flags)
   }
 }
 
-const fn is_attachment_disposition(disposition: c_int) -> bool {
-  disposition & AV_DISPOSITION_ATTACHED_PIC != 0
-    && disposition & AV_DISPOSITION_TIMED_THUMBNAILS == 0
+/// Tells each stream's reading of a seek, or of a seek attempted
+/// ([`NalStream::seeked`]).
+fn sought(bitstreams: &mut [Option<NalStream>]) {
+  for bitstream in bitstreams.iter_mut().flatten() {
+    bitstream.seeked();
+  }
 }
 
 /// Upper bound on the NUL search in [`metadata_value`].
@@ -5080,35 +5200,138 @@ mod tests {
   }
 
   #[test]
-  fn a_corrupt_packet_and_a_track_without_a_reading_pass_through_unmarked() {
+  fn a_corrupt_packet_is_read_but_never_marked_and_a_track_without_a_reading_keeps_its_mark() {
+    // A corrupt packet that switches the framing: the decoder reads it, so
+    // the reading follows, and nothing corrupt is marked.
     let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
-    let corrupt = video_packet(avc_packet(0), vec![]).with_flags(PacketFlags::CORRUPT);
+    let annex = vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x01, 0x88, 0x84, 0x21];
+    let corrupt = video_packet(annex.clone(), vec![]).with_flags(PacketFlags::CORRUPT);
     let corrupt = marked_from_bitstream(Some(&mut bitstream), corrupt);
     assert_eq!(corrupt.flags(), PacketFlags::CORRUPT);
+    assert_eq!(
+      bitstream.as_ref().and_then(NalStream::framing),
+      Some(mediadecode::nal::Framing::AnnexB)
+    );
+    let corrupt = video_packet(annex.clone(), vec![]).with_flags(PacketFlags::CORRUPT);
+    let corrupt = marked_from_bitstream(Some(&mut bitstream), corrupt);
+    assert_eq!(corrupt.flags(), PacketFlags::CORRUPT);
+    let read = marked_from_bitstream(Some(&mut bitstream), video_packet(annex, vec![]));
+    assert!(read.flags().contains(PacketFlags::DISPOSABLE));
+    // No reading: the packet keeps what the container said.
     let mut unread: Option<NalStream> = None;
     let passed = marked_from_bitstream(Some(&mut unread), video_packet(avc_packet(0), vec![]));
     assert_eq!(passed.flags(), PacketFlags::empty());
-    let passed = marked_from_bitstream(None, video_packet(avc_packet(0), vec![]));
-    assert_eq!(passed.flags(), PacketFlags::empty());
+    let container = video_packet(avc_packet(0), vec![]).with_flags(PacketFlags::DISPOSABLE);
+    let passed = marked_from_bitstream(None, container);
+    assert_eq!(passed.flags(), PacketFlags::DISPOSABLE);
+  }
+
+  fn side_data(kind: c_int, data: &[u8]) -> crate::extras::SideDataEntry {
+    crate::extras::SideDataEntry::new(
+      kind,
+      crate::FfmpegBytes::try_copy_from_slice(data).expect("the side data's bytes"),
+    )
   }
 
   #[test]
-  fn new_extradata_on_a_packet_reframes_its_track_before_it_is_read() {
+  fn new_extradata_on_a_packet_reframes_its_track_and_keeps_the_packet() {
     // The track opened as Annex B; the packet brings an `avcC` of
-    // four-byte lengths, and is read in it.
+    // four-byte lengths and is read in it — and, carrying a configuration
+    // the decoder must see, is not marked.
     let mut bitstream = Some(NalStream::new(NalCodec::H264, &[]));
-    let new = ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
-    let entry = crate::extras::SideDataEntry::new(
-      new,
-      crate::FfmpegBytes::try_copy_from_slice(&avcc()).expect("the record's bytes"),
+    let entry = side_data(
+      AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as c_int,
+      &avcc(),
     );
-    let marked = marked_from_bitstream(
+    let read = marked_from_bitstream(
       Some(&mut bitstream),
       video_packet(avc_packet(0), vec![entry]),
     );
-    assert!(marked.flags().contains(PacketFlags::DISPOSABLE));
+    assert!(!read.flags().contains(PacketFlags::DISPOSABLE));
     assert_eq!(
       bitstream.as_ref().and_then(NalStream::framing),
+      Some(mediadecode::nal::Framing::Length(
+        mediadecode::nal::LengthSize::Four
+      ))
+    );
+    // The next packet carries none, and is marked.
+    let marked = marked_from_bitstream(Some(&mut bitstream), video_packet(avc_packet(0), vec![]));
+    assert!(marked.flags().contains(PacketFlags::DISPOSABLE));
+  }
+
+  #[test]
+  fn side_data_that_persists_clears_the_mark_whoever_set_it() {
+    let persisting = PERSISTING_SIDE_DATA
+      .iter()
+      .map(|&kind| kind as c_int)
+      .chain([
+        AVPacketSideDataType::AV_PKT_DATA_NB as c_int,
+        -1,
+        c_int::MAX,
+      ]);
+    for kind in persisting {
+      // The bitstream's mark is not set...
+      let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
+      let read = marked_from_bitstream(
+        Some(&mut bitstream),
+        video_packet(avc_packet(0), vec![side_data(kind, &[1])]),
+      );
+      assert!(!read.flags().contains(PacketFlags::DISPOSABLE), "{kind}");
+      // ...and the container's is cleared, with a reading or without.
+      let container = video_packet(avc_packet(0), vec![side_data(kind, &[1])])
+        .with_flags(PacketFlags::DISPOSABLE | PacketFlags::KEY);
+      let cleared = marked_from_bitstream(Some(&mut bitstream), container);
+      assert_eq!(cleared.flags(), PacketFlags::KEY, "{kind}");
+      let container = video_packet(avc_packet(0), vec![side_data(kind, &[1])])
+        .with_flags(PacketFlags::DISPOSABLE);
+      let cleared = marked_from_bitstream(None, container);
+      assert_eq!(cleared.flags(), PacketFlags::empty(), "{kind}");
+    }
+    // Side data that rides with its packet leaves the mark to the
+    // bitstream.
+    for kind in RIDING_SIDE_DATA {
+      let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
+      let read = marked_from_bitstream(
+        Some(&mut bitstream),
+        video_packet(avc_packet(0), vec![side_data(kind as c_int, &[1])]),
+      );
+      assert!(read.flags().contains(PacketFlags::DISPOSABLE), "{kind:?}");
+    }
+  }
+
+  #[test]
+  fn every_side_data_type_ffmpeg_names_rides_or_persists_and_not_both() {
+    let named = AVPacketSideDataType::AV_PKT_DATA_NB as c_int;
+    assert_eq!(
+      PERSISTING_SIDE_DATA.len() + RIDING_SIDE_DATA.len(),
+      named as usize
+    );
+    for kind in 0..named {
+      let persisting = PERSISTING_SIDE_DATA
+        .iter()
+        .filter(|&&listed| listed as c_int == kind)
+        .count();
+      let riding = RIDING_SIDE_DATA
+        .iter()
+        .filter(|&&listed| listed as c_int == kind)
+        .count();
+      assert_eq!(persisting + riding, 1, "{kind}");
+      assert_eq!(side_data_persists(kind), persisting == 1, "{kind}");
+    }
+  }
+
+  #[test]
+  fn a_seek_reaches_every_reading() {
+    // One reading whose framing moved and one whose did not: after a seek
+    // the first marks nothing, the second reads on.
+    let mut moved = NalStream::new(NalCodec::H264, &avcc());
+    moved.reconfigure(&[0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28]);
+    let still = NalStream::new(NalCodec::H264, &avcc());
+    let mut bitstreams = vec![Some(moved), None, Some(still)];
+    sought(&mut bitstreams);
+    assert_eq!(bitstreams[0].as_ref().and_then(NalStream::framing), None);
+    assert_eq!(
+      bitstreams[2].as_ref().and_then(NalStream::framing),
       Some(mediadecode::nal::Framing::Length(
         mediadecode::nal::LengthSize::Four
       ))
