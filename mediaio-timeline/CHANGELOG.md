@@ -29,6 +29,15 @@ Its versions are its own: they do not move with `mediadecode`'s.
   no such spelling, nor any of the 15 626 tried around each, and are still
   refused by name: 29195/1001, 31264/1001 and 31799/1001. Every common rate
   keeps its shortest spelling, so the goldens are unchanged.
+- **BREAKING: `validate_json` for `OtioTarget::V0_15Plus` holds three
+  members of the newer readers to their types**: an item's `color` to a
+  `Color.1` or `null`, as OpenTimelineIO 0.18 reads an optional `Color`
+  (0.18.1 `item.cpp` 181); an effect's `enabled` to a boolean, as 0.18 reads
+  it (`effect.cpp` 26); and a transition's `enabled` to a boolean, as
+  `main` reads it (`transition.cpp` 38 at `00c22fa`). A boolean member's
+  reader takes no `null`. 0.3.0 walked all three untyped, so it passed a
+  document those readers refuse. `OtioTarget::Legacy` still walks them
+  untyped: its readers keep them as keys they do not know.
 
 ## [0.3.0] - 2026-10-22
 

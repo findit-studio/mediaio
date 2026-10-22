@@ -2931,3 +2931,111 @@ fn every_marker_color_reads_back_as_its_name_in_capitals() {
   assert_eq!(MarkerColor::from_otio_name("Green"), None);
   assert_eq!(MarkerColor::from_otio_name("GRAY"), None);
 }
+
+#[test]
+fn an_items_color_and_an_effects_or_transitions_enabled_are_held_to_the_types_newer_readers_read() {
+  // OpenTimelineIO 0.18 reads an item's `color` as an optional `Color` — a
+  // `Color.1`, or null — and an effect's `enabled` as a boolean (0.18.1
+  // `item.cpp:181`, `effect.cpp:26`); `main` reads a transition's
+  // `enabled` too (`transition.cpp:38` at `00c22fa`). A boolean member's
+  // reader takes no null. `V0_15Plus`, whose readers run to `main`, holds
+  // each to its type; the readers before 0.15 keep all three as keys they
+  // do not know, which `Legacy` walks untyped.
+  let color = |name: &str| {
+    object(vec![
+      ("OTIO_SCHEMA", text("Color.1")),
+      ("name", text(name)),
+      ("r", number("1.0")),
+      ("g", number("0.0")),
+      ("b", number("0.0")),
+      ("a", number("1.0")),
+    ])
+  };
+  let effects = |enabled: Value| {
+    Value::Array(vec![object(vec![
+      ("OTIO_SCHEMA", text("Effect.1")),
+      ("effect_name", text("blur")),
+      ("enabled", enabled),
+    ])])
+  };
+  let edited = |target: OtioTarget, path: &str, key: &str, value: Value| {
+    checked_edited(target, |root| set(root, path, key, value))
+  };
+  // What every reader takes.
+  for &target in TARGETS {
+    for (path, key, value) in [
+      (TRACK, "color", Value::Null),
+      (A, "color", color("red")),
+      (GAP, "color", color("blue")),
+      (DISSOLVE, "enabled", Value::Bool(false)),
+      (A, "effects", effects(Value::Bool(true))),
+    ] {
+      assert_eq!(
+        edited(target, path, key, value),
+        Ok(()),
+        "{target:?}: {path}.{key}"
+      );
+    }
+  }
+  // What a reader from 0.18 refuses, `V0_15Plus` refuses by name; a reader
+  // before 0.15 keeps it.
+  for (path, key, value, refused, expected) in [
+    (TRACK, "color", text("red"), String::new(), "an object"),
+    (A, "color", number("7"), String::new(), "an object"),
+    (GAP, "color", Value::Bool(true), String::new(), "an object"),
+    (DISSOLVE, "enabled", Value::Null, String::new(), "a boolean"),
+    (
+      DISSOLVE,
+      "enabled",
+      text("true"),
+      String::new(),
+      "a boolean",
+    ),
+    (
+      A,
+      "effects",
+      effects(Value::Null),
+      String::from(".effects[0].enabled"),
+      "a boolean",
+    ),
+    (
+      A,
+      "effects",
+      effects(number("1")),
+      String::from(".effects[0].enabled"),
+      "a boolean",
+    ),
+  ] {
+    let at = if refused.is_empty() {
+      format!("{}.{key}", checked_path(path))
+    } else {
+      format!("{}{refused}", checked_path(path))
+    };
+    assert_eq!(
+      edited(OtioTarget::V0_15Plus, path, key, value.clone()),
+      Err((at, expected)),
+      "{path}.{key}"
+    );
+    if !cfg!(miri) {
+      assert_eq!(
+        edited(OtioTarget::Legacy, path, key, value),
+        Ok(()),
+        "Legacy: {path}.{key}"
+      );
+    }
+  }
+  // A dictionary of another schema where an item's color is, under
+  // `V0_15Plus` held to the `Color.1` a reader from 0.18 reads there.
+  assert_eq!(
+    edited(
+      OtioTarget::V0_15Plus,
+      A,
+      "color",
+      object(vec![("OTIO_SCHEMA", text("Gap.1"))])
+    ),
+    Err((
+      format!("{}.color.OTIO_SCHEMA", checked_path(A)),
+      "the schema Color.1"
+    )),
+  );
+}
