@@ -364,7 +364,7 @@ fn near(value: f64, whole: i128, part: i128, den: i128) -> bool {
 /// `std::floor`, which `core` lacks: the greatest whole `f64` not above
 /// `value`. Past ±2^52 an `f64` is whole already, and an infinity or a NaN
 /// is its own floor, as `std::floor` answers them.
-fn floor(value: f64) -> f64 {
+pub(super) fn floor(value: f64) -> f64 {
   if !(value > -WHOLE && value < WHOLE) {
     return value;
   }

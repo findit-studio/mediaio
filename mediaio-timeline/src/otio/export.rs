@@ -1382,8 +1382,9 @@ fn near_integers(scaled: f64) -> Option<Vec<u64>> {
     return None;
   }
   let mut near: Vec<f64> = if scaled < 4_503_599_627_370_496.0 {
-    let floor = scaled.floor();
-    (-2..=3).map(|step| floor + f64::from(step)).collect()
+    // `core` has no `f64::floor`; the walk's own floor is `std`'s.
+    let below = derive::floor(scaled);
+    (-2..=3).map(|step| below + f64::from(step)).collect()
   } else {
     let mut around = vec![scaled];
     let (mut up, mut down) = (scaled, scaled);
@@ -1394,7 +1395,8 @@ fn near_integers(scaled: f64) -> Option<Vec<u64>> {
     }
     around
   };
-  near.retain(|&d| d > 0.0 && d < TWO_64 && d.fract() == 0.0);
+  // A double is whole where it is its own floor.
+  near.retain(|&d| d > 0.0 && d < TWO_64 && derive::floor(d) == d);
   near.sort_by(|a, b| {
     (a - scaled)
       .abs()
