@@ -87,7 +87,9 @@ Its versions are its own: they do not move with the rest of the family's.
   marks. Its promise is pixels: dropping a marked packet changes no later
   picture's pixels, and promises nothing of a later frame's best-effort
   timestamp, which a decoder may guess from every frame before; a frame's
-  own pts is the exact one.
+  own pts is the exact one. No encrypted payload is read for it, and one
+  limit is named: an MXF file whose essence is encrypted and read without
+  a key is outside its guarantee.
 
 ## [0.1.0] - 2026-10-16
 

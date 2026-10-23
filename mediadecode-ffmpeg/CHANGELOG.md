@@ -29,7 +29,12 @@ The backend-agnostic core it adapts has its own log at
   packet carrying `AV_PKT_DATA_ENCRYPTION_INFO` or
   `AV_PKT_DATA_ENCRYPTION_INIT_INFO` gets no bitstream mark, and its
   track's reading stops there for the rest of the stream, a seek
-  included. **More packets are marked DISPOSABLE on H.264
+  included; and a track FFmpeg names encrypted at the open — a Matroska
+  track's `enc_key_id`, a stream's `ENCRYPTION_INIT_INFO` from `pssh` — is
+  never read at all. **A named limit:** an MXF file whose essence is
+  encrypted and read without a key is outside the reading's guarantee,
+  since libavformat returns its ciphertext with nothing that says so.
+  **More packets are marked DISPOSABLE on H.264
   and HEVC, so a consumer that drops them decodes fewer pictures**: two in
   three of a Sony XAVC original, which carries no `sdtp` and was marked
   nowhere before. An H.264 stream whose sequence parameter set codes

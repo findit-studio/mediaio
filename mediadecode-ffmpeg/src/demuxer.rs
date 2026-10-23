@@ -291,7 +291,8 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// ([`marked_from_bitstream`]). Built at open from each stream's codec
   /// and extradata ([`bitstreams`]); told of every seek ([`sought`]);
   /// dropped for good at a track's first packet whose payload is encrypted
-  /// ([`ENCRYPTED_SIDE_DATA`]).
+  /// ([`ENCRYPTED_SIDE_DATA`]), and never built for a track FFmpeg names
+  /// encrypted at the open ([`encrypted_at_open`]).
   bitstreams: Vec<Option<NalStream>>,
   /// Reads that answer in place of libavformat's next ones. Test only:
   /// see [`Self::read_into`].
@@ -3055,7 +3056,8 @@ const fn is_attachment_disposition(disposition: c_int) -> bool {
 /// Each stream's reading of its H.264 or HEVC bitstream, by stream
 /// index: a [`NalStream`] for a video stream of either codec, built from
 /// its extradata, and `None` for every other stream, whose packets carry
-/// the container's mark alone.
+/// the container's mark alone — and for a stream FFmpeg names encrypted at
+/// the open ([`encrypted_at_open`]), opaque from its first packet.
 ///
 /// The codec and the medium are read as the raw integers they are, as
 /// [`build_tracks`] reads them; the extradata is borrowed, not copied —
@@ -3081,6 +3083,9 @@ fn bitstreams(input: &Input) -> Result<Vec<Option<NalStream>>, DemuxError> {
       _ => None,
     }
     .filter(|_| boundary::media_kind_of(&parameters).is_video())
+    // SAFETY: the stream is live for this iteration, and its metadata and
+    // parameters with it.
+    .filter(|_| !unsafe { encrypted_at_open(stream.as_ptr()) })
     .map(|codec| {
       // SAFETY: `extradata` and `extradata_size` are public fields of the
       // stream's live parameters; libavformat keeps `extradata` readable
@@ -3243,11 +3248,68 @@ fn side_data_persists(kind: c_int) -> bool {
 ///
 /// Both stay in the persistence tables as well ([`RIDING_SIDE_DATA`],
 /// [`PERSISTING_SIDE_DATA`]), which answer the container's mark: this table
-/// answers whether the bitstream is read at all.
+/// answers whether the bitstream is read at all. On a stream's coded side
+/// data, either makes its track opaque from the open ([`encrypted_at_open`],
+/// which names the signals that come with no packet side data, and the one
+/// limit no signal answers).
 const ENCRYPTED_SIDE_DATA: &[AVPacketSideDataType] = &[
   AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INFO,
   AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO,
 ];
+
+/// Whether `stream` is one FFmpeg names encrypted at the open, before any
+/// of its packets is read: **its payloads may be ciphertext with no packet
+/// side data to say so**, so its bitstream is never read, from its first
+/// packet on. The signals, by source in FFmpeg 9.0.1:
+///
+/// | demuxer | how it names the track encrypted |
+/// |---|---|
+/// | `mov` | a `pssh` box (`libavformat/mov.c` 8064) puts `AV_PKT_DATA_ENCRYPTION_INIT_INFO` in the stream's coded side data (8148–8177), any kind of [`ENCRYPTED_SIDE_DATA`] being read here alike |
+/// | `matroska` | a track's `ContentEncryption` with a key id leaves its blocks undecrypted (`libavformat/matroskadec.c` 2063–2073) and names the key in the stream's `enc_key_id` metadata (3274–3277) |
+///
+/// **A named limit:** an MXF file whose essence is encrypted and read
+/// without a key is outside the reading's guarantee. libavformat returns
+/// the ciphertext of an encrypted triplet with nothing that says so
+/// (`libavformat/mxfdec.c` 656–726), and no guess is made at it.
+///
+/// # Safety
+///
+/// `stream` is a live `AVStream` for the call, its `codecpar` and
+/// `metadata` with it: `coded_side_data`, where not null and
+/// `nb_coded_side_data` is above 0, valid for that many entries, of which
+/// only each `type` is read, as the integer it is.
+unsafe fn encrypted_at_open(stream: *const AVStream) -> bool {
+  // SAFETY: the caller's contract; `metadata` is the stream's own
+  // dictionary, read by `metadata_value` without being modified.
+  let metadata = unsafe { (*stream).metadata };
+  if !matches!(
+    unsafe { metadata_value(metadata, c"enc_key_id") },
+    MetadataValue::Absent
+  ) {
+    return true;
+  }
+  // SAFETY: the caller's contract; the two fields are a pointer and an
+  // integer of the stream's live parameters.
+  let (entries, count) = unsafe {
+    let par = (*stream).codecpar;
+    if par.is_null() {
+      return false;
+    }
+    ((*par).coded_side_data, (*par).nb_coded_side_data)
+  };
+  if entries.is_null() || count <= 0 {
+    return false;
+  }
+  (0..count as usize).any(|index| {
+    // **Never `&*entry`**, as `measure_parameters` reads the same array:
+    // `type` is an open C enum, so only its address is formed and the
+    // value read as the integer it is.
+    // SAFETY: `index` is below `nb_coded_side_data`, for which the array
+    // is valid per the caller's contract.
+    let kind = unsafe { read_unaligned(addr_of!((*entries.add(index)).type_).cast::<c_int>()) };
+    says_encrypted(kind)
+  })
+}
 
 /// Whether packet side data of `kind`, the raw `AVPacketSideDataType` it
 /// arrives as, is one of [`ENCRYPTED_SIDE_DATA`], compared as the integer
@@ -5520,6 +5582,236 @@ mod tests {
         "{kind}: that track is read no more either"
       );
     }
+  }
+
+  /// Writes `avcc()` into `par` as its extradata, padded as libavcodec
+  /// pads it, with the codec and medium of an H.264 video stream of 16 x 16
+  /// pictures.
+  ///
+  /// # Safety
+  ///
+  /// `par` is a live `AVCodecParameters` with no extradata yet.
+  unsafe fn as_h264(par: *mut ffmpeg_next::ffi::AVCodecParameters) {
+    use ffmpeg_next::ffi::{AV_INPUT_BUFFER_PADDING_SIZE, AVCodecID, AVMediaType, av_mallocz};
+
+    let record = avcc();
+    // SAFETY: the caller's contract; the allocation is the record's size
+    // and its padding, zeroed, and the record is copied into its front.
+    unsafe {
+      (*par).codec_type = AVMediaType::AVMEDIA_TYPE_VIDEO;
+      (*par).codec_id = AVCodecID::AV_CODEC_ID_H264;
+      (*par).width = 16;
+      (*par).height = 16;
+      let extradata = av_mallocz(record.len() + AV_INPUT_BUFFER_PADDING_SIZE as usize).cast::<u8>();
+      assert!(!extradata.is_null(), "the extradata");
+      ptr::copy_nonoverlapping(record.as_ptr(), extradata, record.len());
+      (*par).extradata = extradata;
+      (*par).extradata_size = record.len() as c_int;
+    }
+  }
+
+  /// Adds to `par`'s coded side data a key system's initialization, as
+  /// `mov` adds one from a `pssh` box (`libavformat/mov.c` 8148–8177): one
+  /// system of a 16-byte id with one 16-byte key id and no data, in
+  /// libavutil's layout (`libavutil/encryption_info.c` 164–174, 292–343).
+  ///
+  /// # Safety
+  ///
+  /// `par` is a live `AVCodecParameters`.
+  unsafe fn with_encryption_init_info(par: *mut ffmpeg_next::ffi::AVCodecParameters) {
+    use ffmpeg_next::ffi::av_packet_side_data_new;
+
+    let mut layout = Vec::new();
+    for word in [1u32, 16, 1, 16, 0] {
+      layout.extend_from_slice(&word.to_be_bytes());
+    }
+    layout.extend_from_slice(&[0x5A; 16]);
+    layout.extend_from_slice(&[0xA5; 16]);
+    // SAFETY: the caller's contract; the entry `av_packet_side_data_new`
+    // returns owns `layout.len()` writable bytes.
+    unsafe {
+      let entry = av_packet_side_data_new(
+        &mut (*par).coded_side_data,
+        &mut (*par).nb_coded_side_data,
+        AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO,
+        layout.len(),
+        0,
+      );
+      assert!(!entry.is_null(), "the side data");
+      ptr::copy_nonoverlapping(layout.as_ptr(), (*entry).data, layout.len());
+    }
+  }
+
+  /// LAW: **a track FFmpeg names encrypted at the open is never read** —
+  /// a stream whose metadata names a key (`enc_key_id`, as `matroska`
+  /// names an encrypted track's), and one whose coded side data holds a key
+  /// system's initialization (as `mov` holds a `pssh` box's) — beside a
+  /// control stream, read as ever.
+  ///
+  /// PLANT: the metadata unread turns this red at "`enc_key_id`"; the side
+  /// data unread, at "`ENCRYPTION_INIT_INFO`".
+  #[test]
+  fn a_track_ffmpeg_names_encrypted_at_the_open_is_never_read() {
+    use ffmpeg_next::ffi::{avformat_alloc_context, avformat_new_stream};
+
+    ffmpeg_next::init().expect("ffmpeg init");
+    // SAFETY: a bare context, owned by the `Input` it is wrapped in, which
+    // frees it, its streams and their parameters and metadata; each stream
+    // is written whole before the context is read.
+    let input = unsafe {
+      let ctx = avformat_alloc_context();
+      assert!(!ctx.is_null(), "a context");
+      for signal in 0..3 {
+        let stream = avformat_new_stream(ctx, ptr::null());
+        assert!(!stream.is_null(), "a stream");
+        as_h264((*stream).codecpar);
+        match signal {
+          1 => assert!(
+            av_dict_set(
+              &mut (*stream).metadata,
+              c"enc_key_id".as_ptr(),
+              c"WlpaWlpaWlpaWlpaWlpaWg==".as_ptr(),
+              0
+            ) >= 0,
+            "the metadata"
+          ),
+          2 => with_encryption_init_info((*stream).codecpar),
+          _ => {}
+        }
+      }
+      Input::wrap(ctx)
+    };
+    let readings = bitstreams(&input).expect("the readings");
+    assert!(readings[0].is_some(), "the control is read");
+    assert!(readings[1].is_none(), "`enc_key_id`: never read");
+    assert!(readings[2].is_none(), "`ENCRYPTION_INIT_INFO`: never read");
+  }
+
+  /// Writes, through libavformat's muxer `format`, an H.264 file at `path`
+  /// of `avcc()` and three packets — a reference picture's, then two
+  /// non-reference ones (`avc_packet`) — with `signal` applied to its
+  /// stream before the header; and answers whether the demuxer opens it
+  /// with a reading, and which packets it marks DISPOSABLE.
+  fn marked_after_writing(
+    path: &Path,
+    format: &str,
+    signal: unsafe fn(*mut ffmpeg_next::ffi::AVStream),
+  ) -> (bool, Vec<bool>) {
+    use ffmpeg_next as ff;
+
+    ff::init().expect("ffmpeg init");
+    {
+      let mut output = ff::format::output_as(&path, format).expect("an output");
+      {
+        let mut stream = output.add_stream(ff::codec::Id::None).expect("a stream");
+        stream.set_time_base((1, 25));
+        // SAFETY: the stream is live and its parameters are fresh: no
+        // extradata yet, and nothing else holds them.
+        unsafe {
+          let stream = stream.as_mut_ptr();
+          as_h264((*stream).codecpar);
+          signal(stream);
+        }
+      }
+      output.write_header().expect("the header");
+      let stream_tb = output.stream(0).expect("the stream").time_base();
+      for (index, reference) in [2u8, 0, 0].into_iter().enumerate() {
+        let mut packet = ff::Packet::copy(&avc_packet(reference));
+        packet.set_stream(0);
+        packet.set_pts(Some(index as i64));
+        packet.set_dts(Some(index as i64));
+        packet.set_duration(1);
+        if index == 0 {
+          packet.set_flags(ff::packet::Flags::KEY);
+        }
+        packet.rescale_ts((1, 25), stream_tb);
+        packet.write_interleaved(&mut output).expect("a packet");
+      }
+      output.write_trailer().expect("the trailer");
+    }
+    let mut demuxer = CarrierDemuxer::<crate::Owned>::open_impl(path).expect("the file opens");
+    let read = demuxer.bitstreams.first().is_some_and(Option::is_some);
+    let mut marks = Vec::new();
+    while let Some(packet) = demuxer.next_packet_impl().expect("a packet or the end") {
+      if let DemuxedPacket::Video(video) = packet {
+        marks.push(
+          video
+            .into_packet()
+            .flags()
+            .contains(PacketFlags::DISPOSABLE),
+        );
+      }
+    }
+    (read, marks)
+  }
+
+  /// No signal: the stream as written.
+  unsafe fn no_signal(_: *mut ffmpeg_next::ffi::AVStream) {}
+
+  /// LAW: **an MP4 whose stream carries a key system's initialization is
+  /// never read**, through `mov`'s own muxer and demuxer: `movenc` writes
+  /// the stream's `ENCRYPTION_INIT_INFO` as a `pssh` box at the end of
+  /// `moov` (`libavformat/movenc.c` 5175–5210, 5449–5450), and `mov` reads
+  /// it back onto the stream (`mov.c` 8064, 8148–8177). The same file
+  /// without it is read, its non-reference packets marked.
+  ///
+  /// PLANT: the coded side data unread at the open turns this red at "a
+  /// `pssh` box".
+  #[test]
+  fn an_mp4_whose_stream_carries_a_key_systems_initialization_is_never_read() {
+    unsafe fn pssh(stream: *mut ffmpeg_next::ffi::AVStream) {
+      // SAFETY: `marked_after_writing` hands over a live stream.
+      unsafe { with_encryption_init_info((*stream).codecpar) };
+    }
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    assert_eq!(
+      marked_after_writing(&scratch.path().join("clear.mp4"), "mp4", no_signal),
+      (true, vec![false, true, true]),
+      "the control"
+    );
+    assert_eq!(
+      marked_after_writing(&scratch.path().join("pssh.mp4"), "mp4", pssh),
+      (false, vec![false, false, false]),
+      "a `pssh` box: never read"
+    );
+  }
+
+  /// LAW: **a Matroska track whose stream names a key is never read**,
+  /// through `matroska`'s own muxer and demuxer. `matroskadec` names an
+  /// encrypted track's key in the stream's `enc_key_id` metadata
+  /// (`matroskadec.c` 3274–3277); `matroskaenc` writes no encryption, so
+  /// the law sets the same metadata as a stream tag, which `matroskadec`
+  /// reads into the same dictionary (1838–1842). The same file without it
+  /// is read, its non-reference packets marked.
+  ///
+  /// PLANT: the metadata unread at the open turns this red at "an
+  /// `enc_key_id`".
+  #[test]
+  fn a_matroska_track_whose_stream_names_a_key_is_never_read() {
+    unsafe fn key_id(stream: *mut ffmpeg_next::ffi::AVStream) {
+      // SAFETY: `marked_after_writing` hands over a live stream, whose
+      // metadata dictionary `av_dict_set` may create.
+      let set = unsafe {
+        av_dict_set(
+          &mut (*stream).metadata,
+          c"enc_key_id".as_ptr(),
+          c"WlpaWlpaWlpaWlpaWlpaWg==".as_ptr(),
+          0,
+        )
+      };
+      assert!(set >= 0, "the metadata");
+    }
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    assert_eq!(
+      marked_after_writing(&scratch.path().join("clear.mkv"), "matroska", no_signal),
+      (true, vec![false, true, true]),
+      "the control"
+    );
+    assert_eq!(
+      marked_after_writing(&scratch.path().join("key.mkv"), "matroska", key_id),
+      (false, vec![false, false, false]),
+      "an `enc_key_id`: never read"
+    );
   }
 
   #[test]
