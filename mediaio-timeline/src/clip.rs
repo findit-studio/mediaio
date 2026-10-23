@@ -8,7 +8,7 @@ use mediatime::{Duration, Rate, TimeRange};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use smol_bytes::Utf8Bytes;
 
-use crate::{Marker, Metadata};
+use crate::{Marker, Metadata, ReaderMetadata};
 
 /// A stretch of one medium placed at an explicit position on a track.
 ///
@@ -35,7 +35,8 @@ use crate::{Marker, Metadata};
 /// Its [`markers`](Self::markers) are counted in its medium's time, as its
 /// source range is. On the wire they are written only when there are
 /// some, so a clip without any writes the document it wrote before
-/// markers existed.
+/// markers existed; so are its [`readers`](Self::readers), other readers'
+/// own metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
@@ -56,11 +57,17 @@ pub struct Clip {
     serde(default, skip_serializing_if = "Vec::is_empty")
   )]
   markers: Vec<Marker>,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "ReaderMetadata::is_empty")
+  )]
+  readers: ReaderMetadata,
 }
 
 impl Clip {
   /// The clip `id`, playing `source_range` of `media` at `record` — enabled,
-  /// with no gain, no fades, no metadata and no marker.
+  /// with no gain, no fades, no metadata, no marker and no reader's
+  /// metadata.
   pub fn new(
     id: ClipId,
     name: impl Into<Utf8Bytes>,
@@ -79,6 +86,7 @@ impl Clip {
       fades: Fades::new(),
       metadata: Metadata::new(),
       markers: Vec::new(),
+      readers: ReaderMetadata::new(),
     }
   }
 
@@ -137,6 +145,16 @@ impl Clip {
   /// The clip's own notes, for editing in place.
   pub const fn metadata_mut(&mut self) -> &mut Metadata {
     &mut self.metadata
+  }
+
+  /// Other readers' own metadata on the clip.
+  pub const fn readers(&self) -> &ReaderMetadata {
+    &self.readers
+  }
+
+  /// Other readers' own metadata on the clip, for editing in place.
+  pub const fn readers_mut(&mut self) -> &mut ReaderMetadata {
+    &mut self.readers
   }
 
   /// The markers noted on the clip, counted in its medium's time.
@@ -223,6 +241,13 @@ impl Clip {
   #[must_use]
   pub fn with_metadata(mut self, metadata: Metadata) -> Self {
     self.metadata = metadata;
+    self
+  }
+
+  /// Replaces other readers' own metadata on the clip (consuming builder).
+  #[must_use]
+  pub fn with_readers(mut self, readers: ReaderMetadata) -> Self {
+    self.readers = readers;
     self
   }
 

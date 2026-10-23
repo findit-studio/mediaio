@@ -5,17 +5,21 @@ use core::num::NonZeroI32;
 
 use mediaio_timeline::{
   Clip, ClipId, Duration, Fade, FadeShape, Fades, Gain, Marker, MarkerColor, MediaRef, Metadata,
-  Rate, TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind, Transition,
+  Rate, ReaderMetadata, TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind, Transition,
 };
 
 pub fn tb(num: i32, den: i32) -> Timebase {
   Timebase::new(num, NonZeroI32::new(den).unwrap())
 }
 
-/// Two tracks, three clips, a dissolve, two fades and two markers, at
+/// Two tracks, three clips, a dissolve, two fades and three markers, at
 /// 23.976 fps from 01:00:00:00. The clips' ids are `clip-1` to `clip-3`, in
 /// that order.
 ///
+/// - The timeline: a blue `b` marks frames 96–144, the second shot, its
+///   comment `the second shot` noted again where DaVinci Resolve reads a
+///   marker's note (`Resolve_OTIO`'s `Note`) — on the stack, whose markers
+///   are the ones Resolve imports as its timeline's.
 /// - V1: `a` at [0, 96) plays frames 24–120 of a 240-frame movie (reel
 ///   A001), a green `slate` marking its frames 48–72; a 12 + 12-frame
 ///   dissolve at 96 into `b` at [96, 144), frames 48–96 of a 480-frame
@@ -84,5 +88,14 @@ pub fn law() -> Timeline {
         .with_gain(Gain::from_db(-6.0))
         .with_fades(Fades::new().with_in(Some(Fade::new(frames(12), FadeShape::EqualPower)))),
       ),
+    )
+    .with_marker(
+      Marker::new("b", TimeRange::new(96, 144, edit))
+        .with_color(MarkerColor::Blue)
+        .with_comment("the second shot")
+        .with_readers(ReaderMetadata::new().with(
+          "Resolve_OTIO",
+          Metadata::new().with("Note", "the second shot"),
+        )),
     )
 }

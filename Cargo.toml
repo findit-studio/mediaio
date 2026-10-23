@@ -27,7 +27,7 @@ mediadecode-webcodecs = { version = "0.19", path = "mediadecode-webcodecs", defa
 mediaencode = { version = "0.19", path = "mediaencode", default-features = false }
 mediaencode-ffmpeg = { version = "0.20", path = "mediaencode-ffmpeg", default-features = false }
 mediaio-ffmpeg = { version = "0.20", path = "mediaio-ffmpeg", default-features = false }
-mediaio-timeline = { version = "0.3", path = "mediaio-timeline" }
+mediaio-timeline = { version = "0.4", path = "mediaio-timeline" }
 mediaspine  = { version = "0.1", path = "mediaspine", default-features = false }
 mediaframe  = { version = "0.12", default-features = false, features = ["frame"] }
 

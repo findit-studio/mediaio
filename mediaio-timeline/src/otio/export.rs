@@ -10,28 +10,31 @@
 //! it, or else in the first ruler the timeline's operands are counted in
 //! that does ([`source_plan`]); its medium's available range likewise, in the
 //! first that holds it whole, its end with it ([`whole_plan`]), and each of
-//! its markers the same way; a track's markers at the edit rate — and the
-//! walk, [`mod@derive`], forms what OpenTimelineIO derives from those counts,
-//! in its own arithmetic, holding each: a source range's end among them,
-//! which the plan leaves to the walk. Where the walk refuses a value, a
-//! search ([`settle`]) writes the clips it is formed from in other rulers
-//! that hold their source ranges — every ruler the timeline's own operands
-//! are counted in, and the finest and the coarsest whole ones below a clip's
-//! plan's — one clip one ruler at a time, and walks again; what no plan it
-//! tries holds is refused, with the last walk's refusal and what the search
-//! tried.
+//! its markers the same way; the timeline's markers and a track's at the
+//! edit rate — and the walk, [`mod@derive`], forms what OpenTimelineIO
+//! derives from those counts, in its own arithmetic, holding each: a source
+//! range's end among them, which the plan leaves to the walk. Where the
+//! walk refuses a value, a search ([`settle`]) writes the clips it is formed
+//! from in other rulers that hold their source ranges — every ruler the
+//! timeline's own operands are counted in, and the finest and the coarsest
+//! whole ones below a clip's plan's — one clip one ruler at a time, and
+//! walks again; what no plan it tries holds is refused, with the last
+//! walk's refusal and what the search tried.
 //!
-//! Last, every number the document would carry is read as OpenTimelineIO
-//! 0.17.0's reader reads it ([`spellings`]). That reader, RapidJSON in its
-//! normal precision, reads a count written `<digits>.0` exactly up to
-//! 1 801 439 850 948 198, ⌊2^54 / 10⌋, and past it not always — the
-//! fraction's `0` joins the significand, which converts to a double rounded
-//! past 2^53 before it is divided by ten — and the shortest spelling of the
-//! `f64` of most rates exactly, but not of every one: 96000/1001's it reads
-//! as a neighbouring `f64`, while every common rate reads exactly. A count
-//! or a rate that a build rounding its multiply-adds twice, or one fusing
-//! them, would read as another value is refused there, with no search
-//! ([`read_back`]).
+//! Last, every number the document would carry is spelled so that
+//! OpenTimelineIO 0.17.0's reader reads it back as the value meant. That
+//! reader, RapidJSON in its normal precision, reads a count written
+//! `<digits>.0` exactly up to 1 801 439 850 948 198, ⌊2^54 / 10⌋, and past
+//! it not always — the fraction's `0` joins the significand, which converts
+//! to a double rounded past 2^53 before it is divided by ten — so a count
+//! past it is written as its integer, which it hands over whole
+//! ([`number`]). It reads the shortest spelling of the `f64` of most rates
+//! exactly, but not of every one: 96000/1001's it reads as a neighbouring
+//! `f64`, while every common rate reads exactly. Such a rate is written in
+//! another spelling of the same `f64` that a build rounding its
+//! multiply-adds twice and one fusing them both read exactly
+//! ([`rate_spelling`]); a rate none of those spellings writes is refused,
+//! with no search ([`spellings`], [`read_back`]).
 //!
 //! OpenTimelineIO keeps a rate as an `f64`, which names many rationals, and
 //! a range as two counts in one ruler, which says nothing of the timebase
@@ -44,7 +47,9 @@
 //! on a track whose transitions are kept out of their cuts' order, each
 //! dissolve's place among them (`order`). OpenTimelineIO's own fields stay
 //! the authority for every count; a reader holds each written rate to its
-//! exact word.
+//! exact word. Beside those words, in the same `metadata`, it writes each
+//! other reader's namespace the timeline, a track, a clip or a marker holds
+//! ([`ReaderMetadata`]), whole ([`metadata`]).
 
 use core::cmp::Reverse;
 use std::{collections::BTreeSet, vec, vec::Vec};
@@ -59,12 +64,10 @@ use super::{
 };
 use crate::{
   Clip, ClipAt, Edge, EdgeAt, Fade, FadeShape, Item, Layout, Marker, MarkerAt, MediaRef, Metadata,
-  Timeline, Track, TrackKind, TrackLayout, Transition, TransitionAt,
+  ReaderMetadata, Timeline, Track, TrackKind, TrackLayout, Transition, TransitionAt,
 };
 
-/// The key under which this crate's own words ride in an object's
-/// `metadata`.
-pub(super) const OURS: &str = "mediaio";
+pub(super) use crate::metadata::OURS;
 
 /// The key a `Clip.2` keeps its one media reference under.
 pub(super) const DEFAULT_MEDIA: &str = "DEFAULT_MEDIA";
@@ -81,6 +84,12 @@ pub(crate) fn timeline(
   let edit = Ruler::new(timeline.rate());
   let start = i128::from(timeline.start().pts());
   held(start, edit, Spot::Start)?;
+  let stacked = timeline
+    .markers()
+    .iter()
+    .enumerate()
+    .map(|(marker, placed)| edit_marker(placed, edit, Spot::Marker(MarkerAt::Timeline { marker })))
+    .collect::<Result<Vec<_>, _>>()?;
   let operands = operands(laid, edit);
   let planned = laid
     .tracks()
@@ -95,7 +104,7 @@ pub(crate) fn timeline(
     .map(|(index, laid)| markers_planned(index, laid.track(), edit, &operands))
     .collect::<Result<Vec<_>, _>>()?;
   let settled = settle(planned, edit, &operands, Time::written(start, edit))?;
-  spellings(start, edit, &settled, &marked)?;
+  spellings(start, edit, &stacked, &settled, &marked)?;
   // A valid timeline states its rate, and the reciprocal of a rate above
   // zero is a timebase.
   let ticks = timeline.rate().checked_to_timebase().unwrap_or_default();
@@ -115,7 +124,10 @@ pub(crate) fn timeline(
   rate.extend(spelled(timeline.start().timebase(), ticks).map(|start| ("start", start)));
   Ok(object(vec![
     ("OTIO_SCHEMA", text("Timeline.1")),
-    ("metadata", metadata(rate, timeline.metadata())),
+    (
+      "metadata",
+      metadata(rate, timeline.metadata(), timeline.readers()),
+    ),
     ("name", text(timeline.name())),
     ("global_start_time", rational_time(edit, start)),
     (
@@ -126,7 +138,10 @@ pub(crate) fn timeline(
         ("name", text("tracks")),
         ("source_range", Value::Null),
         ("effects", Value::Array(Vec::new())),
-        ("markers", Value::Array(Vec::new())),
+        (
+          "markers",
+          Value::Array(edit_markers(timeline.markers(), &stacked, ticks)),
+        ),
         ("enabled", Value::Bool(true)),
         ("children", Value::Array(tracks)),
       ]),
@@ -685,18 +700,13 @@ fn track(
       }
     })
     .collect();
-  let markers = track
-    .markers()
-    .iter()
-    .zip(&marked.track)
-    .map(|(marker, &range)| {
-      let word = spelled(marker.range().timebase(), ticks).map(|timebase| ("timebase", timebase));
-      self::marker(marker, range, word)
-    })
-    .collect();
+  let markers = edit_markers(track.markers(), &marked.track, ticks);
   object(vec![
     ("OTIO_SCHEMA", text("Track.1")),
-    ("metadata", Value::Object(Vec::new())),
+    (
+      "metadata",
+      metadata(Vec::new(), &Metadata::new(), track.readers()),
+    ),
     ("name", text(track.name())),
     ("source_range", Value::Null),
     ("effects", Value::Array(Vec::new())),
@@ -750,7 +760,7 @@ fn clip(
         OtioTarget::Legacy => "Clip.1",
       }),
     ),
-    ("metadata", metadata(words, clip.metadata())),
+    ("metadata", metadata(words, clip.metadata(), clip.readers())),
     ("name", text(clip.name())),
     ("source_range", source.time_range()),
     ("effects", Value::Array(Vec::new())),
@@ -781,7 +791,10 @@ fn external_reference(media: &MediaRef, available: Option<Counted>, target: Otio
   }
   let mut members = vec![
     ("OTIO_SCHEMA", text("ExternalReference.1")),
-    ("metadata", metadata(words, &Metadata::new())),
+    (
+      "metadata",
+      metadata(words, &Metadata::new(), &ReaderMetadata::new()),
+    ),
     ("name", text("")),
     (
       "available_range",
@@ -829,7 +842,7 @@ fn fade_transition(fade: Fade, edge: Edge, Edit { edit, ticks }: Edit) -> Value 
   let mut words = vec![("fade", text(word)), ("shape", text(shape))];
   words.extend(spelled(fade.duration().timebase(), ticks).map(|timebase| ("timebase", timebase)));
   transition(
-    metadata(words, &Metadata::new()),
+    metadata(words, &Metadata::new(), &ReaderMetadata::new()),
     rational_time(edit, i128::from(in_offset)),
     rational_time(edit, i128::from(out_offset)),
   )
@@ -851,7 +864,7 @@ fn dissolve(transition: &Transition, Edit { edit, ticks }: Edit, order: Option<u
     words.extend(spelled(timebase, ticks).map(|spelled| (word, spelled)));
   }
   self::transition(
-    metadata(words, &Metadata::new()),
+    metadata(words, &Metadata::new(), &ReaderMetadata::new()),
     rational_time(edit, i128::from(transition.in_offset().ticks())),
     rational_time(edit, i128::from(transition.out_offset().ticks())),
   )
@@ -867,15 +880,33 @@ fn reordered(track: &Track) -> bool {
     .any(|pair| pair[1].at() <= pair[0].at())
 }
 
+/// The timeline's markers or a track's, each as [`marker`] writes one at
+/// the edit rate, as `counted`, its timebase spelled where it is spelled
+/// otherwise than the edit rate's reciprocal, `ticks` (`timebase`).
+fn edit_markers(markers: &[Marker], counted: &[Counted], ticks: Timebase) -> Vec<Value> {
+  markers
+    .iter()
+    .zip(counted)
+    .map(|(marker, &range)| {
+      let word = spelled(marker.range().timebase(), ticks).map(|timebase| ("timebase", timebase));
+      self::marker(marker, range, word)
+    })
+    .collect()
+}
+
 /// A marker as `Marker.2`: its `range` counted in one ruler — the edit
-/// rate's, for a track's marker, with its timebase spelled where it is
-/// spelled otherwise than the edit rate's reciprocal (`timebase`); for a
-/// clip's, the ruler its plan chose, with its exact words (`range`).
+/// rate's, for the timeline's marker or a track's, with its timebase
+/// spelled where it is spelled otherwise than the edit rate's reciprocal
+/// (`timebase`); for a clip's, the ruler its plan chose, with its exact
+/// words (`range`) — and its readers' namespaces beside those words.
 fn marker(marker: &Marker, range: Counted, word: Option<(&'static str, Value)>) -> Value {
   let words = word.into_iter().collect();
   object(vec![
     ("OTIO_SCHEMA", text("Marker.2")),
-    ("metadata", metadata(words, &Metadata::new())),
+    (
+      "metadata",
+      metadata(words, &Metadata::new(), marker.readers()),
+    ),
     ("name", text(marker.name())),
     ("color", text(marker.color().otio_name())),
     ("marked_range", range.time_range()),
@@ -921,12 +952,11 @@ fn markers_planned(
     .iter()
     .enumerate()
     .map(|(marker, placed)| {
-      let range = placed.range();
       let at = Spot::Marker(MarkerAt::Track {
         track: index,
         marker,
       });
-      Counted::new(edit, range.start_pts(), range.span().ticks()).within(true, at, None)
+      edit_marker(placed, edit, at)
     })
     .collect::<Result<Vec<_>, _>>()?;
   let on_clips = track
@@ -952,6 +982,14 @@ fn markers_planned(
     track: on_track,
     clips: on_clips,
   })
+}
+
+/// The timeline's marker or a track's, counted at the edit rate and held
+/// whole there — its start, its length and its end within ±2^53 — or
+/// refused at `at`, with no search, as any count the export writes there.
+fn edit_marker(marker: &Marker, edit: Ruler, at: Spot) -> Result<Counted, NotRepresentable> {
+  let range = marker.range();
+  Counted::new(edit, range.start_pts(), range.span().ticks()).within(true, at, None)
 }
 
 fn transition(metadata: Value, in_offset: Value, out_offset: Value) -> Value {
@@ -1193,15 +1231,28 @@ fn recount(range: TimeRange, length: Duration, rate: Rate) -> Option<Counted> {
 }
 
 /// The metadata object: this crate's own `words` and the model's `notes`
-/// under [`OURS`], or nothing when there are neither.
+/// under [`OURS`], where there are either, and beside them each other
+/// reader's namespace in `readers`, whole — `{}` for one holding no entry,
+/// as the model holds it — every key in byte order, as OpenTimelineIO's own
+/// writer orders a dictionary's; an empty object where there are none of
+/// them, so an object with no namespace writes what it wrote before
+/// namespaces existed.
 ///
 /// The notes are an array of `[key, value]` pairs, never an object: a
 /// note's key is anything the model was given, and OpenTimelineIO reads a
 /// dictionary carrying `OTIO_SCHEMA` as an object of that schema
 /// (`deserialization.cpp` 561–573 in 0.17.0) — a note keyed so would make
 /// the export a document OpenTimelineIO refuses. As strings in an array,
-/// keys are values, which no reader takes for a schema.
-fn metadata(mut words: Vec<(&'static str, Value)>, notes: &Metadata) -> Value {
+/// keys are values, which no reader takes for a schema. A namespace is
+/// written as its reader reads it, an object of strings: validation holds
+/// `OTIO_SCHEMA` out of its keys, and `mediaio` and `OTIO_SCHEMA` out of
+/// the namespaces' names, so no namespace is read as an object of a schema
+/// or takes the place of this crate's words.
+fn metadata(
+  mut words: Vec<(&'static str, Value)>,
+  notes: &Metadata,
+  readers: &ReaderMetadata,
+) -> Value {
   if !notes.is_empty() {
     let notes = notes
       .iter()
@@ -1209,11 +1260,21 @@ fn metadata(mut words: Vec<(&'static str, Value)>, notes: &Metadata) -> Value {
       .collect();
     words.push(("metadata", Value::Array(notes)));
   }
-  if words.is_empty() {
-    Value::Object(Vec::new())
-  } else {
-    object(vec![(OURS, object(words))])
+  let mut members: Vec<(Utf8Bytes, Value)> = readers
+    .iter()
+    .map(|(namespace, entries)| {
+      let entries = entries
+        .iter()
+        .map(|(key, value)| (Utf8Bytes::from(key), text(value)))
+        .collect();
+      (Utf8Bytes::from(namespace), Value::Object(entries))
+    })
+    .collect();
+  if !words.is_empty() {
+    let place = members.partition_point(|(namespace, _)| namespace.as_str() < OURS);
+    members.insert(place, (Utf8Bytes::from_static(OURS), object(words)));
   }
+  Value::Object(members)
 }
 
 /// `count` ticks of `ruler`: its rate as [`rate`] writes one, and the count
@@ -1226,30 +1287,148 @@ fn rational_time(ruler: Ruler, count: i128) -> Value {
   ])
 }
 
-/// A ruler's rate, written as the `f64` nearest it in its shortest spelling
-/// — the one `{:?}` writes, which reads back as that `f64` where a reader
-/// rounds to nearest, as OpenTimelineIO 0.17's does not always
-/// ([`read_back`]).
+/// A ruler's rate: the `f64` nearest it, in the spelling
+/// [`rate_spelling`] finds — its shortest wherever OpenTimelineIO 0.17's
+/// reader reads that back exactly, as it reads every common rate's — or,
+/// where none it tries reads back exactly, the shortest, which
+/// [`read_back`] refuses.
 fn rate(ruler: Ruler) -> Value {
-  Value::Number(format_utf8bytes!("{:?}", ruler.otio()))
+  let value = ruler.otio();
+  Value::Number(rate_spelling(value).unwrap_or_else(|| format_utf8bytes!("{value:?}")))
 }
 
-/// Refuses the first number the document would carry — a count or a
-/// ruler's rate, in the order it writes them — that OpenTimelineIO 0.17's
-/// reader reads as another value ([`read_back`]): the global start; then
-/// per track its markers, then its children — a gap's length, a clip's
+/// The powers of ten an `f64` holds exactly, 10^0 to 10^22: RapidJSON's
+/// table holds these exactly too (`pow10.h` 28–50 at `06d58b9e`), so a
+/// division by one is rounded once.
+const TEN: [f64; 23] = [
+  1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17,
+  1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// 2^64: RapidJSON reads an integer below it whole, into a `uint64_t`.
+const TWO_64: f64 = 18_446_744_073_709_551_616.0;
+
+/// The spelling of `value`, a ruler's rate, positive and finite, that
+/// OpenTimelineIO 0.17's reader reads back as `value`, bit for bit, in a
+/// build that rounds RapidJSON's multiply-adds twice and in one that fuses
+/// them ([`json::readings`]): the first of
+///
+/// 1. its shortest spelling, `{:?}`'s — every common rate's;
+/// 2. `{D}e-{K}`, for `K` from 1 to 22 and `D` an integer below 2^64 that
+///    an `f64` holds: RapidJSON reads `D` whole into its 64-bit integer and
+///    converts it exactly, and its table holds `10^K` exactly, so it reads
+///    `D / 10^K` by one division, rounded once, as both kinds of build do,
+///    and as every reader that rounds to nearest does;
+/// 3. `{D}`, `z` zeros, then `e-{K + z}`, for `z` from 1 to 24: past 2^64
+///    RapidJSON carries the integer on in a `double`, each zero a
+///    multiplication by ten rounded once with nothing added, which no
+///    build fuses, then one division by its table's power of ten;
+///
+/// the smallest `K` first, then the smallest `z`, then the `D` nearest
+/// `value × 10^K`, the lower of two as near. `None` where none of them
+/// reads back as `value`.
+///
+/// Of the rates `num/1001` for `num` from 1 to 200 000, the shortest
+/// spelling of 26 050 reads as another `f64`; the second form spells
+/// 25 750 of them and the third 297 of the other 300, each read exactly by
+/// RapidJSON at `06d58b9e` compiled either way. Three have none:
+/// 29195/1001, 31264/1001 and 31799/1001. Nor does any of the 15 626
+/// spellings tried around each — every integer within 300 of `value ×
+/// 10^E` over `10^E`, for `E` from 15 to 35, and as many written with a
+/// point — read exactly in both builds: the export refuses these three.
+fn rate_spelling(value: f64) -> Option<Utf8Bytes> {
+  let exact = |text: &str| {
+    json::readings(text)
+      .iter()
+      .all(|reading| reading.is_ok_and(|number| number.double().to_bits() == value.to_bits()))
+  };
+  let shortest = format_utf8bytes!("{value:?}");
+  if exact(&shortest) {
+    return Some(shortest);
+  }
+  // Each `K`'s integers near `value × 10^K` that an `f64` holds, while the
+  // product stays below 2^64.
+  let near: Vec<(usize, Vec<u64>)> = (1..TEN.len())
+    .map_while(|k| near_integers(value * TEN[k]).map(|integers| (k, integers)))
+    .collect();
+  for (k, integers) in &near {
+    for d in integers {
+      let text = format_utf8bytes!("{d}e-{k}");
+      if exact(&text) {
+        return Some(text);
+      }
+    }
+  }
+  for (k, integers) in &near {
+    for z in 1..=24 {
+      for d in integers {
+        let text = format_utf8bytes!("{d}{:0>z$}e-{}", "", k + z);
+        if exact(&text) {
+          return Some(text);
+        }
+      }
+    }
+  }
+  None
+}
+
+/// The integers near `scaled` that an `f64` holds, below 2^64 and above
+/// zero, the nearest first and the lower of two as near: within three of it
+/// below 2^52, where every integer is an `f64`, and past it the four
+/// `f64`s either side of it, which are integers there. `None` for a
+/// `scaled` past 2^64.
+fn near_integers(scaled: f64) -> Option<Vec<u64>> {
+  if scaled.is_nan() || scaled >= TWO_64 {
+    return None;
+  }
+  let mut near: Vec<f64> = if scaled < 4_503_599_627_370_496.0 {
+    // `core` has no `f64::floor`; the walk's own floor is `std`'s.
+    let below = derive::floor(scaled);
+    (-2..=3).map(|step| below + f64::from(step)).collect()
+  } else {
+    let mut around = vec![scaled];
+    let (mut up, mut down) = (scaled, scaled);
+    for _ in 0..4 {
+      up = up.next_up();
+      down = down.next_down();
+      around.extend([up, down]);
+    }
+    around
+  };
+  // A double is whole where it is its own floor.
+  near.retain(|&d| d > 0.0 && d < TWO_64 && derive::floor(d) == d);
+  near.sort_by(|a, b| {
+    (a - scaled)
+      .abs()
+      .total_cmp(&(b - scaled).abs())
+      .then(a.total_cmp(b))
+  });
+  near.dedup();
+  // An integer-valued `f64` below 2^64 converts to `u64` exactly.
+  Some(near.into_iter().map(|d| d as u64).collect())
+}
+
+/// Refuses the first rate the document would carry, in the order it writes
+/// them, that no spelling [`rate_spelling`] tries makes OpenTimelineIO
+/// 0.17's reader read exactly ([`read_back`]): the global start's; then per
+/// track its markers', then its children's — a gap's length, a clip's
 /// source range, its markers and its medium's available range, a fade's
-/// length, a dissolve's two offsets. Every count among them the plan holds
-/// within ±2^53 already; this holds each to its spelling. A gap's start
-/// and a fade's offset of zero are zeros, which read exactly, and every
-/// rate written beside them is the edit rate's, read with the start's.
+/// length, a dissolve's two offsets — each named by the count written
+/// beside it. Every count among them the plan holds within ±2^53 already,
+/// where every one is spelled exactly ([`number`]). A gap's start and a
+/// fade's offset of zero are zeros, and every rate written beside them is
+/// the edit rate's, read with the start's.
 fn spellings(
   start: i128,
   edit: Ruler,
+  stacked: &[Counted],
   tracks: &[Vec<Planned<'_>>],
   marked: &[Marked],
 ) -> Result<(), NotRepresentable> {
   read_back(start, edit, Spot::Start)?;
+  for (marker, range) in stacked.iter().enumerate() {
+    range.read_back(Spot::Marker(MarkerAt::Timeline { marker }))?;
+  }
   for (track, (children, marked)) in tracks.iter().zip(marked).enumerate() {
     for (marker, range) in marked.track.iter().enumerate() {
       range.read_back(Spot::Marker(MarkerAt::Track { track, marker }))?;
@@ -1301,38 +1480,29 @@ fn spellings(
   Ok(())
 }
 
-/// Refuses `count` ticks of `ruler`, at `at`, where OpenTimelineIO 0.17's
-/// reader reads a number the export writes there — the ruler's rate
-/// ([`rate`]), then the count ([`number`]) — as another value: in a build
-/// that rounds RapidJSON's multiply-adds twice, or in one that fuses them
-/// ([`json::readings`]). Named as [`NotRepresentable::misread`] with the
-/// value meant and what each reads.
+/// Refuses `count` ticks of `ruler`, at `at`, where no spelling of the
+/// ruler's rate [`rate_spelling`] tries makes OpenTimelineIO 0.17's reader
+/// read it back exactly — in a build that rounds RapidJSON's multiply-adds
+/// twice, or in one that fuses them ([`json::readings`]) — so that the
+/// export would write its shortest, which a build reads as another value.
+/// Named as [`NotRepresentable::misread`] with the value meant and what
+/// each build reads of the shortest. The count itself is spelled exactly
+/// ([`number`]).
 fn read_back(count: i128, ruler: Ruler, at: Spot) -> Result<(), NotRepresentable> {
-  let misread = |number: MisreadNumber, written: Value, meant: f64| -> Option<Misread> {
-    let Value::Number(text) = written else {
-      return None;
-    };
-    // A refused reading is no value at all: NaN, which is no number meant.
-    let read = json::readings(&text).map(|reading| reading.map_or(f64::NAN, Number::double));
-    read
-      .iter()
-      .any(|read| read.to_bits() != meant.to_bits())
-      .then(|| Misread::new(number, meant, read))
-  };
-  // Within ±2^53, which the plan holds every written count to, a count's
-  // `f64` is exact.
-  let found = misread(MisreadNumber::Rate, rate(ruler), ruler.otio())
-    .or_else(|| misread(MisreadNumber::Count, number(count), count as f64));
-  match found {
-    None => Ok(()),
-    Some(misread) => Err(NotRepresentable {
-      at,
-      value: count,
-      rate: ruler.exact(),
-      searched: None,
-      misread: Some(misread),
-    }),
+  let meant = ruler.otio();
+  if rate_spelling(meant).is_some() {
+    return Ok(());
   }
+  // A refused reading is no value at all: NaN, which is no number meant.
+  let read = json::readings(format_utf8bytes!("{meant:?}").as_str())
+    .map(|reading| reading.map_or(f64::NAN, Number::double));
+  Err(NotRepresentable {
+    at,
+    value: count,
+    rate: ruler.exact(),
+    searched: None,
+    misread: Some(Misread::new(MisreadNumber::Rate, meant, read)),
+  })
 }
 
 fn time_range(duration: Value, start_time: Value) -> Value {
@@ -1364,9 +1534,23 @@ fn held(value: i128, ruler: Ruler, at: Spot) -> Result<(), NotRepresentable> {
   }
 }
 
-/// A whole count written as `86400.0`, from the integer's own digits.
+/// ⌊2^54 / 10⌋: OpenTimelineIO 0.17's reader reads every count written
+/// `<digits>.0` exactly up to it, either way from zero.
+const POINT_ZERO_EXACT: u128 = 1_801_439_850_948_198;
+
+/// A whole count, within ±2^53, which the plan holds every written count
+/// to: `86400.0`, its digits and `.0`, as OpenTimelineIO's own writer spells
+/// a `double`, up to ⌊2^54 / 10⌋ either way, where OpenTimelineIO 0.17's
+/// reader reads that back exactly in every build; past it its digits alone,
+/// `1801439850948199`, which RapidJSON hands over as an integer and a
+/// `double` member takes exactly within ±2^53 — as every reader from 0.12
+/// takes one (`deserialization.cpp` 418–454 in 0.17.0).
 fn number(value: i128) -> Value {
-  Value::Number(format_utf8bytes!("{value}.0"))
+  if value.unsigned_abs() <= POINT_ZERO_EXACT {
+    Value::Number(format_utf8bytes!("{value}.0"))
+  } else {
+    Value::Number(format_utf8bytes!("{value}"))
+  }
 }
 
 fn text(value: &str) -> Value {

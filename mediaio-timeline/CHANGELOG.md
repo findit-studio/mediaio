@@ -7,6 +7,76 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with `mediadecode`'s.
 
+## [0.4.0] - 2026-10-23
+
+### Added
+
+- **Markers on the timeline: `Timeline::markers`** (`markers`,
+  `markers_mut`, `with_marker`), counted as a track's are, at the edit rate
+  from the timeline's zero. `to_otio` writes them on the OpenTimelineIO
+  stack, from the stack's zero, and `from_otio` reads them back: DaVinci
+  Resolve 21.1 imports the stack's markers alone as its timeline's, dropping
+  a track's and attaching a clip's to its item
+  (findit-studio/application#265). `validate` holds them as it holds a
+  track's, at `MarkerAt::Timeline`. With `serde`, they are written only
+  where there are some.
+
+- **Other readers' own metadata: `ReaderMetadata`**, on the timeline, a
+  track, a clip and a marker (`readers`, `readers_mut`, `with_readers`).
+  Under each reader's namespace — `Resolve_OTIO`, say — it holds a
+  `Metadata` of that reader's words, which `to_otio` writes in the object's
+  OpenTimelineIO `metadata` beside the crate's own `mediaio` — whole, `{}`
+  for a namespace with no entry, every key in byte order — and `from_otio`
+  reads back exactly. DaVinci Resolve 21.1 reads a marker's note from
+  `Resolve_OTIO`'s `Note` alone, not from `comment`
+  (findit-studio/application#265); the crate interprets no namespace. A
+  namespace holds strings alone: `from_otio` refuses any other value inside
+  one by name (`Feature::NamespaceValue`). `validate` refuses a namespace
+  named `mediaio` or `OTIO_SCHEMA` (`Refusal::ReservedNamespace`) and a key
+  `OTIO_SCHEMA` inside one (`Refusal::SchemaKeyInNamespace`), which
+  OpenTimelineIO reads as a schema word, each at a `NamespaceAt` of a
+  `MetadataAt`. An object with no namespace writes the document 0.3.0
+  wrote, and with `serde` the `readers` are written only where there are
+  some.
+
+### Changed
+
+- **`from_otio` reads the stack's markers** as the timeline's, where 0.3.0
+  refused one as a schema the timeline does not model there.
+- **`from_otio` reads a reader's namespace** where 0.3.0 refused it: a key
+  of the timeline's, a track's, a clip's or a marker's `metadata` beside
+  `mediaio` whose value is an object. It still refuses such a key by name
+  (`Feature::Metadata`) on every other object, and where its value is no
+  object.
+
+- **BREAKING: `MisreadNumber::Count` is gone.** `to_otio` writes every
+  count within ±2^53 in a spelling OpenTimelineIO 0.17's reader reads
+  exactly: `<digits>.0` up to ⌊2^54 / 10⌋ as before, and past it the
+  integer alone, which RapidJSON hands over whole and a `double` member
+  takes exactly — as every reader from 0.12 takes one. No count is refused
+  as misread any more; 0.3.0 refused one past ⌊2^54 / 10⌋ whose
+  `<digits>.0` the reader read as another.
+- **`to_otio` writes a rate whose shortest spelling OpenTimelineIO 0.17
+  misreads in another spelling of the same `f64`** that a build fusing one
+  of RapidJSON's multiply-adds and one that does not both read exactly: an
+  integer an `f64` holds over a power of ten, which the reader converts
+  exactly and divides once (`95904095904095904e-15` for 96000/1001), or,
+  where none is, the same with zeros the reader multiplies in, each rounded
+  once with nothing added. 0.3.0 refused every such rate — about 13 % of
+  the rates num/1001. Of the rates num/1001 up to 200 000/1001, three have
+  no such spelling, nor any of the 15 626 tried around each, and are still
+  refused by name: 29195/1001, 31264/1001 and 31799/1001. Every common rate
+  keeps its shortest spelling, so the goldens are unchanged.
+- **BREAKING: `validate_json` for `OtioTarget::V0_15Plus` holds three
+  members of the newer readers to their types**: an item's `color` to a
+  `Color.1` or `null`, as OpenTimelineIO 0.18 reads an optional `Color`
+  (0.18.1 `item.cpp` 181); an effect's `enabled` to a boolean, as 0.18 reads
+  it (`effect.cpp` 26); and a transition's `enabled` to a boolean, as
+  `main` reads it (`transition.cpp` 38 at `00c22fa`). A boolean member's
+  reader takes no `null`. 0.3.0 walked all three untyped, so it passed a
+  document those readers refuse. `OtioTarget::Legacy` still walks them
+  untyped: its readers keep them as keys they do not know.
+
 ## [0.3.0] - 2026-10-22
 
 ### Changed
