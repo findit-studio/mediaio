@@ -9,6 +9,18 @@ The family releases in lockstep.
 
 ## [Unreleased]
 
+## [0.21.0] - unreleased
+
+### Changed
+
+- **BREAKING: the `ffmpeg` feature's adapters are `mediaio-ffmpeg`,
+  `mediadecode-ffmpeg` and `mediaencode-ffmpeg` 0.21.** `ffmpeg::decode`
+  is `mediadecode-ffmpeg` 0.21: its hardware probe ends in
+  `ProbeExhausted` (it was `AllBackendsFailed`), a backend whose download
+  chooses a layout a `Frame` cannot carry is unfit for the stream rather
+  than failed, and the video decoders take `DecoderOptions` through open
+  requests. See its changelog. The default, pure-Rust build is untouched.
+
 ## [0.20.0] - unreleased
 
 ### Changed

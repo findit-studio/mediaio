@@ -9,6 +9,150 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
+## [0.21.0] - unreleased
+
+The hardware probe's redesign and the video decoders' options. The FFmpeg
+crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
+`mediaio` are 0.21.0 as well.
+
+### Changed
+
+- **BREAKING: `Error::AllBackendsFailed` is `Error::ProbeExhausted`, and
+  its payload `AllBackendsFailed` is `ProbeExhausted`.** A probe can now
+  run out of backends without any of them failing, since a backend may be
+  unfit for the stream (below), so the name no longer claims a failure.
+  The payload's methods are as they were. Each of its `attempts()` is a
+  backend's failure, as the error it answered, or its unfitness,
+  `Error::DownloadFormatUnsupported` naming the layout.
+- **BREAKING: a hardware probe's replay holds back no frame, and
+  `VideoDecoder::with_max_probe_pending_bytes` is removed.** A backend
+  tried after another fails is sent the probe's own packets, by reference
+  and with no copy made, as far as it takes them before it has output for
+  the caller; the rest it is fed as the caller drains, before anything
+  new. No frame is queued while a backend is on trial, so the budget the
+  method set has nothing left to bound. The packets go back with
+  `ProbeExhausted` only once every decoder has let them go.
+- **BREAKING: a failure of this crate's own while a probe opens or
+  advances is reported as it is, never as `ProbeExhausted`.** A copy of
+  the stream's parameters, or a codec context, that cannot be made is the
+  same for every backend. It used to be recorded against the backend being
+  opened, so it could answer `AllBackendsFailed`, the stream decoder's cue
+  for software, which the same failure meets. It is now the error itself,
+  with the backends still to try kept in the order and the history whole.
+  **And the advance is owed**: the backend the probe was leaving is called
+  no more, and the next send, end or receive resumes the advance before
+  anything else, its attempt recorded where it was tried. A `flush` keeps
+  it owed.
+- **BREAKING: a picture whose download chose a CPU layout a `Frame` cannot
+  carry is no delivery, and on trial its backend is unfit for the
+  stream.** `av_hwframe_transfer_data` picks the layout itself, the first
+  its frames context offers, and this crate keeps that choice: a driver's
+  conversion to another layout can lose samples. Such a layout used to be
+  read as the backend failing, with a synthesized `AVERROR(EINVAL)`. Now
+  the probe records the unfitness, naming the layout and never an errno,
+  and leaves the backend as it leaves a failed one, the history replayed
+  whole into the next. With no backend left the probe ends in
+  `ProbeExhausted`, every attempt and every packet with it, on the
+  standalone probe and `DecodePath::AnyHardware` alike: a caller keeps
+  the lossless replay for a software decoder of its own. `DecodePath::Auto`
+  takes the stream to software as before. That includes VAAPI's packed
+  4:2:2 and 4:4:4 downloads (`YUYV422`, `Y210`, `VUYX`, `XV30`) and
+  D3D11VA's (`YUY2`, `Y210`, `AYUV`, `Y410`). **A named limit:** a
+  committed decoder's picture in such a layout is that decoder's
+  `Error::DownloadFormatUnsupported`, for that picture; it used to be
+  `Error::Ffmpeg(EINVAL)`. That covers a mid-stream reconfiguration, a
+  backend committed on a packet the probe could not keep, and a backend
+  pinned alone. Nothing falls back after the commit. A `Frame` that
+  carries the packed layouts hardware downloads is a later change.
+
+### Fixed
+
+- **A hardware probe judges a backend by its own answers alone.** A
+  delivered picture commits a backend on trial and its own error fails
+  it, as before. A clean end — the end taken, then libavcodec's
+  `AVERROR_EOF` with no refusal latched — is now a successful empty
+  completion that commits it too, at every `skip_frame` level and for
+  every codec. A packet past the probe's ceiling (256 packets or 64 MiB)
+  is sent to the candidate with the history whole: taken, it commits the
+  candidate; refused, it fails it, and the next backend is tried with the
+  whole history. So is every packet the probe cannot keep for a replay —
+  one of more than 64 side-data entries, or one whose copy cannot be made
+  — since the probe's own limits are never a backend's answer. They no
+  longer answer `AllBackendsFailed` before the packet is sent, and `Auto`
+  never takes one as its cue for software. After such a commit a failure
+  is the decoder's own error, with no history to replay. No skip level,
+  codec, packet flag or payload is read to guess what a backend should
+  have given. Before, the standalone probe and `DecodePath::AnyHardware`
+  answered `AllBackendsFailed` at either, and `DecodePath::Auto` left for
+  software a hardware decoder that had failed nothing: on a stream of VP9
+  or AV1 hidden frames, an edit list's pre-roll (`AV_PKT_FLAG_DISCARD`),
+  or a run longer than the ceiling with no picture yet.
+- **A backend on trial is charged with its own answers alone, by type.**
+  The probe's replay recorded against the next backend a packet copy that
+  could not be made, for a packet that backend never saw, and the caps of
+  its frame queue against a backend that had produced a picture. Either
+  could answer `AllBackendsFailed`, so `DecodePath::Auto` left for
+  software, and `DecodePath::AnyHardware` failed, with a hardware decoder
+  that worked. The probe now records and advances on a candidate's own
+  calls alone — its open, a send, a receive, a download, and a surface
+  pool its `get_format` declined — and on its unfitness for the stream.
+- **A backend commits at its first delivered picture**: downloaded in a
+  layout a `Frame` carries, its properties copied. A picture over the
+  caller's frame limit is no delivery, as before: `HwTransferTooLarge`,
+  the backend still on trial and charged nothing. A picture whose
+  properties this crate cannot copy is no delivery either, and **no
+  longer the backend's failure**: it is this crate's own error, the
+  backend still on trial and charged nothing, where it used to advance the
+  probe as the backend failing. A backend that this crate's own reason
+  refuses again and again meets the probe's ceiling, which commits it with
+  no failure claimed.
+- **A packet a backend on trial took is kept when this crate refuses it.**
+  libavcodec queues a packet before it decodes it, so the frame budget,
+  refused while a sent packet was decoded, answers a packet the backend
+  took. The probe now keeps it in its history as an accepted packet, or
+  commits the backend where the history cannot keep it, so a later replay
+  holds everything the backend consumed, and the caller does not send it
+  again. Before, its copy was dropped: a backend tried after a later
+  failure was replayed a history without it, and `AllBackendsFailed`
+  handed back packets that did not hold it.
+
+### Added
+
+- **`Error::DownloadFormatUnsupported`**, its payload
+  `DownloadFormatUnsupported` with `format()`, the raw `AVPixelFormat` the
+  download chose: a backend's unfitness in `ProbeExhausted::attempts`,
+  and a committed decoder's error for a picture in a layout a `Frame`
+  cannot carry.
+
+- **`DecoderOptions`, how a video decoder decodes**: libavcodec's
+  `skip_frame`, `skip_loop_filter` and `skip_idct`, each a `Discard`
+  (both re-exported from `mediaio-ffmpeg` 0.21.0, with
+  `ParseDiscardError`). They are written into every video codec context
+  a decoder opens — each hardware candidate, a probe advance, the
+  software decoder and a fallback's — and read back by `options()`. On a
+  temporally scalable HEVC stream `Discard::NonReference` also skips
+  pictures a higher sub-layer references, which the bitstream's
+  `DISPOSABLE` never marks. Which levels a decoder reads is the decoder's
+  — FFmpeg 9.0.1's VP9 decoder reads none, its native AV1 decoder
+  `NonIntra`, `NonKey` and `All` alone, and `libdav1d` decodes key frames
+  under `All` — so the hardware probe runs under every level, `All` among
+  them, and weighs a backend by its answers alone.
+- **One open road per video decoder, through an open request.** Each
+  request holds every optional of its decoder's construction, with a
+  getter, a consuming `with_*` and an in-place `set_*`, and is
+  `#[non_exhaustive]`: a later optional joins the request, not the
+  constructor list.
+  - The stream decoder: `VideoStreamDecoderOpen` (the `DecodePath`, and
+    the `DecoderOptions`) and
+    `FfmpegVideoStreamDecoder::open_from(request, parameters, time_base,
+    limits)`. `open` and `open_as` keep their signatures and behaviour,
+    each opening the request its arguments spell.
+  - The standalone decoder: `VideoDecoderOpen` (the probe or one pinned
+    backend, the limits, the packet timebase, and the `DecoderOptions`)
+    and `VideoDecoder::open_from(request, parameters)`. The eight `open*`
+    constructors keep their signatures and behaviour, each opening the
+    request its arguments spell.
+
 ## [0.20.0] - unreleased
 
 ### Changed
@@ -54,90 +198,6 @@ The backend-agnostic core it adapts has its own log at
   FFmpeg 9 packet side-data kind is named as its headers name it: no
   version gates, and a kind a later FFmpeg adds persists, so its packet is
   never `DISPOSABLE`.
-- **BREAKING: a hardware probe's replay holds back no frame, and
-  `VideoDecoder::with_max_probe_pending_bytes` is removed.** A backend
-  tried after another fails is sent the probe's own packets, by reference
-  and with no copy made, as far as it takes them before it has output for
-  the caller; the rest it is fed as the caller drains, before anything
-  new. No frame is queued while a backend is on trial, so the budget the
-  method set has nothing left to bound. The packets go back with
-  `AllBackendsFailed` only once every decoder has let them go.
-- **BREAKING: a failure of this crate's own while a probe opens or
-  advances is reported as it is, never as `AllBackendsFailed`.** A copy
-  of the stream's parameters, or a codec context, that cannot be made is
-  the same for every backend. It used to be recorded against the backend
-  being opened, so it could answer `AllBackendsFailed`, the stream
-  decoder's cue for software, which the same failure meets; it is now the
-  error itself, with the backends still to try kept in the order and the
-  history whole.
-
-### Fixed
-
-- **A hardware probe judges a backend by its own answers alone.** A
-  picture commits a backend on trial and its own error fails it, as
-  before. A clean end — the end taken, then libavcodec's `AVERROR_EOF`
-  with no refusal latched — is now a successful empty completion that
-  commits it too, at every `skip_frame` level and for every codec. A
-  packet past the probe's ceiling (256 packets or 64 MiB) is sent to the
-  candidate with the history whole: taken, it commits the candidate;
-  refused, it fails it, and the next backend is tried with the whole
-  history. So is every packet the probe cannot keep for a replay — one of
-  more than 64 side-data entries, or one whose copy cannot be made — since
-  the probe's own limits are never a backend's answer: they no longer
-  answer `AllBackendsFailed` before the packet is sent, and `Auto` never
-  takes one as its cue for software. After such a commit a failure is the
-  decoder's own error, with no history to replay. No skip level, codec,
-  packet flag or payload is read to guess what a backend should have
-  given. Before, the standalone probe and
-  `DecodePath::AnyHardware` answered `AllBackendsFailed` at either, and
-  `DecodePath::Auto` left for software a hardware decoder that had failed
-  nothing: on a stream of VP9 or AV1 hidden frames, an edit list's
-  pre-roll (`AV_PKT_FLAG_DISCARD`), or a run longer than the ceiling with
-  no picture yet.
-- **A backend on trial is charged with its own answers alone, by type.**
-  The probe's replay recorded against the next backend a packet copy
-  that could not be made, for a packet that backend never saw, and the
-  caps of its frame queue and the caller's frame limit against a backend
-  that had produced a picture; either could answer `AllBackendsFailed`,
-  so `DecodePath::Auto` left for software, and `DecodePath::AnyHardware`
-  failed, with a hardware decoder that worked. The probe now records and
-  advances on a candidate's own calls alone — its open, a send, a
-  receive, a download, and a surface pool its `get_format` declined —
-  and **a picture commits its backend before any limit of this crate's
-  is applied to it**: a picture over the caller's frame limit is
-  `HwTransferTooLarge` from a committed decoder, and a picture whose
-  properties cannot be copied is that decoder's own error.
-
-### Added
-
-- **`DecoderOptions`, how a video decoder decodes**: libavcodec's
-  `skip_frame`, `skip_loop_filter` and `skip_idct`, each a `Discard`
-  (both re-exported from `mediaio-ffmpeg` 0.20.0, with
-  `ParseDiscardError`). They are written into every video codec context
-  a decoder opens — each hardware candidate, a probe advance, the
-  software decoder and a fallback's — and read back by `options()`. On a
-  temporally scalable HEVC stream `Discard::NonReference` also skips
-  pictures a higher sub-layer references, which the bitstream's
-  `DISPOSABLE` never marks. Which levels a decoder reads is the decoder's
-  — FFmpeg 9.0.1's VP9 decoder reads none, its native AV1 decoder
-  `NonIntra`, `NonKey` and `All` alone, and `libdav1d` decodes key frames
-  under `All` — so the hardware probe runs under every level, `All` among
-  them, and weighs a backend by its answers alone.
-- **One open road per video decoder, through an open request.** Each
-  request holds every optional of its decoder's construction, with a
-  getter, a consuming `with_*` and an in-place `set_*`, and is
-  `#[non_exhaustive]`: a later optional joins the request, not the
-  constructor list.
-  - The stream decoder: `VideoStreamDecoderOpen` (the `DecodePath`, and
-    the `DecoderOptions`) and
-    `FfmpegVideoStreamDecoder::open_from(request, parameters, time_base,
-    limits)`. `open` and `open_as` keep their signatures and behaviour,
-    each opening the request its arguments spell.
-  - The standalone decoder: `VideoDecoderOpen` (the probe or one pinned
-    backend, the limits, the packet timebase, and the `DecoderOptions`)
-    and `VideoDecoder::open_from(request, parameters)`. The eight `open*`
-    constructors keep their signatures and behaviour, each opening the
-    request its arguments spell.
 
 ## [0.19.0] - 2026-10-16
 

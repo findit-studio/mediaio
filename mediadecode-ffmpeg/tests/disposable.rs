@@ -843,7 +843,7 @@ fn auto_pictures(
 /// flagged `AV_PKT_FLAG_DISCARD`, decoded and its frame dropped
 /// (`libavcodec/decode.c` 464–466), so no picture comes. Within the probe's
 /// 256 packets the clean end with none completes the candidate, and past
-/// them the ceiling commits it — no `AllBackendsFailed` — on the standalone
+/// them the ceiling commits it — no `ProbeExhausted` — on the standalone
 /// probe, `AnyHardware` and `Auto`, which stays on hardware.
 #[cfg(target_vendor = "apple")]
 #[test]

@@ -359,7 +359,7 @@ fn a_packet_past_the_byte_ceiling_commits_the_candidate_that_takes_it() {
 }
 
 /// When `advance_probe` exhausts the probe (no more candidates and
-/// the active backend just failed), the `Err(AllBackendsFailed
+/// the active backend just failed), the `Err(ProbeExhausted
 /// { unconsumed_packets, .. })` it returns must include the
 /// packets the decoder has already consumed from the caller's
 /// demuxer. For non-seekable inputs (live streams, pipes, network
@@ -372,7 +372,7 @@ fn a_packet_past_the_byte_ceiling_commits_the_candidate_that_takes_it() {
 /// from the same module.
 #[test]
 #[ignore = "requires HWDECODE_SAMPLE_VIDEO and a working hardware backend"]
-fn all_backends_failed_returns_buffered_packets_to_caller() {
+fn probe_exhausted_returns_buffered_packets_to_caller() {
   use ffmpeg_next::{format, media};
 
   let path = std::env::var_os("HWDECODE_SAMPLE_VIDEO")
@@ -411,7 +411,7 @@ fn all_backends_failed_returns_buffered_packets_to_caller() {
     ffmpeg_next::Error::InvalidData,
   )));
   match result {
-    Err(Error::AllBackendsFailed(p)) => {
+    Err(Error::ProbeExhausted(p)) => {
       let attempts = p.attempts();
       let unconsumed_packets = p.unconsumed_packets();
       assert_eq!(
@@ -428,7 +428,7 @@ fn all_backends_failed_returns_buffered_packets_to_caller() {
         "the active backend's failure should be in attempts"
       );
     }
-    other => panic!("expected AllBackendsFailed, got {other:?}"),
+    other => panic!("expected ProbeExhausted, got {other:?}"),
   }
 }
 
@@ -437,7 +437,7 @@ fn all_backends_failed_returns_buffered_packets_to_caller() {
 /// shape — initialising `ProbeState.attempts` to `Vec::new()` at
 /// the start of `open`'s "promote to runtime" step — drops
 /// earlier failures so a runtime exhaustion surfaces an
-/// `AllBackendsFailed` whose `attempts` log only mentions the
+/// `ProbeExhausted` whose `attempts` log only mentions the
 /// active backend's failure (e.g. VAAPI's earlier open failure
 /// goes missing).
 ///
@@ -452,7 +452,7 @@ fn all_backends_failed_returns_buffered_packets_to_caller() {
 /// before the active backend's failure in the returned `attempts`.
 #[test]
 #[ignore = "requires HWDECODE_SAMPLE_VIDEO and a working hardware backend"]
-fn all_backends_failed_preserves_earlier_open_failures() {
+fn probe_exhausted_preserves_earlier_open_failures() {
   use ffmpeg_next::{format, media};
 
   let path = std::env::var_os("HWDECODE_SAMPLE_VIDEO")
@@ -490,9 +490,10 @@ fn all_backends_failed_preserves_earlier_open_failures() {
   // the active backend opened.
   {
     let probe = decoder.probe.as_mut().expect("probe present");
-    probe
-      .attempts
-      .push((earlier_backend, BackendAnswer::of_open(synthetic_earlier)));
+    probe.attempts.push((
+      earlier_backend,
+      BackendAnswer::of_open(synthetic_earlier).into(),
+    ));
     probe.remaining_backends.clear(); // force exhaustion on next advance.
   }
 
@@ -500,12 +501,12 @@ fn all_backends_failed_preserves_earlier_open_failures() {
     ffmpeg_next::Error::InvalidData,
   )));
   match result {
-    Err(Error::AllBackendsFailed(p)) => {
+    Err(Error::ProbeExhausted(p)) => {
       let attempts = p.attempts();
       assert_eq!(
         attempts.len(),
         2,
-        "AllBackendsFailed must surface BOTH the seeded earlier failure \
+        "ProbeExhausted must surface BOTH the seeded earlier failure \
          and the active backend's runtime failure"
       );
       assert_eq!(
@@ -528,7 +529,7 @@ fn all_backends_failed_preserves_earlier_open_failures() {
         "active backend's failure must preserve the synthetic InvalidData"
       );
     }
-    other => panic!("expected AllBackendsFailed, got {other:?}"),
+    other => panic!("expected ProbeExhausted, got {other:?}"),
   }
 }
 
@@ -1101,7 +1102,7 @@ fn the_raw_decoder_refuses_a_send_after_end_of_stream() {
 
 /// Builds a decoder with the probe window open and no backend left to
 /// advance to, so "the probe road was taken" is observable as
-/// [`Error::AllBackendsFailed`].
+/// [`Error::ProbeExhausted`].
 #[cfg(test)]
 fn auditioning_decoder() -> VideoDecoder {
   ffmpeg_next::init().expect("ffmpeg init");
@@ -1134,7 +1135,7 @@ fn auditioning_decoder() -> VideoDecoder {
 /// one, and stops the probe from trying the next backend.
 ///
 /// It is the probe's business, and the probe says so: with no backend
-/// left to advance to, [`Error::AllBackendsFailed`] — the caller's cue
+/// left to advance to, [`Error::ProbeExhausted`] — the caller's cue
 /// to fall back to software, which is exactly what should happen when
 /// no hardware backend could decode this stream.
 ///
@@ -1177,7 +1178,7 @@ fn a_candidate_that_asks_for_input_past_the_end_fails_the_probe() {
        stopping the probe from trying the next backend",
     ),
     Ok(Received::Produced) => panic!("a candidate fed only the end produced a frame"),
-    Err(Error::AllBackendsFailed(_)) => {}
+    Err(Error::ProbeExhausted(_)) => {}
     Err(other) => panic!("expected the probe road, got {other:?}"),
   }
 
@@ -1226,7 +1227,7 @@ fn a_latched_refusal_reaches_the_probe_instead_of_dying_unread() {
   };
 
   let mut frame = crate::Frame::empty().expect("frame slot");
-  let Err(Error::AllBackendsFailed(p)) = dec.receive_frame(&mut frame) else {
+  let Err(Error::ProbeExhausted(p)) = dec.receive_frame(&mut frame) else {
     panic!("the candidate must fail the probe");
   };
   let reason = format!("{:?}", p.attempts());
@@ -1839,7 +1840,7 @@ fn the_send_roads_route_a_surface_refusal_and_report_a_budget_one() {
           // stream. Auditioning, the probe advances and — with no
           // backend left — surfaces the exhaustion, the cause in its
           // attempt log.
-          (Latch::Surface, Err(Error::AllBackendsFailed(p))) if auditioning => {
+          (Latch::Surface, Err(Error::ProbeExhausted(p))) if auditioning => {
             let cause = format!("{:?}", p.attempts());
             assert!(
               cause.contains("HwSurfaceTooLarge") && cause.contains("8294400"),
@@ -2524,7 +2525,7 @@ fn the_probes_copy_shares_nothing_with_its_source() {
 /// write to it reaches nothing the caller holds.**
 ///
 /// `Packet::data_mut` lends `&mut [u8]` without consulting writability,
-/// and [`Error::AllBackendsFailed`] hands the probe's history to the
+/// and [`Error::ProbeExhausted`] hands the probe's history to the
 /// caller as owned packets. A history that shared the caller's payloads
 /// would carry the caller's writes after the send into what it hands
 /// back, and would give safe code two `&mut [u8]` over one allocation.
@@ -2558,7 +2559,7 @@ fn a_rescued_packet_keeps_the_bytes_it_was_sent_with() {
   );
 
   let mut frame = crate::Frame::empty().expect("frame slot");
-  let Err(Error::AllBackendsFailed(p)) = dec.receive_frame(&mut frame) else {
+  let Err(Error::ProbeExhausted(p)) = dec.receive_frame(&mut frame) else {
     panic!("a CPU frame on trial fails the only backend, and the probe exhausts");
   };
   let mut rescued = p.into_unconsumed_packets();
@@ -2605,7 +2606,7 @@ fn a_rescued_packet_keeps_the_bytes_it_was_sent_with() {
 
 /// LAW: **a copy the probe cannot make is no backend's answer: the packet
 /// is sent, and the candidate that takes it is committed** — with no
-/// [`Error::AllBackendsFailed`], since no backend failed.
+/// [`Error::ProbeExhausted`], since no backend failed.
 ///
 /// The history cannot keep the packet, so it is the trial's last
 /// ([`Unkept::Copy`]): sent with the history whole, taken, and the
@@ -2617,7 +2618,7 @@ fn a_rescued_packet_keeps_the_bytes_it_was_sent_with() {
 /// copies into (8,192 bytes and the padding) is not allocated, while what
 /// libavcodec allocates to take a refcounted packet is.
 ///
-/// PLANT: the copy failure answering `AllBackendsFailed` before the packet
+/// PLANT: the copy failure answering `ProbeExhausted` before the packet
 /// is sent, as in 0.19.0, turns this red at "sent and committed".
 #[test]
 fn a_copy_the_probe_cannot_make_sends_its_packet_and_commits() {
@@ -2705,14 +2706,14 @@ fn with_side_data_entries(mut packet: Packet, entries: usize) -> Packet {
 
 /// LAW: **a packet of more side-data entries than the probe copies is no
 /// backend's answer: it is sent, and the candidate that takes it is
-/// committed** — with no [`Error::AllBackendsFailed`]. And a candidate
+/// committed** — with no [`Error::ProbeExhausted`]. And a candidate
 /// that refuses it fails on its own refusal, as on any packet: the next is
 /// replayed the history and takes it.
 ///
 /// The packet is never copied ([`Unkept::SideData`]); libavcodec takes it
 /// as it takes any, one entry per kind (`av_packet_copy_props`).
 ///
-/// PLANT: the side-data cap answering `AllBackendsFailed` before the
+/// PLANT: the side-data cap answering `ProbeExhausted` before the
 /// packet is sent, as in 0.19.0, turns this red at "sent and committed".
 #[test]
 fn a_packet_of_more_side_data_entries_than_the_probe_copies_is_sent_and_commits() {
@@ -2825,7 +2826,7 @@ fn a_candidate_is_replayed_the_history_itself_and_it_is_released_before_it_goes_
   // the history goes to the caller while the candidate stays the
   // session's.
   let mut frame = crate::Frame::empty().expect("frame slot");
-  let Err(Error::AllBackendsFailed(p)) = dec.receive_frame(&mut frame) else {
+  let Err(Error::ProbeExhausted(p)) = dec.receive_frame(&mut frame) else {
     panic!("the candidate fails on a CPU frame, and the probe exhausts");
   };
   assert_eq!(
@@ -2880,7 +2881,7 @@ fn the_attempt_log_is_in_the_order_the_backends_were_tried() {
     probe.fed = 1;
     probe.buffered_bytes = RAW_PICTURE;
   }
-  let Err(Error::AllBackendsFailed(p)) = dec.advance_probe(BackendAnswer::of_call(Error::Ffmpeg(
+  let Err(Error::ProbeExhausted(p)) = dec.advance_probe(BackendAnswer::of_call(Error::Ffmpeg(
     ffmpeg_next::Error::InvalidData,
   ))) else {
     panic!("the next candidate refuses its replay, and the probe exhausts");
@@ -2927,7 +2928,7 @@ fn software_state_then_capped(
 
 /// LAW: **a replay makes no copy, so an allocator that could make none
 /// installs the candidate** — no backend charged for it, and no
-/// [`Error::AllBackendsFailed`].
+/// [`Error::ProbeExhausted`].
 ///
 /// Codex R7: the replay copied each packet before sending it, and a copy
 /// that could not be made was recorded as the next candidate's failure — a
@@ -3063,7 +3064,7 @@ fn a_replay_drains_nothing_so_a_long_history_charges_no_backend() {
 
 /// LAW: **a copy of this crate's own that an advance cannot make is
 /// surfaced as it is, the backend still to try and the history kept** — no
-/// backend charged, and no [`Error::AllBackendsFailed`].
+/// backend charged, and no [`Error::ProbeExhausted`].
 ///
 /// A candidate is built from a copy of the probe's parameters
 /// (`try_clone_parameters`), bounded by the decoder's own limits. A bound
@@ -3144,7 +3145,7 @@ fn software_state_under_a_cap(
 
 /// LAW: **a codec context this crate cannot allocate for a candidate is
 /// surfaced as it is, the backend still to try and the history kept** — no
-/// backend charged, and no [`Error::AllBackendsFailed`]. The context is this
+/// backend charged, and no [`Error::ProbeExhausted`]. The context is this
 /// crate's own allocation, the same for every backend
 /// ([`BuildFailure::Local`]).
 ///
@@ -3200,7 +3201,7 @@ fn a_context_an_advance_cannot_allocate_keeps_the_next_backend() {
 ///
 /// No backend this machine has is named, so without the cap every one
 /// refuses at the open and the probe answers
-/// [`Error::AllBackendsFailed`]. Under it, the context fails first.
+/// [`Error::ProbeExhausted`]. Under it, the context fails first.
 ///
 /// PLANT: the open recording a failure of this crate's own while it builds
 /// as that backend's answer, and going on, turns this red at "answered as
@@ -3226,7 +3227,7 @@ fn an_open_whose_context_cannot_be_allocated_charges_no_backend() {
         )
       };
       assert!(
-        matches!(open(), Err(Error::AllBackendsFailed(_))),
+        matches!(open(), Err(Error::ProbeExhausted(_))),
         "the control: every backend refuses"
       );
       // SAFETY: in `in_subprocess`'s child, alone; the open checks what it
@@ -3248,7 +3249,7 @@ fn an_open_whose_context_cannot_be_allocated_charges_no_backend() {
 
 /// LAW: **an open whose own copy of the parameters cannot be made answers
 /// that failure, and charges no backend** — not
-/// [`Error::AllBackendsFailed`], which is the cue for software, and which
+/// [`Error::ProbeExhausted`], which is the cue for software, and which
 /// the same bound would refuse there too.
 ///
 /// PLANT: the copy's failure recorded as the backend's answer and the probe
@@ -3270,15 +3271,19 @@ fn an_open_whose_own_copy_cannot_be_made_charges_no_backend() {
   );
 }
 
-/// LAW: **a picture commits its candidate before any limit of this crate's
-/// is applied to it**: a picture whose download would cost more than the
-/// caller's frame limit answers [`Error::HwTransferTooLarge`] from a
-/// committed decoder — never [`Error::AllBackendsFailed`], never an
-/// advance.
+/// LAW: **a picture this crate's own limit refuses is no delivery, and
+/// charges nothing**: a picture whose download would cost more than the
+/// caller's frame limit answers [`Error::HwTransferTooLarge`], and the
+/// candidate stays on trial, its history kept and nothing recorded against
+/// it. It commits at its first delivered picture — never on the refusal,
+/// and never with an advance.
 ///
 /// Codex R7: the replay's frame check refused a picture a candidate had
-/// produced, and recorded the refusal as the candidate's failure. The
-/// limit is the caller's; the picture is the decoder's proof.
+/// produced, and recorded the refusal as the candidate's failure. R8
+/// committed the candidate before the limit instead; the ruling on R8's
+/// finding 5 commits at the first delivered picture alone — downloaded in a
+/// layout a [`Frame`](crate::Frame) carries, its properties copied — so a
+/// limit of this crate's commits nothing and charges nothing.
 ///
 /// The limit is lowered once VideoToolbox has opened and declared its
 /// surface pool under the default. `get_format` prices that pool against
@@ -3291,12 +3296,12 @@ fn an_open_whose_own_copy_cannot_be_made_charges_no_backend() {
 /// downloads offer a wider layout than its pool meets it here. The control
 /// decodes the same picture under the default.
 ///
-/// PLANT: the judge's refusal advancing the probe, as a candidate's
-/// failure, turns this red at "from a committed decoder".
+/// PLANT: the judge's refusal committing the candidate first, as R8 did,
+/// turns this red at "no delivery: still on trial".
 #[cfg(target_vendor = "apple")]
 #[test]
 #[ignore = "decodes VP9 on VideoToolbox, which a virtual machine may not offer"]
-fn on_videotoolbox_a_picture_over_the_frame_limit_is_a_committed_decoders_error() {
+fn on_videotoolbox_a_picture_over_the_frame_limit_is_no_delivery_and_charges_nothing() {
   ffmpeg_next::init().expect("ffmpeg init");
   let opened = || {
     let mut dec =
@@ -3326,17 +3331,34 @@ fn on_videotoolbox_a_picture_over_the_frame_limit_is_a_committed_decoders_error(
   let received = dec.receive_frame(&mut frame);
   assert!(
     matches!(received, Err(Error::HwTransferTooLarge(_))),
-    "the caller's limit, by name, from a committed decoder: {received:?}"
+    "the caller's limit, by name: {received:?}"
   );
   assert_eq!(
     dec.phase(),
-    SessionPhase::Streaming,
-    "committed on its picture"
+    SessionPhase::Auditioning,
+    "no delivery: still on trial"
+  );
+  {
+    let probe = dec.probe.as_ref().expect("on trial");
+    assert!(
+      probe.attempts.is_empty(),
+      "nothing charged: {:?}",
+      probe.attempts
+    );
+    assert_eq!(probe.buffered_packets.len(), 1, "the history kept");
+  }
+
+  // Its first delivered picture commits it.
+  dec.frame_limits = crate::limits::DecoderLimits::new();
+  send_all(&mut dec, &[coded(&VP9_KEY_FRAME)]);
+  assert_eq!(
+    dec.receive_frame(&mut frame).expect("the next picture"),
+    Received::Produced
   );
   assert_eq!(
-    dec.backend(),
-    Backend::VideoToolbox,
-    "the backend that decoded it"
+    (dec.phase(), dec.backend()),
+    (SessionPhase::Streaming, Backend::VideoToolbox),
+    "committed at its first delivered picture"
   );
 }
 
@@ -3450,7 +3472,7 @@ fn an_end_after_pre_roll_alone_completes_the_candidate_at_every_skip_level() {
 /// for a backend that has failed nothing; and the picture of that packet is
 /// the committed candidate's.
 ///
-/// PLANT: the ceiling answering `AllBackendsFailed` before the packet is
+/// PLANT: the ceiling answering `ProbeExhausted` before the packet is
 /// sent, as before this round, turns this red at "taken, and committed".
 #[test]
 fn the_ceiling_commits_the_candidate_once_it_takes_the_packet_past_it() {
@@ -3552,7 +3574,7 @@ fn a_candidate_that_refuses_the_packet_past_the_ceiling_fails_and_the_next_takes
   // failed the candidate, and the packet stays the caller's.
   let mut dec = at_the_ceiling(Vec::new());
   // SAFETY: as above.
-  let Err(Error::AllBackendsFailed(p)) = (unsafe { dec.send_av_packet(&past) }) else {
+  let Err(Error::ProbeExhausted(p)) = (unsafe { dec.send_av_packet(&past) }) else {
     panic!("the candidate fails on its own refusal, and the probe exhausts");
   };
   assert_eq!(p.attempts().len(), 1, "{:?}", p.attempts());
@@ -3765,7 +3787,7 @@ fn the_native_av1_decoder_answers_for_itself_under_every_skip_level() {
       );
       assert_eq!(dec.phase(), SessionPhase::Draining, "{skip}: committed");
     } else {
-      let Err(Error::AllBackendsFailed(p)) = sent else {
+      let Err(Error::ProbeExhausted(p)) = sent else {
         panic!("{skip}: the candidate fails on its own error, got {sent:?}");
       };
       assert!(
@@ -3919,5 +3941,577 @@ fn dropping_a_packet_can_move_a_later_best_effort_timestamp_and_never_a_pts() {
     dropped[1],
     (Some(100), 100),
     "the second dropped: {dropped:?}"
+  );
+}
+
+/// A decoder on trial over libavcodec's native VP9 decoder, with no
+/// backend left to advance to, its frame budget `bytes`: under 1,024, a
+/// 64 × 64 picture is over it.
+fn vp9_auditioning_under(bytes: usize) -> VideoDecoder {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let codec = ffmpeg_next::decoder::find_by_name("vp9").expect("FFmpeg links vp9");
+  VideoDecoder::from_software_for_test_as(
+    coded_parameters(AVCodecID::AV_CODEC_ID_VP9),
+    codec,
+    crate::limits::DecoderLimits::new()
+      .with_frame(crate::FrameLimits::new().with_max_frame_bytes(bytes)),
+    crate::DecoderOptions::new(),
+    /*auditioning=*/ true,
+  )
+  .expect("a software-backed candidate on trial")
+}
+
+/// LAW: **a packet the candidate took before a refusal of this crate's
+/// own is taken** (Codex R8, finding 3). libavcodec queues a packet before
+/// it decodes it (`avcodec_send_packet`, `libavcodec/decode.c` 745–758 in
+/// FFmpeg 9.0.1), so the frame budget, refused while the packet decodes,
+/// answers a packet the candidate consumed. The probe records it, as on
+/// acceptance, so a later replay holds everything the candidate consumed.
+/// Where the history cannot keep the packet — more side-data entries than
+/// the probe copies — the candidate is committed, the only decoder that
+/// will ever have seen it.
+///
+/// The native VP9 decoder decodes a key frame as it is sent, on the one
+/// thread this crate's contexts run (`ff_get_buffer` → the allocator
+/// judge), so the budget refuses on the send.
+///
+/// PLANT: the refusal returned with the staged copy dropped, as in R8,
+/// turns this red at "the packet, kept as taken".
+#[test]
+fn a_packet_the_candidate_took_before_a_local_refusal_is_kept_as_taken() {
+  let mut dec = vp9_auditioning_under(1024);
+  let packet = coded(&VP9_KEY_FRAME);
+  // SAFETY: `coded` is `try_packet_copy`'s, every byte written and the
+  // padding zeroed, and nothing writes through it while the decoder may
+  // still read it.
+  let sent = unsafe { dec.send_av_packet(&packet) };
+  assert!(
+    matches!(sent, Err(Error::FrameBudgetExceeded(_))),
+    "the budget, by name: {sent:?}"
+  );
+  let probe = dec.probe.as_ref().expect("still on trial");
+  assert_eq!(
+    (probe.buffered_packets.len(), probe.fed),
+    (1, 1),
+    "the packet, kept as taken"
+  );
+
+  let mut dec = vp9_auditioning_under(1024);
+  let crowded = with_side_data_entries(
+    coded(&VP9_KEY_FRAME),
+    MAX_PROBE_PACKET_SIDE_DATA_ENTRIES + 1,
+  );
+  // SAFETY: as above; the side data `with_side_data_entries` wrote whole.
+  let sent = unsafe { dec.send_av_packet(&crowded) };
+  assert!(
+    matches!(sent, Err(Error::FrameBudgetExceeded(_))),
+    "the budget, by name: {sent:?}"
+  );
+  assert_eq!(
+    dec.phase(),
+    SessionPhase::Streaming,
+    "a packet the history cannot keep: committed"
+  );
+}
+
+thread_local! {
+  /// Whether [`vaapi_refuses_and_cuda_may_fail`] fails a CUDA build with an
+  /// allocation of this crate's own.
+  static CUDA_FAILS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// A [`BuildCandidate`]: VAAPI's open refuses the stream, the backend's
+/// own answer; CUDA's build fails with this crate's own `ENOMEM` while
+/// [`CUDA_FAILS`] is set, and opens in software otherwise.
+fn vaapi_refuses_and_cuda_may_fail(
+  parameters: codec::Parameters,
+  codec: Codec,
+  backend: Backend,
+  limits: crate::limits::DecoderLimits,
+  options: crate::DecoderOptions,
+  pkt_timebase: Option<mediadecode::Timebase>,
+) -> std::result::Result<DecoderState, BuildFailure> {
+  match backend {
+    Backend::Vaapi => Err(BuildFailure::Refused(BackendAnswer::of_open(
+      Error::BackendUnsupportedByCodec(backend),
+    ))),
+    _ if CUDA_FAILS.with(core::cell::Cell::get) => Err(BuildFailure::Local(Error::Ffmpeg(
+      ffmpeg_next::Error::Other {
+        errno: libc::ENOMEM,
+      },
+    ))),
+    _ => VideoDecoder::software_state_for_test(
+      parameters,
+      codec,
+      backend,
+      limits,
+      options,
+      pkt_timebase,
+    ),
+  }
+}
+
+/// The backends of a probe's attempt log, in order.
+fn tried(probe: &ProbeState) -> Vec<Backend> {
+  probe.attempts.iter().map(|(backend, _)| *backend).collect()
+}
+
+/// LAW: **an advance stopped by a failure of this crate's own is owed, and
+/// resumed before the failed candidate is called again** (Codex R8,
+/// finding 4). The candidate on trial fails by its own answer. The advance
+/// away from it meets VAAPI's refusal, recorded, then CUDA's build failing
+/// with this crate's own `ENOMEM`: the failure is surfaced, and the advance
+/// kept, owed, with the failed candidate's answer and the place it was
+/// tried. The next entry — the end — resumes it: CUDA is installed, and the
+/// attempt log holds the failed candidate first, VAAPI after. The new
+/// candidate ends cleanly and is committed; the failed one, never.
+///
+/// PLANT: the stopped advance left unowed, the failed candidate the active
+/// one again, as in R8, turns this red at "the advance, owed".
+#[test]
+fn an_advance_stopped_by_this_crates_own_failure_is_resumed_before_the_failed_candidate_is_called()
+{
+  let mut dec = raw_auditioning_decoder();
+  let first = dec.backend();
+  {
+    let probe = dec.probe.as_mut().expect("on trial");
+    probe.build = vaapi_refuses_and_cuda_may_fail;
+    probe.remaining_backends = vec![Backend::Vaapi, Backend::Cuda];
+  }
+  send_all(&mut dec, &[discarded(0x11)]);
+
+  CUDA_FAILS.with(|fails| fails.set(true));
+  let stopped = dec.advance_probe(BackendAnswer::of_call(Error::Ffmpeg(
+    ffmpeg_next::Error::InvalidData,
+  )));
+  CUDA_FAILS.with(|fails| fails.set(false));
+  assert!(
+    matches!(
+      stopped,
+      Err(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })) if errno == libc::ENOMEM
+    ),
+    "this crate's own, surfaced: {stopped:?}"
+  );
+  {
+    let probe = dec.probe.as_ref().expect("still on trial");
+    let pending = probe.pending.as_ref().expect("the advance, owed");
+    assert_eq!((pending.backend, pending.tried_at), (first, 0));
+    assert_eq!(
+      tried(probe),
+      vec![Backend::Vaapi],
+      "the refusal before the stop"
+    );
+  }
+
+  assert_eq!(
+    dec.send_eof().expect("the end"),
+    Sent::Accepted,
+    "the end, taken by the resumed advance's candidate"
+  );
+  assert_eq!(dec.backend(), Backend::Cuda, "the advance, resumed");
+  {
+    let probe = dec.probe.as_ref().expect("still on trial");
+    assert!(probe.pending.is_none(), "owed no more");
+    assert_eq!(
+      tried(probe),
+      vec![first, Backend::Vaapi],
+      "in the order tried"
+    );
+  }
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  assert_eq!(
+    dec.receive_frame(&mut frame).expect("a clean end"),
+    Received::Ended
+  );
+  assert_eq!(
+    (dec.backend(), dec.phase()),
+    (Backend::Cuda, SessionPhase::Draining),
+    "the new candidate committed, never the failed one"
+  );
+}
+
+/// `UYVY422`, a CPU layout a [`Frame`] cannot carry: what a stood-in
+/// download chooses for an unfit candidate ([`DownloadsForTest`]).
+const UYVY: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_UYVY422 as i32;
+
+/// Downloads where every backend but CUDA chooses [`UYVY`], and CUDA
+/// delivers.
+fn cuda_alone_delivers(backend: Backend) -> Option<i32> {
+  (backend != Backend::Cuda).then_some(UYVY)
+}
+
+/// Downloads where every backend chooses [`UYVY`].
+fn none_deliver(_: Backend) -> Option<i32> {
+  Some(UYVY)
+}
+
+/// Downloads where every backend delivers.
+fn all_deliver(_: Backend) -> Option<i32> {
+  None
+}
+
+/// [`raw_auditioning_decoder`], its candidate labelled VAAPI and CUDA left
+/// to try, built in software ([`VideoDecoder::software_state_for_test`]).
+fn vaapi_then_cuda() -> VideoDecoder {
+  let mut dec = raw_auditioning_decoder();
+  dec.state.backend = Backend::Vaapi;
+  let probe = dec.probe.as_mut().expect("on trial");
+  probe.build = VideoDecoder::software_state_for_test;
+  probe.remaining_backends = vec![Backend::Cuda];
+  dec
+}
+
+/// The first byte of each picture `dec` delivers until it asks for input,
+/// each picture's first row read through the [`Frame`].
+fn delivered(dec: &mut VideoDecoder, frame: &mut crate::Frame) -> Vec<u8> {
+  let mut fills = Vec::new();
+  loop {
+    match dec
+      .receive_frame(frame)
+      .expect("a picture or a request for input")
+    {
+      Received::Produced => fills.push(frame.row(0, 0).expect("a gray picture's first row")[0]),
+      Received::NeedsInput | Received::Ended => return fills,
+    }
+  }
+}
+
+/// LAW: **at the unfit picture the probe holds its history, and nothing is
+/// committed** (the ruling on Codex R8's finding 5, item 6e). The candidate
+/// on trial decoded a picture whose download chose `UYVY422`, a layout a
+/// [`Frame`] cannot carry: no delivery. It is unfit for the stream, and the
+/// probe leaves it as it leaves a failed one. The unfitness is recorded,
+/// naming the layout, never an errno. The next candidate is replayed the
+/// history whole, each packet once, by reference, and is on trial in its
+/// turn.
+///
+/// PLANT: the layout committing the candidate first, as R8's fix did, turns
+/// this red at "left, the receive to start again".
+#[test]
+fn at_the_unfit_picture_the_probe_holds_its_history_and_nothing_is_committed() {
+  let mut dec = vaapi_then_cuda();
+  let fills = [0x11u8, 0x22];
+  send_all(&mut dec, &fills.map(raw_packet));
+  let mut frame = crate::Frame::empty().expect("frame slot");
+
+  let routed = dec.route_download(Err(TransferFailure::Layout(UYVY)), &mut frame);
+  assert!(
+    matches!(routed, Ok(None)),
+    "left, the receive to start again: {routed:?}"
+  );
+  assert_eq!(
+    (dec.backend(), dec.phase()),
+    (Backend::Cuda, SessionPhase::Auditioning),
+    "the next candidate, on trial: nothing committed"
+  );
+  let probe = dec.probe.as_ref().expect("still on trial");
+  assert_eq!(
+    probe.buffered_packets.len(),
+    fills.len(),
+    "the history whole"
+  );
+  assert_eq!(probe.fed, fills.len(), "replayed whole");
+  for (packet, &fill) in probe.buffered_packets.iter().zip(&fills) {
+    assert_eq!(
+      payload_of(packet).1,
+      2,
+      "{fill:#04x}: the history's own packet, shared with the candidate once"
+    );
+  }
+  assert!(
+    matches!(
+      probe.attempts.as_slice(),
+      [(Backend::Vaapi, Attempt::Unfit(layout))] if layout.format() == UYVY
+    ),
+    "the unfitness, naming the layout: {:?}",
+    probe.attempts
+  );
+}
+
+/// LAW: **a probe leaves an unfit candidate, and the next commits on its
+/// first delivered picture** (item 6b). Two candidates, the probe
+/// hardware-only: VAAPI's downloads choose `UYVY422`, CUDA's deliver. The
+/// first picture asked for is CUDA's, the stream's first, and it commits
+/// CUDA; every picture follows in order, each once.
+///
+/// PLANT: the unfit candidate's advance passing over the candidates left,
+/// so the probe exhausts, turns this red at "the next candidate commits".
+#[test]
+fn a_probe_leaves_an_unfit_candidate_and_the_next_commits_on_its_first_delivered_picture() {
+  let _downloads = DownloadsForTest::set(cuda_alone_delivers);
+  let mut dec = vaapi_then_cuda();
+  let fills = [0x11u8, 0x22];
+  send_all(&mut dec, &fills.map(raw_packet));
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let first = dec.receive_frame(&mut frame);
+  assert!(
+    matches!(first, Ok(Received::Produced)),
+    "the next candidate commits: {first:?}"
+  );
+  assert_eq!(
+    (dec.backend(), dec.phase()),
+    (Backend::Cuda, SessionPhase::Streaming),
+    "committed on its first delivered picture"
+  );
+  let mut pictures = vec![frame.row(0, 0).expect("a gray picture")[0]];
+  pictures.extend(delivered(&mut dec, &mut frame));
+  assert_eq!(pictures, fills, "every picture, in order, each once");
+}
+
+/// LAW: **a probe with no candidate left ends in [`Error::ProbeExhausted`],
+/// its last candidate unfit as when it failed**, with every attempt and
+/// every packet (item 6b'): the standalone probe's road, whose caller
+/// replays the packets into a software decoder of its own. The only
+/// candidate unfit: one attempt, `Unfit`, naming the layout. The last of two
+/// unfit: two. No attempt is an errno, and every packet comes back in
+/// order, referenced by its rescued packet alone.
+///
+/// PLANT: an unfit last candidate ending the probe with
+/// [`Error::DownloadFormatUnsupported`], the rule the ruling withdrew,
+/// turns this red at "the probe exhausted".
+#[test]
+fn a_probe_whose_last_candidate_is_unfit_is_exhausted_with_every_attempt_and_every_packet() {
+  let _downloads = DownloadsForTest::set(none_deliver);
+  let fills = [0x11u8, 0x22];
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  for (name, mut dec, tried) in [
+    ("its only candidate", raw_auditioning_decoder(), 1),
+    ("the last of two", vaapi_then_cuda(), 2),
+  ] {
+    send_all(&mut dec, &fills.map(raw_packet));
+    let exhausted = dec.receive_frame(&mut frame);
+    let Err(Error::ProbeExhausted(exhausted)) = exhausted else {
+      panic!("{name}: the probe exhausted: {exhausted:?}");
+    };
+    assert_eq!(exhausted.attempts().len(), tried, "{name}: every attempt");
+    for (backend, attempt) in exhausted.attempts() {
+      assert!(
+        matches!(**attempt, Error::DownloadFormatUnsupported(layout) if layout.format() == UYVY),
+        "{name}: {backend:?}'s unfitness, naming the layout, no errno: {attempt:?}"
+      );
+    }
+    assert_eq!(
+      exhausted.unconsumed_packets().len(),
+      fills.len(),
+      "{name}: every packet"
+    );
+    for (packet, &fill) in exhausted.unconsumed_packets().iter().zip(&fills) {
+      assert!(holds(packet, fill), "{name}: {fill:#04x}, in order");
+      assert_eq!(
+        payload_of(packet).1,
+        1,
+        "{name}: {fill:#04x}, referenced by the rescued packet alone"
+      );
+    }
+  }
+}
+
+/// [`raw_auditioning_decoder`] with no probe at all: a backend pinned
+/// alone, which no probe ever held.
+fn raw_pinned_decoder() -> VideoDecoder {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let parameters = raw_parameters(RAW_SIDE);
+  let codec = find_decoder(&parameters).expect("rawvideo");
+  VideoDecoder::from_software_for_test_as(
+    parameters,
+    codec,
+    crate::limits::DecoderLimits::default(),
+    crate::DecoderOptions::new(),
+    /*auditioning=*/ false,
+  )
+  .expect("a software-backed pinned decoder")
+}
+
+/// LAW: **a backend pinned alone answers an uncarriable layout with
+/// [`Error::DownloadFormatUnsupported`], naming it** (item 6c): no probe
+/// holds it, so the picture is that decoder's error.
+///
+/// PLANT: a committed decoder's layout answered with R8's synthesized
+/// `EINVAL` turns this red at "by name".
+#[test]
+fn a_backend_pinned_alone_answers_an_uncarriable_layout_by_name() {
+  let _downloads = DownloadsForTest::set(none_deliver);
+  let mut dec = raw_pinned_decoder();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let received = dec.receive_frame(&mut frame);
+  assert!(
+    matches!(received, Err(Error::DownloadFormatUnsupported(layout)) if layout.format() == UYVY),
+    "by name: {received:?}"
+  );
+}
+
+/// LAW: **after the commit, an uncarriable layout is the committed
+/// decoder's [`Error::DownloadFormatUnsupported`]** (item 6d), for that
+/// picture alone: a candidate committed on its first delivered picture whose
+/// downloads then choose `UYVY422` — a mid-stream reconfiguration — answers
+/// the layout by name, stays the session's decoder, and delivers the next
+/// picture once its downloads carry again. And a candidate committed by a
+/// packet the history cannot keep (more side-data entries than the probe
+/// copies) answers it so too, with no probe to leave it by.
+///
+/// PLANT: a committed decoder's layout answered with R8's synthesized
+/// `EINVAL` turns this red at "the committed decoder's, by name".
+#[test]
+fn after_the_commit_an_uncarriable_layout_is_the_committed_decoders_error() {
+  let mut frame = crate::Frame::empty().expect("frame slot");
+
+  let mut dec = raw_auditioning_decoder();
+  let backend = dec.backend();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  {
+    let _downloads = DownloadsForTest::set(all_deliver);
+    assert_eq!(delivered(&mut dec, &mut frame), vec![0x11], "delivered");
+  }
+  assert_eq!(dec.phase(), SessionPhase::Streaming, "committed");
+  send_all(&mut dec, &[raw_packet(0x22)]);
+  {
+    let _downloads = DownloadsForTest::set(none_deliver);
+    let received = dec.receive_frame(&mut frame);
+    assert!(
+      matches!(received, Err(Error::DownloadFormatUnsupported(layout)) if layout.format() == UYVY),
+      "the committed decoder's, by name: {received:?}"
+    );
+  }
+  assert_eq!(
+    (dec.backend(), dec.phase()),
+    (backend, SessionPhase::Streaming),
+    "still the session's decoder"
+  );
+  send_all(&mut dec, &[raw_packet(0x33)]);
+  {
+    let _downloads = DownloadsForTest::set(all_deliver);
+    assert_eq!(
+      delivered(&mut dec, &mut frame),
+      vec![0x33],
+      "the next picture"
+    );
+  }
+
+  let mut dec = raw_auditioning_decoder();
+  let crowded = with_side_data_entries(raw_packet(0x44), MAX_PROBE_PACKET_SIDE_DATA_ENTRIES + 1);
+  send_all(&mut dec, &[crowded]);
+  assert_eq!(
+    dec.phase(),
+    SessionPhase::Streaming,
+    "committed by a packet the history cannot keep"
+  );
+  let _downloads = DownloadsForTest::set(none_deliver);
+  let received = dec.receive_frame(&mut frame);
+  assert!(
+    matches!(received, Err(Error::DownloadFormatUnsupported(layout)) if layout.format() == UYVY),
+    "the committed decoder's, by name: {received:?}"
+  );
+}
+
+/// LAW: **a picture whose properties this crate cannot copy is no delivery,
+/// and charges nothing**: the copy's failure is surfaced as this crate's own,
+/// the candidate stays on trial, its history kept and nothing recorded
+/// against it, so it commits at its first delivered picture. The ruling on
+/// Codex R8's finding 5 defines delivery: downloaded in a layout a [`Frame`]
+/// carries, its properties copied. R8 committed the candidate first.
+///
+/// PLANT: the copy's failure committing the candidate first, as R8 did,
+/// turns this red at "no delivery: still on trial".
+#[test]
+fn a_picture_whose_properties_cannot_be_copied_is_no_delivery_and_charges_nothing() {
+  let mut dec = vaapi_then_cuda();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let enomem = ffmpeg_next::Error::Other {
+    errno: libc::ENOMEM,
+  };
+  let routed = dec.route_download(Err(TransferFailure::Properties(enomem)), &mut frame);
+  assert!(
+    matches!(routed, Err(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })) if errno == libc::ENOMEM),
+    "this crate's own, as it is: {routed:?}"
+  );
+  assert_eq!(
+    (dec.backend(), dec.phase()),
+    (Backend::Vaapi, SessionPhase::Auditioning),
+    "no delivery: still on trial"
+  );
+  let probe = dec.probe.as_ref().expect("on trial");
+  assert!(
+    probe.attempts.is_empty(),
+    "nothing charged: {:?}",
+    probe.attempts
+  );
+  assert_eq!(
+    probe.remaining_backends,
+    vec![Backend::Cuda],
+    "the order kept"
+  );
+  assert_eq!(probe.buffered_packets.len(), 1, "the history kept");
+}
+
+/// LAW: **a VideoToolbox download in a layout a [`Frame`] cannot carry is
+/// told apart from a failed download**: a VideoToolbox frame of `UYVY422`
+/// pixel buffers (`libavutil/hwcontext_videotoolbox.c` 52 in FFmpeg 9.0.1),
+/// a layout [`Frame`] has no accessors for, downloads, and
+/// [`transfer_hw_frame`] answers the layout it chose, this crate's limit;
+/// one of `NV12` downloads whole. A VideoToolbox device
+/// and frames context need no decoder session, so this runs wherever
+/// VideoToolbox is linked.
+///
+/// PLANT: the layout answered as a failed download turns this red at
+/// "the layout, told apart".
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_videotoolbox_download_in_a_layout_a_frame_cannot_carry_is_told_apart() {
+  use ffmpeg_next::ffi::{
+    AVHWDeviceType, AVHWFramesContext, AVPixelFormat, av_buffer_unref, av_hwdevice_ctx_create,
+    av_hwframe_ctx_alloc, av_hwframe_ctx_init, av_hwframe_get_buffer,
+  };
+
+  ffmpeg_next::init().expect("ffmpeg init");
+  let download = |sw_format: AVPixelFormat| -> std::result::Result<(), TransferFailure> {
+    // SAFETY: each reference made here is unreferenced before the closure
+    // returns, the frames context after the frame that holds one of its
+    // buffers; the frames context is written whole before it is
+    // initialised.
+    unsafe {
+      let mut device = ptr::null_mut();
+      assert!(
+        av_hwdevice_ctx_create(
+          &mut device,
+          AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+          ptr::null(),
+          ptr::null_mut(),
+          0
+        ) >= 0,
+        "a VideoToolbox device"
+      );
+      let mut frames = av_hwframe_ctx_alloc(device);
+      assert!(!frames.is_null(), "a frames context");
+      let ctx = (*frames).data.cast::<AVHWFramesContext>();
+      (*ctx).format = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
+      (*ctx).sw_format = sw_format;
+      (*ctx).width = 16;
+      (*ctx).height = 16;
+      assert!(av_hwframe_ctx_init(frames) >= 0, "the frames context");
+      let mut src = frame::Video::empty();
+      assert!(
+        av_hwframe_get_buffer(frames, src.as_mut_ptr(), 0) >= 0,
+        "a VideoToolbox frame"
+      );
+      let mut dst = crate::Frame::empty().expect("frame slot");
+      let downloaded = transfer_hw_frame(&mut dst, &src);
+      drop(src);
+      av_buffer_unref(&mut frames);
+      av_buffer_unref(&mut device);
+      downloaded
+    }
+  };
+  assert!(
+    matches!(
+      download(AVPixelFormat::AV_PIX_FMT_UYVY422),
+      Err(TransferFailure::Layout(format)) if format == AVPixelFormat::AV_PIX_FMT_UYVY422 as i32
+    ),
+    "the layout, told apart"
+  );
+  assert!(
+    download(AVPixelFormat::AV_PIX_FMT_NV12).is_ok(),
+    "NV12 downloads whole"
   );
 }

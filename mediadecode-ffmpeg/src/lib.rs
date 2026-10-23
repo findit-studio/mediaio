@@ -126,7 +126,8 @@ pub use demuxer::{
   TrackTableAlloc, TrackTimebaseInvalid,
 };
 pub use error::{
-  Error, FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge, HwTransferTooLarge, Result,
+  DownloadFormatUnsupported, Error, FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge,
+  HwTransferTooLarge, Result,
 };
 pub use image::{CarrierImageDecoder, Corrupt, CorruptSource, ImageDecodeError, InputTooLarge};
 pub use subtitle::{CarrierSubtitleStreamDecoder, SubtitleDecodeError};

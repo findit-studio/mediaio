@@ -27,7 +27,7 @@ use mediadecode::{Received, Sent, decoder::ScaledOutputCapability};
 
 use crate::{
   backend::{self, Backend},
-  error::{AllBackendsFailed, Error, HwDeviceInitFailed, Result},
+  error::{Error, HwDeviceInitFailed, ProbeExhausted, Result},
   ffi::{CallbackState, codec_supports_hwaccel, get_hw_format},
   frame::Frame,
 };
@@ -40,7 +40,7 @@ pub use open::VideoDecoderOpen;
 ///
 /// Hardware-only — there is no software fallback inside this crate. If
 /// every hardware backend in the platform's probe order fails to open,
-/// `open` returns [`Error::AllBackendsFailed`] and the caller is
+/// `open` returns [`Error::ProbeExhausted`] and the caller is
 /// responsible for falling back to a software decoder of their choice
 /// (e.g. `ffmpeg::decoder::Video`).
 ///
@@ -50,9 +50,9 @@ pub use open::VideoDecoderOpen;
 /// of FFmpeg's raw integer pixel formats can trigger.
 ///
 /// `open` does a true probe: each backend opens with a strict `get_format`
-/// callback. On a backend's own failure (see below) the decoder is torn down
-/// and the next backend in probe order is tried with the history of packets
-/// seen so far. **The history stays the probe's own until a candidate
+/// callback. On a backend's own failure, or its unfitness for the stream
+/// (see below), the decoder is torn down and the next backend in probe order
+/// is tried with the history of packets seen so far. **The history stays the probe's own until a candidate
 /// commits.** A candidate is sent the history's packets themselves, each by
 /// reference, as far as it takes them before it has output for the caller,
 /// and the rest as the caller drains it. So a failing backend in the middle of
@@ -69,7 +69,8 @@ pub use open::VideoDecoderOpen;
 ///
 /// | the candidate's answer | the probe |
 /// |---|---|
-/// | a picture | commits it |
+/// | a picture delivered: downloaded in a layout a [`Frame`] carries, its properties copied | commits it |
+/// | a picture whose download chose a CPU layout a [`Frame`] cannot carry | no delivery: the candidate is unfit for the stream, recorded so with the layout named, never an errno ([`Error::DownloadFormatUnsupported`] in [`ProbeExhausted::attempts`]), and left as a failed one is: the next backend is tried with the whole history |
 /// | its own error: its opening, a send, a receive or a download failing, or its `get_format` declining the surface pool it declared ([`Error::HwSurfaceTooLarge`]) | fails it, and the next backend is tried with the whole history |
 /// | the end taken, then libavcodec's `AVERROR_EOF` with no refusal latched | a successful empty completion: commits it, and the stream has ended |
 /// | `EAGAIN` after the end | fails it: libavcodec answers a decoder drained to its end with `AVERROR_EOF` (`libavcodec/decode.c` 446–451, 489–505, 655–656 in FFmpeg 9.0.1), so a candidate that asks for input there has broken the drain |
@@ -77,25 +78,36 @@ pub use open::VideoDecoderOpen;
 ///
 /// The last row's are **the wrapper's own limits, never a backend's
 /// answer**: none ends a trial without the candidate's word, and none
-/// answers [`Error::AllBackendsFailed`], so none is the stream decoder's
+/// answers [`Error::ProbeExhausted`], so none is the stream decoder's
 /// cue for software. Once the candidate that took such a packet is
 /// committed, a failure is that decoder's own error, reported as it was
 /// minted, with no history to replay: the history could not keep the
 /// packet, so no replay could have been whole.
 ///
-/// **Nothing of this crate's own is a backend's answer, by type.** The
-/// probe records and advances on the candidate's answers alone, and only
-/// the candidate's own calls make one. Every failure of this crate's own is
+/// **Nothing of this crate's own is charged to a backend, by type.** The
+/// probe records and advances on a candidate's attempts alone ([`Attempt`]):
+/// its own answers, which only its own calls make, and its unfitness, which
+/// only a picture's download makes. Every failure of this crate's own is
 /// reported to the caller as the error it is: an allocation or a copy it
 /// makes (the parameters a candidate is built from, a codec context, a
 /// picture's properties), and the caller's limits on what a picture costs
-/// ([`Error::FrameBudgetExceeded`], [`Error::HwTransferTooLarge`]). None
-/// ends a trial, advances to another backend or enters
-/// [`Error::AllBackendsFailed`]: the backends still to try stay in the
-/// order, and the history stays whole. **A picture commits its candidate
-/// before any limit of this crate's is applied to it**, so a limit that
-/// refuses that picture is the committed decoder's error, never the
-/// candidate's.
+/// ([`Error::FrameBudgetExceeded`], [`Error::HwTransferTooLarge`]). None ends
+/// a trial, advances to another backend or enters
+/// [`Error::ProbeExhausted`]: the backends still to try stay in the order,
+/// and the history stays whole.
+///
+/// **A candidate commits at its first delivered picture**, so a picture a
+/// limit of this crate's refuses commits nothing and charges nothing: the
+/// candidate stays on trial. A candidate that this crate's own reason
+/// refuses again and again meets the probe's ceiling, the last row above,
+/// which commits it with no failure claimed. A refusal of this crate's own on
+/// a packet the candidate already took keeps the packet in the history as
+/// taken, or commits the candidate where the history cannot keep it.
+///
+/// **An advance that stops at such a failure is owed.** The candidate it
+/// leaves is called no more: every entry — a send, the end, a receive —
+/// resumes the advance first, and the candidate's attempt goes into the
+/// record where it was tried.
 ///
 /// A skip level is the codec's to honour, not the probe's to assume.
 /// FFmpeg 9.0.1's VP9 decoder reads no `skip_frame` at all, the native AV1
@@ -151,10 +163,10 @@ pub struct VideoDecoder {
   /// Reusable frame buffer used for hw-side decoding before transfer / move.
   /// Internal use only — never handed to callers.
   hw_frame: frame::Video,
-  /// Probe state: present until the first frame is received from the active
-  /// backend, then `None`. While `Some`, packets are buffered for replay and
-  /// the candidate's own answers advance to the next backend
-  /// ([`BackendAnswer`]).
+  /// Probe state: present until the first picture the active backend
+  /// delivers, then `None`. While `Some`, packets are buffered for replay,
+  /// and the candidate's attempts — its own answers, and its unfitness for
+  /// the stream — advance to the next backend ([`Attempt`]).
   probe: Option<ProbeState>,
   /// The probe's history a candidate was committed before being fed, in
   /// order: what its replay still owed when it gave its first picture
@@ -383,19 +395,21 @@ enum HwRoute {
   Advance(BackendAnswer),
 }
 
-/// **A candidate's own answer, and the only thing the probe records
-/// against a backend or advances on.**
+/// **A candidate's own answer**: with its unfitness for the stream, the only
+/// thing the probe records against a backend or advances on ([`Attempt`]).
 ///
 /// It is made at the roads a candidate answers by, and nowhere else: its
 /// opening ([`Self::of_open`]), and its own FFmpeg calls — a send, a
 /// receive, a download — read through the funnel, which names a refusal its
 /// `get_format` latched ([`Self::of_call`]). A failure of this crate's own —
 /// an allocation, a copy, a cap, the caller's limits on what a picture costs
-/// — is an [`Error`], surfaced as it is. The probe's record ([`ProbeState::attempts`]) and its
-/// advance ([`VideoDecoder::advance_probe_with`], [`HwRoute::Advance`]) take
-/// this type alone, so no such failure can enter the one or start the
-/// other: what is charged to a backend is, by type, something the backend
-/// said.
+/// — is an [`Error`], surfaced as it is. The probe's record
+/// ([`ProbeState::attempts`]) and its advance
+/// ([`VideoDecoder::advance_probe_with`], [`HwRoute::Advance`]) take an
+/// [`Attempt`] alone — this answer, or the unfitness the download road
+/// names — so no such failure can enter the one or start the other: what is
+/// charged to a backend is, by type, something the backend said, or a
+/// picture it made that no `Frame` can carry.
 #[derive(Debug)]
 pub(crate) struct BackendAnswer(Error);
 
@@ -419,12 +433,49 @@ impl BackendAnswer {
   }
 }
 
-/// The record a probe hands the caller: each backend's answer, as the error
-/// it was.
-fn answered(attempts: Vec<(Backend, BackendAnswer)>) -> Vec<(Backend, Box<Error>)> {
+/// **What a candidate's attempt at the stream came to, as the probe records
+/// it: the only thing the probe records against a backend or advances on.**
+///
+/// A failure of this crate's own is neither, and cannot become one: an
+/// [`Error`] enters the record only as a backend's answer, made at the roads
+/// a candidate answers by ([`BackendAnswer`]), and an unfitness is made on
+/// the download road alone, from the layout a delivered download chose
+/// ([`VideoDecoder::route_download`]).
+#[derive(Debug)]
+pub(crate) enum Attempt {
+  /// The candidate failed: its own answer, to its opening or to one of its
+  /// own calls.
+  Failed(BackendAnswer),
+  /// The candidate was unfit for the stream: it decoded a picture, and the
+  /// CPU layout its download chose is one a [`Frame`] cannot carry. It
+  /// failed nothing, and no errno is made for it.
+  Unfit(crate::error::DownloadFormatUnsupported),
+}
+
+impl From<BackendAnswer> for Attempt {
+  fn from(answer: BackendAnswer) -> Self {
+    Self::Failed(answer)
+  }
+}
+
+impl Attempt {
+  /// The attempt, as the error a caller reads in
+  /// [`ProbeExhausted::attempts`]: a failure as the answer was, and an
+  /// unfitness as [`Error::DownloadFormatUnsupported`], naming the layout.
+  fn into_error(self) -> Error {
+    match self {
+      Self::Failed(answer) => answer.into_error(),
+      Self::Unfit(layout) => Error::DownloadFormatUnsupported(layout),
+    }
+  }
+}
+
+/// The record a probe hands the caller: each backend's attempt, as the error
+/// it reads as ([`Attempt::into_error`]).
+fn answered(attempts: Vec<(Backend, Attempt)>) -> Vec<(Backend, Box<Error>)> {
   attempts
     .into_iter()
-    .map(|(backend, answer)| (backend, Box::new(answer.into_error())))
+    .map(|(backend, attempt)| (backend, Box::new(attempt.into_error())))
     .collect()
 }
 
@@ -534,6 +585,27 @@ impl core::fmt::Display for Unkept {
   }
 }
 
+/// An advance the probe owes: the candidate on trial failed by its own
+/// answer, or was unfit for the stream, and the advance away from it stopped
+/// at a failure of this crate's own — a copy, a context, a budget
+/// ([`VideoDecoder::advance_probe_with`]).
+///
+/// **Kept, so the candidate it leaves is never called again.** Every entry —
+/// a send, the end, a receive — resumes the advance before it touches the
+/// decoder ([`VideoDecoder::resume_advance`]), and the candidate's attempt
+/// goes into the attempt log where it was tried, ahead of the candidates
+/// that refused since.
+#[derive(Debug)]
+struct PendingAdvance {
+  /// The candidate the advance leaves: the active one still, until the
+  /// advance installs another.
+  backend: Backend,
+  /// What its attempt came to.
+  attempt: Attempt,
+  /// Where its attempt goes in [`ProbeState::attempts`].
+  tried_at: usize,
+}
+
 /// State carried only during the probe window (before the first successful
 /// frame). Holds enough information to tear down the current decoder and
 /// retry with the next backend.
@@ -542,7 +614,7 @@ struct ProbeState {
   codec: Codec,
   /// Backends still to try, in order. Empty means "no more options after
   /// the active one fails" — `advance_probe` then surfaces
-  /// [`Error::AllBackendsFailed`] so the contract is the same on
+  /// [`Error::ProbeExhausted`] so the contract is the same on
   /// single-backend platforms (e.g. macOS) as on multi-backend ones.
   remaining_backends: Vec<Backend>,
   /// How the probe builds each candidate it advances to:
@@ -551,7 +623,7 @@ struct ProbeState {
   /// roads advance, replay and commit on any machine.
   build: BuildCandidate,
   /// Packets sent so far, kept for replay through any candidate backend.
-  /// Preserved across failed candidates — cleared when the probe
+  /// Preserved across the candidates left — cleared when the probe
   /// collapses, and forgotten at a flush ([`Self::forget_history`]).
   buffered_packets: Vec<Packet>,
   /// Cumulative size (in compressed bytes) of `buffered_packets`. Tracked
@@ -562,12 +634,17 @@ struct ProbeState {
   /// candidate first had output for the caller ([`feed_into`]). The rest
   /// is owed, and fed before anything new ([`VideoDecoder::feed`]).
   fed: usize,
-  /// Each backend's answer since the probe window opened, in the order
-  /// tried: a backend that failed to open, the active one when it fails,
-  /// and a candidate that refused its replay. A [`BackendAnswer`] alone, so
-  /// nothing of this crate's own is ever charged here. Drained into
-  /// [`Error::AllBackendsFailed`] when the probe exhausts every option.
-  attempts: Vec<(Backend, BackendAnswer)>,
+  /// Each backend's attempt since the probe window opened, in the order
+  /// tried: a backend that failed to open, the active one when it fails or
+  /// is unfit for the stream, and a candidate that refused its replay. An
+  /// [`Attempt`] alone, so nothing of this crate's own is ever charged here.
+  /// Drained into [`Error::ProbeExhausted`] when the probe exhausts every
+  /// option.
+  attempts: Vec<(Backend, Attempt)>,
+  /// The advance the probe owes, where one stopped at a failure of this
+  /// crate's own ([`PendingAdvance`]): resumed before the decoder is called
+  /// again.
+  pending: Option<PendingAdvance>,
 }
 
 impl ProbeState {
@@ -580,7 +657,8 @@ impl ProbeState {
   /// sorted into one or the other, and no count can outlive a flush unseen.
   /// What is kept is the probe's, not the position's: the stream's
   /// parameters and codec, the backends still to try and how they are
-  /// built, and the failures already seen.
+  /// built, the attempts already seen, and an advance still owed — the
+  /// candidate it leaves stays left across a seek.
   fn forget_history(&mut self) {
     let Self {
       parameters: _,
@@ -588,6 +666,7 @@ impl ProbeState {
       remaining_backends: _,
       build: _,
       attempts: _,
+      pending: _,
       buffered_packets,
       buffered_bytes,
       fed,
@@ -654,7 +733,7 @@ impl VideoDecoder {
   /// [`Self::backend`] reflects whichever backend ultimately produced the
   /// first frame.
   ///
-  /// [`Error::AllBackendsFailed`] surfaces in two places, with the same
+  /// [`Error::ProbeExhausted`] surfaces in two places, with the same
   /// meaning ("no hardware backend can decode this stream — fall back to
   /// software yourself"):
   /// - From `open` itself, when no backend even opens.
@@ -785,7 +864,7 @@ impl VideoDecoder {
   /// Taken as an argument so a lane can stand on a platform with no
   /// hardware backend at all, which no machine that runs the suite is: an
   /// empty `order` is exactly that platform's probe, and it answers
-  /// [`Error::AllBackendsFailed`] with no attempt and no packet.
+  /// [`Error::ProbeExhausted`] with no attempt and no packet.
   pub(crate) fn open_probing(
     parameters: codec::Parameters,
     limits: crate::limits::DecoderLimits,
@@ -795,7 +874,7 @@ impl VideoDecoder {
   ) -> Result<Self> {
     let codec = find_decoder(&parameters)?;
 
-    let mut attempts: Vec<(Backend, BackendAnswer)> = Vec::new();
+    let mut attempts: Vec<(Backend, Attempt)> = Vec::new();
     for (i, &backend) in order.iter().enumerate() {
       // Use the checked clone — ffmpeg-next's `Parameters::clone` does
       // `avcodec_parameters_alloc` without a null check and ignores the
@@ -826,7 +905,7 @@ impl VideoDecoder {
           // We always create ProbeState — even when `remaining` is empty
           // (single-backend platforms like macOS) — so that a first-frame
           // failure on the only backend surfaces as
-          // `Error::AllBackendsFailed` from `receive_frame` /
+          // `Error::ProbeExhausted` from `receive_frame` /
           // `send_packet` rather than as a raw FFmpeg error. That keeps
           // the API contract the same regardless of how many HW backends
           // the platform exposes.
@@ -845,7 +924,7 @@ impl VideoDecoder {
           // to open earlier in this loop (including
           // `BackendUnsupportedByCodec` and parameters-clone errors).
           // Without this, a runtime exhaustion on the active backend
-          // would surface an `AllBackendsFailed` containing only the
+          // would surface an `ProbeExhausted` containing only the
           // active backend's runtime failure — losing the original
           // open-time causes that, on multi-backend platforms (Linux,
           // Windows), are usually the more diagnostic signal. E.g. a
@@ -862,6 +941,7 @@ impl VideoDecoder {
               buffered_bytes: 0,
               fed: 0,
               attempts: std::mem::take(&mut attempts),
+              pending: None,
             },
             Err(e) => {
               tracing::warn!(
@@ -887,7 +967,7 @@ impl VideoDecoder {
         }
         Err(BuildFailure::Refused(answer)) => {
           tracing::warn!(?backend, error = ?answer, "hwdecode: backend open failed");
-          attempts.push((backend, answer));
+          attempts.push((backend, Attempt::Failed(answer)));
         }
         // This crate's own failure, or the stream's: the same for every
         // backend, so surfaced as it is rather than charged to this one.
@@ -895,7 +975,7 @@ impl VideoDecoder {
       }
     }
     // No packets have been consumed at open time.
-    Err(Error::AllBackendsFailed(AllBackendsFailed::new(
+    Err(Error::ProbeExhausted(ProbeExhausted::new(
       answered(attempts),
       Vec::new(),
     )))
@@ -1011,7 +1091,7 @@ impl VideoDecoder {
   /// `auditioning` opens the probe window with **no backends left to
   /// try**, which is what makes the candidate-failure road observable:
   /// `advance_probe` has nowhere to advance to, so it surfaces
-  /// [`Error::AllBackendsFailed`] and a lane can tell "the probe road
+  /// [`Error::ProbeExhausted`] and a lane can tell "the probe road
   /// was taken" from "a status was answered". Passing `false` leaves the
   /// probe collapsed, for lanes that mean to exercise a committed
   /// backend.
@@ -1057,6 +1137,7 @@ impl VideoDecoder {
       buffered_bytes: 0,
       fed: 0,
       attempts: Vec::new(),
+      pending: None,
     });
     let backend = backend::probe_order()
       .first()
@@ -1294,9 +1375,10 @@ impl VideoDecoder {
       | Error::ChannelMapMissing(_)
       | Error::NoCodec(_)
       | Error::HwTransferTooLarge(_)
+      | Error::DownloadFormatUnsupported(_)
       | Error::BackendUnsupportedByCodec(_)
       | Error::HwDeviceInitFailed(_)
-      | Error::AllBackendsFailed(_)
+      | Error::ProbeExhausted(_)
       | Error::FallbackFailed(_) => VerdictRouting::Direct,
     }
   }
@@ -1427,7 +1509,7 @@ impl VideoDecoder {
   /// **Atomic probe rescue.** While the probe is active, the rescue
   /// invariant is that everything FFmpeg has consumed since open is
   /// reflected in `buffered_packets` (so a future
-  /// [`Error::AllBackendsFailed`] can hand a complete replay history
+  /// [`Error::ProbeExhausted`] can hand a complete replay history
   /// back to the caller for software fallback on a non-seekable input).
   /// The post-probe path (after the first frame, when `self.probe` is
   /// `None`) skips this pre-flight entirely.
@@ -1445,6 +1527,12 @@ impl VideoDecoder {
   /// to replay. Refused, the candidate fails as on any packet, and the next
   /// backend is tried with the history whole and offered this packet in its
   /// turn.
+  ///
+  /// **A refusal of this crate's own after the candidate took the packet**
+  /// — the frame budget, refused while the packet was decoded, after
+  /// libavcodec queued it — leaves the packet taken: the probe records it,
+  /// as on acceptance, or commits the candidate where the history cannot
+  /// keep it. The caller does not send it again.
   ///
   /// After commit a failure is this packet's own error, reported as it
   /// was minted, and the next packet reaches libavcodec — nothing is
@@ -1482,6 +1570,8 @@ impl VideoDecoder {
     if self.end_owed {
       return Err(Error::Ffmpeg(ffmpeg_next::Error::Eof));
     }
+    // An advance the probe owes goes before the candidate it leaves is called.
+    self.resume_advance()?;
     loop {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
@@ -1560,33 +1650,7 @@ impl VideoDecoder {
 
       match self.state.inner.send_packet(packet) {
         Ok(()) => {
-          // Probe is still Some here: the only paths that take it are the
-          // bailouts above (which return) and `advance_probe`'s exhaustion
-          // (which would have propagated via `?`).
-          match staged {
-            // Record the clone now that FFmpeg has accepted the packet:
-            // the candidate on trial has been fed the whole history, this
-            // packet included — what it was owed went first, above.
-            Some(Staged::Recorded(cloned, new_bytes)) => {
-              if let Some(probe) = self.probe.as_mut() {
-                probe.buffered_packets.push(cloned);
-                probe.fed = probe.buffered_packets.len();
-                probe.buffered_bytes = new_bytes;
-              }
-            }
-            // The trial's last packet, taken: the candidate is committed,
-            // and a failure after it is that decoder's own — there is no
-            // history to replay, since the history could not keep this.
-            Some(Staged::Last(unkept)) => {
-              tracing::info!(
-                backend = ?self.state.backend,
-                reason = %unkept,
-                "hwdecode: the candidate took a packet the probe could not keep; committed"
-              );
-              self.commit();
-            }
-            None => {}
-          }
+          self.took(staged);
           return Ok(Sent::Accepted);
         }
         // **libavcodec's send-side flow control, guarded here and read
@@ -1631,10 +1695,21 @@ impl VideoDecoder {
         // while a candidate is on trial this is that candidate failing,
         // so `advance_probe` consumes the reason into `attempts` and
         // either installs the next candidate or surfaces
-        // `AllBackendsFailed`. Any staged clone drops without entering
+        // `ProbeExhausted`. Any staged clone drops without entering
         // history; the next iteration clones afresh.
         Err(e) => match self.hw_failure(e, BareVerdict::CandidateFailure) {
-          HwRoute::Report(err) => return Err(err),
+          // **A refusal of this crate's own, after the packet was taken.**
+          // libavcodec queues a packet before it decodes it
+          // (`avcodec_send_packet`, `libavcodec/decode.c` 745–758 in FFmpeg
+          // 9.0.1), so a refusal latched while decoding — the frame budget,
+          // the one report a candidate's send makes that is not its answer —
+          // answers a packet the candidate took. The probe keeps it, as on
+          // acceptance: a later replay holds everything the candidate
+          // consumed, and the packet is not the caller's to send it again.
+          HwRoute::Report(err) => {
+            self.took(staged);
+            return Err(err);
+          }
           HwRoute::Advance(err) => {
             self.advance_probe(err)?;
             continue;
@@ -1662,6 +1737,8 @@ impl VideoDecoder {
     if self.end_owed {
       return Err(Error::Ffmpeg(ffmpeg_next::Error::Eof));
     }
+    // An advance the probe owes, as on `send_packet`.
+    self.resume_advance()?;
     loop {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
@@ -1716,26 +1793,29 @@ impl VideoDecoder {
   ///
   /// While the probe window is open, the candidate's own failure (a decode
   /// error, a download error, or a CPU-format frame from a HW-opened
-  /// context) tears down the current decoder and advances to the next
-  /// hardware backend in probe order, replaying buffered packets through
-  /// it — up to the candidate's first output, the rest fed as the caller
-  /// drains it, so the caller never loses initial frames after a fallback
-  /// and no frame is queued meanwhile.
+  /// context), or its unfitness for the stream (a download in a layout a
+  /// [`Frame`] cannot carry), tears down the current decoder and advances to
+  /// the next hardware backend in probe order, replaying buffered packets
+  /// through it — up to the candidate's first output, the rest fed as the
+  /// caller drains it, so the caller never loses initial frames after a
+  /// fallback and no frame is queued meanwhile.
   ///
-  /// **The first picture commits the candidate, before any limit of this
-  /// crate's is applied to it.** A picture whose download would cost more
-  /// than the caller's frame limit ([`Error::HwTransferTooLarge`]), or one
-  /// whose properties this crate cannot copy, is reported as a committed
-  /// decoder's error: the limit and the copy are this crate's, never the
-  /// backend's answer, so neither advances the probe nor enters its
-  /// record.
+  /// **The first delivered picture commits the candidate**: downloaded in a
+  /// layout a [`Frame`] carries, its properties copied. A picture whose
+  /// download would cost more than the caller's frame limit
+  /// ([`Error::HwTransferTooLarge`]), or whose properties this crate cannot
+  /// copy, is no delivery and charges nothing: the error is this crate's own,
+  /// and a candidate on trial stays on trial. A picture whose download chose
+  /// a layout a `Frame` cannot carry is no delivery either: on trial, the
+  /// candidate is unfit, and the probe leaves it as above; from a committed
+  /// decoder, it is [`Error::DownloadFormatUnsupported`].
   ///
   /// This crate is hardware-only: there is no software fallback inside the
   /// decoder. When every backend in the probe order has been exhausted —
   /// including the case of a single-backend platform whose only backend
-  /// failed — this returns [`Error::AllBackendsFailed`] with the per-
-  /// backend attempt log so the caller can branch into a software
-  /// decoder of their choice.
+  /// failed or was unfit — this returns [`Error::ProbeExhausted`] with the
+  /// per-backend attempt log and every packet of the history, so the caller
+  /// can branch into a software decoder of their choice.
   ///
   /// After commit a failure is that picture's own error, reported as it
   /// was minted, and nothing is remembered: the next call reaches
@@ -1748,6 +1828,8 @@ impl VideoDecoder {
   /// stops here** — the two flow signals never leave this crate as
   /// `Error::Ffmpeg`, so a caller has nothing to decode.
   pub fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received> {
+    // An advance the probe owes, as on `send_packet`.
+    self.resume_advance()?;
     loop {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
@@ -1868,15 +1950,14 @@ impl VideoDecoder {
           // so routing it as one is exactly the wrong answer. The named
           // refusal returns straight to the caller.
           //
-          // **And a picture came, so the candidate is committed first.**
-          // The limit is this crate's, never the backend's answer: a
-          // candidate whose picture the ceiling refuses has decoded it,
-          // and is the session's decoder from here, the refusal reported
-          // as a committed decoder's.
+          // **And the picture is no delivery, so nothing is committed or
+          // charged.** The limit is this crate's, never the backend's
+          // answer: a candidate on trial stays on trial, the history kept,
+          // and commits at its first delivered picture — or at a packet the
+          // history cannot keep, which commits it with no failure claimed.
           if let Err(e) =
             unsafe { judge_hw_transfer(self.hw_frame.as_ptr(), self.frame_limits.frame()) }
           {
-            self.commit();
             return Err(Error::HwTransferTooLarge(e));
           }
           // **The scaled-output stage, and the one place it sits.** A
@@ -1933,38 +2014,114 @@ impl VideoDecoder {
             }
             None => {}
           }
-          match unsafe { transfer_hw_frame(frame, &self.hw_frame) } {
-            Ok(()) => {
-              self.commit();
-              return Ok(Received::Produced);
-            }
-            Err(TransferFailure::Download(e)) => {
-              // The same shared policy. A download failure is the
-              // backend's own answer — an unsupported CPU pix_fmt surfaces
-              // as `AVERROR(EINVAL)`, a context loss as Bug/Bug2/Unknown —
-              // never input corruption, so while a candidate is on trial
-              // it is that candidate failing.
-              match self.hw_failure(e, BareVerdict::CandidateFailure) {
-                HwRoute::Report(err) => return Err(err),
-                HwRoute::Advance(answer) => {
-                  self.advance_probe(answer)?;
-                  // SAFETY: as above — the caller's slot, cleared whole.
-                  unsafe { av_frame_unref(frame.as_inner_mut().as_mut_ptr()) };
-                  continue;
-                }
-              }
-            }
-            // **The picture came and downloaded; what failed is this
-            // crate's own copy of its properties.** No backend's answer:
-            // the candidate is committed, and the failure surfaced as a
-            // committed decoder's.
-            Err(TransferFailure::Properties(e)) => {
-              self.commit();
-              return Err(Error::Ffmpeg(e));
-            }
+          let downloaded = self.download(frame);
+          match self.route_download(downloaded, frame)? {
+            Some(status) => return Ok(status),
+            None => continue,
           }
         }
       }
+    }
+  }
+
+  /// The picture's download into the caller's `frame`
+  /// ([`transfer_hw_frame`]); in a test, the download a law stands in for
+  /// it, where one is set ([`DOWNLOAD_FOR_TEST`]).
+  fn download(&mut self, frame: &mut Frame) -> std::result::Result<(), TransferFailure> {
+    #[cfg(test)]
+    if let Some(layout_of) = DOWNLOAD_FOR_TEST.with(core::cell::Cell::get) {
+      return match layout_of(self.state.backend) {
+        Some(format) => Err(TransferFailure::Layout(format)),
+        None => delivered_for_test(frame, &self.hw_frame),
+      };
+    }
+    // SAFETY: `frame` is the caller's slot and `hw_frame` the live
+    // hardware frame this receive filled.
+    unsafe { transfer_hw_frame(frame, &self.hw_frame) }
+  }
+
+  /// What a picture's download came to, on the receive road
+  /// ([`Self::receive_frame`]): `Some` status to answer, or `None` where the
+  /// probe advanced and the receive starts again.
+  ///
+  /// **A candidate commits at its first delivered picture**: downloaded in
+  /// a layout a [`Frame`] carries, its properties copied.
+  ///
+  /// - **Delivered**: the candidate is committed, its picture produced.
+  /// - **The download failed** (`av_hwframe_transfer_data`): the backend's
+  ///   own answer — a context loss reads as `Bug`, `Bug2` or `Unknown` —
+  ///   routed by the shared policy: on trial, that candidate failing.
+  /// - **The layout it chose is one a [`Frame`] cannot carry**: no
+  ///   delivery. On trial, the candidate is unfit for the stream: recorded
+  ///   so, naming the layout ([`Attempt::Unfit`]), and left as a failed
+  ///   candidate is, the next tried with the history whole, or the probe
+  ///   exhausted ([`Error::ProbeExhausted`]). Committed, it is the committed
+  ///   decoder's error ([`Error::DownloadFormatUnsupported`]).
+  /// - **This crate's copy of the picture's properties failed**: no
+  ///   delivery, and this crate's own failure. It is surfaced as it is,
+  ///   nothing committed or charged: a candidate on trial stays on trial.
+  fn route_download(
+    &mut self,
+    downloaded: std::result::Result<(), TransferFailure>,
+    frame: &mut Frame,
+  ) -> Result<Option<Received>> {
+    match downloaded {
+      Ok(()) => {
+        self.commit();
+        Ok(Some(Received::Produced))
+      }
+      Err(TransferFailure::Download(e)) => {
+        match self.hw_failure(e, BareVerdict::CandidateFailure) {
+          HwRoute::Report(err) => Err(err),
+          HwRoute::Advance(answer) => {
+            self.advance_probe(answer)?;
+            // SAFETY: the caller's slot, cleared whole: `as_inner_mut`'s
+            // contract allows an empty frame.
+            unsafe { av_frame_unref(frame.as_inner_mut().as_mut_ptr()) };
+            Ok(None)
+          }
+        }
+      }
+      Err(TransferFailure::Layout(format)) => {
+        let layout = crate::error::DownloadFormatUnsupported::new(format);
+        if self.probe.is_none() {
+          return Err(Error::DownloadFormatUnsupported(layout));
+        }
+        // **Unfit, not failed**: the probe leaves the candidate with its
+        // history whole, and records the layout, never an errno.
+        self.advance_probe(Attempt::Unfit(layout))?;
+        // SAFETY: as above — the caller's slot, cleared whole.
+        unsafe { av_frame_unref(frame.as_inner_mut().as_mut_ptr()) };
+        Ok(None)
+      }
+      Err(TransferFailure::Properties(e)) => Err(Error::Ffmpeg(e)),
+    }
+  }
+
+  /// What the probe does with a packet the candidate on trial took
+  /// ([`Self::send_av_packet`]): records its copy, the history fed to the
+  /// candidate whole, this packet included — what it was owed went first; or,
+  /// where the history could not keep the packet, commits the candidate,
+  /// the only decoder that will ever have seen it, and a failure after is
+  /// that decoder's own, with no history to replay.
+  fn took(&mut self, staged: Option<Staged>) {
+    match staged {
+      Some(Staged::Recorded(cloned, new_bytes)) => {
+        if let Some(probe) = self.probe.as_mut() {
+          probe.buffered_packets.push(cloned);
+          probe.fed = probe.buffered_packets.len();
+          probe.buffered_bytes = new_bytes;
+        }
+      }
+      Some(Staged::Last(unkept)) => {
+        tracing::info!(
+          backend = ?self.state.backend,
+          reason = %unkept,
+          "hwdecode: the candidate took a packet the probe could not keep; committed"
+        );
+        self.commit();
+      }
+      None => {}
     }
   }
 
@@ -2072,7 +2229,7 @@ impl VideoDecoder {
 
   /// Releases every reference the session holds to the probe's history,
   /// before the history goes to the caller as owned, mutable packets
-  /// ([`Error::AllBackendsFailed`]): the active decoder, which a replay fed
+  /// ([`Error::ProbeExhausted`]): the active decoder, which a replay fed
   /// the history's own packets, is flushed, and the frame scratch cleared.
   fn release_history(&mut self) {
     self.state.inner.flush();
@@ -2168,14 +2325,14 @@ impl VideoDecoder {
   /// it refuses a replayed packet — is recorded into `probe.attempts` with
   /// its own answer, and the loop continues to the next one.
   ///
-  /// `answer` is the active candidate's own answer that triggered this
-  /// advance ([`BackendAnswer`]) — a send, a receive or a download it
-  /// failed. It is recorded against the active backend once the probe
-  /// leaves it — a candidate installed, or every backend exhausted — in
-  /// the place it was tried, ahead of the candidates that refused after
-  /// it, so a final `AllBackendsFailed` carries the full attempt log in
-  /// probe order, the initially-opened backend's runtime failure
-  /// included.
+  /// `attempt` is what the active candidate's attempt came to ([`Attempt`]):
+  /// its own answer — a send, a receive or a download it failed — or its
+  /// unfitness, a picture whose download chose a layout a [`Frame`] cannot
+  /// carry. It is recorded against the active backend once the probe leaves
+  /// it — a candidate installed, or every backend exhausted — in the place
+  /// it was tried, ahead of the candidates that refused after it, so a final
+  /// `ProbeExhausted` carries the full attempt log in probe order, the
+  /// initially-opened backend's runtime attempt included.
   ///
   /// **The replay is the history itself.** Each candidate is sent the
   /// history's own packets, by reference ([`feed_into`]): no copy is made,
@@ -2190,24 +2347,40 @@ impl VideoDecoder {
   /// Returns:
   /// - `Ok(())` when a candidate is installed — caller should retry the
   ///   operation.
-  /// - `Err(Error::AllBackendsFailed(p))` when every remaining backend has
-  ///   been exhausted (including the just-failed active one), with
-  ///   `p.attempts()` the per-backend answers. On a single-backend
-  ///   platform (e.g. macOS) this fires after the only backend's
-  ///   first-frame failure; on multi-backend platforms after the last
-  ///   candidate's.
+  /// - `Err(Error::ProbeExhausted(p))` when every remaining backend has
+  ///   been exhausted (including the just-left active one, failed or
+  ///   unfit), with `p.attempts()` the per-backend attempts and every
+  ///   packet of the history. On a single-backend platform (e.g. macOS) this
+  ///   fires after the only backend's first-picture failure or unfitness;
+  ///   on multi-backend platforms after the last candidate's.
   /// - `Err(_)` for a failure of this crate's own — the parameters copy a
-  ///   candidate is built from, the context it is built on — or the
-  ///   stream's: surfaced as it is, **no backend charged**. The next
-  ///   backend is kept in the order and the history whole; the failed
-  ///   candidate stays the active one, its answer unrecorded, and what it
-  ///   answers next is its own.
-  fn advance_probe(&mut self, answer: BackendAnswer) -> Result<()> {
+  ///   candidate is built from, the context it is built on, a budget a
+  ///   replay met — or the stream's: surfaced as it is, **no backend
+  ///   charged**. The next backend is kept in the order and the history
+  ///   whole, and **the advance is owed** ([`PendingAdvance`]): the candidate
+  ///   it leaves is called no more, and the next entry resumes the advance
+  ///   before anything else ([`Self::resume_advance`]).
+  fn advance_probe(&mut self, attempt: impl Into<Attempt>) -> Result<()> {
     let build = self
       .probe
       .as_ref()
       .map_or(Self::build_state as BuildCandidate, |probe| probe.build);
-    self.advance_probe_with(answer, build)
+    self.advance_probe_with(attempt, build)
+  }
+
+  /// Resumes the advance the probe owes, if it owes one ([`PendingAdvance`]):
+  /// what every entry — [`Self::send_av_packet`], [`Self::send_eof`],
+  /// [`Self::receive_frame`] — does before it touches the decoder, so a
+  /// candidate that failed is never called again.
+  fn resume_advance(&mut self) -> Result<()> {
+    let Some(probe) = self.probe.as_mut() else {
+      return Ok(());
+    };
+    let Some(pending) = probe.pending.take() else {
+      return Ok(());
+    };
+    let build = probe.build;
+    self.advance_probe_from(pending, build)
   }
 
   /// [`Self::advance_probe`], with the candidate builder named: the
@@ -2217,16 +2390,37 @@ impl VideoDecoder {
   /// builder that opens the candidate in software, which is how the
   /// replay and the commit below run on a machine with one hardware
   /// backend or none.
-  fn advance_probe_with(&mut self, answer: BackendAnswer, build: BuildCandidate) -> Result<()> {
-    if self.probe.is_none() {
+  fn advance_probe_with(
+    &mut self,
+    attempt: impl Into<Attempt>,
+    build: BuildCandidate,
+  ) -> Result<()> {
+    let attempt = attempt.into();
+    let Some(probe) = self.probe.as_ref() else {
       // Unreachable: every road advances only while a candidate is on
-      // trial (`hw_route`). The answer is reported as it came.
-      return Err(answer.into_error());
-    }
-    // The failed candidate, recorded once the probe leaves it, where it
-    // was tried: before any candidate that refuses below.
-    let failed = (self.state.backend, answer);
-    let tried_at = self.probe.as_ref().map_or(0, |probe| probe.attempts.len());
+      // trial (`hw_route`, `route_download`). The attempt is reported as
+      // the error it reads as.
+      return Err(attempt.into_error());
+    };
+    // The candidate left, its attempt recorded once the probe leaves it,
+    // where it was tried: before any candidate that refuses below.
+    let pending = PendingAdvance {
+      backend: self.state.backend,
+      attempt,
+      tried_at: probe.attempts.len(),
+    };
+    self.advance_probe_from(pending, build)
+  }
+
+  /// [`Self::advance_probe_with`], away from the candidate `pending`
+  /// names: a new advance, or one resumed ([`Self::resume_advance`]). Where
+  /// it stops at a failure of this crate's own, `pending` is kept in the
+  /// probe, owed.
+  fn advance_probe_from(&mut self, pending: PendingAdvance, build: BuildCandidate) -> Result<()> {
+    debug_assert_eq!(
+      pending.backend, self.state.backend,
+      "the candidate left is the active one until the advance installs another"
+    );
     // Read before any `probe` borrow: the end is the *decoder's* fact
     // now, not the probe's, and a candidate must be handed it along
     // with the replayed history or it will sit at `EAGAIN` forever on a
@@ -2237,27 +2431,37 @@ impl VideoDecoder {
       let probe = self.probe.as_mut().expect("probe state present");
       let Some(&next_backend) = probe.remaining_backends.first() else {
         // **No more candidates** — surface the attempt log as
-        // `AllBackendsFailed`, so single- and multi-backend platforms
-        // have the same contract for "every HW backend failed", and hand
-        // the history back with it: those packets were consumed from the
+        // `ProbeExhausted`, whether the candidate left failed or was unfit,
+        // so single- and multi-backend platforms have the same contract for
+        // "no hardware backend delivered", and hand the history back with
+        // it: those packets were consumed from the
         // caller's demuxer, and for a non-seekable input the caller
         // cannot re-demux them. Every decoder that holds a reference to
         // them lets it go first, so the caller's owned, mutable packets
         // share their bytes with nothing.
         let mut probe = self.probe.take().expect("probe state present");
-        probe.attempts.insert(tried_at, failed);
+        probe
+          .attempts
+          .insert(pending.tried_at, (pending.backend, pending.attempt));
         self.release_history();
-        return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
+        return Err(Error::ProbeExhausted(ProbeExhausted::new(
           answered(probe.attempts),
           probe.buffered_packets,
         )));
       };
       // **This crate's own copy, and no backend's answer**: a copy that
-      // cannot be made is surfaced as it is, `next_backend` kept.
-      let parameters = try_clone_parameters(
+      // cannot be made is surfaced as it is, `next_backend` kept, and the
+      // advance owed.
+      let parameters = match try_clone_parameters(
         &probe.parameters,
         self.frame_limits.max_codec_parameter_bytes(),
-      )?;
+      ) {
+        Ok(parameters) => parameters,
+        Err(e) => {
+          probe.pending = Some(pending);
+          return Err(e);
+        }
+      };
       let codec = probe.codec;
 
       let prev_backend = self.state.backend;
@@ -2276,11 +2480,17 @@ impl VideoDecoder {
           tracing::warn!(?next_backend, error = ?refusal, "hwdecode: candidate build failed");
           let probe = self.probe.as_mut().expect("probe state present");
           probe.remaining_backends.remove(0);
-          probe.attempts.push((next_backend, refusal));
+          probe
+            .attempts
+            .push((next_backend, Attempt::Failed(refusal)));
           continue;
         }
-        // This crate's own failure, or the stream's: surfaced as it is.
-        Err(BuildFailure::Local(e)) => return Err(e),
+        // This crate's own failure, or the stream's: surfaced as it is,
+        // and the advance owed.
+        Err(BuildFailure::Local(e)) => {
+          self.probe.as_mut().expect("probe state present").pending = Some(pending);
+          return Err(e);
+        }
       };
 
       // Replay the history through the candidate WITHOUT installing it:
@@ -2312,7 +2522,9 @@ impl VideoDecoder {
           let probe = self.probe.as_mut().expect("probe state present");
           probe.fed = taken.packets;
           probe.remaining_backends.remove(0);
-          probe.attempts.insert(tried_at, failed);
+          probe
+            .attempts
+            .insert(pending.tried_at, (pending.backend, pending.attempt));
           return Ok(());
         }
         Err(e) => {
@@ -2325,6 +2537,8 @@ impl VideoDecoder {
           // SAFETY: `candidate` owns this state and is dropped only
           // below, after the reads.
           if let Some(refusal) = unsafe { frame_budget_declination_of(candidate.callback_state) } {
+            drop(candidate);
+            self.probe.as_mut().expect("probe state present").pending = Some(pending);
             return Err(refusal);
           }
           // SAFETY: as above.
@@ -2333,9 +2547,10 @@ impl VideoDecoder {
           drop(candidate);
           let probe = self.probe.as_mut().expect("probe state present");
           probe.remaining_backends.remove(0);
-          probe
-            .attempts
-            .push((next_backend, BackendAnswer::of_call(reason)));
+          probe.attempts.push((
+            next_backend,
+            Attempt::Failed(BackendAnswer::of_call(reason)),
+          ));
           continue;
         }
       }
@@ -2592,9 +2807,10 @@ impl Drop for PartialBuildState {
 /// color metadata, add those to `copy_frame_props_minimal` at the same
 /// time.
 ///
-/// Its failures are two, and they are told apart ([`TransferFailure`]):
-/// the download — the backend's own call, or the layout it chose — and
-/// this crate's copy of the frame's properties after it.
+/// Its failures are three, and they are told apart ([`TransferFailure`]):
+/// the download — the backend's own call — and, after it, the layout it
+/// chose being one [`Frame`] cannot carry, and this crate's copy of the
+/// frame's properties: this crate's own, both.
 unsafe fn transfer_hw_frame(
   dst: &mut Frame,
   src: &frame::Video,
@@ -2619,22 +2835,21 @@ unsafe fn transfer_hw_frame(
     // pick a layout outside our NV*/P0xx/P2xx/P4xx set; the call would
     // return success while the resulting frame is unreadable through
     // `Frame::row` / `Frame::as_ptr` (those return `None` for
-    // unsupported formats). Surface the unsupported result as a
-    // transfer failure so `receive_frame`'s probe-active path advances
-    // to the next backend rather than collapsing on an unusable frame;
-    // post-probe, the caller gets that picture's error.
+    // unsupported formats). The picture came and downloaded, so the
+    // layout is this crate's limit, not the backend's answer: surfaced as
+    // its own failure, which `receive_frame` reports from a committed
+    // decoder (`route_download`).
     let dst_raw_fmt: i32 = (*dst.as_inner_mut().as_ptr()).format;
     let dst_pix_fmt = crate::boundary::from_av_pixel_format(dst_raw_fmt);
     if !crate::frame::is_supported_cpu_pix_fmt(&dst_pix_fmt) {
+      // **The download succeeded; the layout is one `Frame` cannot carry**:
+      // this crate's limit, not the backend's answer.
       tracing::warn!(
         pix_fmt = dst_raw_fmt,
-        "hwdecode: hw->cpu transfer produced unsupported pix_fmt; \
-         treating as backend failure"
+        "hwdecode: the download produced a pixel format a Frame cannot carry"
       );
       av_frame_unref(dst.as_inner_mut().as_mut_ptr());
-      return Err(TransferFailure::Download(ffmpeg_next::Error::Other {
-        errno: libc::EINVAL,
-      }));
+      return Err(TransferFailure::Layout(dst_raw_fmt));
     }
     if let Err(e) = copy_frame_props_minimal(dst.as_inner_mut().as_mut_ptr(), src.as_ptr()) {
       // Failed to propagate metadata. Reset the destination so the
@@ -2749,11 +2964,75 @@ pub(crate) fn whitelisted_side_data_kind(
   Some(kind)
 }
 
+#[cfg(test)]
+thread_local! {
+  /// A law's stand-in for the download ([`VideoDecoder::download`]), on this
+  /// thread: for the candidate's backend, the CPU layout its download chooses
+  /// that a [`Frame`] cannot carry, or `None` for a delivery. A
+  /// software-backed candidate decodes CPU pictures, which
+  /// `av_hwframe_transfer_data` refuses, so a delivery hands its picture over
+  /// by reference ([`delivered_for_test`]).
+  pub(crate) static DOWNLOAD_FOR_TEST: core::cell::Cell<Option<fn(Backend) -> Option<i32>>> =
+    const { core::cell::Cell::new(None) };
+}
+
+/// [`DOWNLOAD_FOR_TEST`] set for a law's span, and unset when this drops, a
+/// panic included.
+#[cfg(test)]
+pub(crate) struct DownloadsForTest;
+
+#[cfg(test)]
+impl DownloadsForTest {
+  /// Downloads stand-ins answer for this thread's decoders until the value
+  /// drops: for each backend, `layout_of` its download's uncarriable layout,
+  /// or `None` for a delivery.
+  pub(crate) fn set(layout_of: fn(Backend) -> Option<i32>) -> Self {
+    DOWNLOAD_FOR_TEST.with(|cell| cell.set(Some(layout_of)));
+    Self
+  }
+}
+
+#[cfg(test)]
+impl Drop for DownloadsForTest {
+  fn drop(&mut self) {
+    DOWNLOAD_FOR_TEST.with(|cell| cell.set(None));
+  }
+}
+
+/// A software-backed candidate's picture handed to `dst` by reference, as a
+/// delivered download hands it over: its layout one a [`Frame`] carries, or
+/// this is the layout's refusal ([`TransferFailure::Layout`]).
+#[cfg(test)]
+fn delivered_for_test(
+  dst: &mut Frame,
+  src: &frame::Video,
+) -> std::result::Result<(), TransferFailure> {
+  // SAFETY: `dst` is cleared whole, then filled whole by `av_frame_ref`,
+  // which sets its format, dimensions, line sizes and buffers together;
+  // `src` is the live picture the receive filled.
+  unsafe {
+    av_frame_unref(dst.as_inner_mut().as_mut_ptr());
+    let ret = ffmpeg_next::ffi::av_frame_ref(dst.as_inner_mut().as_mut_ptr(), src.as_ptr());
+    if ret < 0 {
+      return Err(TransferFailure::Properties(ffmpeg_next::Error::from(ret)));
+    }
+    let format: i32 = (*dst.as_inner_mut().as_ptr()).format;
+    if !crate::frame::is_supported_cpu_pix_fmt(&crate::boundary::from_av_pixel_format(format)) {
+      av_frame_unref(dst.as_inner_mut().as_mut_ptr());
+      return Err(TransferFailure::Layout(format));
+    }
+  }
+  Ok(())
+}
+
 /// Why [`transfer_hw_frame`] failed.
 enum TransferFailure {
-  /// The download: `av_hwframe_transfer_data` failing, or the CPU layout it
-  /// chose being one [`Frame`] cannot carry — the backend's own answer.
+  /// The download: `av_hwframe_transfer_data` failing — the backend's own
+  /// answer.
   Download(ffmpeg_next::Error),
+  /// The download succeeded in a CPU layout [`Frame`] cannot carry, the
+  /// raw `AVPixelFormat` it chose: this crate's limit, after a picture.
+  Layout(i32),
   /// This crate's copy of the frame's properties, after the download: no
   /// backend's answer.
   Properties(ffmpeg_next::Error),
@@ -2763,6 +3042,10 @@ impl core::fmt::Display for TransferFailure {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     match self {
       Self::Download(e) => write!(f, "the download failed: {e}"),
+      Self::Layout(format) => write!(
+        f,
+        "the download chose pixel format {format}, which a Frame cannot carry"
+      ),
       Self::Properties(e) => write!(f, "the frame's properties could not be copied: {e}"),
     }
   }

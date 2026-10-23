@@ -9,13 +9,13 @@
 //!   **software** `ffmpeg::decoder::Video` opened from the same
 //!   `Parameters`, and that fallback is lossless: the probe keeps every
 //!   packet it consumed and hands them back in
-//!   [`AllBackendsFailed`](crate::Error::AllBackendsFailed), and they are
+//!   [`ProbeExhausted`](crate::Error::ProbeExhausted), and they are
 //!   replayed into the software decoder — then the packet the probe
 //!   refused — before anything else, so a non-seekable input loses
 //!   nothing. A probe that exhausts at `open` opens software at once.
 //! * **`AnyHardware`** is the same probe with software taken away: when no
 //!   backend takes the stream before its first picture, the session
-//!   reports [`AllBackendsFailed`](crate::Error::AllBackendsFailed) with
+//!   reports [`ProbeExhausted`](crate::Error::ProbeExhausted) with
 //!   the packets the probe took (none, when no backend opens at all), and
 //!   the caller decides what to replay them into.
 //! * **`Hardware(b)`** is that one backend or nothing, committed at open.
@@ -96,13 +96,14 @@ pub use open::VideoStreamDecoderOpen;
 ///   hardware backends in probe order, the packets taken so far replayed
 ///   across them; when none takes the stream, software, the same packets
 ///   replayed into it. After it, the decoder that produced it. Only the
-///   backends' own answers are its cue for software, never the probe's
-///   own limits: a packet the probe cannot keep for a replay commits the
-///   backend that takes it, picture or none (see
-///   [`VideoDecoder`](crate::VideoDecoder)).
+///   backends' own answers and their unfitness for the stream — a picture
+///   downloaded in a layout a [`Frame`](crate::Frame) cannot carry — are its
+///   cue for software, never the probe's own limits: a packet the probe
+///   cannot keep for a replay commits the backend that takes it, picture or
+///   none (see [`VideoDecoder`](crate::VideoDecoder)).
 /// - [`AnyHardware`](Self::AnyHardware): the same probe, and never
 ///   software — when no backend takes the stream,
-///   [`Error::AllBackendsFailed`] hands back the packets the probe took.
+///   [`Error::ProbeExhausted`] hands back the packets the probe took.
 ///   After the first picture, the backend that produced it.
 /// - [`Software`](Self::Software): libavcodec's own decoder, with no
 ///   probe, before and after.
@@ -213,7 +214,7 @@ pub enum DecodePath {
   /// [`open_as`](CarrierVideoStreamDecoder::open_as) when no backend
   /// opens (on a platform with no hardware backend at all, at once), and
   /// on the road that met it when the probe exhausts later — with
-  /// [`Error::AllBackendsFailed`] carrying every backend's attempt and the
+  /// [`Error::ProbeExhausted`] carrying every backend's attempt and the
   /// packets the probe took, so the caller can replay them into a
   /// software session of its own. After the first picture it is the
   /// backend that produced it, as on every path.
@@ -397,7 +398,7 @@ impl HwInner for VideoDecoder {
 /// Internal: which backend is currently driving the decode.
 enum DecodeState {
   /// Hardware-backed decoder. Under [`DecodePath::Auto`] it may
-  /// transition to `Sw` on its probe's `AllBackendsFailed`, before the
+  /// transition to `Sw` on its probe's `ProbeExhausted`, before the
   /// first picture, and at no other time. Boxed behind [`HwInner`] so
   /// tests can inject a fake HW decoder.
   Hw(Box<dyn HwInner>),
@@ -558,7 +559,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         order,
       ) {
         Ok(hw) => DecodeState::Hw(Box::new(hw)),
-        Err(Error::AllBackendsFailed(_)) => {
+        Err(Error::ProbeExhausted(_)) => {
           // Open-time HW exhaustion: no rescued packets (open didn't
           // see any). Just open SW directly from our owned copy.
           let sw = open_sw_decoder(&owned_parameters, limits, options, Some(time_base))?;
@@ -567,7 +568,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         Err(other) => return Err(other),
       },
       // **The same probe, and no software behind it.** An exhaustion at
-      // open is the answer — `AllBackendsFailed` with every backend's
+      // open is the answer — `ProbeExhausted` with every backend's
       // attempt and no packet, since none was sent — where `Auto` would
       // have read it as its cue to open software.
       DecodePath::AnyHardware => DecodeState::Hw(Box::new(VideoDecoder::open_probing(
@@ -813,7 +814,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   ///
   /// **The one place a path that excludes software is enforced**,
   /// consulted by all three roads that can meet a probe-era
-  /// [`Error::AllBackendsFailed`] — the two send arms and the receive
+  /// [`Error::ProbeExhausted`] — the two send arms and the receive
   /// arm. It is one predicate rather than three conditions because the
   /// promise is one: a session opened on [`DecodePath::AnyHardware`] or
   /// [`DecodePath::Hardware`] ends on hardware or ends in an error, and
@@ -1235,7 +1236,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // 9.0.1). The one thing that keeps what it is sent *and hands it
     // back* is the hardware probe, whose rescue history goes to the
     // caller as owned, mutable `Packet`s
-    // (`AllBackendsFailed::into_unconsumed_packets`); it records copies
+    // (`ProbeExhausted::into_unconsumed_packets`); it records copies
     // of its own (`boundary::try_clone_packet`), so nothing it hands back
     // addresses a carrier.
     let route = crate::BodyRoute::Submission;
@@ -1254,7 +1255,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // The seam already classified libavcodec's back pressure, so
           // both states travel on unchanged.
           Ok(status) => Ok(status),
-          Err(Error::AllBackendsFailed(p)) => {
+          Err(Error::ProbeExhausted(p)) => {
             // **A pinned hardware session reports rather than falls back.**
             // See [`Self::may_open_software`]: this is the exhaustion
             // `DecodePath::Auto` reads as its cue to open software, and
@@ -1262,7 +1263,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // Reported with the payload intact, so the caller keeps the
             // backend, its error, and any rescued packets.
             if !self.may_open_software() {
-              return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
+              return Err(VideoDecodeError::Decode(Error::ProbeExhausted(p)));
             }
             // The probe exhausted before the first picture: replay the
             // inner decoder's buffered history (lossless — no frame was
@@ -1373,12 +1374,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           }
           // The hardware seam already classified the two flow signals.
           Ok(status) => return Ok(status),
-          Err(Error::AllBackendsFailed(p)) => {
+          Err(Error::ProbeExhausted(p)) => {
             // The same gate, on the receive road — see
             // [`Self::may_open_software`] and the identical gate on the
             // two send roads.
             if !self.may_open_software() {
-              return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
+              return Err(VideoDecodeError::Decode(Error::ProbeExhausted(p)));
             }
             // The probe exhausted at frame time, before the first picture:
             // replay the buffered history (lossless). There is no current
@@ -1495,13 +1496,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       DecodeState::Hw(hw) => match hw.send_eof() {
         // The seam classified libavcodec's back pressure already.
         Ok(status) => Ok(status),
-        Err(Error::AllBackendsFailed(p)) => {
+        Err(Error::ProbeExhausted(p)) => {
           // The same gate, on the EOF road — see
           // [`Self::may_open_software`]. Returned rather than folded into
           // `outcome`: the commit below fires only on `Ok(Sent::Accepted)`,
           // so the two roads agree.
           if !self.may_open_software() {
-            return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
+            return Err(VideoDecodeError::Decode(Error::ProbeExhausted(p)));
           }
           // EOF is pending for this transaction, so the SW decoder must also
           // receive `send_eof` (codecs that delay tail frames hang otherwise).
@@ -1603,7 +1604,7 @@ macro_rules! video_lane_face {
       /// # Errors
       ///
       /// [`DecodePath::AnyHardware`] fails here with
-      /// [`Error::AllBackendsFailed`] when no hardware backend opens for
+      /// [`Error::ProbeExhausted`] when no hardware backend opens for
       /// the stream — at once on a platform with none — carrying every
       /// backend's attempt and no packet, since none was sent.
       /// [`DecodePath::Hardware`] fails here when the named backend

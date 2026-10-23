@@ -8,19 +8,9 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
 `mediaencode`, `mediaencode-ffmpeg` and `mediaio` — releases in lockstep.
 
-## [0.20.0] - unreleased
+## [0.21.0] - unreleased
 
-### Changed
-
-- **BREAKING: FFmpeg 9 is the floor, for this crate and every crate of the
-  family built on it** — `mediadecode-ffmpeg`, `mediaencode-ffmpeg`, and
-  `mediaio`'s `ffmpeg` feature. The build script refuses an FFmpeg older
-  than 9 by name, before any of the family's code is compiled against it:
-  it reads the linked release from `ffmpeg-sys-next`'s `links` metadata
-  (`DEP_FFMPEG_FFMPEG_9_0`, which `ffmpeg-sys-next` sets from libavcodec
-  63.1, FFmpeg 9.0's), names the release it found instead, and says where
-  to point the build. This crate now depends on `ffmpeg-sys-next` directly
-  for that metadata alone, enabling no feature of it.
+Released in lockstep with `mediadecode-ffmpeg` 0.21.0.
 
 ### Added
 
@@ -37,6 +27,20 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   decoder's open request (`VideoStreamDecoderOpen`, `VideoDecoderOpen`).
   Which levels a decoder reads is the decoder's: a level is a request,
   never a promise that no picture comes.
+
+## [0.20.0] - unreleased
+
+### Changed
+
+- **BREAKING: FFmpeg 9 is the floor, for this crate and every crate of the
+  family built on it** — `mediadecode-ffmpeg`, `mediaencode-ffmpeg`, and
+  `mediaio`'s `ffmpeg` feature. The build script refuses an FFmpeg older
+  than 9 by name, before any of the family's code is compiled against it:
+  it reads the linked release from `ffmpeg-sys-next`'s `links` metadata
+  (`DEP_FFMPEG_FFMPEG_9_0`, which `ffmpeg-sys-next` sets from libavcodec
+  63.1, FFmpeg 9.0's), names the release it found instead, and says where
+  to point the build. This crate now depends on `ffmpeg-sys-next` directly
+  for that metadata alone, enabling no feature of it.
 
 ## [0.19.0] - 2026-10-16
 

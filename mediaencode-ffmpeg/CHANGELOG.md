@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The family releases in lockstep.
 
+## [0.21.0] - unreleased
+
+### Changed
+
+- Released in lockstep with the FFmpeg crates at 0.21.0, on
+  `mediaio-ffmpeg` 0.21.0. Nothing in this crate changed.
+
 ## [0.20.0] - unreleased
 
 ### Changed

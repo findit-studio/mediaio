@@ -932,7 +932,7 @@ pub fn ffmpeg_packet_from_owned_video_packet(
 /// a claim about this function, and a decoder that kept what it is sent
 /// by reference and handed it back would carry the shared body past it.
 /// The video decoder's hardware probe is that recorder: it keeps every
-/// accepted packet in a rescue history, which `AllBackendsFailed` — or
+/// accepted packet in a rescue history, which `ProbeExhausted` — or
 /// a failed fallback's `FallbackFailed` — hands to the caller as owned,
 /// **mutable** `Packet`s. It records copies of its own
 /// (`boundary::try_clone_packet`), so nothing in that history addresses

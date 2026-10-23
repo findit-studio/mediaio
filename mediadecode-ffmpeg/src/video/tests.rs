@@ -234,7 +234,7 @@ fn demuxed_view_packets(clip: &SyntheticClip) -> (Vec<crate::VideoPacket>, Timeb
 ///   It delivers a well-formed CPU frame 1:1 for every accepted packet until
 ///   `doom_from_send`; from that send onward it still *accepts* packets but
 ///   delivers **no** frames for them; on the `fail_at_send` send it raises
-///   the probe's exhaustion — `AllBackendsFailed` carrying every packet
+///   the probe's exhaustion — `ProbeExhausted` carrying every packet
 ///   accepted so far — without accepting that packet.
 struct FakeHw {
   width: u32,
@@ -348,9 +348,10 @@ impl HwInner for FakeHw {
     if idx == self.fail_at_send {
       // The packet is NOT accepted: the probe exhausts, handing back every
       // packet it took.
-      return Err(Error::AllBackendsFailed(
-        crate::error::AllBackendsFailed::new(Vec::new(), std::mem::take(&mut self.history)),
-      ));
+      return Err(Error::ProbeExhausted(crate::error::ProbeExhausted::new(
+        Vec::new(),
+        std::mem::take(&mut self.history),
+      )));
     }
     // Accept the packet. Track it as probe-era history, and deliver a frame for
     // it only before the doomed span.
@@ -371,9 +372,10 @@ impl HwInner for FakeHw {
     if self.fail_at_receive {
       // Once: the decoder falls back and never asks this seam again.
       self.fail_at_receive = false;
-      return Err(Error::AllBackendsFailed(
-        crate::error::AllBackendsFailed::new(Vec::new(), std::mem::take(&mut self.history)),
-      ));
+      return Err(Error::ProbeExhausted(crate::error::ProbeExhausted::new(
+        Vec::new(),
+        std::mem::take(&mut self.history),
+      )));
     }
     match self.queued.pop_front() {
       Some(av) => {
@@ -390,9 +392,10 @@ impl HwInner for FakeHw {
     if self.fail_at_eof {
       // Once: the probe is spent with this answer.
       self.fail_at_eof = false;
-      return Err(Error::AllBackendsFailed(
-        crate::error::AllBackendsFailed::new(Vec::new(), std::mem::take(&mut self.history)),
-      ));
+      return Err(Error::ProbeExhausted(crate::error::ProbeExhausted::new(
+        Vec::new(),
+        std::mem::take(&mut self.history),
+      )));
     }
     Ok(Sent::Accepted)
   }
@@ -450,9 +453,10 @@ impl HwInner for FakeHwEofFails {
   }
 
   fn send_eof(&mut self) -> Result<Sent, Error> {
-    Err(Error::AllBackendsFailed(
-      crate::error::AllBackendsFailed::new(Vec::new(), Vec::new()),
-    ))
+    Err(Error::ProbeExhausted(crate::error::ProbeExhausted::new(
+      Vec::new(),
+      Vec::new(),
+    )))
   }
 
   fn flush(&mut self) -> Result<(), Error> {
@@ -625,6 +629,98 @@ fn probe_era_failure_replays_history_losslessly() {
     sorted, expected,
     "a probe-era fallback must lose no frames — every source PTS delivered \
      exactly once: {pts_out:?}"
+  );
+}
+
+/// `UYVY422`, a CPU layout a [`Frame`] cannot carry: what a stood-in
+/// download chooses for an unfit candidate
+/// ([`crate::decoder::DownloadsForTest`]).
+const UYVY: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_UYVY422 as i32;
+
+/// LAW: **under `Auto`, a first candidate unfit for the stream hands
+/// software the whole stream** (the ruling on Codex R8's finding 5, item
+/// 6a). The probe's only candidate decodes the first picture, and its
+/// download chooses `UYVY422`, a layout a [`Frame`] cannot carry. That is no
+/// delivery, so the candidate is unfit, and with no candidate left the probe
+/// is exhausted. Its record is one attempt, the unfitness naming the
+/// layout, with no errno anywhere, and every packet it took. Under
+/// [`DecodePath::Auto`] they are replayed into software, which decodes the
+/// whole stream: every picture once.
+///
+/// The candidate is the real probe, software-backed
+/// ([`VideoDecoder::from_software_for_test_as`]), its downloads stood in for
+/// ([`crate::decoder::DownloadsForTest`]). The probe is read alone first,
+/// then wrapped in the stream decoder: the same construction both times.
+///
+/// PLANT: an unfit attempt recorded as a synthesized errno, as R8's `EINVAL`
+/// was, turns this red at "no errno anywhere".
+#[test]
+fn under_auto_an_unfit_first_candidate_hands_software_the_whole_stream() {
+  let (w, h) = (128u32, 96u32);
+  let clip = encode_synthetic_clip(w, h, 12, 6);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let _downloads = crate::decoder::DownloadsForTest::set(|_| Some(UYVY));
+  let candidate = || {
+    let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::MPEG4).expect("mpeg4");
+    VideoDecoder::from_software_for_test_as(
+      try_clone_parameters(&clip.parameters, usize::MAX).expect("the parameters"),
+      codec,
+      DecoderLimits::default(),
+      crate::DecoderOptions::new(),
+      /*auditioning=*/ true,
+    )
+    .expect("a software-backed candidate on trial")
+  };
+
+  // The probe alone: exhausted at its first picture, its record the
+  // unfitness.
+  let mut probe = candidate();
+  let mut frame = Frame::empty().expect("frame slot");
+  let mut sent = 0;
+  let exhausted = loop {
+    // SAFETY: the encoder wrote every byte of each packet, its padding
+    // zeroed, and nothing writes through it while the decoder may read it.
+    let accepted = unsafe { probe.send_av_packet(&clip.packets[sent]) };
+    assert!(matches!(accepted, Ok(Sent::Accepted)), "{accepted:?}");
+    sent += 1;
+    match probe.receive_frame(&mut frame) {
+      Err(Error::ProbeExhausted(exhausted)) => break exhausted,
+      Ok(Received::NeedsInput) => {}
+      other => panic!("the probe exhausted at its first picture: {other:?}"),
+    }
+  };
+  assert_eq!(exhausted.attempts().len(), 1, "one attempt");
+  assert!(
+    exhausted
+      .attempts()
+      .iter()
+      .all(|(_, attempt)| matches!(**attempt, Error::DownloadFormatUnsupported(layout) if layout.format() == UYVY)),
+    "the unfitness, naming the layout, no errno anywhere: {:?}",
+    exhausted.attempts()
+  );
+  assert_eq!(
+    exhausted.unconsumed_packets().len(),
+    sent,
+    "every packet it took"
+  );
+
+  // Under `Auto`: software, the whole stream.
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
+    Box::new(candidate()),
+    clip.parameters.clone(),
+    tb,
+    DecodePath::Auto,
+  )
+  .expect("build test decoder");
+  assert!(dec.is_hardware(), "starts on the probe");
+  let pts_out = drive(&mut dec, &clip);
+  assert!(dec.is_software(), "software took the stream");
+  let mut sorted = pts_out.clone();
+  sorted.sort_unstable();
+  assert_eq!(
+    sorted,
+    (0..clip.packets.len() as i64).collect::<Vec<_>>(),
+    "every picture once: {pts_out:?}"
   );
 }
 
@@ -909,7 +1005,7 @@ fn sw_replay_deferred_error_surfaces_fallback_failed_at_commit() {
 #[test]
 fn failed_eof_fallback_restores_eof_sent_and_stays_on_hw() {
   let (w, h) = (64u32, 64u32);
-  // `FakeHwEofFails::send_eof` raises the probe's `AllBackendsFailed`, driving
+  // `FakeHwEofFails::send_eof` raises the probe's `ProbeExhausted`, driving
   // the send_eof fallback arm; the empty `Parameters` from `unopenable_sw_decoder`
   // make `open_sw_decoder` fail, so the fallback returns `FallbackFailed` and the
   // transaction must roll back (HW retained, `eof_sent` un-mutated).
@@ -1429,7 +1525,7 @@ fn a_view_send_in_the_probe_window_is_zero_copy() {
     retained.push(vpkt);
     match answer {
       Ok(Sent::Accepted) => {}
-      Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p))) => {
+      Err(VideoDecodeError::Decode(Error::ProbeExhausted(p))) => {
         rescued = p.into_unconsumed_packets();
         break;
       }
@@ -2438,7 +2534,7 @@ fn a_hardware_pin_reports_its_probes_exhaustion_instead_of_falling_back() {
   let refusal = dec
     .send_packet(&pushed(&clip, fail_at))
     .expect_err("the probe exhausts on this packet, so a refusal must arrive");
-  let VideoDecodeError::Decode(Error::AllBackendsFailed(p)) = &refusal else {
+  let VideoDecodeError::Decode(Error::ProbeExhausted(p)) = &refusal else {
     panic!(
       "the pinned session must report the exhaustion with its payload intact, got {refusal:?}"
     );
@@ -2485,10 +2581,7 @@ fn a_hardware_pin_reports_a_frame_time_exhaustion_too() {
     .receive_frame(&mut dst)
     .expect_err("the seam fails the first time a frame is asked for");
   assert!(
-    matches!(
-      &refusal,
-      VideoDecodeError::Decode(Error::AllBackendsFailed(_)),
-    ),
+    matches!(&refusal, VideoDecodeError::Decode(Error::ProbeExhausted(_)),),
     "got {refusal:?}",
   );
   assert!(dec.is_hardware(), "the pin holds on the receive road too");
@@ -2525,10 +2618,7 @@ fn a_hardware_pin_reports_an_exhaustion_raised_at_eof() {
     .send_eof()
     .expect_err("this seam raises its exhaustion from send_eof");
   assert!(
-    matches!(
-      &refusal,
-      VideoDecodeError::Decode(Error::AllBackendsFailed(_)),
-    ),
+    matches!(&refusal, VideoDecodeError::Decode(Error::ProbeExhausted(_)),),
     "got {refusal:?}",
   );
   assert!(dec.is_hardware(), "the pin holds on the EOF road too");
@@ -3090,7 +3180,7 @@ fn after_a_failure_and_a_flush_the_packets_reach_libavcodec_on_every_hardware_pa
 ///
 /// No machine that runs this suite is such a platform, so the probe is
 /// handed the order one has: none. `AnyHardware` answers
-/// [`Error::AllBackendsFailed`] at once — no attempt, since there is no
+/// [`Error::ProbeExhausted`] at once — no attempt, since there is no
 /// backend to try, and no packet, since none was sent — and the control
 /// beside it, `Auto` over the same order, opens libavcodec's own decoder.
 ///
@@ -3117,7 +3207,7 @@ fn any_hardware_refuses_at_open_on_a_platform_with_no_hardware_backend() {
         "hardware"
       },
     ),
-    Err(Error::AllBackendsFailed(p)) => {
+    Err(Error::ProbeExhausted(p)) => {
       assert!(p.origin().is_probe(), "the probe's own exhaustion");
       assert!(
         p.attempts().is_empty(),
@@ -3158,7 +3248,7 @@ fn assert_the_probes_packets_come_back(
   taken: usize,
   road: &str,
 ) {
-  let VideoDecodeError::Decode(Error::AllBackendsFailed(p)) = &refusal else {
+  let VideoDecodeError::Decode(Error::ProbeExhausted(p)) = &refusal else {
     panic!("{road}: expected the probe's exhaustion, got {refusal:?}");
   };
   assert!(p.origin().is_probe(), "{road}: the probe's own exhaustion");
@@ -3183,7 +3273,7 @@ fn assert_the_probes_packets_come_back(
 /// The seam takes every packet into its history and delivers nothing
 /// until its probe exhausts — on a send, on the first picture asked for,
 /// or at the end of the stream. Each road must answer
-/// [`Error::AllBackendsFailed`] with the probe's origin and the packets in
+/// [`Error::ProbeExhausted`] with the probe's origin and the packets in
 /// the order they were sent, so the caller can replay them into a
 /// software session of its own; and the session must stay a hardware
 /// one, with nothing replayed behind the caller.
@@ -3270,7 +3360,7 @@ fn any_hardware_never_becomes_software_on_this_platform() {
     DecodePath::AnyHardware,
   ) {
     Ok(dec) => dec,
-    Err(Error::AllBackendsFailed(p)) => {
+    Err(Error::ProbeExhausted(p)) => {
       assert!(
         p.origin().is_probe() && p.unconsumed_packets().is_empty(),
         "refused at open, with no packet consumed"
@@ -3291,7 +3381,7 @@ fn any_hardware_never_becomes_software_on_this_platform() {
       !dec.is_software(),
       "packet {index}: AnyHardware never becomes software"
     );
-    if let Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p))) = &sent {
+    if let Err(VideoDecodeError::Decode(Error::ProbeExhausted(p))) = &sent {
       assert!(p.origin().is_probe(), "an exhaustion here is the probe's");
       return;
     }

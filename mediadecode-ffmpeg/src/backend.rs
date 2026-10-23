@@ -6,7 +6,7 @@ use ffmpeg_next::ffi::{AVHWDeviceType, AVPixelFormat};
 /// `hwdecode` only manages **hardware** decoders — software fallback is
 /// out of scope. If no backend in [`probe_order`] for the current platform
 /// can decode a stream, [`crate::VideoDecoder::open`] returns
-/// [`crate::Error::AllBackendsFailed`] and the caller decides how to fall
+/// [`crate::Error::ProbeExhausted`] and the caller decides how to fall
 /// back (e.g. by opening an `ffmpeg::decoder::Video` directly).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, IsVariant)]
 pub enum Backend {
@@ -50,7 +50,7 @@ impl Backend {
 
 /// Probe order for `VideoDecoder::open` on the current target. Hardware
 /// backends only, in preference order. Empty for platforms with no known
-/// HW backend; on those `open()` returns `AllBackendsFailed` immediately.
+/// HW backend; on those `open()` returns `ProbeExhausted` immediately.
 pub(crate) fn probe_order() -> &'static [Backend] {
   #[cfg(target_vendor = "apple")]
   {

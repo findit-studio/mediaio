@@ -9,10 +9,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Errors returned from [`crate::VideoDecoder`].
 ///
 /// `Debug` is derived; the variants that wrap a payload struct
-/// (`HwDeviceInitFailed`, `AllBackendsFailed`, `FallbackFailed`)
+/// (`HwDeviceInitFailed`, `ProbeExhausted`, `FallbackFailed`)
 /// delegate their `Debug` to the payload, which is hand-written
 /// where needed because [`ffmpeg_next::Packet`] (carried by
-/// `AllBackendsFailed::unconsumed_packets` /
+/// `ProbeExhausted::unconsumed_packets` /
 /// `FallbackFailed::unconsumed_packets`) does not derive
 /// `Debug`. Those payloads summarize the packet count rather
 /// than dumping each packet's fields, which would be both noisy
@@ -104,6 +104,14 @@ pub enum Error {
   #[error(transparent)]
   FrameBudgetExceeded(#[from] FrameBudgetExceeded),
 
+  /// A committed decoder's picture downloaded in a CPU layout a
+  /// [`Frame`](crate::Frame) cannot carry: a decoder past its probe, or a
+  /// backend pinned alone. On trial, the layout is the candidate's
+  /// unfitness for the stream, and the probe leaves it. See
+  /// [`DownloadFormatUnsupported`].
+  #[error(transparent)]
+  DownloadFormatUnsupported(#[from] DownloadFormatUnsupported),
+
   /// The stream's **coded** surface is over the frame ceiling, so the
   /// hardware format was declined before its pool could be built.
   ///
@@ -131,13 +139,17 @@ pub enum Error {
   #[error(transparent)]
   HwDeviceInitFailed(#[from] HwDeviceInitFailed),
 
-  /// Auto-probe exhausted every backend in the platform's order. See
-  /// [`AllBackendsFailed`] for the payload details (in particular the
-  /// `unconsumed_packets` history that callers should replay through
-  /// their own software decoder for non-seekable inputs). `#[from]`
-  /// gives a free `impl From<AllBackendsFailed> for Error`.
+  /// **The hardware probe has no candidate left**: each backend it tried
+  /// failed by its own answer or was unfit for the stream, and none
+  /// delivered a picture. See [`ProbeExhausted`] for the payload details
+  /// (in particular the `unconsumed_packets` history that callers should
+  /// replay through their own software decoder for non-seekable inputs).
+  /// `#[from]` gives a free `impl From<ProbeExhausted> for Error`.
+  ///
+  /// It was `AllBackendsFailed` before 0.21.0, renamed because an attempt
+  /// may have been unfit rather than failed.
   #[error(transparent)]
-  AllBackendsFailed(#[from] AllBackendsFailed),
+  ProbeExhausted(#[from] ProbeExhausted),
 
   /// Surfaced by [`crate::FfmpegVideoStreamDecoder`] when a HW->SW
   /// fallback attempt itself fails. See [`FallbackFailed`] for the
@@ -199,7 +211,7 @@ impl HwDeviceInitFailed {
   }
 }
 
-/// Where in a session's life an [`AllBackendsFailed`] was raised: the
+/// Where in a session's life an [`ProbeExhausted`] was raised: the
 /// probe, before the first picture, always.
 ///
 /// It is the only era a hardware failure is collected in. After the
@@ -210,7 +222,7 @@ impl HwDeviceInitFailed {
 pub enum FallbackOrigin {
   /// Before the first picture, while backends are on trial. Every failure
   /// that is a backend's own advances the probe, and when none is left
-  /// [`Error::AllBackendsFailed`] hands back the probe's buffered history
+  /// [`Error::ProbeExhausted`] hands back the probe's buffered history
   /// — possibly empty, when the failure landed on the first packet.
   /// [`DecodePath::Auto`](crate::DecodePath::Auto) replays that history
   /// into a software decoder and routes the still-unconsumed current
@@ -218,10 +230,28 @@ pub enum FallbackOrigin {
   Probe,
 }
 
-/// Payload for [`Error::AllBackendsFailed`].
+/// Payload for [`Error::ProbeExhausted`].
 ///
-/// Auto-probe exhausted every backend in the platform's order. Empty
-/// `attempts` means the platform has no hardware backends listed in
+/// The probe tried every backend in its order, and none delivered a
+/// picture. **Each attempt is a failure or an unfitness**, told apart in
+/// [`Self::attempts`]:
+///
+/// - **A failure** is the backend's own answer, to its open or to one of its
+///   own calls (a send, a receive, a download), as the error it was.
+/// - **An unfitness** is a backend that decoded a picture whose download
+///   chose a CPU layout a [`Frame`](crate::Frame) cannot carry:
+///   [`Error::DownloadFormatUnsupported`], naming the layout. The backend
+///   failed nothing, and no errno is made for it.
+///
+/// The probe ends in this error whatever its last attempt was, with every
+/// attempt and every packet of its history, on every road it runs on: the
+/// standalone [`VideoDecoder`](crate::VideoDecoder)'s, whose caller can
+/// replay the packets into a software decoder of its own, and the stream
+/// decoder's. There [`DecodePath::Auto`](crate::DecodePath::Auto) replays
+/// them into software, and [`DecodePath::AnyHardware`](crate::DecodePath::AnyHardware)
+/// hands them back.
+///
+/// Empty `attempts` means the platform has no hardware backends listed in
 /// [`crate::Backend`] for the current `target_os` — callers must
 /// fall back to a software decoder of their choice.
 ///
@@ -232,7 +262,7 @@ pub enum FallbackOrigin {
 /// non-seekable inputs (live streams, pipes, network sources) the
 /// caller cannot re-demux from start, so this crate surfaces the
 /// buffered history here so the caller can feed those packets directly
-/// into a software decoder of their choice. When `AllBackendsFailed` comes
+/// into a software decoder of their choice. When `ProbeExhausted` comes
 /// from [`crate::VideoDecoder::open`] (no packets were ever sent),
 /// this vec is empty.
 ///
@@ -240,12 +270,14 @@ pub enum FallbackOrigin {
 /// exhaustion, before the first picture. After it a hardware failure is
 /// that picture's own error.
 ///
-/// **Only backends' answers raise it, never a failure of this crate's
-/// own.** An allocation or a copy this crate makes — the parameters a
-/// backend is built from, its codec context, a picture's properties — and
+/// **Only backends' answers and unfitness raise it, never a failure of this
+/// crate's own.** An allocation or a copy this crate makes — the parameters
+/// a backend is built from, its codec context, a picture's properties — and
 /// the caller's limits on what a picture costs are reported as the errors
-/// they are, and a picture commits its backend before any of those limits
-/// is applied to it. A packet the probe's history cannot keep — past its
+/// they are, and charge no backend. A backend commits at its first
+/// delivered picture: downloaded in a layout a `Frame` carries, its
+/// properties copied. A picture one of those refuses is no delivery, and
+/// the backend stays on trial. A packet the probe's history cannot keep — past its
 /// ceiling of 256 packets or 64 MiB, of more side-data entries than it
 /// copies, or one whose copy cannot be made — ends the trial on the
 /// candidate's answer:
@@ -255,13 +287,20 @@ pub enum FallbackOrigin {
 /// no replay history: the history could not keep the packet, so none could
 /// have been replayed whole.
 ///
+/// It was `AllBackendsFailed` before 0.21.0, renamed because an attempt
+/// may have been unfit rather than failed.
+///
 /// `Debug` is hand-written: [`ffmpeg_next::Packet`] does not derive
 /// `Debug`, so we print `[N packets]` instead of dumping per-packet
 /// bytes, which would be both noisy and useless for triage.
 #[derive(thiserror::Error)]
-#[error("all hardware backends failed; attempts: {attempts:?}")]
-pub struct AllBackendsFailed {
-  /// Per-backend errors collected during probing, in the order tried.
+#[error(
+  "no hardware backend delivered a picture, each one failed or unfit for the stream; \
+   attempts: {attempts:?}"
+)]
+pub struct ProbeExhausted {
+  /// Each backend's attempt, in the order tried: its failure, or its
+  /// unfitness for the stream.
   attempts: Vec<(Backend, Box<Error>)>,
   /// Packets the decoder consumed from the caller before exhaustion.
   /// Replay them through a software decoder for non-seekable inputs.
@@ -270,8 +309,8 @@ pub struct AllBackendsFailed {
   origin: FallbackOrigin,
 }
 
-impl AllBackendsFailed {
-  /// Constructs a probe-era [`AllBackendsFailed`] payload — raised while the
+impl ProbeExhausted {
+  /// Constructs a probe-era [`ProbeExhausted`] payload — raised while the
   /// inner decoder's probe is still active. `unconsumed_packets` is the probe's
   /// buffered history (possibly empty if the failure landed on the first
   /// packet). See [`FallbackOrigin::Probe`].
@@ -287,7 +326,10 @@ impl AllBackendsFailed {
       origin: FallbackOrigin::Probe,
     }
   }
-  /// Per-backend errors collected during probing, in the order tried.
+  /// Each backend's attempt, in the order tried: its own answer, as the
+  /// error it was, or its unfitness for the stream,
+  /// [`Error::DownloadFormatUnsupported`] naming the layout of the picture
+  /// it decoded. An attempt may have been unfit rather than failed.
   #[inline]
   pub fn attempts(&self) -> &[(Backend, Box<Error>)] {
     &self.attempts
@@ -319,9 +361,9 @@ impl AllBackendsFailed {
   }
 }
 
-impl std::fmt::Debug for AllBackendsFailed {
+impl std::fmt::Debug for ProbeExhausted {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("AllBackendsFailed")
+    f.debug_struct("ProbeExhausted")
       .field("attempts", &self.attempts)
       // `Packet` is not `Debug`; print just the count so the error is
       // still useful for triage without dumping per-packet bytes.
@@ -345,7 +387,7 @@ impl std::fmt::Debug for AllBackendsFailed {
 /// can drive their own decoder of last resort.
 ///
 /// `Debug` is hand-written for the same reason as
-/// [`AllBackendsFailed`]: [`ffmpeg_next::Packet`] does not derive
+/// [`ProbeExhausted`]: [`ffmpeg_next::Packet`] does not derive
 /// `Debug`.
 #[derive(thiserror::Error)]
 #[error("HW->SW fallback failed: {source}")]
@@ -433,6 +475,53 @@ impl HwTransferTooLarge {
   #[inline]
   pub const fn limit(&self) -> usize {
     self.limit
+  }
+}
+
+/// Payload for [`Error::DownloadFormatUnsupported`]: a picture's hardware
+/// download chose a CPU layout [`Frame`](crate::Frame) cannot carry, and
+/// this is the raw `AVPixelFormat` it chose.
+///
+/// `av_hwframe_transfer_data` picks the layout itself, as the first of the
+/// formats the backend's frames context offers
+/// (`av_hwframe_transfer_get_formats`), since this crate leaves the
+/// destination's format unset; and this crate keeps that choice. A
+/// conversion a driver makes to another layout can lose samples (4:2:2 to
+/// 4:2:0), and some backends offer their surface's own layout alone.
+///
+/// **Such a picture is no delivery**, and a candidate commits at its first
+/// delivered picture. So the layout means one of two things:
+///
+/// - **On trial**, the candidate is unfit for the stream. The probe records
+///   the unfitness against it — this payload, naming the layout, never an
+///   errno — and leaves it as it leaves a failed candidate, the history
+///   replayed whole into the next one. With no candidate left, the probe
+///   ends in [`Error::ProbeExhausted`], every attempt and every packet with
+///   it, and under [`DecodePath::Auto`](crate::DecodePath::Auto) software
+///   takes the stream.
+/// - **From a committed decoder**, it is that decoder's error, for each such
+///   picture: a mid-stream reconfiguration to a layout a `Frame` cannot
+///   carry, a candidate committed on a packet the probe could not keep, or a
+///   backend pinned alone, which no probe ever held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the hardware download produced pixel format {format}, which a Frame cannot carry")]
+pub struct DownloadFormatUnsupported {
+  format: i32,
+}
+
+impl DownloadFormatUnsupported {
+  /// Constructs a `DownloadFormatUnsupported` payload for the raw
+  /// `AVPixelFormat` the download chose.
+  #[inline]
+  pub const fn new(format: i32) -> Self {
+    Self { format }
+  }
+  /// The raw `AVPixelFormat` the download chose, as the integer FFmpeg
+  /// wrote: never formed into the bindings' enum, which a value they do not
+  /// name would make undefined behaviour.
+  #[inline]
+  pub const fn format(&self) -> i32 {
+    self.format
   }
 }
 

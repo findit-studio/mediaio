@@ -62,7 +62,7 @@ The probe keeps every packet it consumes until the first picture comes
 out. When no backend takes the stream by then, `open` (that is,
 `DecodePath::Auto`) replays those packets into the software decoder, so
 nothing is lost; `DecodePath::AnyHardware` and a `DecodePath::Hardware`
-pin report `VideoDecodeError::Decode(Error::AllBackendsFailed(p))`
+pin report `VideoDecodeError::Decode(Error::ProbeExhausted(p))`
 instead, carrying them (`p.unconsumed_packets()` /
 `p.into_unconsumed_packets()`) — so non-seekable callers (live streams,
 pipes, network sources) can replay them through a software decoder of
