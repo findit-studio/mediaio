@@ -388,31 +388,44 @@ type BuildCandidate = fn(
 
 /// Whether `skip_frame` may leave a stream FFmpeg's decoder decodes with
 /// no picture at all, so that a clean end that brought none is the
-/// stream's end and no backend's failure.
+/// stream's end and no backend's failure: **every level above
+/// [`Default`](crate::Discard::Default)**, read by its value.
 ///
-/// Each level skips what the one below it does, and more (`h264_slice.c`
-/// 2139–2147; `hevc/hevcdec.c` 3542–3547, 3766–3768). A random-access picture is a
-/// reference, intra and key picture, so a stream that has one gives a
-/// picture under every level but `All`:
+/// `AVDiscard` is a threshold: a decoder skips a picture where the level is
+/// at or past the one the picture falls under, so each level skips what the
+/// one below it does, and more (`h264dec.c` 626–628, `h264_slice.c`
+/// 2139–2147; `hevc/hevcdec.c` 3542–3547, 3766–3768). Every level above
+/// `Default` skips some pictures, so a fragment of those pictures alone
+/// gives none; a level FFmpeg adds later is answered by its value, with no
+/// list to extend. A random-access picture is a reference, intra and key
+/// picture, so a stream that has one gives a picture under every level but
+/// `All`.
 ///
-/// | `skip_frame` | skips | a stream that gives no picture | a probe's clean end with none |
+/// `Default` and `Nothing` skip no picture: no decoder of FFmpeg 9.0.1
+/// compares `skip_frame` with a level below `AVDISCARD_NONREF` —
+/// `AVDISCARD_DEFAULT`'s "useless packets" are libavformat's
+/// `AVStream.discard` (`libavformat/avidec.c` 1372) and the `filter_units`
+/// bitstream filter's, never a decoder's. The frame of a packet flagged
+/// `AV_PKT_FLAG_DISCARD` is dropped at every level, `Nothing` included
+/// (`decode.c` 1584–1586, 464–466, 645–648): that is the packets' doing,
+/// not the policy's, and this predicate does not answer it.
+///
+/// | `skip_frame` | skips | a stream that gives no picture | a probe's clean end, or full probe, with none |
 /// |---|---|---|---|
-/// | [`Nothing`](crate::Discard::Nothing), [`Default`](crate::Discard::Default) | nothing (`Default`: empty packets) | none | the candidate failing |
-/// | [`NonReference`](crate::Discard::NonReference) | non-reference pictures | a fragment of non-reference pictures alone | the candidate failing |
-/// | [`Bidirectional`](crate::Discard::Bidirectional) | and B pictures | a fragment of those alone | the candidate failing |
-/// | [`NonIntra`](crate::Discard::NonIntra) | and every picture not intra | one with no intra picture: a stream cut after its last | **the stream's end**: the candidate is committed |
-/// | [`NonKey`](crate::Discard::NonKey) | and every picture not a key one | one with no key picture: for H.264, no IDR and no recovery point SEI | **the stream's end**: the candidate is committed |
+/// | [`Nothing`](crate::Discard::Nothing), [`Default`](crate::Discard::Default) | nothing | none | the candidate failing |
+/// | [`NonReference`](crate::Discard::NonReference) | non-reference pictures | a fragment of non-reference pictures alone | **the stream's end**: the candidate is committed |
+/// | [`Bidirectional`](crate::Discard::Bidirectional) | and B pictures | a fragment of those alone | **the stream's end** |
+/// | [`NonIntra`](crate::Discard::NonIntra) | and every picture not intra | one with no intra picture: a stream cut after its last | **the stream's end** |
+/// | [`NonKey`](crate::Discard::NonKey) | and every picture not a key one | one with no key picture: for H.264, no IDR and no recovery point SEI | **the stream's end** |
 /// | [`All`](crate::Discard::All) | every picture | every stream | no probe runs: the first backend that opens is committed at once |
 ///
-/// Under `NonIntra` and `NonKey` the probe runs as ever while pictures
-/// come; only the empty clean end changes its meaning. The stream
-/// decoder's [`DecodePath::Auto`](crate::DecodePath::Auto) ends on software
-/// instead ([`EmptyEnd::HandBack`]), as it opens there under `All`.
+/// Under every level from `NonReference` to `NonKey` the probe runs as ever
+/// while pictures come; only the empty clean end, and a probe that fills
+/// with none, change their meaning. The stream decoder's
+/// [`DecodePath::Auto`](crate::DecodePath::Auto) ends on software instead
+/// ([`EmptyEnd::HandBack`]), as it opens there under `All`.
 pub(crate) const fn skips_may_leave_no_picture(skip_frame: crate::Discard) -> bool {
-  matches!(
-    skip_frame,
-    crate::Discard::NonIntra | crate::Discard::NonKey | crate::Discard::All
-  )
+  skip_frame.as_av() as i32 > ffmpeg_next::ffi::AVDiscard::AVDISCARD_DEFAULT as i32
 }
 
 /// What a probe does with a clean end that came with no picture, under a

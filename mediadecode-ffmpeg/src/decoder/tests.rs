@@ -2218,6 +2218,31 @@ fn every_discard_value_reaches_the_codec_context() {
   }
 }
 
+/// **Every skip level above `Default` may leave a stream with no picture**,
+/// `AVDiscard` being a threshold: `NonReference` over non-reference
+/// pictures alone, `Bidirectional` over B pictures alone, and on up. Below
+/// it, no FFmpeg decoder skips a picture.
+#[test]
+fn every_skip_level_above_default_may_leave_a_stream_with_no_picture() {
+  use crate::Discard;
+
+  for (level, may) in [
+    (Discard::Nothing, false),
+    (Discard::Default, false),
+    (Discard::NonReference, true),
+    (Discard::Bidirectional, true),
+    (Discard::NonIntra, true),
+    (Discard::NonKey, true),
+    (Discard::All, true),
+  ] {
+    assert_eq!(skips_may_leave_no_picture(level), may, "{level}");
+  }
+  // Each level FFmpeg names, in its order: the answer never falls as the
+  // level rises.
+  let answers = Discard::ALL.map(skips_may_leave_no_picture);
+  assert!(answers.is_sorted(), "{answers:?}");
+}
+
 /// **The open request starts at [`VideoDecoder::open`]'s and sets each
 /// optional**, consuming and in place alike, and back to the probe and an
 /// untimed decoder.
@@ -2313,12 +2338,10 @@ fn skipping_every_picture_commits_the_backend_at_open() {
   assert_eq!(all.phase(), SessionPhase::Streaming, "committed at open");
   assert!(all.probe.is_none(), "nothing held for a replay");
   assert_eq!(all.backend(), Backend::VideoToolbox);
-  for skip in [
-    crate::Discard::Default,
-    crate::Discard::NonReference,
-    crate::Discard::NonIntra,
-    crate::Discard::NonKey,
-  ] {
+  for skip in crate::Discard::ALL
+    .into_iter()
+    .filter(|&skip| skip != crate::Discard::All)
+  {
     assert_eq!(
       open(skip).phase(),
       SessionPhase::Auditioning,

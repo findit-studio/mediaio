@@ -144,12 +144,15 @@ impl FromStr for Discard {
 /// stream decoder (`DecodePath::Auto`) opens software at once; one held to
 /// hardware (`DecodePath::AnyHardware`), and the standalone decoder's probe,
 /// commit to the first backend that opens; a pinned backend opens as asked.
-/// Each drains to its end with no picture, cleanly. Under
-/// [`Discard::NonIntra`] and [`Discard::NonKey`] a stream may give no
-/// picture too — one with no intra, or no key, picture — so the probe runs
-/// while pictures come, and a clean end, or a probe that fills, with none is
-/// the stream's end: the backend that opened is committed, and an unpinned
-/// stream decoder ends on software.
+/// Each drains to its end with no picture, cleanly. Under every other level
+/// above [`Discard::Default`] — [`Discard::NonReference`],
+/// [`Discard::Bidirectional`], [`Discard::NonIntra`], [`Discard::NonKey`],
+/// and any FFmpeg adds — a stream may give no picture too: each value is a
+/// threshold, and a stream of pictures the level skips alone gives none. So
+/// the probe runs while pictures come, and a clean end, or a probe that
+/// fills, with none is the stream's end: the backend that opened is
+/// committed, and an unpinned stream decoder ends on software. `Default`
+/// and `Nothing` skip no picture.
 ///
 /// Marked `#[non_exhaustive]`: a later setting joins as a field, read and
 /// set through its own methods.

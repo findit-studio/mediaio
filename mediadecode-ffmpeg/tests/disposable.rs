@@ -515,13 +515,35 @@ fn ue(bits: &[u8], at: &mut usize) -> u32 {
   (1 << zeros) - 1 + value
 }
 
-/// Whether an H.264 slice NAL unit codes an I or SI slice (7.4.3).
+/// An H.264 slice NAL unit's `slice_type` (7.4.3).
 #[cfg(target_vendor = "apple")]
-fn intra_slice(unit: &[u8]) -> bool {
+fn slice_type(unit: &[u8]) -> u32 {
   let bits = rbsp(&unit[1..]);
   let mut at = 0;
   let _first_mb_in_slice = ue(&bits, &mut at);
-  matches!(ue(&bits, &mut at) % 5, 2 | 4)
+  ue(&bits, &mut at)
+}
+
+/// Whether an H.264 slice NAL unit codes an I or SI slice (7.4.3).
+#[cfg(target_vendor = "apple")]
+fn intra_slice(unit: &[u8]) -> bool {
+  matches!(slice_type(unit) % 5, 2 | 4)
+}
+
+/// Every slice in the packet of `nal_ref_idc` 0: a picture `noref` skips.
+#[cfg(target_vendor = "apple")]
+fn non_reference_alone(packet: &[u8]) -> bool {
+  nal_units(packet)
+    .into_iter()
+    .all(|unit| !matches!(unit[0] & 0x1F, 1..=5) || unit[0] & 0x60 == 0)
+}
+
+/// Every slice in the packet a B slice: a picture `bidir` skips.
+#[cfg(target_vendor = "apple")]
+fn b_pictures_alone(packet: &[u8]) -> bool {
+  nal_units(packet)
+    .into_iter()
+    .all(|unit| !matches!(unit[0] & 0x1F, 1 | 5) || slice_type(unit) % 5 == 1)
 }
 
 /// Whether an H.264 SEI NAL unit holds a recovery point (`payloadType` 6).
@@ -575,17 +597,20 @@ fn no_intra_picture(packet: &[u8]) -> bool {
 #[cfg(target_vendor = "apple")]
 #[derive(Clone, Copy, Debug)]
 enum Feed {
-  /// 120 packets: the probe is still on trial at the clean end.
+  /// 120 packets at most: the probe is still on trial at the clean end.
   WithinTheProbe,
-  /// Every packet, past the 256 the probe buffers: it stops with no picture.
+  /// Past the 256 packets the probe buffers — every packet kept, and a
+  /// fragment shorter than that again, as often as it takes: the probe fills
+  /// with no picture.
   PastTheProbe,
 }
 
-/// Under a skip policy that may leave a stream with no picture, a clean end
-/// with none is the stream's end on every unpinned road, and so is a probe
-/// that fills with none: the standalone probe and `AnyHardware` commit the
-/// backend that opened, and `Auto`, which probes hardware while pictures may
-/// come, ends on software.
+/// Under a skip policy that may leave a stream with no picture — every level
+/// above `Default` — a clean end with none is the stream's end on every
+/// unpinned road, and so is a probe that fills with none: the standalone
+/// probe and `AnyHardware` commit the backend that opened, and `Auto`, which
+/// probes hardware while pictures may come, ends on software. Under `All` no
+/// probe runs at all, and `Auto` opens software.
 #[cfg(target_vendor = "apple")]
 fn a_stream_with_no_picture_to_give_ends_cleanly(
   skip: Discard,
@@ -602,9 +627,16 @@ fn a_stream_with_no_picture_to_give_ends_cleanly(
     .into_iter()
     .filter(|packet| keep(packet.data().as_ref()))
     .collect();
+  assert!(!kept.is_empty(), "{skip}: no packet kept");
   match feed {
     Feed::WithinTheProbe => kept.truncate(120),
-    Feed::PastTheProbe => assert!(kept.len() > 256, "{skip}: {} packets kept", kept.len()),
+    // The level skips every picture of the fragment however often it comes.
+    Feed::PastTheProbe => {
+      let fragment = kept.clone();
+      while kept.len() <= 256 {
+        kept.extend(fragment.iter().cloned());
+      }
+    }
   }
   let options = DecoderOptions::new().with_skip_frame(skip);
 
@@ -637,9 +669,11 @@ fn a_stream_with_no_picture_to_give_ends_cleanly(
     DecoderLimits::default(),
   )
   .expect("open on Auto");
-  assert!(
-    !auto.is_software(),
-    "{skip}, {feed:?}: Auto probes hardware while pictures may come"
+  assert_eq!(
+    auto.is_software(),
+    skip == Discard::All,
+    "{skip}, {feed:?}: Auto probes hardware while pictures may come, and opens software where \
+     none can"
   );
   let mut frame = empty_owned_video_frame();
   let mut shown = 0;
@@ -708,4 +742,38 @@ fn a_probe_that_fills_with_no_picture_commits_under_nonkey_and_nonintra() {
     no_intra_picture,
     Feed::PastTheProbe,
   );
+}
+
+/// `skip_frame = noref` over an H.264 fragment of non-reference pictures
+/// alone (the fixture's 145 B pictures), every one of which FFmpeg skips
+/// (`h264dec.c` 626–628): a clean end within the probe, and a probe that
+/// fills, with no picture.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_stream_of_non_reference_pictures_alone_ends_cleanly_under_nonref() {
+  for feed in [Feed::WithinTheProbe, Feed::PastTheProbe] {
+    a_stream_with_no_picture_to_give_ends_cleanly(Discard::NonReference, non_reference_alone, feed);
+  }
+}
+
+/// `skip_frame = bidir` over an H.264 fragment of B pictures alone, which
+/// FFmpeg skips before it starts any (`h264_slice.c` 2139–2147; the
+/// fixture's B pictures are non-reference too, `h264dec.c` 626–628): a clean
+/// end within the probe, and a probe that fills, with no picture.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_stream_of_b_pictures_alone_ends_cleanly_under_bidir() {
+  for feed in [Feed::WithinTheProbe, Feed::PastTheProbe] {
+    a_stream_with_no_picture_to_give_ends_cleanly(Discard::Bidirectional, b_pictures_alone, feed);
+  }
+}
+
+/// `skip_frame = all` over the whole fixture, within and past the probe's
+/// size: no probe runs, and every road drains cleanly to no picture.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn every_picture_skipped_ends_cleanly_under_all_within_and_past_the_probe_size() {
+  for feed in [Feed::WithinTheProbe, Feed::PastTheProbe] {
+    a_stream_with_no_picture_to_give_ends_cleanly(Discard::All, |_| true, feed);
+  }
 }
