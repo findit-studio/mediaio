@@ -9,7 +9,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
-## [0.19.1] - unreleased
+## [0.20.0] - unreleased
 
 ### Changed
 
@@ -46,14 +46,14 @@ The backend-agnostic core it adapts has its own log at
   (`VideoFrameExtra::best_effort_timestamp`, FFmpeg's guess from every
   frame decoded before), as dropping a packet `sdtp` marks may. A
   consumer reads the frame's `pts`, its packet's, for the exact one.
-- **The FFmpeg this crate builds against is still 5.1 or later.** The
-  side-data kinds FFmpeg 7.0 to 9.0 added are named only where the linked
-  FFmpeg names them: the build script reads the linked release from
-  `ffmpeg-sys-next`'s `links` metadata — now a direct dependency, for that
-  alone, adding no feature — and gates each kind on it as `ffmpeg-next`
-  gates the same kinds. A kind this build does not name persists, so its
-  packet is never `DISPOSABLE`. `MEDIADECODE_FFMPEG_GATE_CEILING=6.1`
-  (any `<major>.<minor>`) builds the gates as for an older release.
+- **BREAKING: FFmpeg 9 is the floor.** This crate builds against FFmpeg
+  9 or newer and no older release: the build script of `mediaio-ffmpeg`
+  0.20.0, the base it is built on, reads the linked release from
+  `ffmpeg-sys-next`'s `links` metadata (`DEP_FFMPEG_FFMPEG_9_0`, set from
+  libavcodec 63.1, FFmpeg 9.0's) and refuses an older FFmpeg by name. Every
+  FFmpeg 9 packet side-data kind is named as its headers name it: no
+  version gates, and a kind a later FFmpeg adds persists, so its packet is
+  never `DISPOSABLE`.
 
 ### Fixed
 
@@ -83,7 +83,7 @@ The backend-agnostic core it adapts has its own log at
 
 - **`DecoderOptions`, how a video decoder decodes**: libavcodec's
   `skip_frame`, `skip_loop_filter` and `skip_idct`, each a `Discard`
-  (both re-exported from `mediaio-ffmpeg` 0.19.1, with
+  (both re-exported from `mediaio-ffmpeg` 0.20.0, with
   `ParseDiscardError`). They are written into every video codec context
   a decoder opens — each hardware candidate, a probe advance, the
   software decoder and a fallback's — and read back by `options()`. On a

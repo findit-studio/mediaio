@@ -3114,30 +3114,24 @@ fn bitstreams(input: &Input) -> Result<Vec<Option<NalStream>>, DemuxError> {
 /// `AVPacketSideDataType` FFmpeg 9.0.1 names (`libavcodec/packet.h` 41–394)
 /// is in this list or in [`RIDING_SIDE_DATA`], never both; a type in
 /// neither — one a later FFmpeg adds — persists ([`side_data_persists`]).
+/// FFmpeg 9 is the floor this crate builds against, so every kind is named
+/// as its headers name it.
 ///
-/// **A kind a release after 5.1 added is named only where the linked
-/// FFmpeg is that release or newer** (`ffmpeg_7_0` to `ffmpeg_9_0`, which
-/// `build.rs` sets from `ffmpeg-sys-next`'s report of the release, the gates
-/// `ffmpeg-next` puts on the same kinds): the bindings are generated from
-/// the linked headers, which name no newer kind, and a library that names
-/// none cannot hand one over. FFmpeg appends each new kind to the enum, so
-/// a build's gates leave out its last kinds alone.
-///
-/// | type | since | why it persists |
-/// |---|---|---|
-/// | `PALETTE` | | "a new palette is present" (`packet.h` 43–47), which a decoder keeps (`libavcodec/decode.c` 2321–2334) |
-/// | `NEW_EXTRADATA` | | a new configuration (`h264dec.c` 1038–1044, `hevc/hevcdec.c` 3854–3860) |
-/// | `PARAM_CHANGE` | | new dimensions or a new rate (`decode.c` 117–176) |
-/// | `FALLBACK_TRACK`, `CPB_PROPERTIES` | | a description of the stream, not of the packet |
-/// | `MATROSKA_BLOCKADDITIONAL` | | a block addition of any kind, which nothing here reads |
-/// | `METADATA_UPDATE` | | the stream's metadata from the packet on |
-/// | `A53_CC` | | caption bytes a caption decoder reads across pictures |
-/// | `ENCRYPTION_INIT_INFO` | | a key system's initialization, for the packets after |
-/// | `AFD` | | an active format a receiver may hold until the next |
-/// | `DOVI_CONF` | | a Dolby Vision configuration the decoder keeps (`hevc/hevcdec.c` 3862–3869) |
-/// | `IAMF_MIX_GAIN_PARAM`, `IAMF_DEMIXING_INFO_PARAM`, `IAMF_RECON_GAIN_INFO_PARAM` | 7.0 | a parameter that applies for a duration |
-/// | `LCEVC` | 7.1 | an enhancement whose decoder keeps state across pictures (`decode.c` 1640–1666, 1704–1775) |
-/// | `HEVC_CONF` | 9.0 | an enhancement layer's decoder configuration |
+/// | type | why it persists |
+/// |---|---|
+/// | `PALETTE` | "a new palette is present" (`packet.h` 43–47), which a decoder keeps (`libavcodec/decode.c` 2321–2334) |
+/// | `NEW_EXTRADATA` | a new configuration (`h264dec.c` 1038–1044, `hevc/hevcdec.c` 3854–3860) |
+/// | `PARAM_CHANGE` | new dimensions or a new rate (`decode.c` 117–176) |
+/// | `FALLBACK_TRACK`, `CPB_PROPERTIES` | a description of the stream, not of the packet |
+/// | `MATROSKA_BLOCKADDITIONAL` | a block addition of any kind, which nothing here reads |
+/// | `METADATA_UPDATE` | the stream's metadata from the packet on |
+/// | `A53_CC` | caption bytes a caption decoder reads across pictures |
+/// | `ENCRYPTION_INIT_INFO` | a key system's initialization, for the packets after |
+/// | `AFD` | an active format a receiver may hold until the next |
+/// | `DOVI_CONF` | a Dolby Vision configuration the decoder keeps (`hevc/hevcdec.c` 3862–3869) |
+/// | `IAMF_MIX_GAIN_PARAM`, `IAMF_DEMIXING_INFO_PARAM`, `IAMF_RECON_GAIN_INFO_PARAM` | a parameter that applies for a duration |
+/// | `LCEVC` | an enhancement whose decoder keeps state across pictures (`decode.c` 1640–1666, 1704–1775) |
+/// | `HEVC_CONF` | an enhancement layer's decoder configuration |
 const PERSISTING_SIDE_DATA: &[AVPacketSideDataType] = &[
   AVPacketSideDataType::AV_PKT_DATA_PALETTE,
   AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
@@ -3150,15 +3144,10 @@ const PERSISTING_SIDE_DATA: &[AVPacketSideDataType] = &[
   AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO,
   AVPacketSideDataType::AV_PKT_DATA_AFD,
   AVPacketSideDataType::AV_PKT_DATA_DOVI_CONF,
-  #[cfg(ffmpeg_7_0)]
   AVPacketSideDataType::AV_PKT_DATA_IAMF_MIX_GAIN_PARAM,
-  #[cfg(ffmpeg_7_0)]
   AVPacketSideDataType::AV_PKT_DATA_IAMF_DEMIXING_INFO_PARAM,
-  #[cfg(ffmpeg_7_0)]
   AVPacketSideDataType::AV_PKT_DATA_IAMF_RECON_GAIN_INFO_PARAM,
-  #[cfg(ffmpeg_7_1)]
   AVPacketSideDataType::AV_PKT_DATA_LCEVC,
-  #[cfg(ffmpeg_9_0)]
   AVPacketSideDataType::AV_PKT_DATA_HEVC_CONF,
 ];
 
@@ -3166,27 +3155,21 @@ const PERSISTING_SIDE_DATA: &[AVPacketSideDataType] = &[
 /// what FFmpeg's decoding copies onto the packet's own frame alone
 /// (`ff_sd_global_map`, `libavcodec/avcodec.c` 57–70; the packet map and
 /// the metadata of `ff_decode_frame_props_from_pkt`, `decode.c` 1492–1596),
-/// and what nothing decoding reads, about the packet itself. A kind a
-/// release after 5.1 added is named only where the linked FFmpeg is that
-/// release or newer, as in [`PERSISTING_SIDE_DATA`]; one left out persists.
+/// and what nothing decoding reads, about the packet itself.
 ///
-/// | type | since | why it rides |
-/// |---|---|---|
-/// | `REPLAYGAIN`, `DISPLAYMATRIX`, `STEREO3D`, `AUDIO_SERVICE_TYPE`, `MASTERING_DISPLAY_METADATA`, `SPHERICAL`, `CONTENT_LIGHT_LEVEL`, `ICC_PROFILE` | | copied onto the packet's frame alone (`avcodec.c` 57–70) |
-/// | `AMBIENT_VIEWING_ENVIRONMENT` | 7.0 | the same |
-/// | `3D_REFERENCE_DISPLAYS` | 8.0 | the same |
-/// | `EXIF` | 8.1 | the same |
-/// | `SKIP_SAMPLES`, `S12M_TIMECODE`, `DYNAMIC_HDR10_PLUS` | | the packet's frame's own, copied onto it alone (`decode.c` 1550–1596) |
-/// | `DYNAMIC_HDR_SMPTE_2094_APP5` | 9.0 | the same |
-/// | `STRINGS_METADATA` | | metadata of the packet's frame alone (`decode.c` 1538–1548) |
-/// | `H263_MB_INFO`, `QUALITY_STATS` | | an encoder's account of the packet |
-/// | `JP_DUALMONO` | | which channel of the packet's audio to use |
-/// | `SUBTITLE_POSITION`, `WEBVTT_IDENTIFIER`, `WEBVTT_SETTINGS` | | the packet's own subtitle event or cue |
-/// | `MPEGTS_STREAM_ID` | | the packet's PES stream id, for a muxer (`libavformat/mpegts.c` 1119) |
-/// | `ENCRYPTION_INFO` | | how to decrypt the packet itself |
-/// | `PRFT` | | the time the packet was produced |
-/// | `RTCP_SR` | 8.0 | the last sender report at the packet |
-/// | `FRAME_CROPPING` | 7.1 | the packet's frame's cropping, which no decoder reads from a packet |
+/// | type | why it rides |
+/// |---|---|
+/// | `REPLAYGAIN`, `DISPLAYMATRIX`, `STEREO3D`, `AUDIO_SERVICE_TYPE`, `MASTERING_DISPLAY_METADATA`, `SPHERICAL`, `CONTENT_LIGHT_LEVEL`, `ICC_PROFILE`, `AMBIENT_VIEWING_ENVIRONMENT`, `3D_REFERENCE_DISPLAYS`, `EXIF` | copied onto the packet's frame alone (`avcodec.c` 57–70) |
+/// | `SKIP_SAMPLES`, `S12M_TIMECODE`, `DYNAMIC_HDR10_PLUS`, `DYNAMIC_HDR_SMPTE_2094_APP5` | the packet's frame's own, copied onto it alone (`decode.c` 1550–1596) |
+/// | `STRINGS_METADATA` | metadata of the packet's frame alone (`decode.c` 1538–1548) |
+/// | `H263_MB_INFO`, `QUALITY_STATS` | an encoder's account of the packet |
+/// | `JP_DUALMONO` | which channel of the packet's audio to use |
+/// | `SUBTITLE_POSITION`, `WEBVTT_IDENTIFIER`, `WEBVTT_SETTINGS` | the packet's own subtitle event or cue |
+/// | `MPEGTS_STREAM_ID` | the packet's PES stream id, for a muxer (`libavformat/mpegts.c` 1119) |
+/// | `ENCRYPTION_INFO` | how to decrypt the packet itself |
+/// | `PRFT` | the time the packet was produced |
+/// | `RTCP_SR` | the last sender report at the packet |
+/// | `FRAME_CROPPING` | the packet's frame's cropping, which no decoder reads from a packet |
 const RIDING_SIDE_DATA: &[AVPacketSideDataType] = &[
   AVPacketSideDataType::AV_PKT_DATA_H263_MB_INFO,
   AVPacketSideDataType::AV_PKT_DATA_REPLAYGAIN,
@@ -3209,25 +3192,18 @@ const RIDING_SIDE_DATA: &[AVPacketSideDataType] = &[
   AVPacketSideDataType::AV_PKT_DATA_ICC_PROFILE,
   AVPacketSideDataType::AV_PKT_DATA_S12M_TIMECODE,
   AVPacketSideDataType::AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
-  #[cfg(ffmpeg_7_0)]
   AVPacketSideDataType::AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT,
-  #[cfg(ffmpeg_7_1)]
   AVPacketSideDataType::AV_PKT_DATA_FRAME_CROPPING,
-  #[cfg(ffmpeg_8_0)]
   AVPacketSideDataType::AV_PKT_DATA_3D_REFERENCE_DISPLAYS,
-  #[cfg(ffmpeg_8_0)]
   AVPacketSideDataType::AV_PKT_DATA_RTCP_SR,
-  #[cfg(ffmpeg_8_1)]
   AVPacketSideDataType::AV_PKT_DATA_EXIF,
-  #[cfg(ffmpeg_9_0)]
   AVPacketSideDataType::AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5,
 ];
 
 /// Whether packet side data of `kind`, the raw `AVPacketSideDataType` it
 /// arrives as, may be taken up past its own packet: a kind of
 /// [`PERSISTING_SIDE_DATA`], and a kind of neither list — one a later
-/// FFmpeg names, or one this build's gates leave out — every kind but
-/// those of [`RIDING_SIDE_DATA`]. The kind is compared as the integer it
+/// FFmpeg names — every kind but those of [`RIDING_SIDE_DATA`]. The kind is compared as the integer it
 /// is, never formed into the bindings' enum, which a kind they do not name
 /// would make undefined behaviour.
 fn side_data_persists(kind: c_int) -> bool {
@@ -5458,22 +5434,13 @@ mod tests {
     assert!(disposable(&mut bitstream, hevc_packet(0), vec![]));
   }
 
-  /// The kinds the bindings name that this build's gates leave out: the
-  /// enum's last ones, since FFmpeg appends each new kind, and none where
-  /// the gates are the linked FFmpeg's.
-  fn left_out() -> core::ops::Range<c_int> {
-    let listed = (PERSISTING_SIDE_DATA.len() + RIDING_SIDE_DATA.len()) as c_int;
-    listed..AVPacketSideDataType::AV_PKT_DATA_NB as c_int
-  }
-
   #[test]
   fn side_data_that_persists_clears_the_mark_whoever_set_it() {
-    // A kind of neither table — one the bindings do not name, or one the
-    // build's gates leave out — persists too.
+    // A kind of neither table — one the bindings do not name — persists
+    // too.
     let persisting = PERSISTING_SIDE_DATA
       .iter()
       .map(|&kind| kind as c_int)
-      .chain(left_out())
       .chain([
         AVPacketSideDataType::AV_PKT_DATA_NB as c_int,
         AVPacketSideDataType::AV_PKT_DATA_NB as c_int + 1,
@@ -5816,14 +5783,14 @@ mod tests {
 
   #[test]
   fn every_side_data_type_ffmpeg_names_rides_or_persists_and_not_both() {
+    // The tables name every kind FFmpeg 9 names, the floor this crate
+    // builds against.
     let named = AVPacketSideDataType::AV_PKT_DATA_NB as c_int;
-    let left_out = left_out();
-    // Gated as the linked FFmpeg is, the tables name every kind it names;
-    // gated as an older release, they leave out what a newer one appended.
-    #[cfg(not(ffmpeg_gate_ceiling))]
-    assert!(left_out.is_empty(), "{left_out:?} of {named}");
-    #[cfg(ffmpeg_gate_ceiling)]
-    assert!(!left_out.is_empty(), "{left_out:?} of {named}");
+    assert_eq!(
+      (PERSISTING_SIDE_DATA.len() + RIDING_SIDE_DATA.len()) as c_int,
+      named,
+      "every kind of {named}"
+    );
     for kind in 0..named {
       let persisting = PERSISTING_SIDE_DATA
         .iter()
@@ -5833,12 +5800,6 @@ mod tests {
         .iter()
         .filter(|&&listed| listed as c_int == kind)
         .count();
-      if left_out.contains(&kind) {
-        // A kind the gates leave out is in neither table, and persists.
-        assert_eq!(persisting + riding, 0, "{kind}");
-        assert!(side_data_persists(kind), "{kind}");
-        continue;
-      }
       assert_eq!(persisting + riding, 1, "{kind}");
       assert_eq!(side_data_persists(kind), persisting == 1, "{kind}");
     }

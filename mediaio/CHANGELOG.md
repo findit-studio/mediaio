@@ -9,8 +9,14 @@ The family releases in lockstep.
 
 ## [Unreleased]
 
+## [0.20.0] - unreleased
+
 ### Changed
 
+- **BREAKING: the `ffmpeg` feature needs FFmpeg 9 or newer.** Its adapters
+  are `mediaio-ffmpeg`, `mediadecode-ffmpeg` and `mediaencode-ffmpeg`
+  0.20, whose base refuses an older FFmpeg by name in its build script. The
+  default, pure-Rust build is untouched.
 - **BREAKING: `timeline` is `mediaio-timeline` 0.3** (`mediaio::timeline`):
   markers, `otio::from_otio`, and an OpenTimelineIO export that now carries
   the exact-readback metadata.

@@ -29,6 +29,10 @@ through, and adapters that implement them.
 `mediaspine` and `mediaio-timeline` are versioned on their own; the
 rest of the family releases in lockstep.
 
+**FFmpeg 9 is the floor** of the FFmpeg crates — `mediaio-ffmpeg`,
+`mediadecode-ffmpeg`, `mediaencode-ffmpeg` and `mediaio`'s `ffmpeg`
+feature: no older release is supported, and the build refuses one by name.
+
 The pixel-format and color vocabulary (`PixelFormat`, the H.273 color
 enums, `BayerPattern`, the frame primitives) is sourced from
 [`mediaframe`](https://crates.io/crates/mediaframe), and the time

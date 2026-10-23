@@ -26,91 +26,10 @@ fn main() {
   println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TARPAULIN");
 
   configure_videotoolbox();
-  configure_ffmpeg_release();
 }
 
 fn use_feature(feature: &str) {
   println!("cargo:rustc-cfg={}", feature);
-}
-
-/// The FFmpeg releases after 5.1, the oldest this crate builds against,
-/// that added a packet side-data kind `src/demuxer.rs` names, each with the
-/// cfg that gates its kinds: `ffmpeg-sys-next`'s own flag for the release,
-/// the gate `ffmpeg-next` puts on the same kinds
-/// (`src/codec/packet/side_data.rs`).
-const FFMPEG_RELEASES: [(&str, (u32, u32)); 5] = [
-  ("ffmpeg_7_0", (7, 0)),
-  ("ffmpeg_7_1", (7, 1)),
-  ("ffmpeg_8_0", (8, 0)),
-  ("ffmpeg_8_1", (8, 1)),
-  ("ffmpeg_9_0", (9, 0)),
-];
-
-/// Gate each packet side-data kind a release after 5.1 added on the linked
-/// FFmpeg being that release or newer.
-///
-/// # The question is the headers'
-///
-/// `ffmpeg-sys-next` generates its bindings from the installed headers, so
-/// a kind those headers do not name is no name at all, and naming one fails
-/// the build. Its build script reads the release from the same headers
-/// (`LIBAVCODEC_VERSION_MAJOR` and `_MINOR`) and reports it in its `links`
-/// metadata — `cargo:ffmpeg_7_0=true` and on — which Cargo hands this
-/// script as `DEP_FFMPEG_FFMPEG_7_0`, this crate depending on it directly
-/// for that alone. A kind the linked headers do not name cannot arrive from
-/// that library either, so leaving it out loses nothing, and at run time a
-/// kind the tables do not name persists, its packet never disposable.
-///
-/// # The one switch
-///
-/// `MEDIADECODE_FFMPEG_GATE_CEILING=<major>.<minor>` gates as though the
-/// linked FFmpeg were no newer than that release — what a build against
-/// that release's headers names, against the headers at hand — and sets
-/// `ffmpeg_gate_ceiling` where it lowers a gate. The local gate builds so
-/// to check that the tables and their laws stand with the newer kinds left
-/// out.
-fn configure_ffmpeg_release() {
-  println!("cargo:rerun-if-env-changed=MEDIADECODE_FFMPEG_GATE_CEILING");
-  let ceiling = env::var("MEDIADECODE_FFMPEG_GATE_CEILING")
-    .ok()
-    .map(|value| {
-      let release = value.split_once('.').and_then(|(major, minor)| {
-        Some((
-          major.trim().parse::<u32>().ok()?,
-          minor.trim().parse::<u32>().ok()?,
-        ))
-      });
-      match release {
-        Some(release) => (value, release),
-        None => {
-          panic!("MEDIADECODE_FFMPEG_GATE_CEILING={value:?} names no <major>.<minor> release")
-        }
-      }
-    });
-  let mut lowered = false;
-  for (flag, release) in FFMPEG_RELEASES {
-    let metadata = format!("DEP_FFMPEG_{}", flag.to_uppercase());
-    println!("cargo:rerun-if-env-changed={metadata}");
-    if env::var(&metadata).as_deref() != Ok("true") {
-      continue;
-    }
-    if ceiling
-      .as_ref()
-      .is_some_and(|(_, ceiling)| release > *ceiling)
-    {
-      lowered = true;
-      continue;
-    }
-    use_feature(flag);
-  }
-  if let Some((value, _)) = ceiling.filter(|_| lowered) {
-    use_feature("ffmpeg_gate_ceiling");
-    println!(
-      "cargo:warning=mediadecode-ffmpeg: MEDIADECODE_FFMPEG_GATE_CEILING={value} gates the packet \
-       side-data kinds as for that FFmpeg release: the kinds a newer one added are left out, and \
-       a packet carrying one is never DISPOSABLE"
-    );
-  }
 }
 
 /// Decide whether `src/vtscale`'s VideoToolbox body can be compiled,

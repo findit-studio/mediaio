@@ -455,9 +455,11 @@ once `--ignored` has opted into them.
 
 ## Build requirements
 
-- A system FFmpeg ≥ **5.1** linkable via `pkg-config` (we reference
-  `AV_PIX_FMT_P212LE` / `AV_PIX_FMT_P412LE`, which were added in 5.1).
-  Tested against 9.0. Verify with `ffmpeg -hwaccels` that your build
+- A system **FFmpeg 9** or newer, linkable via `pkg-config`; no older
+  release is supported. The build refuses an older one by name:
+  `mediaio-ffmpeg`'s build script reads the linked release from
+  `ffmpeg-sys-next`'s `links` metadata (`DEP_FFMPEG_FFMPEG_9_0`). Tested
+  against 9.0.1. Verify with `ffmpeg -hwaccels` that your build
   has the backends you expect compiled in
   (e.g. `videotoolbox` on macOS, `vaapi` / `cuda` on Linux,
   `d3d11va` / `cuda` on Windows).
