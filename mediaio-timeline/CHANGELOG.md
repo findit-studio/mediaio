@@ -7,7 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with `mediadecode`'s.
 
-## [0.4.0] - unreleased
+## [0.4.0] - 2026-10-23
 
 ### Added
 
