@@ -1,6 +1,9 @@
 //! `PacketFlags::DISPOSABLE` from the bitstream, on real camera files:
 //! Sony's XAVC originals carry no `sdtp`, so the container marks nothing,
-//! and their H.264 marks two pictures in three `nal_ref_idc` 0.
+//! and their H.264 marks two pictures in three `nal_ref_idc` 0. An MP4 is
+//! read only where the caller declares the `mov` demuxer's inputs
+//! plaintext (`DemuxerOpen::plaintext_demuxers`), as these laws do; by
+//! default it carries the container's marks alone.
 //!
 //! The fixtures are `findit-studio/video-fixtures`' `h264/` clips. Point
 //! `VIDEO_FIXTURES` at a checkout of that repository; without it the
@@ -20,7 +23,7 @@ use mediadecode::{
   packet::PacketFlags,
 };
 use mediadecode_ffmpeg::{
-  DecodePath, DecoderLimits, FfmpegOwnedDemuxer as FfmpegDemuxer,
+  DecodePath, DecoderLimits, DemuxerName, DemuxerOpen, FfmpegOwnedDemuxer as FfmpegDemuxer,
   FfmpegOwnedVideoStreamDecoder as FfmpegVideoStreamDecoder, OwnedVideoFrame as VideoFrame,
   OwnedVideoPacket as VideoPacket, empty_owned_video_frame,
 };
@@ -46,10 +49,27 @@ fn fixture(name: &str) -> Option<PathBuf> {
   }
 }
 
-/// The video track of the file at `path`: its index, timebase and codec
-/// parameters, and every packet it delivers, in order.
+/// The open request these laws read an MP4 with: the `mov` demuxer's
+/// inputs declared plaintext.
+fn declared() -> DemuxerOpen {
+  DemuxerOpen::new().with_plaintext_demuxers(vec![
+    DemuxerName::registered("mov,mp4,m4a,3gp,3g2,mj2").expect("the ISOBMFF demuxer"),
+  ])
+}
+
+/// The video track of the file at `path`, opened with the `mov` demuxer
+/// declared plaintext: its index, timebase and codec parameters, and every
+/// packet it delivers, in order.
 fn video_packets(path: &PathBuf) -> (Timebase, ffmpeg_next::codec::Parameters, Vec<VideoPacket>) {
-  let mut demuxer = FfmpegDemuxer::open(path).expect("open the fixture");
+  video_packets_with(path, declared())
+}
+
+/// [`video_packets`], the file opened with `request`.
+fn video_packets_with(
+  path: &PathBuf,
+  request: DemuxerOpen,
+) -> (Timebase, ffmpeg_next::codec::Parameters, Vec<VideoPacket>) {
+  let mut demuxer = FfmpegDemuxer::open_from(path, request).expect("open the fixture");
   let index = demuxer
     .tracks()
     .iter()
@@ -82,6 +102,13 @@ fn the_fx3_clip_marks_sixteen_of_its_twenty_four_pictures_disposable() {
   assert_eq!(packets.len(), 24);
   let marked = packets.iter().filter(|packet| disposable(packet)).count();
   assert_eq!(marked, 16, "the bitstream's two in three");
+  // By default the file is not read, and the container marks nothing.
+  let (_, _, unread) = video_packets_with(&path, DemuxerOpen::new());
+  assert_eq!(unread.len(), 24);
+  assert!(
+    unread.iter().all(|packet| !disposable(packet)),
+    "by default, the container's marks alone: none"
+  );
   // A keyframe is a reference: never marked.
   for packet in packets
     .iter()

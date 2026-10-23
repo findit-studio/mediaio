@@ -80,3 +80,45 @@ fn a_null_context_has_no_format() {
     None,
   );
 }
+
+/// LAW: **a name no demuxer of the linked libavformat goes by, whole, is no
+/// [`DemuxerName`], and is refused by name** — when the option is made,
+/// before any input is opened. A demuxer's whole comma-list name is one,
+/// and so is a single word that is a demuxer's whole name; a word of a
+/// comma list is not, and the refusal names the whole name to give; nor is
+/// a name FFmpeg has no demuxer for, a whole name in another case, or a
+/// part of one. [`FromStr`] refuses as [`DemuxerName::registered`] does.
+///
+/// PLANT: a name taken as given, unchecked, turns this red at "refused by
+/// name".
+#[test]
+fn a_name_no_registered_demuxer_goes_by_is_refused_by_name() {
+  let mov = DemuxerName::registered("mov,mp4,m4a,3gp,3g2,mj2").expect("the ISOBMFF demuxer");
+  assert_eq!(mov.as_str(), "mov,mp4,m4a,3gp,3g2,mj2");
+  assert_eq!(mov.to_string(), "mov,mp4,m4a,3gp,3g2,mj2");
+  let h264 = "h264"
+    .parse::<DemuxerName>()
+    .expect("the raw H.264 demuxer");
+  assert_eq!(h264.as_str(), "h264");
+  let format = ContainerFormat::new(Utf8Bytes::from("mov,mp4,m4a,3gp,3g2,mj2"), None);
+  assert!(format.is(mov), "a session's format is its demuxer");
+  assert!(!format.is(h264), "and no other");
+
+  let word = DemuxerName::registered("mov").expect_err("refused by name: a word of a comma list");
+  assert_eq!(word.name(), "mov");
+  assert_eq!(word.word_of(), Some(mov), "the whole name to give");
+  assert_eq!(
+    word.to_string(),
+    "no demuxer the linked FFmpeg registers is named \"mov\": it is a word of \
+     \"mov,mp4,m4a,3gp,3g2,mj2\", the demuxer's whole name"
+  );
+  for name in ["not a demuxer", "MOV,MP4,M4A,3GP,3G2,MJ2", "mov,mp4", ""] {
+    let refused = name.parse::<DemuxerName>().expect_err("refused by name");
+    assert_eq!(refused.name(), name, "refused by name");
+    assert_eq!(
+      refused.word_of(),
+      None,
+      "{name:?}: a word of no demuxer's name"
+    );
+  }
+}

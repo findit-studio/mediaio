@@ -76,7 +76,7 @@ pub use channel_layout::{
   channel_order_from_ffmpeg,
 };
 pub use codec_id::CodecId;
-pub use container::ContainerFormat;
+pub use container::{ContainerFormat, DemuxerName, UnregisteredDemuxer};
 pub use error::{
   CrossingError, ParametersAlloc, ParametersChannelMap, ParametersCopy, ParametersError,
   ParametersLayoutShape, ParametersMissing, ParametersOpaque, ParametersTooLarge,

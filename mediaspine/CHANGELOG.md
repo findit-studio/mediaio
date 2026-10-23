@@ -88,11 +88,15 @@ Its versions are its own: they do not move with the rest of the family's.
   the container's mark is cleared on every other verdict. Its promise is pixels: dropping a marked packet changes no later
   picture's pixels, and promises nothing of a later frame's best-effort
   timestamp, which a decoder may guess from every frame before; a frame's
-  own pts is the exact one. No encrypted payload is read for it: only a
-  demuxer on an audited allowlist is read (`mov`, and the raw `h264` and
-  `hevc`), and every other demuxer is container-only. One limit is named:
-  a `mov` track's protected sample description that is not its first is
-  outside its guarantee.
+  own pts is the exact one. A container's bitstream is read for it only
+  where the caller declares its demuxer's inputs plaintext: by default the
+  raw `h264` and `hevc` streams alone are read, since FFmpeg cannot prove a
+  container's payload plaintext — an MP4 track under OMA DRM 2's PDCF
+  reaches the demuxer as ciphertext with nothing to say so. The
+  declaration is the caller's assertion, and its risk; inside a declared
+  demuxer every encryption signal FFmpeg gives still ends a reading. The
+  container's own mark reaches a packet only on a track libavformat does
+  not parse as it reads: never on an H.264 track of MP4.
 
 ## [0.1.0] - 2026-10-16
 

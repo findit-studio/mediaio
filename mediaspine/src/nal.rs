@@ -621,11 +621,14 @@ impl fmt::Display for KeptReason {
 /// move the framing and the parameter sets they are read by.
 /// `mediadecode-ffmpeg`'s demuxer drops a track's reading at its first
 /// packet that carries encryption side data, builds none for a track
-/// FFmpeg names encrypted at the open, and reads a track only of a demuxer
-/// on its audited allowlist — `mov`, and the raw `h264` and `hevc` — since
-/// FFmpeg 9.0.1 passes the ciphertext of others with nothing public to say
-/// so: Matroska's encryption without a key id, ASF's and WTV's, MXF's, and
-/// a `concat` input's child, among them.
+/// FFmpeg names encrypted at the open, and reads a container's tracks only
+/// where its caller declares that demuxer's inputs plaintext — by default
+/// the raw `h264` and `hevc` streams alone — since FFmpeg 9.0.1 passes some
+/// ciphertext with nothing public to say so: an MP4 track protected under
+/// OMA DRM 2's PDCF, Matroska's encryption without a key id, ASF's and
+/// WTV's, MXF's, and a `concat` input's child, among them. A declaration
+/// is its caller's assertion that none of the inputs it opens is such
+/// content, and the risk of it the caller's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NalStream {
   codec: NalCodec,

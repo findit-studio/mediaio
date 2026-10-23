@@ -23,6 +23,19 @@ crate moves only when it changes.
   to point the build. This crate now depends on `ffmpeg-sys-next` directly
   for that metadata alone, enabling no feature of it.
 
+### Added
+
+- **`DemuxerName`: a demuxer the linked FFmpeg registers, by its whole
+  name** — an `AVInputFormat.name` exactly as libavformat spells it, the
+  comma list where FFmpeg registers one demuxer for a family
+  (`mov,mp4,m4a,3gp,3g2,mj2`), never a word of it. It is made only from
+  a name the linked libavformat registers (`DemuxerName::registered`, and
+  `FromStr`), found with `av_demuxer_iterate`, and borrows libavformat's
+  own static text. Any other name is refused by name with
+  `UnregisteredDemuxer`, which gives the whole name to use where the
+  refused one is a word of it. `ContainerFormat::is` tells whether a
+  session's format is that demuxer.
+
 ## [0.19.0] - 2026-10-16
 
 ### Added
