@@ -6,10 +6,13 @@
 //! only where the bitstream itself proves that nothing references the
 //! packet's picture and that nothing else the packet carries is needed
 //! later. Anything it cannot prove keeps the packet ([`Verdict::Kept`]),
-//! with the reason. A demuxer ORs the verdict into
-//! [`PacketFlags::DISPOSABLE`](crate::packet::PacketFlags::DISPOSABLE)
-//! beside the container's own mark, so the fact is the same whichever
-//! container carried the stream.
+//! with the reason. Where a demuxer reads a track, the verdict decides
+//! [`PacketFlags::DISPOSABLE`](crate::packet::PacketFlags::DISPOSABLE): it
+//! is set on a disposable packet alone, and the container's own mark is
+//! cleared on every other verdict, since the container cannot see what the
+//! bitstream holds — a picture nothing references may still take up what
+//! an earlier packet left ([`KeptReason::CarriedOver`]). A track the
+//! demuxer does not read carries the container's mark alone.
 //!
 //! It reads NAL unit headers, the first bytes of an HEVC parameter set, the
 //! message headers of an SEI unit, and the bytes of each NAL unit of a

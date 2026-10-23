@@ -286,8 +286,9 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// [`Self::next_packet_impl`] marks a video packet
   /// [`DISPOSABLE`](mediadecode::packet::PacketFlags::DISPOSABLE) where
   /// its NAL units prove that nothing references its picture
-  /// ([`mediadecode::nal`]), in any container, and clears the mark where
-  /// the packet carries side data that persists past it
+  /// ([`mediadecode::nal`]) and nowhere else, in any container, the
+  /// container's mark cleared on every other verdict, and clears the mark
+  /// where the packet carries side data that persists past it
   /// ([`marked_from_bitstream`]). Built at open from each stream's codec
   /// and extradata ([`bitstreams`]); told of every seek ([`sought`]);
   /// dropped for good at a track's first packet whose payload is encrypted
@@ -3304,11 +3305,21 @@ fn says_encrypted(kind: c_int) -> bool {
 /// carries — the first such entry, as `av_packet_get_side_data` answers —
 /// as the decoder takes the two.
 ///
+/// **Where a track is read, its reading's verdict is authoritative.** The
+/// packet is `DISPOSABLE` where the bitstream proves it and nowhere else:
+/// the container's own mark — MP4's `sdtp` — is cleared on every
+/// [`Verdict::Kept`](mediadecode::nal::Verdict::Kept), and on a corrupt
+/// packet. The container cannot see what the reading sees: a packet whose
+/// picture nothing references may still take up SEI state an earlier
+/// packet left ([`KeptReason::CarriedOver`](mediadecode::nal::KeptReason::CarriedOver)),
+/// and dropping it would hand that state to a later picture.
+///
 /// Every packet of a track is read, a corrupt one too, because the decoder
 /// reads it, and what it moves — the framing, the sub-layers its parameter
 /// sets declare — moves for the packets after; a corrupt packet is never
-/// marked. A track without a reading — a codec other than H.264 and HEVC —
-/// keeps the container's mark, unless side data persists.
+/// marked. A track without a reading — a codec other than H.264 and HEVC,
+/// a track FFmpeg names encrypted, or one whose reading an encrypted packet
+/// ended — keeps the container's mark, unless side data persists.
 ///
 /// **An encrypted payload is opaque, and so is its track from then on.** A
 /// packet carrying encryption side data ([`ENCRYPTED_SIDE_DATA`]) is not
@@ -3332,23 +3343,30 @@ fn marked_from_bitstream<D: AsRef<[u8]>>(
     .find(|entry| entry.kind() == NEW_EXTRADATA)
     .map(crate::extras::SideDataEntry::data);
   let encrypted = side_data.iter().any(|entry| says_encrypted(entry.kind()));
-  let proven = match bitstream {
+  // The reading's verdict on this packet — whether it proves the packet
+  // disposable — where a reading gives one.
+  let verdict = match bitstream {
     // Not read, and the track read no more.
     Some(reading) if encrypted => {
       *reading = None;
-      false
+      None
     }
-    Some(Some(bitstream)) => bitstream
-      .read_with_record(packet.data().as_ref(), record)
-      .is_disposable(),
-    _ => false,
+    Some(Some(bitstream)) => Some(
+      bitstream
+        .read_with_record(packet.data().as_ref(), record)
+        .is_disposable(),
+    ),
+    _ => None,
   };
   let mut flags = packet.flags();
-  if persists {
-    flags.remove(PacketFlags::DISPOSABLE);
-  } else if proven && !flags.contains(PacketFlags::CORRUPT) {
-    flags.insert(PacketFlags::DISPOSABLE);
-  }
+  let disposable = !persists
+    && match verdict {
+      // The reading decides, the container's mark with it.
+      Some(proven) => proven && !flags.contains(PacketFlags::CORRUPT),
+      // No reading: the container's mark stands.
+      None => flags.contains(PacketFlags::DISPOSABLE),
+    };
+  flags.set(PacketFlags::DISPOSABLE, disposable);
   if flags == packet.flags() {
     packet
   } else {
@@ -5432,6 +5450,102 @@ mod tests {
     assert!(!disposable(&mut bitstream, hevc_packet(0), vec![]));
     // That picture took it up.
     assert!(disposable(&mut bitstream, hevc_packet(0), vec![]));
+  }
+
+  /// `units`, each HEVC NAL unit after its two-byte length.
+  fn hevc_units(units: &[&[u8]]) -> Vec<u8> {
+    let mut packet = Vec::new();
+    for unit in units {
+      packet.extend_from_slice(&(unit.len() as u16).to_be_bytes());
+      packet.extend_from_slice(unit);
+    }
+    packet
+  }
+
+  /// LAW: **where a track is read, its reading's verdict is authoritative
+  /// over the container's mark**: a packet the container marks
+  /// `DISPOSABLE`, as `mov` marks one from `sdtp`, keeps the mark only where
+  /// the bitstream proves it. Every other verdict clears it, and so does a
+  /// corrupt packet. A track with no reading keeps the container's mark.
+  ///
+  /// Codex R8's counterexample. An HEVC CRA picture, then a prefix SEI unit
+  /// of film grain beside a RASL picture the decoder skips
+  /// (`hevc/hevcdec.c` 3542–3547), then a non-reference picture at the
+  /// highest sub-layer that the container marks. Decoding that picture
+  /// takes up the grain the skipped picture left
+  /// (`KeptReason::CarriedOver`), so dropping it would hand the grain to a
+  /// later picture: the mark goes. The picture after it is proven, and the
+  /// container's mark stands.
+  ///
+  /// PLANT: the container's mark left standing on a `Kept` verdict, as in
+  /// R8, turns this red at "the film grain's picture".
+  #[test]
+  fn a_reading_s_verdict_is_authoritative_over_the_container_s_mark() {
+    // An SPS of one sub-layer; a prefix SEI unit of film grain that does
+    // not persist; a RASL_N picture's first slice segment.
+    let sps: &[u8] = &[0x42, 0x01, 0x01, 0x01, 0x60];
+    let grain: &[u8] = &[0x4E, 0x01, 0x13, 0x02, 0x00, 0x02, 0x80];
+    let rasl: &[u8] = &[8 << 1, 0x01, 0xAF];
+    let sdtp = PacketFlags::DISPOSABLE;
+    let marked = |bitstream: &mut Option<NalStream>, data: Vec<u8>, flags: PacketFlags| {
+      marked_from_bitstream(
+        Some(bitstream),
+        video_packet(data, vec![]).with_flags(flags),
+      )
+      .flags()
+    };
+
+    let mut bitstream = Some(NalStream::new(NalCodec::Hevc, &hvcc(&[sps])));
+    assert_eq!(
+      marked(&mut bitstream, hevc_packet(21), PacketFlags::KEY),
+      PacketFlags::KEY,
+      "the CRA picture"
+    );
+    assert_eq!(
+      marked(
+        &mut bitstream,
+        hevc_units(&[grain, rasl]),
+        PacketFlags::empty()
+      ),
+      PacketFlags::empty(),
+      "the skipped picture and its grain"
+    );
+    assert_eq!(
+      marked(&mut bitstream, hevc_packet(0), sdtp),
+      PacketFlags::empty(),
+      "the film grain's picture: kept, and the container's mark goes"
+    );
+    assert_eq!(
+      marked(&mut bitstream, hevc_packet(0), sdtp),
+      sdtp,
+      "proven: the container's mark stands"
+    );
+    // A corrupt packet the container marks loses the mark where its track
+    // is read.
+    assert_eq!(
+      marked(&mut bitstream, hevc_packet(0), PacketFlags::CORRUPT | sdtp),
+      PacketFlags::CORRUPT,
+      "a corrupt packet"
+    );
+    // Any other verdict clears it too: a random-access picture.
+    let mut fresh = Some(NalStream::new(NalCodec::Hevc, &hvcc(&[sps])));
+    assert_eq!(
+      marked(&mut fresh, hevc_packet(21), PacketFlags::KEY | sdtp),
+      PacketFlags::KEY,
+      "a random-access picture the container marks"
+    );
+    // No reading: the container's mark stands, as the container gave it.
+    let mut unread: Option<NalStream> = None;
+    assert_eq!(
+      marked(&mut unread, hevc_packet(0), sdtp),
+      sdtp,
+      "no reading"
+    );
+    assert_eq!(
+      marked(&mut unread, hevc_packet(0), PacketFlags::CORRUPT | sdtp),
+      PacketFlags::CORRUPT | sdtp,
+      "no reading, a corrupt packet"
+    );
   }
 
   #[test]

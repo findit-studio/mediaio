@@ -14,15 +14,19 @@ The backend-agnostic core it adapts has its own log at
 ### Changed
 
 - **The demuxer marks `PacketFlags::DISPOSABLE` from the bitstream.**
-  Beside the container's own mark (MP4's `sdtp`), a video packet of an
-  H.264 or HEVC track is marked where its NAL units prove that nothing
-  references its picture (`mediadecode::nal`): a non-reference H.264
-  picture, or an HEVC sub-layer non-reference picture at the highest
-  temporal sub-layer, with nothing beside it a later picture needs — in
-  any container, read with the `AV_PKT_DATA_NEW_EXTRADATA` it carries as
-  the decoder takes the two, and told of every seek. Every packet is
-  read, a corrupt one too, as the decoder reads it; a corrupt one is never
-  marked. **A packet carrying side data that persists past it — a new
+  A video packet of an H.264 or HEVC track is marked where its NAL units
+  prove that nothing references its picture (`mediadecode::nal`): a
+  non-reference H.264 picture, or an HEVC sub-layer non-reference picture
+  at the highest temporal sub-layer, with nothing beside it a later
+  picture needs — in any container, read with the
+  `AV_PKT_DATA_NEW_EXTRADATA` it carries as the decoder takes the two,
+  and told of every seek. **Where a track is read, its reading decides:
+  the container's own mark (MP4's `sdtp`) is cleared on every other
+  verdict**, since a picture nothing references may still take up SEI
+  state an earlier packet left — film grain a skipped RASL picture's SEI
+  left, for one. A track not read keeps the container's mark. Every
+  packet is read, a corrupt one too, as the decoder reads it; a corrupt
+  one is never marked. **A packet carrying side data that persists past it — a new
   configuration, a parameter change, a palette, captions, and any type
   this build does not name — is never `DISPOSABLE`: the container's mark
   is cleared there too.** **An encrypted payload is never read:** a

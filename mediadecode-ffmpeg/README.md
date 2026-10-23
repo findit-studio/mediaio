@@ -349,15 +349,17 @@ for end-to-end demuxer-driven runs that cover all three streams.
   (`open_reader`). Plus `DemuxError`, and `format()` → `ContainerFormat`
   — libavformat's own identification of the bytes (`"matroska,webm"`,
   `"mov,mp4,m4a,3gp,3g2,mj2"`), read from the container rather than
-  guessed from a path. A video packet is marked
-  `PacketFlags::DISPOSABLE` where the container says nothing
-  references it (MP4's `sdtp`) **or** where its H.264 or HEVC NAL units
-  prove it (`mediadecode::nal`) — a non-reference picture, or an HEVC
-  sub-layer non-reference picture at the highest temporal sub-layer,
-  with nothing beside it a later picture needs — in any container. A
-  Sony XAVC original, which carries no `sdtp`, has two pictures in three
-  marked; a consumer that keeps only reference pictures drops them
-  before they are decoded.
+  guessed from a path. A video packet of an H.264 or HEVC track is
+  marked `PacketFlags::DISPOSABLE` where its NAL units prove that
+  nothing references it (`mediadecode::nal`) — a non-reference picture,
+  or an HEVC sub-layer non-reference picture at the highest temporal
+  sub-layer, with nothing beside it a later picture needs — in any
+  container, and only there: where a track is read, its reading
+  decides, the container's own mark (MP4's `sdtp`) with it. A track not
+  read — another codec's — keeps the container's mark. A Sony XAVC
+  original, which carries no `sdtp`, has two pictures in three marked; a
+  consumer that keeps only reference pictures drops them before they are
+  decoded.
 - **Codec identity**: `CodecId` — the number FFmpeg keys on, with
   `name()` / `long_name()` reading libavcodec's own descriptor table
   for the word beside it (`"h264"`, `"aac"`), so a stored track row can

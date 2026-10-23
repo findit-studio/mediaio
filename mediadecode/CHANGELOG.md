@@ -23,7 +23,8 @@ The sibling FFmpeg adapter has its own log at
 ### Changed
 
 - **`PacketFlags::DISPOSABLE` is the container's mark or the
-  bitstream's.** Its contract is unchanged — absent means unknown — but a
+  bitstream's**, and the bitstream's verdict decides wherever a demuxer
+  reads a track. Its contract is unchanged — absent means unknown — but a
   demuxer that reads the bitstream, as `mediadecode-ffmpeg`'s now does,
   marks more H.264 and HEVC packets than the container does, so a
   consumer that drops them decodes fewer pictures. Its promise is pixels:
