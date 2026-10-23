@@ -18,7 +18,11 @@
 ///
 /// `test_path` must be the test's name as libtest spells it — the
 /// module path inside the crate, e.g. `demuxer::tests::the_lane` — so
-/// that `--exact` selects exactly this test in the child.
+/// that `--exact` selects exactly this test in the child. The child runs
+/// it whether or not it is `#[ignore]`d (`--include-ignored`): an ignored
+/// lane — one that needs a sample or a hardware backend — reaches this only
+/// in a run that asked for ignored lanes, and its child runs what its
+/// parent ran.
 pub fn in_subprocess(test_path: &str, body: impl FnOnce()) {
   const CHILD: &str = "MEDIAIO_FFMPEG_FAULT_CHILD";
 
@@ -29,7 +33,13 @@ pub fn in_subprocess(test_path: &str, body: impl FnOnce()) {
 
   let exe = std::env::current_exe().expect("the test binary's own path");
   let output = std::process::Command::new(exe)
-    .args(["--exact", test_path, "--nocapture", "--test-threads=1"])
+    .args([
+      "--exact",
+      test_path,
+      "--include-ignored",
+      "--nocapture",
+      "--test-threads=1",
+    ])
     .env(CHILD, test_path)
     .output()
     .expect("spawning the child test process");

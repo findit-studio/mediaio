@@ -205,6 +205,25 @@ crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
   format the download is made in, at the frames context's extent, where it
   priced the costliest format the backend lists, which over-refused a
   picture whose first format was cheaper.
+- **A picture whose download runs out of memory is held, not lost.** The
+  download-format list's, the destination's or the properties' copy's
+  `ENOMEM` returned this crate's own error with the decoded picture left in
+  the scratch frame, and the next receive unreferenced it
+  (`avcodec_receive_frame` clears its frame first), so the picture was
+  gone. It is held now, and the next receive downloads it again before it
+  asks the decoder for another: delivered, in order, once. A flush, a
+  rejected candidate or a terminal state drops it. On trial, a picture the
+  backend failed to download while a refusal of this crate's own (the frame
+  budget) was latched beside it is held too: the refusal is answered, and a
+  backend failing again is charged at the next download. A picture over the
+  frame limit is dropped by name, its pts in the refusal.
+- **The scaled-output road charges the backend's own transfer failure to
+  the backend.** A fitted surface whose download failed was taken for the
+  stage's failure whatever the cause: the stage stood down and the
+  full-size frame was downloaded, so a backend's transfer error on trial
+  was never recorded. The fitted download now keeps every failure's class,
+  as the full-size one does, and the stage stands down for reasons of its
+  own alone, all decided before a fitted download.
 
 ### Added
 
@@ -223,6 +242,10 @@ crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
 - **`Error::Spent`**, its payload `Spent` (`ProbeExhausted`,
   `AmbiguousSend`, `FallbackFailed`): what every send, end and receive of a
   spent decoder answers, naming the error that spent it.
+
+- **`HwTransferTooLarge::pts` and `with_pts`**: the refusal names the
+  picture it drops, by its presentation timestamp, and says that it is
+  dropped.
 
 - **`Error::DownloadFormatUnsupported`**, its payload
   `DownloadFormatUnsupported` with `format()`, the raw `AVPixelFormat` the

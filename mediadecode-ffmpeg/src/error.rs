@@ -88,13 +88,15 @@ pub enum Error {
   /// The CPU frame a hardware->CPU transfer would allocate is larger
   /// than [`FrameLimits::max_frame_bytes`](crate::FrameLimits::max_frame_bytes).
   ///
-  /// The hardware road's own seat. `judge_buffer` — the allocator hook
+  /// A picture's download would cost more than the caller's frame limit:
+  /// the hardware road's own ceiling. `judge_buffer` — the allocator hook
   /// that applies the byte ceiling to aligned dimensions — is **not** a
   /// universal choke point: `ff_get_buffer` calls `hwaccel->alloc_frame`
   /// directly for VideoToolbox h264/hevc/vp9 and never reaches
-  /// `get_buffer2` at all, and `av_hwframe_transfer_data` allocates its
-  /// CPU destination outside both. This is the seat for that second
-  /// road, judged before the transfer rather than after it.
+  /// `get_buffer2` at all, and the CPU destination of a download is
+  /// allocated outside both. So that second road is judged here, before the
+  /// destination is allocated. The picture is dropped, named by its pts, and
+  /// nothing is charged.
   #[error(transparent)]
   HwTransferTooLarge(#[from] HwTransferTooLarge),
 
@@ -655,19 +657,34 @@ impl std::fmt::Debug for FallbackFailed {
 /// Payload for [`Error::HwTransferTooLarge`].
 ///
 /// The CPU-side cost of a hardware->CPU download, priced before it
-/// happens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("hw->cpu transfer would allocate {bytes} bytes for one frame, over a ceiling of {limit}")]
+/// happens. **The picture is dropped**, deliberately: the limit is the
+/// caller's, so no retry can deliver it, and nothing is charged to the
+/// backend. It is named by its presentation timestamp ([`Self::pts`]), so it
+/// is never lost unseen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HwTransferTooLarge {
   bytes: usize,
   limit: usize,
+  pts: Option<i64>,
 }
 
 impl HwTransferTooLarge {
-  /// Constructs a `HwTransferTooLarge` payload.
+  /// Constructs a `HwTransferTooLarge` payload, naming no picture.
   #[inline]
   pub const fn new(bytes: usize, limit: usize) -> Self {
-    Self { bytes, limit }
+    Self {
+      bytes,
+      limit,
+      pts: None,
+    }
+  }
+  /// The payload, naming the dropped picture by its presentation timestamp,
+  /// in the stream's time base: `None` where the picture carried none.
+  #[inline]
+  #[must_use]
+  pub const fn with_pts(mut self, pts: Option<i64>) -> Self {
+    self.pts = pts;
+    self
   }
   /// Bytes the destination frame would have cost.
   #[inline]
@@ -679,7 +696,30 @@ impl HwTransferTooLarge {
   pub const fn limit(&self) -> usize {
     self.limit
   }
+  /// The dropped picture's presentation timestamp, in the stream's time
+  /// base: `None` where it carried none.
+  #[inline]
+  pub const fn pts(&self) -> Option<i64> {
+    self.pts
+  }
 }
+
+impl core::fmt::Display for HwTransferTooLarge {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "hw->cpu transfer would allocate {} bytes for one frame, over a ceiling of {}; the \
+       picture is dropped",
+      self.bytes, self.limit
+    )?;
+    match self.pts {
+      Some(pts) => write!(f, " (pts {pts})"),
+      None => f.write_str(" (no pts)"),
+    }
+  }
+}
+
+impl std::error::Error for HwTransferTooLarge {}
 
 /// Payload for [`Error::DownloadFormatUnsupported`]: a picture's hardware
 /// download would choose a CPU layout [`Frame`](crate::Frame) cannot carry,

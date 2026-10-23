@@ -291,9 +291,12 @@ pub struct VideoDecoder {
 /// | receive | this crate's own refusal latched (the frame budget) | `Trial` | the refusal | — |
 /// | receive | a picture whose download would choose a layout a [`Frame`] cannot carry, or for which the backend lists none (`AV_PIX_FMT_NONE`) | leaves the candidate, unfit ([`Attempt::Unfit`]), naming the layout | as leaving answers | the caller's frame cleared |
 /// | receive | a picture the backend cannot download: its transfer fails, or its list fails other than for memory | leaves the candidate | as leaving answers | the caller's frame cleared |
-/// | receive | a picture over the frame limit ([`Error::HwTransferTooLarge`]), or one whose destination's allocation, format list (`ENOMEM`) or properties' copy fails | `Trial` | that error, this crate's own | no delivery: nothing charged |
+/// | receive | the same, a refusal of this crate's own latched beside it (the frame budget), which the funnel answers instead | `Trial`, the picture held ([`Held::Pending`]) | the refusal | nothing charged; the next receive downloads it again first, and charges a backend failing again |
+/// | receive | a picture held ([`Held::Pending`]) | as its download answers | as its download answers | downloaded again, before the decoder is asked or fed anything |
+/// | receive | a picture over the frame limit | `Trial` | [`Error::HwTransferTooLarge`], naming its pts | the picture dropped; nothing charged |
+/// | receive | a picture whose format list, destination or properties' copy runs out of memory | `Trial`, the picture held ([`Held::Pending`]) | `ENOMEM`, this crate's own | nothing charged; the next receive downloads it again first |
 /// | receive | a picture delivered | `Committed` | `Produced` | the history's unfed rest becomes the backlog |
-/// | flush | — | `Trial` | — | the decoder flushed; the history forgotten; the end open again |
+/// | flush | — | `Trial` | — | the decoder flushed; the history forgotten; the end open again; a picture held cleared |
 /// | drop | — | — | — | the decoder and the history freed |
 ///
 /// ## An advance owed ([`Session::Owed`])
@@ -330,9 +333,12 @@ pub struct VideoDecoder {
 /// | receive | `AVERROR_EOF` | `Committed` | `Ended` | — |
 /// | receive | the decoder's error, a refusal | `Committed` | that error | — |
 /// | receive | a picture whose download would choose a layout a [`Frame`] cannot carry, or for which the backend lists none | `Committed` | [`Error::DownloadFormatUnsupported`], naming the layout or `AV_PIX_FMT_NONE` | no delivery |
-/// | receive | a picture the backend cannot download; one over the frame limit; a destination, list or properties' failure | `Committed` | that error | no delivery |
+/// | receive | a picture held ([`Held::Pending`]) | as its download answers | as its download answers | downloaded again, before the decoder is asked or fed anything |
+/// | receive | a picture the backend cannot download | `Committed` | that picture's error, or the refusal latched beside it | the picture dropped |
+/// | receive | a picture over the frame limit | `Committed` | [`Error::HwTransferTooLarge`], naming its pts | the picture dropped |
+/// | receive | a picture whose format list, destination or properties' copy runs out of memory | `Committed`, the picture held | `ENOMEM`, this crate's own | the next receive downloads it again first |
 /// | receive | a picture delivered | `Committed` | `Produced` | — |
-/// | flush | — | `Committed` | — | the decoder flushed; the backlog and the end dropped |
+/// | flush | — | `Committed` | — | the decoder flushed; the backlog and the end dropped; a picture held cleared |
 /// | drop | — | — | — | the decoder and the backlog freed |
 ///
 /// ## Spent ([`Session::Exhausted`], [`Session::Ended`])
@@ -345,6 +351,58 @@ pub struct VideoDecoder {
 ///
 /// The terminal states are terminal: going on means building a new decoder,
 /// from the packets the error that spent this one handed back.
+///
+/// **A send never writes the picture held.** It goes to the decoder alone,
+/// so a picture held stays held across any send, and the receive delivers
+/// it before it asks the decoder for another: pictures go out in decode
+/// order. Only a rejection or a terminal state a send makes clears it.
+///
+/// # The output side (Codex R3, finding 1)
+///
+/// **Where a decoded picture is held**, and what becomes of it:
+///
+/// | where | from | until |
+/// |---|---|---|
+/// | [`VideoDecoder::hw_frame`], with [`Held`] in `Trial` and `Committed` | `avcodec_receive_frame` | its download delivers it (`Held::Nothing`; the residual reference goes at the next `avcodec_receive_frame`, which unreferences its frame first — `libavcodec/avcodec.c` 707–710 in FFmpeg 9.0.1 — or a flush, a rejection, a terminal state or the drop). A retryable failure keeps it (`Held::Pending`), downloaded again before the decoder is asked, since that unreference would destroy it. A deliberate drop clears it: the frame limit, by its pts; a committed decoder's backend answer or uncarriable layout; an unreachable local code. A rejection, a flush or a terminal state clears it, its reference with it |
+/// | the scaled stage's fitted surface ([`crate::vtscale`]) | `ScaledOutput::stage`, from `hw_frame` | its download. Made again from `hw_frame` when a held picture is downloaded again, under the request standing then: a held picture has not been produced, and a request takes effect from the next picture produced ([`VideoDecoder::request_scaled_output`]), so its extent is the one promised. The stream decoder refuses a request only while its own scratch holds a picture already downloaded |
+/// | the caller's [`Frame`] | a delivered download | the caller's. A transfer clears it on entry and on every failure; a failure before the transfer (the list, the ceiling) leaves it as it was handed in; a candidate left clears it whole |
+/// | the stream decoder's `hw_scratch` and `sw_scratch` ([`crate::FfmpegVideoStreamDecoder`]) | the receive | their conversion. One that fails for an allocation parks the picture (`scratch_pending`), converted again before anything else and before any send |
+/// | the stream decoder's `sw_replay_frames` | the software fallback's replay | delivered in order, each removed only once a carrier exists for it |
+///
+/// **Every failure on the way from `avcodec_receive_frame` to a delivered
+/// `Frame`**, by class — the same on every road below:
+///
+/// | step | failure | class | the picture, on trial | the picture, committed |
+/// |---|---|---|---|---|
+/// | the format list | `ENOMEM` (its allocation, and the only failure the four backends' lists answer) | retryable local | held; nothing charged | held |
+/// | the format list | another code (`ENOSYS`: a type with no list) | the backend's answer | the candidate left, recorded | dropped; that picture's error |
+/// | the format list | empty, or a layout a `Frame` cannot carry | unfit | the candidate left, `Attempt::Unfit` | dropped; `DownloadFormatUnsupported` |
+/// | the ceiling | over the frame limit | non-retryable local | dropped, `HwTransferTooLarge` naming its pts; nothing charged | the same |
+/// | the destination (`av_frame_get_buffer`) | `ENOMEM` | retryable local | held; nothing charged | held |
+/// | the destination | another code | unreachable: it needs a format or an extent `av_hwframe_ctx_init` refused (`libavutil/frame.c` 206–218 and its video path; `hwcontext.c` 362) | dropped | dropped |
+/// | the frames context's extent | unreadable | unreachable: the ceiling refuses it first | dropped | dropped |
+/// | the backend's transfer (`av_hwframe_transfer_data` on an allocated destination) | any code, `ENOMEM` included | the backend's answer | the candidate left, recorded | dropped; that picture's error |
+/// | the transfer of a picture with no frames context (`DownloadFormat::Unpicked`: a CPU picture from a context opened for hardware) | `EINVAL`, before it allocates anything (`libavutil/hwcontext.c` 404–405) | the backend's answer | the candidate left, recorded | dropped; that picture's error |
+/// | the backend's transfer, or the list's other code | a refusal of this crate's own latched beside it, which the funnel answers instead (the frame budget) | the refusal, this crate's own | held; the refusal answered, nothing charged; a backend failing again at the next download is charged then | dropped; the refusal |
+/// | the layout after the transfer | another than picked | unreachable by source; defensive | unfit | `DownloadFormatUnsupported` |
+/// | the properties' copy | `ENOMEM` (`av_frame_new_side_data`, its only failure) | retryable local | held; nothing charged | held |
+/// | a terminal state | `ProbeExhausted`, `AmbiguousSend` | terminal | cleared, its packet in the history handed back | unreachable while held — a committed decoder ends only on its feed, which runs after the decoder answers `EAGAIN`, and no receive asks it while a picture is held — and cleared all the same |
+///
+/// So, on every road reachable by source, **a candidate on trial never
+/// loses a picture it stays on trial past, except by name**: each is
+/// delivered, held, or goes with the candidate when it is left — the next
+/// replayed the history whole — or, over the frame limit, is dropped naming
+/// its pts. A committed decoder drops a picture only with that picture's
+/// error.
+///
+/// **Every road a transfer takes** (Codex R3, finding 2):
+///
+/// | road | taken when | its failures |
+/// |---|---|---|
+/// | the full-size download | no fitted surface | each by its class above |
+/// | the fitted download ([`crate::vtscale`]) | the stage hands over a fitted surface | each by its class above, through [`VideoDecoder::route_download`] as the full-size one: the backend's transfer is the backend's, through the probe's policy. None is merged into the stage standing down |
+/// | the full-size download after the stage stands down | one of the stage's own reasons, all decided before any fitted download ([`VideoDecoder::fitted_download`] names them) | as the full-size download |
+/// | the stream decoder's software fallback | `DecodePath::Auto` after `ProbeExhausted` | no transfer: the software decoder's own answers, through its funnel, and the conversion |
 ///
 /// ## Unreachable, and why
 ///
@@ -391,6 +449,8 @@ struct Trial {
   probe: ProbeState,
   /// The end, as the candidate has it.
   end: End,
+  /// The picture the candidate decoded and this decoder has not delivered.
+  held: Held,
 }
 
 /// An advance the probe owes ([`Session::Owed`]).
@@ -416,6 +476,27 @@ struct Committed {
   backlog: VecDeque<Packet>,
   /// The end, as the decoder has it.
   end: End,
+  /// The picture the decoder decoded and this decoder has not delivered.
+  held: Held,
+}
+
+/// **A decoded picture this decoder holds and has not delivered** — the
+/// session's output side ([`Session`], "The output side"). The picture is
+/// in [`VideoDecoder::hw_frame`], and the receive road matches this before
+/// it asks the decoder for another ([`VideoDecoder::receive_frame`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Held {
+  /// Nothing undelivered: the next receive asks the decoder.
+  Nothing,
+  /// A picture received from the decoder whose download has not delivered
+  /// it: one in progress; one that failed for an allocation of this crate's
+  /// own that can pass (the format list's, the destination's, the
+  /// properties' copy's `ENOMEM`); or, on trial, one the backend failed to
+  /// download while a refusal of this crate's own was latched beside it.
+  /// The next receive downloads it again before anything else, so it is
+  /// delivered, in order, once. A flush, a rejection or a terminal state
+  /// clears it, its reference with it.
+  Pending,
 }
 
 /// **The end of the stream, as one live decoder has it** — the one state that
@@ -1464,6 +1545,7 @@ impl VideoDecoder {
               decoder: state,
               probe,
               end: End::Open,
+              held: Held::Nothing,
             }),
             hw_frame: alloc_av_frame().map_err(Error::Ffmpeg)?,
             frame_limits: limits,
@@ -1572,6 +1654,7 @@ impl VideoDecoder {
         decoder: state,
         backlog: VecDeque::new(),
         end: End::Open,
+        held: Held::Nothing,
       }),
       hw_frame: alloc_av_frame().map_err(Error::Ffmpeg)?,
       frame_limits: limits,
@@ -1655,11 +1738,13 @@ impl VideoDecoder {
         decoder: state,
         probe,
         end: End::Open,
+        held: Held::Nothing,
       }),
       None => Session::Committed(Committed {
         decoder: state,
         backlog: VecDeque::new(),
         end: End::Open,
+        held: Held::Nothing,
       }),
     };
     Ok(Self {
@@ -2454,10 +2539,22 @@ impl VideoDecoder {
   ///
   /// **The first delivered picture commits the candidate**: downloaded in a
   /// layout a [`Frame`] carries, its properties copied. A picture whose
-  /// download would cost more than the caller's frame limit
-  /// ([`Error::HwTransferTooLarge`]), or whose properties this crate cannot
-  /// copy, is no delivery and charges nothing: the error is this crate's own,
-  /// and a candidate on trial stays on trial. A picture whose download would
+  /// download would cost more than the caller's frame limit is no delivery
+  /// and charges nothing: it is dropped, named by its pts
+  /// ([`Error::HwTransferTooLarge`]), and a candidate on trial stays on
+  /// trial.
+  ///
+  /// **A picture whose download runs out of memory is held, not lost**: the
+  /// format list's, the destination's or the properties' copy's `ENOMEM` is
+  /// this crate's own error, answered as it is and charging nothing, and the
+  /// picture stays in the decoder's scratch frame ([`Held::Pending`]). The
+  /// next receive downloads that picture again before it asks the decoder
+  /// for another, so it is delivered, in order, once. So is a candidate's
+  /// picture whose download the backend failed while a refusal of this
+  /// crate's own was latched beside it (the frame budget): the refusal is
+  /// answered, the candidate stays on trial, and a backend failing again at
+  /// the next download is charged. A flush, a rejected candidate or a
+  /// terminal state drops a picture held. A picture whose download would
   /// choose a layout a `Frame` cannot carry, or for which the backend lists
   /// none, is no delivery either: on trial, the candidate is unfit, and the
   /// probe leaves it as above; from a committed decoder, it is
@@ -2512,7 +2609,24 @@ impl VideoDecoder {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
       let phase = self.phase();
+      // **A picture held from an earlier receive goes first** (Codex R3,
+      // finding 1). Its download failed for an allocation of this crate's
+      // own that can pass, or, on trial, for a backend a refusal of this
+      // crate's own outranked, and it is still in `hw_frame`. Asking the
+      // decoder now would destroy it — `avcodec_receive_frame` unreferences
+      // its frame before anything else (`libavcodec/avcodec.c` 707–710 in
+      // FFmpeg 9.0.1) — so it is downloaded again, before the decoder is
+      // asked for another or fed anything it is owed: delivered in order,
+      // once.
       let res = match &mut self.session {
+        Session::Trial(Trial {
+          held: Held::Pending,
+          ..
+        })
+        | Session::Committed(Committed {
+          held: Held::Pending,
+          ..
+        }) => Ok(()),
         Session::Trial(Trial { decoder, .. }) | Session::Committed(Committed { decoder, .. }) => {
           decoder.inner.receive_frame(&mut self.hw_frame)
         }
@@ -2613,6 +2727,10 @@ impl VideoDecoder {
           }
         }
         Ok(()) => {
+          // **The picture is held from here until it is delivered or dropped**
+          // ([`Held::Pending`]): every outcome below says which, and one that
+          // returns early leaves it held rather than lost.
+          self.set_held(Held::Pending);
           // **The download is split, so only the backend's own call is the
           // backend's** (Codex R2, finding 2). `av_hwframe_transfer_data`
           // into an empty destination allocates it first — `av_frame_alloc`,
@@ -2624,7 +2742,9 @@ impl VideoDecoder {
           // the ceiling, then the destination. Only then is the backend
           // called, into a destination with buffers, which libavutil hands to
           // the backend's own transfer callback and allocates nothing for
-          // (448–453, 486–492).
+          // (448–453, 486–492). Every failure on the way keeps its class on
+          // every road ([`Self::route_download`]; "The output side" in
+          // [`Session`]'s documentation).
           //
           // **First the format, and whether a `Frame` carries it, before any
           // transfer** (the ruling on Codex R8's finding 5): a candidate
@@ -2650,23 +2770,31 @@ impl VideoDecoder {
           // straight to the caller.
           //
           // **And the picture is no delivery, so nothing is committed or
-          // charged.** The limit is this crate's, never the backend's
-          // answer: a candidate on trial stays on trial, the history kept,
-          // and commits at its first delivered picture — or at a packet the
-          // history cannot keep, which commits it with no failure claimed.
+          // charged — and it is dropped by name.** The limit is the caller's,
+          // so no retry can deliver it: the picture goes, its pts in the
+          // refusal, so it is never lost unseen. A candidate on trial stays
+          // on trial, the history kept, and commits at its first delivered
+          // picture — or at a packet the history cannot keep, which commits
+          // it with no failure claimed.
           // SAFETY: `hw_frame` is the live frame this receive filled, and
           // `format` the one read from it.
           if let Err(e) =
             unsafe { judge_hw_transfer(self.hw_frame.as_ptr(), format, self.frame_limits.frame()) }
           {
-            return Err(Error::HwTransferTooLarge(e));
+            let pts = self.picture_pts();
+            self.drop_picture();
+            return Err(Error::HwTransferTooLarge(e.with_pts(pts)));
           }
-          // **The scaled-output stage, and the one place it sits.** A
+          // **The scaled-output road, and the one place it sits.** A
           // standing request turns this into a GPU resize followed by a
-          // download of the *fitted* surface; with no request, or on any
-          // condition the stage cannot honor, `stage` answers `None` and
-          // the full-size hardware frame is downloaded exactly as
-          // before. It cannot fail — see [`crate::vtscale`].
+          // download of the *fitted* surface ([`Self::fitted_download`]).
+          // The stage stands down for reasons of its own alone — named there,
+          // by source — and the full-size frame is downloaded instead. A
+          // fitted download that is made keeps every failure's class, as the
+          // full-size one does (Codex R3, finding 2): the backend's transfer
+          // is the backend's on this road too, and goes through the probe's
+          // policy; the rest are unfit, retryable, or this crate's own, as
+          // below. Nothing on it is merged into the stage standing down.
           //
           // The byte ceiling above is deliberately **not** re-priced
           // against the fitted size. `judge_hw_transfer` bounds what
@@ -2676,47 +2804,10 @@ impl VideoDecoder {
           // turning the stage on can never widen what the ceiling lets
           // through. What it saves is the bus traffic and the CPU
           // allocation actually paid, which is the trade #55 is about.
-          //
-          // **And a fitted surface that will not download is the
-          // stage's failure, not the backend's.** The scale can succeed
-          // and the crossing still fail — an unsupported destination
-          // pixel format, a metadata copy that runs out of memory — and
-          // routing that into the arms below would let an optional
-          // bandwidth optimisation reject a VideoToolbox decode that
-          // was working, or cost the caller a picture the hardware
-          // decoded. So the fitted attempt is made first and
-          // separately, through the same split: if it fails, the stage
-          // latches the key off, the destination is reset, and the
-          // original full-size frame — still live in `hw_frame` — is
-          // downloaded instead. Only *that* failing is the backend's.
-          let scaled = self.scaled_output.stage(&self.hw_frame).map(|fitted| {
-            // SAFETY: `fitted` is the stage's live VideoToolbox frame, and
-            // `frame` the caller's slot.
-            unsafe { download_format_of(fitted) }
-              .and_then(|format| unsafe { transfer_hw_frame(frame, fitted, format) })
-          });
-          match scaled {
-            Some(Ok(())) => {
-              self.commit();
-              return Ok(Received::Produced);
-            }
-            Some(Err(e)) => {
-              tracing::warn!(
-                error = %e,
-                "hwdecode: the fitted surface would not download; retiring scaled output for \
-                 this size and delivering the full-size frame instead"
-              );
-              self.scaled_output.latch_failure();
-              // SAFETY: `frame` is the caller's slot; unreferencing it
-              // discards whatever the failed transfer left behind
-              // before the retry writes it again, and leaves an empty
-              // frame whose geometry describes no buffer — the shape
-              // `as_inner_mut`'s contract allows.
-              unsafe { av_frame_unref(frame.as_inner_mut().as_mut_ptr()) };
-            }
-            None => {}
-          }
-          let downloaded = self.download(frame, format);
+          let downloaded = match self.fitted_download(frame) {
+            Some(fitted) => fitted,
+            None => self.download(frame, format),
+          };
           match self.route_download(downloaded, frame)? {
             Some(status) => return Ok(status),
             None => continue,
@@ -2726,12 +2817,107 @@ impl VideoDecoder {
     }
   }
 
+  /// **The scaled-output road** ([`crate::vtscale`]): `None` where the stage
+  /// does not scale this picture, and the full-size download follows;
+  /// `Some` with the fitted surface's download, routed by class as the
+  /// full-size one is ([`Self::route_download`]).
+  ///
+  /// The stage's own reasons, the only ones that send a picture down the
+  /// full-size road, are all decided inside
+  /// [`ScaledOutput::stage`](crate::vtscale::ScaledOutput::stage), before
+  /// any fitted download (`vtscale/videotoolbox.rs`):
+  /// - no standing request, or a promise already broken;
+  /// - an extent it cannot read, or already the requested one;
+  /// - a source it cannot read (`read_source`: no VideoToolbox surface, no
+  ///   frames context or pixel buffer, a crop, a pixel buffer whose extent
+  ///   is not the frame's, side data a resize would strand), or a request
+  ///   that is no downscale of it;
+  /// - a sample aspect ratio it cannot represent;
+  /// - a session it cannot build (`Built::create`);
+  /// - its own transfer failing (`Built::transfer`): a fitted surface it
+  ///   cannot draw from its pool, one whose pixel format is not the
+  ///   source's, one with no pixel buffer, the resize itself, or the
+  ///   picture's properties it cannot carry onto the fitted surface.
+  ///
+  /// Every other stage (the stub off Apple targets) answers `None`. Once
+  /// the stage hands over a fitted surface, its download — the format list,
+  /// the destination, the backend's transfer, the properties' copy — is the
+  /// same download as the full-size one, each failure its own class.
+  fn fitted_download(
+    &mut self,
+    frame: &mut Frame,
+  ) -> Option<std::result::Result<(), TransferFailure>> {
+    #[cfg(test)]
+    if let Some(answer) = FITTED_FOR_TEST.with(|script| {
+      script
+        .borrow_mut()
+        .as_mut()
+        .map(|answers| answers.pop_front().unwrap_or(FittedForTest::StandsDown))
+    }) {
+      return match answer {
+        FittedForTest::StandsDown => None,
+        FittedForTest::Delivers => Some(delivered_for_test(frame, &self.hw_frame)),
+        FittedForTest::Fails(failure) => Some(Err(failure)),
+      };
+    }
+    let fitted = self.scaled_output.stage(&self.hw_frame)?;
+    // SAFETY: `fitted` is the stage's live VideoToolbox frame, and `frame`
+    // the caller's slot.
+    Some(unsafe { download_format_of(fitted) }.and_then(|format| {
+      #[cfg(test)]
+      let _capped = CappedTransferForTest::take();
+      // SAFETY: as above.
+      unsafe { transfer_hw_frame(frame, fitted, format) }
+    }))
+  }
+
+  /// The picture the live decoder holds undelivered ([`Held`]); `Nothing`
+  /// where no decoder lives. The receive road matches the session for it
+  /// directly; the laws read it here.
+  #[cfg(test)]
+  const fn held(&self) -> Held {
+    match &self.session {
+      Session::Trial(Trial { held, .. }) | Session::Committed(Committed { held, .. }) => *held,
+      Session::Owed(_) | Session::Exhausted(_) | Session::Ended(_) => Held::Nothing,
+    }
+  }
+
+  /// Records what the live decoder holds undelivered; nothing where no
+  /// decoder lives.
+  fn set_held(&mut self, to: Held) {
+    match &mut self.session {
+      Session::Trial(Trial { held, .. }) | Session::Committed(Committed { held, .. }) => *held = to,
+      Session::Owed(_) | Session::Exhausted(_) | Session::Ended(_) => {}
+    }
+  }
+
+  /// **Drops the picture held, deliberately**: the scratch frame cleared,
+  /// its reference with it, and nothing held after.
+  fn drop_picture(&mut self) {
+    // SAFETY: `hw_frame` is a valid AVFrame we own; `av_frame_unref` is a
+    // no-op for an already-empty frame.
+    unsafe { av_frame_unref(self.hw_frame.as_mut_ptr()) };
+    self.set_held(Held::Nothing);
+  }
+
+  /// The held picture's presentation timestamp, in the stream's time base:
+  /// `None` where it carries none (`AV_NOPTS_VALUE`).
+  fn picture_pts(&self) -> Option<i64> {
+    // SAFETY: `hw_frame` is a valid AVFrame we own; `pts` is a plain field.
+    let pts = unsafe { (*self.hw_frame.as_ptr()).pts };
+    (pts != ffmpeg_next::ffi::AV_NOPTS_VALUE).then_some(pts)
+  }
+
   /// The format a picture's download would choose, read before any transfer
   /// ([`download_format_of`]); in a test, the stand-in's
   /// ([`DOWNLOAD_FOR_TEST`]): the first entry of the list it stands in for,
   /// mapped as a backend's is ([`download_format_from`]), or a picture handed
   /// over by reference.
   fn download_format(&self) -> std::result::Result<DownloadFormat, TransferFailure> {
+    #[cfg(test)]
+    if take_local_failure_for_test(LocalStep::List) {
+      return download_format_from(Err(-libc::ENOMEM));
+    }
     #[cfg(test)]
     if let Some(first_listed) = DOWNLOAD_FOR_TEST.with(core::cell::Cell::get) {
       let none = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE as libc::c_int;
@@ -2755,40 +2941,73 @@ impl VideoDecoder {
     format: DownloadFormat,
   ) -> std::result::Result<(), TransferFailure> {
     #[cfg(test)]
-    if DOWNLOAD_FOR_TEST.with(core::cell::Cell::get).is_some() {
-      return delivered_for_test(frame, &self.hw_frame);
+    {
+      let enomem = ffmpeg_next::Error::Other {
+        errno: libc::ENOMEM,
+      };
+      if take_local_failure_for_test(LocalStep::Destination) {
+        return Err(TransferFailure::Unattributed(enomem));
+      }
+      if take_local_failure_for_test(LocalStep::Properties) {
+        return Err(TransferFailure::Properties(enomem));
+      }
+      if DOWNLOAD_FOR_TEST.with(core::cell::Cell::get).is_some() {
+        return delivered_for_test(frame, &self.hw_frame);
+      }
     }
+    #[cfg(test)]
+    let _capped = CappedTransferForTest::take();
     // SAFETY: `frame` is the caller's slot and `hw_frame` the live
     // hardware frame this receive filled.
     unsafe { transfer_hw_frame(frame, &self.hw_frame, format) }
   }
 
   /// What a picture's download came to, on the receive road
-  /// ([`Self::receive_frame`]): `Some` status to answer, or `None` where the
-  /// probe left the candidate and the receive starts again.
+  /// ([`Self::receive_frame`]) — the full-size one and the fitted one alike:
+  /// `Some` status to answer, or `None` where the probe left the candidate
+  /// and the receive starts again. **Every outcome says what becomes of the
+  /// picture held** ([`Held`]).
   ///
   /// **A candidate commits at its first delivered picture**: downloaded in
   /// a layout a [`Frame`] carries, its properties copied.
   ///
-  /// - **Delivered**: the candidate is committed, its picture produced.
+  /// - **Delivered**: nothing held any more; the candidate is committed, its
+  ///   picture produced.
   /// - **The backend's transfer failed** (`av_hwframe_transfer_data` into a
   ///   destination this crate allocated, which libavutil hands to the
   ///   backend's own callback), or its download-format list answered an
   ///   error code other than `ENOMEM`: the backend's own answer, routed by
-  ///   the shared policy — on trial, the candidate leaves.
+  ///   the shared policy. On trial the candidate is left, and the picture
+  ///   with it (the rejection clears it). Committed, the picture is dropped,
+  ///   and the error is its own. Where a refusal of this crate's own
+  ///   latched beside it outranks the answer (the frame budget, the
+  ///   funnel's verdict), the refusal is answered: on trial the candidate
+  ///   stays and **its picture is held**, downloaded again at the next
+  ///   receive, where a backend failing again is charged — so a candidate on
+  ///   trial never loses a picture it stays on trial past, except by name
+  ///   ([`Error::HwTransferTooLarge`]); committed, the picture is dropped.
   /// - **The layout it would choose is one a [`Frame`] cannot carry, or the
   ///   backend lists none** (`AV_PIX_FMT_NONE`), read before any transfer:
   ///   no delivery. On trial, the candidate is unfit
   ///   for the stream: recorded so, naming the layout ([`Attempt::Unfit`]),
   ///   and left as a failed candidate is, the next tried with the history
   ///   whole, or the probe exhausted ([`Error::ProbeExhausted`]). Committed,
-  ///   it is the committed decoder's error
+  ///   the picture is dropped, and it is the committed decoder's error
   ///   ([`Error::DownloadFormatUnsupported`]).
-  /// - **An allocation this crate cannot charge** — the destination's
-  ///   buffers, or the download-format list's — **or this crate's copy of
-  ///   the picture's properties**: no delivery, and this crate's own
-  ///   failure. It is surfaced as it is, nothing committed or charged: a
-  ///   candidate on trial stays on trial.
+  /// - **An allocation this crate made that ran out of memory** — the
+  ///   download-format list's, the destination's buffers, or this crate's
+  ///   copy of the picture's properties, each answering `ENOMEM` and nothing
+  ///   else by source: no delivery, this crate's own failure, and one that
+  ///   can pass. **The picture stays held** ([`Held::Pending`]): it is
+  ///   surfaced as it is, nothing committed or charged, a candidate on trial
+  ///   on trial still, and the next receive downloads the same picture
+  ///   again before it asks the decoder for another (Codex R3, finding 1).
+  /// - **Any other failure of this crate's own** — none is reachable: a
+  ///   frames context whose extent does not read is refused by the ceiling
+  ///   first, and `av_frame_get_buffer`'s other codes need a format or an
+  ///   extent `av_hwframe_ctx_init` already refused (`libavutil/frame.c`
+  ///   206–218 and the video path after it, `hwcontext.c` 362): the picture
+  ///   is dropped, and the error surfaced, never retried.
   ///
   /// The caller's `frame` is cleared before a candidate is left, so nothing
   /// of the candidate's outlives it there either.
@@ -2799,12 +3018,27 @@ impl VideoDecoder {
   ) -> Result<Option<Received>> {
     match downloaded {
       Ok(()) => {
+        self.set_held(Held::Nothing);
         self.commit();
         Ok(Some(Received::Produced))
       }
       Err(TransferFailure::Download(e)) => {
         match self.hw_failure(e, BareVerdict::CandidateFailure) {
-          HwRoute::Report(err) => Err(err),
+          HwRoute::Report(err) => {
+            // **On trial, a refusal of this crate's own outranked the
+            // backend's answer** — the funnel's verdict, a frame budget
+            // latched beside it — so the candidate stays, and its picture
+            // with it: held, its download made again at the next receive,
+            // where a backend failing again is charged. A candidate on trial
+            // never loses a picture it stays on trial past, except by name.
+            // Committed, it is that picture's error, and the picture goes.
+            if matches!(self.session, Session::Trial(_)) {
+              self.set_held(Held::Pending);
+            } else {
+              self.drop_picture();
+            }
+            Err(err)
+          }
           HwRoute::Advance(answer) => {
             // SAFETY: the caller's slot, cleared whole: `as_inner_mut`'s
             // contract allows an empty frame.
@@ -2817,6 +3051,7 @@ impl VideoDecoder {
       Err(TransferFailure::Layout(format)) => {
         let layout = crate::error::DownloadFormatUnsupported::new(format);
         if !matches!(self.session, Session::Trial(_)) {
+          self.drop_picture();
           return Err(Error::DownloadFormatUnsupported(layout));
         }
         // SAFETY: as above — the caller's slot, cleared whole.
@@ -2829,6 +3064,12 @@ impl VideoDecoder {
         Ok(None)
       }
       Err(TransferFailure::Unattributed(e) | TransferFailure::Properties(e)) => {
+        if is_errno(&e, libc::ENOMEM) {
+          // Retryable: the picture stays held, and goes first next time.
+          self.set_held(Held::Pending);
+        } else {
+          self.drop_picture();
+        }
         Err(Error::Ffmpeg(e))
       }
     }
@@ -2881,13 +3122,17 @@ impl VideoDecoder {
       decoder,
       mut probe,
       end,
+      held,
     }) = self.take_session()
     {
       let fed = probe.fed.min(probe.buffered_packets.len());
+      // A picture still held goes on being held: a commit on a packet the
+      // history cannot keep delivers it no less, and before anything else.
       self.session = Session::Committed(Committed {
         decoder,
         backlog: probe.buffered_packets.drain(fed..).collect(),
         end,
+        held,
       });
     }
   }
@@ -2934,6 +3179,7 @@ impl VideoDecoder {
         decoder,
         probe,
         end,
+        ..
       }) => {
         while let Some(packet) = probe.buffered_packets.get(probe.fed) {
           match send(&mut decoder.inner, Sending::Packet(packet)) {
@@ -2956,6 +3202,7 @@ impl VideoDecoder {
         decoder,
         backlog,
         end,
+        ..
       }) => {
         while let Some(packet) = backlog.front() {
           match send(&mut decoder.inner, Sending::Packet(packet)) {
@@ -3052,11 +3299,13 @@ impl VideoDecoder {
         decoder,
         probe,
         end,
+        ..
       }) => (decoder, probe.buffered_packets, end),
       Session::Committed(Committed {
         decoder,
         backlog,
         end,
+        ..
       }) => (decoder, Vec::from(backlog), end),
       // Unreachable: only a live decoder sends. The session goes back as it
       // was, and the reason is answered.
@@ -3088,8 +3337,8 @@ impl VideoDecoder {
   /// Flush internal buffers (e.g. after a seek).
   ///
   /// Discards every frame buffered by the decoder, the residual `hw_frame`
-  /// scratch buffer, and whatever the decoder was still owed (the backlog,
-  /// an end). Probe-time replay state (buffered packets, the count fed, the
+  /// scratch buffer — a picture held undelivered with it ([`Held`]) — and
+  /// whatever the decoder was still owed (the backlog, an end). Probe-time replay state (buffered packets, the count fed, the
   /// end) is also cleared since post-seek packets do not align with the
   /// previously captured history. After a flush, the next `receive_frame`
   /// waits for new post-seek input.
@@ -3115,19 +3364,25 @@ impl VideoDecoder {
         decoder,
         probe,
         end,
+        held,
       }) => {
         decoder.inner.flush();
         probe.forget_history();
         *end = End::Open;
+        // The picture held belongs to the position being abandoned: its
+        // reference went with the scratch frame, cleared above.
+        *held = Held::Nothing;
       }
       Session::Committed(Committed {
         decoder,
         backlog,
         end,
+        held,
       }) => {
         decoder.inner.flush();
         backlog.clear();
         *end = End::Open;
+        *held = Held::Nothing;
       }
       Session::Owed(Owed {
         probe, end_given, ..
@@ -3248,6 +3503,7 @@ impl VideoDecoder {
       decoder,
       probe,
       end,
+      ..
     }) = self.take_session()
     {
       let backend = decoder.backend;
@@ -3408,6 +3664,7 @@ impl VideoDecoder {
             decoder: candidate,
             probe,
             end,
+            held: Held::Nothing,
           });
           return Ok(());
         }
@@ -4054,6 +4311,94 @@ impl DownloadsForTest {
 impl Drop for DownloadsForTest {
   fn drop(&mut self) {
     DOWNLOAD_FOR_TEST.with(|cell| cell.set(None));
+  }
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A law's stand-in for the scaled-output road
+  /// ([`VideoDecoder::fitted_download`]), on this thread: while set, the
+  /// answers the road gives, one per picture downloaded, in order — the
+  /// stage standing down once they run out.
+  static FITTED_FOR_TEST: core::cell::RefCell<Option<VecDeque<FittedForTest>>> =
+    const { core::cell::RefCell::new(None) };
+
+  /// A law's stand-in for an allocation of this crate's own running out of
+  /// memory on the download: the next `.0` downloads fail with `ENOMEM` at
+  /// the step `.1` names, before anything else is read.
+  static LOCAL_FAILURES_FOR_TEST: core::cell::Cell<(u32, LocalStep)> =
+    const { core::cell::Cell::new((0, LocalStep::Destination)) };
+
+  /// For a child-process law on a real backend: an allocation cap
+  /// (`av_max_alloc`) in force for the next transfer alone, fitted or
+  /// full-size ([`CappedTransferForTest`]).
+  static CAP_NEXT_TRANSFER_FOR_TEST: core::cell::Cell<Option<usize>> =
+    const { core::cell::Cell::new(None) };
+}
+
+/// One answer of the scaled-output road's stand-in ([`FITTED_FOR_TEST`]).
+#[cfg(test)]
+enum FittedForTest {
+  /// The stage stands down: the full-size download follows.
+  StandsDown,
+  /// The fitted download delivers ([`delivered_for_test`]).
+  Delivers,
+  /// The fitted download fails so.
+  Fails(TransferFailure),
+}
+
+/// Where [`LOCAL_FAILURES_FOR_TEST`] fails a download.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalStep {
+  /// The download-format list's allocation ([`download_format_from`]).
+  List,
+  /// The destination's buffers (`av_frame_get_buffer`).
+  Destination,
+  /// This crate's copy of the picture's properties.
+  Properties,
+}
+
+/// Whether the next download fails at `step` ([`LOCAL_FAILURES_FOR_TEST`]),
+/// counting it.
+#[cfg(test)]
+fn take_local_failure_for_test(step: LocalStep) -> bool {
+  LOCAL_FAILURES_FOR_TEST.with(|cell| {
+    let (count, at) = cell.get();
+    let fails = count > 0 && at == step;
+    if fails {
+      cell.set((count - 1, at));
+    }
+    fails
+  })
+}
+
+/// [`CAP_NEXT_TRANSFER_FOR_TEST`] taken and in force while this lives, the
+/// cap lifted when it drops.
+#[cfg(test)]
+struct CappedTransferForTest(bool);
+
+#[cfg(test)]
+impl CappedTransferForTest {
+  fn take() -> Self {
+    match CAP_NEXT_TRANSFER_FOR_TEST.with(core::cell::Cell::take) {
+      Some(cap) => {
+        // SAFETY: set only by a law running alone in `in_subprocess`'s
+        // child, which owns the whole process's allocator.
+        unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(cap) };
+        Self(true)
+      }
+      None => Self(false),
+    }
+  }
+}
+
+#[cfg(test)]
+impl Drop for CappedTransferForTest {
+  fn drop(&mut self) {
+    if self.0 {
+      mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
+    }
   }
 }
 

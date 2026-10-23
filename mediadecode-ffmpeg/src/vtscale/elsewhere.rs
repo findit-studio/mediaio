@@ -55,9 +55,6 @@ impl ScaledOutput {
   /// Nothing is built here, so nothing is retired.
   pub(crate) fn retire(&mut self) {}
 
-  /// Nothing is built here, so nothing is latched.
-  pub(crate) fn latch_failure(&mut self) {}
-
   /// Refuses. Nothing was ever standing, so a refusal returning the
   /// session to full size is what it has always been doing.
   pub(crate) fn request(&mut self, size: (u32, u32), source: (u32, u32)) -> ScaledOutputCapability {
