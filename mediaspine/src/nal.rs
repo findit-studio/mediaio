@@ -589,6 +589,14 @@ impl fmt::Display for KeptReason {
 /// [`Self::read_with_record`]), told of every seek ([`Self::seeked`]), and
 /// fed each of the track's packets in decoding order ([`Self::read`]),
 /// which learns from every parameter set it reads.
+///
+/// **It reads plaintext, and only a track's whole plaintext.** What it is
+/// fed it takes for the bitstream's own bytes, and every verdict stands on
+/// every packet before it. So a caller feeds it no encrypted payload, and
+/// none of the track's packets after one: the plaintext it never saw may
+/// move the framing and the parameter sets they are read by.
+/// `mediadecode-ffmpeg`'s demuxer drops a track's reading at its first
+/// packet that carries encryption side data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NalStream {
   codec: NalCodec,

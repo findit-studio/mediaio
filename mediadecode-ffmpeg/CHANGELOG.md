@@ -25,7 +25,11 @@ The backend-agnostic core it adapts has its own log at
   marked. **A packet carrying side data that persists past it — a new
   configuration, a parameter change, a palette, captions, and any type
   this build does not name — is never `DISPOSABLE`: the container's mark
-  is cleared there too.** **More packets are marked DISPOSABLE on H.264
+  is cleared there too.** **An encrypted payload is never read:** a
+  packet carrying `AV_PKT_DATA_ENCRYPTION_INFO` or
+  `AV_PKT_DATA_ENCRYPTION_INIT_INFO` gets no bitstream mark, and its
+  track's reading stops there for the rest of the stream, a seek
+  included. **More packets are marked DISPOSABLE on H.264
   and HEVC, so a consumer that drops them decodes fewer pictures**: two in
   three of a Sony XAVC original, which carries no `sdtp` and was marked
   nowhere before. An H.264 stream whose sequence parameter set codes

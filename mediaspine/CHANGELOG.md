@@ -51,7 +51,8 @@ Its versions are its own: they do not move with the rest of the family's.
 
   Parameter sets are learned from every packet a decoder reads, one the
   reading cannot frame included: that one in every framing a decoder may
-  read it in.
+  read it in. It reads plaintext only: a caller feeds it no encrypted
+  payload, and none of the track's packets after one.
 
   The framing is FFmpeg's decoder's own state — whether lengths are read,
   and their size, kept apart — moved where FFmpeg moves it: by the

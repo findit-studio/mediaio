@@ -289,7 +289,9 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// ([`mediadecode::nal`]), in any container, and clears the mark where
   /// the packet carries side data that persists past it
   /// ([`marked_from_bitstream`]). Built at open from each stream's codec
-  /// and extradata ([`bitstreams`]); told of every seek ([`sought`]).
+  /// and extradata ([`bitstreams`]); told of every seek ([`sought`]);
+  /// dropped for good at a track's first packet whose payload is encrypted
+  /// ([`ENCRYPTED_SIDE_DATA`]).
   bitstreams: Vec<Option<NalStream>>,
   /// Reads that answer in place of libavformat's next ones. Test only:
   /// see [`Self::read_into`].
@@ -3228,6 +3230,34 @@ fn side_data_persists(kind: c_int) -> bool {
   listed(PERSISTING_SIDE_DATA) || !listed(RIDING_SIDE_DATA)
 }
 
+/// The packet side data that says a payload is encrypted, or that its
+/// track's are: a packet carrying any is **opaque** to the bitstream's
+/// reading ([`marked_from_bitstream`]). These are every kind FFmpeg 9.0.1
+/// gives an encrypted payload (`libavcodec/packet.h` 241–252), and the only
+/// encryption side data it names:
+///
+/// | type | in FFmpeg 9.0.1 | what it says of the payload |
+/// |---|---|---|
+/// | `ENCRYPTION_INFO` | "encryption info for how to decrypt the packet" (`packet.h` 248–252); `mov` attaches it to each encrypted sample it does not decrypt itself, with no key given (`libavformat/mov.c` 8726–8736), and with a key decrypts the sample in place and attaches none (8726–8727) | ciphertext |
+/// | `ENCRYPTION_INIT_INFO` | a key system's "encryption initialization data" (`packet.h` 241–246), from `pssh` (`mov.c` 8064); libavformat 9.0.1 sets it on the stream (8148–8177), not on a packet | a protected track's |
+///
+/// Both stay in the persistence tables as well ([`RIDING_SIDE_DATA`],
+/// [`PERSISTING_SIDE_DATA`]), which answer the container's mark: this table
+/// answers whether the bitstream is read at all.
+const ENCRYPTED_SIDE_DATA: &[AVPacketSideDataType] = &[
+  AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INFO,
+  AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO,
+];
+
+/// Whether packet side data of `kind`, the raw `AVPacketSideDataType` it
+/// arrives as, is one of [`ENCRYPTED_SIDE_DATA`], compared as the integer
+/// it is, as [`side_data_persists`] compares.
+fn says_encrypted(kind: c_int) -> bool {
+  ENCRYPTED_SIDE_DATA
+    .iter()
+    .any(|&named| named as c_int == kind)
+}
+
 /// `packet`, its [`PacketFlags::DISPOSABLE`] set where its track's
 /// bitstream proves that nothing references its picture
 /// ([`NalStream::read_with_record`]) and cleared, whoever set it, where it
@@ -3241,6 +3271,15 @@ fn side_data_persists(kind: c_int) -> bool {
 /// sets declare — moves for the packets after; a corrupt packet is never
 /// marked. A track without a reading — a codec other than H.264 and HEVC —
 /// keeps the container's mark, unless side data persists.
+///
+/// **An encrypted payload is opaque, and so is its track from then on.** A
+/// packet carrying encryption side data ([`ENCRYPTED_SIDE_DATA`]) is not
+/// read, and no bitstream mark is made from it: its bytes may be
+/// ciphertext, which can look like any NAL unit. And its track's reading is
+/// dropped for the rest of the stream, a seek included, since the plaintext
+/// it did not see may move the framing and the parameter sets the packets
+/// after are read by. The container's own mark is the container's, and
+/// stays as the persistence tables answer it.
 fn marked_from_bitstream<D: AsRef<[u8]>>(
   bitstream: Option<&mut Option<NalStream>>,
   packet: mediadecode::packet::VideoPacket<crate::extras::VideoPacketExtra, D>,
@@ -3254,7 +3293,13 @@ fn marked_from_bitstream<D: AsRef<[u8]>>(
     .iter()
     .find(|entry| entry.kind() == NEW_EXTRADATA)
     .map(crate::extras::SideDataEntry::data);
+  let encrypted = side_data.iter().any(|entry| says_encrypted(entry.kind()));
   let proven = match bitstream {
+    // Not read, and the track read no more.
+    Some(reading) if encrypted => {
+      *reading = None;
+      false
+    }
     Some(Some(bitstream)) => bitstream
       .read_with_record(packet.data().as_ref(), record)
       .is_disposable(),
@@ -5393,8 +5438,12 @@ mod tests {
       assert_eq!(cleared.flags(), PacketFlags::empty(), "{kind}");
     }
     // Side data that rides with its packet leaves the mark to the
-    // bitstream.
-    for &kind in RIDING_SIDE_DATA {
+    // bitstream — but for encryption's, which makes the packet opaque
+    // (`an_encrypted_packet_is_never_read_and_its_track_is_read_no_more`).
+    for &kind in RIDING_SIDE_DATA
+      .iter()
+      .filter(|&&kind| !says_encrypted(kind as c_int))
+    {
       let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
       past_a_reference(&mut bitstream);
       let read = marked_from_bitstream(
@@ -5402,6 +5451,74 @@ mod tests {
         video_packet(avc_packet(0), vec![side_data(kind as c_int, &[1])]),
       );
       assert!(read.flags().contains(PacketFlags::DISPOSABLE), "{kind:?}");
+    }
+  }
+
+  /// LAW: **an encrypted packet is never read, and its track is read no
+  /// more** — for each kind of encryption side data FFmpeg names
+  /// ([`ENCRYPTED_SIDE_DATA`]). The packet a reading would mark is not
+  /// marked; the reading is dropped; the track's later packets, which a
+  /// reading would mark, are not marked, before a seek or after it; and
+  /// another track reads on. The container's own mark stays as the
+  /// persistence tables answer it.
+  ///
+  /// PLANT: reading an encrypted packet as any other turns this red at
+  /// "not read"; skipping it without dropping the reading, at "the reading
+  /// is dropped".
+  #[test]
+  fn an_encrypted_packet_is_never_read_and_its_track_is_read_no_more() {
+    for &kind in ENCRYPTED_SIDE_DATA {
+      let kind = kind as c_int;
+      let mut bitstreams = vec![
+        Some(NalStream::new(NalCodec::H264, &avcc())),
+        Some(NalStream::new(NalCodec::H264, &avcc())),
+      ];
+      for bitstream in &mut bitstreams {
+        past_a_reference(bitstream);
+      }
+      // A non-reference picture's packet, which the reading would mark,
+      // encrypted.
+      let read = marked_from_bitstream(
+        bitstreams.get_mut(0),
+        video_packet(avc_packet(0), vec![side_data(kind, &[1])]),
+      );
+      assert!(
+        !read.flags().contains(PacketFlags::DISPOSABLE),
+        "{kind}: not read"
+      );
+      assert!(bitstreams[0].is_none(), "{kind}: the reading is dropped");
+      // The track's next packets are clear, and still not read.
+      for at in ["before a seek", "after a seek"] {
+        let read =
+          marked_from_bitstream(bitstreams.get_mut(0), video_packet(avc_packet(0), vec![]));
+        assert!(
+          !read.flags().contains(PacketFlags::DISPOSABLE),
+          "{kind}, {at}: read no more"
+        );
+        sought(&mut bitstreams);
+      }
+      // The other track reads on: past the seek, a reference picture
+      // again, then the non-reference one it marks.
+      past_a_reference(&mut bitstreams[1]);
+      let other = marked_from_bitstream(bitstreams.get_mut(1), video_packet(avc_packet(0), vec![]));
+      assert!(
+        other.flags().contains(PacketFlags::DISPOSABLE),
+        "{kind}: another track reads on"
+      );
+      // The container's mark: kept where the kind rides, cleared where it
+      // persists.
+      let container = video_packet(avc_packet(0), vec![side_data(kind, &[1])])
+        .with_flags(PacketFlags::DISPOSABLE);
+      let passed = marked_from_bitstream(bitstreams.get_mut(1), container);
+      assert_eq!(
+        passed.flags().contains(PacketFlags::DISPOSABLE),
+        !side_data_persists(kind),
+        "{kind}: the container's mark"
+      );
+      assert!(
+        bitstreams[1].is_none(),
+        "{kind}: that track is read no more either"
+      );
     }
   }
 

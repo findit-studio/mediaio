@@ -56,7 +56,9 @@ bitflags! {
     /// or an HEVC sub-layer non-reference picture at the highest temporal
     /// sub-layer, with nothing beside it a later picture needs
     /// ([`nal::NalStream`](crate::nal::NalStream)) — in any container. No
-    /// other codec's bitstream is read.
+    /// other codec's bitstream is read, and no encrypted payload: a demuxer
+    /// reads no packet that carries encryption side data, and nothing of
+    /// its track after it.
     ///
     /// **Never with side data a decoder takes up past the packet** — a
     /// new configuration, a parameter change: dropping such a packet
