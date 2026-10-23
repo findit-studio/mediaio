@@ -151,6 +151,20 @@ pub enum Error {
   #[error(transparent)]
   ProbeExhausted(#[from] ProbeExhausted),
 
+  /// **A decoder ended, because libavcodec left unknown whether it took a
+  /// packet.** `avcodec_send_packet` answers `AVERROR(ENOMEM)` both when it
+  /// cannot reference a packet, which it then has not taken, and when the
+  /// decode it runs after taking one fails for memory
+  /// (`libavcodec/decode.c` 748–750 and 754–757 in FFmpeg 9.0.1), and
+  /// nothing public tells the two apart. Where the packet was one only this
+  /// decoder held, it can go on neither as if it had been taken nor as if it
+  /// had not without losing it or feeding it twice, so it ends. See
+  /// [`AmbiguousSend`] for the payload: every packet it may not have taken,
+  /// in order, for a decoder that starts from them. `#[from]` gives a free
+  /// `impl From<AmbiguousSend> for Error`.
+  #[error(transparent)]
+  AmbiguousSend(#[from] AmbiguousSend),
+
   /// Surfaced by [`crate::FfmpegVideoStreamDecoder`] when a HW->SW
   /// fallback attempt itself fails. See [`FallbackFailed`] for the
   /// payload details (in particular the rescued `unconsumed_packets`
@@ -372,6 +386,135 @@ impl std::fmt::Debug for ProbeExhausted {
         &format_args!("[{} packets]", self.unconsumed_packets.len()),
       )
       .field("origin", &self.origin)
+      .finish()
+  }
+}
+
+/// Payload for [`Error::AmbiguousSend`]: a hardware decoder that ended
+/// because libavcodec left unknown whether it took a packet, and what it
+/// hands back.
+///
+/// # When
+///
+/// - **After the commit, feeding the backlog**: the packets a probe's replay
+///   had not yet given the backend it committed, at its first picture, fed
+///   before anything new. They are this decoder's only copies, so the one
+///   whose send answered `ENOMEM` can be neither dropped, which would lose
+///   it if it was not taken, nor sent again, which would feed it twice if it
+///   was.
+/// - **On trial**, where a candidate's send answered `ENOMEM` with a
+///   refusal of this crate's own latched beside it, the frame budget: the
+///   candidate can be neither kept, not knowing what it holds, nor charged
+///   with this crate's refusal and left for the next backend. Where nothing
+///   of this crate's is latched, the probe leaves the candidate instead, its
+///   answer the `ENOMEM` libavcodec returned, and the next backend is
+///   replayed the history whole.
+///
+/// # What comes back
+///
+/// [`Self::residual`] is every packet the decoder may not have taken, in
+/// the order sent: on trial the whole history, since no picture was
+/// delivered and a decoder that starts again starts from the first;
+/// committed, the backlog, its first the packet whose send was ambiguous.
+/// Each is a copy the probe made, its payload referenced by its packet
+/// alone: the decoder let every reference go before it ended. Where the
+/// caller had already signalled the end, [`Self::end_follows`] says so, and
+/// a decoder that starts from the residual is sent the end after it. **A
+/// packet the caller was sending when the decoder ended is not in it**: it
+/// was not taken, and is the caller's to send after the residual.
+///
+/// A committed decoder's residual follows pictures already delivered, so a
+/// decoder that starts from it starts mid-stream, and the pictures the
+/// ended decoder still held from packets it took went with it. Whether to
+/// go on, and from where, is the caller's: a seekable input is better
+/// sought back to a key frame.
+///
+/// After it the decoder has ended: every packet sent to it answers
+/// `AVERROR_EOF`, and every receive
+/// [`Received::Ended`](mediadecode::Received::Ended), until a `flush`.
+///
+/// `Debug` is hand-written, as for [`ProbeExhausted`].
+#[derive(thiserror::Error)]
+#[error(
+  "libavcodec left unknown whether the {backend:?} decoder took a packet ({reason}); it ended, \
+   handing back {} packets",
+  .residual.len()
+)]
+pub struct AmbiguousSend {
+  /// The backend whose decoder ended.
+  backend: Backend,
+  /// The send's verdict: `ENOMEM` as libavcodec returned it, or the refusal
+  /// this crate latched beside it.
+  reason: Box<Error>,
+  /// Every packet the decoder may not have taken, in order.
+  residual: Vec<Packet>,
+  /// Whether the caller's end follows the residual.
+  end_follows: bool,
+}
+
+impl AmbiguousSend {
+  /// Constructs an [`AmbiguousSend`] payload.
+  ///
+  /// Not `const fn`: the `Vec` argument may carry destructors.
+  #[inline]
+  pub fn new(
+    backend: Backend,
+    reason: Box<Error>,
+    residual: Vec<Packet>,
+    end_follows: bool,
+  ) -> Self {
+    Self {
+      backend,
+      reason,
+      residual,
+      end_follows,
+    }
+  }
+  /// The backend whose decoder ended.
+  #[inline]
+  pub const fn backend(&self) -> Backend {
+    self.backend
+  }
+  /// The send's verdict: `ENOMEM` as libavcodec returned it, or the refusal
+  /// this crate latched beside it, by name.
+  #[inline]
+  pub fn reason(&self) -> &Error {
+    &self.reason
+  }
+  /// Every packet the decoder may not have taken, in the order sent.
+  #[inline]
+  pub fn residual(&self) -> &[Packet] {
+    &self.residual
+  }
+  /// Whether the caller had signalled the end, which follows the residual.
+  #[inline]
+  pub const fn end_follows(&self) -> bool {
+    self.end_follows
+  }
+  /// Consume the payload, returning the moved residual.
+  #[inline]
+  pub fn into_residual(self) -> Vec<Packet> {
+    self.residual
+  }
+  /// Consume the payload, returning the backend, the verdict, the residual
+  /// and whether the end follows it.
+  #[inline]
+  pub fn into_parts(self) -> (Backend, Box<Error>, Vec<Packet>, bool) {
+    (self.backend, self.reason, self.residual, self.end_follows)
+  }
+}
+
+impl std::fmt::Debug for AmbiguousSend {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("AmbiguousSend")
+      .field("backend", &self.backend)
+      .field("reason", &self.reason)
+      // `Packet` is not `Debug`; the count is what triage needs.
+      .field(
+        "residual",
+        &format_args!("[{} packets]", self.residual.len()),
+      )
+      .field("end_follows", &self.end_follows)
       .finish()
   }
 }

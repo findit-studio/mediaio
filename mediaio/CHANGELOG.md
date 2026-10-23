@@ -20,8 +20,11 @@ crate moves only when it changes.
   is `mediadecode-ffmpeg` 0.21: its hardware probe ends in
   `ProbeExhausted` (it was `AllBackendsFailed`), a backend whose download
   chooses a layout a `Frame` cannot carry is unfit for the stream rather
-  than failed, and the video decoders take `DecoderOptions` through open
-  requests. See its changelog. The default, pure-Rust build is untouched.
+  than failed, a hardware decoder that libavcodec's `ENOMEM` leaves unsure
+  whether it took a packet ends with `Error::AmbiguousSend`, handing back
+  what it may not have taken, and the video decoders take `DecoderOptions`
+  through open requests. See its changelog. The default, pure-Rust build
+  is untouched.
 
 ## [0.20.0] - 2026-10-23
 

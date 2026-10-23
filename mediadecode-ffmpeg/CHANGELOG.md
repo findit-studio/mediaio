@@ -115,8 +115,61 @@ crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
   again. Before, its copy was dropped: a backend tried after a later
   failure was replayed a history without it, and `AllBackendsFailed`
   handed back packets that did not hold it.
+- **No packet is lost or fed twice where `avcodec_send_packet` leaves in
+  doubt whether it took one.** It answers `AVERROR(ENOMEM)` both when it
+  cannot reference a packet, which it then has not taken, and when the
+  decode it runs after taking one fails for memory (`libavcodec/decode.c`
+  748–757 in FFmpeg 9.0.1). Every road that sends now goes through one
+  door that reads the answer by source: taken, not taken, taken with the
+  decoder's error, or `ENOMEM`, in doubt. A packet the probe's replay had
+  not reached when its backend committed was dropped on any error but
+  `EAGAIN`, so under memory pressure the stream went on past a packet the
+  decoder never took. Now a decoder whose send of such a packet answers
+  `ENOMEM` ends, and hands that packet and every one behind it back
+  (`Error::AmbiguousSend`, below). On trial, a backend's `ENOMEM` leaves it
+  as its own answer, the history replayed whole into the next; where a
+  refusal of this crate's own is latched beside it, the backend can be
+  neither kept nor charged, and the decoder ends the same way. A packet
+  is kept as taken on this crate's own refusal only where the answer says
+  the backend took it.
+- **A send's answer is about its own packet.** `Sent::MustDrain` means the
+  packet was not taken, and an error that it was taken or is refused for
+  good. Three answers broke that. A decoder owed packets — the rest of a
+  replay, or a backlog after the commit — was fed them by the caller's
+  send, which then answered an owed packet's error for a packet it never
+  sent; the sends now answer `Sent::MustDrain` while anything is owed, and
+  the receive road feeds it and reports what it answers. An advance a send
+  starts or resumes that stops at a failure of this crate's own answered
+  that failure for a packet no backend that goes on had seen; it now
+  answers `Sent::MustDrain`, and the drain resumes the advance and reports
+  the failure if it stands. And `EAGAIN` with a refusal latched before the
+  send answered the refusal for a packet the decoder had not taken; it is
+  `Sent::MustDrain` now, and the drain reports the refusal.
+- **A packet of a shape libavcodec refuses charges no backend.** Data with
+  no size is refused with `AVERROR(EINVAL)` before libavcodec references
+  it (`decode.c` 742–743), as is a packet with no buffer of a size it will
+  not allocate. The probe took that `EINVAL` for a backend's answer, so a
+  malformed packet failed every backend in turn; it is the packet's own
+  error now, the backend still on trial. The `EINVAL` a decode answers is
+  told apart by the packet's shape.
+- **A packet with neither payload nor side data is the end**, as
+  libavcodec takes it (`avcodec.h` 2341–2347): `VideoDecoder::send_av_packet`
+  sends it as `send_eof` does. The probe used to record it in its history
+  as a packet while libavcodec started draining.
 
 ### Added
+
+- **`Error::AmbiguousSend`**, its payload `AmbiguousSend` with
+  `backend()`, `reason()`, `residual()`, `end_follows()`,
+  `into_residual()` and `into_parts()`: a hardware decoder that ended
+  because libavcodec's `ENOMEM` left unknown whether it took a packet only
+  the decoder held. `residual()` is every packet it may not have taken, in
+  order — after the commit the backlog from that packet on, on trial the
+  whole history — each referenced by its packet alone, and `end_follows()`
+  whether the caller's end comes after them. A packet the caller was
+  sending when the decoder ended is not in it. The decoder answers as an
+  ended one after it, until a `flush`. No `DecodePath` takes it as the cue
+  for software.
 
 - **`Error::DownloadFormatUnsupported`**, its payload
   `DownloadFormatUnsupported` with `format()`, the raw `AVPixelFormat` the

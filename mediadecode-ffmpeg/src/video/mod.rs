@@ -34,6 +34,15 @@
 //! [`crate::VideoDecoder`] for the lines). This wrapper neither waits for
 //! a recovery nor rules one out.
 //!
+//! One answer ends the hardware decoder: [`Error::AmbiguousSend`](crate::Error::AmbiguousSend),
+//! where libavcodec's `ENOMEM` left unknown whether it took a packet only
+//! the decoder held. It hands back every packet the decoder may not have
+//! taken, and the session answers as an ended one after it, until a
+//! `flush`. No path takes it as the cue for software: after the first
+//! picture nothing changes the road, and before it the decoder ends so
+//! only for a refusal of this crate's own, which software meets the same
+//! way.
+//!
 //! A [`VideoDecodeError::Convert`] is this wrapper's own failure to
 //! convert a decoded picture into a frame, not the decoder's. One that
 //! failed on an allocation parks the picture, and until a `receive_frame`
@@ -959,12 +968,21 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       Ok(())
     }
 
+    // **Through the one door, and transactional by class**
+    // ([`crate::decoder::Acceptance`]): a packet taken goes on, and back
+    // pressure drains and offers it again. Any other answer — taken with the
+    // decoder's error, `ENOMEM` and so perhaps taken, or not taken — ends the
+    // transaction: the software decoder is dropped, and every rescued packet
+    // goes back with `FallbackFailed`, so nothing goes on past a packet this
+    // decoder may or may not hold.
     for pkt in unconsumed_packets {
       let mut attempts: u32 = 0;
       loop {
-        match sw.send_packet(pkt) {
-          Ok(()) => break,
-          Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
+        match crate::decoder::send(&mut sw, crate::decoder::Sending::Packet(pkt)) {
+          crate::decoder::Acceptance::Accepted => break,
+          crate::decoder::Acceptance::NotAccepted(ffmpeg_next::Error::Other { errno })
+            if errno == ffmpeg_next::error::EAGAIN =>
+          {
             // SAFETY: `sw_state` is `sw`'s own callback state, and `sw`
             // lives until the commit at the end of this function.
             unsafe { drain_into(&mut sw, sw_state, &mut local_replay) }?;
@@ -975,8 +993,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               }));
             }
           }
-          // SAFETY: `sw_state` is `sw`'s own callback state, live here.
-          Err(other) => return Err(unsafe { crate::decoder::software_exit(sw_state, other) }),
+          crate::decoder::Acceptance::NotAccepted(other)
+          | crate::decoder::Acceptance::Ambiguous(other)
+          | crate::decoder::Acceptance::AcceptedWithError(other) => {
+            // SAFETY: `sw_state` is `sw`'s own callback state, live here.
+            return Err(unsafe { crate::decoder::software_exit(sw_state, other) });
+          }
         }
       }
     }
@@ -986,9 +1008,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     if eof_pending {
       let mut attempts: u32 = 0;
       loop {
-        match sw.send_eof() {
-          Ok(()) => break,
-          Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
+        match crate::decoder::send(&mut sw, crate::decoder::Sending::End) {
+          crate::decoder::Acceptance::Accepted => break,
+          crate::decoder::Acceptance::NotAccepted(ffmpeg_next::Error::Other { errno })
+            if errno == ffmpeg_next::error::EAGAIN =>
+          {
             // SAFETY: `sw_state` is `sw`'s own callback state, and `sw`
             // lives until the commit at the end of this function.
             unsafe { drain_into(&mut sw, sw_state, &mut local_replay) }?;
@@ -999,8 +1023,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               }));
             }
           }
-          // SAFETY: `sw_state` is `sw`'s own callback state, live here.
-          Err(other) => return Err(unsafe { crate::decoder::software_exit(sw_state, other) }),
+          crate::decoder::Acceptance::NotAccepted(other)
+          | crate::decoder::Acceptance::Ambiguous(other)
+          | crate::decoder::Acceptance::AcceptedWithError(other) => {
+            // SAFETY: `sw_state` is `sw`'s own callback state, live here.
+            return Err(unsafe { crate::decoder::software_exit(sw_state, other) });
+          }
         }
       }
     }
@@ -1283,11 +1311,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // way, and the caller re-offers the packet.
             if let DecodeState::Sw(sw) = &mut self.state {
               let st = sw.state();
-              if let Err(e) = sw.send_packet(av_pkt) {
-                // SAFETY: `st` is `sw`'s own callback state, live while
-                // `sw` is.
-                return unsafe { crate::decoder::software_send(st, e, phase) }
-                  .map_err(VideoDecodeError::Decode);
+              match crate::decoder::send(sw, crate::decoder::Sending::Packet(av_pkt)) {
+                crate::decoder::Acceptance::Accepted => {}
+                crate::decoder::Acceptance::NotAccepted(e)
+                | crate::decoder::Acceptance::Ambiguous(e)
+                | crate::decoder::Acceptance::AcceptedWithError(e) => {
+                  // SAFETY: `st` is `sw`'s own callback state, live while
+                  // `sw` is.
+                  return unsafe { crate::decoder::software_send(st, e, phase) }
+                    .map_err(VideoDecodeError::Decode);
+                }
               }
             }
             Ok(Sent::Accepted)
@@ -1296,15 +1329,25 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         },
         DecodeState::Sw(sw) => {
           let st = sw.state();
-          match sw.send_packet(av_pkt) {
-            Ok(()) => Ok(Sent::Accepted),
+          // **Through the one door** ([`crate::decoder::send`]). The packet
+          // is the caller's, and nothing of this wrapper's is at stake, so
+          // libavcodec's own contract is the answer, by class: taken, back
+          // pressure, or the funnel's verdict — a packet's own error, a
+          // refusal for good, or `ENOMEM`, which leaves the caller unable to
+          // know whether it was taken (`avcodec.h` 2358).
+          match crate::decoder::send(sw, crate::decoder::Sending::Packet(av_pkt)) {
+            crate::decoder::Acceptance::Accepted => Ok(Sent::Accepted),
             // Funnel, then gate: a refusal the allocator judge latched
             // comes back named, and back pressure is `MustDrain`.
             //
             // SAFETY: `st` is `sw`'s own callback state, live while `sw`
             // is.
-            Err(e) => unsafe { crate::decoder::software_send(st, e, phase) }
-              .map_err(VideoDecodeError::Decode),
+            crate::decoder::Acceptance::NotAccepted(e)
+            | crate::decoder::Acceptance::Ambiguous(e)
+            | crate::decoder::Acceptance::AcceptedWithError(e) => {
+              unsafe { crate::decoder::software_send(st, e, phase) }
+                .map_err(VideoDecodeError::Decode)
+            }
           }
         }
       }
@@ -1525,10 +1568,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       },
       DecodeState::Sw(sw) => {
         let st = sw.state();
-        match sw.send_eof() {
-          Ok(()) => Ok(Sent::Accepted),
+        match crate::decoder::send(sw, crate::decoder::Sending::End) {
+          crate::decoder::Acceptance::Accepted => Ok(Sent::Accepted),
           // SAFETY: `st` is `sw`'s own callback state, live while `sw` is.
-          Err(e) => {
+          crate::decoder::Acceptance::NotAccepted(e)
+          | crate::decoder::Acceptance::Ambiguous(e)
+          | crate::decoder::Acceptance::AcceptedWithError(e) => {
             unsafe { crate::decoder::software_send(st, e, phase) }.map_err(VideoDecodeError::Decode)
           }
         }

@@ -15,17 +15,6 @@ fn videodecoder_is_send() {
   _assert_send();
 }
 
-#[test]
-fn is_transient_recognises_eagain_and_eof() {
-  let eagain = ffmpeg_next::Error::Other {
-    errno: ffmpeg_next::error::EAGAIN,
-  };
-  assert!(is_transient(&eagain));
-  assert!(is_transient(&ffmpeg_next::Error::Eof));
-  let other = ffmpeg_next::Error::InvalidData;
-  assert!(!is_transient(&other));
-}
-
 /// Regression: a `codec::Parameters` with a null inner pointer must be
 /// rejected at the entrypoint, not deref'd. ffmpeg-next's
 /// `Parameters::new()` does not check `avcodec_parameters_alloc()`, so a
@@ -4514,4 +4503,809 @@ fn a_videotoolbox_download_in_a_layout_a_frame_cannot_carry_is_told_apart() {
     download(AVPixelFormat::AV_PIX_FMT_NV12).is_ok(),
     "NV12 downloads whole"
   );
+}
+
+// ---------------------------------------------------------------------------
+//  The acceptance boundary of `avcodec_send_packet`, by class (Codex R1 on
+//  #89): one door, every road, every class.
+// ---------------------------------------------------------------------------
+
+/// The allocation cap the boundary's laws set, in a child process of their
+/// own: over what libavcodec allocates to reference a refcounted packet
+/// (an `AVBufferRef`), to copy a picture's payload, to copy codec
+/// parameters, and to decode a rawvideo picture, and under a 4,096-byte
+/// side-data entry's copy (`av_packet_new_side_data`, `libavcodec/packet.c`
+/// 231–250 in FFmpeg 9.0.1).
+const CAPPED: usize = 2048;
+
+/// A side-data entry's size that [`CAPPED`] refuses to copy.
+const SIDE_DATA_PAST_THE_CAP: usize = 4096;
+
+/// [`raw_packet`], carrying one side-data entry of `bytes`, zeroed: the
+/// type `AV_PKT_DATA_MPEGTS_STREAM_ID`, which no decoder reads.
+/// `av_packet_ref` copies the entry into an allocation of its own
+/// (`av_packet_copy_props`, `packet.c` 417–428), so a cap below `bytes`
+/// refuses the reference, `ENOMEM`, before the packet is taken
+/// (`libavcodec/decode.c` 748–750).
+fn raw_packet_with_side_data(fill: u8, bytes: usize) -> Packet {
+  use ffmpeg_next::ffi::{AVPacketSideDataType, av_packet_new_side_data};
+  let mut packet = raw_packet(fill);
+  // SAFETY: the packet is live; libavcodec allocates and zeroes the entry,
+  // and frees it with the packet.
+  let entry = unsafe {
+    av_packet_new_side_data(
+      packet.as_mut_ptr(),
+      AVPacketSideDataType::AV_PKT_DATA_MPEGTS_STREAM_ID,
+      bytes,
+    )
+  };
+  assert!(!entry.is_null(), "the side-data entry");
+  packet
+}
+
+/// The first byte of each packet's payload: which picture it holds.
+fn fills(packets: &[Packet]) -> Vec<u8> {
+  packets
+    .iter()
+    .map(|packet| packet.data().expect("a payload")[0])
+    .collect()
+}
+
+/// A decoder committed with a backlog. The candidate on trial (VAAPI, in
+/// software) is left, and CUDA, built in software, is replayed `history`:
+/// rawvideo decodes a picture's packet as it is sent and holds a second
+/// until a picture is asked for, so the replay stops at the third, the
+/// candidate's first output. CUDA's first picture, delivered, commits it,
+/// and what the replay did not reach is the backlog. The second picture is
+/// drained too, so the decoder holds nothing and asks for input. Answers the
+/// decoder and the two pictures delivered.
+fn committed_with_backlog(
+  history: Vec<Packet>,
+  frame: &mut crate::Frame,
+) -> (VideoDecoder, Vec<u8>) {
+  let mut dec = vaapi_then_cuda();
+  {
+    let probe = dec.probe.as_mut().expect("on trial");
+    probe.buffered_bytes = history.len() * RAW_PICTURE;
+    probe.fed = history.len();
+    probe.buffered_packets = history;
+  }
+  dec
+    .advance_probe(BackendAnswer::of_call(Error::Ffmpeg(
+      ffmpeg_next::Error::InvalidData,
+    )))
+    .expect("CUDA installed");
+  assert_eq!(
+    dec.probe.as_ref().map(|probe| probe.fed),
+    Some(2),
+    "the replay stopped at the candidate's first output"
+  );
+  let _downloads = DownloadsForTest::set(all_deliver);
+  let mut pictures = Vec::new();
+  for _ in 0..2 {
+    let received = dec.receive_frame(frame);
+    assert!(
+      matches!(received, Ok(Received::Produced)),
+      "a picture: {received:?}"
+    );
+    pictures.push(frame.row(0, 0).expect("a gray picture")[0]);
+  }
+  assert_eq!(
+    (dec.backend(), dec.phase()),
+    (Backend::Cuda, SessionPhase::Streaming),
+    "committed at its first delivered picture"
+  );
+  (dec, pictures)
+}
+
+/// A [`BuildCandidate`] that lifts the allocation cap, then opens the
+/// candidate in software: a law's cap reaches the send it is set for, and
+/// no candidate built after it.
+fn uncapped_then_software_state(
+  parameters: codec::Parameters,
+  codec: Codec,
+  backend: Backend,
+  limits: crate::limits::DecoderLimits,
+  options: crate::DecoderOptions,
+  pkt_timebase: Option<mediadecode::Timebase>,
+) -> std::result::Result<DecoderState, BuildFailure> {
+  mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
+  VideoDecoder::software_state_for_test(parameters, codec, backend, limits, options, pkt_timebase)
+}
+
+/// LAW: **every answer of `avcodec_send_packet` is classed by its source**
+/// ([`Acceptance`]; `libavcodec/decode.c` 730–760 in FFmpeg 9.0.1): the
+/// table over the codes, a packet's and the end's, the shapes libavcodec
+/// refuses before it references a packet, the end in a packet's shape
+/// refused unsent, and libavcodec's own answers, live, on both sides of the
+/// one code the shape tells apart.
+///
+/// PLANT: `EINVAL` classed without the packet's shape, as the decode's
+/// always, turns this red at "the shape's", and the shape law with it.
+#[test]
+fn every_answer_to_a_send_is_classed_by_its_source() {
+  use ffmpeg_next::Error as E;
+  let errno = |code| E::Other { errno: code };
+  let (eagain, einval, enomem) = (
+    errno(ffmpeg_next::error::EAGAIN),
+    errno(libc::EINVAL),
+    errno(libc::ENOMEM),
+  );
+  // (the shape refused before the reference, the answer, the class)
+  let packet_cells = [
+    (false, Ok(()), Acceptance::Accepted),
+    (false, Err(eagain), Acceptance::NotAccepted(eagain)),
+    (true, Err(eagain), Acceptance::NotAccepted(eagain)),
+    (false, Err(E::Eof), Acceptance::NotAccepted(E::Eof)),
+    (true, Err(einval), Acceptance::NotAccepted(einval)),
+    (false, Err(einval), Acceptance::AcceptedWithError(einval)),
+    (false, Err(enomem), Acceptance::Ambiguous(enomem)),
+    (true, Err(enomem), Acceptance::Ambiguous(enomem)),
+    (
+      false,
+      Err(E::InvalidData),
+      Acceptance::AcceptedWithError(E::InvalidData),
+    ),
+    (
+      false,
+      Err(E::External),
+      Acceptance::AcceptedWithError(E::External),
+    ),
+    (
+      false,
+      Err(errno(libc::ENOSYS)),
+      Acceptance::AcceptedWithError(errno(libc::ENOSYS)),
+    ),
+    (false, Err(E::Bug), Acceptance::AcceptedWithError(E::Bug)),
+  ];
+  for (shape, answer, class) in packet_cells {
+    assert_eq!(
+      Acceptance::of_packet(shape, answer),
+      class,
+      "a packet, shape refused {shape}, answered {answer:?}"
+    );
+  }
+  for (answer, class) in [
+    (Ok(()), Acceptance::Accepted),
+    (Err(E::Eof), Acceptance::NotAccepted(E::Eof)),
+    (Err(eagain), Acceptance::NotAccepted(eagain)),
+    (Err(einval), Acceptance::NotAccepted(einval)),
+    (Err(enomem), Acceptance::NotAccepted(enomem)),
+  ] {
+    assert_eq!(
+      Acceptance::of_end(answer),
+      class,
+      "the end, answered {answer:?}"
+    );
+  }
+
+  // The shapes, read from the packet: data with no size (742–743), and no
+  // buffer with a size `packet_alloc` will not allocate (packet.c 86–87).
+  static BYTES: [u8; 64] = [0; 64];
+  let zero_size = crate::boundary::try_packet_copy(&[]).expect("data with no size");
+  let unbuffered = |size: i32| {
+    let mut packet = Packet::empty();
+    // SAFETY: the packet is live and blank; it points at static bytes it
+    // does not own, with no buffer, so its unref frees nothing of them.
+    unsafe {
+      let raw = packet.as_mut_ptr();
+      (*raw).data = BYTES.as_ptr().cast_mut();
+      (*raw).size = size;
+    }
+    packet
+  };
+  assert!(refused_before_reference(&zero_size), "data with no size");
+  assert!(refused_before_reference(&unbuffered(-1)), "a negative size");
+  assert!(
+    refused_before_reference(&unbuffered(i32::MAX - 64)),
+    "a size past what packet_alloc allocates"
+  );
+  assert!(
+    !refused_before_reference(&unbuffered(64)),
+    "an unbuffered packet libavcodec copies"
+  );
+  assert!(!refused_before_reference(&raw_packet(0x11)), "a picture");
+  assert!(
+    is_flush_packet(&Packet::empty()),
+    "the end, in a packet's shape"
+  );
+  assert!(!is_flush_packet(&raw_packet(0x11)), "a picture");
+
+  // libavcodec's own answers, live. The end in a packet's shape is refused
+  // unsent: the decoder takes the end after it, so it never began draining.
+  let mut dec = raw_pinned_decoder();
+  assert_eq!(
+    send(&mut dec.state.inner, Sending::Packet(&Packet::empty())),
+    Acceptance::NotAccepted(einval),
+    "the end in a packet's shape, refused unsent"
+  );
+  assert_eq!(
+    send(&mut dec.state.inner, Sending::End),
+    Acceptance::Accepted,
+    "the end, taken: nothing had started the drain"
+  );
+  // `EINVAL` either side of the shape: 743's for data with no size, and the
+  // decode's for a packet a row's worth long, short of a 16 × 16 picture
+  // (`rawdec.c` 342–346).
+  let mut dec = raw_pinned_decoder();
+  assert_eq!(
+    send(&mut dec.state.inner, Sending::Packet(&zero_size)),
+    Acceptance::NotAccepted(einval),
+    "the shape's"
+  );
+  let short = crate::boundary::try_packet_copy(&[0x77; RAW_SIDE as usize]).expect("a short packet");
+  assert_eq!(
+    send(&mut dec.state.inner, Sending::Packet(&short)),
+    Acceptance::AcceptedWithError(einval),
+    "the decode's"
+  );
+  let mut refused = unbuffered(-1);
+  assert_eq!(
+    send(&mut dec.state.inner, Sending::Packet(&refused)),
+    Acceptance::NotAccepted(einval),
+    "packet_alloc's, inside av_packet_ref"
+  );
+  // SAFETY: the packet is live; it is pointed at nothing of the static
+  // bytes before it drops.
+  unsafe { (*refused.as_mut_ptr()).data = ptr::null_mut() };
+}
+
+/// LAW: **an ambiguous send of the backlog's front ends the decoder, and
+/// hands the front back with every packet behind it** (Codex R1 on #89, the
+/// [high]). The backlog is the packets a replay had not reached when its
+/// candidate gave its first picture, and it holds their only copies, so a
+/// front whose send answered `ENOMEM` can be neither retired, which would
+/// lose it if the decoder had not taken it, nor sent again, which would
+/// feed it twice if it had.
+///
+/// The front carries a 4,096-byte side-data entry, and FFmpeg's allocations
+/// are capped ([`CAPPED`], `av_max_alloc`, in a child process of its own)
+/// once the decoder holds nothing: `av_packet_ref` cannot copy the entry,
+/// so `avcodec_send_packet` answers `ENOMEM` before it takes the packet
+/// (`libavcodec/decode.c` 748–750 in FFmpeg 9.0.1) — the code the decode it
+/// runs after taking one also answers. A decoder fed the residual then
+/// decodes the pictures the committed one had not given: every picture
+/// once, in order.
+///
+/// PLANT: the front retired on every answer but `EAGAIN`, as R1's backlog
+/// did, turns this red at "ended"; so does the ambiguous class read as
+/// accepted with the decoder's error.
+#[test]
+fn an_ambiguous_send_of_the_backlogs_front_ends_the_decoder_and_hands_it_back() {
+  use mediaio_ffmpeg::test_support::{
+    cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations,
+  };
+
+  in_subprocess(
+    "decoder::tests::an_ambiguous_send_of_the_backlogs_front_ends_the_decoder_and_hands_it_back",
+    || {
+      let mut frame = crate::Frame::empty().expect("frame slot");
+      let history = vec![
+        raw_packet(0x11),
+        raw_packet(0x22),
+        raw_packet_with_side_data(0x33, SIDE_DATA_PAST_THE_CAP),
+        raw_packet(0x44),
+      ];
+      let (mut dec, mut pictures) = committed_with_backlog(history, &mut frame);
+      assert_eq!(pictures, vec![0x11, 0x22], "the committed decoder's");
+      assert_eq!(
+        dec
+          .backlog
+          .iter()
+          .map(|packet| packet.data().expect("a payload")[0])
+          .collect::<Vec<u8>>(),
+        vec![0x33, 0x44],
+        "the replay's rest, owed"
+      );
+
+      let _downloads = DownloadsForTest::set(all_deliver);
+      // SAFETY: in `in_subprocess`'s child, alone; the receive checks what
+      // libavcodec answers, and the cap is lifted as it returns.
+      unsafe { cap_ffmpeg_allocations(CAPPED) };
+      let ended = dec.receive_frame(&mut frame);
+      uncap_ffmpeg_allocations();
+      let Err(Error::AmbiguousSend(ended)) = ended else {
+        panic!("ended: {ended:?}");
+      };
+      assert!(
+        matches!(
+          ended.reason(),
+          Error::Ffmpeg(ffmpeg_next::Error::Other { errno }) if *errno == libc::ENOMEM
+        ),
+        "libavcodec's answer, as it returned it: {ended:?}"
+      );
+      assert_eq!(ended.backend(), Backend::Cuda, "the committed decoder's");
+      assert!(!ended.end_follows(), "no end was given");
+      assert_eq!(
+        fills(ended.residual()),
+        vec![0x33, 0x44],
+        "the front, and every packet behind it"
+      );
+      for packet in ended.residual() {
+        assert_eq!(payload_of(packet).1, 1, "referenced by its packet alone");
+      }
+
+      // The decoder has ended: nothing owed, every packet after it
+      // `AVERROR_EOF`, every receive the end.
+      assert!(dec.backlog.is_empty(), "nothing owed");
+      let after = raw_packet(0x55);
+      // SAFETY: `raw_packet`'s, every byte written and the padding zeroed,
+      // and nothing writes through it while the decoder may read it.
+      let sent = unsafe { dec.send_av_packet(&after) };
+      assert!(
+        matches!(sent, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
+        "a packet after it: {sent:?}"
+      );
+      assert_eq!(
+        dec.receive_frame(&mut frame).expect("the end"),
+        Received::Ended
+      );
+
+      // A decoder that starts from the residual decodes the rest.
+      let mut next = raw_pinned_decoder();
+      send_all(&mut next, ended.residual());
+      pictures.extend(delivered(&mut next, &mut frame));
+      assert_eq!(
+        pictures,
+        vec![0x11, 0x22, 0x33, 0x44],
+        "every picture once, in order"
+      );
+    },
+  );
+}
+
+/// LAW: **back pressure on the backlog keeps its front**: the committed
+/// decoder, holding nothing, takes a picture's packet and a second, and
+/// answers `EAGAIN` to the third (`libavcodec/decode.c` 746–747), which is
+/// kept and fed once the caller drains. Every picture comes once, in order.
+///
+/// PLANT: the front retired on `EAGAIN` turns this red at "kept".
+#[test]
+fn back_pressure_on_the_backlog_keeps_its_front() {
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let sent = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
+  let (mut dec, mut pictures) = committed_with_backlog(Vec::from(sent.map(raw_packet)), &mut frame);
+  assert_eq!(dec.backlog.len(), 4, "the replay's rest");
+
+  let fed = dec.feed().expect("taken, then back pressure");
+  assert_eq!(
+    fed,
+    Fed {
+      taken: 2,
+      all: false
+    },
+    "two taken, the third not"
+  );
+  assert!(
+    holds(dec.backlog.front().expect("a front"), 0x55),
+    "the packet it did not take, kept"
+  );
+  assert_eq!(dec.backlog.len(), 2, "the rest behind it");
+
+  let _downloads = DownloadsForTest::set(all_deliver);
+  pictures.extend(delivered(&mut dec, &mut frame));
+  assert_eq!(pictures, sent, "every picture once, in order");
+}
+
+/// LAW: **on trial, an ambiguous send beside a refusal of this crate's own
+/// ends the decoder** — the trial road's half of the class. The send of the
+/// caller's packet answers `ENOMEM` (its side-data entry cannot be copied
+/// under [`CAPPED`], in a child process), and a frame-budget refusal is
+/// latched beside it, as an earlier call could have left one. The candidate
+/// can be neither kept, not knowing whether it holds the packet, nor charged
+/// with this crate's refusal, so the decoder ends with the refusal by name:
+/// the whole history back, and the caller's packet the caller's. R8's
+/// finding 3 keeps a packet as taken on a refusal of this crate's own only
+/// where the class says the candidate took it.
+///
+/// PLANT: the ambiguous send kept as taken, as R8's fix kept every report,
+/// turns this red at "ended".
+#[test]
+fn on_trial_an_ambiguous_send_beside_a_refusal_of_this_crates_own_ends_the_decoder() {
+  use mediaio_ffmpeg::test_support::{
+    cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations,
+  };
+
+  in_subprocess(
+    "decoder::tests::on_trial_an_ambiguous_send_beside_a_refusal_of_this_crates_own_ends_the_decoder",
+    || {
+      let mut dec = raw_auditioning_decoder();
+      send_all(&mut dec, &[raw_packet(0x11)]);
+      let caller = raw_packet_with_side_data(0x22, SIDE_DATA_PAST_THE_CAP);
+      // SAFETY: `dec` owns this state and frees it only when it drops,
+      // after this call.
+      unsafe {
+        crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912)
+      };
+      // SAFETY: in `in_subprocess`'s child, alone; the send checks what
+      // libavcodec answers, and the cap is lifted as it returns.
+      unsafe { cap_ffmpeg_allocations(CAPPED) };
+      // SAFETY: `raw_packet`'s, every byte written and the padding zeroed,
+      // and nothing writes through it while the decoder may read it.
+      let answer = unsafe { dec.send_av_packet(&caller) };
+      uncap_ffmpeg_allocations();
+      let Err(Error::AmbiguousSend(ended)) = answer else {
+        panic!("ended: {answer:?}");
+      };
+      assert!(
+        matches!(ended.reason(), Error::FrameBudgetExceeded(p) if p.bytes() == 12_582_912),
+        "this crate's refusal, by name: {ended:?}"
+      );
+      assert_eq!(
+        fills(ended.residual()),
+        vec![0x11],
+        "the whole history, and not the caller's packet"
+      );
+      assert!(dec.probe.is_none(), "the probe ended with it");
+      // SAFETY: as above.
+      let sent = unsafe { dec.send_av_packet(&caller) };
+      assert!(
+        matches!(sent, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
+        "the decoder ended: {sent:?}"
+      );
+    },
+  );
+}
+
+/// LAW: **on trial, an ambiguous send that is the candidate's own leaves
+/// the candidate, and the next takes the packet once**: libavcodec's
+/// `ENOMEM` on the caller's packet ([`CAPPED`], in a child process) is the
+/// candidate's answer as it was returned. The probe leaves it — never called
+/// again, whatever it holds going with it — and the next candidate, built
+/// once the cap is lifted, is replayed the history, which never held the
+/// packet, and then takes it: recorded once, its picture delivered once.
+///
+/// PLANT: the ambiguous send reported as this crate's own, the candidate
+/// kept on trial, turns this red at "the next candidate took it".
+#[test]
+fn on_trial_an_ambiguous_send_leaves_the_candidate_and_the_next_takes_the_packet_once() {
+  use mediaio_ffmpeg::test_support::{
+    cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations,
+  };
+
+  in_subprocess(
+    "decoder::tests::on_trial_an_ambiguous_send_leaves_the_candidate_and_the_next_takes_the_packet_once",
+    || {
+      let mut dec = vaapi_then_cuda();
+      dec.probe.as_mut().expect("on trial").build = uncapped_then_software_state;
+      send_all(&mut dec, &[raw_packet(0x11)]);
+      let caller = raw_packet_with_side_data(0x22, SIDE_DATA_PAST_THE_CAP);
+      // SAFETY: in `in_subprocess`'s child, alone; the send checks what
+      // libavcodec answers, and the next candidate's build lifts the cap.
+      unsafe { cap_ffmpeg_allocations(CAPPED) };
+      // SAFETY: `raw_packet`'s, every byte written and the padding zeroed,
+      // and nothing writes through it while the decoder may read it.
+      let answer = unsafe { dec.send_av_packet(&caller) };
+      uncap_ffmpeg_allocations();
+      assert!(
+        matches!(answer, Ok(Sent::Accepted)),
+        "the next candidate took it: {answer:?}"
+      );
+      assert_eq!(dec.backend(), Backend::Cuda, "the next candidate's");
+      {
+        let probe = dec.probe.as_ref().expect("still on trial");
+        assert!(
+          matches!(
+            probe.attempts.as_slice(),
+            [(Backend::Vaapi, Attempt::Failed(BackendAnswer(Error::Ffmpeg(ffmpeg_next::Error::Other { errno }))))]
+              if *errno == libc::ENOMEM
+          ),
+          "the candidate's answer, as libavcodec returned it: {:?}",
+          probe.attempts
+        );
+        assert_eq!(
+          fills(&probe.buffered_packets),
+          vec![0x11, 0x22],
+          "recorded once, in order"
+        );
+        assert_eq!(probe.fed, 2, "fed whole");
+      }
+      let _downloads = DownloadsForTest::set(all_deliver);
+      let mut frame = crate::Frame::empty().expect("frame slot");
+      assert_eq!(
+        delivered(&mut dec, &mut frame),
+        vec![0x11, 0x22],
+        "every picture once, in order"
+      );
+    },
+  );
+}
+
+/// LAW: **while the decoder is owed packets, a send takes nothing, and an
+/// owed packet's answer is the receive road's**. A committed decoder owes
+/// a backlog whose front is too short to hold a row (`rawdec.c` 195–197).
+/// The caller's send answers [`Sent::MustDrain`] and sends nothing; the
+/// drain feeds the front, whose own error — the decode's
+/// `AVERROR_INVALIDDATA`, the packet taken and retired — comes from the
+/// receive, where no packet of the caller's is in hand; and the caller's
+/// packet, offered again, is taken.
+///
+/// PLANT: the send road feeding what is owed, as R1 did, turns this red at
+/// "nothing sent": the owed packet's error is answered for the caller's,
+/// which was never sent.
+#[test]
+fn while_the_decoder_is_owed_a_send_takes_nothing_and_an_owed_packets_answer_is_the_receives() {
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let short = crate::boundary::try_packet_copy(&[0x77; 8]).expect("a packet short of a picture");
+  let history = vec![raw_packet(0x11), raw_packet(0x22), short, raw_packet(0x44)];
+  let (mut dec, mut pictures) = committed_with_backlog(history, &mut frame);
+
+  let caller = raw_packet(0x55);
+  // SAFETY: `raw_packet`'s, every byte written and the padding zeroed, and
+  // nothing writes through it while the decoder may read it.
+  let sent = unsafe { dec.send_av_packet(&caller) };
+  assert!(
+    matches!(sent, Ok(Sent::MustDrain)),
+    "nothing sent while the decoder is owed: {sent:?}"
+  );
+  assert_eq!(dec.backlog.len(), 2, "the backlog, untouched");
+
+  let _downloads = DownloadsForTest::set(all_deliver);
+  let refused = dec.receive_frame(&mut frame);
+  assert!(
+    matches!(refused, Err(Error::Ffmpeg(ffmpeg_next::Error::InvalidData))),
+    "the owed packet's own error, on the receive road: {refused:?}"
+  );
+  pictures.extend(delivered(&mut dec, &mut frame));
+  // SAFETY: as above.
+  let sent = unsafe { dec.send_av_packet(&caller) };
+  assert!(matches!(sent, Ok(Sent::Accepted)), "then taken: {sent:?}");
+  pictures.extend(delivered(&mut dec, &mut frame));
+  assert_eq!(
+    pictures,
+    vec![0x11, 0x22, 0x44, 0x55],
+    "every picture the decoder could give, once, in order"
+  );
+}
+
+/// LAW: **a packet with neither payload nor side data is the end**, as
+/// libavcodec takes it (`libavcodec/decode.c` 745, 751–752; `avcodec.h`
+/// 2341–2347): sent as the end, recorded as the end, never in the history,
+/// and a second is a second end. The candidate drains to a clean end.
+///
+/// PLANT: the packet sent as a packet turns this red at "the end".
+#[test]
+fn a_packet_with_neither_payload_nor_side_data_is_the_end() {
+  let mut dec = raw_auditioning_decoder();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  let empty = Packet::empty();
+  // SAFETY: a blank packet: nothing to read, and nothing to write through.
+  let sent = unsafe { dec.send_av_packet(&empty) };
+  assert!(matches!(sent, Ok(Sent::Accepted)), "the end: {sent:?}");
+  assert!(dec.eof_sent, "recorded as the end");
+  assert_eq!(
+    dec.probe.as_ref().map(|probe| probe.buffered_packets.len()),
+    Some(1),
+    "the history holds no packet for it"
+  );
+  // SAFETY: as above.
+  let again = unsafe { dec.send_av_packet(&empty) };
+  assert!(
+    matches!(again, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
+    "a second end: {again:?}"
+  );
+  let _downloads = DownloadsForTest::set(all_deliver);
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  assert_eq!(delivered(&mut dec, &mut frame), vec![0x11], "its picture");
+  assert_eq!(
+    dec.phase(),
+    SessionPhase::Draining,
+    "committed, the stream over"
+  );
+}
+
+/// LAW: **a packet of a shape libavcodec refuses is refused, and charges no
+/// candidate**: data with no size answers `EINVAL` before libavcodec
+/// references it (`libavcodec/decode.c` 742–743), the caller's fault and no
+/// backend's answer. The candidate stays on trial, nothing recorded and
+/// nothing charged.
+///
+/// PLANT: `EINVAL` classed without the packet's shape, as the decode's
+/// always, turns this red at "refused": the candidate is charged, and the
+/// probe exhausted.
+#[test]
+fn a_packet_of_a_shape_libavcodec_refuses_charges_no_candidate() {
+  let mut dec = raw_auditioning_decoder();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  let zero_size = crate::boundary::try_packet_copy(&[]).expect("data with no size");
+  // SAFETY: `try_packet_copy`'s: its padding written, and nothing writes
+  // through it while the decoder may read it.
+  let refused = unsafe { dec.send_av_packet(&zero_size) };
+  assert!(
+    matches!(
+      refused,
+      Err(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })) if errno == libc::EINVAL
+    ),
+    "refused: {refused:?}"
+  );
+  assert_eq!(dec.phase(), SessionPhase::Auditioning, "still on trial");
+  let probe = dec.probe.as_ref().expect("on trial");
+  assert!(
+    probe.attempts.is_empty(),
+    "no candidate charged: {:?}",
+    probe.attempts
+  );
+  assert_eq!(probe.buffered_packets.len(), 1, "nothing recorded");
+}
+
+/// LAW: **a packet with no payload is copied with none, and libavcodec
+/// takes the copy as it takes the source**
+/// ([`try_clone_packet`](crate::boundary::try_clone_packet)). A
+/// side-data-only packet is one libavcodec takes (`libavcodec/decode.c`
+/// 745–750); `av_packet_ref` would give its copy a buffer of padding and
+/// data with no size, which libavcodec refuses (742–743). A decoder whose
+/// frame waits takes a packet without decoding it (754), so the second send
+/// shows what libavcodec makes of the copy alone.
+///
+/// PLANT: the copy made by `av_packet_ref` and `av_packet_make_writable`
+/// alone turns this red at "no payload".
+#[test]
+fn a_packet_with_no_payload_is_copied_with_none_and_libavcodec_takes_the_copy() {
+  use ffmpeg_next::ffi::{AVPacketSideDataType, av_packet_new_side_data};
+  let mut source = Packet::empty();
+  // SAFETY: the packet is live; libavcodec allocates and zeroes the entry,
+  // and frees it with the packet.
+  let entry = unsafe {
+    av_packet_new_side_data(
+      source.as_mut_ptr(),
+      AVPacketSideDataType::AV_PKT_DATA_MPEGTS_STREAM_ID,
+      1,
+    )
+  };
+  assert!(!entry.is_null(), "the side-data entry");
+  assert!(
+    !is_flush_packet(&source) && !refused_before_reference(&source),
+    "a packet libavcodec takes"
+  );
+  // SAFETY: the source's entry is libavcodec's zeroed allocation, every
+  // byte written.
+  let copy = unsafe { crate::boundary::try_clone_packet(&source) }.expect("a copy");
+  // SAFETY: the copy is live; plain fields.
+  let (data, entries) = unsafe {
+    let raw = copy.as_ptr();
+    ((*raw).data, (*raw).side_data_elems)
+  };
+  assert!(data.is_null(), "no payload");
+  assert_eq!(entries, 1, "the side data, copied");
+  assert!(!refused_before_reference(&copy), "a shape libavcodec takes");
+
+  let mut dec = raw_pinned_decoder();
+  let picture = raw_packet(0x11);
+  assert_eq!(
+    send(&mut dec.state.inner, Sending::Packet(&picture)),
+    Acceptance::Accepted
+  );
+  assert_eq!(
+    send(&mut dec.state.inner, Sending::Packet(&copy)),
+    Acceptance::Accepted,
+    "taken, as the source is"
+  );
+}
+
+/// LAW: **a send whose advance is owed does not take the packet, and the
+/// next candidate does**. The candidate on trial refuses the caller's
+/// picture — it decodes 32 × 32 pictures, and the packet is short of one
+/// (`rawdec.c`) — and the advance away from it meets VAAPI's refusal, then
+/// CUDA's build failing with this crate's own `ENOMEM`, so it is owed. No
+/// candidate is there to take the packet, and the history never held it:
+/// the send answers [`Sent::MustDrain`]. The drain resumes the advance —
+/// CUDA installed — and the packet, offered again, is CUDA's, recorded
+/// once, its picture delivered once.
+///
+/// PLANT: the owed advance's failure answered for the packet, as R1 did,
+/// turns this red at "not taken": the caller reads an error for a packet no
+/// decoder that goes on has seen.
+#[test]
+fn a_send_whose_advance_is_owed_does_not_take_the_packet_and_the_next_candidate_does() {
+  let mut dec = raw_auditioning_decoder_with(32, crate::DecoderOptions::new());
+  let first = dec.backend();
+  {
+    let probe = dec.probe.as_mut().expect("on trial");
+    probe.parameters = raw_parameters(RAW_SIDE);
+    probe.build = vaapi_refuses_and_cuda_may_fail;
+    probe.remaining_backends = vec![Backend::Vaapi, Backend::Cuda];
+  }
+  let picture = raw_packet(0x11);
+  CUDA_FAILS.with(|fails| fails.set(true));
+  // SAFETY: `raw_packet`'s, every byte written and the padding zeroed, and
+  // nothing writes through it while the decoder may read it.
+  let sent = unsafe { dec.send_av_packet(&picture) };
+  CUDA_FAILS.with(|fails| fails.set(false));
+  assert!(
+    matches!(sent, Ok(Sent::MustDrain)),
+    "not taken, the advance owed: {sent:?}"
+  );
+  {
+    let probe = dec.probe.as_ref().expect("on trial");
+    assert!(probe.pending.is_some(), "the advance, owed");
+    assert!(
+      probe.buffered_packets.is_empty(),
+      "the history never held it"
+    );
+    assert_eq!(
+      tried(probe),
+      vec![Backend::Vaapi],
+      "the refusal before the stop"
+    );
+  }
+
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  assert_eq!(
+    dec
+      .receive_frame(&mut frame)
+      .expect("the drain resumes the advance"),
+    Received::NeedsInput
+  );
+  assert_eq!(dec.backend(), Backend::Cuda, "the advance, resumed");
+  // SAFETY: as above.
+  let sent = unsafe { dec.send_av_packet(&picture) };
+  assert!(
+    matches!(sent, Ok(Sent::Accepted)),
+    "the next candidate's: {sent:?}"
+  );
+  {
+    let probe = dec.probe.as_ref().expect("on trial");
+    assert_eq!(fills(&probe.buffered_packets), vec![0x11], "recorded once");
+    assert_eq!(
+      tried(probe),
+      vec![first, Backend::Vaapi],
+      "in the order tried"
+    );
+  }
+  let _downloads = DownloadsForTest::set(all_deliver);
+  assert_eq!(
+    delivered(&mut dec, &mut frame),
+    vec![0x11],
+    "its picture, once"
+  );
+}
+
+/// LAW: **back pressure on a send is answered for the packet alone**. A
+/// committed decoder holds a picture and a packet behind it, so a third
+/// packet's send answers `EAGAIN` from the packet slot (`libavcodec/decode.c`
+/// 746–747), before any decode runs, and a frame-budget refusal latched
+/// beside it belongs to an earlier call. The send answers
+/// [`Sent::MustDrain`], the packet not taken; the drain gives both pictures
+/// and then reports the refusal, by name, where no packet is in hand; and
+/// the packet, offered again, is taken.
+///
+/// PLANT: the send road reading the funnel at `EAGAIN`, as R1 did, turns
+/// this red at "not taken": the refusal is answered for a packet the
+/// decoder never took.
+#[test]
+fn back_pressure_on_a_send_is_answered_for_the_packet_alone() {
+  let mut dec = raw_pinned_decoder();
+  send_all(&mut dec, &[raw_packet(0x11), raw_packet(0x22)]);
+  // SAFETY: `dec` owns this state and frees it only when it drops, after
+  // this call.
+  unsafe {
+    crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912)
+  };
+  let third = raw_packet(0x33);
+  // SAFETY: `raw_packet`'s, every byte written and the padding zeroed, and
+  // nothing writes through it while the decoder may read it.
+  let sent = unsafe { dec.send_av_packet(&third) };
+  assert!(
+    matches!(sent, Ok(Sent::MustDrain)),
+    "not taken: back pressure, and nothing else: {sent:?}"
+  );
+
+  let _downloads = DownloadsForTest::set(all_deliver);
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let mut pictures = Vec::new();
+  loop {
+    match dec.receive_frame(&mut frame) {
+      Ok(Received::Produced) => pictures.push(frame.row(0, 0).expect("a gray picture")[0]),
+      Err(Error::FrameBudgetExceeded(p)) => {
+        assert_eq!(p.bytes(), 12_582_912, "the refusal's own numbers");
+        break;
+      }
+      other => panic!("a picture, or the refusal: {other:?}"),
+    }
+  }
+  assert_eq!(pictures, vec![0x11, 0x22], "both pictures first");
+  // SAFETY: as above.
+  let sent = unsafe { dec.send_av_packet(&third) };
+  assert!(matches!(sent, Ok(Sent::Accepted)), "then taken: {sent:?}");
+  assert_eq!(delivered(&mut dec, &mut frame), vec![0x33], "its picture");
 }

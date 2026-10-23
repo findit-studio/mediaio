@@ -261,22 +261,28 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
     // Through the software funnel: a frame the allocator judge refused
     // surfaces named, not as the `EINVAL` a corrupt file also produces.
     let state: *const crate::ffi::CallbackState = self._callback_state.as_ptr();
+    // Through the one door ([`crate::decoder::send`]): one packet of the
+    // caller's, and its answer is the payload's, whatever its class.
+    //
     // SAFETY: `state` is the pointer the codec context holds, owned by
     // `self._callback_state` until after the context is freed.
-    self
-      .decoder
-      .send_packet(&av_pkt)
-      .map_err(|e| ImageDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) }))?;
+    let refused = |e| ImageDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) });
+    match crate::decoder::send(&mut self.decoder, crate::decoder::Sending::Packet(&av_pkt)) {
+      crate::decoder::Acceptance::Accepted => {}
+      crate::decoder::Acceptance::NotAccepted(e)
+      | crate::decoder::Acceptance::Ambiguous(e)
+      | crate::decoder::Acceptance::AcceptedWithError(e) => return Err(refused(e)),
+    }
     // Every still codec answers its one packet with its one frame, but
     // it is entitled to want the end of the stream first — so the EOF
     // goes in before the drain rather than after a speculative
     // `receive_frame` that would have to interpret `EAGAIN`.
-    //
-    // SAFETY: as above.
-    self
-      .decoder
-      .send_eof()
-      .map_err(|e| ImageDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) }))?;
+    match crate::decoder::send(&mut self.decoder, crate::decoder::Sending::End) {
+      crate::decoder::Acceptance::Accepted => {}
+      crate::decoder::Acceptance::NotAccepted(e)
+      | crate::decoder::Acceptance::Ambiguous(e)
+      | crate::decoder::Acceptance::AcceptedWithError(e) => return Err(refused(e)),
+    }
     if let Err(e) = self.decoder.receive_frame(&mut self.scratch) {
       self.decoder.flush();
       // Funnelled, then classified — the same two steps every receive

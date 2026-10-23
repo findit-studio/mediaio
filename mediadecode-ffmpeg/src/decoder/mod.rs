@@ -72,6 +72,7 @@ pub use open::VideoDecoderOpen;
 /// | a picture delivered: downloaded in a layout a [`Frame`] carries, its properties copied | commits it |
 /// | a picture whose download chose a CPU layout a [`Frame`] cannot carry | no delivery: the candidate is unfit for the stream, recorded so with the layout named, never an errno ([`Error::DownloadFormatUnsupported`] in [`ProbeExhausted::attempts`]), and left as a failed one is: the next backend is tried with the whole history |
 /// | its own error: its opening, a send, a receive or a download failing, or its `get_format` declining the surface pool it declared ([`Error::HwSurfaceTooLarge`]) | fails it, and the next backend is tried with the whole history |
+/// | `ENOMEM` from a send, which leaves unknown whether it took the packet (`libavcodec/decode.c` 748–757) | the same: it is left, its answer the errno as libavcodec returned it, and the next backend is tried with the whole history, which never holds a packet whose send was ambiguous. With a refusal of this crate's own latched beside it, the candidate can be neither kept nor charged, and the decoder ends ([`Error::AmbiguousSend`]) |
 /// | the end taken, then libavcodec's `AVERROR_EOF` with no refusal latched | a successful empty completion: commits it, and the stream has ended |
 /// | `EAGAIN` after the end | fails it: libavcodec answers a decoder drained to its end with `AVERROR_EOF` (`libavcodec/decode.c` 446–451, 489–505, 655–656 in FFmpeg 9.0.1), so a candidate that asks for input there has broken the drain |
 /// | a packet the history cannot keep: past the probe's ceiling (256 packets or 64 MiB), of more side-data entries than the probe copies (64), or one whose copy cannot be made | the trial's last: sent with the history whole, it commits the candidate once taken, and fails it as above if refused |
@@ -157,6 +158,15 @@ pub use open::VideoDecoderOpen;
 /// is the caller's policy — the caller sees the errors, the packets' key
 /// flags and what it has delivered — and [`DecodePath`](crate::DecodePath)
 /// describes one.
+///
+/// **One answer ends a committed decoder**: `ENOMEM` from the send of a
+/// backlog packet — one a replay had not reached when its candidate gave
+/// its first picture, of which the backlog holds the only copy. libavcodec
+/// gives `ENOMEM` both for a packet it could not reference and for one it
+/// took and could not decode (`libavcodec/decode.c` 748–757), so the
+/// decoder can neither drop the packet nor send it again, and ends, handing
+/// the backlog back ([`Error::AmbiguousSend`]). See [`Acceptance`] for every
+/// road's answer to every class.
 pub struct VideoDecoder {
   /// Live FFmpeg state for the currently active backend.
   state: DecoderState,
@@ -170,8 +180,10 @@ pub struct VideoDecoder {
   probe: Option<ProbeState>,
   /// The probe's history a candidate was committed before being fed, in
   /// order: what its replay still owed when it gave its first picture
-  /// ([`Self::commit`]). Fed before anything new ([`Self::feed`]), each
-  /// packet dropped once the decoder takes it.
+  /// ([`Self::commit`]). Fed before anything new, by the receive road
+  /// ([`Self::feed`]), each packet retired once the decoder takes it, and
+  /// handed back where its send leaves that unknown
+  /// ([`Error::AmbiguousSend`]).
   backlog: VecDeque<Packet>,
   /// Whether the end the caller already gave ([`Self::eof_sent`]) is still
   /// owed to the decoder: a candidate replayed a history that ends stops
@@ -519,17 +531,218 @@ struct Fed {
   all: bool,
 }
 
-/// What feeding the decoder what it is owed came to, routed as a send is
-/// ([`VideoDecoder::feed_owed`]).
-enum Owed {
-  /// Everything owed was taken.
-  Taken,
-  /// The decoder answered `EAGAIN` first: it has output for the caller.
-  Full,
-  /// A committed decoder refused it: that packet's own error.
-  Report(Error),
-  /// The candidate on trial refused it: its own answer.
-  Advance(BackendAnswer),
+/// What [`send`] sends a decoder: a packet, or the end.
+#[derive(Clone, Copy)]
+pub(crate) enum Sending<'a> {
+  /// A packet, sent by reference: `avcodec_send_packet` with it.
+  Packet(&'a Packet),
+  /// The end: `avcodec_send_packet` with no packet, libavcodec's flush
+  /// packet.
+  End,
+}
+
+/// **What a decoder did with what it was sent, read by source**:
+/// `avcodec_send_packet`, `libavcodec/decode.c` 730–760 in FFmpeg 9.0.1,
+/// and the one answer every road that sends acts on ([`send`]).
+///
+/// libavcodec checks, in order: that the codec is open and a decoder
+/// (736–737, `EINVAL`); that the decoder has not started draining (739–740,
+/// `AVERROR_EOF`); that a packet with data has a size (742–743, `EINVAL`).
+/// A packet with data or side data is then taken only where its one slot is
+/// free (746–747, `EAGAIN`) and `av_packet_ref` can reference it into that
+/// slot (748–750, its own error); anything else is the end (751–752). Only
+/// then, the packet taken, does it decode, where no frame waits (754–757):
+/// an error from that decode is returned, the packet taken all the same,
+/// and the decode's own `EAGAIN` and `AVERROR_EOF` are swallowed into `0`
+/// (756). The end references nothing and decodes nothing.
+///
+/// So every code but two has one source:
+///
+/// - **`ENOMEM`** is `av_packet_ref`'s (`libavcodec/packet.c` 413–415,
+///   423–427, 463–466; `libavutil/buffer.c` 192–200), the packet not taken,
+///   or the decode's, the packet taken. Nothing public tells them apart:
+///   [`Self::Ambiguous`].
+/// - **`EINVAL`** is 737's, 743's, or `av_packet_ref`'s for a packet with
+///   no buffer whose size it will not allocate (`packet.c` 452–455 and
+///   86–87), the packet not taken in each; or the decode's, the packet
+///   taken. The first is impossible by construction: every decoder this
+///   crate sends to was opened by `avcodec_open2`, on a decoder
+///   `avcodec_find_decoder` named ([`find_decoder`]), and is closed only
+///   when it drops. The others are a packet's shape, which tells them apart
+///   ([`refused_before_reference`]): `EINVAL` for a packet of such a shape
+///   is not taken, and for any other is the decode's.
+///
+/// `av_packet_ref` answers nothing else (`packet.c` 442–476: `ENOMEM`, or
+/// `packet_alloc`'s `EINVAL`), and `EAGAIN` and `AVERROR_EOF` come from
+/// 747 and 740 alone. Every other code is the decode's.
+///
+/// # What each road does with each class
+///
+/// The roads are the ones a packet or the end reaches a decoder by. A
+/// candidate's history and its backlog are the probe's own copies
+/// ([`crate::boundary::try_clone_packet`]): each carries a buffer of its
+/// own, so `av_packet_ref` never allocates its payload, and a copy of a
+/// packet libavcodec took is a packet it takes the same way, so none is
+/// refused by its shape. The send roads never feed what is owed: while
+/// anything is, they answer [`Sent::MustDrain`] and send nothing, and the
+/// receive road feeds it, holding no packet of the caller's. A decoder that
+/// answers a receive `EAGAIN` takes a send, so the feed makes progress
+/// (`avcodec.h` 158–164).
+///
+/// | road | accepted | not accepted | ambiguous (`ENOMEM`) | accepted with the decoder's error |
+/// |---|---|---|---|---|
+/// | the caller's packet, a committed decoder ([`VideoDecoder::send_av_packet`]) | [`Sent::Accepted`] | `EAGAIN`: [`Sent::MustDrain`], the packet the caller's to offer again, the funnel not read (a refusal latched before stays for the receive road); `AVERROR_EOF` after the end, or `EINVAL` for a shape libavcodec refuses: the funnel's verdict, the packet refused for good | the funnel's verdict, as libavcodec's own contract leaves it: the caller cannot know whether the packet was taken. No packet only this crate holds is at stake: nothing is owed when a caller's packet is sent | the funnel's verdict: the packet taken, and the next call reaches libavcodec |
+/// | the caller's packet, a candidate on trial | the history records the probe's copy, or a packet it cannot keep commits the candidate ([`VideoDecoder::took`]) | as above, the probe's copy dropped; a surface refusal latched leaves the candidate, and the packet is offered to the next | the candidate's own verdict (the errno as libavcodec returned it, or a surface refusal it latched): the candidate is left, the copy dropped, the history whole, and the packet offered to the next — at once, or, where the advance stops at a failure of this crate's own and is owed, once the caller drains ([`Sent::MustDrain`], the packet not taken). This crate's own (a frame-budget refusal latched): it can be neither kept nor charged, so the decoder ends ([`Error::AmbiguousSend`], the whole history back, the packet the caller's) | the candidate's own verdict: left, as for ambiguous. This crate's own (the frame budget): the packet taken, so kept as taken ([`VideoDecoder::took`]), and the refusal returned |
+/// | a history replay into a new candidate ([`feed_into`]) | the next packet | `EAGAIN`: the replay stops, the candidate installed with the rest owed. No other (a fresh decoder, the end sent last, copies of packets taken) | the candidate is dropped uninstalled, so nothing it may hold goes on; its answer is recorded as libavcodec returned it, or it is kept in the order with the advance owed where the refusal latched is this crate's own ([`VideoDecoder::advance_probe_with`]). The history is whole either way | as for ambiguous |
+/// | the owed history, into the installed candidate ([`VideoDecoder::feed`], receive road) | counted fed | `EAGAIN`: kept owed, the caller drains first. No other (no end before the history, copies) | not counted; the candidate's own verdict leaves it, the history whole; this crate's own ends the decoder, the whole history back | counted fed; the candidate's own verdict leaves it; this crate's own is returned, the candidate on trial and the packet counted taken |
+/// | the backlog, after the commit ([`VideoDecoder::feed`], receive road) | the front retired | `EAGAIN`: the front kept, the caller drains first. No other (the end comes after the backlog, copies) | **the decoder ends**: the front, and every packet behind it, back ([`Error::AmbiguousSend`]) | the front retired, and the error is that packet's own |
+/// | the end: [`VideoDecoder::send_eof`], the owed end, a replay's end, the end a decoder ends with | taken | `AVERROR_EOF`: a second end, the caller's fault, read through the funnel. No `EAGAIN` in FFmpeg 9.0.1 (739–752), answered as back pressure all the same | none: the end references and decodes nothing | none |
+/// | the stream decoder's software fallback, the history and the end replayed into a software decoder | the next | `EAGAIN`: drained into the fallback's own queue, and offered again; any other: as for ambiguous | the software decoder is dropped and every rescued packet handed back ([`Error::FallbackFailed`]): nothing goes on past the send | as for ambiguous |
+/// | the stream decoder's software decoder, and the audio and image decoders: the caller's packet and end | taken | `EAGAIN`: [`Sent::MustDrain`]; any other: the funnel's verdict | the funnel's verdict, the caller unable to know whether the packet was taken, as libavcodec's own contract leaves it: these decoders keep no packet of their own | the funnel's verdict |
+/// | [`VideoDecoder::flush`] | — | — | — | — |
+///
+/// A flush sends nothing: `avcodec_flush_buffers` drops the packet slot,
+/// the waiting frame and the draining mark (`libavcodec/avcodec.c` 407–412,
+/// `decode.c` 2382), and the decoder forgets the backlog and the end with
+/// the position, and the probe its history; an advance owed stays owed, and
+/// a decoder that ended can take input again.
+///
+/// A packet with neither payload nor side data is the end to libavcodec
+/// (745, 751–752; `avcodec.h` 2341–2347), so [`VideoDecoder::send_av_packet`]
+/// sends it as the end, and no other road holds one; [`send`] would refuse
+/// it unsent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Acceptance {
+  /// `0`: the decoder took it.
+  Accepted,
+  /// The decoder did not take it, and says so: `EAGAIN`, `AVERROR_EOF`, or
+  /// `EINVAL` for a packet of a shape libavcodec refuses before it
+  /// references one.
+  NotAccepted(ffmpeg_next::Error),
+  /// `ENOMEM`: the decoder may or may not have taken it.
+  Ambiguous(ffmpeg_next::Error),
+  /// The decoder took it, and its decode failed with this error.
+  AcceptedWithError(ffmpeg_next::Error),
+}
+
+impl Acceptance {
+  /// A packet's answer, read by source: `refused_by_shape` is whether
+  /// libavcodec refuses the packet's shape before it references it
+  /// ([`refused_before_reference`]).
+  fn of_packet(
+    refused_by_shape: bool,
+    answer: std::result::Result<(), ffmpeg_next::Error>,
+  ) -> Self {
+    match answer {
+      Ok(()) => Self::Accepted,
+      // 747 alone: the decode's own `EAGAIN` is `0` (756).
+      Err(e) if is_eagain(&e) => Self::NotAccepted(e),
+      // 740 alone: the decode's own `AVERROR_EOF` is `0` (756).
+      Err(e @ ffmpeg_next::Error::Eof) => Self::NotAccepted(e),
+      // 743, or `packet_alloc` inside `av_packet_ref` (748–750).
+      Err(e) if refused_by_shape && is_errno(&e, libc::EINVAL) => Self::NotAccepted(e),
+      // `av_packet_ref`'s (748–750), or the decode's (757).
+      Err(e) if is_errno(&e, libc::ENOMEM) => Self::Ambiguous(e),
+      // The decode's (757).
+      Err(e) => Self::AcceptedWithError(e),
+    }
+  }
+
+  /// The end's answer: `0`, or a refusal. The end references nothing and
+  /// decodes nothing (751–754), so libavcodec answers it only by 737 and
+  /// 740.
+  fn of_end(answer: std::result::Result<(), ffmpeg_next::Error>) -> Self {
+    match answer {
+      Ok(()) => Self::Accepted,
+      Err(e) => Self::NotAccepted(e),
+    }
+  }
+}
+
+/// **The one door into a decoder.** Every road in this crate that sends a
+/// packet or the end sends it here, and acts on libavcodec's answer read by
+/// source ([`Acceptance`]): the hardware decoder's — the caller's packet and
+/// end, a replay, the owed history, the backlog — the stream decoder's
+/// software fallback and software decoder, and the audio and image
+/// decoders.
+///
+/// A packet with neither payload nor side data is never sent as a packet,
+/// since libavcodec takes it as the end and starts draining (`decode.c`
+/// 745, 751–752): no road holds one, and one here is refused unsent.
+pub(crate) fn send(decoder: &mut codec::decoder::Opened, sending: Sending<'_>) -> Acceptance {
+  match sending {
+    Sending::Packet(packet) if is_flush_packet(packet) => {
+      Acceptance::NotAccepted(ffmpeg_next::Error::Other {
+        errno: libc::EINVAL,
+      })
+    }
+    Sending::Packet(packet) => Acceptance::of_packet(
+      refused_before_reference(packet),
+      decoder.send_packet(packet),
+    ),
+    Sending::End => Acceptance::of_end(decoder.send_eof()),
+  }
+}
+
+/// Whether libavcodec refuses `packet` by its shape before it references
+/// it, whatever the decoder (FFmpeg 9.0.1): data with no size (`decode.c`
+/// 742–743), or no buffer and a size `av_packet_ref` will not allocate
+/// (748–750; `packet.c` 452–455 and 86–87). It answers `EINVAL` for both.
+fn refused_before_reference(packet: &Packet) -> bool {
+  // SAFETY: the packet is live; `data`, `size` and `buf` are plain fields.
+  let (data, size, buf) = unsafe {
+    let raw = packet.as_ptr();
+    ((*raw).data, (*raw).size, (*raw).buf)
+  };
+  let padding = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as libc::c_int;
+  (size == 0 && !data.is_null())
+    || (buf.is_null() && (size < 0 || size >= libc::c_int::MAX - padding))
+}
+
+/// Whether libavcodec takes `packet` as the end: neither payload nor side
+/// data (`decode.c` 745, 751–752; `avcodec.h` 2341–2347 in FFmpeg 9.0.1).
+fn is_flush_packet(packet: &Packet) -> bool {
+  // SAFETY: the packet is live; `data` and `side_data_elems` are plain
+  // fields.
+  unsafe {
+    let raw = packet.as_ptr();
+    (*raw).data.is_null() && (*raw).side_data_elems == 0
+  }
+}
+
+/// What [`VideoDecoder::feed`] was feeding when the decoder answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owing {
+  /// A packet of the history, to the candidate on trial.
+  History,
+  /// The backlog's front, to the committed decoder.
+  Backlog,
+  /// The end.
+  End,
+}
+
+/// Where [`VideoDecoder::feed`] stopped short of feeding all it owed, other
+/// than at back pressure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stopped {
+  /// What it was feeding.
+  owing: Owing,
+  /// libavcodec's error.
+  error: ffmpeg_next::Error,
+  /// Whether the error leaves unknown if the decoder took it
+  /// ([`Acceptance::Ambiguous`]).
+  ambiguous: bool,
+}
+
+impl Stopped {
+  /// Stopped where `owing` was being fed, at `error`, `ambiguous` or not.
+  const fn at(owing: Owing, error: ffmpeg_next::Error, ambiguous: bool) -> Self {
+    Self {
+      owing,
+      error,
+      ambiguous,
+    }
+  }
 }
 
 /// How far [`feed_into`] got with a replay.
@@ -1379,6 +1592,7 @@ impl VideoDecoder {
       | Error::BackendUnsupportedByCodec(_)
       | Error::HwDeviceInitFailed(_)
       | Error::ProbeExhausted(_)
+      | Error::AmbiguousSend(_)
       | Error::FallbackFailed(_) => VerdictRouting::Direct,
     }
   }
@@ -1492,19 +1706,35 @@ impl VideoDecoder {
   /// }
   /// ```
   ///
-  /// On success — and only on success — the packet is buffered for potential
-  /// replay through a fallback backend while the probe is active. `EAGAIN`
-  /// (the decoder needs `receive_frame` to drain output first) is
-  /// [`Sent::MustDrain`]: nothing was consumed, so the caller drains and
-  /// offers the same packet again. `AVERROR_EOF` is **not** back pressure
-  /// on this face — it means this decoder was already told the stream
-  /// ended — so it stays a fault. See [`send_status`].
+  /// **The answer is about this packet, and says whether it was taken**,
+  /// libavcodec's answer read by source ([`Acceptance`], whose table this
+  /// follows):
   ///
-  /// While the probe is active, a non-transient error (e.g. the active HW
-  /// backend rejecting this stream's geometry on first packet) advances the
-  /// probe to the next candidate and retries the packet there. The caller
-  /// observes only the eventual success or, if the probe is exhausted, the
-  /// final error.
+  /// - [`Sent::Accepted`]: taken. While the probe is active it is recorded
+  ///   for a replay through a fallback backend.
+  /// - [`Sent::MustDrain`]: not taken. The caller drains and offers the same
+  ///   packet again. libavcodec's `EAGAIN` is this, and so is a decoder owed
+  ///   what a replay or a commit left it ([`Self::feed`]), which the drain
+  ///   feeds first, and an advance the probe owes, which the drain resumes:
+  ///   in neither is there a candidate to take the packet now.
+  /// - An error: the packet was taken and this is its own error; or it is
+  ///   refused for good — after the end (`AVERROR_EOF`, which is **not**
+  ///   back pressure on this face, see [`send_status`]), or of a shape
+  ///   libavcodec refuses (`EINVAL`: data with no size); or, from a
+  ///   committed decoder, `ENOMEM`, where libavcodec's own contract leaves
+  ///   the caller unable to know whether it was taken. [`Error::AmbiguousSend`]
+  ///   and [`Error::ProbeExhausted`] say the packet was not taken: it is the
+  ///   caller's, to send after the packets either hands back.
+  ///
+  /// A packet with neither payload nor side data is the end, as libavcodec
+  /// takes it (`avcodec.h` 2341–2347), and is sent as [`Self::send_eof`]
+  /// sends it.
+  ///
+  /// While the probe is active, the candidate's own error on the packet (e.g.
+  /// the active HW backend rejecting this stream's geometry on first packet),
+  /// or its `ENOMEM`, leaves it: the probe advances to the next candidate and
+  /// offers it the packet. The caller observes only the eventual answer or,
+  /// if the probe is exhausted, the final error.
   ///
   /// **Atomic probe rescue.** While the probe is active, the rescue
   /// invariant is that everything FFmpeg has consumed since open is
@@ -1532,7 +1762,13 @@ impl VideoDecoder {
   /// — the frame budget, refused while the packet was decoded, after
   /// libavcodec queued it — leaves the packet taken: the probe records it,
   /// as on acceptance, or commits the candidate where the history cannot
-  /// keep it. The caller does not send it again.
+  /// keep it. The caller does not send it again. Only the class says the
+  /// packet was taken — an error from the decode that follows the reference
+  /// (`libavcodec/decode.c` 748–757) — and never the refusal: one latched
+  /// beside `ENOMEM` may be older than the send, and `ENOMEM` may be
+  /// `av_packet_ref`'s. There the candidate can be neither kept, not knowing
+  /// what it holds, nor charged, the refusal being this crate's own, so the
+  /// decoder ends ([`Error::AmbiguousSend`]).
   ///
   /// After commit a failure is this packet's own error, reported as it
   /// was minted, and the next packet reaches libavcodec — nothing is
@@ -1564,31 +1800,37 @@ impl VideoDecoder {
   /// through it — no `Packet::data_mut`, no in-place write — until this
   /// decoder is flushed or dropped.
   pub unsafe fn send_av_packet(&mut self, packet: &Packet) -> Result<Sent> {
+    // **A packet with neither payload nor side data is the end**, as
+    // libavcodec takes it (`libavcodec/decode.c` 745, 751–752 in FFmpeg
+    // 9.0.1): it goes where the end goes, and the history never holds it.
+    if is_flush_packet(packet) {
+      return self.send_eof();
+    }
     // **A submission after the end is the caller's fault**, whether or not
     // the decoder has yet been handed that end: one still owed behind a
     // replay is the caller's all the same.
     if self.end_owed {
       return Err(Error::Ffmpeg(ffmpeg_next::Error::Eof));
     }
-    // An advance the probe owes goes before the candidate it leaves is called.
-    self.resume_advance()?;
+    // An advance the probe owes goes before the candidate it leaves is
+    // called; one that stops again leaves nothing to take this packet.
+    let resumed = self.resume_advance();
+    if let Some(sent) = self.answered_on_send(resumed)? {
+      return Ok(sent);
+    }
     loop {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
       let phase = self.phase();
-      // **What the decoder is owed goes first**, in order: a replay that
-      // stopped at the candidate's first output, or a backlog a commit
-      // left. While it cannot all be taken, this packet waits.
-      if let Some(route) = self.feed_owed() {
-        match route {
-          Owed::Taken => {}
-          Owed::Full => return Ok(Sent::MustDrain),
-          Owed::Report(err) => return Err(err),
-          Owed::Advance(answer) => {
-            self.advance_probe(answer)?;
-            continue;
-          }
-        }
+      // **What the decoder is owed goes first, and the receive road feeds
+      // it**: a replay that stopped at the candidate's first output, or a
+      // backlog a commit left. This packet is not sent meanwhile, so no
+      // answer about another packet is ever this one's. The drain makes
+      // progress: a decoder that wants input takes what it is owed, since
+      // libavcodec never answers `EAGAIN` on both sides (`avcodec.h`
+      // 158–164 in FFmpeg 9.0.1).
+      if self.owes() {
+        return Ok(Sent::MustDrain);
       }
       // Pre-flight while probe is active: prove we can record this
       // packet for replay BEFORE the active decoder consumes it.
@@ -1648,86 +1890,141 @@ impl VideoDecoder {
         None
       };
 
-      match self.state.inner.send_packet(packet) {
-        Ok(()) => {
+      // **What libavcodec did with the packet, by class** ([`Acceptance`]):
+      // the staged copy is acted on as the class says the candidate holds
+      // the packet, and only so.
+      match send(&mut self.state.inner, Sending::Packet(packet)) {
+        Acceptance::Accepted => {
           self.took(staged);
           return Ok(Sent::Accepted);
         }
-        // **libavcodec's send-side flow control, guarded here and read
-        // through the funnel — the same door the software road uses.**
-        //
-        // The guard and the classification are two different questions
-        // and they get two different answers. `is_transient` decides
-        // *whether the probe may advance*: neither `EAGAIN` nor
-        // `AVERROR_EOF` is a candidate failing, so both are taken here,
-        // ahead of the failure road, exactly as this one guard always
-        // took them. `send_status` then decides *which* of the two this
-        // is — back pressure or the double-EOF fault — and that
-        // decision is not written here at all, so this arm cannot drift
-        // away from the road the software decoders take. The staged
-        // clone drops; the caller drains and re-offers, and we re-clone
-        // at the top of the loop.
-        //
-        // It reads the errno through [`Self::hw_send`] rather than
-        // classifying it raw: a refusal this crate latched during the
-        // submission — `get_format` declining a coded surface as the
-        // decoder configures on its first packet — must be what the
-        // caller is told, not the `EAGAIN` libavcodec reported over the
-        // top of it.
-        // **Mint, then route — not mint and return.** A flow signal
-        // leaves immediately; anything else is a verdict, and a verdict
-        // that names a declined surface has to reach a running probe,
-        // which advances on it. `BareVerdict::Reported`
-        // is the road's own reading of an *unnamed* verdict here: the
-        // double-EOF is the caller's fault, not the candidate's, so the
-        // probe must not advance on it.
-        Err(e) if is_transient(&e) => match self.hw_send(e, phase) {
+        // **Not taken, the decoder full: back pressure, and nothing else.**
+        // `EAGAIN` comes from the packet slot alone (`decode.c` 746–747),
+        // before any decode runs, so a refusal latched beside it belongs to
+        // an earlier call and is not this packet's: the funnel is not read,
+        // and the receive road the caller drains by collects it. The staged
+        // copy drops; the caller re-offers, and the loop re-stages it.
+        Acceptance::NotAccepted(e) if is_eagain(&e) => {
+          return send_status(Error::Ffmpeg(e), phase);
+        }
+        // **Not taken, and never to be**: a send after the end (740), or a
+        // shape libavcodec refuses before it references the packet (742–743,
+        // 748–750). The caller's fault, read through the funnel all the same:
+        // a refusal latched is what the caller is told, and a declined
+        // surface reaches a running probe, which advances on it.
+        // `BareVerdict::Reported` is this road's reading of an *unnamed*
+        // verdict: the candidate did nothing wrong, so the probe does not
+        // advance on it.
+        Acceptance::NotAccepted(e) => match self.hw_send(e, phase) {
           Ok(status) => return Ok(status),
           Err(reason) => match self.hw_route(reason, BareVerdict::Reported) {
             HwRoute::Report(err) => return Err(err),
-            HwRoute::Advance(err) => {
-              self.advance_probe(err)?;
-              continue;
+            HwRoute::Advance(answer) => {
+              let advanced = self.advance_probe(answer);
+              match self.answered_on_send(advanced)? {
+                None => continue,
+                Some(sent) => return Ok(sent),
+              }
             }
           },
         },
-        // A real failure. Minted once and routed by the shared policy:
-        // while a candidate is on trial this is that candidate failing,
-        // so `advance_probe` consumes the reason into `attempts` and
-        // either installs the next candidate or surfaces
-        // `ProbeExhausted`. Any staged clone drops without entering
-        // history; the next iteration clones afresh.
-        Err(e) => match self.hw_failure(e, BareVerdict::CandidateFailure) {
-          // **A refusal of this crate's own, after the packet was taken.**
-          // libavcodec queues a packet before it decodes it
-          // (`avcodec_send_packet`, `libavcodec/decode.c` 745–758 in FFmpeg
-          // 9.0.1), so a refusal latched while decoding — the frame budget,
-          // the one report a candidate's send makes that is not its answer —
-          // answers a packet the candidate took. The probe keeps it, as on
+        // **Taken, and the decode after the reference failed** (`decode.c`
+        // 748–757). Minted once and routed by the shared policy.
+        Acceptance::AcceptedWithError(e) => match self.hw_failure(e, BareVerdict::CandidateFailure)
+        {
+          // **A refusal of this crate's own, after the packet was taken**
+          // (Codex R8, finding 3): the frame budget, the one report a
+          // candidate's send makes that is not its answer. The class says
+          // the candidate took the packet, so the probe keeps it, as on
           // acceptance: a later replay holds everything the candidate
-          // consumed, and the packet is not the caller's to send it again.
+          // consumed, and the packet is not the caller's to send again.
+          // Committed, `staged` is `None` and this is the packet's own error.
           HwRoute::Report(err) => {
             self.took(staged);
             return Err(err);
           }
-          HwRoute::Advance(err) => {
-            self.advance_probe(err)?;
-            continue;
+          // The candidate failing: it is left, and the packet goes to the
+          // next candidate as the caller's. The staged copy drops without
+          // entering the history; the next iteration copies afresh.
+          HwRoute::Advance(answer) => {
+            let advanced = self.advance_probe(answer);
+            match self.answered_on_send(advanced)? {
+              None => continue,
+              Some(sent) => return Ok(sent),
+            }
+          }
+        },
+        // **`ENOMEM`: the decoder may or may not hold the packet.**
+        Acceptance::Ambiguous(e) => match self.hw_failure(e, BareVerdict::CandidateFailure) {
+          // Committed: libavcodec's own contract, `avcodec.h` 2358, and the
+          // caller cannot know whether the packet was taken. Nothing owed
+          // is at stake: this packet is sent only when nothing is.
+          HwRoute::Report(err) if self.probe.is_none() => return Err(err),
+          // On trial, a refusal of this crate's own latched with it (the
+          // frame budget, `Direct`): the candidate can be neither kept, not
+          // knowing what it holds, nor charged, the refusal being this
+          // crate's. The decoder ends, the whole history back, and the
+          // packet stays the caller's.
+          HwRoute::Report(reason) => return Err(self.end_ambiguously(reason)),
+          // **The candidate's own verdict leaves it, and that is sound by
+          // source**: the candidate is never called again (installed over,
+          // released at the exhaustion, or owed an advance that resumes
+          // before any call), whatever it holds goes with it, the history
+          // never held this packet, and the next candidate is replayed the
+          // history from its start, then offered this packet. Its answer is
+          // libavcodec's errno as returned, or a surface refusal it latched.
+          HwRoute::Advance(answer) => {
+            let advanced = self.advance_probe(answer);
+            match self.answered_on_send(advanced)? {
+              None => continue,
+              Some(sent) => return Ok(sent),
+            }
           }
         },
       }
     }
   }
 
+  /// An advance a send road made or resumed, as the send answers it: `None`
+  /// where a candidate is installed (or none was owed), to be offered the
+  /// packet; [`Sent::MustDrain`] where the advance stopped at a failure of
+  /// this crate's own and is owed ([`PendingAdvance`]); and
+  /// [`Error::ProbeExhausted`] as it is.
+  ///
+  /// **Owed, nothing can take the packet**, so it is not taken: the send
+  /// answers back pressure, the caller drains, and the drain — which holds no
+  /// packet — resumes the advance first, and reports the failure if it
+  /// stands. Answering the failure here would say nothing of the packet: the
+  /// caller would read an error for a packet no decoder that goes on has
+  /// seen.
+  fn answered_on_send(&self, advanced: Result<()>) -> Result<Option<Sent>> {
+    match advanced {
+      Ok(()) => Ok(None),
+      Err(_)
+        if self
+          .probe
+          .as_ref()
+          .is_some_and(|probe| probe.pending.is_some()) =>
+      {
+        Ok(Some(Sent::MustDrain))
+      }
+      Err(e) => Err(e),
+    }
+  }
+
   /// Signal end-of-stream to the decoder.
   ///
-  /// Recorded for replay only if the underlying `send_eof` succeeds. While
-  /// the probe is active, non-transient errors trigger probe advance and
-  /// retry, matching `send_packet`'s behaviour.
+  /// Recorded for replay only once the decoder takes it. The end references
+  /// no packet and runs no decode (`libavcodec/decode.c` 751–754 in FFmpeg
+  /// 9.0.1), so it is taken or refused, and never a candidate's failure:
+  /// only a surface refusal latched before it advances a running probe, as
+  /// on [`Self::send_packet`].
   ///
-  /// Answers [`Sent::MustDrain`] on `EAGAIN` — the end-of-stream was
-  /// **not** recorded, so drain and signal again. A second EOF is a
-  /// caller fault and stays one; see [`send_status`].
+  /// Answers [`Sent::MustDrain`] where the end was **not** recorded and can
+  /// be: while the decoder is owed packets, which the drain feeds first, or
+  /// an advance, which the drain resumes, and on `EAGAIN`, which libavcodec
+  /// does not give the end. A second EOF is a caller fault and stays one;
+  /// see [`send_status`].
   ///
   /// After commit a failure here is reported as it was minted, as on
   /// [`Self::send_packet`], and nothing is remembered.
@@ -1738,47 +2035,45 @@ impl VideoDecoder {
       return Err(Error::Ffmpeg(ffmpeg_next::Error::Eof));
     }
     // An advance the probe owes, as on `send_packet`.
-    self.resume_advance()?;
+    let resumed = self.resume_advance();
+    if let Some(sent) = self.answered_on_send(resumed)? {
+      return Ok(sent);
+    }
     loop {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
       let phase = self.phase();
-      // What the decoder is owed goes first, as on `send_packet`.
-      if let Some(route) = self.feed_owed() {
-        match route {
-          Owed::Taken => {}
-          Owed::Full => return Ok(Sent::MustDrain),
-          Owed::Report(err) => return Err(err),
-          Owed::Advance(answer) => {
-            self.advance_probe(answer)?;
-            continue;
-          }
-        }
+      // What the decoder is owed goes first, fed by the receive road, as on
+      // `send_packet`.
+      if self.owes() {
+        return Ok(Sent::MustDrain);
       }
-      match self.state.inner.send_eof() {
-        Ok(()) => {
+      match send(&mut self.state.inner, Sending::End) {
+        Acceptance::Accepted => {
           self.eof_sent = true;
           return Ok(Sent::Accepted);
         }
-        // The same guard, the same door and the same routing as
-        // `send_packet`; see the note there.
-        Err(e) if is_transient(&e) => match self.hw_send(e, phase) {
+        // Not in FFmpeg 9.0.1 (739–752), and back pressure if it comes.
+        Acceptance::NotAccepted(e) if is_eagain(&e) => {
+          return send_status(Error::Ffmpeg(e), phase);
+        }
+        // A second end (740) — the caller's fault — read through the funnel,
+        // and routed as `send_packet` routes a refusal; see the note there.
+        // The end answers no other class, so none is a candidate failing.
+        Acceptance::NotAccepted(e)
+        | Acceptance::Ambiguous(e)
+        | Acceptance::AcceptedWithError(e) => match self.hw_send(e, phase) {
           Ok(status) => return Ok(status),
           Err(reason) => match self.hw_route(reason, BareVerdict::Reported) {
             HwRoute::Report(err) => return Err(err),
-            HwRoute::Advance(err) => {
-              self.advance_probe(err)?;
-              continue;
+            HwRoute::Advance(answer) => {
+              let advanced = self.advance_probe(answer);
+              match self.answered_on_send(advanced)? {
+                None => continue,
+                Some(sent) => return Ok(sent),
+              }
             }
           },
-        },
-        // The same shared policy; see `send_packet`.
-        Err(e) => match self.hw_failure(e, BareVerdict::CandidateFailure) {
-          HwRoute::Report(err) => return Err(err),
-          HwRoute::Advance(err) => {
-            self.advance_probe(err)?;
-            continue;
-          }
         },
       }
     }
@@ -1821,6 +2116,12 @@ impl VideoDecoder {
   /// was minted, and nothing is remembered: the next call reaches
   /// libavcodec. See the type's documentation.
   ///
+  /// **The receive road alone feeds what the decoder is owed** — a replay's
+  /// rest, a backlog, an end — so an owed packet's answer is reported here,
+  /// never as a caller's packet's. Where a backlog packet's send leaves
+  /// unknown whether the decoder took it, the decoder ends, handing the
+  /// backlog back ([`Error::AmbiguousSend`]).
+  ///
   /// Answers the same three states `ffmpeg::decoder::Video` does, in
   /// the shape the trait tier publishes: [`Received::NeedsInput`] where
   /// libavcodec says `EAGAIN`, [`Received::Ended`] where it says `EOF`,
@@ -1836,11 +2137,11 @@ impl VideoDecoder {
       let phase = self.phase();
       let res = self.state.inner.receive_frame(&mut self.hw_frame);
       match res {
-        // **A decoder that wants input is fed what it is owed first**: a
-        // replay that stopped at a candidate's first output, a backlog a
-        // commit left, an end still owed. Only once nothing is owed, or the
-        // decoder takes none of it, does its `EAGAIN` mean what the phase
-        // says it means.
+        // **A decoder that wants input is fed what it is owed first**, here
+        // and on no other road: a replay that stopped at a candidate's first
+        // output, a backlog a commit left, an end still owed. Only once
+        // nothing is owed, or the decoder takes none of it, does its `EAGAIN`
+        // mean what the phase says it means.
         Err(e) if is_eagain(&e) && self.owes() => match self.feed() {
           Ok(Fed { taken, .. }) if taken > 0 => continue,
           Ok(_) => match self.hw_receive(e, phase) {
@@ -1853,13 +2154,10 @@ impl VideoDecoder {
               }
             },
           },
-          Err(refused) => match self.hw_failure(refused, BareVerdict::CandidateFailure) {
-            HwRoute::Report(err) => return Err(err),
-            HwRoute::Advance(answer) => {
-              self.advance_probe(answer)?;
-              continue;
-            }
-          },
+          Err(stopped) => {
+            self.route_fed(stopped)?;
+            continue;
+          }
         },
         Err(e) => {
           // **The phase decides whether this errno is a protocol state
@@ -2150,87 +2448,162 @@ impl VideoDecoder {
   /// Feeds the active decoder, in order, what it is owed: the history's
   /// unfed packets while it is on trial — the history keeps them for a
   /// later advance, and the decoder takes a reference to each, no copy —
-  /// then the backlog once it is committed, each packet dropped once
-  /// taken; then the end, where the caller's was not yet passed on. Stops
-  /// where the decoder first answers `EAGAIN`, having output for the
-  /// caller first.
+  /// then the backlog once it is committed, each packet retired once taken;
+  /// then the end, where the caller's was not yet passed on. Stops where the
+  /// decoder first answers `EAGAIN`, having output for the caller first, the
+  /// packet it did not take kept. **The receive road alone feeds**
+  /// ([`Self::receive_frame`]): it holds no packet of the caller's, so what
+  /// the decoder answers about an owed packet is never reported as another's.
   ///
-  /// A refusal is the decoder's own answer, returned raw for the road to
-  /// read through its funnel, and that packet is not sent to it again:
-  /// libavcodec queues a packet before decoding it (`avcodec_send_packet`,
-  /// `libavcodec/decode.c` 745–758 in FFmpeg 9.0.1), so an error out of the
-  /// decode answers a packet the decoder took. A candidate's stays in the
-  /// history, whole for the next candidate, which is replayed it from the
-  /// start; a committed decoder's is that packet's own error, and is
-  /// dropped.
-  fn feed(&mut self) -> std::result::Result<Fed, ffmpeg_next::Error> {
+  /// Anything else stops the feed, and the class says what the decoder
+  /// holds ([`Acceptance`]); the receive road routes it ([`Self::route_fed`]):
+  ///
+  /// - **Taken with the decoder's error**: a history packet is counted fed
+  ///   and a backlog packet retired, and the error is that packet's own.
+  /// - **Ambiguous (`ENOMEM`)**: kept, neither counted fed nor retired — the
+  ///   decoder may not hold it, and it must not be sent to this decoder
+  ///   again, since it may.
+  /// - **Not taken** otherwise: kept. No road reaches this (the history's and
+  ///   the backlog's packets are copies of packets libavcodec took, and the
+  ///   end is sent after them, once).
+  fn feed(&mut self) -> std::result::Result<Fed, Stopped> {
     let mut taken = 0;
     if let Some(probe) = self.probe.as_mut() {
       while let Some(packet) = probe.buffered_packets.get(probe.fed) {
-        match self.state.inner.send_packet(packet) {
-          Ok(()) => {
+        match send(&mut self.state.inner, Sending::Packet(packet)) {
+          Acceptance::Accepted => {
             probe.fed += 1;
             taken += 1;
           }
-          Err(e) if is_eagain(&e) => return Ok(Fed { taken, all: false }),
-          Err(e) => {
+          Acceptance::NotAccepted(e) if is_eagain(&e) => return Ok(Fed { taken, all: false }),
+          Acceptance::AcceptedWithError(e) => {
             probe.fed += 1;
-            return Err(e);
+            return Err(Stopped::at(Owing::History, e, false));
           }
+          Acceptance::Ambiguous(e) => return Err(Stopped::at(Owing::History, e, true)),
+          Acceptance::NotAccepted(e) => return Err(Stopped::at(Owing::History, e, false)),
         }
       }
     }
     while let Some(packet) = self.backlog.front() {
-      match self.state.inner.send_packet(packet) {
-        Ok(()) => {
+      match send(&mut self.state.inner, Sending::Packet(packet)) {
+        Acceptance::Accepted => {
           self.backlog.pop_front();
           taken += 1;
         }
-        Err(e) if is_eagain(&e) => return Ok(Fed { taken, all: false }),
-        Err(e) => {
+        Acceptance::NotAccepted(e) if is_eagain(&e) => return Ok(Fed { taken, all: false }),
+        Acceptance::AcceptedWithError(e) => {
           self.backlog.pop_front();
-          return Err(e);
+          return Err(Stopped::at(Owing::Backlog, e, false));
         }
+        Acceptance::Ambiguous(e) => return Err(Stopped::at(Owing::Backlog, e, true)),
+        Acceptance::NotAccepted(e) => return Err(Stopped::at(Owing::Backlog, e, false)),
       }
     }
     if self.end_owed {
-      match self.state.inner.send_eof() {
-        Ok(()) => {
+      match send(&mut self.state.inner, Sending::End) {
+        Acceptance::Accepted => {
           self.end_owed = false;
           taken += 1;
         }
-        Err(e) if is_eagain(&e) => return Ok(Fed { taken, all: false }),
-        Err(e) => {
+        Acceptance::NotAccepted(e) if is_eagain(&e) => return Ok(Fed { taken, all: false }),
+        // The end answers no other class (751–754), so none is ambiguous.
+        Acceptance::NotAccepted(e)
+        | Acceptance::Ambiguous(e)
+        | Acceptance::AcceptedWithError(e) => {
           if self.probe.is_none() {
             self.end_owed = false;
           }
-          return Err(e);
+          return Err(Stopped::at(Owing::End, e, false));
         }
       }
     }
     Ok(Fed { taken, all: true })
   }
 
-  /// [`Self::feed`], where anything is owed, with a refusal routed as any
-  /// send's: `None` where nothing is owed.
-  fn feed_owed(&mut self) -> Option<Owed> {
-    if !self.owes() {
-      return None;
-    }
-    Some(match self.feed() {
-      Ok(Fed { all: true, .. }) => Owed::Taken,
-      Ok(Fed { all: false, .. }) => Owed::Full,
-      Err(e) => match self.hw_failure(e, BareVerdict::CandidateFailure) {
-        HwRoute::Report(err) => Owed::Report(err),
-        HwRoute::Advance(answer) => Owed::Advance(answer),
+  /// Routes where [`Self::feed`] stopped, on the receive road: `Ok` where
+  /// the probe advanced, and the receive starts again; the error to report
+  /// otherwise. The funnel runs once, here.
+  ///
+  /// - **The backlog's front, ambiguous: the decoder ends**
+  ///   ([`Self::end_ambiguously`]). The backlog holds the only copy, so the
+  ///   front can be neither retired, which would lose it if the decoder had
+  ///   not taken it, nor sent again, which would feed it twice if it had.
+  /// - **A history packet, ambiguous**: the candidate's own verdict leaves
+  ///   it, the history whole for the next; a refusal of this crate's own
+  ///   latched with it (the frame budget) can neither keep the candidate nor
+  ///   be charged to it, so the decoder ends, the whole history back.
+  /// - **Any other**, by the shared policy: on trial the candidate's own
+  ///   verdict leaves it and this crate's own is reported; committed, every
+  ///   verdict is the packet's own error.
+  fn route_fed(&mut self, stopped: Stopped) -> Result<()> {
+    let verdict = self.hw_exit(Error::Ffmpeg(stopped.error));
+    match (stopped.owing, stopped.ambiguous) {
+      (Owing::Backlog, true) => Err(self.end_ambiguously(verdict)),
+      (_, true) => match self.hw_route(verdict, BareVerdict::CandidateFailure) {
+        HwRoute::Advance(answer) => self.advance_probe(answer),
+        HwRoute::Report(reason) => Err(self.end_ambiguously(reason)),
       },
-    })
+      _ => match self.hw_route(verdict, BareVerdict::CandidateFailure) {
+        HwRoute::Report(err) => Err(err),
+        HwRoute::Advance(answer) => self.advance_probe(answer),
+      },
+    }
+  }
+
+  /// **Ends the decoder, terminally, and hands back what it may not have
+  /// taken** ([`Error::AmbiguousSend`]): libavcodec answered a send of a
+  /// packet only this decoder held — or a candidate's, whose answer cannot
+  /// be charged — with `ENOMEM`, and nothing tells whether it took it
+  /// ([`Acceptance::Ambiguous`]). Going on would either lose the packet or
+  /// feed it twice, so the decoder does neither.
+  ///
+  /// The residual is every packet it may not have taken, in order: on trial
+  /// the whole history, since no picture was delivered and a decoder that
+  /// starts again starts from the first; committed, the backlog, its front
+  /// the packet whose send was ambiguous. With it, whether the end the caller
+  /// gave follows them. Every reference the decoder holds to them is released
+  /// first ([`Self::release_history`]), so each is the caller's alone, and
+  /// the decoder is sent the end, holding nothing: from here libavcodec
+  /// answers every packet `AVERROR_EOF` and every receive the end, until a
+  /// [`Self::flush`].
+  fn end_ambiguously(&mut self, reason: Error) -> Error {
+    let backend = self.state.backend;
+    let mut residual = self
+      .probe
+      .take()
+      .map(|probe| probe.buffered_packets)
+      .unwrap_or_default();
+    residual.extend(self.backlog.drain(..));
+    let end_follows = self.eof_sent;
+    self.release_history();
+    let ended = send(&mut self.state.inner, Sending::End);
+    debug_assert_eq!(
+      ended,
+      Acceptance::Accepted,
+      "a flushed decoder takes the end (decode.c 739–752)"
+    );
+    self.end_owed = false;
+    self.eof_sent = true;
+    tracing::warn!(
+      ?backend,
+      error = %reason,
+      residual = residual.len(),
+      "hwdecode: libavcodec left unknown whether the decoder took a packet; it ended"
+    );
+    Error::AmbiguousSend(crate::error::AmbiguousSend::new(
+      backend,
+      Box::new(reason),
+      residual,
+      end_follows,
+    ))
   }
 
   /// Releases every reference the session holds to the probe's history,
   /// before the history goes to the caller as owned, mutable packets
-  /// ([`Error::ProbeExhausted`]): the active decoder, which a replay fed
-  /// the history's own packets, is flushed, and the frame scratch cleared.
+  /// ([`Error::ProbeExhausted`], [`Error::AmbiguousSend`]): the active
+  /// decoder, which a replay or a feed sent the history's own packets, is
+  /// flushed, and the frame scratch cleared.
   fn release_history(&mut self) {
     self.state.inner.flush();
     // SAFETY: `hw_frame` is a valid AVFrame we own; `av_frame_unref` is a
@@ -2251,6 +2624,9 @@ impl VideoDecoder {
   /// the codec's own flush (`libavcodec/avcodec.c` 417–418 in FFmpeg
   /// 9.0.1), which drops the pictures and references the codec holds. See
   /// the type's documentation for a session FFmpeg leaves without one.
+  ///
+  /// It clears the end, so a decoder that ended ([`Error::AmbiguousSend`])
+  /// takes input again, at the new position.
   pub fn flush(&mut self) {
     self.state.inner.flush();
     // SAFETY: hw_frame is a valid AVFrame we own; av_frame_unref is a no-op
@@ -3233,21 +3609,31 @@ pub(crate) unsafe fn copy_frame_props_minimal(
 /// is shared with the candidate this way, never with the caller: it is
 /// released from every decoder before it is handed back
 /// ([`VideoDecoder::release_history`]).
+///
+/// **Any answer but acceptance and back pressure stops it**, by class
+/// ([`Acceptance`]): taken with the candidate's error, ambiguous, or (on no
+/// road, the candidate fresh and the history copies of packets libavcodec
+/// took) not taken. Each is answered as libavcodec returned it, never a code
+/// of this crate's, and the candidate is dropped uninstalled
+/// ([`VideoDecoder::advance_probe_with`]): whatever it may hold goes with
+/// it, and the history is whole for the next.
 fn feed_into(
   decoder: &mut ffmpeg_next::decoder::Video,
   history: &[Packet],
   end: bool,
 ) -> std::result::Result<Taken, ffmpeg_next::Error> {
   for (index, packet) in history.iter().enumerate() {
-    match decoder.send_packet(packet) {
-      Ok(()) => {}
-      Err(e) if is_eagain(&e) => {
+    match send(decoder, Sending::Packet(packet)) {
+      Acceptance::Accepted => {}
+      Acceptance::NotAccepted(e) if is_eagain(&e) => {
         return Ok(Taken {
           packets: index,
           end: false,
         });
       }
-      Err(e) => return Err(e),
+      Acceptance::NotAccepted(e) | Acceptance::Ambiguous(e) | Acceptance::AcceptedWithError(e) => {
+        return Err(e);
+      }
     }
   }
   let packets = history.len();
@@ -3257,28 +3643,16 @@ fn feed_into(
       end: false,
     });
   }
-  match decoder.send_eof() {
-    Ok(()) => Ok(Taken { packets, end: true }),
-    Err(e) if is_eagain(&e) => Ok(Taken {
+  match send(decoder, Sending::End) {
+    Acceptance::Accepted => Ok(Taken { packets, end: true }),
+    Acceptance::NotAccepted(e) if is_eagain(&e) => Ok(Taken {
       packets,
       end: false,
     }),
-    Err(e) => Err(e),
+    Acceptance::NotAccepted(e) | Acceptance::Ambiguous(e) | Acceptance::AcceptedWithError(e) => {
+      Err(e)
+    }
   }
-}
-
-/// `EAGAIN` and `EOF` together: "this decoder has no more output for
-/// now", either because it wants input or because it is finished.
-///
-/// **What is left of a predicate that used to guard both roads.** Both
-/// public faces classify at their boundary now — [`receive_status`] and
-/// [`send_status`] — and the send face had to stop treating the two
-/// alike, since `AVERROR_EOF` there is a caller fault rather than a
-/// state. What still wants them together is the send roads' guard: neither
-/// is the candidate failing, so the probe never advances on one, and
-/// [`send_status`] then says which of the two it is.
-fn is_transient(e: &ffmpeg_next::Error) -> bool {
-  is_eagain(e) || matches!(e, ffmpeg_next::Error::Eof)
 }
 
 /// **The receive road's single errno gate, and it cannot be spent
@@ -3842,6 +4216,11 @@ pub(crate) fn parks_in_decode(e: &crate::convert::ConvertError) -> bool {
 /// distinguishes "drain output and retry" from "stream over").
 fn is_eagain(e: &ffmpeg_next::Error) -> bool {
   matches!(e, ffmpeg_next::Error::Other { errno } if *errno == ffmpeg_next::error::EAGAIN)
+}
+
+/// Whether `e` is the POSIX `errno` libavutil wraps as `AVERROR(errno)`.
+fn is_errno(e: &ffmpeg_next::Error, errno: libc::c_int) -> bool {
+  matches!(e, ffmpeg_next::Error::Other { errno: code } if *code == errno)
 }
 
 /// Prices the CPU frame `av_hwframe_transfer_data` would allocate, and

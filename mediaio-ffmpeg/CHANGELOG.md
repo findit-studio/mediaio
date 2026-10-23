@@ -13,6 +13,17 @@ crate moves only when it changes.
 
 Released in lockstep with `mediadecode-ffmpeg` 0.21.0.
 
+### Fixed
+
+- **`try_clone_packet` copies a packet with no payload with none**, its
+  properties and side data alone. `av_packet_ref` and
+  `av_packet_make_writable` gave the copy of a side-data-only packet a
+  buffer of padding and data with no size, which `avcodec_send_packet`
+  refuses (`AVERROR(EINVAL)`, `libavcodec/decode.c` 742–743 in FFmpeg
+  9.0.1) where it takes the source: `mediadecode-ffmpeg`'s hardware probe,
+  which records such copies, replayed one into the next backend and failed
+  it.
+
 ### Added
 
 - **`options`: how a decoder decodes, beside what it may spend.**

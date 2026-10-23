@@ -183,11 +183,19 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
     // frame the allocator judge refused surfaces named, not as the
     // `EINVAL` a corrupt file also produces; whatever survives the
     // funnel is read for back pressure.
-    let submit = |av_pkt: &ffmpeg_next::Packet| match decoder.send_packet(av_pkt) {
-      Ok(()) => Ok(Sent::Accepted),
+    // Through the one door ([`crate::decoder::send`]): the packet is the
+    // caller's, and this decoder keeps none, so libavcodec's own contract
+    // is the answer, by class.
+    let submit = |av_pkt: &ffmpeg_next::Packet| match crate::decoder::send(
+      decoder,
+      crate::decoder::Sending::Packet(av_pkt),
+    ) {
+      crate::decoder::Acceptance::Accepted => Ok(Sent::Accepted),
       // SAFETY: `state` is the pointer the codec context holds, owned by
       // `self._callback_state` until after the context is freed.
-      Err(e) => {
+      crate::decoder::Acceptance::NotAccepted(e)
+      | crate::decoder::Acceptance::Ambiguous(e)
+      | crate::decoder::Acceptance::AcceptedWithError(e) => {
         unsafe { crate::decoder::software_send(state, e, phase) }.map_err(AudioDecodeError::Decode)
       }
     };
@@ -264,14 +272,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
   pub(crate) fn send_eof_impl(&mut self) -> Result<Sent, AudioDecodeError> {
     let state: *const crate::ffi::CallbackState = self._callback_state.as_ptr();
     let phase = self.phase();
-    match self.decoder.send_eof() {
-      Ok(()) => {
+    match crate::decoder::send(&mut self.decoder, crate::decoder::Sending::End) {
+      crate::decoder::Acceptance::Accepted => {
         self.eof = true;
         Ok(Sent::Accepted)
       }
       // SAFETY: `state` is the pointer the codec context holds, owned by
       // `self._callback_state` until after the context is freed.
-      Err(e) => {
+      crate::decoder::Acceptance::NotAccepted(e)
+      | crate::decoder::Acceptance::Ambiguous(e)
+      | crate::decoder::Acceptance::AcceptedWithError(e) => {
         unsafe { crate::decoder::software_send(state, e, phase) }.map_err(AudioDecodeError::Decode)
       }
     }
