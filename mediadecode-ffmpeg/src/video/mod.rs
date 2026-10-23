@@ -34,13 +34,22 @@
 //! [`crate::VideoDecoder`] for the lines). This wrapper neither waits for
 //! a recovery nor rules one out.
 //!
-//! One answer ends the hardware decoder: [`Error::AmbiguousSend`](crate::Error::AmbiguousSend),
-//! where libavcodec's `ENOMEM` left unknown whether it took a packet only
-//! the decoder held. It hands back every packet the decoder may not have
-//! taken, and the session answers as an ended one after it, until a
-//! `flush`. No path takes it as the cue for software: after the first
-//! picture nothing changes the road, and before it the decoder ends so
-//! only for a refusal of this crate's own, which software meets the same
+//! # Three answers end the session
+//!
+//! [`Error::AmbiguousSend`](crate::Error::AmbiguousSend), where libavcodec's
+//! `ENOMEM` left unknown whether the hardware decoder took a packet only it
+//! held, hands back every packet the decoder may not have taken.
+//! [`Error::ProbeExhausted`](crate::Error::ProbeExhausted) on a path that
+//! excludes software hands back every packet the probe took, and
+//! [`Error::FallbackFailed`](crate::Error::FallbackFailed), where the
+//! software decoder `Auto` falls back to could not take the stream, every
+//! packet it rescued. After each the session is **spent**: no decoder is
+//! left in it, hardware or software, and every send, end and receive
+//! answers [`Error::Spent`](crate::Error::Spent) naming which, a `flush`
+//! included. Going on means a new session, from what that error handed
+//! back. No path takes an ambiguous send as the cue for software: after the
+//! first picture nothing changes the road, and before it the decoder ends
+//! so only for a refusal of this crate's own, which software meets the same
 //! way.
 //!
 //! A [`VideoDecodeError::Convert`] is this wrapper's own failure to
@@ -87,7 +96,7 @@ use crate::{
   Backend, DecoderLimits, Error, Ffmpeg, Frame, VideoDecoder, boundary,
   convert::{self, ConvertError},
   decoder::{build_codec_context, try_clone_parameters},
-  error::FallbackFailed,
+  error::{FallbackFailed, Spent},
   extras::{VideoFrameExtra, VideoPacketExtra},
   frame::alloc_av_video_frame,
 };
@@ -404,15 +413,24 @@ impl HwInner for VideoDecoder {
   }
 }
 
-/// Internal: which backend is currently driving the decode.
+/// Internal: which backend is currently driving the decode — every entry
+/// matches it first.
 enum DecodeState {
   /// Hardware-backed decoder. Under [`DecodePath::Auto`] it may
   /// transition to `Sw` on its probe's `ProbeExhausted`, before the
-  /// first picture, and at no other time. Boxed behind [`HwInner`] so
-  /// tests can inject a fake HW decoder.
+  /// first picture, and at no other time; to `Spent` where that fallback
+  /// fails, where the probe exhausts on a path that excludes software, and
+  /// where it ends on an ambiguous send. Boxed behind [`HwInner`] so tests
+  /// can inject a fake HW decoder.
   Hw(Box<dyn HwInner>),
-  /// Software decoder. Terminal state.
+  /// Software decoder. Terminal for the road: nothing leaves it.
   Sw(SwDecoder),
+  /// **No decoder is left**: the session answered the error this names,
+  /// which handed back what it held. Terminal: every send, end and receive
+  /// answers [`Error::Spent`], and a flush leaves it so. The hardware
+  /// decoder that answered it was dropped at the transition, so nothing
+  /// exhausted or ended stays installed.
+  Spent(Spent),
 }
 
 /// A software decoder and the callback state its codec context points
@@ -628,13 +646,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   }
 
   /// Returns `true` when this decoder has fallen back to the software
-  /// path. `false` while still on the HW probe (the initial state).
+  /// path. `false` while still on the HW probe (the initial state), and once
+  /// the session is spent.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) const fn is_software_impl(&self) -> bool {
     matches!(self.state, DecodeState::Sw(_))
   }
 
-  /// Returns `true` while the HW probe is still active.
+  /// Returns `true` while a hardware decoder drives the session: on trial,
+  /// or committed. `false` once the session is spent.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) const fn is_hardware_impl(&self) -> bool {
     matches!(self.state, DecodeState::Hw(_))
@@ -690,7 +710,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   pub(crate) fn scaled_output_capability_impl(&self) -> ScaledOutputCapability {
     match &self.state {
       DecodeState::Hw(hw) => hw.scaled_output_capability(),
-      DecodeState::Sw(_) => ScaledOutputCapability::Unsupported,
+      DecodeState::Sw(_) | DecodeState::Spent(_) => ScaledOutputCapability::Unsupported,
     }
   }
 
@@ -797,7 +817,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
     match &mut self.state {
       DecodeState::Hw(hw) => hw.request_scaled_output(size),
-      DecodeState::Sw(_) => ScaledOutputCapability::Unsupported,
+      DecodeState::Sw(_) | DecodeState::Spent(_) => ScaledOutputCapability::Unsupported,
     }
   }
 
@@ -808,7 +828,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   pub(crate) fn hardware_inner_impl(&self) -> Option<&VideoDecoder> {
     match &self.state {
       DecodeState::Hw(hw) => hw.as_video_decoder(),
-      DecodeState::Sw(_) => None,
+      DecodeState::Sw(_) | DecodeState::Spent(_) => None,
     }
   }
 
@@ -856,9 +876,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// **Transactional**: drained replay frames accumulate in a local
   /// queue; we only commit them to `self.sw_replay_frames` and switch
   /// `self.state` to `Sw` after the replay (and EOF re-forwarding, if
-  /// needed) succeed. On failure, the SW decoder, the local frame
-  /// queue, and (where reachable) any consumed packets are dropped —
-  /// `self` is left in its prior state.
+  /// needed) succeed. On failure, the SW decoder and the local frame
+  /// queue are dropped, every rescued packet goes back with
+  /// [`Error::FallbackFailed`], and **the session is spent**
+  /// ([`DecodeState::Spent`]): the exhausted hardware decoder is dropped
+  /// with it, so no decoder is left installed that could take a packet
+  /// (Codex R2, finding 3), and every entry after answers
+  /// [`Error::Spent`] with [`Spent::FallbackFailed`].
   ///
   /// **EOF-aware**: when EOF was already accepted on the HW path
   /// (`self.eof_sent`), the new SW decoder also receives `send_eof()`
@@ -890,10 +914,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // fallback transition fails partway.
     match self.fall_back_to_sw_inner(&unconsumed_packets, eof_pending) {
       Ok(()) => Ok(()),
-      Err(source) => Err(Error::FallbackFailed(FallbackFailed::new(
-        Box::new(source),
-        unconsumed_packets,
-      ))),
+      Err(source) => {
+        self.state = DecodeState::Spent(Spent::FallbackFailed);
+        Err(Error::FallbackFailed(FallbackFailed::new(
+          Box::new(source),
+          unconsumed_packets,
+        )))
+      }
     }
   }
 
@@ -1042,8 +1069,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // dropped) and reach the caller as a plain decode failure, not
     // `FallbackFailed` — breaking probe-era recovery on non-seekable input.
     // Draining to EAGAIN/EOF here forces any such error to surface now, so it is
-    // wrapped as `FallbackFailed` (retaining the rescued packets) and the
-    // decoder stays on HW — nothing is committed.
+    // wrapped as `FallbackFailed` (retaining the rescued packets), nothing is
+    // committed, and the session is spent.
     // SAFETY: `sw_state` is `sw`'s own callback state, and `sw` is still
     // here — it moves into `self.state` only below.
     unsafe { drain_into(&mut sw, sw_state, &mut local_replay) }?;
@@ -1096,6 +1123,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // `as_inner_mut`'s contract guards is touched.
       DecodeState::Hw(_) => unsafe { self.hw_scratch.as_inner_mut().as_ptr() },
       DecodeState::Sw(_) => unsafe { self.sw_scratch.as_ptr() },
+      // Unreachable: a spent session parks nothing, since it is spent only
+      // at an error, never at a picture.
+      DecodeState::Spent(spent) => return Err(VideoDecodeError::Decode(Error::Spent(*spent))),
     };
     // SAFETY: the scratch frame is live — either just filled by the
     // inner decoder's `receive_frame` (libavcodec's decode, or
@@ -1223,6 +1253,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     &mut self,
     packet: &VideoPacket<VideoPacketExtra, C::Buffer>,
   ) -> Result<Sent, VideoDecodeError> {
+    // **The state first**: a spent session answers by name, before any
+    // other gate, since none of them can be satisfied by anything.
+    if let DecodeState::Spent(spent) = self.state {
+      return Err(VideoDecodeError::Decode(Error::Spent(spent)));
+    }
     // **The end of the stream outranks the parked seat, and the order
     // is the whole point.**
     //
@@ -1291,6 +1326,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // Reported with the payload intact, so the caller keeps the
             // backend, its error, and any rescued packets.
             if !self.may_open_software() {
+              // **And the session is spent**: the exhausted hardware
+              // decoder is dropped, so nothing is left installed.
+              self.state = DecodeState::Spent(Spent::ProbeExhausted);
               return Err(VideoDecodeError::Decode(Error::ProbeExhausted(p)));
             }
             // The probe exhausted before the first picture: replay the
@@ -1325,8 +1363,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             }
             Ok(Sent::Accepted)
           }
+          // **The hardware decoder ended**, terminally: dropped, and the
+          // session spent with it.
+          Err(e @ Error::AmbiguousSend(_)) => {
+            self.state = DecodeState::Spent(Spent::AmbiguousSend);
+            Err(VideoDecodeError::Decode(e))
+          }
           Err(other) => Err(VideoDecodeError::Decode(other)),
         },
+        // Checked before the submission was built.
+        DecodeState::Spent(spent) => Err(VideoDecodeError::Decode(Error::Spent(*spent))),
         DecodeState::Sw(sw) => {
           let st = sw.state();
           // **Through the one door** ([`crate::decoder::send`]). The packet
@@ -1365,6 +1411,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     &mut self,
     dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
   ) -> Result<Received, VideoDecodeError> {
+    // **The state first**, as on the send roads. A spent session holds no
+    // replayed frame and parks none: it is spent only at an error.
+    if let DecodeState::Spent(spent) = self.state {
+      return Err(VideoDecodeError::Decode(Error::Spent(spent)));
+    }
     // Deliver any frames produced during SW fallback replay before
     // pulling new ones from the SW decoder. This is the queue
     // populated by `fall_back_to_sw` when SW returned EAGAIN during
@@ -1422,6 +1473,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // [`Self::may_open_software`] and the identical gate on the
             // two send roads.
             if !self.may_open_software() {
+              // Spent, as on the send road.
+              self.state = DecodeState::Spent(Spent::ProbeExhausted);
               return Err(VideoDecodeError::Decode(Error::ProbeExhausted(p)));
             }
             // The probe exhausted at frame time, before the first picture:
@@ -1472,8 +1525,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             }
             // Fall through to the loop; next iteration takes the Sw arm.
           }
+          // Ended, as on the send road.
+          Err(e @ Error::AmbiguousSend(_)) => {
+            self.state = DecodeState::Spent(Spent::AmbiguousSend);
+            return Err(VideoDecodeError::Decode(e));
+          }
           Err(other) => return Err(VideoDecodeError::Decode(other)),
         },
+        // Checked at the top.
+        DecodeState::Spent(spent) => return Err(VideoDecodeError::Decode(Error::Spent(*spent))),
         DecodeState::Sw(sw) => {
           // Convert inline (rather than via `deliver_frame`, which borrows all
           // of `self`) so only the disjoint fields `sw_scratch` / `time_base`
@@ -1522,6 +1582,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   }
 
   pub(crate) fn send_eof_impl(&mut self) -> Result<Sent, VideoDecodeError> {
+    // **The state first**, as on `send_packet`.
+    if let DecodeState::Spent(spent) = self.state {
+      return Err(VideoDecodeError::Decode(Error::Spent(spent)));
+    }
     // The same two gates in the same order, for the same reason: a
     // repeated end-of-stream past a committed one is refused however
     // much is drained, so answering back pressure would be a promise
@@ -1545,16 +1609,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // `outcome`: the commit below fires only on `Ok(Sent::Accepted)`,
           // so the two roads agree.
           if !self.may_open_software() {
+            // Spent, as on the send road.
+            self.state = DecodeState::Spent(Spent::ProbeExhausted);
             return Err(VideoDecodeError::Decode(Error::ProbeExhausted(p)));
           }
           // EOF is pending for this transaction, so the SW decoder must also
           // receive `send_eof` (codecs that delay tail frames hang otherwise).
           // We pass that intent locally rather than pre-setting `self.eof_sent`:
-          // a fallback that fails returns `FallbackFailed` and stays on HW, and a
-          // half-mutated `self.eof_sent = true` would then make a *later*
-          // fallback inject an EOF into SW even though this `send_eof` errored.
-          // `self.eof_sent` is committed only after the whole operation succeeds
-          // (the `outcome` check below), keeping the fallback all-or-nothing.
+          // `self.eof_sent` is committed only after the whole operation
+          // succeeds (the `outcome` check below), keeping the fallback
+          // all-or-nothing. A fallback that fails returns `FallbackFailed`
+          // and leaves the session spent, so no later fallback can follow.
           //
           // Replay the buffered history (lossless), re-forwarding EOF inside
           // the transaction.
@@ -1564,8 +1629,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             .map(|()| Sent::Accepted)
             .map_err(VideoDecodeError::Decode)
         }
+        // Ended, as on the send road.
+        Err(e @ Error::AmbiguousSend(_)) => {
+          self.state = DecodeState::Spent(Spent::AmbiguousSend);
+          Err(VideoDecodeError::Decode(e))
+        }
         Err(other) => Err(VideoDecodeError::Decode(other)),
       },
+      // Checked at the top.
+      DecodeState::Spent(spent) => Err(VideoDecodeError::Decode(Error::Spent(*spent))),
       DecodeState::Sw(sw) => {
         let st = sw.state();
         match crate::decoder::send(sw, crate::decoder::Sending::End) {
@@ -1581,8 +1653,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     };
     // Commit EOF state only when the EOF was actually **taken** — a failed
     // fallback left `self.eof_sent` untouched (restored-by-construction: we
-    // never mutated it), so HW stays EOF-not-yet-sent and a retry behaves
-    // correctly.
+    // never mutated it), and left the session spent.
     //
     // **`is_ok()` is not the test any more, and that is not a stylistic
     // change.** `Ok(Sent::MustDrain)` means the decoder did not take the
@@ -1611,6 +1682,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // real `VideoDecoder::flush` is infallible (always `Ok`).
       DecodeState::Hw(hw) => hw.flush().map_err(VideoDecodeError::Decode)?,
       DecodeState::Sw(sw) => sw.flush(),
+      // **Nothing to flush, and nothing revived**: a spent session stays
+      // spent.
+      DecodeState::Spent(_) => {}
     }
     Ok(())
   }
@@ -1724,11 +1798,18 @@ macro_rules! video_lane_face {
       }
 
       /// Whether this decoder is currently running on software.
+      ///
+      /// Neither this nor [`is_hardware`](Self::is_hardware) once the
+      /// session is spent — after an `AmbiguousSend`, a `FallbackFailed`, or
+      /// a probe's exhaustion on a path that excludes software: no decoder is
+      /// left, and every entry answers [`Error::Spent`].
       pub const fn is_software(&self) -> bool {
         self.is_software_impl()
       }
 
-      /// Whether this decoder is currently running on hardware.
+      /// Whether this decoder is currently running on hardware. See
+      /// [`is_software`](Self::is_software) for a spent session, which is
+      /// neither.
       pub const fn is_hardware(&self) -> bool {
         self.is_hardware_impl()
       }

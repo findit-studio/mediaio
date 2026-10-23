@@ -391,10 +391,11 @@ struct PlaneInfo {
 /// - the safe `Frame::*` row accessors (via `plane_row_bytes_for` /
 ///   `plane_height_for`, which agree with this helper — every format
 ///   that returns `Some` from those functions is also accepted here).
-/// - `mediadecode-ffmpeg`'s `transfer_hw_frame` post-transfer
-///   validation — if FFmpeg's auto-pick produces a format outside this
-///   set, treat as a backend failure so probe advances rather than
-///   collapsing on an unusable frame.
+/// - `mediadecode-ffmpeg`'s download road, which reads the format a
+///   hardware frame's download would be made in — the first the backend
+///   lists, as libavutil picks it — before any transfer: a candidate whose
+///   format falls outside this set is unfit for the stream, and a
+///   committed decoder answers it by name.
 pub fn is_supported_cpu_pix_fmt(pix_fmt: &PixelFormat) -> bool {
   matches!(
     pix_fmt,

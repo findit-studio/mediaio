@@ -165,6 +165,14 @@ pub enum Error {
   #[error(transparent)]
   AmbiguousSend(#[from] AmbiguousSend),
 
+  /// **The decoder is spent, and takes nothing more**: it answered
+  /// [`Error::ProbeExhausted`] or [`Error::AmbiguousSend`] before, and no
+  /// decoder lives behind it. Every send, end and receive after answers this,
+  /// naming which, and a flush does not revive it: going on means building a
+  /// new decoder, from what that error handed back. See [`Spent`].
+  #[error("{0}")]
+  Spent(Spent),
+
   /// Surfaced by [`crate::FfmpegVideoStreamDecoder`] when a HW->SW
   /// fallback attempt itself fails. See [`FallbackFailed`] for the
   /// payload details (in particular the rescued `unconsumed_packets`
@@ -283,6 +291,14 @@ pub enum FallbackOrigin {
 /// `origin` is always [`FallbackOrigin::Probe`]: this is the probe's
 /// exhaustion, before the first picture. After it a hardware failure is
 /// that picture's own error.
+///
+/// **Raised at run time, it leaves the decoder spent**, terminally: the
+/// candidate it left was torn down before it was raised, no decoder lives
+/// behind it, and every send, end and receive after answers
+/// [`Error::Spent`] with [`Spent::ProbeExhausted`], a flush included. The
+/// stream decoder under [`DecodePath::Auto`](crate::DecodePath::Auto) goes
+/// on in software from the packets it hands back; any other caller opens a
+/// new decoder.
 ///
 /// **Only backends' answers and unfitness raise it, never a failure of this
 /// crate's own.** An allocation or a copy this crate makes — the parameters
@@ -429,9 +445,10 @@ impl std::fmt::Debug for ProbeExhausted {
 /// go on, and from where, is the caller's: a seekable input is better
 /// sought back to a key frame.
 ///
-/// After it the decoder has ended: every packet sent to it answers
-/// `AVERROR_EOF`, and every receive
-/// [`Received::Ended`](mediadecode::Received::Ended), until a `flush`.
+/// **After it the decoder is spent**, terminally: no decoder lives behind
+/// it, and every send, end and receive answers [`Error::Spent`] with
+/// [`Spent::AmbiguousSend`], a flush included. Going on means a new
+/// decoder.
 ///
 /// `Debug` is hand-written, as for [`ProbeExhausted`].
 #[derive(thiserror::Error)]
@@ -516,6 +533,46 @@ impl std::fmt::Debug for AmbiguousSend {
       )
       .field("end_follows", &self.end_follows)
       .finish()
+  }
+}
+
+/// Payload for [`Error::Spent`]: why a hardware decoder takes nothing more.
+///
+/// A decoder is spent at the error that ended it, which handed back what it
+/// held; no decoder lives behind it after. So every entry — a send, the end,
+/// a receive — answers [`Error::Spent`] naming that error, and a flush,
+/// which has no decoder to flush, leaves it spent. Reuse means a new
+/// decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IsVariant)]
+pub enum Spent {
+  /// The probe ran out of backends: it answered [`Error::ProbeExhausted`],
+  /// with every attempt and every packet of its history.
+  ProbeExhausted,
+  /// libavcodec left unknown whether the decoder took a packet only it
+  /// held: it answered [`Error::AmbiguousSend`], with every packet it may
+  /// not have taken.
+  AmbiguousSend,
+  /// The stream decoder's hardware probe was exhausted, and the software
+  /// decoder [`DecodePath::Auto`](crate::DecodePath::Auto) falls back to
+  /// could not take the stream: it answered [`Error::FallbackFailed`], with
+  /// every packet it rescued.
+  FallbackFailed,
+}
+
+impl core::fmt::Display for Spent {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::ProbeExhausted => f.write_str(
+        "the decoder is spent: its probe was exhausted, and it takes nothing more; open a new one",
+      ),
+      Self::AmbiguousSend => f.write_str(
+        "the decoder is spent: it ended on an ambiguous send, and takes nothing more; open a new one",
+      ),
+      Self::FallbackFailed => f.write_str(
+        "the decoder is spent: its hardware probe was exhausted and the software fallback failed, \
+         and it takes nothing more; open a new one",
+      ),
+    }
   }
 }
 
@@ -622,13 +679,13 @@ impl HwTransferTooLarge {
 }
 
 /// Payload for [`Error::DownloadFormatUnsupported`]: a picture's hardware
-/// download chose a CPU layout [`Frame`](crate::Frame) cannot carry, and
-/// this is the raw `AVPixelFormat` it chose.
+/// download would choose a CPU layout [`Frame`](crate::Frame) cannot carry,
+/// and this is the raw `AVPixelFormat` it would choose.
 ///
-/// `av_hwframe_transfer_data` picks the layout itself, as the first of the
-/// formats the backend's frames context offers
-/// (`av_hwframe_transfer_get_formats`), since this crate leaves the
-/// destination's format unset; and this crate keeps that choice. A
+/// The layout is the first of the formats the backend's frames context
+/// offers (`av_hwframe_transfer_get_formats`), as libavutil's own
+/// allocating road picks it, and this crate keeps that choice, reading it
+/// before any transfer and allocating the destination in it itself. A
 /// conversion a driver makes to another layout can lose samples (4:2:2 to
 /// 4:2:0), and some backends offer their surface's own layout alone.
 ///
@@ -647,21 +704,21 @@ impl HwTransferTooLarge {
 ///   carry, a candidate committed on a packet the probe could not keep, or a
 ///   backend pinned alone, which no probe ever held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the hardware download produced pixel format {format}, which a Frame cannot carry")]
+#[error("the hardware download would choose pixel format {format}, which a Frame cannot carry")]
 pub struct DownloadFormatUnsupported {
   format: i32,
 }
 
 impl DownloadFormatUnsupported {
   /// Constructs a `DownloadFormatUnsupported` payload for the raw
-  /// `AVPixelFormat` the download chose.
+  /// `AVPixelFormat` the download would choose.
   #[inline]
   pub const fn new(format: i32) -> Self {
     Self { format }
   }
-  /// The raw `AVPixelFormat` the download chose, as the integer FFmpeg
-  /// wrote: never formed into the bindings' enum, which a value they do not
-  /// name would make undefined behaviour.
+  /// The raw `AVPixelFormat` the download would choose, as the integer
+  /// FFmpeg listed: never formed into the bindings' enum, which a value they
+  /// do not name would make undefined behaviour.
   #[inline]
   pub const fn format(&self) -> i32 {
     self.format

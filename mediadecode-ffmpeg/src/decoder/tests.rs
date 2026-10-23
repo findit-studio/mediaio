@@ -303,8 +303,9 @@ fn a_packet_past_the_byte_ceiling_commits_the_candidate_that_takes_it() {
     .parameters();
 
   let mut decoder = VideoDecoder::open(stream_params).expect("open decoder");
-  assert!(
-    decoder.probe.is_some(),
+  assert_eq!(
+    decoder.session_kind(),
+    SessionKind::Trial,
     "probe must be active immediately after open"
   );
 
@@ -312,7 +313,7 @@ fn a_packet_past_the_byte_ceiling_commits_the_candidate_that_takes_it() {
   // push the byte counter to its ceiling so the very next send_packet is
   // past it.
   {
-    let probe = decoder.probe.as_mut().expect("probe present");
+    let probe = decoder.probe_mut().expect("probe present");
     probe.buffered_packets.push(Packet::new(8));
     probe.fed = probe.buffered_packets.len();
     probe.buffered_bytes = MAX_PROBE_PACKET_BYTES;
@@ -337,12 +338,13 @@ fn a_packet_past_the_byte_ceiling_commits_the_candidate_that_takes_it() {
   }
   assert!(taken, "expected a video packet to send past the ceiling");
 
-  assert!(
-    decoder.probe.is_none(),
+  assert_eq!(
+    decoder.session_kind(),
+    SessionKind::Committed,
     "the candidate that took the packet past the ceiling is committed"
   );
   assert!(
-    decoder.backlog.is_empty(),
+    decoder.backlog().is_empty(),
     "the candidate had been fed the whole history, so nothing is owed it"
   );
 }
@@ -376,8 +378,9 @@ fn probe_exhausted_returns_buffered_packets_to_caller() {
     .parameters();
 
   let mut decoder = VideoDecoder::open(stream_params).expect("open decoder");
-  assert!(
-    decoder.probe.is_some(),
+  assert_eq!(
+    decoder.session_kind(),
+    SessionKind::Trial,
     "probe must be active immediately after open"
   );
 
@@ -387,7 +390,7 @@ fn probe_exhausted_returns_buffered_packets_to_caller() {
   let p1 = Packet::new(16);
   let p2 = Packet::new(32);
   {
-    let probe = decoder.probe.as_mut().expect("probe");
+    let probe = decoder.probe_mut().expect("probe");
     probe.buffered_packets.push(p1);
     probe.buffered_packets.push(p2);
     probe.remaining_backends.clear();
@@ -419,6 +422,13 @@ fn probe_exhausted_returns_buffered_packets_to_caller() {
     }
     other => panic!("expected ProbeExhausted, got {other:?}"),
   }
+  // And the hardware decoder is gone: the exhausted session is spent, on a
+  // real backend as on the software lanes (Codex R2, finding 3).
+  assert_spent(
+    &mut decoder,
+    crate::Spent::ProbeExhausted,
+    SessionKind::Exhausted,
+  );
 }
 
 /// `ProbeState.attempts` must carry forward `open`'s accumulated
@@ -478,7 +488,7 @@ fn probe_exhausted_preserves_earlier_open_failures() {
   // Seed attempts as `open` would have if backend 0 failed before
   // the active backend opened.
   {
-    let probe = decoder.probe.as_mut().expect("probe present");
+    let probe = decoder.probe_mut().expect("probe present");
     probe.attempts.push((
       earlier_backend,
       BackendAnswer::of_open(synthetic_earlier).into(),
@@ -548,6 +558,7 @@ fn the_transfer_judge_prices_the_pool_not_the_display() {
   let refusal = unsafe {
     judge_hw_transfer(
       frame.as_ptr(),
+      DownloadFormat::Picked(NV12),
       FrameLimits::new().with_max_frame_bytes(16 * 1024 * 1024),
     )
   };
@@ -571,12 +582,17 @@ fn the_transfer_judge_prices_the_pool_not_the_display() {
     unsafe {
       judge_hw_transfer(
         frame.as_ptr(),
+        DownloadFormat::Picked(NV12),
         FrameLimits::new().with_max_frame_bytes(usize::MAX),
       )
     }
     .is_ok(),
   );
 }
+
+/// `NV12`, the layout a VideoToolbox pool downloads to here, as the raw
+/// `AVPixelFormat` a picked download format is.
+const NV12: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
 
 #[test]
 fn a_hardware_frame_with_an_unreadable_pool_fails_closed() {
@@ -588,15 +604,32 @@ fn a_hardware_frame_with_an_unreadable_pool_fails_closed() {
   // extent is not a small one.
   let frame = hw_frame_with_pool(100, 100, 0, 0);
   assert!(
-    unsafe { judge_hw_transfer(frame.as_ptr(), FrameLimits::new()) }.is_err(),
+    unsafe {
+      judge_hw_transfer(
+        frame.as_ptr(),
+        DownloadFormat::Picked(NV12),
+        FrameLimits::new(),
+      )
+    }
+    .is_err(),
     "an unreadable pool extent must fail closed",
   );
 
   // But a frame that is not a hardware frame at all allocates nothing —
-  // `av_hwframe_transfer_data` refuses it outright — so it is passed
-  // through rather than given a ceiling's name for a different fault.
+  // `av_hwframe_transfer_data` refuses it outright — so no format is
+  // picked for it, and it is passed through rather than given a ceiling's
+  // name for a different fault.
   let plain = ffmpeg_next::frame::Video::empty();
-  assert!(unsafe { judge_hw_transfer(plain.as_ptr(), FrameLimits::new()) }.is_ok());
+  // SAFETY: `plain` is a live frame.
+  let format = unsafe { download_format_of(&plain) };
+  assert!(
+    matches!(format, Ok(DownloadFormat::Unpicked)),
+    "no format picked for a frame that is no hardware frame"
+  );
+  assert!(
+    unsafe { judge_hw_transfer(plain.as_ptr(), DownloadFormat::Unpicked, FrameLimits::new()) }
+      .is_ok()
+  );
 }
 
 /// Builds a frame with a display extent of `dw x dh` and a hardware
@@ -764,64 +797,53 @@ fn the_declination_reader_reports_then_clears() {
   );
 }
 
-/// The transfer judge must fold **every** candidate, priceable or not.
+/// **The judge prices the format the destination is allocated in, and a
+/// format the build cannot price at the conservative bound.** The download
+/// road allocates the destination itself, in the format it picked — the
+/// first the backend lists, as libavutil's own road picks it — so the judge
+/// prices that one format, at the pool's extent ([`judge_hw_transfer`]);
+/// when it could still be FFmpeg's to pick, the whole list was priced. A
+/// picked format libavutil will not size is charged
+/// `video_frame_bytes_upper_bound`, which dominates whatever that layout
+/// would cost: a ceiling between NV12's price and the bound admits NV12 and
+/// refuses the unpriceable one.
 ///
-/// FFmpeg picks the destination format from the list; this crate does
-/// not. So a list holding one cheap priceable format beside one the
-/// build cannot price must be judged at the expensive bound — the fold
-/// used to skip unpriceable members entirely and reach for a fallback
-/// only when *nothing* priced, so a mixed list was judged at the cheap
-/// price while FFmpeg stayed free to select the member that was ignored.
-///
-/// Driven at the pricing level rather than through a real transfer:
-/// `av_hwframe_transfer_get_formats` returns whatever the driver
-/// offers, and this build's VideoToolbox offers only priceable
-/// layouts — so a genuinely mixed list is not reachable here. What is
-/// pinned is the rule the fold now applies to each member.
+/// PLANT: the unpriceable format priced at nothing, as a fold that skipped
+/// it did, turns this red at "the conservative bound".
 #[test]
-fn an_unpriceable_candidate_is_charged_the_conservative_bound() {
+fn the_judge_prices_the_picked_format_and_an_unpriceable_one_at_the_bound() {
   ffmpeg_next::init().expect("ffmpeg init");
+  use crate::FrameLimits;
   use crate::footprint::{video_frame_bytes, video_frame_bytes_upper_bound};
 
-  const NV12: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
   let (w, h) = (1920, 1088);
-
   let cheap = video_frame_bytes(NV12, w, h).expect("NV12 prices");
   let bound = video_frame_bytes_upper_bound(w, h).expect("a picture");
-
-  // The two really are far apart, so folding one in place of the other
-  // is not a rounding difference: NV12 is 1.5 bytes a pixel and the
-  // bound charges the widest layout the build can emit.
+  // The two really are far apart, so taking one for the other is not a
+  // rounding difference: NV12 is 1.5 bytes a pixel and the bound charges
+  // the widest layout the build can emit.
   assert!(
     bound > cheap * 5,
-    "the bound {bound} should dwarf the cheap candidate {cheap}",
+    "the bound {bound} should dwarf the cheap format {cheap}",
   );
-
-  // A hardware-only format cannot be priced, so a fold that skipped it
-  // would have taken `cheap` for a list containing both — and the
-  // maximum of the two is what the judge must now use.
+  // A hardware-only format cannot be priced.
   const VT: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32;
   assert!(
     video_frame_bytes(VT, w, h).is_none(),
-    "the harness needs a genuinely unpriceable candidate",
+    "the harness needs a genuinely unpriceable format",
   );
-  let folded = [NV12, VT]
-    .iter()
-    .map(|&f| {
-      video_frame_bytes(f, w, h)
-        .or_else(|| video_frame_bytes_upper_bound(w, h))
-        .expect("every candidate must fold")
-    })
-    .max()
-    .expect("a non-empty list");
-  assert_eq!(
-    folded, bound,
-    "a mixed list must be judged at the unpriceable member's bound, not the cheap one",
-  );
-  assert_ne!(
-    folded, cheap,
-    "the old fold would have taken the cheap figure"
-  );
+  let frame = hw_frame_with_pool(w, h, w, h);
+  let between = FrameLimits::new().with_max_frame_bytes(cheap + (bound - cheap) / 2);
+  // SAFETY: `frame` is live for both calls.
+  unsafe {
+    assert!(
+      judge_hw_transfer(frame.as_ptr(), DownloadFormat::Picked(NV12), between).is_ok(),
+      "NV12, priced as it is"
+    );
+    let refused = judge_hw_transfer(frame.as_ptr(), DownloadFormat::Picked(VT), between)
+      .expect_err("the conservative bound");
+    assert_eq!(refused.bytes(), bound, "charged the bound");
+  }
 }
 
 /// The hardware-pool judge's boundaries.
@@ -1148,7 +1170,7 @@ fn a_candidate_that_asks_for_input_past_the_end_fails_the_probe() {
   // `EAGAIN`, which is precisely the state `advance_probe` leaves a
   // candidate in mid-replay. The phase is the subject here, so the
   // phase is what is constructed.
-  dec.eof_sent = true;
+  dec.set_end(End::Taken);
   assert_eq!(
     dec.phase(),
     SessionPhase::AuditioningPastEnd,
@@ -1171,22 +1193,75 @@ fn a_candidate_that_asks_for_input_past_the_end_fails_the_probe() {
     Err(other) => panic!("expected the probe road, got {other:?}"),
   }
 
-  // **And then the session really has ended**, which is the other half
-  // of the answer being honest. The probe is spent — every backend was
-  // tried — so there is no candidate left to fail and the phase says so.
-  // A caller that reaches here has been told to fall back to software
-  // and can still drain what it holds.
+  // **And then the decoder is spent**, which is the other half of the
+  // answer being honest — and the half the R3 ruling reversed (Codex R2,
+  // finding 3): an exhausted probe used to leave its last candidate behind
+  // as a committed session, which a caller could go on feeding. No decoder
+  // lives now, the phase commits to nothing, and every entry is refused by
+  // name, a flush included. A caller that reaches here has been told to
+  // fall back to software, with every packet the probe took.
   assert_eq!(
     dec.phase(),
-    SessionPhase::Draining,
-    "an exhausted probe leaves a committed session, not a candidate",
+    SessionPhase::Spent,
+    "an exhausted probe leaves no session to speak for the stream",
   );
-  assert_eq!(
-    dec
-      .receive_frame(&mut frame)
-      .expect("no fault past the end"),
-    Received::Ended,
+  assert_spent(
+    &mut dec,
+    crate::Spent::ProbeExhausted,
+    SessionKind::Exhausted,
   );
+}
+
+/// Asserts `dec` is spent, as `spent` names, at every entry, before a flush
+/// and after one: no decoder lives, and a send — the safe road and the raw
+/// one, a packet and a packet that is the end — the end and a receive are
+/// each refused by name ([`Error::Spent`]). The state table's spent rows.
+fn assert_spent(dec: &mut VideoDecoder, spent: crate::Spent, kind: SessionKind) {
+  let packet = raw_packet(0x99);
+  // SAFETY: `raw_packet`'s, every byte written.
+  let owned =
+    unsafe { crate::boundary::video_packet_from_ffmpeg(&packet, mediadecode::Timebase::SECONDS) }
+      .expect("a wrappable payload")
+      .expect("a buffer");
+  let empty = Packet::empty();
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  for when in ["before a flush", "after a flush"] {
+    assert_eq!(dec.session_kind(), kind, "{when}: spent");
+    assert!(dec.live().is_none(), "{when}: no decoder lives");
+    assert_eq!(
+      dec.phase(),
+      SessionPhase::Spent,
+      "{when}: committed to nothing"
+    );
+    refused_by_name(when, "the safe send", dec.send_packet(&owned), spent);
+    // SAFETY: `raw_packet`'s, every byte written and the padding zeroed;
+    // no decoder lives to read it.
+    refused_by_name(
+      when,
+      "a send",
+      unsafe { dec.send_av_packet(&packet) },
+      spent,
+    );
+    // SAFETY: a blank packet: nothing to read, and nothing to write through.
+    let sent = unsafe { dec.send_av_packet(&empty) };
+    refused_by_name(when, "a packet that is the end", sent, spent);
+    refused_by_name(when, "the end", dec.send_eof(), spent);
+    refused_by_name(when, "a receive", dec.receive_frame(&mut frame), spent);
+    dec.flush();
+  }
+}
+
+/// Asserts `got` is [`Error::Spent`] naming `spent`.
+fn refused_by_name<T: core::fmt::Debug>(
+  when: &str,
+  entry: &str,
+  got: Result<T>,
+  spent: crate::Spent,
+) {
+  match got {
+    Err(Error::Spent(named)) if named == spent => {}
+    other => panic!("{when}: {entry}, refused by name as {spent:?}: {other:?}"),
+  }
 }
 
 /// **The latched-refusal variant: the funnel is no longer bypassed.**
@@ -1205,14 +1280,18 @@ fn a_latched_refusal_reaches_the_probe_instead_of_dying_unread() {
   let mut dec = auditioning_decoder();
   // The same phase, constructed the same way and for the same reason —
   // see the lane above.
-  dec.eof_sent = true;
+  dec.set_end(End::Taken);
 
   // Latch a coded-surface refusal, exactly as the `get_format` callback
   // does when it declines a surface over the ceiling.
   // SAFETY: `dec` owns this state and frees it only when it drops, after this
   // call.
   unsafe {
-    crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600)
+    crate::ffi::declare_ceiling_declined_for_test(
+      dec.decoder().callback_state,
+      8_294_400,
+      2_073_600,
+    )
   };
 
   let mut frame = crate::Frame::empty().expect("frame slot");
@@ -1256,7 +1335,7 @@ fn a_latched_refusal_outranks_the_errno_in_every_committed_phase() {
       "streaming x EOF",
       |dec: &mut VideoDecoder| {
         dec
-          .state
+          .decoder_mut()
           .inner
           .send_eof()
           .expect("the substrate takes the end");
@@ -1268,7 +1347,7 @@ fn a_latched_refusal_outranks_the_errno_in_every_committed_phase() {
     (
       "draining x EAGAIN",
       |dec: &mut VideoDecoder| {
-        dec.eof_sent = true;
+        dec.set_end(End::Taken);
       },
       SessionPhase::Draining,
     ),
@@ -1292,7 +1371,11 @@ fn a_latched_refusal_outranks_the_errno_in_every_committed_phase() {
     // SAFETY: `dec` owns this state and frees it only when it drops, after this
     // call.
     unsafe {
-      crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600)
+      crate::ffi::declare_ceiling_declined_for_test(
+        dec.decoder().callback_state,
+        8_294_400,
+        2_073_600,
+      )
     };
 
     let mut frame = crate::Frame::empty().expect("frame slot");
@@ -1368,7 +1451,11 @@ fn a_latched_refusal_outranks_the_errno_on_the_send_road_too() {
   // SAFETY: `dec` owns this state and frees it only when it drops, after this
   // call.
   unsafe {
-    crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600)
+    crate::ffi::declare_ceiling_declined_for_test(
+      dec.decoder().callback_state,
+      8_294_400,
+      2_073_600,
+    )
   };
 
   match dec.send_eof() {
@@ -1409,7 +1496,11 @@ fn the_committed_route_reports_the_verdict_it_was_given() {
   // SAFETY: `dec` owns this state and frees it only when it drops, after this
   // call.
   unsafe {
-    crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600)
+    crate::ffi::declare_ceiling_declined_for_test(
+      dec.decoder().callback_state,
+      8_294_400,
+      2_073_600,
+    )
   };
 
   // Handed a raw failure while a refusal sits latched: the route must
@@ -1457,7 +1548,9 @@ fn a_funnel_consumes_what_it_collects() {
   let dec = committed_decoder();
   // SAFETY: `dec` owns this state and frees it only when it drops, after this
   // call.
-  unsafe { crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 4_096, 1_024) };
+  unsafe {
+    crate::ffi::declare_ceiling_declined_for_test(dec.decoder().callback_state, 4_096, 1_024)
+  };
 
   let first = dec.hw_exit(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
   assert!(
@@ -1499,7 +1592,11 @@ fn a_declined_surface_reaches_the_caller_whatever_errno_the_codec_wrapped_it_in(
   // SAFETY: `dec` owns this state and frees it only when it drops, after this
   // call.
   unsafe {
-    crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600)
+    crate::ffi::declare_ceiling_declined_for_test(
+      dec.decoder().callback_state,
+      8_294_400,
+      2_073_600,
+    )
   };
 
   let out = reported(dec.hw_failure(hevc, BareVerdict::CandidateFailure));
@@ -1540,7 +1637,7 @@ fn a_budget_refusal_travels_unwrapped_whatever_errno_rides_with_it() {
     // SAFETY: `dec` owns this state and frees it only when it drops, after this
     // call.
     unsafe {
-      crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912)
+      crate::ffi::declare_frame_budget_declined_for_test(dec.decoder().callback_state, 12_582_912)
     };
 
     let out = reported(dec.hw_failure(raw, BareVerdict::CandidateFailure));
@@ -1565,7 +1662,7 @@ fn the_committed_receive_route_lets_a_budget_refusal_travel_unwrapped() {
   // SAFETY: `dec` owns this state and frees it only when it drops, after this
   // call.
   unsafe {
-    crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912)
+    crate::ffi::declare_frame_budget_declined_for_test(dec.decoder().callback_state, 12_582_912)
   };
 
   let mut frame = crate::Frame::empty().expect("frame slot");
@@ -1641,7 +1738,7 @@ fn a_committed_failure_is_its_pictures_own_and_the_next_packet_reaches_libavcode
   for raw in COMMITTED_FAILURES {
     let mut dec = committed_decoder();
     dec
-      .state
+      .decoder_mut()
       .inner
       .send_eof()
       .expect("libavcodec takes the end");
@@ -1699,7 +1796,10 @@ fn after_a_committed_failure_and_a_flush_the_end_reaches_libavcodec() {
       "{raw:?}: after a flush the end reaches libavcodec — it is taken, got {eof:?}",
     );
     assert!(
-      matches!(dec.state.inner.send_eof(), Err(ffmpeg_next::Error::Eof)),
+      matches!(
+        dec.decoder_mut().inner.send_eof(),
+        Err(ffmpeg_next::Error::Eof)
+      ),
       "{raw:?}: the end reached libavcodec, which refuses a second one",
     );
     let mut frame = crate::Frame::empty().expect("frame slot");
@@ -1783,7 +1883,7 @@ fn the_send_roads_route_a_surface_refusal_and_report_a_budget_one() {
           // call.
           Latch::Surface => unsafe {
             crate::ffi::declare_ceiling_declined_for_test(
-              dec.state.callback_state,
+              dec.decoder().callback_state,
               8_294_400,
               2_073_600,
             )
@@ -1793,7 +1893,7 @@ fn the_send_roads_route_a_surface_refusal_and_report_a_budget_one() {
             // call.
             unsafe {
               crate::ffi::declare_frame_budget_declined_for_test(
-                dec.state.callback_state,
+                dec.decoder().callback_state,
                 12_582_912,
               )
             }
@@ -2107,11 +2207,11 @@ type Opened = (
 #[cfg(target_vendor = "apple")]
 fn opened(decoder: Result<VideoDecoder>) -> Opened {
   let decoder = decoder.expect("the decoder opens");
-  // SAFETY: `decoder.state.inner` owns a live, opened `AVCodecContext` for
+  // SAFETY: the live decoder owns an opened `AVCodecContext` for
   // this borrow; `pkt_timebase` is a public `AVRational` field, and the
   // three skips are `AVDiscard` fields, read as the integers they are.
   let (timebase, skips) = unsafe {
-    let ctx = decoder.state.inner.as_ptr();
+    let ctx = decoder.decoder().inner.as_ptr();
     (
       ((*ctx).pkt_timebase.num, (*ctx).pkt_timebase.den),
       (
@@ -2122,7 +2222,7 @@ fn opened(decoder: Result<VideoDecoder>) -> Opened {
     )
   };
   (
-    decoder.probe.is_some(),
+    decoder.session_kind() == SessionKind::Trial,
     decoder.backend(),
     decoder.frame_limits,
     timebase,
@@ -2542,7 +2642,7 @@ fn a_rescued_packet_keeps_the_bytes_it_was_sent_with() {
     );
   }
   assert_eq!(
-    dec.probe.as_ref().expect("still on trial").buffered_bytes,
+    dec.probe().expect("still on trial").buffered_bytes,
     fills.len() * RAW_PICTURE,
     "each copy is charged its payload",
   );
@@ -2646,12 +2746,12 @@ fn a_copy_the_probe_cannot_make_sends_its_packet_and_commits() {
       // one whose packet the probe could not copy.
       let mut picture = frame::Video::empty();
       dec
-        .state
+        .decoder_mut()
         .inner
         .receive_frame(&mut picture)
         .expect("the first picture");
       dec
-        .state
+        .decoder_mut()
         .inner
         .receive_frame(&mut picture)
         .expect("the uncopied packet's picture");
@@ -2735,7 +2835,7 @@ fn a_packet_of_more_side_data_entries_than_the_probe_copies_is_sent_and_commits(
   // replayed the history and takes it.
   let mut dec = raw_auditioning_decoder_with(32, crate::DecoderOptions::new());
   {
-    let probe = dec.probe.as_mut().expect("on trial");
+    let probe = dec.probe_mut().expect("on trial");
     probe.parameters = raw_parameters(RAW_SIDE);
     probe.build = VideoDecoder::software_state_for_test;
     probe.remaining_backends = vec![Backend::Cuda];
@@ -2762,11 +2862,10 @@ fn a_packet_of_more_side_data_entries_than_the_probe_copies_is_sent_and_commits(
 /// shares their buffers and no copy is made: none that could fail, and none
 /// for the probe to pay twice. When the candidate fails in its turn and the
 /// probe exhausts, the history goes to the caller as owned, mutable
-/// packets, so the session first flushes the decoder that holds them
-/// (`avcodec_flush_buffers`, `libavcodec/avcodec.c` 409–412, and
-/// `decode.c` 2370–2379) and clears its frame scratch
-/// ([`VideoDecoder::release_history`]): the caller's `&mut [u8]` covers
-/// bytes no decoder holds.
+/// packets, and no decoder holds them: the candidate was torn down when it
+/// was left — its scratch frame cleared and its decoder dropped
+/// ([`VideoDecoder::reject`]) — before the exhaustion was answered, so the
+/// caller's `&mut [u8]` covers bytes no decoder holds.
 ///
 /// The candidate is opened in software through
 /// [`VideoDecoder::advance_probe_with`]. Two packets: rawvideo's picture of
@@ -2774,15 +2873,14 @@ fn a_packet_of_more_side_data_entries_than_the_probe_copies_is_sent_and_commits(
 /// the second waits in libavcodec's queue behind it, so the replay asks for
 /// no drain.
 ///
-/// PLANT: the exhaustion handing the history back without
-/// [`VideoDecoder::release_history`] turns this red at "referenced by the
-/// rescued packet alone".
+/// PLANT: the exhaustion handing the history back with the candidate kept,
+/// as R2's did, turns this red at "referenced by the rescued packet alone"
+/// (PB3-2).
 #[test]
 fn a_candidate_is_replayed_the_history_itself_and_it_is_released_before_it_goes_back() {
   let mut dec = raw_auditioning_decoder();
   dec
-    .probe
-    .as_mut()
+    .probe_mut()
     .expect("on trial")
     .remaining_backends
     .push(Backend::Cuda);
@@ -2801,7 +2899,7 @@ fn a_candidate_is_replayed_the_history_itself_and_it_is_released_before_it_goes_
     Backend::Cuda,
     "the candidate is the session's"
   );
-  let probe = dec.probe.as_ref().expect("still on trial: no picture yet");
+  let probe = dec.probe().expect("still on trial: no picture yet");
   assert_eq!(probe.fed, fills.len(), "it took the whole history");
   for (packet, &fill) in probe.buffered_packets.iter().zip(&fills) {
     assert_eq!(
@@ -2862,7 +2960,7 @@ fn the_attempt_log_is_in_the_order_the_backends_were_tried() {
   let mut dec = raw_auditioning_decoder();
   let first = dec.backend();
   {
-    let probe = dec.probe.as_mut().expect("on trial");
+    let probe = dec.probe_mut().expect("on trial");
     probe.parameters = raw_parameters(32);
     probe.build = VideoDecoder::software_state_for_test;
     probe.remaining_backends = vec![Backend::Cuda];
@@ -2941,8 +3039,7 @@ fn a_replay_makes_no_copy_so_one_that_could_not_be_made_charges_no_backend() {
     || {
       let mut dec = raw_auditioning_decoder();
       dec
-        .probe
-        .as_mut()
+        .probe_mut()
         .expect("on trial")
         .remaining_backends
         .push(Backend::Cuda);
@@ -2965,7 +3062,7 @@ fn a_replay_makes_no_copy_so_one_that_could_not_be_made_charges_no_backend() {
         Backend::Cuda,
         "the candidate is the session's"
       );
-      let probe = dec.probe.as_ref().expect("on trial");
+      let probe = dec.probe().expect("on trial");
       assert_eq!(probe.fed, fills.len(), "it took the whole history");
       assert_eq!(
         probe.attempts.len(),
@@ -3005,7 +3102,7 @@ fn a_replay_drains_nothing_so_a_long_history_charges_no_backend() {
   const PICTURES: usize = 40;
   let mut dec = raw_auditioning_decoder();
   {
-    let probe = dec.probe.as_mut().expect("on trial");
+    let probe = dec.probe_mut().expect("on trial");
     probe.remaining_backends = vec![Backend::Cuda];
     probe.build = VideoDecoder::software_state_for_test;
     probe.buffered_packets = (0..PICTURES).map(|index| raw_packet(index as u8)).collect();
@@ -3018,7 +3115,7 @@ fn a_replay_drains_nothing_so_a_long_history_charges_no_backend() {
     )))
     .expect("installed");
   assert_eq!(dec.backend(), Backend::Cuda, "the candidate's");
-  let probe = dec.probe.as_ref().expect("on trial");
+  let probe = dec.probe().expect("on trial");
   assert_eq!(
     probe.fed, 2,
     "the replay stopped at the candidate's first output: a picture waiting, a packet queued \
@@ -3029,7 +3126,7 @@ fn a_replay_drains_nothing_so_a_long_history_charges_no_backend() {
   let mut picture = frame::Video::empty();
   let mut delivered = Vec::new();
   loop {
-    match dec.state.inner.receive_frame(&mut picture) {
+    match dec.decoder_mut().inner.receive_frame(&mut picture) {
       Ok(()) => delivered.push(picture.data(0)[0]),
       Err(e) if is_eagain(&e) && dec.owes() => {
         let fed = dec.feed().expect("the candidate takes what it is owed");
@@ -3045,7 +3142,7 @@ fn a_replay_drains_nothing_so_a_long_history_charges_no_backend() {
     "every picture, in order"
   );
   assert_eq!(
-    dec.probe.as_ref().map(|probe| probe.fed),
+    dec.probe().map(|probe| probe.fed),
     Some(PICTURES),
     "the whole history fed, and the candidate still on trial"
   );
@@ -3068,7 +3165,7 @@ fn a_replay_drains_nothing_so_a_long_history_charges_no_backend() {
 fn a_copy_an_advance_cannot_make_keeps_the_next_backend_and_the_history() {
   let mut dec = raw_auditioning_decoder();
   {
-    let probe = dec.probe.as_mut().expect("on trial");
+    let probe = dec.probe_mut().expect("on trial");
     probe.parameters = with_extradata(raw_parameters(RAW_SIDE), 64);
     probe.remaining_backends = vec![Backend::Cuda];
     probe.build = VideoDecoder::software_state_for_test;
@@ -3085,7 +3182,8 @@ fn a_copy_an_advance_cannot_make_keeps_the_next_backend_and_the_history() {
     matches!(answer, Err(Error::ParametersTooLarge(_))),
     "surfaced as it is: {answer:?}"
   );
-  let probe = dec.probe.as_ref().expect("still on trial");
+  assert_eq!(dec.session_kind(), SessionKind::Owed, "the advance, owed");
+  let probe = dec.probe().expect("the probe's record");
   assert_eq!(
     probe.remaining_backends,
     vec![Backend::Cuda],
@@ -3100,7 +3198,7 @@ fn a_copy_an_advance_cannot_make_keeps_the_next_backend_and_the_history() {
 
   // With the bound back, the advance goes on to that backend.
   dec.frame_limits = crate::limits::DecoderLimits::new();
-  dec.advance_probe(failed()).expect("installed");
+  dec.resume().expect("installed");
   assert_eq!(dec.backend(), Backend::Cuda, "the backend kept");
 }
 
@@ -3150,7 +3248,7 @@ fn a_context_an_advance_cannot_allocate_keeps_the_next_backend() {
     || {
       let mut dec = raw_auditioning_decoder();
       {
-        let probe = dec.probe.as_mut().expect("on trial");
+        let probe = dec.probe_mut().expect("on trial");
         probe.remaining_backends = vec![Backend::Cuda];
         probe.buffered_packets = vec![raw_packet(0x11)];
         probe.fed = 1;
@@ -3167,7 +3265,7 @@ fn a_context_an_advance_cannot_allocate_keeps_the_next_backend() {
         ),
         "surfaced as it is: {answer:?}"
       );
-      let probe = dec.probe.as_ref().expect("still on trial");
+      let probe = dec.probe().expect("still on trial");
       assert_eq!(
         probe.remaining_backends,
         vec![Backend::Cuda],
@@ -3328,7 +3426,7 @@ fn on_videotoolbox_a_picture_over_the_frame_limit_is_no_delivery_and_charges_not
     "no delivery: still on trial"
   );
   {
-    let probe = dec.probe.as_ref().expect("on trial");
+    let probe = dec.probe().expect("on trial");
     assert!(
       probe.attempts.is_empty(),
       "nothing charged: {:?}",
@@ -3435,7 +3533,7 @@ fn an_end_after_pre_roll_alone_completes_the_candidate_at_every_skip_level() {
       let packets: Vec<Packet> = (0..count).map(|index| discarded(index as u8)).collect();
       send_all(&mut dec, &packets);
       assert_eq!(
-        dec.probe.as_ref().map(|probe| probe.buffered_packets.len()),
+        dec.probe().map(|probe| probe.buffered_packets.len()),
         (count <= MAX_PROBE_PACKETS).then_some(count),
         "{skip}, {count}: on trial with every packet held, or committed at the ceiling"
       );
@@ -3448,8 +3546,9 @@ fn an_end_after_pre_roll_alone_completes_the_candidate_at_every_skip_level() {
         Received::Ended,
         "{skip}, {count}"
       );
-      assert!(
-        dec.probe.is_none(),
+      assert_eq!(
+        dec.session_kind(),
+        SessionKind::Committed,
         "{skip}, {count}: the candidate is committed"
       );
     }
@@ -3472,7 +3571,7 @@ fn the_ceiling_commits_the_candidate_once_it_takes_the_packet_past_it() {
     .collect();
   send_all(&mut dec, &preroll);
   assert_eq!(
-    dec.probe.as_ref().map(|probe| probe.buffered_packets.len()),
+    dec.probe().map(|probe| probe.buffered_packets.len()),
     Some(MAX_PROBE_PACKETS),
     "on trial at the ceiling"
   );
@@ -3494,7 +3593,7 @@ fn the_ceiling_commits_the_candidate_once_it_takes_the_packet_past_it() {
   // 64 MiB.
   let mut dec = raw_auditioning_decoder();
   {
-    let probe = dec.probe.as_mut().expect("on trial");
+    let probe = dec.probe_mut().expect("on trial");
     probe.buffered_packets.push(discarded(0x22));
     probe.fed = 1;
     probe.buffered_bytes = MAX_PROBE_PACKET_BYTES;
@@ -3531,7 +3630,7 @@ fn a_candidate_that_refuses_the_packet_past_the_ceiling_fails_and_the_next_takes
   };
   let at_the_ceiling = |remaining: Vec<Backend>| {
     let mut dec = raw_auditioning_decoder_with(32, crate::DecoderOptions::new());
-    let probe = dec.probe.as_mut().expect("on trial");
+    let probe = dec.probe_mut().expect("on trial");
     probe.parameters = raw_parameters(RAW_SIDE);
     probe.build = VideoDecoder::software_state_for_test;
     probe.remaining_backends = remaining;
@@ -3592,8 +3691,7 @@ fn a_candidate_that_refuses_the_packet_past_the_ceiling_fails_and_the_next_takes
 fn a_flush_mid_probe_forgets_the_history_and_the_ceiling_counts_from_it() {
   let held = |dec: &VideoDecoder| {
     dec
-      .probe
-      .as_ref()
+      .probe()
       .map(|probe| (probe.buffered_packets.len(), probe.buffered_bytes))
   };
   let preroll = |count: usize| {
@@ -3711,7 +3809,7 @@ fn pictures(dec: &mut VideoDecoder) -> (usize, Result<Received>) {
 /// (`a_candidate_is_replayed_the_history_itself_and_it_is_released_before_it_goes_back`).
 fn holds_a_picture(dec: &mut VideoDecoder) -> bool {
   let mut picture = frame::Video::empty();
-  dec.state.inner.receive_frame(&mut picture).is_ok()
+  dec.decoder_mut().inner.receive_frame(&mut picture).is_ok()
 }
 
 /// LAW: **a VP9 stream of hidden frames ends the trial in a clean, empty
@@ -3909,10 +4007,10 @@ fn dropping_a_packet_can_move_a_later_best_effort_timestamp_and_never_a_pts() {
         let mut packet = raw_packet(0x33);
         packet.set_pts(Some(pts));
         packet.set_dts(Some(dts));
-        dec.state.inner.send_packet(&packet).expect("taken");
+        dec.decoder_mut().inner.send_packet(&packet).expect("taken");
         let mut picture = frame::Video::empty();
         dec
-          .state
+          .decoder_mut()
           .inner
           .receive_frame(&mut picture)
           .expect("its picture");
@@ -3978,7 +4076,7 @@ fn a_packet_the_candidate_took_before_a_local_refusal_is_kept_as_taken() {
     matches!(sent, Err(Error::FrameBudgetExceeded(_))),
     "the budget, by name: {sent:?}"
   );
-  let probe = dec.probe.as_ref().expect("still on trial");
+  let probe = dec.probe().expect("still on trial");
   assert_eq!(
     (probe.buffered_packets.len(), probe.fed),
     (1, 1),
@@ -4063,7 +4161,7 @@ fn an_advance_stopped_by_this_crates_own_failure_is_resumed_before_the_failed_ca
   let mut dec = raw_auditioning_decoder();
   let first = dec.backend();
   {
-    let probe = dec.probe.as_mut().expect("on trial");
+    let probe = dec.probe_mut().expect("on trial");
     probe.build = vaapi_refuses_and_cuda_may_fail;
     probe.remaining_backends = vec![Backend::Vaapi, Backend::Cuda];
   }
@@ -4082,8 +4180,10 @@ fn an_advance_stopped_by_this_crates_own_failure_is_resumed_before_the_failed_ca
     "this crate's own, surfaced: {stopped:?}"
   );
   {
-    let probe = dec.probe.as_ref().expect("still on trial");
-    let pending = probe.pending.as_ref().expect("the advance, owed");
+    assert_eq!(dec.session_kind(), SessionKind::Owed, "the advance, owed");
+    assert!(dec.live().is_none(), "no decoder lives while it is owed");
+    let probe = dec.probe().expect("the probe's record");
+    let pending = dec.pending().expect("the advance, owed");
     assert_eq!((pending.backend, pending.tried_at), (first, 0));
     assert_eq!(
       tried(probe),
@@ -4099,8 +4199,8 @@ fn an_advance_stopped_by_this_crates_own_failure_is_resumed_before_the_failed_ca
   );
   assert_eq!(dec.backend(), Backend::Cuda, "the advance, resumed");
   {
-    let probe = dec.probe.as_ref().expect("still on trial");
-    assert!(probe.pending.is_none(), "owed no more");
+    assert_eq!(dec.session_kind(), SessionKind::Trial, "owed no more");
+    let probe = dec.probe().expect("still on trial");
     assert_eq!(
       tried(probe),
       vec![first, Backend::Vaapi],
@@ -4143,8 +4243,8 @@ fn all_deliver(_: Backend) -> Option<i32> {
 /// to try, built in software ([`VideoDecoder::software_state_for_test`]).
 fn vaapi_then_cuda() -> VideoDecoder {
   let mut dec = raw_auditioning_decoder();
-  dec.state.backend = Backend::Vaapi;
-  let probe = dec.probe.as_mut().expect("on trial");
+  dec.decoder_mut().backend = Backend::Vaapi;
+  let probe = dec.probe_mut().expect("on trial");
   probe.build = VideoDecoder::software_state_for_test;
   probe.remaining_backends = vec![Backend::Cuda];
   dec
@@ -4193,7 +4293,7 @@ fn at_the_unfit_picture_the_probe_holds_its_history_and_nothing_is_committed() {
     (Backend::Cuda, SessionPhase::Auditioning),
     "the next candidate, on trial: nothing committed"
   );
-  let probe = dec.probe.as_ref().expect("still on trial");
+  let probe = dec.probe().expect("still on trial");
   assert_eq!(
     probe.buffered_packets.len(),
     fills.len(),
@@ -4420,7 +4520,7 @@ fn a_picture_whose_properties_cannot_be_copied_is_no_delivery_and_charges_nothin
     (Backend::Vaapi, SessionPhase::Auditioning),
     "no delivery: still on trial"
   );
-  let probe = dec.probe.as_ref().expect("on trial");
+  let probe = dec.probe().expect("on trial");
   assert!(
     probe.attempts.is_empty(),
     "nothing charged: {:?}",
@@ -4435,13 +4535,13 @@ fn a_picture_whose_properties_cannot_be_copied_is_no_delivery_and_charges_nothin
 }
 
 /// LAW: **a VideoToolbox download in a layout a [`Frame`] cannot carry is
-/// told apart from a failed download**: a VideoToolbox frame of `UYVY422`
-/// pixel buffers (`libavutil/hwcontext_videotoolbox.c` 52 in FFmpeg 9.0.1),
-/// a layout [`Frame`] has no accessors for, downloads, and
-/// [`transfer_hw_frame`] answers the layout it chose, this crate's limit;
-/// one of `NV12` downloads whole. A VideoToolbox device
-/// and frames context need no decoder session, so this runs wherever
-/// VideoToolbox is linked.
+/// told apart from a failed download, before any transfer**: for a
+/// VideoToolbox frame of `UYVY422` pixel buffers
+/// (`libavutil/hwcontext_videotoolbox.c` 52 in FFmpeg 9.0.1), a layout
+/// [`Frame`] has no accessors for, [`download_format_of`] answers the layout
+/// the download would choose, and nothing is transferred; one of `NV12` is
+/// picked, and downloads whole. A VideoToolbox device and frames context need
+/// no decoder session, so this runs wherever VideoToolbox is linked.
 ///
 /// PLANT: the layout answered as a failed download turns this red at
 /// "the layout, told apart".
@@ -4485,7 +4585,8 @@ fn a_videotoolbox_download_in_a_layout_a_frame_cannot_carry_is_told_apart() {
         "a VideoToolbox frame"
       );
       let mut dst = crate::Frame::empty().expect("frame slot");
-      let downloaded = transfer_hw_frame(&mut dst, &src);
+      let downloaded =
+        download_format_of(&src).and_then(|format| transfer_hw_frame(&mut dst, &src, format));
       drop(src);
       av_buffer_unref(&mut frames);
       av_buffer_unref(&mut device);
@@ -4565,7 +4666,7 @@ fn committed_with_backlog(
 ) -> (VideoDecoder, Vec<u8>) {
   let mut dec = vaapi_then_cuda();
   {
-    let probe = dec.probe.as_mut().expect("on trial");
+    let probe = dec.probe_mut().expect("on trial");
     probe.buffered_bytes = history.len() * RAW_PICTURE;
     probe.fed = history.len();
     probe.buffered_packets = history;
@@ -4576,7 +4677,7 @@ fn committed_with_backlog(
     )))
     .expect("CUDA installed");
   assert_eq!(
-    dec.probe.as_ref().map(|probe| probe.fed),
+    dec.probe().map(|probe| probe.fed),
     Some(2),
     "the replay stopped at the candidate's first output"
   );
@@ -4715,12 +4816,15 @@ fn every_answer_to_a_send_is_classed_by_its_source() {
   // unsent: the decoder takes the end after it, so it never began draining.
   let mut dec = raw_pinned_decoder();
   assert_eq!(
-    send(&mut dec.state.inner, Sending::Packet(&Packet::empty())),
+    send(
+      &mut dec.decoder_mut().inner,
+      Sending::Packet(&Packet::empty())
+    ),
     Acceptance::NotAccepted(einval),
     "the end in a packet's shape, refused unsent"
   );
   assert_eq!(
-    send(&mut dec.state.inner, Sending::End),
+    send(&mut dec.decoder_mut().inner, Sending::End),
     Acceptance::Accepted,
     "the end, taken: nothing had started the drain"
   );
@@ -4729,19 +4833,19 @@ fn every_answer_to_a_send_is_classed_by_its_source() {
   // (`rawdec.c` 342–346).
   let mut dec = raw_pinned_decoder();
   assert_eq!(
-    send(&mut dec.state.inner, Sending::Packet(&zero_size)),
+    send(&mut dec.decoder_mut().inner, Sending::Packet(&zero_size)),
     Acceptance::NotAccepted(einval),
     "the shape's"
   );
   let short = crate::boundary::try_packet_copy(&[0x77; RAW_SIDE as usize]).expect("a short packet");
   assert_eq!(
-    send(&mut dec.state.inner, Sending::Packet(&short)),
+    send(&mut dec.decoder_mut().inner, Sending::Packet(&short)),
     Acceptance::AcceptedWithError(einval),
     "the decode's"
   );
   let mut refused = unbuffered(-1);
   assert_eq!(
-    send(&mut dec.state.inner, Sending::Packet(&refused)),
+    send(&mut dec.decoder_mut().inner, Sending::Packet(&refused)),
     Acceptance::NotAccepted(einval),
     "packet_alloc's, inside av_packet_ref"
   );
@@ -4790,7 +4894,7 @@ fn an_ambiguous_send_of_the_backlogs_front_ends_the_decoder_and_hands_it_back() 
       assert_eq!(pictures, vec![0x11, 0x22], "the committed decoder's");
       assert_eq!(
         dec
-          .backlog
+          .backlog()
           .iter()
           .map(|packet| packet.data().expect("a payload")[0])
           .collect::<Vec<u8>>(),
@@ -4825,21 +4929,9 @@ fn an_ambiguous_send_of_the_backlogs_front_ends_the_decoder_and_hands_it_back() 
         assert_eq!(payload_of(packet).1, 1, "referenced by its packet alone");
       }
 
-      // The decoder has ended: nothing owed, every packet after it
-      // `AVERROR_EOF`, every receive the end.
-      assert!(dec.backlog.is_empty(), "nothing owed");
-      let after = raw_packet(0x55);
-      // SAFETY: `raw_packet`'s, every byte written and the padding zeroed,
-      // and nothing writes through it while the decoder may read it.
-      let sent = unsafe { dec.send_av_packet(&after) };
-      assert!(
-        matches!(sent, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
-        "a packet after it: {sent:?}"
-      );
-      assert_eq!(
-        dec.receive_frame(&mut frame).expect("the end"),
-        Received::Ended
-      );
+      // The decoder is spent, terminally: no decoder lives, and every
+      // entry after it is refused by name, a flush included.
+      assert_spent(&mut dec, crate::Spent::AmbiguousSend, SessionKind::Ended);
 
       // A decoder that starts from the residual decodes the rest.
       let mut next = raw_pinned_decoder();
@@ -4865,7 +4957,7 @@ fn back_pressure_on_the_backlog_keeps_its_front() {
   let mut frame = crate::Frame::empty().expect("frame slot");
   let sent = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
   let (mut dec, mut pictures) = committed_with_backlog(Vec::from(sent.map(raw_packet)), &mut frame);
-  assert_eq!(dec.backlog.len(), 4, "the replay's rest");
+  assert_eq!(dec.backlog().len(), 4, "the replay's rest");
 
   let fed = dec.feed().expect("taken, then back pressure");
   assert_eq!(
@@ -4877,10 +4969,10 @@ fn back_pressure_on_the_backlog_keeps_its_front() {
     "two taken, the third not"
   );
   assert!(
-    holds(dec.backlog.front().expect("a front"), 0x55),
+    holds(dec.backlog().front().expect("a front"), 0x55),
     "the packet it did not take, kept"
   );
-  assert_eq!(dec.backlog.len(), 2, "the rest behind it");
+  assert_eq!(dec.backlog().len(), 2, "the rest behind it");
 
   let _downloads = DownloadsForTest::set(all_deliver);
   pictures.extend(delivered(&mut dec, &mut frame));
@@ -4915,7 +5007,7 @@ fn on_trial_an_ambiguous_send_beside_a_refusal_of_this_crates_own_ends_the_decod
       // SAFETY: `dec` owns this state and frees it only when it drops,
       // after this call.
       unsafe {
-        crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912)
+        crate::ffi::declare_frame_budget_declined_for_test(dec.decoder().callback_state, 12_582_912)
       };
       // SAFETY: in `in_subprocess`'s child, alone; the send checks what
       // libavcodec answers, and the cap is lifted as it returns.
@@ -4936,13 +5028,20 @@ fn on_trial_an_ambiguous_send_beside_a_refusal_of_this_crates_own_ends_the_decod
         vec![0x11],
         "the whole history, and not the caller's packet"
       );
-      assert!(dec.probe.is_none(), "the probe ended with it");
-      // SAFETY: as above.
-      let sent = unsafe { dec.send_av_packet(&caller) };
-      assert!(
-        matches!(sent, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
-        "the decoder ended: {sent:?}"
+      assert_eq!(
+        dec.session_kind(),
+        SessionKind::Ended,
+        "the probe ended with it"
       );
+      for packet in ended.residual() {
+        assert_eq!(payload_of(packet).1, 1, "referenced by its packet alone");
+      }
+      assert_eq!(
+        payload_of(&caller).1,
+        1,
+        "the caller's, referenced by it alone"
+      );
+      assert_spent(&mut dec, crate::Spent::AmbiguousSend, SessionKind::Ended);
     },
   );
 }
@@ -4967,7 +5066,7 @@ fn on_trial_an_ambiguous_send_leaves_the_candidate_and_the_next_takes_the_packet
     "decoder::tests::on_trial_an_ambiguous_send_leaves_the_candidate_and_the_next_takes_the_packet_once",
     || {
       let mut dec = vaapi_then_cuda();
-      dec.probe.as_mut().expect("on trial").build = uncapped_then_software_state;
+      dec.probe_mut().expect("on trial").build = uncapped_then_software_state;
       send_all(&mut dec, &[raw_packet(0x11)]);
       let caller = raw_packet_with_side_data(0x22, SIDE_DATA_PAST_THE_CAP);
       // SAFETY: in `in_subprocess`'s child, alone; the send checks what
@@ -4983,7 +5082,7 @@ fn on_trial_an_ambiguous_send_leaves_the_candidate_and_the_next_takes_the_packet
       );
       assert_eq!(dec.backend(), Backend::Cuda, "the next candidate's");
       {
-        let probe = dec.probe.as_ref().expect("still on trial");
+        let probe = dec.probe().expect("still on trial");
         assert!(
           matches!(
             probe.attempts.as_slice(),
@@ -5038,7 +5137,7 @@ fn while_the_decoder_is_owed_a_send_takes_nothing_and_an_owed_packets_answer_is_
     matches!(sent, Ok(Sent::MustDrain)),
     "nothing sent while the decoder is owed: {sent:?}"
   );
-  assert_eq!(dec.backlog.len(), 2, "the backlog, untouched");
+  assert_eq!(dec.backlog().len(), 2, "the backlog, untouched");
 
   let _downloads = DownloadsForTest::set(all_deliver);
   let refused = dec.receive_frame(&mut frame);
@@ -5072,9 +5171,9 @@ fn a_packet_with_neither_payload_nor_side_data_is_the_end() {
   // SAFETY: a blank packet: nothing to read, and nothing to write through.
   let sent = unsafe { dec.send_av_packet(&empty) };
   assert!(matches!(sent, Ok(Sent::Accepted)), "the end: {sent:?}");
-  assert!(dec.eof_sent, "recorded as the end");
+  assert_eq!(dec.end(), Some(End::Taken), "recorded as the end");
   assert_eq!(
-    dec.probe.as_ref().map(|probe| probe.buffered_packets.len()),
+    dec.probe().map(|probe| probe.buffered_packets.len()),
     Some(1),
     "the history holds no packet for it"
   );
@@ -5119,7 +5218,7 @@ fn a_packet_of_a_shape_libavcodec_refuses_charges_no_candidate() {
     "refused: {refused:?}"
   );
   assert_eq!(dec.phase(), SessionPhase::Auditioning, "still on trial");
-  let probe = dec.probe.as_ref().expect("on trial");
+  let probe = dec.probe().expect("on trial");
   assert!(
     probe.attempts.is_empty(),
     "no candidate charged: {:?}",
@@ -5172,11 +5271,11 @@ fn a_packet_with_no_payload_is_copied_with_none_and_libavcodec_takes_the_copy() 
   let mut dec = raw_pinned_decoder();
   let picture = raw_packet(0x11);
   assert_eq!(
-    send(&mut dec.state.inner, Sending::Packet(&picture)),
+    send(&mut dec.decoder_mut().inner, Sending::Packet(&picture)),
     Acceptance::Accepted
   );
   assert_eq!(
-    send(&mut dec.state.inner, Sending::Packet(&copy)),
+    send(&mut dec.decoder_mut().inner, Sending::Packet(&copy)),
     Acceptance::Accepted,
     "taken, as the source is"
   );
@@ -5200,7 +5299,7 @@ fn a_send_whose_advance_is_owed_does_not_take_the_packet_and_the_next_candidate_
   let mut dec = raw_auditioning_decoder_with(32, crate::DecoderOptions::new());
   let first = dec.backend();
   {
-    let probe = dec.probe.as_mut().expect("on trial");
+    let probe = dec.probe_mut().expect("on trial");
     probe.parameters = raw_parameters(RAW_SIDE);
     probe.build = vaapi_refuses_and_cuda_may_fail;
     probe.remaining_backends = vec![Backend::Vaapi, Backend::Cuda];
@@ -5216,8 +5315,8 @@ fn a_send_whose_advance_is_owed_does_not_take_the_packet_and_the_next_candidate_
     "not taken, the advance owed: {sent:?}"
   );
   {
-    let probe = dec.probe.as_ref().expect("on trial");
-    assert!(probe.pending.is_some(), "the advance, owed");
+    assert_eq!(dec.session_kind(), SessionKind::Owed, "the advance, owed");
+    let probe = dec.probe().expect("the probe's record");
     assert!(
       probe.buffered_packets.is_empty(),
       "the history never held it"
@@ -5244,7 +5343,7 @@ fn a_send_whose_advance_is_owed_does_not_take_the_packet_and_the_next_candidate_
     "the next candidate's: {sent:?}"
   );
   {
-    let probe = dec.probe.as_ref().expect("on trial");
+    let probe = dec.probe().expect("on trial");
     assert_eq!(fills(&probe.buffered_packets), vec![0x11], "recorded once");
     assert_eq!(
       tried(probe),
@@ -5279,7 +5378,7 @@ fn back_pressure_on_a_send_is_answered_for_the_packet_alone() {
   // SAFETY: `dec` owns this state and frees it only when it drops, after
   // this call.
   unsafe {
-    crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912)
+    crate::ffi::declare_frame_budget_declined_for_test(dec.decoder().callback_state, 12_582_912)
   };
   let third = raw_packet(0x33);
   // SAFETY: `raw_packet`'s, every byte written and the padding zeroed, and
@@ -5308,4 +5407,1157 @@ fn back_pressure_on_a_send_is_answered_for_the_packet_alone() {
   let sent = unsafe { dec.send_av_packet(&third) };
   assert!(matches!(sent, Ok(Sent::Accepted)), "then taken: {sent:?}");
   assert_eq!(delivered(&mut dec, &mut frame), vec![0x33], "its picture");
+}
+
+// ---------------------------------------------------------------------------
+//  The probe's state, as one class (Codex R2 on #89, findings 1 and 3): one
+//  typed state every entry reads first, a candidate left torn down at once,
+//  and exhaustion terminal. And the download's attribution (finding 2).
+// ---------------------------------------------------------------------------
+
+/// The [`DecoderState`]s dropped on this thread so far: the seam a law sees
+/// a candidate torn down through.
+fn decoders_dropped() -> usize {
+  DECODER_STATES_DROPPED.with(core::cell::Cell::get)
+}
+
+/// A [`BuildCandidate`] that refuses every backend: the backend's own
+/// answer, for a law whose advance must find no candidate.
+fn every_backend_refuses(
+  _: codec::Parameters,
+  _: Codec,
+  backend: Backend,
+  _: crate::limits::DecoderLimits,
+  _: crate::DecoderOptions,
+  _: Option<mediadecode::Timebase>,
+) -> std::result::Result<DecoderState, BuildFailure> {
+  Err(BuildFailure::Refused(BackendAnswer::of_open(
+    Error::BackendUnsupportedByCodec(backend),
+  )))
+}
+
+/// A [`BuildCandidate`]: [`vaapi_refuses_and_cuda_may_fail`], with the
+/// allocation cap lifted first, so a law's cap reaches the send it is set
+/// for and no candidate built after it.
+fn uncapped_vaapi_refuses_and_cuda_may_fail(
+  parameters: codec::Parameters,
+  codec: Codec,
+  backend: Backend,
+  limits: crate::limits::DecoderLimits,
+  options: crate::DecoderOptions,
+  pkt_timebase: Option<mediadecode::Timebase>,
+) -> std::result::Result<DecoderState, BuildFailure> {
+  mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
+  vaapi_refuses_and_cuda_may_fail(parameters, codec, backend, limits, options, pkt_timebase)
+}
+
+/// The candidate on trial (raw, in software) with `remaining` to try,
+/// built by `build`.
+fn on_trial_with(build: BuildCandidate, remaining: Vec<Backend>) -> VideoDecoder {
+  let mut dec = raw_auditioning_decoder();
+  let probe = dec.probe_mut().expect("on trial");
+  probe.build = build;
+  probe.remaining_backends = remaining;
+  dec
+}
+
+/// A failed candidate's own answer, for a law that leaves one.
+fn its_own_failure() -> BackendAnswer {
+  BackendAnswer::of_call(Error::Ffmpeg(ffmpeg_next::Error::InvalidData))
+}
+
+/// Whether `answer` is this crate's own `ENOMEM`, as it was surfaced.
+fn is_own_enomem<T>(answer: &Result<T>) -> bool {
+  matches!(answer, Err(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })) if *errno == libc::ENOMEM)
+}
+
+/// LAW: **a candidate left on a send is torn down before the send answers
+/// that the packet was not taken** (Codex R2, finding 1). The candidate on
+/// trial takes the caller's picture and its decode fails — it decodes
+/// 32 × 32 pictures, and the packet is short of one — so it is left. The
+/// advance away from it meets VAAPI's refusal, then CUDA's build failing
+/// with this crate's own `ENOMEM`, and is owed. The send answers
+/// [`Sent::MustDrain`], and by then the candidate is gone: its decoder
+/// dropped before the answer, the session [`Session::Owed`] with no decoder
+/// in it, and the caller's packet referenced by its own alone. The drain
+/// resumes the advance, and the packet, offered again, is fed to CUDA once:
+/// recorded once, its picture delivered once.
+///
+/// PLANT: the candidate kept in the owed state, as R2's `PendingAdvance`
+/// kept it, turns this red at "torn down before the answer".
+#[test]
+fn a_candidate_left_on_a_send_is_torn_down_before_the_send_answers_not_taken() {
+  let mut dec = raw_auditioning_decoder_with(32, crate::DecoderOptions::new());
+  let first = dec.backend();
+  {
+    let probe = dec.probe_mut().expect("on trial");
+    probe.parameters = raw_parameters(RAW_SIDE);
+    probe.build = vaapi_refuses_and_cuda_may_fail;
+    probe.remaining_backends = vec![Backend::Vaapi, Backend::Cuda];
+  }
+  let picture = raw_packet(0x11);
+  let dropped = decoders_dropped();
+  CUDA_FAILS.with(|fails| fails.set(true));
+  // SAFETY: `raw_packet`'s, every byte written and the padding zeroed, and
+  // nothing writes through it while the decoder may read it.
+  let sent = unsafe { dec.send_av_packet(&picture) };
+  CUDA_FAILS.with(|fails| fails.set(false));
+  assert!(
+    matches!(sent, Ok(Sent::MustDrain)),
+    "not taken, the advance owed: {sent:?}"
+  );
+  assert_eq!(
+    decoders_dropped() - dropped,
+    1,
+    "the candidate left, torn down before the answer"
+  );
+  assert_eq!(dec.session_kind(), SessionKind::Owed, "the advance, owed");
+  assert!(dec.live().is_none(), "no decoder lives while it is owed");
+  assert_eq!(
+    payload_of(&picture).1,
+    1,
+    "the caller's packet, referenced by its own alone"
+  );
+  {
+    let pending = dec.pending().expect("the advance, owed");
+    assert_eq!(pending.backend, first, "the candidate left");
+    assert!(
+      matches!(pending.attempt, Attempt::Failed(_)),
+      "its own answer: {:?}",
+      pending.attempt
+    );
+  }
+
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  assert_eq!(
+    dec
+      .receive_frame(&mut frame)
+      .expect("the drain resumes the advance"),
+    Received::NeedsInput
+  );
+  assert_eq!(
+    (dec.backend(), dec.session_kind()),
+    (Backend::Cuda, SessionKind::Trial),
+    "the next candidate, on trial"
+  );
+  // SAFETY: as above.
+  let sent = unsafe { dec.send_av_packet(&picture) };
+  assert!(
+    matches!(sent, Ok(Sent::Accepted)),
+    "fed to the next candidate: {sent:?}"
+  );
+  assert_eq!(
+    fills(&dec.probe().expect("on trial").buffered_packets),
+    vec![0x11],
+    "recorded once"
+  );
+  let _downloads = DownloadsForTest::set(all_deliver);
+  assert_eq!(
+    delivered(&mut dec, &mut frame),
+    vec![0x11],
+    "its picture, once"
+  );
+}
+
+/// LAW: **an ambiguous send whose advance is owed leaves no reference to
+/// any packet behind it** (Codex R2, finding 1, read off libavcodec's own
+/// counts). The candidate on trial decodes the caller's first picture as it
+/// is sent, by reference — rawvideo does not copy a refcounted `GRAY8`
+/// packet (`libavcodec/rawdec.c` 226 and 244 in FFmpeg 9.0.1) — and holds
+/// it, so the caller's first packet has two references. The second
+/// packet's reference cannot be made under the cap ([`CAPPED`], in a child
+/// process): `ENOMEM`, ambiguous, the candidate's own answer, so it is
+/// left; the advance meets VAAPI's refusal and then CUDA's build failing
+/// with this crate's own `ENOMEM`, and is owed. By the time the send answers
+/// [`Sent::MustDrain`], every packet is referenced by its own alone: the
+/// caller's two and the history's copy. The drain resumes the advance, and
+/// the second packet, offered again, is fed once: every picture once, in
+/// order.
+///
+/// PLANT: the candidate kept in the owed state turns this red at "the
+/// caller's first packet, released".
+#[test]
+fn an_ambiguous_send_whose_advance_is_owed_leaves_no_reference_behind() {
+  use mediaio_ffmpeg::test_support::{
+    cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations,
+  };
+
+  in_subprocess(
+    "decoder::tests::an_ambiguous_send_whose_advance_is_owed_leaves_no_reference_behind",
+    || {
+      let mut dec = on_trial_with(
+        uncapped_vaapi_refuses_and_cuda_may_fail,
+        vec![Backend::Vaapi, Backend::Cuda],
+      );
+      let first = dec.backend();
+      let held = raw_packet(0x11);
+      // SAFETY: `raw_packet`'s, every byte written and the padding zeroed,
+      // and nothing writes through it while the decoder may read it.
+      let sent = unsafe { dec.send_av_packet(&held) };
+      assert!(matches!(sent, Ok(Sent::Accepted)), "taken: {sent:?}");
+      assert_eq!(
+        payload_of(&held).1,
+        2,
+        "the candidate holds the caller's first picture, by reference"
+      );
+      let caller = raw_packet_with_side_data(0x22, SIDE_DATA_PAST_THE_CAP);
+      let dropped = decoders_dropped();
+      CUDA_FAILS.with(|fails| fails.set(true));
+      // SAFETY: in `in_subprocess`'s child, alone; the send checks what
+      // libavcodec answers, and the next candidate's build lifts the cap.
+      unsafe { cap_ffmpeg_allocations(CAPPED) };
+      // SAFETY: as above.
+      let sent = unsafe { dec.send_av_packet(&caller) };
+      uncap_ffmpeg_allocations();
+      CUDA_FAILS.with(|fails| fails.set(false));
+      assert!(
+        matches!(sent, Ok(Sent::MustDrain)),
+        "not taken, the advance owed: {sent:?}"
+      );
+      assert_eq!(
+        decoders_dropped() - dropped,
+        1,
+        "the candidate left, torn down before the answer"
+      );
+      assert_eq!(dec.session_kind(), SessionKind::Owed, "the advance, owed");
+      assert!(dec.live().is_none(), "no decoder lives while it is owed");
+      assert_eq!(
+        payload_of(&held).1,
+        1,
+        "the caller's first packet, released"
+      );
+      assert_eq!(
+        payload_of(&caller).1,
+        1,
+        "the caller's second, referenced by its own alone"
+      );
+      {
+        let probe = dec.probe().expect("the probe's record");
+        assert_eq!(fills(&probe.buffered_packets), vec![0x11], "the history");
+        for packet in &probe.buffered_packets {
+          assert_eq!(
+            payload_of(packet).1,
+            1,
+            "the history's copy, by its own alone"
+          );
+        }
+        let pending = dec.pending().expect("the advance, owed");
+        assert!(
+          matches!(
+            &pending.attempt,
+            Attempt::Failed(BackendAnswer(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
+              if *errno == libc::ENOMEM
+          ),
+          "{first:?}'s answer, the errno as libavcodec returned it: {:?}",
+          pending.attempt
+        );
+      }
+
+      let _downloads = DownloadsForTest::set(all_deliver);
+      let mut frame = crate::Frame::empty().expect("frame slot");
+      let mut pictures = delivered(&mut dec, &mut frame);
+      assert_eq!(dec.backend(), Backend::Cuda, "the advance, resumed");
+      // SAFETY: as above.
+      let sent = unsafe { dec.send_av_packet(&caller) };
+      assert!(matches!(sent, Ok(Sent::Accepted)), "then taken: {sent:?}");
+      pictures.extend(delivered(&mut dec, &mut frame));
+      assert_eq!(pictures, vec![0x11, 0x22], "every picture once, in order");
+    },
+  );
+}
+
+/// LAW: **after the end and then the probe's exhaustion, no packet is ever
+/// taken** (Codex R2, finding 3). The only candidate takes a picture and the
+/// end, and its download chooses a layout a [`Frame`](crate::Frame) cannot
+/// carry: unfit, and with no backend left the probe is exhausted, every
+/// packet handed back. R2 flushed the candidate to hand the history back
+/// and left it behind as a committed decoder with its end forgotten, so the
+/// next packet was taken after the end. Now no decoder lives, and every
+/// entry is refused by name, a flush included — a packet most of all.
+///
+/// PLANT: exhaustion read as committed — the candidate flushed and kept, as
+/// R2 left it — turns this red at "never taken".
+#[test]
+fn after_the_end_and_the_probes_exhaustion_no_packet_is_ever_taken() {
+  let _downloads = DownloadsForTest::set(none_deliver);
+  let mut dec = raw_auditioning_decoder();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  assert_eq!(dec.send_eof().expect("the end"), Sent::Accepted);
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let exhausted = dec.receive_frame(&mut frame);
+  let Err(Error::ProbeExhausted(exhausted)) = exhausted else {
+    panic!("the probe exhausted: {exhausted:?}");
+  };
+  assert_eq!(
+    fills(exhausted.unconsumed_packets()),
+    vec![0x11],
+    "every packet back"
+  );
+  for when in ["at once", "after a flush"] {
+    let packet = raw_packet(0x22);
+    // SAFETY: `raw_packet`'s, every byte written and the padding zeroed;
+    // no decoder lives to read it.
+    let sent = unsafe { dec.send_av_packet(&packet) };
+    assert!(
+      matches!(sent, Err(Error::Spent(crate::Spent::ProbeExhausted))),
+      "{when}: never taken: {sent:?}"
+    );
+    dec.flush();
+  }
+  assert_spent(
+    &mut dec,
+    crate::Spent::ProbeExhausted,
+    SessionKind::Exhausted,
+  );
+}
+
+/// LAW: **an exhausted probe is spent on every road it exhausts on**: a
+/// send, the end, and a receive (the state table's spent rows). On a send
+/// and on the end, the candidate's own surface refusal leaves it, latched
+/// beside libavcodec's answer to a submission after the end; on a receive,
+/// its unfit picture. With no backend left, each answers
+/// [`Error::ProbeExhausted`] once, and the decoder is spent after it.
+///
+/// PLANT: the exhausted state answering as a live one — the entry check
+/// gone — turns this red at "refused by name".
+#[test]
+fn an_exhausted_probe_is_spent_on_every_road_it_exhausts_on() {
+  for road in ["a send", "the end"] {
+    let mut dec = raw_auditioning_decoder();
+    assert_eq!(dec.send_eof().expect("the end"), Sent::Accepted);
+    // SAFETY: `dec` owns this state and frees it only when it drops, after
+    // this call.
+    unsafe {
+      crate::ffi::declare_ceiling_declined_for_test(
+        dec.decoder().callback_state,
+        8_294_400,
+        2_073_600,
+      )
+    };
+    let packet = raw_packet(0x11);
+    let answer = if road == "a send" {
+      // SAFETY: `raw_packet`'s, every byte written and the padding zeroed.
+      unsafe { dec.send_av_packet(&packet) }
+    } else {
+      dec.send_eof()
+    };
+    assert!(
+      matches!(answer, Err(Error::ProbeExhausted(_))),
+      "{road}: exhausted: {answer:?}"
+    );
+    assert_spent(
+      &mut dec,
+      crate::Spent::ProbeExhausted,
+      SessionKind::Exhausted,
+    );
+  }
+  let _downloads = DownloadsForTest::set(none_deliver);
+  let mut dec = raw_auditioning_decoder();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let answer = dec.receive_frame(&mut frame);
+  assert!(
+    matches!(answer, Err(Error::ProbeExhausted(_))),
+    "a receive: exhausted: {answer:?}"
+  );
+  assert_spent(
+    &mut dec,
+    crate::Spent::ProbeExhausted,
+    SessionKind::Exhausted,
+  );
+}
+
+/// LAW: **an allocation this crate makes for a download is its own, and
+/// only the backend's transfer answers for the backend** (Codex R2, finding
+/// 2). The download is split ([`transfer_hw_frame`]): the destination's
+/// buffers and the download-format list's `ENOMEM` are this crate's own
+/// ([`TransferFailure::Unattributed`]) — no delivery, nothing charged or
+/// recorded, the candidate on trial still with the order and the history
+/// whole. The backend's transfer failing ([`TransferFailure::Download`]), its
+/// callback's `ENOMEM` included, is the backend's: the candidate is left,
+/// recorded with that answer, and the next is on trial. Committed, each is
+/// that picture's error, and the decoder stays.
+///
+/// PLANT: the destination's failure answered as the backend's, as R2's
+/// unsplit transfer charged it, turns this red at "this crate's own".
+#[test]
+fn a_downloads_own_allocation_charges_no_backend_and_the_backends_transfer_does() {
+  let enomem = ffmpeg_next::Error::Other {
+    errno: libc::ENOMEM,
+  };
+  let mut dec = vaapi_then_cuda();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let routed = dec.route_download(Err(TransferFailure::Unattributed(enomem)), &mut frame);
+  assert!(
+    is_own_enomem(&routed),
+    "this crate's own, as it is: {routed:?}"
+  );
+  assert_eq!(
+    (dec.backend(), dec.session_kind()),
+    (Backend::Vaapi, SessionKind::Trial),
+    "no delivery: still on trial"
+  );
+  {
+    let probe = dec.probe().expect("on trial");
+    assert!(
+      probe.attempts.is_empty(),
+      "nothing charged: {:?}",
+      probe.attempts
+    );
+    assert_eq!(
+      probe.remaining_backends,
+      vec![Backend::Cuda],
+      "the order kept"
+    );
+    assert_eq!(
+      fills(&probe.buffered_packets),
+      vec![0x11],
+      "the history kept"
+    );
+  }
+
+  let routed = dec.route_download(Err(TransferFailure::Download(enomem)), &mut frame);
+  assert!(
+    matches!(routed, Ok(None)),
+    "the backend's: left, the receive to start again: {routed:?}"
+  );
+  assert_eq!(
+    (dec.backend(), dec.session_kind()),
+    (Backend::Cuda, SessionKind::Trial),
+    "the next candidate, on trial"
+  );
+  {
+    let probe = dec.probe().expect("on trial");
+    assert!(
+      matches!(
+        probe.attempts.as_slice(),
+        [(Backend::Vaapi, Attempt::Failed(BackendAnswer(Error::Ffmpeg(ffmpeg_next::Error::Other { errno }))))]
+          if *errno == libc::ENOMEM
+      ),
+      "the backend's answer, recorded: {:?}",
+      probe.attempts
+    );
+  }
+
+  let mut dec = raw_pinned_decoder();
+  for failure in [
+    TransferFailure::Unattributed(enomem),
+    TransferFailure::Download(enomem),
+  ] {
+    let routed = dec.route_download(Err(failure), &mut frame);
+    assert!(
+      is_own_enomem(&routed),
+      "the picture's own error: {routed:?}"
+    );
+    assert_eq!(
+      dec.session_kind(),
+      SessionKind::Committed,
+      "the decoder stays"
+    );
+  }
+}
+
+/// A VideoToolbox frame of `sw_format` surfaces, `side` pixels square, its
+/// device and frames context unreferenced when it drops.
+#[cfg(target_vendor = "apple")]
+struct VideoToolboxFrame {
+  frame: frame::Video,
+  frames: *mut AVBufferRef,
+  device: *mut AVBufferRef,
+}
+
+#[cfg(target_vendor = "apple")]
+impl VideoToolboxFrame {
+  fn new(sw_format: ffmpeg_next::ffi::AVPixelFormat, side: i32) -> Self {
+    use ffmpeg_next::ffi::{
+      AVHWDeviceType, AVPixelFormat, av_hwdevice_ctx_create, av_hwframe_ctx_alloc,
+      av_hwframe_ctx_init, av_hwframe_get_buffer,
+    };
+    ffmpeg_next::init().expect("ffmpeg init");
+    // SAFETY: every reference made here is owned by the value returned and
+    // unreferenced when it drops, the frame first; the frames context is
+    // written whole before it is initialised.
+    unsafe {
+      let mut device = ptr::null_mut();
+      assert!(
+        av_hwdevice_ctx_create(
+          &mut device,
+          AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+          ptr::null(),
+          ptr::null_mut(),
+          0
+        ) >= 0,
+        "a VideoToolbox device"
+      );
+      let frames = av_hwframe_ctx_alloc(device);
+      assert!(!frames.is_null(), "a frames context");
+      let ctx = (*frames).data.cast::<AVHWFramesContext>();
+      (*ctx).format = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
+      (*ctx).sw_format = sw_format;
+      (*ctx).width = side;
+      (*ctx).height = side;
+      assert!(av_hwframe_ctx_init(frames) >= 0, "the frames context");
+      let mut frame = frame::Video::empty();
+      assert!(
+        av_hwframe_get_buffer(frames, frame.as_mut_ptr(), 0) >= 0,
+        "a VideoToolbox frame"
+      );
+      Self {
+        frame,
+        frames,
+        device,
+      }
+    }
+  }
+}
+
+#[cfg(target_vendor = "apple")]
+impl Drop for VideoToolboxFrame {
+  fn drop(&mut self) {
+    // SAFETY: the frame's buffers go first, then the references this value
+    // owns, each once.
+    unsafe {
+      av_frame_unref(self.frame.as_mut_ptr());
+      av_buffer_unref(&mut self.frames);
+      av_buffer_unref(&mut self.device);
+    }
+  }
+}
+
+/// What a download came to, for a law's message.
+fn download_answer(answer: &std::result::Result<(), TransferFailure>) -> String {
+  match answer {
+    Ok(()) => "delivered".to_owned(),
+    Err(failure) => failure.to_string(),
+  }
+}
+
+/// LAW: **on VideoToolbox, the download's destination is this crate's own
+/// allocation, and only the backend's callback answers for the backend**
+/// (Codex R2, finding 2), by libavutil's own behaviour, in a child process.
+/// A VideoToolbox `NV12` frame, 256 × 256, its download format picked
+/// before any transfer ([`download_format_of`]). Under an allocation cap
+/// below the destination's buffers and above everything the callback
+/// allocates (`vt_transfer_data_from`, `libavutil/hwcontext_videotoolbox.c`
+/// 739–768 in FFmpeg 9.0.1: a mapping frame, its descriptor and buffer
+/// references), the destination's `av_frame_get_buffer` fails, and that is
+/// this crate's own ([`TransferFailure::Unattributed`]). With the cap
+/// lifted the transfer delivers, the frame in the format picked at the
+/// frame's display extent. The backend's own callback failing — asked for a
+/// layout its surface is not, `vt_map_frame`'s `AVERROR_UNKNOWN` (694–699)
+/// — is the backend's ([`TransferFailure::Download`]). And the
+/// download-format list's own `ENOMEM`, under a cap below its few bytes, is
+/// this crate's own. Before the split the cap's `ENOMEM` came out of
+/// `av_hwframe_transfer_data` itself (`transfer_data_alloc`,
+/// `libavutil/hwcontext.c` 398–446) and was charged to the backend.
+///
+/// PLANT: the destination allocated inside the transfer again turns this
+/// red at "this crate's own".
+#[cfg(target_vendor = "apple")]
+#[test]
+fn on_videotoolbox_the_download_destination_is_this_crates_own_and_the_callback_the_backends() {
+  use ffmpeg_next::ffi::AVPixelFormat;
+  use mediaio_ffmpeg::test_support::{
+    cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations,
+  };
+
+  in_subprocess(
+    "decoder::tests::on_videotoolbox_the_download_destination_is_this_crates_own_and_the_callback_the_backends",
+    || {
+      let src = VideoToolboxFrame::new(AVPixelFormat::AV_PIX_FMT_NV12, 256);
+      // SAFETY: `src.frame` is live for every call below, and `dst` is a
+      // slot of this law's own.
+      unsafe {
+        let format = download_format_of(&src.frame).map_err(|failure| failure.to_string());
+        assert_eq!(
+          format,
+          Ok(DownloadFormat::Picked(NV12)),
+          "the format, picked first"
+        );
+        let format = DownloadFormat::Picked(NV12);
+        let mut dst = crate::Frame::empty().expect("frame slot");
+
+        // In `in_subprocess`'s child, alone: the transfer checks what
+        // libavutil answers, and the cap is lifted as it returns.
+        cap_ffmpeg_allocations(16 * 1024);
+        let capped = transfer_hw_frame(&mut dst, &src.frame, format);
+        uncap_ffmpeg_allocations();
+        assert!(
+          matches!(&capped, Err(TransferFailure::Unattributed(e)) if is_errno(e, libc::ENOMEM)),
+          "the destination's allocation, this crate's own: {}",
+          download_answer(&capped)
+        );
+        assert_eq!(
+          (*dst.as_inner_mut().as_ptr()).format,
+          AVPixelFormat::AV_PIX_FMT_NONE as i32,
+          "the slot left empty"
+        );
+
+        let delivered = transfer_hw_frame(&mut dst, &src.frame, format);
+        assert!(
+          delivered.is_ok(),
+          "uncapped, delivered: {}",
+          download_answer(&delivered)
+        );
+        let raw = dst.as_inner_mut().as_ptr();
+        assert_eq!(
+          ((*raw).format, (*raw).width, (*raw).height),
+          (NV12, 256, 256),
+          "in the format picked, at the display extent"
+        );
+
+        let p010 = AVPixelFormat::AV_PIX_FMT_P010LE as i32;
+        let mismatched = transfer_hw_frame(&mut dst, &src.frame, DownloadFormat::Picked(p010));
+        assert!(
+          matches!(
+            mismatched,
+            Err(TransferFailure::Download(ffmpeg_next::Error::Unknown))
+          ),
+          "the callback's own answer, the backend's: {}",
+          download_answer(&mismatched)
+        );
+
+        cap_ffmpeg_allocations(1);
+        let listed = download_format_of(&src.frame);
+        uncap_ffmpeg_allocations();
+        assert!(
+          matches!(&listed, Err(TransferFailure::Unattributed(e)) if is_errno(e, libc::ENOMEM)),
+          "the list's allocation, this crate's own: {:?}",
+          listed.map_err(|failure| failure.to_string())
+        );
+      }
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+//  The state table, cell by cell: what the laws above leave unnamed.
+// ---------------------------------------------------------------------------
+
+/// A candidate on trial owed the history: the probe left VAAPI with four
+/// pictures' packets recorded, and CUDA, built in software, was replayed
+/// them as far as its first output — two, rawvideo decoding a picture's
+/// packet as it is sent and holding a second until a picture is asked for.
+/// With `end_given`, the caller had given the end, which the replay stopped
+/// short of.
+fn owed_the_history(end_given: bool) -> VideoDecoder {
+  let mut dec = vaapi_then_cuda();
+  {
+    let probe = dec.probe_mut().expect("on trial");
+    probe.buffered_packets = [0x11, 0x22, 0x33, 0x44].map(raw_packet).into();
+    probe.fed = 4;
+    probe.buffered_bytes = 4 * RAW_PICTURE;
+  }
+  if end_given {
+    dec.set_end(End::Taken);
+  }
+  dec
+    .advance_probe(its_own_failure())
+    .expect("CUDA installed");
+  assert_eq!(
+    (dec.backend(), dec.session_kind()),
+    (Backend::Cuda, SessionKind::Trial),
+    "the next candidate, on trial"
+  );
+  assert_eq!(
+    dec.probe().map(|probe| probe.fed),
+    Some(2),
+    "the replay stopped at the candidate's first output"
+  );
+  dec
+}
+
+/// STATE TABLE, on trial — a send and the end, **history owed**:
+/// `MustDrain`, nothing sent; and a send that meets back pressure:
+/// `MustDrain`, the copy dropped.
+///
+/// PLANT: the trial's entry check reading no history owed turns this red
+/// at "nothing sent".
+#[test]
+fn on_trial_with_history_owed_a_send_and_the_end_drain_first() {
+  let mut dec = owed_the_history(false);
+  let packet = raw_packet(0x55);
+  // SAFETY: `raw_packet`'s, every byte written and the padding zeroed, and
+  // nothing writes through it while the decoder may read it.
+  let sent = unsafe { dec.send_av_packet(&packet) };
+  assert!(matches!(sent, Ok(Sent::MustDrain)), "a send: {sent:?}");
+  let ended = dec.send_eof();
+  assert!(matches!(ended, Ok(Sent::MustDrain)), "the end: {ended:?}");
+  let probe = dec.probe().expect("on trial");
+  assert_eq!(
+    (probe.buffered_packets.len(), probe.fed),
+    (4, 2),
+    "nothing sent, nothing recorded"
+  );
+  assert_eq!(dec.end(), Some(End::Open), "the end not taken");
+
+  // Back pressure on trial: the candidate holds a picture and a packet.
+  let mut dec = raw_auditioning_decoder();
+  send_all(&mut dec, &[raw_packet(0x11), raw_packet(0x22)]);
+  // SAFETY: as above.
+  let sent = unsafe { dec.send_av_packet(&packet) };
+  assert!(
+    matches!(sent, Ok(Sent::MustDrain)),
+    "back pressure: {sent:?}"
+  );
+  assert_eq!(
+    fills(&dec.probe().expect("on trial").buffered_packets),
+    vec![0x11, 0x22],
+    "the copy dropped"
+  );
+}
+
+/// STATE TABLE — **the end given and owed**, on trial and then committed: a
+/// send and a second end each answer `AVERROR_EOF`, nothing sent, though the
+/// decoder has not yet been fed the end. The candidate's first picture
+/// commits it with the history's rest as the backlog and the end still
+/// owed; the receive road feeds the backlog, then the end, in order, and the
+/// stream ends.
+///
+/// PLANT: the end-owed check gone from the gate turns this red at "a send
+/// after the end".
+#[test]
+fn with_the_end_owed_a_send_and_a_second_end_are_refused_on_trial_and_committed() {
+  let mut dec = owed_the_history(true);
+  assert_eq!(dec.end(), Some(End::Owed), "the end, owed to the candidate");
+  assert_eq!(dec.phase(), SessionPhase::AuditioningPastEnd);
+  let packet = raw_packet(0x55);
+  for state in ["on trial", "committed"] {
+    // SAFETY: `raw_packet`'s, every byte written and the padding zeroed, and
+    // nothing writes through it while the decoder may read it.
+    let sent = unsafe { dec.send_av_packet(&packet) };
+    assert!(
+      matches!(sent, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
+      "{state}: a send after the end: {sent:?}"
+    );
+    let ended = dec.send_eof();
+    assert!(
+      matches!(ended, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
+      "{state}: a second end: {ended:?}"
+    );
+    if state == "on trial" {
+      let probe = dec.probe().expect("on trial");
+      assert_eq!(
+        (probe.buffered_packets.len(), probe.fed),
+        (4, 2),
+        "nothing sent"
+      );
+      let _downloads = DownloadsForTest::set(all_deliver);
+      let mut frame = crate::Frame::empty().expect("frame slot");
+      assert_eq!(
+        dec.receive_frame(&mut frame).expect("the first picture"),
+        Received::Produced
+      );
+      assert_eq!(dec.session_kind(), SessionKind::Committed, "committed");
+      assert_eq!(dec.end(), Some(End::Owed), "the end, still owed");
+      assert_eq!(
+        dec
+          .backlog()
+          .iter()
+          .map(|packet| packet.data().expect("a payload")[0])
+          .collect::<Vec<u8>>(),
+        vec![0x33, 0x44],
+        "the backlog"
+      );
+    }
+  }
+  let _downloads = DownloadsForTest::set(all_deliver);
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  assert_eq!(
+    delivered(&mut dec, &mut frame),
+    vec![0x22, 0x33, 0x44],
+    "the rest, in order"
+  );
+  assert_eq!(
+    dec.receive_frame(&mut frame).expect("the end"),
+    Received::Ended,
+    "the end, fed after the backlog"
+  );
+  assert_eq!(dec.end(), Some(End::Taken));
+}
+
+/// STATE TABLE, committed — the end, **a backlog owed**: `MustDrain`,
+/// nothing sent, and taken once the drain has fed the backlog.
+///
+/// PLANT: the committed entry check reading no backlog owed turns this red
+/// at "the end drains first".
+#[test]
+fn committed_with_a_backlog_owed_the_end_drains_first() {
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let history = [0x11, 0x22, 0x33, 0x44].map(raw_packet).into();
+  let (mut dec, mut pictures) = committed_with_backlog(history, &mut frame);
+  assert_eq!(dec.backlog().len(), 2, "the replay's rest, owed");
+  let ended = dec.send_eof();
+  assert!(
+    matches!(ended, Ok(Sent::MustDrain)),
+    "the end drains first: {ended:?}"
+  );
+  assert_eq!(dec.end(), Some(End::Open), "not taken");
+  let _downloads = DownloadsForTest::set(all_deliver);
+  pictures.extend(delivered(&mut dec, &mut frame));
+  assert_eq!(
+    dec.send_eof().expect("the end"),
+    Sent::Accepted,
+    "then taken"
+  );
+  pictures.extend(delivered(&mut dec, &mut frame));
+  assert_eq!(
+    pictures,
+    vec![0x11, 0x22, 0x33, 0x44],
+    "every picture, in order"
+  );
+}
+
+/// STATE TABLE — **an advance owed**, every entry. No decoder lives in it.
+/// With the end not given, a send and the end resume the advance and, where
+/// it stops again, answer `MustDrain`; a receive answers the failure that
+/// stopped it; a flush forgets the history and keeps the advance owed; and
+/// once the failure is gone, a send resumes it and runs on the candidate
+/// installed. With the end given, a send and a second end are the caller's
+/// fault, `AVERROR_EOF`, and a receive resumes the advance: the next
+/// candidate is replayed the history and the end. And an advance that finds
+/// no candidate left exhausts the probe.
+///
+/// PLANT: the owed entry check gone — a send answering `MustDrain` without
+/// resuming — turns this red at "runs on the candidate installed".
+#[test]
+fn an_owed_advance_answers_every_entry_by_its_state() {
+  let owed = |end_given: bool, remaining: Vec<Backend>| {
+    let mut dec = on_trial_with(vaapi_refuses_and_cuda_may_fail, remaining);
+    send_all(&mut dec, &[raw_packet(0x11)]);
+    if end_given {
+      assert_eq!(dec.send_eof().expect("the end"), Sent::Accepted);
+    }
+    CUDA_FAILS.with(|fails| fails.set(true));
+    let stopped = dec.advance_probe(its_own_failure());
+    assert!(
+      is_own_enomem(&stopped),
+      "this crate's own, surfaced: {stopped:?}"
+    );
+    assert_eq!(dec.session_kind(), SessionKind::Owed, "the advance, owed");
+    dec
+  };
+  let packet = raw_packet(0x22);
+  let mut frame = crate::Frame::empty().expect("frame slot");
+
+  // The end not given; CUDA's build still failing.
+  let mut dec = owed(false, vec![Backend::Vaapi, Backend::Cuda]);
+  // SAFETY: `raw_packet`'s, every byte written and the padding zeroed, and
+  // nothing writes through it while a decoder may read it.
+  let sent = unsafe { dec.send_av_packet(&packet) };
+  assert!(
+    matches!(sent, Ok(Sent::MustDrain)),
+    "a send, stopped again: {sent:?}"
+  );
+  let ended = dec.send_eof();
+  assert!(
+    matches!(ended, Ok(Sent::MustDrain)),
+    "the end, stopped again: {ended:?}"
+  );
+  let received = dec.receive_frame(&mut frame);
+  assert!(
+    is_own_enomem(&received),
+    "a receive: the failure: {received:?}"
+  );
+  assert_eq!(dec.session_kind(), SessionKind::Owed, "still owed");
+  assert!(dec.live().is_none(), "no decoder lives");
+  dec.flush();
+  assert_eq!(
+    dec.session_kind(),
+    SessionKind::Owed,
+    "a flush keeps it owed"
+  );
+  assert!(
+    dec.probe().expect("the record").buffered_packets.is_empty(),
+    "and forgets the history"
+  );
+  CUDA_FAILS.with(|fails| fails.set(false));
+  // SAFETY: as above.
+  let sent = unsafe { dec.send_av_packet(&packet) };
+  assert!(
+    matches!(sent, Ok(Sent::Accepted)),
+    "runs on the candidate installed: {sent:?}"
+  );
+  assert_eq!(
+    (dec.backend(), dec.session_kind()),
+    (Backend::Cuda, SessionKind::Trial)
+  );
+  assert_eq!(
+    fills(&dec.probe().expect("on trial").buffered_packets),
+    vec![0x22]
+  );
+
+  // The end given.
+  let mut dec = owed(true, vec![Backend::Vaapi, Backend::Cuda]);
+  // SAFETY: as above.
+  let sent = unsafe { dec.send_av_packet(&packet) };
+  assert!(
+    matches!(sent, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
+    "a send after the end: {sent:?}"
+  );
+  let ended = dec.send_eof();
+  assert!(
+    matches!(ended, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
+    "a second end: {ended:?}"
+  );
+  let received = dec.receive_frame(&mut frame);
+  assert!(
+    is_own_enomem(&received),
+    "a receive, stopped again: {received:?}"
+  );
+  CUDA_FAILS.with(|fails| fails.set(false));
+  let _downloads = DownloadsForTest::set(all_deliver);
+  assert_eq!(
+    delivered(&mut dec, &mut frame),
+    vec![0x11],
+    "the next candidate, replayed the history"
+  );
+  assert_eq!(
+    dec.receive_frame(&mut frame).expect("and the end"),
+    Received::Ended
+  );
+
+  // No candidate left.
+  let mut dec = owed(false, vec![Backend::Cuda]);
+  CUDA_FAILS.with(|fails| fails.set(false));
+  dec.probe_mut().expect("the record").build = every_backend_refuses;
+  // SAFETY: as above.
+  let sent = unsafe { dec.send_av_packet(&packet) };
+  let Err(Error::ProbeExhausted(exhausted)) = sent else {
+    panic!("exhausted: {sent:?}");
+  };
+  assert_eq!(
+    exhausted.attempts().len(),
+    2,
+    "the candidate left, then CUDA"
+  );
+  assert_spent(
+    &mut dec,
+    crate::Spent::ProbeExhausted,
+    SessionKind::Exhausted,
+  );
+}
+
+/// STATE TABLE — **the drop, in every state**: a live decoder — on trial,
+/// or committed — is freed with the decoder; an advance owed, an exhausted
+/// probe and an ended decoder hold none, so the drop frees no decoder.
+///
+/// PLANT: the candidate kept in the owed state turns this red at "an
+/// advance owed".
+#[test]
+fn every_state_frees_what_it_holds_when_it_drops() {
+  let drops = |dec: VideoDecoder| {
+    let before = decoders_dropped();
+    drop(dec);
+    decoders_dropped() - before
+  };
+  assert_eq!(drops(raw_auditioning_decoder()), 1, "on trial");
+  assert_eq!(drops(raw_pinned_decoder()), 1, "committed");
+
+  let mut dec = on_trial_with(vaapi_refuses_and_cuda_may_fail, vec![Backend::Cuda]);
+  CUDA_FAILS.with(|fails| fails.set(true));
+  let stopped = dec.advance_probe(its_own_failure());
+  CUDA_FAILS.with(|fails| fails.set(false));
+  assert!(is_own_enomem(&stopped), "owed: {stopped:?}");
+  assert_eq!(drops(dec), 0, "an advance owed");
+
+  let mut dec = raw_auditioning_decoder();
+  let exhausted = dec.advance_probe(its_own_failure());
+  assert!(
+    matches!(exhausted, Err(Error::ProbeExhausted(_))),
+    "{exhausted:?}"
+  );
+  assert_eq!(drops(dec), 0, "exhausted");
+
+  let mut dec = raw_auditioning_decoder();
+  let ended = dec.end_ambiguously(Error::Ffmpeg(ffmpeg_next::Error::Other {
+    errno: libc::ENOMEM,
+  }));
+  assert!(matches!(ended, Error::AmbiguousSend(_)), "{ended:?}");
+  assert_eq!(dec.session_kind(), SessionKind::Ended);
+  assert_eq!(drops(dec), 0, "ended");
+}
+
+/// STATE TABLE, on trial — **the feed, by class** ([`VideoDecoder::route_fed`]),
+/// and the receive's own refusal. A history packet taken with the
+/// candidate's error, or `ENOMEM`, leaves the candidate, the history whole
+/// for the next; taken beside this crate's own refusal (the frame budget),
+/// the refusal is answered and the candidate stays; `ENOMEM` beside it ends
+/// the decoder, the whole history back. And a receive that reads this
+/// crate's own refusal answers it, the candidate on trial still.
+///
+/// PLANT: the feed's `ENOMEM` reported as this crate's own, the candidate
+/// kept, turns this red at "leaves the candidate".
+#[test]
+fn on_trial_the_feed_routes_by_class() {
+  let enomem = ffmpeg_next::Error::Other {
+    errno: libc::ENOMEM,
+  };
+  for (name, error, ambiguous) in [
+    (
+      "taken with the candidate's error",
+      ffmpeg_next::Error::InvalidData,
+      false,
+    ),
+    ("ENOMEM", enomem, true),
+  ] {
+    let mut dec = vaapi_then_cuda();
+    send_all(&mut dec, &[raw_packet(0x11)]);
+    let routed = dec.route_fed(Stopped::at(Owing::History, error, ambiguous));
+    assert!(routed.is_ok(), "{name}: leaves the candidate: {routed:?}");
+    assert_eq!(
+      (dec.backend(), dec.session_kind()),
+      (Backend::Cuda, SessionKind::Trial),
+      "{name}: the next, on trial"
+    );
+    let probe = dec.probe().expect("on trial");
+    assert_eq!(
+      fills(&probe.buffered_packets),
+      vec![0x11],
+      "{name}: the history whole"
+    );
+    assert_eq!(
+      tried(probe),
+      vec![Backend::Vaapi],
+      "{name}: the candidate's own answer"
+    );
+  }
+
+  let budget = |dec: &VideoDecoder| {
+    // SAFETY: `dec` owns this state and frees it only when it drops, after
+    // this call.
+    unsafe {
+      crate::ffi::declare_frame_budget_declined_for_test(dec.decoder().callback_state, 12_582_912)
+    }
+  };
+  let mut dec = vaapi_then_cuda();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  budget(&dec);
+  let routed = dec.route_fed(Stopped::at(
+    Owing::History,
+    ffmpeg_next::Error::InvalidData,
+    false,
+  ));
+  assert!(
+    matches!(routed, Err(Error::FrameBudgetExceeded(_))),
+    "taken beside this crate's refusal: the refusal: {routed:?}"
+  );
+  assert_eq!(
+    (dec.backend(), dec.session_kind()),
+    (Backend::Vaapi, SessionKind::Trial),
+    "the candidate stays"
+  );
+  assert!(
+    dec.probe().expect("on trial").attempts.is_empty(),
+    "nothing charged"
+  );
+
+  let mut dec = vaapi_then_cuda();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  budget(&dec);
+  let routed = dec.route_fed(Stopped::at(Owing::History, enomem, true));
+  let Err(Error::AmbiguousSend(ended)) = routed else {
+    panic!("ENOMEM beside this crate's refusal ends the decoder: {routed:?}");
+  };
+  assert_eq!(
+    fills(ended.residual()),
+    vec![0x11],
+    "the whole history back"
+  );
+  assert_eq!(dec.session_kind(), SessionKind::Ended);
+
+  let mut dec = raw_auditioning_decoder();
+  budget(&dec);
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let received = dec.receive_frame(&mut frame);
+  assert!(
+    matches!(received, Err(Error::FrameBudgetExceeded(_))),
+    "the receive's own refusal: {received:?}"
+  );
+  assert_eq!(dec.session_kind(), SessionKind::Trial, "on trial still");
+}
+
+/// STATE TABLE, on trial — a send **after the end the candidate took** is
+/// refused for good: libavcodec answers `AVERROR_EOF` (`decode.c` 739–740),
+/// the caller's fault, and the candidate stays on trial, nothing recorded
+/// and nothing charged.
+///
+/// PLANT: a send after the end read as the candidate failing turns this red
+/// at "on trial still".
+#[test]
+fn on_trial_a_send_after_the_end_the_candidate_took_is_refused_for_good() {
+  let mut dec = raw_auditioning_decoder();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  assert_eq!(dec.send_eof().expect("the end"), Sent::Accepted);
+  assert_eq!(dec.end(), Some(End::Taken));
+  let packet = raw_packet(0x22);
+  // SAFETY: `raw_packet`'s, every byte written and the padding zeroed, and
+  // nothing writes through it while the decoder may read it.
+  let sent = unsafe { dec.send_av_packet(&packet) };
+  assert!(
+    matches!(sent, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
+    "refused for good: {sent:?}"
+  );
+  assert_eq!(dec.session_kind(), SessionKind::Trial, "on trial still");
+  let probe = dec.probe().expect("on trial");
+  assert!(
+    probe.attempts.is_empty(),
+    "nothing charged: {:?}",
+    probe.attempts
+  );
+  assert_eq!(
+    fills(&probe.buffered_packets),
+    vec![0x11],
+    "nothing recorded"
+  );
+}
+
+/// STATE TABLE, on trial — a send **taken with the candidate's error goes to
+/// the next candidate in the same call**: the candidate decodes 32 × 32
+/// pictures and the packet is short of one, so it is left, torn down, and
+/// CUDA — built in software over 16 × 16 pictures — is installed and takes
+/// the packet: `Accepted`, recorded once, its picture delivered once.
+///
+/// PLANT: the send answering `MustDrain` where a candidate was installed
+/// turns this red at "the next candidate's, in this call".
+#[test]
+fn on_trial_a_send_taken_with_the_candidates_error_goes_to_the_next_in_the_same_call() {
+  let mut dec = raw_auditioning_decoder_with(32, crate::DecoderOptions::new());
+  let first = dec.backend();
+  {
+    let probe = dec.probe_mut().expect("on trial");
+    probe.parameters = raw_parameters(RAW_SIDE);
+    probe.build = VideoDecoder::software_state_for_test;
+    probe.remaining_backends = vec![Backend::Cuda];
+  }
+  let packet = raw_packet(0x11);
+  let dropped = decoders_dropped();
+  // SAFETY: as above.
+  let sent = unsafe { dec.send_av_packet(&packet) };
+  assert!(
+    matches!(sent, Ok(Sent::Accepted)),
+    "the next candidate's, in this call: {sent:?}"
+  );
+  assert_eq!(
+    decoders_dropped() - dropped,
+    1,
+    "the candidate left, torn down"
+  );
+  assert_eq!(
+    (dec.backend(), dec.session_kind()),
+    (Backend::Cuda, SessionKind::Trial)
+  );
+  {
+    let probe = dec.probe().expect("on trial");
+    assert_eq!(tried(probe), vec![first], "the candidate's own answer");
+    assert_eq!(fills(&probe.buffered_packets), vec![0x11], "recorded once");
+  }
+  let _downloads = DownloadsForTest::set(all_deliver);
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  assert_eq!(
+    delivered(&mut dec, &mut frame),
+    vec![0x11],
+    "its picture, once"
+  );
 }

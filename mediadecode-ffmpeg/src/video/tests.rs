@@ -469,6 +469,62 @@ impl HwInner for FakeHwEofFails {
   }
 }
 
+/// Where [`FakeHwEnds`] ends.
+#[derive(Clone, Copy, Debug)]
+enum EndsOn {
+  /// A send.
+  Send,
+  /// A receive: an owed packet's send, fed on the receive road.
+  Receive,
+  /// The end.
+  End,
+}
+
+/// A hardware seam that ends on an ambiguous send, on the road named, with
+/// nothing to hand back ([`Error::AmbiguousSend`]); everything else takes
+/// what it is given and has nothing to give.
+struct FakeHwEnds(EndsOn);
+
+impl FakeHwEnds {
+  fn ambiguous() -> Error {
+    Error::AmbiguousSend(crate::error::AmbiguousSend::new(
+      Backend::VideoToolbox,
+      Box::new(Error::Ffmpeg(ffmpeg_next::Error::Other {
+        errno: libc::ENOMEM,
+      })),
+      Vec::new(),
+      false,
+    ))
+  }
+}
+
+impl HwInner for FakeHwEnds {
+  unsafe fn send_packet(&mut self, _: &Packet) -> Result<Sent, Error> {
+    match self.0 {
+      EndsOn::Send => Err(Self::ambiguous()),
+      EndsOn::Receive | EndsOn::End => Ok(Sent::Accepted),
+    }
+  }
+  fn receive_frame(&mut self, _: &mut Frame) -> Result<Received, Error> {
+    match self.0 {
+      EndsOn::Receive => Err(Self::ambiguous()),
+      EndsOn::Send | EndsOn::End => Ok(Received::NeedsInput),
+    }
+  }
+  fn send_eof(&mut self) -> Result<Sent, Error> {
+    match self.0 {
+      EndsOn::End => Err(Self::ambiguous()),
+      EndsOn::Send | EndsOn::Receive => Ok(Sent::Accepted),
+    }
+  }
+  fn flush(&mut self) -> Result<(), Error> {
+    Ok(())
+  }
+  fn as_video_decoder(&self) -> Option<&VideoDecoder> {
+    None
+  }
+}
+
 /// A hardware seam whose `send_eof` answers back pressure rather than
 /// taking the end. Nothing else about it matters.
 struct FakeHwEofBackpressures;
@@ -724,8 +780,54 @@ fn under_auto_an_unfit_first_candidate_hands_software_the_whole_stream() {
   );
 }
 
+/// Asserts the session is **spent**, as `spent` names, at every entry,
+/// before a flush and after one: no decoder is left in it, hardware or
+/// software, nothing installed behind it, and a send, the end and a receive
+/// each answer [`Error::Spent`] by name. Codex R2, finding 3: an exhausted
+/// or ended hardware decoder left installed could take a packet after the
+/// end.
+fn assert_session_spent(
+  dec: &mut FfmpegVideoStreamDecoder,
+  spent: crate::Spent,
+  packet: &crate::OwnedVideoPacket,
+  road: &str,
+) {
+  let by_name = |entry: &str, got: Result<String, VideoDecodeError>| match got {
+    Err(VideoDecodeError::Decode(Error::Spent(named))) if named == spent => {}
+    other => panic!("{road}: {entry}, refused by name as {spent:?}: {other:?}"),
+  };
+  let mut dst = crate::empty_owned_video_frame();
+  for when in ["before a flush", "after a flush"] {
+    assert!(
+      !dec.is_hardware() && !dec.is_software(),
+      "{road}, {when}: no decoder is left in a spent session"
+    );
+    assert!(
+      dec.hardware_inner().is_none(),
+      "{road}, {when}: no hardware decoder stays installed"
+    );
+    by_name(
+      &format!("{when}: a send"),
+      dec.send_packet(packet).map(|sent| format!("{sent:?}")),
+    );
+    by_name(
+      &format!("{when}: the end"),
+      dec.send_eof().map(|sent| format!("{sent:?}")),
+    );
+    by_name(
+      &format!("{when}: a receive"),
+      dec
+        .receive_frame(&mut dst)
+        .map(|received| format!("{received:?}")),
+    );
+    dec
+      .flush()
+      .expect("a spent session's flush has nothing to fail");
+  }
+}
+
 // ---------------------------------------------------------------------------
-//  Transactional SW-open failure: stays on HW, surfaces FallbackFailed
+//  A failed SW open: FallbackFailed, and the session spent
 // ---------------------------------------------------------------------------
 
 /// A decoder whose stored `parameters` cannot open a SW decoder. An empty
@@ -739,13 +841,19 @@ fn unopenable_sw_decoder(hw: Box<dyn HwInner>) -> FfmpegVideoStreamDecoder {
   FfmpegVideoStreamDecoder::from_hw_inner_for_test(hw, params, tb).expect("build test decoder")
 }
 
-/// On a probe-era fallback whose SW decoder fails to OPEN, the transition is
-/// transactional: the wrapper surfaces `FallbackFailed` (carrying the rescued
-/// packets — empty here, the failure landing on the first packet) and stays
-/// on the HW state. It must NOT silently commit a broken SW decoder or lose
-/// the HW path.
+/// LAW: **a failed `Auto` fallback answers terminally** (Codex R2, finding
+/// 3; the R3 ruling). On a probe-era fallback whose SW decoder fails to
+/// OPEN, the wrapper surfaces `FallbackFailed` (carrying the rescued packets
+/// — empty here, the failure landing on the first packet), commits no broken
+/// SW decoder, and leaves **no exhausted hardware decoder installed**: the
+/// session is spent, and every entry after answers
+/// [`Error::Spent`] with [`Spent::FallbackFailed`](crate::Spent::FallbackFailed),
+/// a flush included. Before R3 it stayed on the exhausted hardware decoder.
+///
+/// PLANT: the failed fallback leaving the hardware decoder installed, as
+/// before R3, turns this red at "no decoder is left".
 #[test]
-fn probe_era_sw_open_failure_stays_on_hw_transactionally() {
+fn a_failed_auto_fallback_spends_the_session() {
   let (w, h) = (64u32, 64u32);
   // The probe exhausts on the very first send. The stored `Parameters` are
   // empty, so `open_sw_decoder` fails and the fallback must roll back to HW.
@@ -768,11 +876,60 @@ fn probe_era_sw_open_failure_stays_on_hw_transactionally() {
     VideoDecodeError::Decode(Error::FallbackFailed(_)) => {}
     other => panic!("expected FallbackFailed on SW-open failure, got {other:?}"),
   }
-  assert!(
-    dec.is_hardware(),
-    "a failed fallback (SW could not open) must leave the decoder on its prior \
-     HW state — transactional rollback, not a half-committed SW"
+  assert_session_spent(
+    &mut dec,
+    crate::Spent::FallbackFailed,
+    &vpkt,
+    "a failed SW open",
   );
+}
+
+/// LAW: **a hardware decoder that ends on an ambiguous send spends the
+/// stream session**, on every road it can end on (the R3 ruling): the
+/// session answers [`Error::AmbiguousSend`] once, with what the decoder
+/// handed back, and is spent — the ended decoder not left installed — every
+/// entry after it refused by name, a flush included. No path takes it as the
+/// cue for software.
+///
+/// PLANT: the ended decoder left installed, as before R3, turns this red at
+/// "no decoder is left".
+#[test]
+fn an_ambiguous_send_spends_the_stream_session_on_every_road() {
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 8, 4);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  for road in [EndsOn::Send, EndsOn::Receive, EndsOn::End] {
+    let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
+      Box::new(FakeHwEnds(road)),
+      clip.parameters.clone(),
+      tb,
+      DecodePath::Auto,
+    )
+    .expect("build an Auto test decoder");
+    let packet = pushed(&clip, 0);
+    let mut dst = crate::empty_owned_video_frame();
+    let answer = match road {
+      EndsOn::Send => dec.send_packet(&packet).map(|sent| format!("{sent:?}")),
+      EndsOn::Receive => dec
+        .receive_frame(&mut dst)
+        .map(|received| format!("{received:?}")),
+      EndsOn::End => dec.send_eof().map(|sent| format!("{sent:?}")),
+    };
+    assert!(
+      matches!(
+        answer,
+        Err(VideoDecodeError::Decode(Error::AmbiguousSend(_)))
+      ),
+      "{road:?}: the decoder ended: {answer:?}"
+    );
+    assert!(!dec.is_software(), "{road:?}: never the cue for software");
+    assert_session_spent(
+      &mut dec,
+      crate::Spent::AmbiguousSend,
+      &packet,
+      &format!("{road:?}"),
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -872,10 +1029,14 @@ fn sw_replay_drain_surfaces_non_transient_decode_error() {
     other => panic!("expected FallbackFailed surfacing InvalidData, got {other:?}"),
   }
 
-  assert!(
-    dec.is_hardware(),
-    "a failed fallback must leave the decoder on its prior (HW) state, not \
-     commit SW over swallowed corruption"
+  // Nothing committed over the corruption, and nothing left installed: the
+  // session is spent.
+  let packet = pushed(&clip, 0);
+  assert_session_spent(
+    &mut dec,
+    crate::Spent::FallbackFailed,
+    &packet,
+    "a corrupt replay",
   );
 }
 
@@ -985,25 +1146,29 @@ fn sw_replay_deferred_error_surfaces_fallback_failed_at_commit() {
     }
     other => panic!("expected FallbackFailed surfacing the deferred InvalidData, got {other:?}"),
   }
-  assert!(
-    dec.is_hardware(),
-    "a deferred-error fallback caught at the commit boundary must leave the \
-     decoder on its prior HW state — nothing committed"
+  // Nothing committed, and nothing left installed: the session is spent.
+  let packet = pushed(&clip, 0);
+  assert_session_spent(
+    &mut dec,
+    crate::Spent::FallbackFailed,
+    &packet,
+    "a deferred error",
   );
 }
 
 // ---------------------------------------------------------------------------
-//  Failed EOF fallback: eof_sent is RESTORED (no half-mutation), stays HW
+//  Failed EOF fallback: no end recorded, and the session spent
 // ---------------------------------------------------------------------------
 
 /// `send_eof` meets the probe's exhaustion and the SW decoder cannot open
-/// (empty `Parameters`). The fallback returns `FallbackFailed`, so the decoder
-/// stays HW — and `eof_sent` must be RESTORED to its prior value (`false`),
-/// never left half-mutated `true`. A stale `eof_sent = true` would make a
-/// *later* fallback inject EOF into the new SW decoder though this `send_eof`
-/// errored.
+/// (empty `Parameters`). The fallback returns `FallbackFailed`, records no
+/// end — `eof_sent` stays `false`, never half-mutated `true` — and **spends
+/// the session** (the R3 ruling): no hardware decoder stays installed to
+/// re-attempt anything, and every entry after answers [`Error::Spent`].
+/// Before R3 the session stayed on the exhausted hardware decoder, and a
+/// second `send_eof` drove a second fallback.
 #[test]
-fn failed_eof_fallback_restores_eof_sent_and_stays_on_hw() {
+fn a_failed_eof_fallback_records_no_end_and_spends_the_session() {
   let (w, h) = (64u32, 64u32);
   // `FakeHwEofFails::send_eof` raises the probe's `ProbeExhausted`, driving
   // the send_eof fallback arm; the empty `Parameters` from `unopenable_sw_decoder`
@@ -1023,33 +1188,23 @@ fn failed_eof_fallback_restores_eof_sent_and_stays_on_hw() {
     VideoDecodeError::Decode(Error::FallbackFailed(_)) => {}
     other => panic!("expected FallbackFailed on the failed EOF fallback, got {other:?}"),
   }
-
-  assert!(
-    dec.is_hardware(),
-    "a failed EOF fallback (SW could not open) must leave the decoder on its \
-     prior HW state — transactional rollback"
-  );
   assert!(
     !dec.eof_sent_for_test(),
-    "eof_sent must be RESTORED to its prior value (false) after a failed EOF \
-     fallback — a stale true would inject EOF into a later SW fallback"
+    "a refused end is not recorded: eof_sent stays false after a failed EOF fallback"
   );
-
-  // A subsequent operation must not see stale EOF: a normal send_eof on the
-  // (still-HW, EOF-never-accepted) decoder behaves as a first EOF. Our seam's
-  // send_eof keeps failing the same way, so this just re-confirms HW + the
-  // rolled-back flag rather than silently succeeding off a stale `eof_sent`.
-  let err2 = dec.send_eof().expect_err(
-    "the still-HW decoder must re-attempt (and re-fail) EOF, not no-op off stale state",
+  let mut raw = Packet::copy(&[0u8; 16]);
+  raw.set_pts(Some(0));
+  // SAFETY: `Packet::copy` wrote every byte of the payload.
+  let vpkt = unsafe { boundary::video_packet_from_ffmpeg(&raw, mediadecode::Timebase::SECONDS) }
+    .expect("a wrappable payload")
+    .expect("packet has a buffer");
+  assert_session_spent(
+    &mut dec,
+    crate::Spent::FallbackFailed,
+    &vpkt,
+    "a failed EOF fallback",
   );
-  assert!(
-    matches!(err2, VideoDecodeError::Decode(Error::FallbackFailed(_))),
-    "second send_eof must again drive the fallback (proving no stale-EOF short-circuit)"
-  );
-  assert!(
-    !dec.eof_sent_for_test(),
-    "still rolled back after the retry"
-  );
+  assert!(!dec.eof_sent_for_test(), "and still no end recorded");
 }
 
 // ---------------------------------------------------------------------------
@@ -2335,6 +2490,7 @@ fn session_skips(dec: &FfmpegVideoStreamDecoder) -> (i32, i32, i32) {
       .skips_for_test(),
     // SAFETY: `sw.decoder` owns a live, opened context for this borrow.
     DecodeState::Sw(sw) => unsafe { crate::decoder::skips_of(sw.decoder.as_ptr()) },
+    DecodeState::Spent(spent) => panic!("a spent session holds no context: {spent:?}"),
   }
 }
 
@@ -2505,10 +2661,12 @@ fn a_hardware_pin_on_an_absent_backend_fails_instead_of_falling_back() {
 ///
 /// A hardware backend that opens and then cannot take the stream before
 /// its first picture raises exactly the exhaustion `Auto` reads as its cue
-/// to open software. Under a pin that cue is reported instead: the session
-/// stays on hardware, the caller keeps every packet the probe consumed,
+/// to open software. Under a pin that cue is reported instead: no software
+/// decoder is opened, the caller keeps every packet the probe consumed,
 /// and it learns the backend failed rather than silently receiving
-/// software pixels for the rest of the stream. After the first picture
+/// software pixels for the rest of the stream. And the session is spent
+/// (the R3 ruling): the exhausted hardware decoder is not left installed,
+/// and every entry after answers [`Error::Spent`]. After the first picture
 /// there is no exhaustion to report on any path — see
 /// `after_the_first_picture_nothing_changes_the_road_on_any_path`.
 #[test]
@@ -2546,10 +2704,16 @@ fn a_hardware_pin_reports_its_probes_exhaustion_instead_of_falling_back() {
     "the packets the probe consumed ride back with the refusal",
   );
   assert!(
-    dec.is_hardware(),
+    !dec.is_software(),
     "the pin holds after the refusal: nothing opened a software decoder behind it",
   );
-  assert!(!dec.is_software());
+  let packet = pushed(&clip, fail_at);
+  assert_session_spent(
+    &mut dec,
+    crate::Spent::ProbeExhausted,
+    &packet,
+    "a pin's send",
+  );
 }
 
 /// The same promise on the **receive** road, where the exhaustion
@@ -2584,7 +2748,13 @@ fn a_hardware_pin_reports_a_frame_time_exhaustion_too() {
     matches!(&refusal, VideoDecodeError::Decode(Error::ProbeExhausted(_)),),
     "got {refusal:?}",
   );
-  assert!(dec.is_hardware(), "the pin holds on the receive road too");
+  assert!(!dec.is_software(), "the pin holds on the receive road too");
+  assert_session_spent(
+    &mut dec,
+    crate::Spent::ProbeExhausted,
+    &vpkt,
+    "a pin's receive",
+  );
 }
 
 /// And on the **EOF** road, the third and last place a hardware
@@ -2621,7 +2791,8 @@ fn a_hardware_pin_reports_an_exhaustion_raised_at_eof() {
     matches!(&refusal, VideoDecodeError::Decode(Error::ProbeExhausted(_)),),
     "got {refusal:?}",
   );
-  assert!(dec.is_hardware(), "the pin holds on the EOF road too");
+  assert!(!dec.is_software(), "the pin holds on the EOF road too");
+  assert_session_spent(&mut dec, crate::Spent::ProbeExhausted, &vpkt, "a pin's end");
 }
 
 /// **`Auto` still falls back during its probe**, checked beside the pin
@@ -3275,8 +3446,8 @@ fn assert_the_probes_packets_come_back(
 /// or at the end of the stream. Each road must answer
 /// [`Error::ProbeExhausted`] with the probe's origin and the packets in
 /// the order they were sent, so the caller can replay them into a
-/// software session of its own; and the session must stay a hardware
-/// one, with nothing replayed behind the caller.
+/// software session of its own; nothing is replayed behind the caller, and
+/// the session is spent — no exhausted hardware decoder left installed.
 ///
 /// PLANT: letting `AnyHardware` open software on its probe's exhaustion
 /// turns this red at "never opens software".
@@ -3303,11 +3474,17 @@ fn any_hardware_hands_back_the_probes_packets_and_never_opens_software() {
   }
   let answer = dec.send_packet(&pushed(&clip, taken));
   assert!(
-    dec.is_hardware() && !dec.is_software(),
+    !dec.is_software(),
     "on a send: AnyHardware never opens software"
   );
   let refusal = answer.expect_err("on a send: the probe's exhaustion is reported");
   assert_the_probes_packets_come_back(&dec, refusal, &clip, taken, "on a send");
+  assert_session_spent(
+    &mut dec,
+    crate::Spent::ProbeExhausted,
+    &pushed(&clip, taken),
+    "on a send",
+  );
 
   // On the first picture asked for.
   let mut dec = any_hardware(FakeHw::failing_at_receive(w, h));
@@ -3317,11 +3494,17 @@ fn any_hardware_hands_back_the_probes_packets_and_never_opens_software() {
   let mut dst = crate::empty_owned_video_frame();
   let answer = dec.receive_frame(&mut dst);
   assert!(
-    dec.is_hardware() && !dec.is_software(),
+    !dec.is_software(),
     "on a picture: AnyHardware never opens software"
   );
   let refusal = answer.expect_err("on a picture: the probe's exhaustion is reported");
   assert_the_probes_packets_come_back(&dec, refusal, &clip, taken, "on a picture");
+  assert_session_spent(
+    &mut dec,
+    crate::Spent::ProbeExhausted,
+    &pushed(&clip, taken),
+    "on a picture",
+  );
 
   // At the end of the stream.
   let mut dec = any_hardware(FakeHw::failing_at_eof(w, h));
@@ -3330,7 +3513,7 @@ fn any_hardware_hands_back_the_probes_packets_and_never_opens_software() {
   }
   let answer = dec.send_eof();
   assert!(
-    dec.is_hardware() && !dec.is_software(),
+    !dec.is_software(),
     "at the end: AnyHardware never opens software"
   );
   let refusal = answer.expect_err("at the end: the probe's exhaustion is reported");
@@ -3338,6 +3521,12 @@ fn any_hardware_hands_back_the_probes_packets_and_never_opens_software() {
   assert!(
     !dec.eof_sent_for_test(),
     "a refused end is not a committed one"
+  );
+  assert_session_spent(
+    &mut dec,
+    crate::Spent::ProbeExhausted,
+    &pushed(&clip, taken),
+    "at the end",
   );
 }
 

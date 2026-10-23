@@ -127,7 +127,7 @@ pub use demuxer::{
 };
 pub use error::{
   DownloadFormatUnsupported, Error, FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge,
-  HwTransferTooLarge, Result,
+  HwTransferTooLarge, Result, Spent,
 };
 pub use image::{CarrierImageDecoder, Corrupt, CorruptSource, ImageDecodeError, InputTooLarge};
 pub use subtitle::{CarrierSubtitleStreamDecoder, SubtitleDecodeError};

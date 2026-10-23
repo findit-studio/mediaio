@@ -39,15 +39,34 @@ crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
   opened, so it could answer `AllBackendsFailed`, the stream decoder's cue
   for software, which the same failure meets. It is now the error itself,
   with the backends still to try kept in the order and the history whole.
-  **And the advance is owed**: the backend the probe was leaving is called
-  no more, and the next send, end or receive resumes the advance before
-  anything else, its attempt recorded where it was tried. A `flush` keeps
-  it owed.
+  **And the advance is owed**: the backend the probe was leaving was torn
+  down when it was left, so no decoder lives while the advance is owed,
+  and the next send, end or receive resumes the advance before anything
+  else, its attempt recorded where it was tried. A send meanwhile answers
+  `Sent::MustDrain`, the packet the caller's with no decoder to hold it. A
+  `flush` keeps it owed.
+- **BREAKING: a decoder that answers `ProbeExhausted` at run time, or
+  `AmbiguousSend`, is spent, and every entry after it answers the new
+  `Error::Spent`.** No decoder lives after either: every send, end and
+  receive is refused by name, `Spent::ProbeExhausted` or
+  `Spent::AmbiguousSend`, and a `flush` does not revive it — going on
+  means a new decoder, from the packets the error handed back. An
+  exhausted probe used to flush its last backend to hand the history back
+  and leave it behind as a committed decoder, its end forgotten, so a
+  packet sent after the end was taken; an ended decoder took input again
+  after a `flush`. The stream decoder alike: a path that excludes software
+  and meets its probe's exhaustion, an `Auto` fallback that fails
+  (`FallbackFailed`, `Spent::FallbackFailed`), and an ambiguous send each
+  leave no decoder installed. `is_hardware()` and `is_software()` are both
+  `false` then, `hardware_inner()` is `None`, and every entry answers
+  `Error::Spent`. A failed fallback used to leave the exhausted hardware
+  decoder in place, and the next end drove a second fallback.
 - **BREAKING: a picture whose download chose a CPU layout a `Frame` cannot
   carry is no delivery, and on trial its backend is unfit for the
-  stream.** `av_hwframe_transfer_data` picks the layout itself, the first
-  its frames context offers, and this crate keeps that choice: a driver's
-  conversion to another layout can lose samples. Such a layout used to be
+  stream.** The layout is the first the backend lists for a download, as
+  libavutil's own allocating road picks it, and this crate keeps that
+  choice — a driver's conversion to another layout can lose samples — and
+  reads it before any transfer. Such a layout used to be
   read as the backend failing, with a synthesized `AVERROR(EINVAL)`. Now
   the probe records the unfitness, naming the layout and never an errno,
   and leaves the backend as it leaves a failed one, the history replayed
@@ -156,6 +175,32 @@ crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
   libavcodec takes it (`avcodec.h` 2341–2347): `VideoDecoder::send_av_packet`
   sends it as `send_eof` does. The probe used to record it in its history
   as a packet while libavcodec started draining.
+- **A backend the probe leaves is torn down at once.** A backend that
+  failed, was unfit, or answered a send `ENOMEM` was kept, with the
+  picture its scratch frame held, while an advance stopped by a failure of
+  this crate's own was owed; a send then answered `Sent::MustDrain` for a
+  packet the decoder it left might still hold a reference to. It is
+  dropped the moment it is left now, before anything is answered, and
+  every reference it held to a packet, the caller's or the history's, goes
+  with it.
+- **A memory failure of the download's own allocations charges no
+  backend.** `av_hwframe_transfer_data` into an empty destination
+  allocates it first (`libavutil/hwcontext.c` 398–446 in FFmpeg 9.0.1), so
+  an `ENOMEM` it answered could be the CPU's as well as the backend's, and
+  a healthy backend under memory pressure was recorded as failing — enough
+  to exhaust the probe and send `Auto` to software. The download is split
+  now: this crate reads the format the backend lists first, checks that a
+  `Frame` carries it, prices it, and allocates the destination itself
+  (`av_frame_get_buffer`); a failure there, or the format list's own
+  `ENOMEM`, is this crate's error, the backend still on trial and charged
+  nothing. `av_hwframe_transfer_data` is then called on a destination with
+  buffers, which libavutil hands straight to the backend's own transfer
+  callback (488–492), and only that answer, its `ENOMEM` included, is the
+  backend's.
+- **The download's ceiling prices the destination it allocates**: the
+  format the download is made in, at the frames context's extent, where it
+  priced the costliest format the backend lists, which over-refused a
+  picture whose first format was cheaper.
 
 ### Added
 
@@ -167,13 +212,17 @@ crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
   order — after the commit the backlog from that packet on, on trial the
   whole history — each referenced by its packet alone, and `end_follows()`
   whether the caller's end comes after them. A packet the caller was
-  sending when the decoder ended is not in it. The decoder answers as an
-  ended one after it, until a `flush`. No `DecodePath` takes it as the cue
-  for software.
+  sending when the decoder ended is not in it. The decoder is spent after
+  it: every entry answers `Error::Spent`, a `flush` included. No
+  `DecodePath` takes it as the cue for software.
+
+- **`Error::Spent`**, its payload `Spent` (`ProbeExhausted`,
+  `AmbiguousSend`, `FallbackFailed`): what every send, end and receive of a
+  spent decoder answers, naming the error that spent it.
 
 - **`Error::DownloadFormatUnsupported`**, its payload
   `DownloadFormatUnsupported` with `format()`, the raw `AVPixelFormat` the
-  download chose: a backend's unfitness in `ProbeExhausted::attempts`,
+  download would choose: a backend's unfitness in `ProbeExhausted::attempts`,
   and a committed decoder's error for a picture in a layout a `Frame`
   cannot carry.
 
