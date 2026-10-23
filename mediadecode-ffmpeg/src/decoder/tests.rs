@@ -2795,29 +2795,30 @@ fn a_rescued_packet_keeps_the_bytes_it_was_sent_with() {
   }
 }
 
-/// LAW: **a copy the probe cannot make refuses the send by name, before
-/// libavcodec sees the packet, and leaves the packet with the caller.**
+/// LAW: **a copy the probe cannot make is no backend's answer: the packet
+/// is sent, and the candidate that takes it is committed** — with no
+/// [`Error::AllBackendsFailed`], since no backend failed.
 ///
-/// The refusal is the probe's own, as at its byte ceiling:
-/// [`Error::AllBackendsFailed`] with the history recorded so far and no
-/// attempt, since no backend failed. The session stays where it was, on
-/// the same backend and no longer on trial.
+/// The history cannot keep the packet, so it is the trial's last
+/// ([`Unkept::Copy`]): sent with the history whole, taken, and the
+/// candidate committed. A failure after is that decoder's own, with no
+/// history to replay.
 ///
-/// The allocator fails it, through `av_max_alloc` in a child process of
-/// its own: capped at 512 bytes, `av_packet_ref`'s `AVBufferRef` is
-/// still allocated and the payload `av_packet_make_writable` copies into
-/// (8,192 bytes and the padding) is not.
+/// The allocator fails the copy, through `av_max_alloc` in a child process
+/// of its own: capped at 512 bytes, the payload `av_packet_make_writable`
+/// copies into (8,192 bytes and the padding) is not allocated, while what
+/// libavcodec allocates to take a refcounted packet is.
 ///
-/// PLANT: `av_packet_make_writable` skipped in [`try_clone_packet`]
-/// turns this red at "refused by name".
+/// PLANT: the copy failure answering `AllBackendsFailed` before the packet
+/// is sent, as in 0.19.0, turns this red at "sent and committed".
 #[test]
-fn a_copy_the_probe_cannot_make_refuses_the_send_by_name() {
+fn a_copy_the_probe_cannot_make_sends_its_packet_and_commits() {
   use mediaio_ffmpeg::test_support::{
     cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations,
   };
 
   in_subprocess(
-    "decoder::tests::a_copy_the_probe_cannot_make_refuses_the_send_by_name",
+    "decoder::tests::a_copy_the_probe_cannot_make_sends_its_packet_and_commits",
     || {
       let mut dec = raw_auditioning_decoder();
       let first = raw_packet(0x11);
@@ -2828,55 +2829,129 @@ fn a_copy_the_probe_cannot_make_refuses_the_send_by_name() {
         Sent::Accepted
       );
 
-      let mut refused = crate::boundary::try_packet_copy(&[0x77; 8192]).expect("a packet");
+      let uncopied = crate::boundary::try_packet_copy(&[0x77; 8192]).expect("a packet");
       // SAFETY: in `in_subprocess`'s child, alone. The capped window runs one send:
       // the probe's copy goes through `try_clone_packet`, which checks both of
       // its calls, and libavcodec checks its own allocations.
       unsafe { cap_ffmpeg_allocations(512) };
-      // SAFETY: `try_packet_copy` wrote every byte and zeroed the padding; the probe refuses
-      // the packet before libavcodec sees it.
-      let answer = unsafe { dec.send_av_packet(&refused) };
+      // SAFETY: `try_packet_copy` wrote every byte and zeroed the padding, and nothing writes
+      // through it while the decoder may still read it.
+      let answer = unsafe { dec.send_av_packet(&uncopied) };
       uncap_ffmpeg_allocations();
 
-      let Err(Error::AllBackendsFailed(p)) = answer else {
-        panic!("a copy that cannot be made is refused by name, got {answer:?}");
-      };
       assert!(
-        p.attempts().is_empty(),
-        "the probe's own refusal: no backend failed, got {:?}",
-        p.attempts(),
+        matches!(answer, Ok(Sent::Accepted)),
+        "sent and committed: {answer:?}"
       );
-      let history = p.into_unconsumed_packets();
-      assert!(
-        history.len() == 1 && holds(&history[0], 0x11),
-        "the history recorded before the refusal, without the refused packet",
-      );
-
-      // The packet is the caller's again: neither the copy that failed
-      // nor libavcodec holds a reference to it.
-      assert_eq!(
-        payload_of(&refused).1,
-        1,
-        "nothing else references the packet"
-      );
-      assert!(holds(&refused, 0x77), "its bytes untouched");
-      refused.data_mut().expect("a payload").fill(0x78);
-
-      // The same backend, no longer on trial; and libavcodec never saw
-      // the packet. Offered now it is taken, where a decoder already
-      // holding one packet beside a waiting picture answers back
-      // pressure (`decode.c` 746–747).
-      assert_eq!(dec.phase(), SessionPhase::Streaming);
-      assert_eq!(
-        // SAFETY: every byte written and the padding zeroed (`try_packet_copy`'s); the caller
-        // wrote the payload while no decoder held it — the probe refused it and libavcodec
-        // never saw it — and nothing writes it again.
-        unsafe { dec.send_av_packet(&refused) }.expect("offered again"),
-        Sent::Accepted,
-        "libavcodec never saw the refused packet",
-      );
+      assert_eq!(dec.phase(), SessionPhase::Streaming, "committed");
+      // Both pictures are the committed candidate's: the first, then the
+      // one whose packet the probe could not copy.
+      let mut picture = frame::Video::empty();
+      dec
+        .state
+        .inner
+        .receive_frame(&mut picture)
+        .expect("the first picture");
+      dec
+        .state
+        .inner
+        .receive_frame(&mut picture)
+        .expect("the uncopied packet's picture");
+      assert_eq!(picture.data(0)[0], 0x77, "decoded from the packet sent");
     },
   );
+}
+
+/// `packet` with `entries` side-data entries of one kind, attached past
+/// FFmpeg's API — which holds a packet to one entry per kind
+/// (`av_packet_add_side_data`, `libavcodec/packet.c` 197–228) — as a packet
+/// built by hand would carry them. Each is a byte of
+/// `AV_PKT_DATA_MPEGTS_STREAM_ID`, which no decoder reads; the array and
+/// each entry are libavutil allocations, which the packet's unref frees.
+fn with_side_data_entries(mut packet: Packet, entries: usize) -> Packet {
+  use ffmpeg_next::ffi::{AVPacketSideData, AVPacketSideDataType, av_malloc, av_mallocz};
+
+  // SAFETY: `packet` owns a live `AVPacket` with no side data; the array
+  // is allocated for `entries` descriptors and every one is written before
+  // the packet holds it, each `data` a live one-byte allocation.
+  unsafe {
+    let raw = packet.as_mut_ptr();
+    assert!((*raw).side_data.is_null(), "a packet with no side data yet");
+    let array =
+      av_malloc(entries * core::mem::size_of::<AVPacketSideData>()).cast::<AVPacketSideData>();
+    assert!(!array.is_null(), "the descriptor array");
+    for index in 0..entries {
+      let data = av_mallocz(1).cast::<u8>();
+      assert!(!data.is_null(), "an entry's byte");
+      array.add(index).write(AVPacketSideData {
+        data,
+        size: 1,
+        type_: AVPacketSideDataType::AV_PKT_DATA_MPEGTS_STREAM_ID,
+      });
+    }
+    (*raw).side_data = array;
+    (*raw).side_data_elems = entries as i32;
+  }
+  packet
+}
+
+/// LAW: **a packet of more side-data entries than the probe copies is no
+/// backend's answer: it is sent, and the candidate that takes it is
+/// committed** — with no [`Error::AllBackendsFailed`]. And a candidate
+/// that refuses it fails on its own refusal, as on any packet: the next is
+/// replayed the history and takes it.
+///
+/// The packet is never copied ([`Unkept::SideData`]); libavcodec takes it
+/// as it takes any, one entry per kind (`av_packet_copy_props`).
+///
+/// PLANT: the side-data cap answering `AllBackendsFailed` before the
+/// packet is sent, as in 0.19.0, turns this red at "sent and committed".
+#[test]
+fn a_packet_of_more_side_data_entries_than_the_probe_copies_is_sent_and_commits() {
+  let crowded = || with_side_data_entries(raw_packet(0x5A), MAX_PROBE_PACKET_SIDE_DATA_ENTRIES + 1);
+  assert_eq!(
+    packet_side_data_count(&crowded()),
+    MAX_PROBE_PACKET_SIDE_DATA_ENTRIES + 1
+  );
+
+  // Taken: committed, its picture the candidate's.
+  let mut dec = raw_auditioning_decoder();
+  send_all(&mut dec, &[discarded(0x11)]);
+  let packet = crowded();
+  // SAFETY: `raw_packet`'s payload, every byte written and the padding
+  // zeroed; its side data `with_side_data_entries` wrote whole; nothing
+  // writes through it while the decoder may still read it.
+  let sent = unsafe { dec.send_av_packet(&packet) };
+  assert!(
+    matches!(sent, Ok(Sent::Accepted)),
+    "sent and committed: {sent:?}"
+  );
+  assert_eq!(dec.phase(), SessionPhase::Streaming, "committed");
+  assert!(
+    holds_a_picture(&mut dec),
+    "its picture, the committed candidate's"
+  );
+
+  // Refused, by a candidate of 32 x 32 pictures it is short of: the next
+  // candidate, built in software from the probe's 16 x 16 parameters, is
+  // replayed the history and takes it.
+  let mut dec = raw_auditioning_decoder_with(32, crate::DecoderOptions::new());
+  {
+    let probe = dec.probe.as_mut().expect("on trial");
+    probe.parameters = raw_parameters(RAW_SIDE);
+    probe.build = VideoDecoder::software_state_for_test;
+    probe.remaining_backends = vec![Backend::Cuda];
+    probe.buffered_packets = vec![discarded(0x11)];
+    probe.buffered_bytes = RAW_PICTURE;
+  }
+  // SAFETY: as above.
+  let sent = unsafe { dec.send_av_packet(&packet) };
+  assert!(
+    matches!(sent, Ok(Sent::Accepted)),
+    "the next candidate took it: {sent:?}"
+  );
+  assert_eq!(dec.backend(), Backend::Cuda, "the next candidate's");
+  assert_eq!(dec.phase(), SessionPhase::Streaming, "and committed");
 }
 
 /// LAW: **a candidate is replayed copies, and the history stays the

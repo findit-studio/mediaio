@@ -240,6 +240,16 @@ pub enum FallbackOrigin {
 /// exhaustion, before the first picture. After it a hardware failure is
 /// that picture's own error.
 ///
+/// **Only backends' answers raise it, never the probe's own limits.** A
+/// packet the probe's history cannot keep — past its ceiling of 256
+/// packets or 64 MiB, of more side-data entries than it copies, or one
+/// whose copy cannot be made — ends the trial on the candidate's answer:
+/// the candidate that takes it is committed, and one that refuses it fails
+/// on that refusal as on any packet. After such a commit a failure is the
+/// committed decoder's own error, reported as it was minted, and comes with
+/// no replay history: the history could not keep the packet, so none could
+/// have been replayed whole.
+///
 /// `Debug` is hand-written: [`ffmpeg_next::Packet`] does not derive
 /// `Debug`, so we print `[N packets]` instead of dumping per-packet
 /// bytes, which would be both noisy and useless for triage.

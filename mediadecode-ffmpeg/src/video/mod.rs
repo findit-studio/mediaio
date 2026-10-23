@@ -95,7 +95,11 @@ pub use open::VideoStreamDecoderOpen;
 /// - [`Auto`](Self::Auto): before the first picture, the platform's
 ///   hardware backends in probe order, the packets taken so far replayed
 ///   across them; when none takes the stream, software, the same packets
-///   replayed into it. After it, the decoder that produced it.
+///   replayed into it. After it, the decoder that produced it. Only the
+///   backends' own answers are its cue for software, never the probe's
+///   own limits: a packet the probe cannot keep for a replay commits the
+///   backend that takes it, picture or none (see
+///   [`VideoDecoder`](crate::VideoDecoder)).
 /// - [`AnyHardware`](Self::AnyHardware): the same probe, and never
 ///   software — when no backend takes the stream,
 ///   [`Error::AllBackendsFailed`] hands back the packets the probe took.

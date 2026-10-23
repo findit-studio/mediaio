@@ -60,8 +60,14 @@ The backend-agnostic core it adapts has its own log at
   packet past the probe's ceiling (256 packets or 64 MiB) is sent to the
   candidate with the history whole: taken, it commits the candidate;
   refused, it fails it, and the next backend is tried with the whole
-  history. No skip level, codec, packet flag or payload is read to guess
-  what a backend should have given. Before, the standalone probe and
+  history. So is every packet the probe cannot keep for a replay — one of
+  more than 64 side-data entries, or one whose copy cannot be made — since
+  the probe's own limits are never a backend's answer: they no longer
+  answer `AllBackendsFailed` before the packet is sent, and `Auto` never
+  takes one as its cue for software. After such a commit a failure is the
+  decoder's own error, with no history to replay. No skip level, codec,
+  packet flag or payload is read to guess what a backend should have
+  given. Before, the standalone probe and
   `DecodePath::AnyHardware` answered `AllBackendsFailed` at either, and
   `DecodePath::Auto` left for software a hardware decoder that had failed
   nothing: on a stream of VP9 or AV1 hidden frames, an edit list's

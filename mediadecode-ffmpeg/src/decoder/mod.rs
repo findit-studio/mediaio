@@ -71,7 +71,15 @@ pub use open::VideoDecoderOpen;
 /// | its own error: a send, a receive or a transfer failing, or a refusal this crate latched | fails it, and the next backend is tried with the whole history |
 /// | the end taken, then libavcodec's `AVERROR_EOF` with no refusal latched | a successful empty completion: commits it, and the stream has ended |
 /// | `EAGAIN` after the end | fails it: libavcodec answers a decoder drained to its end with `AVERROR_EOF` (`libavcodec/decode.c` 446–451, 489–505, 655–656 in FFmpeg 9.0.1), so a candidate that asks for input there has broken the drain |
-/// | a packet past the probe's ceiling, 256 packets or 64 MiB | the trial's last: sent with the history whole, it commits the candidate once taken, and fails it as above if refused |
+/// | a packet the history cannot keep: past the probe's ceiling (256 packets or 64 MiB), of more side-data entries than the probe copies (64), or one whose copy cannot be made | the trial's last: sent with the history whole, it commits the candidate once taken, and fails it as above if refused |
+///
+/// The last row's are **the wrapper's own limits, never a backend's
+/// answer**: none ends a trial without the candidate's word, and none
+/// answers [`Error::AllBackendsFailed`], so none is the stream decoder's
+/// cue for software. Once the candidate that took such a packet is
+/// committed, a failure is that decoder's own error, reported as it was
+/// minted, with no history to replay: the history could not keep the
+/// packet, so no replay could have been whole.
 ///
 /// A skip level is the codec's to honour, not the probe's to assume.
 /// FFmpeg 9.0.1's VP9 decoder reads no `skip_frame` at all, the native AV1
@@ -237,8 +245,12 @@ const MAX_PROBE_PACKET_BYTES: usize = 64 * 1024 * 1024;
 /// an `AVBufferRef` per entry, so a packet stuffed with many tiny or
 /// zero-sized entries can consume significant memory in descriptor /
 /// allocator overhead even after [`packet_side_data_bytes`] charges
-/// [`SIDE_DATA_ENTRY_OVERHEAD`] bytes per entry. Refusing to clone such
-/// packets short-circuits the descriptor explosion path.
+/// [`SIDE_DATA_ENTRY_OVERHEAD`] bytes per entry. Such a packet is never
+/// copied, which short-circuits the descriptor explosion path: it is the
+/// trial's last ([`Unkept::SideData`]), sent with the history whole, and
+/// the candidate that takes it is committed. FFmpeg's own API holds a
+/// packet to one entry per kind (`av_packet_add_side_data`,
+/// `libavcodec/packet.c` 197–228), so only a packet built past it is.
 ///
 /// Sized for legitimate streams (typical video packets carry 0-5 side-
 /// data entries; SEI-heavy HEVC/AV1 maybe a dozen) while comfortably
@@ -422,10 +434,42 @@ enum Staged {
   /// The history records the probe's copy, and holds the second field's
   /// bytes with it.
   Recorded(Packet, usize),
-  /// The packet is past the probe's ceiling ([`MAX_PROBE_PACKETS`]), and
-  /// the trial's last: taken, the candidate is committed. The history
-  /// would have held `packets` packets and `bytes` bytes with it.
-  Last { packets: usize, bytes: usize },
+  /// The history cannot keep the packet, so it is the trial's last: taken,
+  /// the candidate is committed.
+  Last(Unkept),
+}
+
+/// Why the probe's history cannot keep a packet for a replay — **the
+/// wrapper's own limits, and never a backend's answer.** None ends the
+/// trial without the candidate's word: the packet is sent with the history
+/// whole, the candidate that takes it is committed, and one that refuses it
+/// fails on its own refusal ([`VideoDecoder::send_av_packet`]).
+#[derive(Debug)]
+enum Unkept {
+  /// It would carry the history past the probe's ceiling, to `packets`
+  /// packets or `bytes` bytes ([`MAX_PROBE_PACKETS`],
+  /// [`MAX_PROBE_PACKET_BYTES`]).
+  Ceiling { packets: usize, bytes: usize },
+  /// It carries `entries` side-data entries, more than the probe copies
+  /// ([`MAX_PROBE_PACKET_SIDE_DATA_ENTRIES`]).
+  SideData { entries: usize },
+  /// The probe's copy of it could not be made.
+  Copy(ffmpeg_next::Error),
+}
+
+impl core::fmt::Display for Unkept {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::Ceiling { packets, bytes } => write!(
+        f,
+        "past the probe's ceiling, at {packets} packets and {bytes} bytes"
+      ),
+      Self::SideData { entries } => {
+        write!(f, "{entries} side-data entries, more than the probe copies")
+      }
+      Self::Copy(e) => write!(f, "the probe's copy could not be made: {e}"),
+    }
+  }
 }
 
 /// State carried only during the probe window (before the first successful
@@ -1329,25 +1373,22 @@ impl VideoDecoder {
   /// reflected in `buffered_packets` (so a future
   /// [`Error::AllBackendsFailed`] can hand a complete replay history
   /// back to the caller for software fallback on a non-seekable input).
-  /// If we cannot prove this packet is buffer-able — its side-data
-  /// entry count exceeds [`MAX_PROBE_PACKET_SIDE_DATA_ENTRIES`], or the
-  /// probe's copy of it cannot be made (`av_packet_ref` or
-  /// `av_packet_make_writable` failing) — `send_av_packet` returns
-  /// [`Error::AllBackendsFailed`] **without invoking**
-  /// `state.inner.send_packet` on this packet. The caller's packet stays
-  /// in their hand and `unconsumed_packets` carries the pre-existing
-  /// buffered history, so they can replay `unconsumed_packets` plus the
-  /// current packet through their software decoder of choice. The
-  /// post-probe path (after the first frame, when `self.probe` is `None`)
-  /// skips this pre-flight entirely.
+  /// The post-probe path (after the first frame, when `self.probe` is
+  /// `None`) skips this pre-flight entirely.
   ///
-  /// **A packet past the probe's ceiling is the trial's last**, and no
-  /// refusal: it would carry the history past [`MAX_PROBE_PACKETS`] or
-  /// [`MAX_PROBE_PACKET_BYTES`], so it is sent to the candidate on trial
-  /// with the history whole. Taken, the candidate is committed, and the
-  /// history is released with the probe; refused, the candidate fails as
-  /// on any packet, and the next backend is tried with the history whole
-  /// and offered this packet in its turn.
+  /// **A packet the history cannot keep is the trial's last**, and no
+  /// refusal: one past the probe's ceiling ([`MAX_PROBE_PACKETS`],
+  /// [`MAX_PROBE_PACKET_BYTES`]), one of more side-data entries than the
+  /// probe copies ([`MAX_PROBE_PACKET_SIDE_DATA_ENTRIES`]), or one whose
+  /// copy cannot be made (`av_packet_ref` or `av_packet_make_writable`
+  /// failing). These are the wrapper's own limits, never the backend's
+  /// answer ([`Unkept`]), so the packet is sent to the candidate on trial
+  /// with the history whole. Taken, the candidate is committed — the
+  /// invariant holds, since no probe outlives a packet it does not hold —
+  /// and a failure after it is that decoder's own error, with no history
+  /// to replay. Refused, the candidate fails as on any packet, and the next
+  /// backend is tried with the history whole and offered this packet in its
+  /// turn.
   ///
   /// After commit a failure is this packet's own error, reported as it
   /// was minted, and the next packet reaches libavcodec — nothing is
@@ -1389,69 +1430,51 @@ impl VideoDecoder {
       // send below — records its copy, or ends the trial on it — and is
       // acted on only if FFmpeg accepts the packet.
       let staged: Option<Staged> = if let Some(probe) = self.probe.as_ref() {
+        // **Where the history cannot keep the packet, the trial ends on
+        // this packet's answer, and never before it** ([`Unkept`]: the
+        // wrapper's own limits, never a backend's answer). The candidate
+        // is sent it with the history whole: taken, it is committed below,
+        // no failure claimed for a backend that has failed nothing;
+        // refused, it fails as on any packet, and the next backend is tried
+        // with the history as it stands and offered the packet in its turn.
+        //
         // Step 1: side-data entry count cap. Read just `side_data_elems`
         // (no array walk yet) so a corrupt or weaponised value cannot
-        // drive an unbounded loop from the safe entry point.
+        // drive an unbounded loop from the safe entry point; such a packet
+        // is never copied.
         let side_count = packet_side_data_count(packet);
         if side_count > MAX_PROBE_PACKET_SIDE_DATA_ENTRIES {
-          let probe = self.probe.take().expect("probe present");
-          tracing::warn!(
-            side_data_entries = side_count,
-            max_side_data_entries = MAX_PROBE_PACKET_SIDE_DATA_ENTRIES,
-            trigger = "side_data_entry_cap",
-            "hwdecode: probe rescue exhausted before consuming packet; \
-             returning AllBackendsFailed without invoking decoder"
-          );
-          return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-            probe.attempts,
-            probe.buffered_packets,
-          )));
-        }
-        // Step 2: the probe's ceiling, in packets and in bytes.
-        // `packet_side_data_bytes` clamps its walk to
-        // MAX_PROBE_PACKET_SIDE_DATA_ENTRIES as defense-in-depth even
-        // though the count check above already bounded the array length.
-        let pkt_size = packet.size().saturating_add(packet_side_data_bytes(
-          packet,
-          MAX_PROBE_PACKET_SIDE_DATA_ENTRIES,
-        ));
-        let new_count = probe.buffered_packets.len() + 1;
-        let new_bytes = probe.buffered_bytes.saturating_add(pkt_size);
-        if new_count > MAX_PROBE_PACKETS || new_bytes > MAX_PROBE_PACKET_BYTES {
-          // **At the ceiling the trial ends on this packet's answer, and
-          // never before it.** The history cannot take the packet, so the
-          // candidate is sent it with the history whole: taken, it is
-          // committed below, no failure claimed for a backend that has
-          // failed nothing; refused, it fails as on any packet, and the
-          // next backend is tried with the history as it stands.
-          Some(Staged::Last {
-            packets: new_count,
-            bytes: new_bytes,
-          })
+          Some(Staged::Last(Unkept::SideData {
+            entries: side_count,
+          }))
         } else {
-          // Step 3: copy before consuming. The history goes to the caller
-          // as owned, mutable `Packet`s, so it keeps a payload of its own:
-          // a reference to this one would carry the caller's later writes
-          // into the history, and `data_mut` on the two would alias. The
-          // copy is the size step 2 charged — payload and side data — so
-          // `new_bytes` stands. If it cannot be made we bail rather than
-          // consuming a packet we can't track; the packet stays the
-          // caller's, unsent.
-          // SAFETY: `packet` meets the `AVPacket` contract with every byte
-          // written — this function's own contract, forwarded.
-          match unsafe { crate::boundary::try_clone_packet(packet) } {
-            Ok(c) => Some(Staged::Recorded(c, new_bytes)),
-            Err(e) => {
-              let probe = self.probe.take().expect("probe present");
-              tracing::warn!(
-                error = %e,
-                "hwdecode: packet copy failed before consuming; \
-                 returning AllBackendsFailed without invoking decoder"
-              );
-              return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-                probe.attempts,
-                probe.buffered_packets,
-              )));
+          // Step 2: the probe's ceiling, in packets and in bytes.
+          // `packet_side_data_bytes` clamps its walk to
+          // MAX_PROBE_PACKET_SIDE_DATA_ENTRIES as defense-in-depth even
+          // though the count check above already bounded the array length.
+          let pkt_size = packet.size().saturating_add(packet_side_data_bytes(
+            packet,
+            MAX_PROBE_PACKET_SIDE_DATA_ENTRIES,
+          ));
+          let new_count = probe.buffered_packets.len() + 1;
+          let new_bytes = probe.buffered_bytes.saturating_add(pkt_size);
+          if new_count > MAX_PROBE_PACKETS || new_bytes > MAX_PROBE_PACKET_BYTES {
+            Some(Staged::Last(Unkept::Ceiling {
+              packets: new_count,
+              bytes: new_bytes,
+            }))
+          } else {
+            // Step 3: copy before consuming. The history goes to the
+            // caller as owned, mutable `Packet`s, so it keeps a payload of
+            // its own: a reference to this one would carry the caller's
+            // later writes into the history, and `data_mut` on the two
+            // would alias. The copy is the size step 2 charged — payload
+            // and side data — so `new_bytes` stands.
+            // SAFETY: `packet` meets the `AVPacket` contract with every
+            // byte written — this function's own contract, forwarded.
+            match unsafe { crate::boundary::try_clone_packet(packet) } {
+              Ok(c) => Some(Staged::Recorded(c, new_bytes)),
+              Err(e) => Some(Staged::Last(Unkept::Copy(e))),
             }
           }
         }
@@ -1472,13 +1495,14 @@ impl VideoDecoder {
                 probe.buffered_bytes = new_bytes;
               }
             }
-            // The trial's last packet, taken: the candidate is committed.
-            Some(Staged::Last { packets, bytes }) => {
+            // The trial's last packet, taken: the candidate is committed,
+            // and a failure after it is that decoder's own — there is no
+            // history to replay, since the history could not keep this.
+            Some(Staged::Last(unkept)) => {
               tracing::info!(
                 backend = ?self.state.backend,
-                packets,
-                bytes,
-                "hwdecode: the candidate took the packet past the probe's ceiling; committed"
+                reason = %unkept,
+                "hwdecode: the candidate took a packet the probe could not keep; committed"
               );
               self.probe = None;
             }
