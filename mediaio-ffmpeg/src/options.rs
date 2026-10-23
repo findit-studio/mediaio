@@ -25,7 +25,17 @@ use ffmpeg_next::ffi::AVDiscard;
 
 /// Which frames a libavcodec decoder skips a stage of work for: FFmpeg's
 /// `AVDiscard` (`libavcodec/defs.h` 226–232 in 9.0.1), each value a
-/// threshold — a frame is skipped where it falls at or past it.
+/// threshold — a decoder that reads the setting skips a frame that falls at
+/// or past it.
+///
+/// **Which values a decoder reads is the decoder's.** In FFmpeg 9.0.1 the
+/// H.264 and HEVC decoders read every level from `NonReference` up
+/// (`libavcodec/h264_slice.c` 2141–2145, `hevc/hevcdec.c` 3542–3544,
+/// 3766–3767); the VP9 decoder reads none; the native AV1 decoder reads
+/// `NonIntra`, `NonKey` and `All` alone (`av1dec.c` 1166–1171); and
+/// `libdav1d` decodes key frames under `NonKey` and `All` alike
+/// (`libdav1d.c` 236–243). A level is a request, never a promise that no
+/// picture comes.
 ///
 /// Its text form is FFmpeg's own option constant (`libavcodec/options_table.h`
 /// 258–264): `none`, `default`, `noref`, `bidir`, `nointra`, `nokey`,
@@ -138,21 +148,15 @@ impl FromStr for Discard {
 /// this is what it does. The defaults are libavcodec's: [`Discard::Default`]
 /// for each.
 ///
-/// **`skip_frame` = [`Discard::All`] decodes no picture**, so
-/// `mediadecode-ffmpeg`'s decoders run no hardware probe under it — a probe
-/// commits a backend on its first picture, and none comes. An unpinned
-/// stream decoder (`DecodePath::Auto`) opens software at once; one held to
-/// hardware (`DecodePath::AnyHardware`), and the standalone decoder's probe,
-/// commit to the first backend that opens; a pinned backend opens as asked.
-/// Each drains to its end with no picture, cleanly. Under every other level
-/// above [`Discard::Default`] — [`Discard::NonReference`],
-/// [`Discard::Bidirectional`], [`Discard::NonIntra`], [`Discard::NonKey`],
-/// and any FFmpeg adds — a stream may give no picture too: each value is a
-/// threshold, and a stream of pictures the level skips alone gives none. So
-/// the probe runs while pictures come, and a clean end, or a probe that
-/// fills, with none is the stream's end: the backend that opened is
-/// committed, and an unpinned stream decoder ends on software. `Default`
-/// and `Nothing` skip no picture.
+/// **The options change what a decoder gives, never how
+/// `mediadecode-ffmpeg`'s hardware probe judges one.** The probe runs under
+/// every level, `All` among them, and weighs a backend on trial by its own
+/// answers alone: a picture commits it, its own error fails it, and a clean
+/// end with no picture — under a level that skips every picture the stream
+/// has, or a stream of hidden frames — completes it, and the stream ends
+/// there on the backend that completed. No level is read to guess what a
+/// decoder should have given, since which levels a decoder reads is its own
+/// ([`Discard`]).
 ///
 /// Marked `#[non_exhaustive]`: a later setting joins as a field, read and
 /// set through its own methods.

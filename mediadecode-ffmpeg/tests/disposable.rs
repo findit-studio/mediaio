@@ -401,14 +401,15 @@ fn the_session_skipping_non_references_keeps_the_reference_pictures_on_every_pat
   }
 }
 
-/// Under `skip_frame` = `all` no picture comes, so no probe could commit
-/// on one: every road opens committed and drains cleanly to no picture —
-/// the standalone decoder on its probe and on its pin, and the session on
-/// `Auto` (software from the open), `AnyHardware`, the VideoToolbox pin and
-/// software.
+/// Under `skip_frame` = `all` H.264 gives no picture, and every road drains
+/// cleanly to none — the standalone decoder on its probe and on its pin, and
+/// the session on `Auto`, `AnyHardware`, the VideoToolbox pin and software.
+/// The probe runs under it as under every level, and is completed by the
+/// clean end, or committed at its ceiling: `Auto` probes hardware from the
+/// open, and stays there.
 #[cfg(target_vendor = "apple")]
 #[test]
-fn skipping_every_picture_opens_committed_and_drains_cleanly_on_every_road() {
+fn skipping_every_picture_drains_cleanly_on_every_road() {
   use mediadecode_ffmpeg::{Backend, VideoDecoder, VideoDecoderOpen};
 
   let Some(path) = fixture("01_pandas_muted.mp4") else {
@@ -438,8 +439,8 @@ fn skipping_every_picture_opens_committed_and_drains_cleanly_on_every_road() {
   )
   .expect("open on Auto");
   assert!(
-    auto.is_software(),
-    "Auto opens software under skip_frame all"
+    !auto.is_software(),
+    "Auto probes hardware under skip_frame all, as under every level"
   );
   for path in [
     DecodePath::Auto,
@@ -605,12 +606,12 @@ enum Feed {
   PastTheProbe,
 }
 
-/// Under a skip policy that may leave a stream with no picture — every level
-/// above `Default` — a clean end with none is the stream's end on every
-/// unpinned road, and so is a probe that fills with none: the standalone
-/// probe and `AnyHardware` commit the backend that opened, and `Auto`, which
-/// probes hardware while pictures may come, ends on software. Under `All` no
-/// probe runs at all, and `Auto` opens software.
+/// A stream that gives no picture under its skip level ends cleanly on every
+/// unpinned road: a clean end with none completes the candidate on trial,
+/// and a probe that reaches its ceiling with none commits the candidate that
+/// takes the packet past it. The standalone probe and `AnyHardware` end on
+/// the backend that opened, and so does `Auto`, which probes hardware under
+/// every level, `All` among them.
 #[cfg(target_vendor = "apple")]
 fn a_stream_with_no_picture_to_give_ends_cleanly(
   skip: Discard,
@@ -669,11 +670,9 @@ fn a_stream_with_no_picture_to_give_ends_cleanly(
     DecoderLimits::default(),
   )
   .expect("open on Auto");
-  assert_eq!(
-    auto.is_software(),
-    skip == Discard::All,
-    "{skip}, {feed:?}: Auto probes hardware while pictures may come, and opens software where \
-     none can"
+  assert!(
+    !auto.is_software(),
+    "{skip}, {feed:?}: Auto probes hardware under every level"
   );
   let mut frame = empty_owned_video_frame();
   let mut shown = 0;
@@ -697,8 +696,8 @@ fn a_stream_with_no_picture_to_give_ends_cleanly(
   take(&mut auto, &mut frame);
   assert_eq!(shown, 0, "{skip}, {feed:?}: Auto");
   assert!(
-    auto.is_software(),
-    "{skip}, {feed:?}: Auto ends on software"
+    !auto.is_software(),
+    "{skip}, {feed:?}: Auto ends on the hardware decoder that completed"
   );
 }
 
@@ -727,8 +726,8 @@ fn a_stream_with_no_intra_picture_ends_cleanly_under_nonintra() {
   );
 }
 
-/// The same streams whole, longer than the probe buffers: a probe that fills
-/// with no picture under these policies commits too.
+/// The same streams whole, longer than the probe buffers: at the probe's
+/// ceiling the candidate takes the packet past it and is committed.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_probe_that_fills_with_no_picture_commits_under_nonkey_and_nonintra() {
@@ -769,7 +768,8 @@ fn a_stream_of_b_pictures_alone_ends_cleanly_under_bidir() {
 }
 
 /// `skip_frame = all` over the whole fixture, within and past the probe's
-/// size: no probe runs, and every road drains cleanly to no picture.
+/// size: the probe runs, the clean end or the ceiling commits its candidate,
+/// and every road drains cleanly to no picture.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn every_picture_skipped_ends_cleanly_under_all_within_and_past_the_probe_size() {
@@ -841,10 +841,10 @@ fn auto_pictures(
 
 /// Edit-list pre-roll alone, under `Default` and `Nothing`: every packet
 /// flagged `AV_PKT_FLAG_DISCARD`, decoded and its frame dropped
-/// (`libavcodec/decode.c` 1584–1586, 464–466), so no packet can give a
-/// picture. Within the probe's 256 packets and past them, the clean end
-/// with none is the stream's end — no `AllBackendsFailed` — on the
-/// standalone probe, `AnyHardware` and `Auto`.
+/// (`libavcodec/decode.c` 464–466), so no picture comes. Within the probe's
+/// 256 packets the clean end with none completes the candidate, and past
+/// them the ceiling commits it — no `AllBackendsFailed` — on the standalone
+/// probe, `AnyHardware` and `Auto`, which stays on hardware.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_fragment_of_pre_roll_alone_ends_cleanly_under_default_and_nothing() {
@@ -880,17 +880,18 @@ fn a_fragment_of_pre_roll_alone_ends_cleanly_under_default_and_nothing() {
         |_| (),
       );
       assert!(pictures.is_empty(), "{skip}, {count}: AnyHardware");
-      let (pictures, _) = auto_pictures(&parameters, timebase, options, &fragment);
+      let (pictures, software) = auto_pictures(&parameters, timebase, options, &fragment);
       assert!(pictures.is_empty(), "{skip}, {count}: Auto");
+      assert!(!software, "{skip}, {count}: Auto stays on hardware");
     }
   }
 }
 
 /// Edit-list pre-roll past the probe's 256 packets, then pictures: the
-/// probe auditions past the pre-roll, which proves nothing, to the first
-/// picture after it, so the hardware decoder is kept and every picture
-/// after the pre-roll is produced — on the standalone probe, `AnyHardware`
-/// and `Auto`, which stays on hardware.
+/// candidate takes the packet past the probe's ceiling and is committed, so
+/// the hardware decoder is kept and every picture after the pre-roll is
+/// produced — on the standalone probe, `AnyHardware` and `Auto`, which
+/// stays on hardware.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn pre_roll_past_the_probe_then_pictures_keeps_the_hardware_decoder() {

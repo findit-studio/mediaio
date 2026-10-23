@@ -59,6 +59,31 @@ pub use open::VideoDecoderOpen;
 /// is delivered the probe collapses and subsequent calls go straight to the
 /// active (committed) backend.
 ///
+/// # What the probe weighs
+///
+/// **A backend on trial is judged by its own answers, and by nothing
+/// else.** No skip level, codec, packet flag or payload is read to guess
+/// what it should have given:
+///
+/// | the candidate's answer | the probe |
+/// |---|---|
+/// | a picture | commits it |
+/// | its own error: a send, a receive or a transfer failing, or a refusal this crate latched | fails it, and the next backend is tried with the whole history |
+/// | the end taken, then libavcodec's `AVERROR_EOF` with no refusal latched | a successful empty completion: commits it, and the stream has ended |
+/// | `EAGAIN` after the end | fails it: libavcodec answers a decoder drained to its end with `AVERROR_EOF` (`libavcodec/decode.c` 446–451, 489–505, 655–656 in FFmpeg 9.0.1), so a candidate that asks for input there has broken the drain |
+/// | a packet past the probe's ceiling, 256 packets or 64 MiB | the trial's last: sent with the history whole, it commits the candidate once taken, and fails it as above if refused |
+///
+/// A skip level is the codec's to honour, not the probe's to assume.
+/// FFmpeg 9.0.1's VP9 decoder reads no `skip_frame` at all, the native AV1
+/// decoder reads `NonIntra`, `NonKey` and `All` alone (`av1dec.c`
+/// 1166–1171), and `libdav1d` decodes key pictures under `All`
+/// (`libdav1d.c` 236–243). A packet that decodes to no picture is no
+/// failure either: a VP9 or AV1 hidden frame (`vp9.c` 1818–1821), or
+/// edit-list pre-roll flagged `AV_PKT_FLAG_DISCARD`, whose frame libavcodec
+/// drops (`decode.c` 464–466). A stream of them ends in a clean, empty
+/// completion. This decoder drops nothing itself, so no shortcut stands on
+/// what it would drop: every skip is libavcodec's, enforced by the codec.
+///
 /// # After commit
 ///
 /// A committed backend reports per picture, and nothing is classified or
@@ -148,11 +173,6 @@ pub struct VideoDecoder {
   /// guessing. The probe machinery still reads it for replay; it simply
   /// no longer owns it.
   eof_sent: bool,
-  /// What a probe makes of a clean end that came with no picture under a
-  /// skip policy that may leave a stream with none
-  /// ([`skips_may_leave_no_picture`]): [`EmptyEnd::Commit`] but on the
-  /// stream decoder's [`DecodePath::Auto`](crate::DecodePath::Auto).
-  empty_end: EmptyEnd,
   /// The GPU-side scaled-output stage — see [`crate::vtscale`]. Carries
   /// the caller's standing [`Self::request_scaled_output`] and, on the
   /// VideoToolbox road, the cached pixel-transfer session and fitted
@@ -190,37 +210,27 @@ struct DecoderState {
   callback_state: *mut CallbackState,
 }
 
-/// Maximum number of packets we are willing to buffer for probe replay
-/// before abandoning the fallback safety net. Set high enough to absorb
-/// long B-frame GOPs and codec setup latency, low enough to bound memory
-/// against malicious / pathological streams that never produce a first
-/// frame.
+/// The most packets the probe holds for a replay: its ceiling, with
+/// [`MAX_PROBE_PACKET_BYTES`]. Set high enough to absorb long B-frame GOPs
+/// and codec setup latency, low enough to bound memory against streams
+/// that never produce a first frame.
+///
+/// **At the ceiling the trial ends on the next packet's answer.** The
+/// history cannot take that packet, so it is sent to the candidate on trial
+/// with the history whole ([`Staged::Last`]): taken, the candidate is
+/// committed, with no failure claimed for a backend that has not failed;
+/// refused, the candidate fails, and the next backend is tried with the
+/// history as it stands. The ceiling counts the packets the history holds,
+/// every one alike, from the open or the last [`VideoDecoder::flush`].
 const MAX_PROBE_PACKETS: usize = 256;
 
 /// Maximum total compressed-byte size of buffered probe packets. Each
 /// buffered packet holds its own copy of the payload (see
 /// [`try_clone_packet`](crate::boundary::try_clone_packet)), so this bounds bytes the probe itself holds.
 /// 64 MiB is generous for normal video and gives untrusted media a hard
-/// ceiling.
+/// ceiling, which a packet that would carry the history past it reaches as
+/// [`MAX_PROBE_PACKETS`] describes.
 const MAX_PROBE_PACKET_BYTES: usize = 64 * 1024 * 1024;
-
-/// How many packets the probe holds while none it has been fed can give a
-/// picture ([`may_give_a_picture`]): every one flagged
-/// `AV_PKT_FLAG_DISCARD`, whose frame FFmpeg decodes and drops at every
-/// skip level (`libavcodec/decode.c` 1584–1586, 464–466, 645–648), or
-/// empty.
-///
-/// Such a run proves no backend and fails none. An edit list's pre-roll is
-/// one: `mov` keeps every frame from the key frame before an edit's start
-/// and flags those before the start (`libavformat/mov.c` 4478–4505,
-/// 4545–4567, 11674–11675), less than one GOP. So these packets do not count
-/// against [`MAX_PROBE_PACKETS`], which counts from the first packet that
-/// can give a picture: the probe keeps auditioning until one arrives,
-/// within this bound and [`MAX_PROBE_PACKET_BYTES`] — 4096 packets are a
-/// GOP of 68 seconds at 60 frames a second. A run past either bound has
-/// still proved nothing, and the probe ends there as at a clean end with no
-/// picture ([`EmptyEnd`]).
-const MAX_PROBE_PREROLL_PACKETS: usize = 4096;
 
 /// Hard cap on the number of side-data entries we tolerate per buffered
 /// packet. `av_packet_ref` allocates an `AVPacketSideData` descriptor and
@@ -333,10 +343,12 @@ pub(crate) enum SessionPhase {
   ///
   /// The arm that had no name. A candidate here has been given
   /// everything there is and answers about a stream that is already
-  /// over: if it has produced no frame, it never will. That is a
-  /// candidate failing — the probe's business — and neither "send me
-  /// more" (nothing left to send) nor "the stream ended" (this backend
-  /// never decoded a thing) is a true reading of it.
+  /// over, so its answer settles the trial. libavcodec's own
+  /// `AVERROR_EOF`, no refusal latched, is a successful empty completion:
+  /// the receive road commits the candidate, and the stream has ended.
+  /// `EAGAIN` is neither "send me more" (nothing is left to send) nor the
+  /// end (a drained decoder answers `AVERROR_EOF`): it is the candidate
+  /// failing, the probe's business.
   AuditioningPastEnd,
 }
 
@@ -404,65 +416,16 @@ type BuildCandidate = fn(
   Option<mediadecode::Timebase>,
 ) -> Result<DecoderState>;
 
-/// Whether `skip_frame` may leave a stream FFmpeg's decoder decodes with
-/// no picture at all, so that a clean end that brought none is the
-/// stream's end and no backend's failure: **every level above
-/// [`Default`](crate::Discard::Default)**, read by its value.
-///
-/// `AVDiscard` is a threshold: a decoder skips a picture where the level is
-/// at or past the one the picture falls under, so each level skips what the
-/// one below it does, and more (`h264dec.c` 626–628, `h264_slice.c`
-/// 2139–2147; `hevc/hevcdec.c` 3542–3547, 3766–3768). Every level above
-/// `Default` skips some pictures, so a fragment of those pictures alone
-/// gives none; a level FFmpeg adds later is answered by its value, with no
-/// list to extend. A random-access picture is a reference, intra and key
-/// picture, so a stream that has one gives a picture under every level but
-/// `All`.
-///
-/// `Default` and `Nothing` skip no picture: no decoder of FFmpeg 9.0.1
-/// compares `skip_frame` with a level below `AVDISCARD_NONREF` —
-/// `AVDISCARD_DEFAULT`'s "useless packets" are libavformat's
-/// `AVStream.discard` (`libavformat/avidec.c` 1372) and the `filter_units`
-/// bitstream filter's, never a decoder's. The frame of a packet flagged
-/// `AV_PKT_FLAG_DISCARD` is dropped at every level, `Nothing` included
-/// (`decode.c` 1584–1586, 464–466, 645–648): that is the packets' doing,
-/// not the policy's, and the probe answers it beside this predicate — a
-/// clean end after no packet that can give a picture is as empty an end as
-/// one this predicate allows ([`ProbeState::undecided`]).
-///
-/// | `skip_frame` | skips | a stream that gives no picture | a probe's clean end, or full probe, with none |
-/// |---|---|---|---|
-/// | [`Nothing`](crate::Discard::Nothing), [`Default`](crate::Discard::Default) | nothing | none | the candidate failing |
-/// | [`NonReference`](crate::Discard::NonReference) | non-reference pictures | a fragment of non-reference pictures alone | **the stream's end**: the candidate is committed |
-/// | [`Bidirectional`](crate::Discard::Bidirectional) | and B pictures | a fragment of those alone | **the stream's end** |
-/// | [`NonIntra`](crate::Discard::NonIntra) | and every picture not intra | one with no intra picture: a stream cut after its last | **the stream's end** |
-/// | [`NonKey`](crate::Discard::NonKey) | and every picture not a key one | one with no key picture: for H.264, no IDR and no recovery point SEI | **the stream's end** |
-/// | [`All`](crate::Discard::All) | every picture | every stream | no probe runs: the first backend that opens is committed at once |
-///
-/// Under every level from `NonReference` to `NonKey` the probe runs as ever
-/// while pictures come; only the empty clean end, and a probe that fills
-/// with none, change their meaning. The stream decoder's
-/// [`DecodePath::Auto`](crate::DecodePath::Auto) ends on software instead
-/// ([`EmptyEnd::HandBack`]), as it opens there under `All`.
-pub(crate) const fn skips_may_leave_no_picture(skip_frame: crate::Discard) -> bool {
-  skip_frame.as_av() as i32 > ffmpeg_next::ffi::AVDiscard::AVDISCARD_DEFAULT as i32
-}
-
-/// What a probe does with a clean end that came with no picture, under a
-/// skip policy that may leave a stream with none
-/// ([`skips_may_leave_no_picture`]), or after no packet that can give one
-/// ([`ProbeState::undecided`]); and with a run of the latter past its
-/// bound ([`MAX_PROBE_PREROLL_PACKETS`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EmptyEnd {
-  /// Commit the candidate on trial: the stream has ended. The standalone
-  /// decoder's probe, and [`DecodePath::AnyHardware`](crate::DecodePath::AnyHardware).
-  Commit,
-  /// Hand the history back as [`Error::AllBackendsFailed`], no other
-  /// backend tried, so the stream decoder's
-  /// [`DecodePath::Auto`](crate::DecodePath::Auto) replays it through
-  /// software and ends there.
-  HandBack,
+/// What [`VideoDecoder::send_av_packet`] does with a packet once the
+/// candidate on trial takes it.
+enum Staged {
+  /// The history records the probe's copy, and holds the second field's
+  /// bytes with it.
+  Recorded(Packet, usize),
+  /// The packet is past the probe's ceiling ([`MAX_PROBE_PACKETS`]), and
+  /// the trial's last: taken, the candidate is committed. The history
+  /// would have held `packets` packets and `bytes` bytes with it.
+  Last { packets: usize, bytes: usize },
 }
 
 /// State carried only during the probe window (before the first successful
@@ -476,23 +439,18 @@ struct ProbeState {
   /// [`Error::AllBackendsFailed`] so the contract is the same on
   /// single-backend platforms (e.g. macOS) as on multi-backend ones.
   remaining_backends: Vec<Backend>,
+  /// How the probe builds each candidate it advances to:
+  /// [`VideoDecoder::build_state`] on every production road. A lane opens
+  /// its candidates in software through this, so that the probe's own
+  /// roads advance, replay and commit on any machine.
+  build: BuildCandidate,
   /// Packets sent so far, kept for replay through any candidate backend.
-  /// Preserved across failed candidates — only cleared when the probe
-  /// collapses on a successful first frame, or when the probe is
-  /// abandoned due to the size caps.
+  /// Preserved across failed candidates — cleared when the probe
+  /// collapses, and forgotten at a flush ([`Self::forget_history`]).
   buffered_packets: Vec<Packet>,
   /// Cumulative size (in compressed bytes) of `buffered_packets`. Tracked
   /// incrementally so we don't have to re-sum on every send.
   buffered_bytes: usize,
-  /// How many of `buffered_packets` can give a picture
-  /// ([`may_give_a_picture`]). The candidate on trial has been fed every
-  /// one of them, a replayed candidate included.
-  decodable_packets: usize,
-  /// How many of `buffered_packets` came before the first that can give a
-  /// picture — an edit list's pre-roll — which count against
-  /// [`MAX_PROBE_PREROLL_PACKETS`] rather than [`MAX_PROBE_PACKETS`].
-  preroll_packets: usize,
-  /// Whether `send_eof` has been called; replayed alongside packets.
   /// Per-backend errors captured since the probe window opened. Pushed
   /// whenever a backend's failure triggers `advance_probe` (the active
   /// backend that just failed) or a candidate's build / replay rejects
@@ -502,11 +460,28 @@ struct ProbeState {
 }
 
 impl ProbeState {
-  /// Whether no packet the candidate on trial has been fed can give a
-  /// picture: an end, or a full probe, reached so proves nothing either
-  /// way, and is never the candidate failing.
-  const fn undecided(&self) -> bool {
-    self.decodable_packets == 0
+  /// Forgets what the history recorded at a position the caller has left
+  /// ([`VideoDecoder::flush`]): the packets, and every count kept of them,
+  /// so the ceiling counts from the flush.
+  ///
+  /// **Exhaustive on purpose.** Every field is named here, kept or
+  /// forgotten, so a field added to the probe does not compile until it is
+  /// sorted into one or the other, and no count can outlive a flush unseen.
+  /// What is kept is the probe's, not the position's: the stream's
+  /// parameters and codec, the backends still to try and how they are
+  /// built, and the failures already seen.
+  fn forget_history(&mut self) {
+    let Self {
+      parameters: _,
+      codec: _,
+      remaining_backends: _,
+      build: _,
+      attempts: _,
+      buffered_packets,
+      buffered_bytes,
+    } = self;
+    buffered_packets.clear();
+    *buffered_bytes = 0;
   }
 }
 
@@ -688,9 +663,9 @@ impl VideoDecoder {
   /// The probe itself, across `order` — [`backend::probe_order`] for
   /// [`Self::open_from`] and the stream decoder.
   ///
-  /// Under [`Discard::All`](crate::Discard::All) there is no probe: no
-  /// picture will come to prove a backend by, so the first backend that
-  /// opens is committed at once, and drains to its end with no picture.
+  /// The probe runs under every skip policy, `All` among them: what a
+  /// codec skips is the codec's to say, and the candidate's answers say it
+  /// (see the type's documentation).
   ///
   /// Taken as an argument so a lane can stand on a platform with no
   /// hardware backend at all, which no machine that runs the suite is: an
@@ -729,30 +704,6 @@ impl VideoDecoder {
         pkt_timebase,
       ) {
         Ok(state) => {
-          // **No picture comes under `skip_frame = all`**, and the probe
-          // commits a backend only on its first one: it would buffer every
-          // packet up to its caps, and read the clean end of a stream that
-          // gave none as this backend's failure. With nothing to prove a
-          // backend by, the first that opens is committed now.
-          if options.skip_frame() == crate::Discard::All {
-            tracing::info!(
-              ?backend,
-              "hwdecode: opened video decoder (skip_frame all: committed)"
-            );
-            return Ok(Self {
-              state,
-              hw_frame: alloc_av_frame().map_err(Error::Ffmpeg)?,
-              probe: None,
-              pending_frames: VecDeque::new(),
-              max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
-              frame_limits: limits,
-              pkt_timebase,
-              options,
-              eof_sent: false,
-              empty_end: EmptyEnd::Commit,
-              scaled_output: crate::vtscale::ScaledOutput::new(),
-            });
-          }
           tracing::info!(?backend, "hwdecode: opened video decoder (probing)");
           let remaining = order[(i + 1)..].to_vec();
           // Deep-copy the caller's `parameters` before storing in ProbeState.
@@ -796,10 +747,9 @@ impl VideoDecoder {
               parameters: probe_params,
               codec,
               remaining_backends: remaining,
+              build: Self::build_state,
               buffered_packets: Vec::new(),
               buffered_bytes: 0,
-              decodable_packets: 0,
-              preroll_packets: 0,
               attempts: std::mem::take(&mut attempts),
             },
             Err(e) => {
@@ -821,7 +771,6 @@ impl VideoDecoder {
             pkt_timebase,
             options,
             eof_sent: false,
-            empty_end: EmptyEnd::Commit,
             scaled_output: crate::vtscale::ScaledOutput::new(),
           });
         }
@@ -836,14 +785,6 @@ impl VideoDecoder {
       attempts,
       Vec::new(),
     )))
-  }
-
-  /// Makes this probe hand a clean end with no picture back as
-  /// [`Error::AllBackendsFailed`] ([`EmptyEnd::HandBack`]): the stream
-  /// decoder's [`DecodePath::Auto`](crate::DecodePath::Auto) ends on
-  /// software.
-  pub(crate) const fn hand_back_an_empty_end(&mut self) {
-    self.empty_end = EmptyEnd::HandBack;
   }
 
   /// Open the decoder with a specific backend. No probe, no fallback.
@@ -935,7 +876,6 @@ impl VideoDecoder {
       pkt_timebase,
       options,
       eof_sent: false,
-      empty_end: EmptyEnd::Commit,
       scaled_output: crate::vtscale::ScaledOutput::new(),
     })
   }
@@ -973,29 +913,41 @@ impl VideoDecoder {
     auditioning: bool,
   ) -> Result<Self> {
     let codec = find_decoder(&parameters)?;
+    Self::from_software_for_test_as(
+      parameters,
+      codec,
+      limits,
+      crate::DecoderOptions::new(),
+      auditioning,
+    )
+  }
+
+  /// [`Self::from_software_for_test`], over the decoder `codec` names —
+  /// one by name, where FFmpeg registers more than one for a codec — and
+  /// with `options` written into its context, as every road writes them.
+  #[cfg(test)]
+  pub(crate) fn from_software_for_test_as(
+    parameters: codec::Parameters,
+    codec: Codec,
+    limits: crate::limits::DecoderLimits,
+    options: crate::DecoderOptions,
+    auditioning: bool,
+  ) -> Result<Self> {
     let probe = auditioning.then(|| ProbeState {
       parameters: try_clone_parameters(&parameters, limits.max_codec_parameter_bytes())
         .expect("a clonable parameter set"),
       codec,
       remaining_backends: Vec::new(),
+      build: Self::build_state,
       buffered_packets: Vec::new(),
       buffered_bytes: 0,
-      decodable_packets: 0,
-      preroll_packets: 0,
       attempts: Vec::new(),
     });
     let backend = backend::probe_order()
       .first()
       .copied()
       .unwrap_or(Backend::VideoToolbox);
-    let state = Self::software_state_for_test(
-      parameters,
-      codec,
-      backend,
-      limits,
-      crate::DecoderOptions::new(),
-      None,
-    )?;
+    let state = Self::software_state_for_test(parameters, codec, backend, limits, options, None)?;
     Ok(Self {
       state,
       hw_frame: alloc_av_frame().map_err(Error::Ffmpeg)?,
@@ -1004,9 +956,8 @@ impl VideoDecoder {
       max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
       frame_limits: limits,
       pkt_timebase: None,
-      options: crate::DecoderOptions::new(),
+      options,
       eof_sent: false,
-      empty_end: EmptyEnd::Commit,
       scaled_output: crate::vtscale::ScaledOutput::new(),
     })
   }
@@ -1379,18 +1330,24 @@ impl VideoDecoder {
   /// [`Error::AllBackendsFailed`] can hand a complete replay history
   /// back to the caller for software fallback on a non-seekable input).
   /// If we cannot prove this packet is buffer-able — its side-data
-  /// entry count exceeds [`MAX_PROBE_PACKET_SIDE_DATA_ENTRIES`], its
-  /// bytes would push the probe past [`MAX_PROBE_PACKETS`] or
-  /// [`MAX_PROBE_PACKET_BYTES`], or the probe's copy of it cannot be
-  /// made (`av_packet_ref` or `av_packet_make_writable` failing) —
-  /// `send_av_packet` returns [`Error::AllBackendsFailed`] **without
-  /// invoking** `state.inner.send_packet` on this packet. The caller's
-  /// packet stays in their hand and `unconsumed_packets` carries the
-  /// pre-existing buffered history, so they can replay
-  /// `unconsumed_packets` plus the current packet through their
-  /// software decoder of choice. The post-probe path (after the first
-  /// frame, when `self.probe` is `None`) skips this pre-flight
-  /// entirely.
+  /// entry count exceeds [`MAX_PROBE_PACKET_SIDE_DATA_ENTRIES`], or the
+  /// probe's copy of it cannot be made (`av_packet_ref` or
+  /// `av_packet_make_writable` failing) — `send_av_packet` returns
+  /// [`Error::AllBackendsFailed`] **without invoking**
+  /// `state.inner.send_packet` on this packet. The caller's packet stays
+  /// in their hand and `unconsumed_packets` carries the pre-existing
+  /// buffered history, so they can replay `unconsumed_packets` plus the
+  /// current packet through their software decoder of choice. The
+  /// post-probe path (after the first frame, when `self.probe` is `None`)
+  /// skips this pre-flight entirely.
+  ///
+  /// **A packet past the probe's ceiling is the trial's last**, and no
+  /// refusal: it would carry the history past [`MAX_PROBE_PACKETS`] or
+  /// [`MAX_PROBE_PACKET_BYTES`], so it is sent to the candidate on trial
+  /// with the history whole. Taken, the candidate is committed, and the
+  /// history is released with the probe; refused, the candidate fails as
+  /// on any packet, and the next backend is tried with the history whole
+  /// and offered this packet in its turn.
   ///
   /// After commit a failure is this packet's own error, reported as it
   /// was minted, and the next packet reaches libavcodec — nothing is
@@ -1428,11 +1385,10 @@ impl VideoDecoder {
       let phase = self.phase();
       // Pre-flight while probe is active: prove we can record this
       // packet for replay BEFORE the active decoder consumes it.
-      // `staged_clone` carries the probe's copy, the new `buffered_bytes`
-      // value and whether the packet can give a picture through the send
-      // below; we only commit them to the probe state if FFmpeg accepts
-      // the packet.
-      let staged_clone: Option<(Packet, usize, bool)> = if let Some(probe) = self.probe.as_ref() {
+      // `staged` carries what the probe does with the packet through the
+      // send below — records its copy, or ends the trial on it — and is
+      // acted on only if FFmpeg accepts the packet.
+      let staged: Option<Staged> = if let Some(probe) = self.probe.as_ref() {
         // Step 1: side-data entry count cap. Read just `side_data_elems`
         // (no array walk yet) so a corrupt or weaponised value cannot
         // drive an unbounded loop from the safe entry point.
@@ -1451,66 +1407,28 @@ impl VideoDecoder {
             probe.buffered_packets,
           )));
         }
-        // Step 2: byte / packet count cap. `packet_side_data_bytes`
-        // clamps its walk to MAX_PROBE_PACKET_SIDE_DATA_ENTRIES as
-        // defense-in-depth even though the count check above already
-        // bounded the array length.
+        // Step 2: the probe's ceiling, in packets and in bytes.
+        // `packet_side_data_bytes` clamps its walk to
+        // MAX_PROBE_PACKET_SIDE_DATA_ENTRIES as defense-in-depth even
+        // though the count check above already bounded the array length.
         let pkt_size = packet.size().saturating_add(packet_side_data_bytes(
           packet,
           MAX_PROBE_PACKET_SIDE_DATA_ENTRIES,
         ));
         let new_count = probe.buffered_packets.len() + 1;
         let new_bytes = probe.buffered_bytes.saturating_add(pkt_size);
-        // **A run of packets none of which can give a picture proves no
-        // backend and fails none**, so it is held to its own bound rather
-        // than the probe's ceiling, which counts from the first packet that
-        // can give one ([`MAX_PROBE_PREROLL_PACKETS`]). The byte ceiling
-        // bounds the two together.
-        let decodable = may_give_a_picture(packet);
-        let undecided = probe.undecided();
-        let full = new_bytes > MAX_PROBE_PACKET_BYTES
-          || if undecided && !decodable {
-            new_count > MAX_PROBE_PREROLL_PACKETS
-          } else {
-            new_count.saturating_sub(probe.preroll_packets) > MAX_PROBE_PACKETS
-          };
-        if full
-          && self.empty_end == EmptyEnd::Commit
-          && (undecided || skips_may_leave_no_picture(self.options.skip_frame()))
-        {
-          // **A probe that fills with no picture, under a skip policy that
-          // may leave a stream with none, or before any packet that can
-          // give one, commits the candidate on trial**: a stream may go
-          // this long with no picture to give, and the candidate has taken
-          // every packet. The stream decoder's `Auto` takes the exhaustion
-          // below instead, and ends on software.
-          tracing::info!(
-            backend = ?self.state.backend,
-            packets = new_count,
-            bytes = new_bytes,
-            undecided,
-            "hwdecode: the probe filled with no picture it could give; committed"
-          );
-          self.probe = None;
-          None
+        if new_count > MAX_PROBE_PACKETS || new_bytes > MAX_PROBE_PACKET_BYTES {
+          // **At the ceiling the trial ends on this packet's answer, and
+          // never before it.** The history cannot take the packet, so the
+          // candidate is sent it with the history whole: taken, it is
+          // committed below, no failure claimed for a backend that has
+          // failed nothing; refused, it fails as on any packet, and the
+          // next backend is tried with the history as it stands.
+          Some(Staged::Last {
+            packets: new_count,
+            bytes: new_bytes,
+          })
         } else {
-          if full {
-            let probe = self.probe.take().expect("probe present");
-            tracing::warn!(
-              packets = new_count,
-              bytes = new_bytes,
-              side_data_entries = side_count,
-              max_packets = MAX_PROBE_PACKETS,
-              max_bytes = MAX_PROBE_PACKET_BYTES,
-              trigger = "byte_or_packet_cap",
-              "hwdecode: probe rescue exhausted before consuming packet; \
-             returning AllBackendsFailed without invoking decoder"
-            );
-            return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-              probe.attempts,
-              probe.buffered_packets,
-            )));
-          }
           // Step 3: copy before consuming. The history goes to the caller
           // as owned, mutable `Packet`s, so it keeps a payload of its own:
           // a reference to this one would carry the caller's later writes
@@ -1522,7 +1440,7 @@ impl VideoDecoder {
           // SAFETY: `packet` meets the `AVPacket` contract with every byte
           // written — this function's own contract, forwarded.
           match unsafe { crate::boundary::try_clone_packet(packet) } {
-            Ok(c) => Some((c, new_bytes, decodable)),
+            Ok(c) => Some(Staged::Recorded(c, new_bytes)),
             Err(e) => {
               let probe = self.probe.take().expect("probe present");
               tracing::warn!(
@@ -1543,20 +1461,28 @@ impl VideoDecoder {
 
       match self.state.inner.send_packet(packet) {
         Ok(()) => {
-          if let Some((cloned, new_bytes, decodable)) = staged_clone {
-            // Probe is still Some here: the only paths that take it are
-            // the bailouts above (which return) and `advance_probe`'s
-            // exhaustion (which would have propagated via `?`). Commit
-            // the clone now that FFmpeg has accepted the packet.
-            if let Some(probe) = self.probe.as_mut() {
-              probe.buffered_packets.push(cloned);
-              probe.buffered_bytes = new_bytes;
-              if decodable {
-                probe.decodable_packets += 1;
-              } else if probe.undecided() {
-                probe.preroll_packets += 1;
+          // Probe is still Some here: the only paths that take it are the
+          // bailouts above (which return) and `advance_probe`'s exhaustion
+          // (which would have propagated via `?`).
+          match staged {
+            // Record the clone now that FFmpeg has accepted the packet.
+            Some(Staged::Recorded(cloned, new_bytes)) => {
+              if let Some(probe) = self.probe.as_mut() {
+                probe.buffered_packets.push(cloned);
+                probe.buffered_bytes = new_bytes;
               }
             }
+            // The trial's last packet, taken: the candidate is committed.
+            Some(Staged::Last { packets, bytes }) => {
+              tracing::info!(
+                backend = ?self.state.backend,
+                packets,
+                bytes,
+                "hwdecode: the candidate took the packet past the probe's ceiling; committed"
+              );
+              self.probe = None;
+            }
+            None => {}
           }
           return Ok(Sent::Accepted);
         }
@@ -1715,13 +1641,13 @@ impl VideoDecoder {
           // was right for three of the four phases and quietly wrong for
           // the fourth: a candidate that has been replayed the whole
           // history *including the end* and still answers "nothing yet"
-          // has produced zero frames and never will. Answering the
-          // caller `NeedsInput` there asked for input nothing could
-          // supply; answering `Ended` would have credited a backend that
-          // never decoded a thing. It is a candidate failing, and the
-          // classifier says so by handing it back — straight into the
-          // probe road below, which is where candidate failures have
-          // always gone.
+          // has broken the drain, since libavcodec answers a decoder
+          // drained to its end with `AVERROR_EOF`. Answering the caller
+          // `NeedsInput` there asked for input nothing could supply;
+          // answering `Ended` would have taken a broken drain for a
+          // finished one. It is a candidate failing, and the classifier
+          // says so by handing it back — straight into the probe road
+          // below, which is where candidate failures have always gone.
           //
           // **And it reads the errno through the funnel, which is the
           // law this road lost and got back.** A `get_format`
@@ -1740,25 +1666,31 @@ impl VideoDecoder {
             // throw away the collection that just happened.
             Err(reason) => reason,
           };
-          // **A clean end with no picture, under a skip policy that may
-          // leave a stream with none, or after no packet that can give one,
-          // is the stream's end** — never the candidate failing. The
-          // candidate has been handed everything, and it answers with
-          // libavcodec's own end, no refusal latched.
-          if matches!(phase, SessionPhase::AuditioningPastEnd)
-            && matches!(&reason, Error::Ffmpeg(e) if is_transient(e))
-            && (skips_may_leave_no_picture(self.options.skip_frame())
-              || self.probe.as_ref().is_some_and(ProbeState::undecided))
+          // **A clean end is a successful empty completion**, at every
+          // skip level and for every codec. The candidate took the end and
+          // drained to libavcodec's own `AVERROR_EOF`, no refusal latched
+          // (a refusal would be the funnel's verdict instead): it did all
+          // it was asked and failed nothing, so it is committed, and the
+          // stream has ended. No skip level, flag or byte is read to doubt
+          // it — a stream may give no picture for reasons none of them
+          // foretells: hidden frames, pre-roll, a level the codec honours.
+          if phase == SessionPhase::AuditioningPastEnd
+            && matches!(reason, Error::Ffmpeg(ffmpeg_next::Error::Eof))
           {
-            return self.end_with_no_picture();
+            tracing::info!(
+              backend = ?self.state.backend,
+              "hwdecode: a clean end with no picture; committed"
+            );
+            self.probe = None;
+            return Ok(Received::Ended);
           }
           // **The same shared policy every hardware road uses.** This
           // road mints its own verdict (above), so it routes rather than
           // minting again. `CandidateFailure` is its reading of an
-          // unnamed verdict: a candidate that drains to `EOF` without
-          // ever producing a frame is a candidate failing, not a stream
-          // ending — which is why this road hands `AVERROR_EOF` to the
-          // probe while the send roads report it.
+          // unnamed verdict: what reaches here unnamed past the clean end
+          // above — `EAGAIN` after the end, a decode error, or an
+          // `AVERROR_EOF` before the end was taken, which libavcodec does
+          // not give — is the candidate failing.
           match self.hw_route(reason, BareVerdict::CandidateFailure) {
             HwRoute::Report(err) => return Err(err),
             HwRoute::Advance(err) => {
@@ -1924,11 +1856,11 @@ impl VideoDecoder {
     // for an already-empty frame.
     unsafe { av_frame_unref(self.hw_frame.as_mut_ptr()) };
     self.pending_frames.clear();
-    // The end belongs to the position being abandoned.
+    // The end belongs to the position being abandoned, and so does the
+    // history: the probe forgets it whole, every count with it.
     self.eof_sent = false;
     if let Some(probe) = self.probe.as_mut() {
-      probe.buffered_packets.clear();
-      probe.buffered_bytes = 0;
+      probe.forget_history();
     }
   }
 
@@ -1938,28 +1870,6 @@ impl VideoDecoder {
     // SAFETY: the state is this decoder's own, freed by `DecoderState`'s
     // drop only after the codec context that points at it.
     unsafe { ceiling_declination_of(self.state.callback_state) }
-  }
-
-  /// The probe's answer to a clean end that brought no picture, under a
-  /// skip policy that may leave a stream with none or after no packet that
-  /// can give one ([`EmptyEnd`]).
-  fn end_with_no_picture(&mut self) -> Result<Received> {
-    let Some(probe) = self.probe.take() else {
-      return Ok(Received::Ended);
-    };
-    match self.empty_end {
-      EmptyEnd::Commit => {
-        tracing::info!(
-          backend = ?self.state.backend,
-          "hwdecode: a clean end with no picture it could give; committed"
-        );
-        Ok(Received::Ended)
-      }
-      EmptyEnd::HandBack => Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-        probe.attempts,
-        probe.buffered_packets,
-      ))),
-    }
   }
 
   /// **The single hardware-exit funnel.** Every road that turns a
@@ -2033,10 +1943,15 @@ impl VideoDecoder {
   /// - `Err(_)` for other fatal conditions surfaced by probe machinery
   ///   itself (e.g. `alloc_av_frame` ENOMEM during replay drain).
   fn advance_probe(&mut self, last_error: Error) -> Result<()> {
-    self.advance_probe_with(last_error, Self::build_state)
+    let build = self
+      .probe
+      .as_ref()
+      .map_or(Self::build_state as BuildCandidate, |probe| probe.build);
+    self.advance_probe_with(last_error, build)
   }
 
-  /// [`Self::advance_probe`], with the candidate builder named.
+  /// [`Self::advance_probe`], with the candidate builder named: the
+  /// probe's own ([`ProbeState::build`]) on every road that advances.
   ///
   /// [`Self::build_state`] on every production road. A lane passes a
   /// builder that opens the candidate in software, which is how the
@@ -2971,11 +2886,15 @@ fn is_transient(e: &ffmpeg_next::Error) -> bool {
 ///   arrive. Past a recorded end it is an instruction the caller cannot
 ///   carry out — the send gates refuse — so it is the end instead. And
 ///   on a candidate that has already been handed the whole history
-///   including the end, it is neither: that candidate has produced no
-///   frame and never will, which is a candidate failing, so it goes
-///   back as an error for the probe machinery to act on.
-/// * `AVERROR_EOF` is [`Received::Ended`] only from a backend that has
-///   committed. A candidate's is its own exhaustion, not the stream's.
+///   including the end, it is neither: a drained decoder answers
+///   `AVERROR_EOF`, so that candidate has broken the drain, which is a
+///   candidate failing, and it goes back as an error for the probe
+///   machinery to act on.
+/// * `AVERROR_EOF` is [`Received::Ended`] from a backend that has
+///   committed. A candidate's goes back as an error: past the end it is
+///   the candidate's successful empty completion, which the receive road
+///   commits ([`VideoDecoder::receive_frame`]) — a state change no
+///   classifier makes — and before the end libavcodec does not give it.
 ///
 /// Making the phase an argument is what stops a road from having an
 /// opinion about this. A classification without it does not compile.
@@ -3481,16 +3400,6 @@ pub(crate) fn packet_side_data_count(packet: &Packet) -> usize {
   // SAFETY: side_data_elems is `c_int`, safe to read; clamp negatives to 0.
   let nel = unsafe { (*packet.as_ptr()).side_data_elems };
   if nel <= 0 { 0 } else { nel as usize }
-}
-
-/// Whether `packet` can give a picture: it carries bytes, and no
-/// `AV_PKT_FLAG_DISCARD`, the frame of which FFmpeg decodes and drops at
-/// every skip level (`libavcodec/decode.c` 1584–1586, 464–466, 645–648).
-fn may_give_a_picture(packet: &Packet) -> bool {
-  // SAFETY: `packet` keeps its `AVPacket` live for the call, and `flags`
-  // is a plain `c_int`.
-  let flags = unsafe { (*packet.as_ptr()).flags };
-  packet.size() > 0 && flags & ffmpeg_next::ffi::AV_PKT_FLAG_DISCARD == 0
 }
 
 /// Whether a decode session should **park** the frame a conversion

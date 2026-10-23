@@ -43,17 +43,21 @@ The backend-agnostic core it adapts has its own log at
 
 ### Fixed
 
-- **A hardware probe no longer fails a backend over an edit list's
-  pre-roll.** libavcodec decodes a packet flagged `AV_PKT_FLAG_DISCARD`
-  and drops its frame at every `skip_frame` level, so a run of them proves
-  no backend. The probe counts the packets that can give a picture: an end
-  after none is the stream's end — the backend that opened is committed,
-  and `DecodePath::Auto` ends on software — and a run longer than the
-  probe's 256 packets keeps it auditioning, up to 4096 packets and 64 MiB,
-  until a packet that can give a picture arrives. Before, the standalone
-  probe and `DecodePath::AnyHardware` answered `AllBackendsFailed`, and
-  `Auto` left a hardware decoder the pictures after the pre-roll would have
-  proved.
+- **A hardware probe judges a backend by its own answers alone.** A
+  picture commits a backend on trial and its own error fails it, as
+  before. A clean end — the end taken, then libavcodec's `AVERROR_EOF`
+  with no refusal latched — is now a successful empty completion that
+  commits it too, at every `skip_frame` level and for every codec. A
+  packet past the probe's ceiling (256 packets or 64 MiB) is sent to the
+  candidate with the history whole: taken, it commits the candidate;
+  refused, it fails it, and the next backend is tried with the whole
+  history. No skip level, codec, packet flag or payload is read to guess
+  what a backend should have given. Before, the standalone probe and
+  `DecodePath::AnyHardware` answered `AllBackendsFailed` at either, and
+  `DecodePath::Auto` left for software a hardware decoder that had failed
+  nothing: on a stream of VP9 or AV1 hidden frames, an edit list's
+  pre-roll (`AV_PKT_FLAG_DISCARD`), or a run longer than the ceiling with
+  no picture yet.
 
 ### Added
 
@@ -65,18 +69,11 @@ The backend-agnostic core it adapts has its own log at
   software decoder and a fallback's — and read back by `options()`. On a
   temporally scalable HEVC stream `Discard::NonReference` also skips
   pictures a higher sub-layer references, which the bitstream's
-  `DISPOSABLE` never marks. Under `skip_frame` = `Discard::All`, which
-  decodes no picture, no hardware probe runs, since a probe commits on its
-  first picture: an unpinned session (`DecodePath::Auto`) opens software at
-  once, `DecodePath::AnyHardware` and the standalone decoder's probe commit
-  to the first backend that opens, and a pinned backend opens as asked.
-  Each drains to its end with no picture. Under every other level above
-  `Discard::Default` — `NonReference`, `Bidirectional`, `NonIntra`,
-  `NonKey`, each a threshold — a stream may give no picture too (one of
-  pictures the level skips alone): the probe runs as ever while pictures
-  come, and a clean end, or a probe that fills, with none is the stream's
-  end. The backend that opened is committed, and `DecodePath::Auto` ends on
-  software. `Default` and `Nothing` skip no picture.
+  `DISPOSABLE` never marks. Which levels a decoder reads is the decoder's
+  — FFmpeg 9.0.1's VP9 decoder reads none, its native AV1 decoder
+  `NonIntra`, `NonKey` and `All` alone, and `libdav1d` decodes key frames
+  under `All` — so the hardware probe runs under every level, `All` among
+  them, and weighs a backend by its answers alone.
 - **One open road per video decoder, through an open request.** Each
   request holds every optional of its decoder's construction, with a
   getter, a consuming `with_*` and an in-place `set_*`, and is
