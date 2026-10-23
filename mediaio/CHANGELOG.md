@@ -11,7 +11,7 @@ crate moves only when it changes.
 
 ## [Unreleased]
 
-## [0.20.0] - unreleased
+## [0.20.0] - 2026-10-23
 
 ### Changed
 

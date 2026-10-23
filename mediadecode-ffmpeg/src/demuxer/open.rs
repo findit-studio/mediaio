@@ -102,7 +102,7 @@ impl DemuxerOpen {
   /// | `matroska,webm` | a `ContentEncryption` without a key id, and a track of more than one encoding |
   /// | `asf` | its content encryption, which FFmpeg names in the container's metadata alone, unread here, returning the payload as stored |
   /// | `asf_o` | its content encryption, whose objects FFmpeg skips |
-  /// | `wtv` | its protection, which FFmpeg logs, nothing more |
+  /// | `wtv` | its protection (`DSATTRIB_WMDRMProtectionInfo`) and a DVB-scrambled stream, each of which FFmpeg logs, nothing more |
   /// | `mxf` | an encrypted triplet read without a key, which FFmpeg returns as its ciphertext |
   /// | `mpegts`, `mpegtsraw` | a scrambled packet: FFmpeg never reads the transport scrambling control |
   /// | `concat`, `hls`, `dash` | any input they open, each through its own demuxer: a declaration of one is a declaration of every input it opens |

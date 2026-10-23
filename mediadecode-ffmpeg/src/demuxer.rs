@@ -3245,7 +3245,7 @@ struct AuditedDemuxer {
 /// | `matroska,webm` (`libavformat/matroskadec.c` 5037) | declared | a `ContentEncryption`'s key id is the stream's `enc_key_id` metadata (2062–2073, 3274–3277), read at the open | a `ContentEncryption` without a key id, whose blocks pass through undecrypted with a log line alone (2074–2076), and a track of more than one encoding (2055–2058) |
 /// | `asf` (`libavformat/asfdec_f.c` 1627) | declared | none on a stream or a packet | content encryption, logged and named in the container's metadata alone, which this crate does not read, the payload returned as stored (764–800) |
 /// | `asf_o` (`libavformat/asfdec_o.c` 1656) | declared | none | content encryption, whose objects are skipped as unknown (900–909, 163–194), and a stream's encrypted-content flag, read and not kept (619) |
-/// | `wtv` (`libavformat/wtvdec.c` 1093) | declared | none | `DSATTRIB_WMDRMProtectionInfo`, logged, nothing more (888–891) |
+/// | `wtv` (`libavformat/wtvdec.c` 1093) | declared | none | `DSATTRIB_WMDRMProtectionInfo` (888–891), and a DVB-scrambled stream, whose nonzero `EVENTID_DVBScramblingControlSpanningEvent` control is logged, nothing more (836–842); the payload is returned as stored either way |
 /// | `mxf` (`libavformat/mxfdec.c` 4366) | declared | none | an encrypted triplet read without a key, returned as its ciphertext (656–726) |
 /// | `mpegts` (`libavformat/mpegts.c` 3878), `mpegtsraw` (3892) | declared | none | a packet's transport scrambling control, never read (3223–3233); SAMPLE-AES is decrypted by `hls` alone (`hls.c` 909) |
 /// | `concat` (`libavformat/concatdec.c` 970) | declared | each child's own, on the packets it forwards | any child, opened with its own demuxer, its packets forwarded (337–368): the outer name says nothing of the child's, and a declaration of `concat` declares every child |
@@ -3339,8 +3339,12 @@ const AUDITED_DEMUXERS: &[AuditedDemuxer] = &[
     name: "wtv",
     reading: Reading::Declared,
     signals: "none",
-    limits: "DSATTRIB_WMDRMProtectionInfo is logged, nothing more",
-    sources: &["libavformat/wtvdec.c:1093", "libavformat/wtvdec.c:888-891"],
+    limits: "DSATTRIB_WMDRMProtectionInfo and a nonzero EVENTID_DVBScramblingControlSpanningEvent control (a DVB-scrambled stream) are each logged, nothing more; the payload is returned as stored",
+    sources: &[
+      "libavformat/wtvdec.c:1093",
+      "libavformat/wtvdec.c:888-891",
+      "libavformat/wtvdec.c:836-842",
+    ],
   },
   AuditedDemuxer {
     name: "mxf",
@@ -7069,10 +7073,11 @@ mod tests {
   /// declared**: ASF content encryption is logged and named in the
   /// container's metadata alone, its payload returned as stored
   /// (`libavformat/asfdec_f.c` 764–800), and WTV's
-  /// `DSATTRIB_WMDRMProtectionInfo` is logged, nothing more (`wtvdec.c`
-  /// 888–891), so neither is read by default ([`AUDITED_DEMUXERS`]). Each
-  /// file is written through FFmpeg's own muxer, of the packets the MP4
-  /// control reads and marks.
+  /// `DSATTRIB_WMDRMProtectionInfo` (`wtvdec.c` 888–891) and a
+  /// DVB-scrambled stream's nonzero `EVENTID_DVBScramblingControlSpanningEvent`
+  /// control (836–842) are each logged, nothing more, so neither is read
+  /// by default ([`AUDITED_DEMUXERS`]). Each file is written through
+  /// FFmpeg's own muxer, of the packets the MP4 control reads and marks.
   ///
   /// PLANT: `asf` read by default turns this red at "an ASF file, by
   /// default".

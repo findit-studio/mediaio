@@ -11,7 +11,7 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
-## [0.19.1] - unreleased
+## [0.19.1] - 2026-10-23
 
 ### Added
 
