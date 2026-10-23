@@ -54,6 +54,22 @@ The backend-agnostic core it adapts has its own log at
   FFmpeg 9 packet side-data kind is named as its headers name it: no
   version gates, and a kind a later FFmpeg adds persists, so its packet is
   never `DISPOSABLE`.
+- **BREAKING: a hardware probe's replay holds back no frame, and
+  `VideoDecoder::with_max_probe_pending_bytes` is removed.** A backend
+  tried after another fails is sent the probe's own packets, by reference
+  and with no copy made, as far as it takes them before it has output for
+  the caller; the rest it is fed as the caller drains, before anything
+  new. No frame is queued while a backend is on trial, so the budget the
+  method set has nothing left to bound. The packets go back with
+  `AllBackendsFailed` only once every decoder has let them go.
+- **BREAKING: a failure of this crate's own while a probe opens or
+  advances is reported as it is, never as `AllBackendsFailed`.** A copy
+  of the stream's parameters, or a codec context, that cannot be made is
+  the same for every backend. It used to be recorded against the backend
+  being opened, so it could answer `AllBackendsFailed`, the stream
+  decoder's cue for software, which the same failure meets; it is now the
+  error itself, with the backends still to try kept in the order and the
+  history whole.
 
 ### Fixed
 
@@ -78,6 +94,19 @@ The backend-agnostic core it adapts has its own log at
   nothing: on a stream of VP9 or AV1 hidden frames, an edit list's
   pre-roll (`AV_PKT_FLAG_DISCARD`), or a run longer than the ceiling with
   no picture yet.
+- **A backend on trial is charged with its own answers alone, by type.**
+  The probe's replay recorded against the next backend a packet copy
+  that could not be made, for a packet that backend never saw, and the
+  caps of its frame queue and the caller's frame limit against a backend
+  that had produced a picture; either could answer `AllBackendsFailed`,
+  so `DecodePath::Auto` left for software, and `DecodePath::AnyHardware`
+  failed, with a hardware decoder that worked. The probe now records and
+  advances on a candidate's own calls alone — its open, a send, a
+  receive, a download, and a surface pool its `get_format` declined —
+  and **a picture commits its backend before any limit of this crate's
+  is applied to it**: a picture over the caller's frame limit is
+  `HwTransferTooLarge` from a committed decoder, and a picture whose
+  properties cannot be copied is that decoder's own error.
 
 ### Added
 

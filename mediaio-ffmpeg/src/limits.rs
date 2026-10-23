@@ -37,10 +37,7 @@
 //! # The house shape
 //!
 //! `DEFAULT_*` consts, `Copy` options structs with `new` / getters /
-//! `with_*` / `set_*`, and a `with_*` seat on each session — the same
-//! shape `mediadecode-ffmpeg`'s `VideoDecoder::with_max_probe_pending_bytes`
-//! and its `DEFAULT_MAX_PROBE_PENDING_BYTES` already established for the
-//! probe-replay budget.
+//! `with_*` / `set_*`, and a `with_*` builder on each session.
 //!
 //! [law]: mediaspine::adapter#the-carrier-amputation-contract
 //! [gov]: mediaspine::adapter#the-resource-governance-contract

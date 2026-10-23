@@ -209,7 +209,7 @@ impl HwDeviceInitFailed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IsVariant)]
 pub enum FallbackOrigin {
   /// Before the first picture, while backends are on trial. Every failure
-  /// advances the probe, and when none is left
+  /// that is a backend's own advances the probe, and when none is left
   /// [`Error::AllBackendsFailed`] hands back the probe's buffered history
   /// — possibly empty, when the failure landed on the first packet.
   /// [`DecodePath::Auto`](crate::DecodePath::Auto) replays that history
@@ -240,10 +240,15 @@ pub enum FallbackOrigin {
 /// exhaustion, before the first picture. After it a hardware failure is
 /// that picture's own error.
 ///
-/// **Only backends' answers raise it, never the probe's own limits.** A
-/// packet the probe's history cannot keep — past its ceiling of 256
-/// packets or 64 MiB, of more side-data entries than it copies, or one
-/// whose copy cannot be made — ends the trial on the candidate's answer:
+/// **Only backends' answers raise it, never a failure of this crate's
+/// own.** An allocation or a copy this crate makes — the parameters a
+/// backend is built from, its codec context, a picture's properties — and
+/// the caller's limits on what a picture costs are reported as the errors
+/// they are, and a picture commits its backend before any of those limits
+/// is applied to it. A packet the probe's history cannot keep — past its
+/// ceiling of 256 packets or 64 MiB, of more side-data entries than it
+/// copies, or one whose copy cannot be made — ends the trial on the
+/// candidate's answer:
 /// the candidate that takes it is committed, and one that refuses it fails
 /// on that refusal as on any packet. After such a commit a failure is the
 /// committed decoder's own error, reported as it was minted, and comes with

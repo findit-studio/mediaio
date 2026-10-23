@@ -17,8 +17,8 @@ use ffmpeg_next::{
   },
   ffi::{
     AVBufferRef, AVFrame, AVHWFramesContext, AVMediaType, av_buffer_ref, av_buffer_unref,
-    av_frame_move_ref, av_frame_unref, av_hwdevice_ctx_create, av_hwframe_transfer_data,
-    avcodec_alloc_context3, avcodec_free_context, avcodec_parameters_to_context,
+    av_frame_unref, av_hwdevice_ctx_create, av_hwframe_transfer_data, avcodec_alloc_context3,
+    avcodec_free_context, avcodec_parameters_to_context,
   },
   frame,
 };
@@ -50,13 +50,15 @@ pub use open::VideoDecoderOpen;
 /// of FFmpeg's raw integer pixel formats can trigger.
 ///
 /// `open` does a true probe: each backend opens with a strict `get_format`
-/// callback. On the first non-transient error from a backend the decoder is
-/// torn down and the next backend in probe order is tried, with all packets
-/// seen so far replayed through it. The advance is *transactional* — the
-/// candidate backend must successfully build and accept the replayed packets
-/// before any probe state is consumed, so a failing backend in the middle of
-/// the order does not strand the caller without history. Once the first frame
-/// is delivered the probe collapses and subsequent calls go straight to the
+/// callback. On a backend's own failure (see below) the decoder is torn down
+/// and the next backend in probe order is tried with the history of packets
+/// seen so far. **The history stays the probe's own until a candidate
+/// commits.** A candidate is sent the history's packets themselves, each by
+/// reference, as far as it takes them before it has output for the caller,
+/// and the rest as the caller drains it. So a failing backend in the middle of
+/// the order does not strand the caller without history, no packet is copied
+/// a second time, and no frame is held back. Once the first frame is
+/// delivered the probe collapses and subsequent calls go straight to the
 /// active (committed) backend.
 ///
 /// # What the probe weighs
@@ -68,7 +70,7 @@ pub use open::VideoDecoderOpen;
 /// | the candidate's answer | the probe |
 /// |---|---|
 /// | a picture | commits it |
-/// | its own error: a send, a receive or a transfer failing, or a refusal this crate latched | fails it, and the next backend is tried with the whole history |
+/// | its own error: its opening, a send, a receive or a download failing, or its `get_format` declining the surface pool it declared ([`Error::HwSurfaceTooLarge`]) | fails it, and the next backend is tried with the whole history |
 /// | the end taken, then libavcodec's `AVERROR_EOF` with no refusal latched | a successful empty completion: commits it, and the stream has ended |
 /// | `EAGAIN` after the end | fails it: libavcodec answers a decoder drained to its end with `AVERROR_EOF` (`libavcodec/decode.c` 446–451, 489–505, 655–656 in FFmpeg 9.0.1), so a candidate that asks for input there has broken the drain |
 /// | a packet the history cannot keep: past the probe's ceiling (256 packets or 64 MiB), of more side-data entries than the probe copies (64), or one whose copy cannot be made | the trial's last: sent with the history whole, it commits the candidate once taken, and fails it as above if refused |
@@ -80,6 +82,20 @@ pub use open::VideoDecoderOpen;
 /// committed, a failure is that decoder's own error, reported as it was
 /// minted, with no history to replay: the history could not keep the
 /// packet, so no replay could have been whole.
+///
+/// **Nothing of this crate's own is a backend's answer, by type.** The
+/// probe records and advances on the candidate's answers alone, and only
+/// the candidate's own calls make one. Every failure of this crate's own is
+/// reported to the caller as the error it is: an allocation or a copy it
+/// makes (the parameters a candidate is built from, a codec context, a
+/// picture's properties), and the caller's limits on what a picture costs
+/// ([`Error::FrameBudgetExceeded`], [`Error::HwTransferTooLarge`]). None
+/// ends a trial, advances to another backend or enters
+/// [`Error::AllBackendsFailed`]: the backends still to try stay in the
+/// order, and the history stays whole. **A picture commits its candidate
+/// before any limit of this crate's is applied to it**, so a limit that
+/// refuses that picture is the committed decoder's error, never the
+/// candidate's.
 ///
 /// A skip level is the codec's to honour, not the probe's to assume.
 /// FFmpeg 9.0.1's VP9 decoder reads no `skip_frame` at all, the native AV1
@@ -137,19 +153,19 @@ pub struct VideoDecoder {
   hw_frame: frame::Video,
   /// Probe state: present until the first frame is received from the active
   /// backend, then `None`. While `Some`, packets are buffered for replay and
-  /// non-transient errors / decoder failures advance to the next backend.
+  /// the candidate's own answers advance to the next backend
+  /// ([`BackendAnswer`]).
   probe: Option<ProbeState>,
-  /// CPU-side frames produced by a candidate decoder during probe replay
-  /// (when its internal queue filled and we had to drain output before the
-  /// next `send_packet`). Already transferred from the candidate's
-  /// `AVHWFramesContext` to a CPU frame, so they remain valid after the
-  /// candidate state is committed. [`Self::receive_frame`] dequeues these
-  /// FIFO before reading from `state.inner`.
-  pending_frames: VecDeque<frame::Video>,
-  /// Per-decoder byte budget for [`Self::pending_frames`] during probe
-  /// replay. Defaults to [`DEFAULT_MAX_PROBE_PENDING_BYTES`]; override via
-  /// [`Self::with_max_probe_pending_bytes`].
-  max_probe_pending_bytes: usize,
+  /// The probe's history a candidate was committed before being fed, in
+  /// order: what its replay still owed when it gave its first picture
+  /// ([`Self::commit`]). Fed before anything new ([`Self::feed`]), each
+  /// packet dropped once the decoder takes it.
+  backlog: VecDeque<Packet>,
+  /// Whether the end the caller already gave ([`Self::eof_sent`]) is still
+  /// owed to the decoder: a candidate replayed a history that ends stops
+  /// where it first has output for the caller, before the end
+  /// ([`Self::feed`]). Implies `eof_sent`.
+  end_owed: bool,
   /// Resource ceilings for the frames this decoder produces. Fixed at
   /// open, because [`FrameLimits::max_pixels`] is written into every
   /// `AVCodecContext` this decoder builds — including the ones a probe
@@ -271,55 +287,6 @@ pub(crate) const MAX_PROBE_PACKET_SIDE_DATA_ENTRIES: usize = 64;
 /// would let many tiny entries slip past the cap.
 const SIDE_DATA_ENTRY_OVERHEAD: usize = 80;
 
-/// Conservative upper-bound bytes-per-pixel multiplier used to estimate
-/// the size of a CPU frame **before** `av_hwframe_transfer_data`
-/// allocates its pixel buffers. Covers every HW download format this
-/// crate produces (worst case is `P416LE` / `P412LE` at 6 bytes/pixel
-/// for 16-bit 4:4:4 semi-planar) plus a margin for FFmpeg's per-row
-/// stride alignment (typically 32-byte aligned, ~5% extra at HD widths
-/// and below).
-///
-/// Used by [`drain_into_pending`] as a pre-transfer guard: if the
-/// product `width * height * WORST_CASE_BYTES_PER_PIXEL` would already
-/// push `pending_bytes` past `max_probe_pending_bytes`, the candidate
-/// replay refuses the frame *before* allocating. Without this, FFmpeg
-/// would perform the full HW→CPU download (potentially ~100 MiB for
-/// 8K HDR) and we would only reject the frame after RSS had already
-/// spiked. The post-transfer accounting via [`cpu_frame_bytes`] stays in
-/// place as a backstop using the frame's actual stride/format.
-///
-/// Slightly over-charges true 4:2:0 NV12 / P010 frames (which dominate
-/// real workloads) — that's the right side to err on. Callers feeding
-/// 8K+ workloads through the probe path can tune
-/// [`VideoDecoder::with_max_probe_pending_bytes`] upward to compensate.
-const WORST_CASE_BYTES_PER_PIXEL: usize = 8;
-
-/// Maximum number of CPU frames we are willing to queue from a candidate
-/// during probe replay. Each frame is a fully-allocated CPU buffer
-/// (~3 MiB for 1080p NV12, ~24 MiB for 4K P010, ~96 MiB for 8K P010), so
-/// an unbounded queue would OOM on a candidate with a shallow internal
-/// queue against a deep replay history. This cap, together with
-/// [`DEFAULT_MAX_PROBE_PENDING_BYTES`], is enforced as a hard limit during
-/// replay: once either limit is reached, probe buffering fails for the
-/// candidate (returns `ENOMEM` from `drain_into_pending`) instead of
-/// queueing additional drained frames. The probe loop then advances to
-/// the next backend or returns `Error::AllBackendsFailed` if exhausted.
-const MAX_PROBE_PENDING_FRAMES: usize = 16;
-
-/// Default byte budget for probe-replay drained frames. 256 MiB is enough
-/// for 16 frames at 4K P010 (~24 MiB each = 384 MiB worst case under the
-/// count cap), and is the cap that fires first for very high-resolution
-/// content (8K P010: ~96 MiB per frame → only ~2 frames fit).
-///
-/// Override per-decoder with [`VideoDecoder::with_max_probe_pending_bytes`]
-/// when targeting 8K+ workloads or memory-constrained environments.
-///
-/// TODO: when frames significantly exceed typical sizes, consider
-/// memmap-backed pending buffers (write transferred frames to a temp file
-/// or shared-memory segment) so the resident set stays bounded even when
-/// the byte cap is raised. Out of scope for now.
-pub const DEFAULT_MAX_PROBE_PENDING_BYTES: usize = 256 * 1024 * 1024;
-
 /// Where a decoding session is in its life — **the one derived fact the
 /// classifiers read, and the only place the latches are interpreted.**
 ///
@@ -413,7 +380,70 @@ enum HwRoute {
   /// Hand this to the caller.
   Report(Error),
   /// The active candidate failed: advance the probe and retry.
-  Advance(Error),
+  Advance(BackendAnswer),
+}
+
+/// **A candidate's own answer, and the only thing the probe records
+/// against a backend or advances on.**
+///
+/// It is made at the roads a candidate answers by, and nowhere else: its
+/// opening ([`Self::of_open`]), and its own FFmpeg calls — a send, a
+/// receive, a download — read through the funnel, which names a refusal its
+/// `get_format` latched ([`Self::of_call`]). A failure of this crate's own —
+/// an allocation, a copy, a cap, the caller's limits on what a picture costs
+/// — is an [`Error`], surfaced as it is. The probe's record ([`ProbeState::attempts`]) and its
+/// advance ([`VideoDecoder::advance_probe_with`], [`HwRoute::Advance`]) take
+/// this type alone, so no such failure can enter the one or start the
+/// other: what is charged to a backend is, by type, something the backend
+/// said.
+#[derive(Debug)]
+pub(crate) struct BackendAnswer(Error);
+
+impl BackendAnswer {
+  /// What one of a candidate's own calls answered: `reason`, the funnel's
+  /// verdict on the call's errno ([`VideoDecoder::hw_route`]).
+  const fn of_call(reason: Error) -> Self {
+    Self(reason)
+  }
+
+  /// What a backend answered when it was opened for the stream: the codec
+  /// offers it no hardware configuration, its device would not be created,
+  /// or the codec would not open on it ([`VideoDecoder::build_state`]).
+  const fn of_open(reason: Error) -> Self {
+    Self(reason)
+  }
+
+  /// The answer, as the error a caller reads.
+  fn into_error(self) -> Error {
+    self.0
+  }
+}
+
+/// The record a probe hands the caller: each backend's answer, as the error
+/// it was.
+fn answered(attempts: Vec<(Backend, BackendAnswer)>) -> Vec<(Backend, Box<Error>)> {
+  attempts
+    .into_iter()
+    .map(|(backend, answer)| (backend, Box::new(answer.into_error())))
+    .collect()
+}
+
+/// Why a candidate could not be built ([`BuildCandidate`]).
+enum BuildFailure {
+  /// The backend's own answer: it cannot take the stream.
+  Refused(BackendAnswer),
+  /// A failure of this crate's own, or the stream's — the same for every
+  /// backend: surfaced as it is, and no backend's answer.
+  Local(Error),
+}
+
+impl From<BuildFailure> for Error {
+  fn from(failure: BuildFailure) -> Self {
+    match failure {
+      BuildFailure::Refused(answer) => answer.into_error(),
+      BuildFailure::Local(error) => error,
+    }
+  }
 }
 
 /// How [`VideoDecoder::advance_probe_with`] builds a candidate: the
@@ -426,7 +456,39 @@ type BuildCandidate = fn(
   crate::limits::DecoderLimits,
   crate::DecoderOptions,
   Option<mediadecode::Timebase>,
-) -> Result<DecoderState>;
+) -> std::result::Result<DecoderState, BuildFailure>;
+
+/// How far [`VideoDecoder::feed`] got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fed {
+  /// What the decoder took: packets, and the end.
+  taken: usize,
+  /// Whether it took everything it was owed; where not, it answered
+  /// `EAGAIN` first, with output for the caller.
+  all: bool,
+}
+
+/// What feeding the decoder what it is owed came to, routed as a send is
+/// ([`VideoDecoder::feed_owed`]).
+enum Owed {
+  /// Everything owed was taken.
+  Taken,
+  /// The decoder answered `EAGAIN` first: it has output for the caller.
+  Full,
+  /// A committed decoder refused it: that packet's own error.
+  Report(Error),
+  /// The candidate on trial refused it: its own answer.
+  Advance(BackendAnswer),
+}
+
+/// How far [`feed_into`] got with a replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Taken {
+  /// How many of the history's packets the candidate took, in order.
+  packets: usize,
+  /// Whether it took the end.
+  end: bool,
+}
 
 /// What [`VideoDecoder::send_av_packet`] does with a packet once the
 /// candidate on trial takes it.
@@ -495,12 +557,17 @@ struct ProbeState {
   /// Cumulative size (in compressed bytes) of `buffered_packets`. Tracked
   /// incrementally so we don't have to re-sum on every send.
   buffered_bytes: usize,
-  /// Per-backend errors captured since the probe window opened. Pushed
-  /// whenever a backend's failure triggers `advance_probe` (the active
-  /// backend that just failed) or a candidate's build / replay rejects
-  /// it. Drained into [`Error::AllBackendsFailed`] when the probe
-  /// exhausts every option.
-  attempts: Vec<(Backend, Box<Error>)>,
+  /// How many of `buffered_packets` the candidate on trial has been fed:
+  /// all of them, but after an advance whose replay stopped where the
+  /// candidate first had output for the caller ([`feed_into`]). The rest
+  /// is owed, and fed before anything new ([`VideoDecoder::feed`]).
+  fed: usize,
+  /// Each backend's answer since the probe window opened, in the order
+  /// tried: a backend that failed to open, the active one when it fails,
+  /// and a candidate that refused its replay. A [`BackendAnswer`] alone, so
+  /// nothing of this crate's own is ever charged here. Drained into
+  /// [`Error::AllBackendsFailed`] when the probe exhausts every option.
+  attempts: Vec<(Backend, BackendAnswer)>,
 }
 
 impl ProbeState {
@@ -523,9 +590,11 @@ impl ProbeState {
       attempts: _,
       buffered_packets,
       buffered_bytes,
+      fed,
     } = self;
     buffered_packets.clear();
     *buffered_bytes = 0;
+    *fed = 0;
   }
 }
 
@@ -577,8 +646,10 @@ impl VideoDecoder {
   /// frame from a HW context) the decoder is torn down and the next backend
   /// is tried — packets sent so far are replayed through the new decoder
   /// transparently. The probe advance is transactional: the next backend
-  /// must build *and* accept the replayed history before any probe state is
-  /// consumed, so a misbehaving middle backend cannot strand the caller.
+  /// must build *and* take the history, as far as it takes it before it has
+  /// output for the caller, before it replaces the one that failed; the
+  /// history stays the probe's own, so a misbehaving middle backend cannot
+  /// strand the caller.
   ///
   /// [`Self::backend`] reflects whichever backend ultimately produced the
   /// first frame.
@@ -724,21 +795,16 @@ impl VideoDecoder {
   ) -> Result<Self> {
     let codec = find_decoder(&parameters)?;
 
-    let mut attempts: Vec<(Backend, Box<Error>)> = Vec::new();
+    let mut attempts: Vec<(Backend, BackendAnswer)> = Vec::new();
     for (i, &backend) in order.iter().enumerate() {
       // Use the checked clone — ffmpeg-next's `Parameters::clone` does
       // `avcodec_parameters_alloc` without a null check and ignores the
       // return of `avcodec_parameters_copy`. Under OOM that path silently
       // produces a Parameters with a null inner pointer.
-      let cloned_for_build =
-        match try_clone_parameters(&parameters, limits.max_codec_parameter_bytes()) {
-          Ok(p) => p,
-          Err(e) => {
-            tracing::warn!(?backend, error = %e, "hwdecode: parameters clone failed");
-            attempts.push((backend, Box::new(e)));
-            continue;
-          }
-        };
+      //
+      // **The copy is this crate's own, and no backend's answer**: it is
+      // surfaced as it is, and the next backend would need the same copy.
+      let cloned_for_build = try_clone_parameters(&parameters, limits.max_codec_parameter_bytes())?;
       match Self::build_state(
         cloned_for_build,
         codec,
@@ -794,6 +860,7 @@ impl VideoDecoder {
               build: Self::build_state,
               buffered_packets: Vec::new(),
               buffered_bytes: 0,
+              fed: 0,
               attempts: std::mem::take(&mut attempts),
             },
             Err(e) => {
@@ -809,8 +876,8 @@ impl VideoDecoder {
             state,
             hw_frame: alloc_av_frame().map_err(Error::Ffmpeg)?,
             probe: Some(probe),
-            pending_frames: VecDeque::new(),
-            max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
+            backlog: VecDeque::new(),
+            end_owed: false,
             frame_limits: limits,
             pkt_timebase,
             options,
@@ -818,15 +885,18 @@ impl VideoDecoder {
             scaled_output: crate::vtscale::ScaledOutput::new(),
           });
         }
-        Err(e) => {
-          tracing::warn!(?backend, error = %e, "hwdecode: backend open failed");
-          attempts.push((backend, Box::new(e)));
+        Err(BuildFailure::Refused(answer)) => {
+          tracing::warn!(?backend, error = ?answer, "hwdecode: backend open failed");
+          attempts.push((backend, answer));
         }
+        // This crate's own failure, or the stream's: the same for every
+        // backend, so surfaced as it is rather than charged to this one.
+        Err(BuildFailure::Local(e)) => return Err(e),
       }
     }
     // No packets have been consumed at open time.
     Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-      attempts,
+      answered(attempts),
       Vec::new(),
     )))
   }
@@ -914,8 +984,8 @@ impl VideoDecoder {
       state,
       hw_frame: alloc_av_frame().map_err(Error::Ffmpeg)?,
       probe: None,
-      pending_frames: VecDeque::new(),
-      max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
+      backlog: VecDeque::new(),
+      end_owed: false,
       frame_limits: limits,
       pkt_timebase,
       options,
@@ -985,6 +1055,7 @@ impl VideoDecoder {
       build: Self::build_state,
       buffered_packets: Vec::new(),
       buffered_bytes: 0,
+      fed: 0,
       attempts: Vec::new(),
     });
     let backend = backend::probe_order()
@@ -996,8 +1067,8 @@ impl VideoDecoder {
       state,
       hw_frame: alloc_av_frame().map_err(Error::Ffmpeg)?,
       probe,
-      pending_frames: VecDeque::new(),
-      max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
+      backlog: VecDeque::new(),
+      end_owed: false,
       frame_limits: limits,
       pkt_timebase: None,
       options,
@@ -1019,37 +1090,20 @@ impl VideoDecoder {
     limits: crate::limits::DecoderLimits,
     options: crate::DecoderOptions,
     pkt_timebase: Option<mediadecode::Timebase>,
-  ) -> Result<DecoderState> {
-    let (ctx, callback_state) = build_codec_context(&parameters, limits, options, pkt_timebase)?;
-    let opened = ctx.decoder().open_as(codec).map_err(Error::Ffmpeg)?;
-    ensure_video_codec_type(&opened)?;
+  ) -> std::result::Result<DecoderState, BuildFailure> {
+    let (ctx, callback_state) = build_codec_context(&parameters, limits, options, pkt_timebase)
+      .map_err(BuildFailure::Local)?;
+    let opened = ctx
+      .decoder()
+      .open_as(codec)
+      .map_err(|e| BuildFailure::Refused(BackendAnswer::of_open(Error::Ffmpeg(e))))?;
+    ensure_video_codec_type(&opened).map_err(BuildFailure::Local)?;
     Ok(DecoderState {
       inner: ManuallyDrop::new(ffmpeg_next::decoder::Video(opened)),
       backend,
       hw_device_ref: ptr::null_mut(),
       callback_state: callback_state.into_raw(),
     })
-  }
-
-  /// Override the byte budget for probe-replay queued frames. Defaults to
-  /// [`DEFAULT_MAX_PROBE_PENDING_BYTES`]. Use a higher value when targeting
-  /// 8K+ workloads where 16 frames at full size could exceed the default;
-  /// use a lower value in memory-constrained services to bound peak
-  /// allocation more tightly.
-  ///
-  /// Setting after the first frame has been delivered is harmless but has
-  /// no observable effect — the probe has already collapsed and the cap
-  /// only applies during replay drain.
-  ///
-  /// Returns `self` for builder-style chaining:
-  /// ```ignore
-  /// let decoder = VideoDecoder::open(params)?
-  ///     .with_max_probe_pending_bytes(1024 * 1024 * 1024); // 1 GiB
-  /// ```
-  #[must_use]
-  pub fn with_max_probe_pending_bytes(mut self, bytes: usize) -> Self {
-    self.max_probe_pending_bytes = bytes;
-    self
   }
 
   /// The backend currently producing frames. While the probe is still in
@@ -1118,8 +1172,8 @@ impl VideoDecoder {
   /// The stage is consulted per frame, on the way out of the decoder
   /// and before the GPU→CPU download. So a request placed mid-stream
   /// takes effect on the next picture `receive_frame` produces — never
-  /// retroactively on one already decoded and queued, and never later
-  /// than that.
+  /// retroactively on one it has already produced, and never later than
+  /// that.
   ///
   /// # Refusal is not an error
   ///
@@ -1275,7 +1329,9 @@ impl VideoDecoder {
       VerdictRouting::Unnamed => matches!(bare, BareVerdict::CandidateFailure),
     };
     if candidate_failed && self.probe.is_some() {
-      return HwRoute::Advance(reason);
+      // **Where a backend's answer is made, on every road a call answers
+      // by**: `reason` is the funnel's verdict on the candidate's own call.
+      return HwRoute::Advance(BackendAnswer::of_call(reason));
     }
     HwRoute::Report(reason)
   }
@@ -1420,10 +1476,30 @@ impl VideoDecoder {
   /// through it — no `Packet::data_mut`, no in-place write — until this
   /// decoder is flushed or dropped.
   pub unsafe fn send_av_packet(&mut self, packet: &Packet) -> Result<Sent> {
+    // **A submission after the end is the caller's fault**, whether or not
+    // the decoder has yet been handed that end: one still owed behind a
+    // replay is the caller's all the same.
+    if self.end_owed {
+      return Err(Error::Ffmpeg(ffmpeg_next::Error::Eof));
+    }
     loop {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
       let phase = self.phase();
+      // **What the decoder is owed goes first**, in order: a replay that
+      // stopped at the candidate's first output, or a backlog a commit
+      // left. While it cannot all be taken, this packet waits.
+      if let Some(route) = self.feed_owed() {
+        match route {
+          Owed::Taken => {}
+          Owed::Full => return Ok(Sent::MustDrain),
+          Owed::Report(err) => return Err(err),
+          Owed::Advance(answer) => {
+            self.advance_probe(answer)?;
+            continue;
+          }
+        }
+      }
       // Pre-flight while probe is active: prove we can record this
       // packet for replay BEFORE the active decoder consumes it.
       // `staged` carries what the probe does with the packet through the
@@ -1488,10 +1564,13 @@ impl VideoDecoder {
           // bailouts above (which return) and `advance_probe`'s exhaustion
           // (which would have propagated via `?`).
           match staged {
-            // Record the clone now that FFmpeg has accepted the packet.
+            // Record the clone now that FFmpeg has accepted the packet:
+            // the candidate on trial has been fed the whole history, this
+            // packet included — what it was owed went first, above.
             Some(Staged::Recorded(cloned, new_bytes)) => {
               if let Some(probe) = self.probe.as_mut() {
                 probe.buffered_packets.push(cloned);
+                probe.fed = probe.buffered_packets.len();
                 probe.buffered_bytes = new_bytes;
               }
             }
@@ -1504,7 +1583,7 @@ impl VideoDecoder {
                 reason = %unkept,
                 "hwdecode: the candidate took a packet the probe could not keep; committed"
               );
-              self.probe = None;
+              self.commit();
             }
             None => {}
           }
@@ -1578,10 +1657,27 @@ impl VideoDecoder {
   /// After commit a failure here is reported as it was minted, as on
   /// [`Self::send_packet`], and nothing is remembered.
   pub fn send_eof(&mut self) -> Result<Sent> {
+    // A second end, though the decoder is still owed the first: the
+    // caller's fault, as libavcodec answers a second flush packet.
+    if self.end_owed {
+      return Err(Error::Ffmpeg(ffmpeg_next::Error::Eof));
+    }
     loop {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
       let phase = self.phase();
+      // What the decoder is owed goes first, as on `send_packet`.
+      if let Some(route) = self.feed_owed() {
+        match route {
+          Owed::Taken => {}
+          Owed::Full => return Ok(Sent::MustDrain),
+          Owed::Report(err) => return Err(err),
+          Owed::Advance(answer) => {
+            self.advance_probe(answer)?;
+            continue;
+          }
+        }
+      }
       match self.state.inner.send_eof() {
         Ok(()) => {
           self.eof_sent = true;
@@ -1618,13 +1714,21 @@ impl VideoDecoder {
   /// unref'd first, so reuse across resolution changes or different
   /// decoders is safe.
   ///
-  /// While the probe window is open, *any* non-transient failure (decode
-  /// error, transfer error, copy_props error, or a CPU-format frame from a
-  /// HW-opened context) tears down the current decoder and advances to the
-  /// next hardware backend in probe order, replaying buffered packets
-  /// through it. Frames the candidate produced during replay (drained when
-  /// `send_packet` returned EAGAIN) are queued and delivered FIFO via this
-  /// method, so the caller never loses initial frames after a fallback.
+  /// While the probe window is open, the candidate's own failure (a decode
+  /// error, a download error, or a CPU-format frame from a HW-opened
+  /// context) tears down the current decoder and advances to the next
+  /// hardware backend in probe order, replaying buffered packets through
+  /// it — up to the candidate's first output, the rest fed as the caller
+  /// drains it, so the caller never loses initial frames after a fallback
+  /// and no frame is queued meanwhile.
+  ///
+  /// **The first picture commits the candidate, before any limit of this
+  /// crate's is applied to it.** A picture whose download would cost more
+  /// than the caller's frame limit ([`Error::HwTransferTooLarge`]), or one
+  /// whose properties this crate cannot copy, is reported as a committed
+  /// decoder's error: the limit and the copy are this crate's, never the
+  /// backend's answer, so neither advances the probe nor enters its
+  /// record.
   ///
   /// This crate is hardware-only: there is no software fallback inside the
   /// decoder. When every backend in the probe order has been exhausted —
@@ -1644,19 +1748,37 @@ impl VideoDecoder {
   /// stops here** — the two flow signals never leave this crate as
   /// `Error::Ffmpeg`, so a caller has nothing to decode.
   pub fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received> {
-    // Pre-drain frames queued during probe replay. They are already CPU-side
-    // (transferred at drain time, when the candidate's HW context was alive)
-    // so we just move them into the caller's slot.
-    if self.try_pop_pending(frame) {
-      return Ok(Received::Produced);
-    }
-
     loop {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
       let phase = self.phase();
       let res = self.state.inner.receive_frame(&mut self.hw_frame);
       match res {
+        // **A decoder that wants input is fed what it is owed first**: a
+        // replay that stopped at a candidate's first output, a backlog a
+        // commit left, an end still owed. Only once nothing is owed, or the
+        // decoder takes none of it, does its `EAGAIN` mean what the phase
+        // says it means.
+        Err(e) if is_eagain(&e) && self.owes() => match self.feed() {
+          Ok(Fed { taken, .. }) if taken > 0 => continue,
+          Ok(_) => match self.hw_receive(e, phase) {
+            Ok(status) => return Ok(status),
+            Err(reason) => match self.hw_route(reason, BareVerdict::CandidateFailure) {
+              HwRoute::Report(err) => return Err(err),
+              HwRoute::Advance(answer) => {
+                self.advance_probe(answer)?;
+                continue;
+              }
+            },
+          },
+          Err(refused) => match self.hw_failure(refused, BareVerdict::CandidateFailure) {
+            HwRoute::Report(err) => return Err(err),
+            HwRoute::Advance(answer) => {
+              self.advance_probe(answer)?;
+              continue;
+            }
+          },
+        },
         Err(e) => {
           // **The phase decides whether this errno is a protocol state
           // at all, and this arm holds no opinion of its own.**
@@ -1705,7 +1827,7 @@ impl VideoDecoder {
               backend = ?self.state.backend,
               "hwdecode: a clean end with no picture; committed"
             );
-            self.probe = None;
+            self.commit();
             return Ok(Received::Ended);
           }
           // **The same shared policy every hardware road uses.** This
@@ -1717,14 +1839,8 @@ impl VideoDecoder {
           // not give — is the candidate failing.
           match self.hw_route(reason, BareVerdict::CandidateFailure) {
             HwRoute::Report(err) => return Err(err),
-            HwRoute::Advance(err) => {
-              self.advance_probe(err)?;
-              // Probe advance may have populated `pending_frames`;
-              // deliver one of those before reading more from the new
-              // candidate.
-              if self.try_pop_pending(frame) {
-                return Ok(Received::Produced);
-              }
+            HwRoute::Advance(answer) => {
+              self.advance_probe(answer)?;
               continue;
             }
           }
@@ -1741,8 +1857,7 @@ impl VideoDecoder {
           // hook reaches this allocation — `hwaccel->alloc_frame`
           // bypasses `get_buffer2` entirely, and the CPU destination is
           // allocated by `av_hwframe_transfer_data` outside both — so
-          // this is the seat that bounds what the hardware road hands
-          // back.
+          // this judge is what bounds what the hardware road hands back.
           //
           // Judged out here rather than inside `transfer_hw_frame`
           // deliberately. Errors from that function are FFmpeg's, and
@@ -1752,9 +1867,16 @@ impl VideoDecoder {
           // would decode the same oversized frame and be refused again,
           // so routing it as one is exactly the wrong answer. The named
           // refusal returns straight to the caller.
+          //
+          // **And a picture came, so the candidate is committed first.**
+          // The limit is this crate's, never the backend's answer: a
+          // candidate whose picture the ceiling refuses has decoded it,
+          // and is the session's decoder from here, the refusal reported
+          // as a committed decoder's.
           if let Err(e) =
             unsafe { judge_hw_transfer(self.hw_frame.as_ptr(), self.frame_limits.frame()) }
           {
+            self.commit();
             return Err(Error::HwTransferTooLarge(e));
           }
           // **The scaled-output stage, and the one place it sits.** A
@@ -1792,7 +1914,7 @@ impl VideoDecoder {
             .map(|fitted| unsafe { transfer_hw_frame(frame, fitted) });
           match scaled {
             Some(Ok(())) => {
-              self.probe = None;
+              self.commit();
               return Ok(Received::Produced);
             }
             Some(Err(e)) => {
@@ -1813,27 +1935,32 @@ impl VideoDecoder {
           }
           match unsafe { transfer_hw_frame(frame, &self.hw_frame) } {
             Ok(()) => {
-              self.probe = None;
+              self.commit();
               return Ok(Received::Produced);
             }
-            Err(e) => {
-              // The same shared policy. A transfer failure is an
-              // HW-output problem — an unsupported CPU pix_fmt surfaces
-              // as `AVERROR(EINVAL)`, a context loss as Bug/Bug2/Unknown
-              // — never input corruption, so while a candidate is on
-              // trial it is that candidate failing.
+            Err(TransferFailure::Download(e)) => {
+              // The same shared policy. A download failure is the
+              // backend's own answer — an unsupported CPU pix_fmt surfaces
+              // as `AVERROR(EINVAL)`, a context loss as Bug/Bug2/Unknown —
+              // never input corruption, so while a candidate is on trial
+              // it is that candidate failing.
               match self.hw_failure(e, BareVerdict::CandidateFailure) {
                 HwRoute::Report(err) => return Err(err),
-                HwRoute::Advance(err) => {
-                  self.advance_probe(err)?;
+                HwRoute::Advance(answer) => {
+                  self.advance_probe(answer)?;
                   // SAFETY: as above — the caller's slot, cleared whole.
                   unsafe { av_frame_unref(frame.as_inner_mut().as_mut_ptr()) };
-                  if self.try_pop_pending(frame) {
-                    return Ok(Received::Produced);
-                  }
                   continue;
                 }
               }
+            }
+            // **The picture came and downloaded; what failed is this
+            // crate's own copy of its properties.** No backend's answer:
+            // the candidate is committed, and the failure surfaced as a
+            // committed decoder's.
+            Err(TransferFailure::Properties(e)) => {
+              self.commit();
+              return Err(Error::Ffmpeg(e));
             }
           }
         }
@@ -1841,34 +1968,127 @@ impl VideoDecoder {
     }
   }
 
-  /// Pop one queued frame (produced by a candidate decoder during probe
-  /// replay) into the caller's slot. Returns `true` when a frame was
-  /// delivered, `false` when the queue was empty.
-  fn try_pop_pending(&mut self, frame: &mut Frame) -> bool {
-    let Some(mut buffered) = self.pending_frames.pop_front() else {
-      return false;
-    };
-    // SAFETY: `buffered` is a CPU-side AVFrame we previously transferred
-    // and pushed into the queue; both pointers are valid. The slot is
-    // cleared whole and then takes `buffered` whole, so its geometry and
-    // its buffers arrive together, as `as_inner_mut`'s contract asks.
-    unsafe {
-      av_frame_unref(frame.as_inner_mut().as_mut_ptr());
-      av_frame_move_ref(frame.as_inner_mut().as_mut_ptr(), buffered.as_mut_ptr());
+  /// **Commits the candidate on trial**: the probe ends, and what its
+  /// history still owed the candidate — the packets a replay stopped short
+  /// of, at the candidate's first output — moves to the backlog, fed before
+  /// anything new ([`Self::feed`]). A no-op for a committed decoder.
+  fn commit(&mut self) {
+    if let Some(mut probe) = self.probe.take() {
+      let fed = probe.fed.min(probe.buffered_packets.len());
+      self.backlog.extend(probe.buffered_packets.drain(fed..));
     }
-    // Probe semantics: delivering a frame collapses the probe.
-    self.probe = None;
-    true
+  }
+
+  /// Whether the decoder is owed anything: the history's unfed packets
+  /// while a candidate is on trial, the backlog once committed, or the end.
+  fn owes(&self) -> bool {
+    self
+      .probe
+      .as_ref()
+      .is_some_and(|probe| probe.fed < probe.buffered_packets.len())
+      || !self.backlog.is_empty()
+      || self.end_owed
+  }
+
+  /// Feeds the active decoder, in order, what it is owed: the history's
+  /// unfed packets while it is on trial — the history keeps them for a
+  /// later advance, and the decoder takes a reference to each, no copy —
+  /// then the backlog once it is committed, each packet dropped once
+  /// taken; then the end, where the caller's was not yet passed on. Stops
+  /// where the decoder first answers `EAGAIN`, having output for the
+  /// caller first.
+  ///
+  /// A refusal is the decoder's own answer, returned raw for the road to
+  /// read through its funnel, and that packet is not sent to it again:
+  /// libavcodec queues a packet before decoding it (`avcodec_send_packet`,
+  /// `libavcodec/decode.c` 745–758 in FFmpeg 9.0.1), so an error out of the
+  /// decode answers a packet the decoder took. A candidate's stays in the
+  /// history, whole for the next candidate, which is replayed it from the
+  /// start; a committed decoder's is that packet's own error, and is
+  /// dropped.
+  fn feed(&mut self) -> std::result::Result<Fed, ffmpeg_next::Error> {
+    let mut taken = 0;
+    if let Some(probe) = self.probe.as_mut() {
+      while let Some(packet) = probe.buffered_packets.get(probe.fed) {
+        match self.state.inner.send_packet(packet) {
+          Ok(()) => {
+            probe.fed += 1;
+            taken += 1;
+          }
+          Err(e) if is_eagain(&e) => return Ok(Fed { taken, all: false }),
+          Err(e) => {
+            probe.fed += 1;
+            return Err(e);
+          }
+        }
+      }
+    }
+    while let Some(packet) = self.backlog.front() {
+      match self.state.inner.send_packet(packet) {
+        Ok(()) => {
+          self.backlog.pop_front();
+          taken += 1;
+        }
+        Err(e) if is_eagain(&e) => return Ok(Fed { taken, all: false }),
+        Err(e) => {
+          self.backlog.pop_front();
+          return Err(e);
+        }
+      }
+    }
+    if self.end_owed {
+      match self.state.inner.send_eof() {
+        Ok(()) => {
+          self.end_owed = false;
+          taken += 1;
+        }
+        Err(e) if is_eagain(&e) => return Ok(Fed { taken, all: false }),
+        Err(e) => {
+          if self.probe.is_none() {
+            self.end_owed = false;
+          }
+          return Err(e);
+        }
+      }
+    }
+    Ok(Fed { taken, all: true })
+  }
+
+  /// [`Self::feed`], where anything is owed, with a refusal routed as any
+  /// send's: `None` where nothing is owed.
+  fn feed_owed(&mut self) -> Option<Owed> {
+    if !self.owes() {
+      return None;
+    }
+    Some(match self.feed() {
+      Ok(Fed { all: true, .. }) => Owed::Taken,
+      Ok(Fed { all: false, .. }) => Owed::Full,
+      Err(e) => match self.hw_failure(e, BareVerdict::CandidateFailure) {
+        HwRoute::Report(err) => Owed::Report(err),
+        HwRoute::Advance(answer) => Owed::Advance(answer),
+      },
+    })
+  }
+
+  /// Releases every reference the session holds to the probe's history,
+  /// before the history goes to the caller as owned, mutable packets
+  /// ([`Error::AllBackendsFailed`]): the active decoder, which a replay fed
+  /// the history's own packets, is flushed, and the frame scratch cleared.
+  fn release_history(&mut self) {
+    self.state.inner.flush();
+    // SAFETY: `hw_frame` is a valid AVFrame we own; `av_frame_unref` is a
+    // no-op for an already-empty frame.
+    unsafe { av_frame_unref(self.hw_frame.as_mut_ptr()) };
   }
 
   /// Flush internal buffers (e.g. after a seek).
   ///
-  /// Discards every frame buffered by the decoder, every frame queued during
-  /// probe replay (`pending_frames`), and the residual `hw_frame` scratch
-  /// buffer. Probe-time replay state (buffered packets, EOF marker) is also
-  /// cleared since post-seek packets do not align with the previously
-  /// captured history. After a flush, the next `receive_frame` waits for new
-  /// post-seek input.
+  /// Discards every frame buffered by the decoder, the residual `hw_frame`
+  /// scratch buffer, and whatever the decoder was still owed (the backlog,
+  /// an end). Probe-time replay state (buffered packets, the count fed, the
+  /// EOF marker) is also cleared since post-seek packets do not align with
+  /// the previously captured history. After a flush, the next
+  /// `receive_frame` waits for new post-seek input.
   ///
   /// It rebuilds no hardware session. `avcodec_flush_buffers` reaches only
   /// the codec's own flush (`libavcodec/avcodec.c` 417–418 in FFmpeg
@@ -1879,9 +2099,11 @@ impl VideoDecoder {
     // SAFETY: hw_frame is a valid AVFrame we own; av_frame_unref is a no-op
     // for an already-empty frame.
     unsafe { av_frame_unref(self.hw_frame.as_mut_ptr()) };
-    self.pending_frames.clear();
     // The end belongs to the position being abandoned, and so does the
-    // history: the probe forgets it whole, every count with it.
+    // history, and what the decoder was owed of it: the probe forgets it
+    // whole, every count with it.
+    self.backlog.clear();
+    self.end_owed = false;
     self.eof_sent = false;
     if let Some(probe) = self.probe.as_mut() {
       probe.forget_history();
@@ -1941,37 +2163,51 @@ impl VideoDecoder {
   }
 
   /// Try the next backend in `remaining_backends`. Transactional: a
-  /// candidate must successfully build and accept the replayed history
-  /// before any probe state is consumed. Backends that fail to build or
-  /// reject the replay are recorded into `probe.attempts` and the loop
-  /// continues to the next one.
+  /// candidate must build and take its replay of the history before any
+  /// probe state is consumed. A backend that refuses — it will not open, or
+  /// it refuses a replayed packet — is recorded into `probe.attempts` with
+  /// its own answer, and the loop continues to the next one.
   ///
-  /// `last_error` is the error that triggered this advance — i.e. the
-  /// failure of the currently active backend on `send_packet` /
-  /// `send_eof` / `receive_frame`. It is recorded against the active
-  /// backend before any candidate is tried so that a final
-  /// `AllBackendsFailed` carries the full attempt log including the
-  /// initially-opened backend's runtime failure.
+  /// `answer` is the active candidate's own answer that triggered this
+  /// advance ([`BackendAnswer`]) — a send, a receive or a download it
+  /// failed. It is recorded against the active backend once the probe
+  /// leaves it — a candidate installed, or every backend exhausted — in
+  /// the place it was tried, ahead of the candidates that refused after
+  /// it, so a final `AllBackendsFailed` carries the full attempt log in
+  /// probe order, the initially-opened backend's runtime failure
+  /// included.
+  ///
+  /// **The replay is the history itself.** Each candidate is sent the
+  /// history's own packets, by reference ([`feed_into`]): no copy is made,
+  /// so nothing of this crate's own can fail a replay, and the history is
+  /// released from every decoder before it is handed back
+  /// ([`Self::release_history`]). It stops where the candidate first has
+  /// output for the caller — it answers `EAGAIN` — and the candidate is
+  /// installed with the rest of the history owed, fed before anything new
+  /// as the caller drains it ([`Self::feed`]). So no frame is queued, and
+  /// no queue can be exhausted.
   ///
   /// Returns:
-  /// - `Ok(())` when a candidate is installed and replay completed —
-  ///   caller should retry the operation.
-  /// - `Err(Error::AllBackendsFailed(p))` when every remaining
-  ///   backend has been exhausted (including the just-failed active one).
-  ///   `p.attempts()` carries the per-backend failure log.
-  ///   This is what the documented `open` contract promises, surfaced at
-  ///   runtime so the caller can branch into a software fallback. On a
-  ///   single-backend platform (e.g. macOS), this fires after the only
-  ///   backend's first-frame failure; on multi-backend platforms it
-  ///   fires after the last candidate's failure.
-  /// - `Err(_)` for other fatal conditions surfaced by probe machinery
-  ///   itself (e.g. `alloc_av_frame` ENOMEM during replay drain).
-  fn advance_probe(&mut self, last_error: Error) -> Result<()> {
+  /// - `Ok(())` when a candidate is installed — caller should retry the
+  ///   operation.
+  /// - `Err(Error::AllBackendsFailed(p))` when every remaining backend has
+  ///   been exhausted (including the just-failed active one), with
+  ///   `p.attempts()` the per-backend answers. On a single-backend
+  ///   platform (e.g. macOS) this fires after the only backend's
+  ///   first-frame failure; on multi-backend platforms after the last
+  ///   candidate's.
+  /// - `Err(_)` for a failure of this crate's own — the parameters copy a
+  ///   candidate is built from, the context it is built on — or the
+  ///   stream's: surfaced as it is, **no backend charged**. The next
+  ///   backend is kept in the order and the history whole; the failed
+  ///   candidate stays the active one, its answer unrecorded, and what it
+  ///   answers next is its own.
+  fn advance_probe(&mut self, answer: BackendAnswer) -> Result<()> {
     let build = self
       .probe
       .as_ref()
       .map_or(Self::build_state as BuildCandidate, |probe| probe.build);
-    self.advance_probe_with(last_error, build)
+    self.advance_probe_with(answer, build)
   }
 
   /// [`Self::advance_probe`], with the candidate builder named: the
@@ -1981,41 +2217,16 @@ impl VideoDecoder {
   /// builder that opens the candidate in software, which is how the
   /// replay and the commit below run on a machine with one hardware
   /// backend or none.
-  fn advance_probe_with(&mut self, last_error: Error, build: BuildCandidate) -> Result<()> {
-    // Record the failure that triggered this advance against the active
-    // backend. If the probe was somehow already gone (shouldn't happen —
-    // call sites guard with `self.probe.is_some()`), just propagate the
-    // error so behaviour matches the pre-fix code path.
-    let active_backend = self.state.backend;
-    // **The reason the callback could not return.** Declining a format
-    // in `get_format` surfaces from libavcodec as
-    // `Invalid data found when processing input` — true about what it
-    // saw, false about what happened, because the data was fine and
-    // this crate declined it over the coded surface's size. The
-    // callback leaves the real reason in its own state; this is where
-    // it becomes the error the caller reads.
-    // **Mint or no-op, and never a re-derivation.** Three of this
-    // method's callers hand it a raw `Error::Ffmpeg` — no funnel has run
-    // on their roads — so this is where their verdict is minted. The
-    // receive road hands it one already minted, and this call then finds
-    // the latch empty and returns its argument unchanged: `hw_exit`
-    // answers with the recorded refusal when there is one and with its
-    // fallback when there is not, so a verdict passed in comes back out.
-    // Either way the caller's reason is what gets recorded. See the
-    // invariant on [`software_receive`].
-    let last_error = self.hw_exit(last_error);
-    match self.probe.as_mut() {
-      Some(probe) => probe.attempts.push((active_backend, Box::new(last_error))),
-      None => return Err(last_error),
+  fn advance_probe_with(&mut self, answer: BackendAnswer, build: BuildCandidate) -> Result<()> {
+    if self.probe.is_none() {
+      // Unreachable: every road advances only while a candidate is on
+      // trial (`hw_route`). The answer is reported as it came.
+      return Err(answer.into_error());
     }
-
-    // Drop frames previously queued from the backend we're now abandoning.
-    // They came from a candidate that just failed for cause and cannot be
-    // trusted alongside frames we may queue from the next candidate. (If
-    // this method is called repeatedly via chained probe advances, this
-    // also keeps `pending_frames` from accumulating frames from multiple
-    // rejected backends.)
-    self.pending_frames.clear();
+    // The failed candidate, recorded once the probe leaves it, where it
+    // was tried: before any candidate that refuses below.
+    let failed = (self.state.backend, answer);
+    let tried_at = self.probe.as_ref().map_or(0, |probe| probe.attempts.len());
     // Read before any `probe` borrow: the end is the *decoder's* fact
     // now, not the probe's, and a candidate must be handed it along
     // with the replayed history or it will sit at `EAGAIN` forever on a
@@ -2023,70 +2234,36 @@ impl VideoDecoder {
     let eof_sent = self.eof_sent;
 
     loop {
-      // Snapshot inputs without mutating probe state. Use the checked
-      // clone helper rather than `Parameters::clone` (which masks ENOMEM).
-      let (next_backend, parameters, codec) = match self.probe.as_ref() {
-        Some(probe) if !probe.remaining_backends.is_empty() => {
-          let parameters = match try_clone_parameters(
-            &probe.parameters,
-            self.frame_limits.max_codec_parameter_bytes(),
-          ) {
-            Ok(p) => p,
-            Err(e) => {
-              tracing::warn!(
-                error = %e,
-                "hwdecode: parameters clone failed during probe advance; popping backend and trying next"
-              );
-              let popped = self
-                .probe
-                .as_mut()
-                .expect("probe state present")
-                .remaining_backends
-                .remove(0);
-              self
-                .probe
-                .as_mut()
-                .expect("probe state present")
-                .attempts
-                .push((popped, Box::new(e)));
-              continue;
-            }
-          };
-          (probe.remaining_backends[0], parameters, probe.codec)
-        }
-        // No more candidates — surface the accumulated attempt log as
-        // AllBackendsFailed so single- and multi-backend platforms have
-        // the same contract for "every HW backend failed."
-        //
-        // Hand the buffered packet history back to the caller along
-        // with the attempt log: those packets were consumed from the
-        // caller's demuxer (and copied into `buffered_packets`)
-        // before the probe exhausted, and for non-seekable inputs the
-        // caller cannot re-demux them. Returning them here lets a
-        // caller-side software fallback replay the same byte history
-        // through `ffmpeg::decoder::Video` without losing initial frames.
-        // Dropping `ProbeState` after the take frees the codec/params
-        // refs we no longer need; only `attempts` and `buffered_packets`
-        // are retained.
-        _ => {
-          let (attempts, unconsumed_packets) = self
-            .probe
-            .take()
-            .map(|p| (p.attempts, p.buffered_packets))
-            .unwrap_or_default();
-          return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-            attempts,
-            unconsumed_packets,
-          )));
-        }
+      let probe = self.probe.as_mut().expect("probe state present");
+      let Some(&next_backend) = probe.remaining_backends.first() else {
+        // **No more candidates** — surface the attempt log as
+        // `AllBackendsFailed`, so single- and multi-backend platforms
+        // have the same contract for "every HW backend failed", and hand
+        // the history back with it: those packets were consumed from the
+        // caller's demuxer, and for a non-seekable input the caller
+        // cannot re-demux them. Every decoder that holds a reference to
+        // them lets it go first, so the caller's owned, mutable packets
+        // share their bytes with nothing.
+        let mut probe = self.probe.take().expect("probe state present");
+        probe.attempts.insert(tried_at, failed);
+        self.release_history();
+        return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
+          answered(probe.attempts),
+          probe.buffered_packets,
+        )));
       };
+      // **This crate's own copy, and no backend's answer**: a copy that
+      // cannot be made is surfaced as it is, `next_backend` kept.
+      let parameters = try_clone_parameters(
+        &probe.parameters,
+        self.frame_limits.max_codec_parameter_bytes(),
+      )?;
+      let codec = probe.codec;
 
       let prev_backend = self.state.backend;
       tracing::warn!(from = ?prev_backend, to = ?next_backend, "hwdecode: advancing probe");
 
-      // Build candidate. On failure, record into attempts and continue
-      // without touching the packet buffer.
-      let mut candidate_state = match build(
+      let mut candidate = match build(
         parameters,
         codec,
         next_backend,
@@ -2094,184 +2271,74 @@ impl VideoDecoder {
         self.options,
         self.pkt_timebase,
       ) {
-        Ok(s) => s,
-        Err(e) => {
-          tracing::warn!(?next_backend, error = %e, "hwdecode: candidate build failed");
-          self
-            .probe
-            .as_mut()
-            .expect("probe state present")
-            .remaining_backends
-            .remove(0);
-          self
-            .probe
-            .as_mut()
-            .expect("probe state present")
-            .attempts
-            .push((next_backend, Box::new(e)));
+        Ok(state) => state,
+        Err(BuildFailure::Refused(refusal)) => {
+          tracing::warn!(?next_backend, error = ?refusal, "hwdecode: candidate build failed");
+          let probe = self.probe.as_mut().expect("probe state present");
+          probe.remaining_backends.remove(0);
+          probe.attempts.push((next_backend, refusal));
           continue;
         }
+        // This crate's own failure, or the stream's: surfaced as it is.
+        Err(BuildFailure::Local(e)) => return Err(e),
       };
 
-      // Replay buffered history through the candidate WITHOUT installing it.
-      // We borrow the buffer immutably; if replay fails the candidate's Drop
-      // releases the FFmpeg state and the buffer is preserved for the next
-      // attempt.
-      //
-      // EAGAIN handling: `avcodec_send_packet` may return EAGAIN when its
-      // internal queue is full and the user is expected to drain output
-      // first (B-frame buffering, candidate-specific queue depth, etc.).
-      // This is normal flow — we drain frames out of the candidate, transfer
-      // each one to a CPU frame, and stash them in `local_pending`. After
-      // commit they move to `self.pending_frames` and are delivered FIFO
-      // by `receive_frame`, so the caller never loses initial frames.
-      let mut local_pending: VecDeque<frame::Video> = VecDeque::new();
-      let mut local_pending_bytes: usize = 0;
-      let max_pending_bytes = self.max_probe_pending_bytes;
-      let replay_result: std::result::Result<(), ffmpeg_next::Error> = {
+      // Replay the history through the candidate WITHOUT installing it:
+      // the history's own packets, borrowed. If the candidate refuses one,
+      // its Drop releases the FFmpeg state, and with it every reference it
+      // took, and the history is whole for the next attempt.
+      let replay = {
         let probe = self.probe.as_ref().expect("probe state present");
-        let mut hw_buf = match alloc_av_frame() {
-          Ok(f) => f,
-          Err(e) => return Err(Error::Ffmpeg(e)),
-        };
-        let mut r: std::result::Result<(), ffmpeg_next::Error> = Ok(());
-
-        'replay: for kept in &probe.buffered_packets {
-          // **The candidate is sent a copy, never the history's own
-          // packet.** `avcodec_send_packet` takes a reference to what it
-          // is sent (`libavcodec/decode.c` 748 in FFmpeg 9.0.1) and the
-          // decoder may hold it past the call, while a candidate
-          // committed here stays the session's when the history later
-          // goes to the caller as owned, mutable `Packet`s. A copy that
-          // cannot be made fails this candidate's replay.
-          //
-          // SAFETY: `kept` is one of this probe's own copies, made by
-          // `try_clone_packet` from a packet whose sender vouched for
-          // the `AVPacket` contract and its written bytes
-          // (`send_av_packet`'s contract) — a copy owns its bytes, and
-          // nothing writes them.
-          let pkt = match unsafe { crate::boundary::try_clone_packet(kept) } {
-            Ok(pkt) => pkt,
-            Err(e) => {
-              r = Err(e);
-              break 'replay;
-            }
-          };
-          loop {
-            match candidate_state.inner.send_packet(&pkt) {
-              Ok(()) => break,
-              Err(e) if is_eagain(&e) => {
-                // Drain candidate output (transferring + queueing each frame)
-                // and retry the same packet.
-                if let Err(de) = drain_into_pending(
-                  &mut candidate_state.inner,
-                  &mut hw_buf,
-                  &mut local_pending,
-                  &mut local_pending_bytes,
-                  max_pending_bytes,
-                  self.frame_limits.frame(),
-                ) {
-                  r = Err(de);
-                  break 'replay;
-                }
-              }
-              Err(e) => {
-                r = Err(e);
-                break 'replay;
-              }
-            }
-          }
-        }
-        if r.is_ok() && eof_sent {
-          // `avcodec_send_packet(NULL)` (which `send_eof` becomes) can
-          // return EAGAIN with the same drain-output-first semantics as
-          // a regular send_packet. Loop drain+retry instead of failing
-          // the candidate on backpressure.
-          loop {
-            match candidate_state.inner.send_eof() {
-              Ok(()) => break,
-              Err(e) if is_eagain(&e) => {
-                if let Err(de) = drain_into_pending(
-                  &mut candidate_state.inner,
-                  &mut hw_buf,
-                  &mut local_pending,
-                  &mut local_pending_bytes,
-                  max_pending_bytes,
-                  self.frame_limits.frame(),
-                ) {
-                  r = Err(de);
-                  break;
-                }
-              }
-              Err(e) => {
-                r = Err(e);
-                break;
-              }
-            }
-          }
-        }
-        r
+        feed_into(&mut candidate.inner, &probe.buffered_packets, eof_sent)
       };
-
-      if let Err(e) = replay_result {
-        tracing::warn!(?next_backend, error = %e, "hwdecode: candidate replay failed");
-        // **The candidate's own refusal, read before the candidate
-        // dies.** `hw_exit` consults `self.state` — the backend that is
-        // still active — but the error being recorded here belongs to
-        // `candidate_state`, whose `get_format` callback is the one
-        // that may have declined. Classifying through the wrong state
-        // and then dropping the right one lost the reason entirely: the
-        // attempt log recorded FFmpeg's `Invalid data found when
-        // processing input` for a coded surface this crate refused.
-        //
-        // Order matters and is the whole fix — read, then drop.
-        //
-        // SAFETY: `candidate_state` owns this state and is dropped only
-        // below, after the read.
-        let recorded = unsafe { ceiling_declination_of(candidate_state.callback_state) }
-          .unwrap_or(Error::Ffmpeg(e));
-        // Drop candidate explicitly so its FFI cleanup runs now. Discard any
-        // frames we drained from this candidate — they're tied to a decoder
-        // we're throwing away.
-        drop(candidate_state);
-        drop(local_pending);
-        self
-          .probe
-          .as_mut()
-          .expect("probe state present")
-          .remaining_backends
-          .remove(0);
-        self
-          .probe
-          .as_mut()
-          .expect("probe state present")
-          .attempts
-          .push((next_backend, Box::new(recorded)));
-        continue;
+      match replay {
+        Ok(taken) => {
+          // Install: the candidate is the active one, still on trial, owed
+          // what its replay stopped short of.
+          self.state = candidate;
+          // **The scaled-output stage's session belongs to the device
+          // that just went away.** Its fitted frames context was built over
+          // the outgoing backend's hardware device; the caller's standing
+          // request outlives the advance, but nothing built for the old
+          // device may. Unreachable on the one platform where the stage
+          // has a body — `probe_order` names a single backend on Apple
+          // targets, so this method never reaches an install there — and
+          // written all the same, because "unreachable today" is not a
+          // property a resource-owning cache should depend on.
+          self.scaled_output.retire();
+          // SAFETY: `hw_frame` is a valid AVFrame we own.
+          unsafe { av_frame_unref(self.hw_frame.as_mut_ptr()) };
+          self.end_owed = eof_sent && !taken.end;
+          let probe = self.probe.as_mut().expect("probe state present");
+          probe.fed = taken.packets;
+          probe.remaining_backends.remove(0);
+          probe.attempts.insert(tried_at, failed);
+          return Ok(());
+        }
+        Err(e) => {
+          tracing::warn!(?next_backend, error = %e, "hwdecode: candidate replay failed");
+          // **The candidate's own refusal, read before the candidate
+          // dies**, through its own funnel — not the active backend's,
+          // whose callback state is not the one that may have declined. A
+          // budget refusal is this crate's own, and surfaced as it is.
+          //
+          // SAFETY: `candidate` owns this state and is dropped only
+          // below, after the reads.
+          if let Some(refusal) = unsafe { frame_budget_declination_of(candidate.callback_state) } {
+            return Err(refusal);
+          }
+          // SAFETY: as above.
+          let reason =
+            unsafe { ceiling_declination_of(candidate.callback_state) }.unwrap_or(Error::Ffmpeg(e));
+          drop(candidate);
+          let probe = self.probe.as_mut().expect("probe state present");
+          probe.remaining_backends.remove(0);
+          probe
+            .attempts
+            .push((next_backend, BackendAnswer::of_call(reason)));
+          continue;
+        }
       }
-
-      // Commit: install the candidate, clear residual hw_frame, queue the
-      // drained frames for the caller, and pop the now-active backend.
-      self.state = candidate_state;
-      // **The scaled-output stage's session belongs to the device that
-      // just went away.** Its fitted frames context was built over the
-      // outgoing backend's hardware device; the caller's standing
-      // request outlives the advance, but nothing built for the old
-      // device may. Unreachable on the one platform where the stage has
-      // a body — `probe_order` names a single backend on Apple targets,
-      // so this method never reaches a commit there — and written all
-      // the same, because "unreachable today" is not a property a
-      // resource-owning cache should depend on.
-      self.scaled_output.retire();
-      unsafe { av_frame_unref(self.hw_frame.as_mut_ptr()) };
-      self.pending_frames.append(&mut local_pending);
-      self
-        .probe
-        .as_mut()
-        .expect("probe state present")
-        .remaining_backends
-        .remove(0);
-      return Ok(());
     }
   }
 
@@ -2284,11 +2351,13 @@ impl VideoDecoder {
     limits: crate::limits::DecoderLimits,
     options: crate::DecoderOptions,
     pkt_timebase: Option<mediadecode::Timebase>,
-  ) -> Result<DecoderState> {
+  ) -> std::result::Result<DecoderState, BuildFailure> {
     // Use our checked allocator instead of Context::from_parameters, which
     // does not null-check avcodec_alloc_context3 and would feed a null
-    // AVCodecContext into FFmpeg under OOM.
-    let (mut ctx, state) = build_codec_context(&parameters, limits, options, pkt_timebase)?;
+    // AVCodecContext into FFmpeg under OOM. Whatever refuses here is this
+    // crate's own, or the stream's — the same for every backend.
+    let (mut ctx, state) = build_codec_context(&parameters, limits, options, pkt_timebase)
+      .map_err(BuildFailure::Local)?;
     let av_type = backend.av_hwdevice_type();
 
     // Verify the codec advertises this hwaccel **with the exact HW pix_fmt
@@ -2303,7 +2372,9 @@ impl VideoDecoder {
     // SAFETY: `codec` is the decoder `find_decoder` answered — an entry
     // in libavcodec's static codec table, live for the process.
     if !unsafe { codec_supports_hwaccel(codec.as_ptr(), av_type, hw_pix_fmt as i32) } {
-      return Err(Error::BackendUnsupportedByCodec(backend));
+      return Err(BuildFailure::Refused(BackendAnswer::of_open(
+        Error::BackendUnsupportedByCodec(backend),
+      )));
     }
 
     // Create the device context.
@@ -2313,9 +2384,11 @@ impl VideoDecoder {
       av_hwdevice_ctx_create(&mut hw_device_ref, av_type, ptr::null(), ptr::null_mut(), 0)
     };
     if ret < 0 {
-      return Err(Error::HwDeviceInitFailed(HwDeviceInitFailed::new(
-        backend,
-        ffmpeg_next::Error::from(ret),
+      return Err(BuildFailure::Refused(BackendAnswer::of_open(
+        Error::HwDeviceInitFailed(HwDeviceInitFailed::new(
+          backend,
+          ffmpeg_next::Error::from(ret),
+        )),
       )));
     }
 
@@ -2356,9 +2429,13 @@ impl VideoDecoder {
     let device_ref_for_ctx = unsafe { av_buffer_ref(hw_device_ref) };
     if device_ref_for_ctx.is_null() {
       // guard's Drop frees hw_device_ref (the first ref) and callback_state.
-      return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
-        errno: libc::ENOMEM,
-      }));
+      // This crate's own reference that could not be made: no backend's
+      // answer.
+      return Err(BuildFailure::Local(Error::Ffmpeg(
+        ffmpeg_next::Error::Other {
+          errno: libc::ENOMEM,
+        },
+      )));
     }
     // SAFETY: device_ref_for_ctx is a valid AVBufferRef* from av_buffer_ref;
     // ctx is freshly built, not yet opened, and owned by us. It has
@@ -2391,8 +2468,11 @@ impl VideoDecoder {
       Ok(opened) => opened,
       // SAFETY: `callback_state` is the guard's live state, freed only
       // when the guard drops on this return, after the read.
+      // The codec would not open on this backend: its own answer.
       Err(e) => {
-        return Err(unsafe { ceiling_declination_of(callback_state) }.unwrap_or(Error::Ffmpeg(e)));
+        return Err(BuildFailure::Refused(BackendAnswer::of_open(
+          unsafe { ceiling_declination_of(callback_state) }.unwrap_or(Error::Ffmpeg(e)),
+        )));
       }
     };
 
@@ -2402,10 +2482,14 @@ impl VideoDecoder {
     // hw_device_ref and the callback state.
     if let Err(e) = ensure_video_codec_type(&opened) {
       // Same exit, same collection: a declined format can leave the
-      // context looking like the wrong medium.
+      // context looking like the wrong medium, and is the backend's
+      // refusal; a context that opened as another medium is the stream's.
       //
       // SAFETY: as above — the guard's live state, read before it drops.
-      return Err(unsafe { ceiling_declination_of(callback_state) }.unwrap_or(e));
+      return Err(match unsafe { ceiling_declination_of(callback_state) } {
+        Some(refusal) => BuildFailure::Refused(BackendAnswer::of_open(refusal)),
+        None => BuildFailure::Local(e),
+      });
     }
     // SAFETY of construction: `decoder::Video` is `pub struct Video(pub Opened)`.
     // We construct via the public field; this is the same wrapping
@@ -2507,10 +2591,14 @@ impl Drop for PartialBuildState {
 /// accessors for timing extras (`duration`, `time_base`, `pkt_dts`) or
 /// color metadata, add those to `copy_frame_props_minimal` at the same
 /// time.
+///
+/// Its failures are two, and they are told apart ([`TransferFailure`]):
+/// the download — the backend's own call, or the layout it chose — and
+/// this crate's copy of the frame's properties after it.
 unsafe fn transfer_hw_frame(
   dst: &mut Frame,
   src: &frame::Video,
-) -> std::result::Result<(), ffmpeg_next::Error> {
+) -> std::result::Result<(), TransferFailure> {
   // SAFETY (`as_inner_mut`, every use below): `dst` is only cleared
   // whole (`av_frame_unref`), filled whole by `av_hwframe_transfer_data`
   // (which sets its format, dimensions, line sizes and buffers together),
@@ -2521,7 +2609,7 @@ unsafe fn transfer_hw_frame(
     av_frame_unref(dst.as_inner_mut().as_mut_ptr());
     let ret = av_hwframe_transfer_data(dst.as_inner_mut().as_mut_ptr(), src.as_ptr(), 0);
     if ret < 0 {
-      return Err(ffmpeg_next::Error::from(ret));
+      return Err(TransferFailure::Download(ffmpeg_next::Error::from(ret)));
     }
     // Validate the post-transfer CPU pix_fmt against the safe `Frame`
     // accessor's supported set. FFmpeg picks the destination format
@@ -2544,81 +2632,21 @@ unsafe fn transfer_hw_frame(
          treating as backend failure"
       );
       av_frame_unref(dst.as_inner_mut().as_mut_ptr());
-      return Err(ffmpeg_next::Error::Other {
+      return Err(TransferFailure::Download(ffmpeg_next::Error::Other {
         errno: libc::EINVAL,
-      });
+      }));
     }
     if let Err(e) = copy_frame_props_minimal(dst.as_inner_mut().as_mut_ptr(), src.as_ptr()) {
       // Failed to propagate metadata. Reset the destination so the
-      // partial frame doesn't leak (its pixel buffers were attached
-      // by `av_hwframe_transfer_data` above) and surface as a
-      // backend failure — the probe path will advance to the next
-      // candidate; post-probe, the caller gets that picture's error.
+      // partial frame doesn't leak (its pixel buffers were attached by
+      // `av_hwframe_transfer_data` above) and surface it as this crate's
+      // own failure, after a picture: no backend's answer, the caller gets
+      // that picture's error from a committed decoder.
       av_frame_unref(dst.as_inner_mut().as_mut_ptr());
-      return Err(e);
+      return Err(TransferFailure::Properties(e));
     }
   }
   Ok(())
-}
-
-/// Copies AVFrame metadata (timestamps, color metadata, crop rect,
-/// flags, side data, etc.) from the source HW frame to the destination
-/// CPU frame so the post-transfer frame surfaces the same metadata a
-/// SW-decoded frame would.
-///
-/// Defers to FFmpeg's `av_frame_copy_props`, which handles the per-
-/// `side_data[i]` allocation, dict copy, and refcounted buffer
-/// replacements internally. The cost is bounded by what the source
-/// frame attaches — typical HDR streams carry 1–3 side-data entries
-/// (mastering display, content light level, dolby/HDR10+ dynamic
-/// metadata) totalling a few hundred bytes, so per-frame allocation
-/// overhead stays negligible relative to the pixel data already
-/// transferred via `av_hwframe_transfer_data`.
-///
-/// # Safety
-/// Both pointers must be valid `AVFrame` pointers we own. We do not
-/// form `&AVFrame` — `av_frame_copy_props` operates on raw pointers
-/// directly.
-/// Sum the byte sizes of every entry in `(*frame).side_data[]`.
-/// Used by the probe replay queue's byte-cap accounting so a
-/// frame's deep-copied side-data is charged against
-/// `max_probe_pending_bytes` along with its pixel buffers.
-///
-/// # Safety
-/// `frame` must be a live `*const AVFrame`. Reads only `nb_side_data`,
-/// the `side_data` pointer array, and each `AVFrameSideData.size` —
-/// no `&AVFrame` reference is formed.
-unsafe fn sum_side_data_bytes(frame: *const AVFrame) -> usize {
-  // Clamp `nb_side_data` to the same entry cap the copy path
-  // enforces. Without the clamp, a decoder-controlled or
-  // version-skew `nb_side_data` value (the bindgen field is
-  // `c_int`, signed) could drive this walk arbitrarily long
-  // before the cap downstream kicks in. Negative values are
-  // pinned to zero before casting.
-  let raw = unsafe { (*frame).nb_side_data };
-  let arr = unsafe { (*frame).side_data };
-  if raw <= 0 || arr.is_null() {
-    return 0;
-  }
-  let count = (raw as usize).min(HW_COPY_SIDE_DATA_MAX_ENTRIES);
-  let mut total: usize = 0;
-  for i in 0..count {
-    // SAFETY: `arr` points to `nb_side_data` valid `*mut AVFrameSideData`
-    // entries per FFmpeg's contract; `i < count` is in-bounds.
-    let entry = unsafe { *arr.add(i) };
-    if entry.is_null() {
-      continue;
-    }
-    let sz = unsafe { (*entry).size };
-    total = total.saturating_add(sz);
-    if total >= HW_COPY_SIDE_DATA_MAX_TOTAL_BYTES {
-      // Already at or above the byte cap — further entries can't
-      // change the projected-vs-cap decision the caller makes.
-      total = HW_COPY_SIDE_DATA_MAX_TOTAL_BYTES;
-      break;
-    }
-  }
-  total
 }
 
 /// Hard cap on the number of `AVFrameSideData` entries we copy from
@@ -2721,6 +2749,43 @@ pub(crate) fn whitelisted_side_data_kind(
   Some(kind)
 }
 
+/// Why [`transfer_hw_frame`] failed.
+enum TransferFailure {
+  /// The download: `av_hwframe_transfer_data` failing, or the CPU layout it
+  /// chose being one [`Frame`] cannot carry — the backend's own answer.
+  Download(ffmpeg_next::Error),
+  /// This crate's copy of the frame's properties, after the download: no
+  /// backend's answer.
+  Properties(ffmpeg_next::Error),
+}
+
+impl core::fmt::Display for TransferFailure {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::Download(e) => write!(f, "the download failed: {e}"),
+      Self::Properties(e) => write!(f, "the frame's properties could not be copied: {e}"),
+    }
+  }
+}
+
+/// Copies AVFrame metadata (timestamps, color metadata, crop rect,
+/// flags, side data, etc.) from the source HW frame to the destination
+/// CPU frame so the post-transfer frame surfaces the same metadata a
+/// SW-decoded frame would.
+///
+/// Defers to FFmpeg's `av_frame_copy_props`, which handles the per-
+/// `side_data[i]` allocation, dict copy, and refcounted buffer
+/// replacements internally. The cost is bounded by what the source
+/// frame attaches — typical HDR streams carry 1–3 side-data entries
+/// (mastering display, content light level, dolby/HDR10+ dynamic
+/// metadata) totalling a few hundred bytes, so per-frame allocation
+/// overhead stays negligible relative to the pixel data already
+/// transferred via `av_hwframe_transfer_data`.
+///
+/// # Safety
+/// Both pointers must be valid `AVFrame` pointers we own. We do not
+/// form `&AVFrame` — `av_frame_copy_props` operates on raw pointers
+/// directly.
 pub(crate) unsafe fn copy_frame_props_minimal(
   dst: *mut AVFrame,
   src: *const AVFrame,
@@ -2780,8 +2845,8 @@ pub(crate) unsafe fn copy_frame_props_minimal(
     // Side-data: bounded copy. `av_frame_new_side_data(dst, type,
     // size)` allocates the entry and returns a pointer to write
     // the payload bytes into; a null return is the OOM signal.
-    // Callers (`transfer_hw_frame`, `drain_into_pending`) hand us
-    // freshly-unref'd `dst` frames, so any prior side-data has
+    // The caller (`transfer_hw_frame`) hands us a
+    // freshly-unref'd `dst` frame, so any prior side-data has
     // already been freed by `av_frame_unref` — we don't need to
     // strip dst's existing side-data here.
     // Read `nb_side_data` as the bindgen `c_int` and clamp non-
@@ -2789,7 +2854,7 @@ pub(crate) unsafe fn copy_frame_props_minimal(
     // (corrupt / version-skew decoder output) cast directly to
     // `usize` becomes a huge positive count and would walk OOB
     // memory below; pinning to zero up front collapses that to a
-    // no-op. Same signed-count guard `sum_side_data_bytes` applies.
+    // no-op.
     let nb_side_data_raw = (*src).nb_side_data;
     let src_arr = (*src).side_data;
     if nb_side_data_raw > 0 && !src_arr.is_null() {
@@ -2853,8 +2918,9 @@ pub(crate) unsafe fn copy_frame_props_minimal(
           // come back, because nothing downstream can tell.
           //
           // The caller already knows what to do with an error here: it
-          // unrefs the partial destination and either advances to the
-          // next backend or surfaces the failure for a software retry.
+          // unrefs the partial destination and reports this picture's
+          // error from a committed decoder. The copy is this crate's own,
+          // no backend's answer, so the probe never advances on it.
           tracing::warn!("mediadecode-ffmpeg: av_frame_new_side_data OOM during HW->CPU transfer",);
           return Err(ffmpeg_next::Error::Other {
             errno: libc::ENOMEM,
@@ -2871,6 +2937,53 @@ pub(crate) unsafe fn copy_frame_props_minimal(
   Ok(())
 }
 
+/// Feeds a candidate the probe's history in order — the packets
+/// themselves, the candidate taking a reference to each — and then the end
+/// if `end`: until one is refused, or the candidate answers `EAGAIN`,
+/// having output for the caller first. Answers how far it got.
+///
+/// **A replay makes no copy**, so nothing of this crate's own can fail it:
+/// what can stop it is the candidate's own answer, and its output. And it
+/// drains nothing, so no frame is queued while the probe runs and no queue
+/// can fill: the candidate is installed with what it has yet to take
+/// owed, fed as the caller drains it ([`VideoDecoder::feed`]). The history
+/// is shared with the candidate this way, never with the caller: it is
+/// released from every decoder before it is handed back
+/// ([`VideoDecoder::release_history`]).
+fn feed_into(
+  decoder: &mut ffmpeg_next::decoder::Video,
+  history: &[Packet],
+  end: bool,
+) -> std::result::Result<Taken, ffmpeg_next::Error> {
+  for (index, packet) in history.iter().enumerate() {
+    match decoder.send_packet(packet) {
+      Ok(()) => {}
+      Err(e) if is_eagain(&e) => {
+        return Ok(Taken {
+          packets: index,
+          end: false,
+        });
+      }
+      Err(e) => return Err(e),
+    }
+  }
+  let packets = history.len();
+  if !end {
+    return Ok(Taken {
+      packets,
+      end: false,
+    });
+  }
+  match decoder.send_eof() {
+    Ok(()) => Ok(Taken { packets, end: true }),
+    Err(e) if is_eagain(&e) => Ok(Taken {
+      packets,
+      end: false,
+    }),
+    Err(e) => Err(e),
+  }
+}
+
 /// `EAGAIN` and `EOF` together: "this decoder has no more output for
 /// now", either because it wants input or because it is finished.
 ///
@@ -2878,11 +2991,9 @@ pub(crate) unsafe fn copy_frame_props_minimal(
 /// public faces classify at their boundary now — [`receive_status`] and
 /// [`send_status`] — and the send face had to stop treating the two
 /// alike, since `AVERROR_EOF` there is a caller fault rather than a
-/// state. The one caller that still wants them together is
-/// [`drain_into_pending`], the probe-replay drain: it reads a raw
-/// `ffmpeg_next::decoder::Video` that never crosses a public seam, and
-/// for it "wants input" and "finished" really are one answer — stop
-/// draining, the candidate produced everything it is going to.
+/// state. What still wants them together is the send roads' guard: neither
+/// is the candidate failing, so the probe never advances on one, and
+/// [`send_status`] then says which of the two it is.
 fn is_transient(e: &ffmpeg_next::Error) -> bool {
   is_eagain(e) || matches!(e, ffmpeg_next::Error::Eof)
 }
@@ -3516,10 +3627,8 @@ unsafe fn judge_hw_transfer(
   //
   // **Fail closed.** No context, no dims, or no priceable candidate
   // means the allocation extent cannot be proved — and an unprovable
-  // extent is not a small one. The same stance
-  // `estimate_transfer_bytes` takes next door, and for the same reason:
-  // falling back to display dims here would restore precisely the hole
-  // this judge exists to close.
+  // extent is not a small one: falling back to display dims here would
+  // restore precisely the hole this judge exists to close.
   if frames_ctx.is_null() {
     // Not a hardware frame at all. `av_hwframe_transfer_data` refuses
     // such a source with `EINVAL` and allocates nothing, so there is no
@@ -3804,217 +3913,7 @@ pub(crate) fn find_decoder(parameters: &codec::Parameters) -> Result<Codec> {
   Ok(unsafe { Codec::wrap(codec_ptr.as_ptr().cast_const()) })
 }
 
-/// Drain output frames from a candidate decoder during probe replay,
-/// transferring each one from the candidate's HW context to a fresh CPU
-/// frame and queueing it. Returns `Ok(())` once the candidate signals
-/// EAGAIN/EOF. The transfer happens while the candidate is still alive
-/// (its `AVHWFramesContext` is reachable); the resulting CPU frames remain
-/// valid after the candidate is committed because they hold their own
-/// buffer references with no dependency on the original device context.
-fn drain_into_pending(
-  decoder: &mut ffmpeg_next::decoder::Video,
-  hw_buf: &mut frame::Video,
-  pending: &mut VecDeque<frame::Video>,
-  pending_bytes: &mut usize,
-  max_bytes: usize,
-  frame_limits: crate::FrameLimits,
-) -> std::result::Result<(), ffmpeg_next::Error> {
-  loop {
-    match decoder.receive_frame(hw_buf) {
-      Ok(()) => {
-        // Pre-transfer cap check: if we are already at or over either cap,
-        // the candidate is producing more than we can hold. Treat as an
-        // explicit candidate failure so `advance_probe` can try the next
-        // backend instead of committing a stream with silently-dropped
-        // frames in the middle.
-        //
-        // TODO: at very large frame sizes (8K HDR P010, > ~96 MiB each)
-        // even a single retained frame is significant. Future direction:
-        // memmap-backed pending frames (write to a temp file or shared
-        // memory segment) so the resident set stays bounded even when the
-        // byte cap is raised. Out of scope for now.
-        if pending.len() >= MAX_PROBE_PENDING_FRAMES || *pending_bytes >= max_bytes {
-          tracing::warn!(
-            frames = pending.len(),
-            bytes = *pending_bytes,
-            max_frames = MAX_PROBE_PENDING_FRAMES,
-            max_bytes = max_bytes,
-            "hwdecode: probe pending cap reached; failing candidate replay"
-          );
-          // SAFETY: hw_buf is owned and valid; unref of an empty frame is a no-op.
-          unsafe { av_frame_unref(hw_buf.as_mut_ptr()) };
-          return Err(ffmpeg_next::Error::Other {
-            errno: libc::ENOMEM,
-          });
-        }
-        // Pre-transfer size guard: `av_hwframe_transfer_data` will
-        // allocate the CPU buffer based on `hw_buf`'s dimensions. If a
-        // single frame's worst-case footprint already pushes past the
-        // cap, refuse the candidate **before** allocating so RSS does
-        // not spike on a frame we'd immediately drop. Uses a width *
-        // height * `WORST_CASE_BYTES_PER_PIXEL` upper bound; the
-        // post-transfer accounting via `cpu_frame_bytes` below stays in
-        // place as a backstop using the actual stride/format.
-        let estimated_bytes = match estimate_transfer_bytes(hw_buf) {
-          Some(b) => b,
-          None => {
-            // SAFETY: AVFrame.width/height are c_int reads.
-            let (w, h) = unsafe {
-              let raw = hw_buf.as_ptr();
-              ((*raw).width, (*raw).height)
-            };
-            tracing::warn!(
-              width = w,
-              height = h,
-              "hwdecode: HW frame dimensions invalid for sizing; failing candidate replay"
-            );
-            unsafe { av_frame_unref(hw_buf.as_mut_ptr()) };
-            return Err(ffmpeg_next::Error::Other {
-              errno: libc::ENOMEM,
-            });
-          }
-        };
-        let estimated_total = pending_bytes.saturating_add(estimated_bytes);
-        if estimated_total > max_bytes {
-          // SAFETY: AVFrame.width/height are c_int reads.
-          let (w, h) = unsafe {
-            let raw = hw_buf.as_ptr();
-            ((*raw).width, (*raw).height)
-          };
-          tracing::warn!(
-            pending_bytes = *pending_bytes,
-            estimated_bytes,
-            width = w,
-            height = h,
-            max_bytes = max_bytes,
-            "hwdecode: pre-transfer size estimate exceeds cap; \
-             refusing candidate replay before allocating CPU frame"
-          );
-          unsafe { av_frame_unref(hw_buf.as_mut_ptr()) };
-          return Err(ffmpeg_next::Error::Other {
-            errno: libc::ENOMEM,
-          });
-        }
-        // **The same exact judge, on the replay road.** This site
-        // already had a pre-transfer *estimate* (`w * h * 8`) against
-        // the probe's own pending budget; that stays, and this adds the
-        // frame ceiling itself, priced exactly.
-        //
-        // The refusal is reported through this function's existing
-        // `ffmpeg_next::Error` channel rather than the named arm: every
-        // error out of a probe-replay drain is collapsed by the caller
-        // into "this candidate failed, try the next backend", so a name
-        // has no consumer here. The reason is logged so it is not lost.
-        // SAFETY: `hw_buf` holds a live decoded HW frame.
-        if let Err(e) = unsafe { judge_hw_transfer(hw_buf.as_ptr(), frame_limits) } {
-          tracing::warn!(
-            bytes = e.bytes(),
-            limit = e.limit(),
-            "hwdecode: candidate's hw->cpu transfer would exceed the frame ceiling; \
-             refusing the candidate before the download"
-          );
-          // SAFETY: `hw_buf` is owned and valid.
-          unsafe { av_frame_unref(hw_buf.as_mut_ptr()) };
-          return Err(ffmpeg_next::Error::Other {
-            errno: libc::EINVAL,
-          });
-        }
-        let mut cpu = alloc_av_frame()?;
-        // SAFETY: hw_buf is a freshly-decoded HW frame;
-        // `av_hwframe_transfer_data` allocates pixel buffers on `cpu`.
-        // We use `copy_frame_props_minimal` (only `pts`) instead of
-        // `av_frame_copy_props` for the same reason as
-        // `transfer_hw_frame`: the public `Frame` API does not expose
-        // side data / metadata / opaque refs, so deep-copying them per
-        // frame is pure cost and an unbounded allocation source on
-        // attacker-controlled streams.
-        unsafe {
-          let r1 = av_hwframe_transfer_data(cpu.as_mut_ptr(), hw_buf.as_ptr(), 0);
-          if r1 < 0 {
-            return Err(ffmpeg_next::Error::from(r1));
-          }
-        }
-        // Same post-transfer pix_fmt validation as `transfer_hw_frame`.
-        // A driver that picks a CPU format outside our supported set
-        // would queue an unusable frame here; later, when
-        // `try_pop_pending` hands it to the caller, `Frame::row` /
-        // `Frame::as_ptr` would return `None`. Refuse the candidate
-        // before the queue grows so probing advances to the next
-        // backend instead.
-        let cpu_raw_fmt: i32 = unsafe { (*cpu.as_ptr()).format };
-        let cpu_pix_fmt = crate::boundary::from_av_pixel_format(cpu_raw_fmt);
-        if !crate::frame::is_supported_cpu_pix_fmt(&cpu_pix_fmt) {
-          tracing::warn!(
-            pix_fmt = cpu_raw_fmt,
-            "hwdecode: candidate produced unsupported CPU pix_fmt during \
-             probe replay; failing candidate"
-          );
-          return Err(ffmpeg_next::Error::Other {
-            errno: libc::EINVAL,
-          });
-        }
-        let pixel_bytes = match cpu_frame_bytes(&cpu) {
-          Some(b) => b,
-          None => {
-            // Unknown pix_fmt or vertically-flipped layout — we cannot
-            // bound this frame's contribution against the byte cap, so up
-            // to MAX_PROBE_PENDING_FRAMES of them could exhaust memory.
-            // Fail the candidate so probing tries the next backend
-            // rather than queueing untracked allocations.
-            // SAFETY: AVFrame.format is c_int, safe to read.
-            let pix_fmt: i32 = unsafe { (*cpu.as_ptr()).format };
-            tracing::warn!(
-              pix_fmt,
-              "hwdecode: cannot size unknown CPU pix_fmt during replay; failing candidate"
-            );
-            // cpu drops here.
-            return Err(ffmpeg_next::Error::Other {
-              errno: libc::ENOMEM,
-            });
-          }
-        };
-        // Account for side-data bytes that `av_frame_copy_props`
-        // will deep-copy from the source HW frame. HDR streams
-        // typically carry mastering display + content light level
-        // (~50 bytes) and dynamic HDR metadata (~few hundred bytes);
-        // pathological side-data could otherwise quietly bypass the
-        // pixel-data byte cap.
-        // SAFETY: hw_buf is a valid AVFrame; we read scalar fields
-        // and pointer arrays without forming a `&AVFrame`.
-        let side_data_bytes = unsafe { sum_side_data_bytes(hw_buf.as_ptr()) };
-        let new_total = pending_bytes
-          .saturating_add(pixel_bytes)
-          .saturating_add(side_data_bytes);
-        if new_total > max_bytes {
-          tracing::warn!(
-            pending_bytes = *pending_bytes,
-            pixel_bytes,
-            side_data_bytes,
-            max_bytes,
-            "hwdecode: queueing this frame would exceed byte cap; \
-             failing candidate replay"
-          );
-          // cpu drops here without ever paying a metadata deep copy.
-          return Err(ffmpeg_next::Error::Other {
-            errno: libc::ENOMEM,
-          });
-        }
-        // Cap check passed — copy AVFrame metadata. SAFETY: cpu and
-        // hw_buf are both valid AVFrames we own. On failure (OOM
-        // during side-data alloc) we propagate so the probe candidate
-        // is treated as failed rather than queueing a frame whose
-        // metadata silently disappeared.
-        unsafe { copy_frame_props_minimal(cpu.as_mut_ptr(), hw_buf.as_ptr()) }?;
-        *pending_bytes = new_total;
-        pending.push_back(cpu);
-      }
-      Err(e) if is_transient(&e) => return Ok(()),
-      Err(e) => return Err(e),
-    }
-  }
-}
-
-/// Allocated frame dimensions according to `hw_buf.hw_frames_ctx`.
+/// Allocated frame dimensions according to `raw`'s `hw_frames_ctx`.
 ///
 /// Per FFmpeg's `libavutil/hwcontext.c::transfer_data_alloc`, the CPU
 /// destination of `av_hwframe_transfer_data` is allocated using
@@ -4028,15 +3927,8 @@ fn drain_into_pending(
 /// real allocation slip past the cap.
 ///
 /// Returns `None` when no `hw_frames_ctx` is attached or the dimensions
-/// are non-positive — the caller treats `None` as "cannot prove
-/// allocation extent, fail the candidate."
-fn hw_frames_ctx_dimensions(frame: &frame::Video) -> Option<(i32, i32)> {
-  // SAFETY: `frame` owns a live `AVFrame` for the call.
-  unsafe { hw_frames_ctx_dimensions_raw(frame.as_ptr()) }
-}
-
-/// Pointer form of [`hw_frames_ctx_dimensions`], for the judges that
-/// hold a raw `AVFrame` rather than a wrapper.
+/// are non-positive — [`judge_hw_transfer`] charges a frame it cannot
+/// size as unbounded.
 ///
 /// # Safety
 ///
@@ -4062,74 +3954,6 @@ unsafe fn hw_frames_ctx_dimensions_raw(raw: *const AVFrame) -> Option<(i32, i32)
       return None;
     }
     Some((w, h))
-  }
-}
-
-/// Conservative upper-bound estimate of the bytes
-/// `av_hwframe_transfer_data` will allocate when downloading `hw_buf` to
-/// a CPU frame. Used by [`drain_into_pending`] as a pre-transfer guard
-/// so a candidate replay can refuse a frame whose footprint would
-/// exceed the byte budget *without* first paying the allocation.
-///
-/// Sizes from `hw_buf.hw_frames_ctx` (the allocated dims used by the
-/// FFmpeg transfer path) rather than `AVFrame.width / .height` (display
-/// dims). On a cropped stream the two can differ by orders of magnitude
-/// and using display dims would let the real allocation slip past the
-/// cap.
-///
-/// Returns `None` when `hw_frames_ctx` is missing or its width/height
-/// are non-positive — caller treats as candidate failure since we
-/// cannot prove the allocation extent. (A SW source frame on the probe
-/// replay path is not expected; we don't fall back to display dims
-/// because that's the exact attack the cap is meant to prevent.)
-fn estimate_transfer_bytes(hw_buf: &frame::Video) -> Option<usize> {
-  let (w, h) = hw_frames_ctx_dimensions(hw_buf)?;
-  Some(
-    (w as usize)
-      .saturating_mul(h as usize)
-      .saturating_mul(WORST_CASE_BYTES_PER_PIXEL),
-  )
-}
-
-/// Exact resident size of a CPU frame: sum of `AVFrame.buf[i].size`
-/// across every populated buffer.
-///
-/// `AVBufferRef.size` is documented as "Size of data in bytes" — the
-/// real allocated extent FFmpeg used. Reading it directly handles the
-/// cropped/aligned case where `AVFrame.height` (display) is smaller
-/// than the underlying allocation height (the `AVHWFramesContext`
-/// surface size FFmpeg sized the buffer for); a `linesize *
-/// plane_height_for(display_height)` formula would undercount in that
-/// case.
-///
-/// Returns `None` only when `linesize[0]` is negative — FFmpeg's
-/// vertically-flipped layout. The crate's safe row accessors
-/// ([`crate::Frame::row`] / [`crate::Frame::rows`]) already reject
-/// negative-stride frames, so queueing one during probe replay would
-/// just delay the failure to the consumer; refusing here lets the
-/// probe loop advance to the next backend instead.
-fn cpu_frame_bytes(frame: &frame::Video) -> Option<usize> {
-  // SAFETY: AVFrame.linesize is `[c_int; 8]`; AVFrame.buf is
-  // `[*mut AVBufferRef; 8]`; AVBufferRef.size is `usize`. All are
-  // primitive reads / pointer dereferences with no enum interpretation.
-  unsafe {
-    let raw = frame.as_ptr();
-    let first_linesize = (*raw).linesize[0];
-    // Vertically-flipped (negative linesize) is the only "unsizeable"
-    // case we still surface as `None`; everything else can be exactly
-    // measured from buf[i].size.
-    if first_linesize < 0 {
-      return None;
-    }
-    let mut total: usize = 0;
-    for i in 0..(*raw).buf.len() {
-      let buf = (*raw).buf[i];
-      if buf.is_null() {
-        continue;
-      }
-      total = total.saturating_add((*buf).size);
-    }
-    Some(total)
   }
 }
 
