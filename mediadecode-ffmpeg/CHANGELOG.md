@@ -46,7 +46,9 @@ The backend-agnostic core it adapts has its own log at
   read:** a packet carrying `AV_PKT_DATA_ENCRYPTION_INFO` or
   `AV_PKT_DATA_ENCRYPTION_INIT_INFO` gets no bitstream mark, and its
   track's reading stops there for the rest of the stream, a seek
-  included; and a track FFmpeg names encrypted at the open — a stream's
+  included, latched as the packet is read, whatever becomes of it
+  (delivered, refused by a limit, parked, or discarded by a seek); and a
+  track FFmpeg names encrypted at the open — a stream's
   `ENCRYPTION_INIT_INFO` from `pssh`, its `enc_key_id`, or a `codec_tag`
   of `encv` — is never read at all. What no signal answers is named, by
   demuxer, with the option: in `mov`, a protection scheme with no CENC

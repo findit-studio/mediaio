@@ -88,8 +88,10 @@ impl DemuxerOpen {
   /// **Inside a declared demuxer every signal FFmpeg gives still fails
   /// closed**, and none adds a reading: a packet carrying
   /// `AV_PKT_DATA_ENCRYPTION_INFO` or `AV_PKT_DATA_ENCRYPTION_INIT_INFO` is
-  /// not read, and its track's reading ends there; and a track FFmpeg names
-  /// encrypted at the open is never read — the stream's
+  /// not read, and its track's reading ends there for good — **latched as
+  /// the packet enters the demuxer, whatever becomes of it**: delivered,
+  /// refused by a limit, parked after a failed allocation, or discarded by a
+  /// seek. And a track FFmpeg names encrypted at the open is never read — the stream's
   /// `ENCRYPTION_INIT_INFO` (`mov`'s `pssh`), its `enc_key_id` (Matroska's
   /// key id), or a `codec_tag` of `encv`. What no signal answers, by
   /// demuxer, in FFmpeg 9.0.1:

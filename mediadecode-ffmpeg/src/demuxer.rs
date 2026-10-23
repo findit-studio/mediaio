@@ -160,6 +160,10 @@ enum InjectedRead {
     duration: i64,
     payload: Vec<u8>,
   },
+  /// libavformat hands over this packet as it is: its payload, side data
+  /// and timing, all the law's. Built before the read, so a read under a
+  /// capped allocator makes no allocation of its own.
+  Built(Packet),
 }
 
 /// `mediadecode::demuxer::Demuxer` impl wrapping `ffmpeg::format::context::Input`.
@@ -297,9 +301,10 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// raw `h264` and `hevc` demuxers and a demuxer the caller declares
   /// plaintext alone ([`reads_bitstreams_of`],
   /// [`DemuxerOpen::plaintext_demuxers`]); told of every seek ([`sought`]);
-  /// dropped for good at a track's first packet whose payload is encrypted
-  /// ([`ENCRYPTED_SIDE_DATA`]), and never built for a track FFmpeg names
-  /// encrypted at the open ([`encrypted_at_open`]).
+  /// dropped for good at a track's first packet that carries encryption
+  /// side data ([`ENCRYPTED_SIDE_DATA`]), as that packet is read and
+  /// whatever becomes of it ([`latch_encryption`]); and never built for a
+  /// track FFmpeg names encrypted at the open ([`encrypted_at_open`]).
   bitstreams: Vec<Option<NalStream>>,
   /// Reads that answer in place of libavformat's next ones. Test only:
   /// see [`Self::read_into`].
@@ -1016,6 +1021,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
           packet.set_duration(duration);
           Ok(())
         }
+        InjectedRead::Built(built) => {
+          *packet = built;
+          Ok(())
+        }
       };
     }
     packet.read(&mut self.input)
@@ -1053,11 +1062,19 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       // **A parked packet is re-attempted before another is read.**
       // See [`Self::unconverted`]: `av_read_frame` has already given
       // this one up, so reading past it would lose it.
+      // A parked packet's signal was latched when it was read.
       let (packet, parked_provenance) = match self.unconverted.take() {
         Some((packet, provenance)) => (packet, Some(provenance)),
         None => {
           let mut packet = Packet::empty();
           let read = self.read_into(&mut packet);
+          // **The encryption latch, at the packet's entry**, before every
+          // road it can take from here: the panic check below, the
+          // conversion, a refusal, a parking, a seek's discard. See
+          // [`latch_encryption`] for the roads.
+          if read.is_ok() {
+            latch_encryption(&mut self.bitstreams, &packet);
+          }
           // A panicking reader reported an ordinary I/O error to C, and
           // libavformat may answer that with the error, with EOF (a
           // stream it cannot read looks finished), or with a packet it
@@ -3591,6 +3608,73 @@ unsafe fn encrypted_at_open(stream: *const AVStream) -> bool {
   })
 }
 
+/// **The encryption latch, at a packet's entry.** Where the packet
+/// `av_read_frame` just handed over carries encryption side data
+/// ([`ENCRYPTED_SIDE_DATA`]), its track's reading is dropped for good, then
+/// and there, before anything else becomes of the packet. So the first
+/// signal ends the reading whatever the packet's road — delivered, refused,
+/// parked, or discarded by a seek — and no later packet of the track is
+/// read, after a seek or before it. The raw `AVPacket`'s side-data types are
+/// read as the integers they are, never formed into the bindings' enum
+/// ([`carries_encryption`]).
+///
+/// **Every road a packet takes from `av_read_frame`, and the latch before
+/// it** ([`CarrierDemuxer::next_packet_impl`],
+/// [`CarrierDemuxer::seek_impl`]):
+///
+/// | road | what becomes of the packet | the latch |
+/// |---|---|---|
+/// | delivered | converted, marked from the bitstream where its track is read ([`marked_from_bitstream`]), and returned | before the conversion |
+/// | refused by its conversion: a payload over the packet limit, side data over its budget or malformed, flags the vocabulary cannot hold | dropped, the walk broken, and the error returned | before the conversion |
+/// | refused by an allocation (`CaptureFailed`, `SideDataAlloc`) | parked in `unconverted`, the error returned, and re-attempted at the next pull before anything is read; the latch does not run again | before the parking |
+/// | parked, then discarded by a successful seek | dropped by the seek | before the parking, so before the seek |
+/// | read while the caller's reader panicked | dropped: the session is terminal, the panic returned, and nothing is read again | before the panic is returned |
+/// | on a stream the track table does not describe, a stream added after the open among them | passed by, the walk broken; no such stream has a reading, since the readings are built at the open | runs, and finds no reading |
+/// | on a track with no reading: a demuxer neither read by default nor declared, a codec other than H.264 and HEVC, an attachment's duplicate, a track of unknown kind | delivered with the container's mark, or passed by | runs, and drops a reading where one exists |
+/// | carrying no payload | not delivered; its timing observed | before it is passed by |
+/// | `av_read_frame` answers an error, or the end of the file | no packet is handed over | — |
+/// | an attachment's packet, queued at the open (`pending`) | delivered first; an attachment track has no reading | — |
+/// | an injected read, in tests alone ([`InjectedRead`]) | as libavformat's packet, by the same roads | as above |
+fn latch_encryption(bitstreams: &mut [Option<NalStream>], packet: &Packet) {
+  // SAFETY: `packet` is live for the call, and `carries_encryption` reads
+  // its side-data array as its own contract states.
+  if unsafe { carries_encryption(packet) }
+    && let Some(reading) = bitstreams.get_mut(packet.stream())
+  {
+    *reading = None;
+  }
+}
+
+/// Whether the raw `packet` carries a kind of [`ENCRYPTED_SIDE_DATA`], each
+/// entry's `type` read as the integer it is.
+///
+/// # Safety
+///
+/// `packet` is live for the call: its `side_data`, where not null and
+/// `side_data_elems` is above 0, is valid for that many entries, of which
+/// only each `type` is read.
+unsafe fn carries_encryption(packet: &Packet) -> bool {
+  use ffmpeg_next::packet::Ref;
+  // SAFETY: the caller's contract; `side_data` and `side_data_elems` are
+  // plain fields of the live packet.
+  let (entries, count) = unsafe {
+    let raw = packet.as_ptr();
+    ((*raw).side_data, (*raw).side_data_elems)
+  };
+  if entries.is_null() || count <= 0 {
+    return false;
+  }
+  (0..count as usize).any(|index| {
+    // **Never `&*entry`**, as `encrypted_at_open` reads the coded side
+    // data: `type` is an open C enum, so only its address is formed and the
+    // value read as the integer it is.
+    // SAFETY: `index` is below `side_data_elems`, for which the array is
+    // valid per the caller's contract.
+    let kind = unsafe { read_unaligned(addr_of!((*entries.add(index)).type_).cast::<c_int>()) };
+    says_encrypted(kind)
+  })
+}
+
 /// Whether packet side data of `kind`, the raw `AVPacketSideDataType` it
 /// arrives as, is one of [`ENCRYPTED_SIDE_DATA`], compared as the integer
 /// it is, as [`side_data_persists`] compares.
@@ -3632,8 +3716,12 @@ fn says_encrypted(kind: c_int) -> bool {
 /// ciphertext, which can look like any NAL unit. And its track's reading is
 /// dropped for the rest of the stream, a seek included, since the plaintext
 /// it did not see may move the framing and the parameter sets the packets
-/// after are read by. The container's own mark is the container's, and
-/// stays as the persistence tables answer it.
+/// after are read by. **The signal is latched as the packet enters the
+/// demuxer** ([`latch_encryption`]), before its conversion, whatever becomes
+/// of it — delivered, refused, parked, or discarded by a seek; the check here
+/// stands behind the latch, for a packet converted with the side data it was
+/// read with. The container's own mark is the container's, and stays as the
+/// persistence tables answer it.
 fn marked_from_bitstream<D: AsRef<[u8]>>(
   bitstream: Option<&mut Option<NalStream>>,
   packet: mediadecode::packet::VideoPacket<crate::extras::VideoPacketExtra, D>,
@@ -6422,6 +6510,162 @@ mod tests {
       marks_of(&path, &DemuxerOpen::new()),
       (false, vec![false, false, false]),
       "by default: never read"
+    );
+  }
+
+  /// `payload` as a packet of stream 0 carrying `AV_PKT_DATA_ENCRYPTION_INFO`,
+  /// as `mov` attaches it to a sample under an encryption index
+  /// (`libavformat/mov.c` 8726–8736), to be handed over whole
+  /// ([`InjectedRead::Built`]).
+  fn signalled(payload: &[u8]) -> Packet {
+    use ffmpeg_next::{ffi::av_packet_new_side_data, packet::Mut};
+
+    let mut packet = Packet::copy(payload);
+    // SAFETY: `packet` owns a live packet; the entry is FFmpeg's own
+    // allocation of 16 bytes, written only through the pointer it returns.
+    unsafe {
+      let entry = av_packet_new_side_data(
+        packet.as_mut_ptr(),
+        AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INFO,
+        16,
+      );
+      assert!(!entry.is_null(), "the side data");
+      ptr::write_bytes(entry, 0x5A, 16);
+    }
+    packet.set_stream(0);
+    packet.set_pts(Some(1));
+    packet.set_dts(Some(1));
+    packet.set_duration(1);
+    packet
+  }
+
+  /// Which of the video packets `demuxer` delivers from here to the end are
+  /// marked DISPOSABLE.
+  fn marks_to_the_end<C: crate::FfmpegCarrier + crate::CarrierOps>(
+    demuxer: &mut CarrierDemuxer<C>,
+  ) -> Vec<bool> {
+    let mut marks = Vec::new();
+    while let Some(packet) = demuxer.next_packet_impl().expect("a packet or the end") {
+      if let DemuxedPacket::Video(video) = packet {
+        marks.push(
+          video
+            .into_packet()
+            .flags()
+            .contains(PacketFlags::DISPOSABLE),
+        );
+      }
+    }
+    marks
+  }
+
+  /// LAW: **a signalled packet a limit refuses still ends its track's
+  /// reading** (Codex R11). A declared `mov` session is read past its
+  /// reference picture. Then a packet carrying `ENCRYPTION_INFO`, its payload
+  /// over the packet limit, is refused by its conversion and dropped. The
+  /// latch ran as the packet was read: the reading is gone, and the
+  /// plaintext non-reference packets after it are unread and unmarked.
+  ///
+  /// The signalled packet is an injected read ([`InjectedRead::Built`]),
+  /// which takes libavformat's road from the read on. A real CENC file
+  /// signals every sample, so it cannot put an unsignalled packet after a
+  /// signalled one, as a fragmented MOV that switches sample descriptions
+  /// can.
+  ///
+  /// PLANT: the latch moved back after the conversion, as in R11, turns
+  /// this red at "latched as it was read".
+  #[test]
+  fn a_signalled_packet_a_limit_refuses_still_ends_its_tracks_reading() {
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    let path = scratch.path().join("clear.mp4");
+    let (record, packets) = h264_of(Framed::Lengths);
+    write_h264(&path, "mp4", &record, &packets, &[], no_signal, &[]);
+    let limits =
+      DemuxLimits::new().with_packet(crate::limits::PacketLimits::new().with_max_packet_bytes(64));
+    let mut demuxer =
+      CarrierDemuxer::<crate::Owned>::open_from_impl(&path, declaring(&[MOV]).with_limits(limits))
+        .expect("the file opens");
+    let Some(DemuxedPacket::Video(first)) = demuxer.next_packet_impl().expect("a packet") else {
+      panic!("the reference picture's packet");
+    };
+    assert!(
+      !first
+        .into_packet()
+        .flags()
+        .contains(PacketFlags::DISPOSABLE),
+      "the reference picture"
+    );
+
+    demuxer
+      .injected_reads
+      .push_back(InjectedRead::Built(signalled(&[0; 128])));
+    let refused = demuxer.next_packet_impl().map(|packet| packet.is_some());
+    assert!(
+      matches!(refused, Err(DemuxError::PacketBuffer(_))),
+      "refused by the packet limit: {refused:?}"
+    );
+    assert!(demuxer.unconverted.is_none(), "dropped, not parked");
+    assert!(demuxer.bitstreams[0].is_none(), "latched as it was read");
+    assert_eq!(
+      marks_to_the_end(&mut demuxer),
+      vec![false, false],
+      "the plaintext after it, unread and unmarked"
+    );
+  }
+
+  /// LAW: **a signalled packet parked, then discarded by a seek, still ends
+  /// its track's reading** (Codex R11). In a declared `mov` session on the
+  /// view lane, a packet carrying `ENCRYPTION_INFO` is handed over whole
+  /// ([`InjectedRead::Built`]). Its conversion meets an allocator capped at
+  /// one byte (`av_max_alloc`, in a child process of its own), so its capture
+  /// fails, and the packet is parked to be re-attempted. A successful seek
+  /// then discards it. The latch ran as the packet was read: after the seek,
+  /// the file's packets — a reference picture, then two non-reference ones,
+  /// all plaintext — are unread and unmarked.
+  ///
+  /// PLANT: the latch skipped on the parking road, run only for a packet
+  /// dropped or delivered, turns this red at "latched before the parking".
+  #[test]
+  fn a_signalled_packet_parked_then_discarded_by_a_seek_still_ends_its_tracks_reading() {
+    mediaio_ffmpeg::test_support::in_subprocess(
+      "demuxer::tests::a_signalled_packet_parked_then_discarded_by_a_seek_still_ends_its_tracks_reading",
+      || {
+        let scratch = tempfile::tempdir().expect("a temp dir");
+        let path = scratch.path().join("clear.mp4");
+        let (record, packets) = h264_of(Framed::Lengths);
+        write_h264(&path, "mp4", &record, &packets, &[], no_signal, &[]);
+        let mut demuxer = CarrierDemuxer::<crate::View>::open_from_impl(&path, declaring(&[MOV]))
+          .expect("the file opens");
+        demuxer
+          .injected_reads
+          .push_back(InjectedRead::Built(signalled(&avc_packet(0))));
+
+        // SAFETY: in `in_subprocess`'s child, alone. The capped window is one
+        // pull, whose read moves a packet built before it and whose
+        // conversion checks every allocation it makes.
+        unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(1) };
+        let parked = demuxer.next_packet_impl().map(|packet| packet.is_some());
+        mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
+        assert!(
+          matches!(parked, Err(DemuxError::PacketBuffer(ref refused)) if parks_in_demux(refused.source())),
+          "refused by the allocator: {parked:?}"
+        );
+        assert!(demuxer.unconverted.is_some(), "parked, to be re-attempted");
+        assert!(
+          demuxer.bitstreams[0].is_none(),
+          "latched before the parking"
+        );
+
+        demuxer
+          .seek_impl(Timestamp::new(0, Timebase::HZ_8K))
+          .expect("a seek");
+        assert!(demuxer.unconverted.is_none(), "discarded by the seek");
+        assert_eq!(
+          marks_to_the_end(&mut demuxer),
+          vec![false, false, false],
+          "after the seek, the track read no more"
+        );
+        assert!(demuxer.bitstreams[0].is_none(), "its reading gone for good");
+      },
     );
   }
 
