@@ -2595,15 +2595,16 @@ impl VideoDecoder {
           Ok(()) => continue,
           Err(stop) => return Err(stop.into_error()),
         },
-        Gate::PastEnd => match self.session {
+        Gate::PastEnd => {
           // The caller gave the end while the advance was owed: the advance
           // resumes all the same, the next candidate replayed it.
-          Session::Owed(_) => match self.resume() {
-            Ok(()) => continue,
-            Err(stop) => return Err(stop.into_error()),
-          },
-          _ => {}
-        },
+          if let Session::Owed(_) = self.session {
+            match self.resume() {
+              Ok(()) => continue,
+              Err(stop) => return Err(stop.into_error()),
+            }
+          }
+        }
         Gate::Live => {}
       }
       // Re-read each iteration: a probe advance moves this session from

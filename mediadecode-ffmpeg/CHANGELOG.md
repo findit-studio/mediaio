@@ -9,7 +9,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
-## [0.21.0] - unreleased
+## [0.21.0] - 2026-10-24
 
 The hardware probe's redesign and the video decoders' options. The FFmpeg
 crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
