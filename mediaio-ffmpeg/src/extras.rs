@@ -178,6 +178,17 @@ impl VideoFrameExtra {
     self.top_field_first
   }
   /// FFmpeg's heuristic best-effort PTS, or `None` if unknown.
+  ///
+  /// **A guess, and one that a dropped packet can move.** libavcodec picks
+  /// the frame's pts or its packet's dts by counts it keeps across every
+  /// frame the decoder has output (`guess_correct_pts`,
+  /// `libavcodec/decode.c` 296–319 in FFmpeg 9.0.1, called for each frame
+  /// at 694–696), so a packet dropped before the decoder — one marked
+  /// [`DISPOSABLE`](mediaspine::packet::PacketFlags::DISPOSABLE) among
+  /// them, by the container or the bitstream — can move it for a later
+  /// frame. The frame's own pts ([`VideoFrame::pts`](crate::VideoFrame),
+  /// `AVFrame.pts`: the pts of the packet its picture came in) moves for
+  /// no other packet, and is the exact one.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn best_effort_timestamp(&self) -> Option<i64> {
     self.best_effort_timestamp
@@ -429,7 +440,10 @@ impl AudioFrameExtra {
     }
   }
 
-  /// FFmpeg's heuristic best-effort PTS, or `None` if unknown.
+  /// FFmpeg's heuristic best-effort PTS, or `None` if unknown: a guess
+  /// from every frame the decoder output before, as
+  /// [`VideoFrameExtra::best_effort_timestamp`] describes; the frame's own
+  /// pts is the exact one.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn best_effort_timestamp(&self) -> Option<i64> {
     self.best_effort_timestamp

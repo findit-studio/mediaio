@@ -7,6 +7,11 @@ libavcodec and libavformat (through
 [`ffmpeg-next`](https://crates.io/crates/ffmpeg-next)) and the
 **crossings** between FFmpeg's memory and the shared media vocabulary.
 
+**FFmpeg 9 is the floor**, for this crate and every crate of the family
+built on it: no older release is supported, and the build script refuses
+one by name. It reads the linked release from `ffmpeg-sys-next`'s `links`
+metadata (`DEP_FFMPEG_FFMPEG_9_0`, set from libavcodec 63.1, FFmpeg 9.0's).
+
 | here | not here |
 |---|---|
 | the carriers (`FfmpegBytes`, `FfmpegBuffer`, the `Owned` / `View` lanes) and the operations that fill them | the decoders and the demuxer — `mediadecode-ffmpeg` |

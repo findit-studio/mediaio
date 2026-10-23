@@ -346,10 +346,35 @@ for end-to-end demuxer-driven runs that cover all three streams.
 - **Demuxer**: `FfmpegDemuxer` — `mediadecode`'s `Demuxer` over
   `libavformat`, opened from a path (`open`) or from any
   `Read + Seek` byte source through a custom `AVIOContext`
-  (`open_reader`). Plus `DemuxError`, and `format()` → `ContainerFormat`
+  (`open_reader`), or with every optional of the open named in a
+  `DemuxerOpen` (`open_from`, `open_reader_from`). Plus `DemuxError`, and
+  `format()` → `ContainerFormat`
   — libavformat's own identification of the bytes (`"matroska,webm"`,
   `"mov,mp4,m4a,3gp,3g2,mj2"`), read from the container rather than
-  guessed from a path.
+  guessed from a path. A video packet of an H.264 or HEVC track is
+  marked `PacketFlags::DISPOSABLE` where its NAL units prove that
+  nothing references it (`mediadecode::nal`) — a non-reference picture,
+  or an HEVC sub-layer non-reference picture at the highest temporal
+  sub-layer, with nothing beside it a later picture needs — and only
+  there: where a track is read, its reading decides, the container's own
+  mark (MP4's `sdtp`) with it. **A container is read only where the
+  caller declares its demuxer's inputs plaintext**
+  (`DemuxerOpen::plaintext_demuxers`, each a `DemuxerName` the linked
+  FFmpeg registers, by its whole name: `"mov,mp4,m4a,3gp,3g2,mj2"`).
+  FFmpeg cannot prove a container's payload plaintext — an MP4 track
+  protected under OMA DRM 2's PDCF reaches the demuxer as ciphertext,
+  with nothing public to say so — so by default the raw `h264` and `hevc`
+  elementary streams alone are read, plaintext by construction, and every
+  other demuxer is container-only: its packets carry the container's mark
+  alone, as FFmpeg delivers it, which it sets in `mov` alone and never on
+  an H.264 track. **The declaration is the caller's assertion, and its
+  risk:** an encrypted input's ciphertext, read as a bitstream, can be
+  marked falsely. Inside a declared demuxer every encryption signal
+  FFmpeg gives — `ENCRYPTION_INFO` on a packet, `pssh`'s
+  `ENCRYPTION_INIT_INFO` or Matroska's `enc_key_id` on a stream — still
+  ends a reading. A Sony XAVC original, which carries no `sdtp`, has two
+  pictures in three marked where `mov` is declared; a consumer that keeps
+  only reference pictures drops them before they are decoded.
 - **Codec identity**: `CodecId` — the number FFmpeg keys on, with
   `name()` / `long_name()` reading libavcodec's own descriptor table
   for the word beside it (`"h264"`, `"aac"`), so a stored track row can
@@ -434,9 +459,11 @@ once `--ignored` has opted into them.
 
 ## Build requirements
 
-- A system FFmpeg ≥ **5.1** linkable via `pkg-config` (we reference
-  `AV_PIX_FMT_P212LE` / `AV_PIX_FMT_P412LE`, which were added in 5.1).
-  Tested against 9.0. Verify with `ffmpeg -hwaccels` that your build
+- A system **FFmpeg 9** or newer, linkable via `pkg-config`; no older
+  release is supported. The build refuses an older one by name:
+  `mediaio-ffmpeg`'s build script reads the linked release from
+  `ffmpeg-sys-next`'s `links` metadata (`DEP_FFMPEG_FFMPEG_9_0`). Tested
+  against 9.0.1. Verify with `ffmpeg -hwaccels` that your build
   has the backends you expect compiled in
   (e.g. `videotoolbox` on macOS, `vaapi` / `cuda` on Linux,
   `d3d11va` / `cuda` on Windows).

@@ -16,9 +16,10 @@ bitflags! {
   ///   `AV_PKT_FLAG_CORRUPT`).
   /// - `DISCARD = 0b100` — packet should be skipped during reconstruction
   ///   (FFmpeg `AV_PKT_FLAG_DISCARD`).
-  /// - `DISPOSABLE = 0b1_0000` — the demuxer states that nothing
-  ///   references this packet (FFmpeg `AV_PKT_FLAG_DISPOSABLE`). Absent
-  ///   means unknown, never "referenced".
+  /// - `DISPOSABLE = 0b1_0000` — nothing references this picture: the
+  ///   container's mark or the bitstream's (FFmpeg
+  ///   `AV_PKT_FLAG_DISPOSABLE`, and [`nal`](crate::nal)). Absent means
+  ///   unknown, never "referenced".
   ///
   /// # Text form
   ///
@@ -40,16 +41,68 @@ bitflags! {
     const CORRUPT = 0b010;
     /// Demuxer hint: skip this packet.
     const DISCARD = 0b100;
-    /// Demuxer hint: nothing references this packet, so dropping it
-    /// loses its own picture and no other (FFmpeg
-    /// `AV_PKT_FLAG_DISPOSABLE`). In libavformat 9.0.1 one demuxer sets
+    /// Nothing references this picture: the container's mark or the
+    /// bitstream's. Dropping the packet loses its own picture and no
+    /// other (FFmpeg `AV_PKT_FLAG_DISPOSABLE`).
+    ///
+    /// **The promise is pixels:** dropping the packet changes no later
+    /// picture's pixels. It does not promise a later frame's best-effort
+    /// timestamp, which a decoder may guess from every frame it output
+    /// before — FFmpeg's does ([`nal`](crate::nal#what-the-mark-promises)),
+    /// for a packet the container marks as for one the bitstream does. A
+    /// frame's own pts, its packet's, is the exact one.
+    ///
+    /// **The container's mark.** In libavformat 9.0.1 one demuxer sets
     /// it: MP4/MOV, from `sdtp`, for a sample nothing depends on
-    /// (`libavformat/mov.c` 11719–11723). Matroska's own discardable bit
-    /// is NOT mapped (`libavformat/matroskadec.c` reads the block's
-    /// keyframe bit alone, 4319–4320), so a Matroska packet reads absent.
+    /// (`libavformat/mov.c` 11719–11723). It reaches a packet only on a
+    /// track libavformat does not parse as it reads: `mov` parses an H.264
+    /// track's headers (3159–3160), and the parse rebuilds each packet's
+    /// flags without the mark (`libavformat/demux.c` 1289), so no H.264
+    /// packet of MP4 carries it. Matroska's own discardable bit is NOT
+    /// mapped (`libavformat/matroskadec.c` reads the block's keyframe bit
+    /// alone, 4319–4320).
+    ///
+    /// **The bitstream's.** For H.264 and HEVC, a demuxer also marks
+    /// every packet whose NAL units prove it — a non-reference picture,
+    /// or an HEVC sub-layer non-reference picture at the highest temporal
+    /// sub-layer, with nothing beside it a later picture needs
+    /// ([`nal::NalStream`](crate::nal::NalStream)). **Where it reads a
+    /// track, the bitstream's verdict decides**: the bit is set on a packet
+    /// the bitstream proves and on no other, the container's mark cleared
+    /// on every other verdict and on a corrupt packet, since a picture
+    /// nothing references may still take up what an earlier packet left. A
+    /// track it does not read carries the container's mark alone. No other
+    /// codec's bitstream is read, and no encrypted payload: a demuxer reads
+    /// no packet that carries encryption side data, and nothing of its
+    /// track after it, nor any packet of a track its container names
+    /// encrypted at the open.
+    ///
+    /// **A container's bitstream is read only where the caller declares its
+    /// demuxer's inputs plaintext.** FFmpeg cannot prove a container's
+    /// payload plaintext — an MP4 track protected under OMA DRM 2's PDCF
+    /// reaches the demuxer as ciphertext, with nothing public to say so — so
+    /// `mediadecode-ffmpeg`'s demuxer reads by default the raw `h264` and
+    /// `hevc` elementary streams alone, plaintext by construction, and a
+    /// container's tracks only where its caller names that demuxer among
+    /// those whose inputs it declares plaintext
+    /// (`DemuxerOpen::plaintext_demuxers`). Every other demuxer is
+    /// container-only, and its packets are never marked from the bitstream.
+    /// **The declaration is the caller's assertion, and its risk the
+    /// caller's:** an encrypted input's ciphertext, read as a bitstream, can
+    /// look like a picture nothing references, and be marked falsely. Inside
+    /// a declared demuxer every encryption signal FFmpeg gives still ends a
+    /// reading; what no signal answers is named, by demuxer, with the
+    /// option.
+    ///
+    /// **Never with side data a decoder takes up past the packet** — a
+    /// new configuration, a parameter change: dropping such a packet
+    /// loses more than its picture, so a demuxer clears the bit there,
+    /// whoever set it.
+    ///
     /// The bit's ABSENCE means unknown, never "referenced": that is the
-    /// rule a consumer must honour, because most containers never mark
-    /// it, and a packet without it may be disposable all the same.
+    /// rule a consumer must honour, because a container may never mark
+    /// it, a codec's bitstream may not be read, and a packet without it
+    /// may be disposable all the same.
     const DISPOSABLE = 0b1_0000;
   }
 }

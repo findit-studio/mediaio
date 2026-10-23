@@ -48,7 +48,7 @@ fn use_feature(feature: &str) {
 ///
 /// # And deliberately nothing about the FFmpeg
 ///
-/// This script does **not** probe the linked FFmpeg, and that is the
+/// This decision does **not** probe the linked FFmpeg, and that is the
 /// point rather than an omission. `src/vtscale`'s body names only Apple
 /// system-framework symbols — `VTPixelTransferSession*`,
 /// `CVPixelBufferGet*`, `CFRelease` — and no FFmpeg symbol whose

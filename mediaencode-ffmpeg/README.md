@@ -8,6 +8,10 @@ is the gate every encoder will be opened through: the encoder-by-name
 catalogue and its GPL rule. The muxer and the encoders themselves
 arrive in the following releases.
 
+It builds against **FFmpeg 9** or newer, the family's floor: no older
+release is supported, and `mediaio-ffmpeg`'s build script refuses one by
+name.
+
 ## Encoders by name
 
 An encoder is named by its FFmpeg name and passes two gates. The first

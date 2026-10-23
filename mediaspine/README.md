@@ -18,6 +18,7 @@ allocator.
 | `adapter` | the per-kind adapter traits: `VideoAdapter`, `AudioAdapter`, `SubtitleAdapter`, `ImageAdapter` |
 | `resampler` | the resampler face: `AudioResampler`, `AdapterAudioFrame` |
 | `hdr` | HDR metadata: `MasteringDisplay`, `ContentLightLevel` |
+| `nal` | what an H.264 or HEVC packet's NAL units say: `NalStream` reads whether nothing references the packet's picture (`Verdict`, `KeptReason`), for `PacketFlags::DISPOSABLE` in any container |
 | `pixel_format`, `color`, `cfa` | re-exports from `mediaframe` |
 
 The time primitives (`Timebase`, `Timestamp`, `TimeRange`) are

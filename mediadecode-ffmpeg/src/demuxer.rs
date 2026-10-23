@@ -99,8 +99,8 @@ use ffmpeg_next::{
   Dictionary, Packet, Rational,
   ffi::{
     AV_DISPOSITION_ATTACHED_PIC, AV_DISPOSITION_TIMED_THUMBNAILS, AV_NOPTS_VALUE, AVDictionary,
-    AVDurationEstimationMethod, AVFMT_FLAG_CUSTOM_IO, AVFormatContext, AVStream, av_dict_get,
-    avformat_alloc_context, avformat_find_stream_info, avformat_open_input,
+    AVDurationEstimationMethod, AVFMT_FLAG_CUSTOM_IO, AVFormatContext, AVPacketSideDataType,
+    AVStream, av_dict_get, avformat_alloc_context, avformat_find_stream_info, avformat_open_input,
   },
   format::context::{Input, StreamIo},
 };
@@ -112,11 +112,13 @@ use mediadecode::{
     Demuxer, DurationSource, MeasuredEnd, SubtitleTrackPacket, SubtitleTrackParams, TrackIndex,
     TrackInfo, TrackKind, TrackParams, UnknownTrackParams, VideoTrackPacket, VideoTrackParams,
   },
+  nal::{NalCodec, NalStream},
+  packet::PacketFlags,
 };
 use smol_bytes::Utf8Bytes;
 
 use crate::{
-  CodecId, Ffmpeg, SampleFormat, boundary,
+  CodecId, DemuxerName, Ffmpeg, SampleFormat, boundary,
   buffer::PacketBufferError,
   extras::{AttachmentPacketExtra, TrackExtra},
   limits::DemuxLimits,
@@ -124,6 +126,10 @@ use crate::{
   reader_guard::{GuardedReader, PanicLatch},
   text::{lossy_len, lossy_text},
 };
+
+mod open;
+
+pub use open::DemuxerOpen;
 // The codec-parameter refusals are the base's: `mediaio-ffmpeg` mirrors,
 // copies and rebuilds parameters, and this demuxer reports each of its
 // refusals under the same payload (`From<ParametersError>` below).
@@ -154,6 +160,10 @@ enum InjectedRead {
     duration: i64,
     payload: Vec<u8>,
   },
+  /// libavformat hands over this packet as it is: its payload, side data
+  /// and timing, all the law's. Built before the read, so a read under a
+  /// capped allocator makes no allocation of its own.
+  Built(Packet),
 }
 
 /// `mediadecode::demuxer::Demuxer` impl wrapping `ffmpeg::format::context::Input`.
@@ -279,6 +289,23 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// [`Measured`]. Fed by [`Self::next_packet_impl`] as packets are
   /// read; it reads nothing itself.
   measured: Measured,
+  /// Each track's reading of its H.264 or HEVC bitstream, by track
+  /// index — `None` for every other track — through which
+  /// [`Self::next_packet_impl`] marks a video packet
+  /// [`DISPOSABLE`](mediadecode::packet::PacketFlags::DISPOSABLE) where
+  /// its NAL units prove that nothing references its picture
+  /// ([`mediadecode::nal`]) and nowhere else, the container's mark cleared
+  /// on every other verdict, and clears the mark where the packet carries
+  /// side data that persists past it ([`marked_from_bitstream`]). Built at
+  /// open from each stream's codec and extradata ([`bitstreams`]), for the
+  /// raw `h264` and `hevc` demuxers and a demuxer the caller declares
+  /// plaintext alone ([`reads_bitstreams_of`],
+  /// [`DemuxerOpen::plaintext_demuxers`]); told of every seek ([`sought`]);
+  /// dropped for good at a track's first packet that carries encryption
+  /// side data ([`ENCRYPTED_SIDE_DATA`]), as that packet is read and
+  /// whatever becomes of it ([`latch_encryption`]); and never built for a
+  /// track FFmpeg names encrypted at the open ([`encrypted_at_open`]).
+  bitstreams: Vec<Option<NalStream>>,
   /// Reads that answer in place of libavformat's next ones. Test only:
   /// see [`Self::read_into`].
   #[cfg(test)]
@@ -351,7 +378,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
   /// FFmpeg's logging and network protocols configured; probing a local
   /// container does not require it.
   pub(crate) fn open_impl<P: AsRef<Path> + ?Sized>(path: &P) -> Result<Self, DemuxError> {
-    Self::open_with_impl(path, DemuxLimits::default())
+    Self::open_from_impl(path, DemuxerOpen::new())
   }
 
   /// [`Self::open`], with the session's resource budgets named.
@@ -371,6 +398,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     path: &P,
     limits: DemuxLimits,
   ) -> Result<Self, DemuxError> {
+    Self::open_from_impl(path, DemuxerOpen::new().with_limits(limits))
+  }
+
+  /// [`Self::open`], with every optional of the open named: the session's
+  /// budgets, and the demuxers whose inputs the caller declares plaintext
+  /// ([`DemuxerOpen`]).
+  pub(crate) fn open_from_impl<P: AsRef<Path> + ?Sized>(
+    path: &P,
+    request: DemuxerOpen,
+  ) -> Result<Self, DemuxError> {
+    let limits = request.limits();
     // **The probe knobs, set before libavformat reads a byte.** See
     // [`DemuxLimits::max_probe_bytes`]: `avformat_open_input` and
     // `avformat_find_stream_info` build the attachment, extradata and
@@ -384,7 +422,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     // this crate owns, and a path is opened by libavformat's own
     // protocol layer. The reader entrypoint gets both.
     let (input, pre_probe) = open_path(path.as_ref(), limits)?;
-    Self::from_input(input, pre_probe, limits)
+    Self::from_input(input, pre_probe, &request)
   }
 
   /// Opens a container from any `Read + Seek` byte source, through a
@@ -413,7 +451,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     reader: R,
     filename: Option<&str>,
   ) -> Result<Self, DemuxError> {
-    Self::open_reader_with_impl(reader, filename, DemuxLimits::default())
+    Self::open_reader_from_impl(reader, filename, DemuxerOpen::new())
   }
 
   /// [`Self::open_reader`], with the session's resource budgets named.
@@ -423,6 +461,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     filename: Option<&str>,
     limits: DemuxLimits,
   ) -> Result<Self, DemuxError> {
+    Self::open_reader_from_impl(reader, filename, DemuxerOpen::new().with_limits(limits))
+  }
+
+  /// [`Self::open_reader`], with every optional of the open named
+  /// ([`DemuxerOpen`]), as [`Self::open_from`].
+  pub(crate) fn open_reader_from_impl<R: Read + Seek + Send + 'static>(
+    reader: R,
+    filename: Option<&str>,
+    request: DemuxerOpen,
+  ) -> Result<Self, DemuxError> {
+    let limits = request.limits();
     let (guarded, latch, meter) = GuardedReader::new(reader, limits.max_probe_bytes());
     let io = StreamIo::from_read_seek(guarded)?;
     let (input, pre_probe) = open_stream(io, filename, probe_options(limits)).map_err(|fault| {
@@ -461,7 +510,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     if let Some(panicked) = reader_panic(&latch) {
       return Err(panicked);
     }
-    let mut demuxer = Self::from_input(input, pre_probe, limits)?;
+    let mut demuxer = Self::from_input(input, pre_probe, &request)?;
     demuxer.reader_panic = Some(latch);
     Ok(demuxer)
   }
@@ -496,8 +545,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
   fn from_input(
     input: Input,
     pre_probe: PreProbeDurations,
-    limits: DemuxLimits,
+    request: &DemuxerOpen,
   ) -> Result<Self, DemuxError> {
+    let limits = request.limits();
     // **Everything the container declares is judged before anything it
     // declares is paid for**, and that is a property of the *whole*
     // open rather than of either table.
@@ -561,6 +611,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     // `max_streams`.
     let measured =
       Measured::new(count).map_err(|_| DemuxError::TrackTableAlloc(TrackTableAlloc::new(count)))?;
+    let bitstreams = bitstreams(&input, format.as_ref(), request.plaintext_demuxers())?;
     Ok(Self {
       input,
       tracks,
@@ -568,6 +619,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       format,
       duration,
       measured,
+      bitstreams,
       #[cfg(test)]
       injected_reads: VecDeque::new(),
       pending,
@@ -969,6 +1021,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
           packet.set_duration(duration);
           Ok(())
         }
+        InjectedRead::Built(built) => {
+          *packet = built;
+          Ok(())
+        }
       };
     }
     packet.read(&mut self.input)
@@ -1006,11 +1062,19 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       // **A parked packet is re-attempted before another is read.**
       // See [`Self::unconverted`]: `av_read_frame` has already given
       // this one up, so reading past it would lose it.
+      // A parked packet's signal was latched when it was read.
       let (packet, parked_provenance) = match self.unconverted.take() {
         Some((packet, provenance)) => (packet, Some(provenance)),
         None => {
           let mut packet = Packet::empty();
           let read = self.read_into(&mut packet);
+          // **The encryption latch, at the packet's entry**, before every
+          // road it can take from here: the panic check below, the
+          // conversion, a refusal, a parking, a seek's discard. See
+          // [`latch_encryption`] for the roads.
+          if read.is_ok() {
+            latch_encryption(&mut self.bitstreams, &packet);
+          }
           // A panicking reader reported an ordinary I/O error to C, and
           // libavformat may answer that with the error, with EOF (a
           // stream it cannot read looks finished), or with a packet it
@@ -1181,7 +1245,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
             provenance,
           )
         }
-        .map(|built| built.map(|p| DemuxedPacket::Video(VideoTrackPacket::new(track, p)))),
+        .map(|built| {
+          built.map(|p| {
+            let p = marked_from_bitstream(self.bitstreams.get_mut(index), p);
+            DemuxedPacket::Video(VideoTrackPacket::new(track, p))
+          })
+        }),
         TrackKind::Audio => unsafe {
           boundary::audio_packet_from_borrowed::<C>(
             &packet,
@@ -1260,6 +1329,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     // Any seek ends the claim to be one unbroken walk — a failed one
     // too, since where the container sits afterwards is unspecified.
     self.measured.break_walk();
+    // So every reading of a bitstream hears of it, for the same reason:
+    // the packets after it may meet a decoder that kept its framing or
+    // one opened afresh.
+    sought(&mut self.bitstreams);
     let ts = target.rescale_to(av_time_base_q()).pts();
     // Only our own EOF latch is cleared, and only before the seek —
     // the seek machinery gates on `eof_reached`, so clearing it
@@ -1324,6 +1397,20 @@ macro_rules! demuxer_lane_face {
         Self::open_with_impl(path, limits)
       }
 
+      /// [`Self::open`], with every optional of the open named
+      /// ([`DemuxerOpen`]): the session's budgets, and **the demuxers
+      /// whose inputs the caller declares plaintext**, whose H.264 and
+      /// HEVC tracks are read for the bitstream's `DISPOSABLE` marks —
+      /// the caller's assertion, and its risk
+      /// ([`DemuxerOpen::plaintext_demuxers`]). [`Self::open`] declares
+      /// none, and reads the raw `h264` and `hevc` streams alone.
+      pub fn open_from<P: AsRef<Path> + ?Sized>(
+        path: &P,
+        request: DemuxerOpen,
+      ) -> Result<Self, DemuxError> {
+        Self::open_from_impl(path, request)
+      }
+
       /// Opens a container from any `Read + Seek` source.
       pub fn open_reader<R: Read + Seek + Send + 'static>(
         reader: R,
@@ -1339,6 +1426,16 @@ macro_rules! demuxer_lane_face {
         limits: DemuxLimits,
       ) -> Result<Self, DemuxError> {
         Self::open_reader_with_impl(reader, url, limits)
+      }
+
+      /// [`Self::open_reader`], with every optional of the open named
+      /// ([`DemuxerOpen`]), as [`Self::open_from`].
+      pub fn open_reader_from<R: Read + Seek + Send + 'static>(
+        reader: R,
+        url: Option<&str>,
+        request: DemuxerOpen,
+      ) -> Result<Self, DemuxError> {
+        Self::open_reader_from_impl(reader, url, request)
       }
 
       /// The wrapped `AVFormatContext`.
@@ -3025,6 +3122,661 @@ unsafe fn packet_is_parked_picture(stream: *const AVStream, packet: &Packet) -> 
 const fn is_attachment_disposition(disposition: c_int) -> bool {
   disposition & AV_DISPOSITION_ATTACHED_PIC != 0
     && disposition & AV_DISPOSITION_TIMED_THUMBNAILS == 0
+}
+
+/// Each stream's reading of its H.264 or HEVC bitstream, by stream
+/// index: a [`NalStream`] for a video stream of either codec, built from
+/// its extradata, and `None` for every other stream, whose packets carry
+/// the container's mark alone. `None` too for every stream of a demuxer
+/// neither read by default nor among the caller's `declared` plaintext
+/// ones ([`reads_bitstreams_of`]: the format libavformat opened the input
+/// as, `format`), and for a stream FFmpeg names encrypted at the open
+/// ([`encrypted_at_open`]), opaque from its first packet.
+///
+/// The codec and the medium are read as the raw integers they are, as
+/// [`build_tracks`] reads them; the extradata is borrowed, not copied —
+/// the reading keeps only its framing and the sub-layers its parameter
+/// sets declare.
+fn bitstreams(
+  input: &Input,
+  format: Option<&crate::ContainerFormat>,
+  declared: &[DemuxerName],
+) -> Result<Vec<Option<NalStream>>, DemuxError> {
+  let count = input.streams().len();
+  let mut out = Vec::new();
+  out
+    .try_reserve_exact(count)
+    .map_err(|_| DemuxError::TrackTableAlloc(TrackTableAlloc::new(count)))?;
+  let readable = reads_bitstreams_of(format, declared);
+  for stream in input.streams() {
+    let parameters = stream.parameters();
+    // SAFETY: the stream's parameters are live for this iteration.
+    let par = unsafe { parameters.as_ptr() };
+    // SAFETY: `codec_id` is a public field of the live parameters, read
+    // as the integer it is rather than as its bindgen enum.
+    let codec =
+      CodecId::from_raw(unsafe { read_unaligned(addr_of!((*par).codec_id).cast::<i32>()) });
+    let nal = match codec {
+      CodecId::H264 => Some(NalCodec::H264),
+      CodecId::HEVC => Some(NalCodec::Hevc),
+      _ => None,
+    }
+    .filter(|_| readable && boundary::media_kind_of(&parameters).is_video())
+    // SAFETY: the stream is live for this iteration, and its metadata and
+    // parameters with it.
+    .filter(|_| !unsafe { encrypted_at_open(stream.as_ptr()) })
+    .map(|codec| {
+      // SAFETY: `extradata` and `extradata_size` are public fields of the
+      // stream's live parameters; libavformat keeps `extradata` readable
+      // for `extradata_size` bytes while the stream exists, and the slice
+      // is read before this iteration ends.
+      let extradata = unsafe {
+        let ptr = (*par).extradata;
+        let len = (*par).extradata_size.max(0) as usize;
+        if ptr.is_null() || len == 0 {
+          &[][..]
+        } else {
+          core::slice::from_raw_parts(ptr, len)
+        }
+      };
+      NalStream::new(codec, extradata)
+    });
+    out.push(nal);
+  }
+  Ok(out)
+}
+
+/// When a demuxer's tracks are read for their bitstreams
+/// ([`reads_bitstreams_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+  /// By default: the demuxer's payload is plaintext by construction.
+  Default,
+  /// Only where the caller declares the demuxer's inputs plaintext
+  /// ([`DemuxerOpen::plaintext_demuxers`]): FFmpeg cannot prove its payload
+  /// plaintext, and what no signal answers is the caller's documented risk.
+  Declared,
+}
+
+/// A demuxer this crate has audited, and the audit: when its tracks are
+/// read, how FFmpeg 9.0.1 says that a sample there is encrypted, or why none
+/// can be, and what no signal answers, by source.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+  not(test),
+  expect(
+    dead_code,
+    reason = "the audit's prose is read by its law, and shown in the table's docs"
+  )
+)]
+struct AuditedDemuxer {
+  /// The demuxer's `AVInputFormat.name`, exactly as libavformat spells
+  /// it: a comma list where FFmpeg registers one, never one of its words.
+  name: &'static str,
+  /// When its tracks are read.
+  reading: Reading,
+  /// How FFmpeg 9.0.1 signals an encrypted sample of this demuxer, and
+  /// where this crate reads the signal; or why plaintext is guaranteed. A
+  /// signal only ever ends a reading.
+  signals: &'static str,
+  /// What reaches a declared reading as ciphertext with no signal to say
+  /// so: the caller's documented risk. Empty for a demuxer read by
+  /// default, whose payload is plaintext by construction.
+  limits: &'static str,
+  /// The FFmpeg 9.0.1 sources the audit stands on, each `file:lines`.
+  sources: &'static [&'static str],
+}
+
+/// **The demuxers this crate has audited.** By default the raw `h264` and
+/// `hevc` elementary streams alone are read, plaintext by construction
+/// ([`Reading::Default`]); every other demuxer is read only where the caller
+/// declares its inputs plaintext ([`DemuxerOpen::plaintext_demuxers`]), and
+/// is container-only otherwise: its tracks get no reading, and its packets
+/// carry the container's mark alone ([`reads_bitstreams_of`]). A declared
+/// demuxer's signals are read by stream ([`encrypted_at_open`]) and by packet
+/// ([`ENCRYPTED_SIDE_DATA`]), and only ever end a reading; what they leave
+/// unanswered is the caller's risk, and is listed here.
+///
+/// | demuxer | read | how FFmpeg 9.0.1 signals an encrypted sample, and where it is read | what no signal answers |
+/// |---|---|---|---|
+/// | `h264` (`libavformat/h264dec.c` 119, `rawdec.h` 53–65) | by default | none can be: a raw Annex B elementary stream has no container to carry an encryption, and Rec. ITU-T H.264 defines none; the demuxer hands over the file's bytes | — |
+/// | `hevc` (`libavformat/hevcdec.c` 64, `rawdec.h` 53–65) | by default | none can be, as for `h264`: Rec. ITU-T H.265 defines no encryption | — |
+/// | `mov,mp4,m4a,3gp,3g2,mj2` (`libavformat/mov.c` 12205) | declared | a `pssh` box is the stream's `ENCRYPTION_INIT_INFO` (8064–8177), read at the open; every sample under an encryption index — a `tenc` of a protected track (8254–8258), or `senc`, `saiz` and `saio` (7662–7708) — carries `ENCRYPTION_INFO` (8673–8741), read per packet | **OMA DRM 2's PDCF**: a protected sample entry's `encv` is not kept — the entry's four-cc becomes the stream's `codec_tag` (3254–3256, 2812), and its `frma` replaces it with the original four-cc as it names the codec (7615–7650, 7631) — its scheme (`schm`, `odkm`) is kept private (8185–8214), and its `schi` is read for no box of OMA's (9831, 9957–9958); with no `tenc`, `senc` or `pssh`, no sample carries `ENCRYPTION_INFO` (8697, 8740). And a protected sample description that is not the track's first: FFmpeg reads the first description's protection alone (8684–8685, 8195–8198, 8224–8228) and skips a later description of another four-cc with a warning (3168–3192, 3246–3250) |
+/// | `matroska,webm` (`libavformat/matroskadec.c` 5037) | declared | a `ContentEncryption`'s key id is the stream's `enc_key_id` metadata (2062–2073, 3274–3277), read at the open | a `ContentEncryption` without a key id, whose blocks pass through undecrypted with a log line alone (2074–2076), and a track of more than one encoding (2055–2058) |
+/// | `asf` (`libavformat/asfdec_f.c` 1627) | declared | none on a stream or a packet | content encryption, logged and named in the container's metadata alone, which this crate does not read, the payload returned as stored (764–800) |
+/// | `asf_o` (`libavformat/asfdec_o.c` 1656) | declared | none | content encryption, whose objects are skipped as unknown (900–909, 163–194), and a stream's encrypted-content flag, read and not kept (619) |
+/// | `wtv` (`libavformat/wtvdec.c` 1093) | declared | none | `DSATTRIB_WMDRMProtectionInfo` (888–891), and a DVB-scrambled stream, whose nonzero `EVENTID_DVBScramblingControlSpanningEvent` control is logged, nothing more (836–842); the payload is returned as stored either way |
+/// | `mxf` (`libavformat/mxfdec.c` 4366) | declared | none | an encrypted triplet read without a key, returned as its ciphertext (656–726) |
+/// | `mpegts` (`libavformat/mpegts.c` 3878), `mpegtsraw` (3892) | declared | none | a packet's transport scrambling control, never read (3223–3233); SAMPLE-AES is decrypted by `hls` alone (`hls.c` 909) |
+/// | `concat` (`libavformat/concatdec.c` 970) | declared | each child's own, on the packets it forwards | any child, opened with its own demuxer, its packets forwarded (337–368): the outer name says nothing of the child's, and a declaration of `concat` declares every child |
+/// | `hls` (`libavformat/hls.c` 3079), and `dash` (`dashdec.c` 2559) where the build has `libxml2` | declared | each segment's own | any segment, opened with its own demuxer: a declaration declares every segment |
+/// | every other | declared | not audited | not audited |
+const AUDITED_DEMUXERS: &[AuditedDemuxer] = &[
+  AuditedDemuxer {
+    name: "h264",
+    reading: Reading::Default,
+    signals: "none can be: a raw Annex B elementary stream has no container to carry an encryption, \
+              and H.264 defines none",
+    limits: "",
+    sources: &["libavformat/h264dec.c:119", "libavformat/rawdec.h:53-65"],
+  },
+  AuditedDemuxer {
+    name: "hevc",
+    reading: Reading::Default,
+    signals: "none can be: a raw Annex B elementary stream has no container to carry an encryption, \
+              and H.265 defines none",
+    limits: "",
+    sources: &["libavformat/hevcdec.c:64", "libavformat/rawdec.h:53-65"],
+  },
+  AuditedDemuxer {
+    name: "mov,mp4,m4a,3gp,3g2,mj2",
+    reading: Reading::Declared,
+    signals: "a pssh box is the stream's ENCRYPTION_INIT_INFO, read at the open; every sample under \
+              an encryption index (a tenc of a protected track, or senc, saiz and saio) carries \
+              ENCRYPTION_INFO, read per packet",
+    limits: "OMA DRM 2's PDCF: frma replaces a protected entry's encv four-cc as it names the codec, \
+             the schm scheme (odkm) is kept private, and with no tenc, senc or pssh no sample \
+             carries ENCRYPTION_INFO; and a protected sample description that is not the track's \
+             first",
+    sources: &[
+      "libavformat/mov.c:12205",
+      "libavformat/mov.c:8064-8177",
+      "libavformat/mov.c:8254-8258",
+      "libavformat/mov.c:7662-7708",
+      "libavformat/mov.c:8673-8741",
+      "libavformat/mov.c:3254-3256",
+      "libavformat/mov.c:2812",
+      "libavformat/mov.c:7615-7650",
+      "libavformat/mov.c:8185-8214",
+      "libavformat/mov.c:9831",
+      "libavformat/mov.c:9957-9958",
+      "libavformat/mov.c:8697",
+      "libavformat/mov.c:8740",
+      "libavformat/mov.c:8684-8685",
+      "libavformat/mov.c:3168-3192",
+      "libavformat/mov.c:3246-3250",
+    ],
+  },
+  AuditedDemuxer {
+    name: "matroska,webm",
+    reading: Reading::Declared,
+    signals: "a ContentEncryption's key id is the stream's enc_key_id metadata, read at the open",
+    limits: "a ContentEncryption without a key id passes its blocks through undecrypted, and so \
+             does a track of more than one encoding",
+    sources: &[
+      "libavformat/matroskadec.c:5037",
+      "libavformat/matroskadec.c:2062-2073",
+      "libavformat/matroskadec.c:3274-3277",
+      "libavformat/matroskadec.c:2074-2076",
+      "libavformat/matroskadec.c:2055-2058",
+    ],
+  },
+  AuditedDemuxer {
+    name: "asf",
+    reading: Reading::Declared,
+    signals: "none on a stream or a packet",
+    limits: "content encryption is logged and named in the container's metadata alone, the payload \
+             returned as stored",
+    sources: &[
+      "libavformat/asfdec_f.c:1627",
+      "libavformat/asfdec_f.c:764-800",
+    ],
+  },
+  AuditedDemuxer {
+    name: "asf_o",
+    reading: Reading::Declared,
+    signals: "none",
+    limits: "content encryption's objects are skipped as unknown, and a stream's encrypted-content \
+             flag is read and not kept",
+    sources: &[
+      "libavformat/asfdec_o.c:1656",
+      "libavformat/asfdec_o.c:900-909",
+      "libavformat/asfdec_o.c:163-194",
+      "libavformat/asfdec_o.c:619",
+    ],
+  },
+  AuditedDemuxer {
+    name: "wtv",
+    reading: Reading::Declared,
+    signals: "none",
+    limits: "DSATTRIB_WMDRMProtectionInfo and a nonzero EVENTID_DVBScramblingControlSpanningEvent control (a DVB-scrambled stream) are each logged, nothing more; the payload is returned as stored",
+    sources: &[
+      "libavformat/wtvdec.c:1093",
+      "libavformat/wtvdec.c:888-891",
+      "libavformat/wtvdec.c:836-842",
+    ],
+  },
+  AuditedDemuxer {
+    name: "mxf",
+    reading: Reading::Declared,
+    signals: "none",
+    limits: "an encrypted triplet read without a key comes back as its ciphertext",
+    sources: &["libavformat/mxfdec.c:4366", "libavformat/mxfdec.c:656-726"],
+  },
+  AuditedDemuxer {
+    name: "mpegts",
+    reading: Reading::Declared,
+    signals: "none",
+    limits: "a packet's transport scrambling control is never read, and SAMPLE-AES is decrypted by \
+             hls alone",
+    sources: &[
+      "libavformat/mpegts.c:3878",
+      "libavformat/mpegts.c:3223-3233",
+      "libavformat/hls.c:909",
+    ],
+  },
+  AuditedDemuxer {
+    name: "mpegtsraw",
+    reading: Reading::Declared,
+    signals: "none",
+    limits: "as mpegts",
+    sources: &[
+      "libavformat/mpegts.c:3892",
+      "libavformat/mpegts.c:3223-3233",
+    ],
+  },
+  AuditedDemuxer {
+    name: "concat",
+    reading: Reading::Declared,
+    signals: "each child's own, on the packets it forwards",
+    limits: "any child, opened with its own demuxer and its packets forwarded: a declaration of \
+             concat declares every child",
+    sources: &[
+      "libavformat/concatdec.c:970",
+      "libavformat/concatdec.c:337-368",
+    ],
+  },
+  AuditedDemuxer {
+    name: "hls",
+    reading: Reading::Declared,
+    signals: "each segment's own",
+    limits: "any segment, opened with its own demuxer: a declaration declares every segment",
+    sources: &["libavformat/hls.c:3079"],
+  },
+];
+
+/// Whether a track of the container `format` may have its bitstream read:
+/// whether `format` is a demuxer read by default ([`AUDITED_DEMUXERS`]: the
+/// raw `h264` and `hevc`), or one of the caller's `declared` plaintext
+/// demuxers ([`DemuxerOpen::plaintext_demuxers`]) — by its whole
+/// `AVInputFormat.name`, exactly.
+///
+/// **Every other demuxer is container-only**, `mov` among them: its tracks
+/// get no reading, and its packets carry the container's mark alone, as
+/// FFmpeg 9.0.1 delivers it — set in `mov` alone, from `sdtp` (`mov.c`
+/// 11719–11723), and kept on a track libavformat does not parse as it
+/// reads: never on H.264, whose headers `mov` parses (3159–3160) and whose
+/// packets the parse rebuilds without the mark (`demux.c` 1289). A
+/// container libavformat gives no name (`format` is `None`) is not read
+/// either. Inside a demuxer read, the encryption signals are read by stream
+/// ([`encrypted_at_open`]) and by packet ([`ENCRYPTED_SIDE_DATA`]).
+fn reads_bitstreams_of(format: Option<&crate::ContainerFormat>, declared: &[DemuxerName]) -> bool {
+  format.is_some_and(|format| {
+    AUDITED_DEMUXERS
+      .iter()
+      .any(|row| row.reading == Reading::Default && row.name == format.name())
+      || declared.iter().any(|&demuxer| format.is(demuxer))
+  })
+}
+
+/// The packet side data a decoder may take up past its own packet: a
+/// packet carrying any is never
+/// [`DISPOSABLE`](PacketFlags::DISPOSABLE), whoever marked it, because
+/// dropping it would lose what the decoder, or a later picture, needs. Every
+/// `AVPacketSideDataType` FFmpeg 9.0.1 names (`libavcodec/packet.h` 41–394)
+/// is in this list or in [`RIDING_SIDE_DATA`], never both; a type in
+/// neither — one a later FFmpeg adds — persists ([`side_data_persists`]).
+/// FFmpeg 9 is the floor this crate builds against, so every kind is named
+/// as its headers name it.
+///
+/// | type | why it persists |
+/// |---|---|
+/// | `PALETTE` | "a new palette is present" (`packet.h` 43–47), which a decoder keeps (`libavcodec/decode.c` 2321–2334) |
+/// | `NEW_EXTRADATA` | a new configuration (`h264dec.c` 1038–1044, `hevc/hevcdec.c` 3854–3860) |
+/// | `PARAM_CHANGE` | new dimensions or a new rate (`decode.c` 117–176) |
+/// | `FALLBACK_TRACK`, `CPB_PROPERTIES` | a description of the stream, not of the packet |
+/// | `MATROSKA_BLOCKADDITIONAL` | a block addition of any kind, which nothing here reads |
+/// | `METADATA_UPDATE` | the stream's metadata from the packet on |
+/// | `A53_CC` | caption bytes a caption decoder reads across pictures |
+/// | `ENCRYPTION_INIT_INFO` | a key system's initialization, for the packets after |
+/// | `AFD` | an active format a receiver may hold until the next |
+/// | `DOVI_CONF` | a Dolby Vision configuration the decoder keeps (`hevc/hevcdec.c` 3862–3869) |
+/// | `IAMF_MIX_GAIN_PARAM`, `IAMF_DEMIXING_INFO_PARAM`, `IAMF_RECON_GAIN_INFO_PARAM` | a parameter that applies for a duration |
+/// | `LCEVC` | an enhancement whose decoder keeps state across pictures (`decode.c` 1640–1666, 1704–1775) |
+/// | `HEVC_CONF` | an enhancement layer's decoder configuration |
+const PERSISTING_SIDE_DATA: &[AVPacketSideDataType] = &[
+  AVPacketSideDataType::AV_PKT_DATA_PALETTE,
+  AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+  AVPacketSideDataType::AV_PKT_DATA_PARAM_CHANGE,
+  AVPacketSideDataType::AV_PKT_DATA_FALLBACK_TRACK,
+  AVPacketSideDataType::AV_PKT_DATA_CPB_PROPERTIES,
+  AVPacketSideDataType::AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
+  AVPacketSideDataType::AV_PKT_DATA_METADATA_UPDATE,
+  AVPacketSideDataType::AV_PKT_DATA_A53_CC,
+  AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO,
+  AVPacketSideDataType::AV_PKT_DATA_AFD,
+  AVPacketSideDataType::AV_PKT_DATA_DOVI_CONF,
+  AVPacketSideDataType::AV_PKT_DATA_IAMF_MIX_GAIN_PARAM,
+  AVPacketSideDataType::AV_PKT_DATA_IAMF_DEMIXING_INFO_PARAM,
+  AVPacketSideDataType::AV_PKT_DATA_IAMF_RECON_GAIN_INFO_PARAM,
+  AVPacketSideDataType::AV_PKT_DATA_LCEVC,
+  AVPacketSideDataType::AV_PKT_DATA_HEVC_CONF,
+];
+
+/// The packet side data that rides with its own packet and no further:
+/// what FFmpeg's decoding copies onto the packet's own frame alone
+/// (`ff_sd_global_map`, `libavcodec/avcodec.c` 57–70; the packet map and
+/// the metadata of `ff_decode_frame_props_from_pkt`, `decode.c` 1492–1596),
+/// and what nothing decoding reads, about the packet itself.
+///
+/// | type | why it rides |
+/// |---|---|
+/// | `REPLAYGAIN`, `DISPLAYMATRIX`, `STEREO3D`, `AUDIO_SERVICE_TYPE`, `MASTERING_DISPLAY_METADATA`, `SPHERICAL`, `CONTENT_LIGHT_LEVEL`, `ICC_PROFILE`, `AMBIENT_VIEWING_ENVIRONMENT`, `3D_REFERENCE_DISPLAYS`, `EXIF` | copied onto the packet's frame alone (`avcodec.c` 57–70) |
+/// | `SKIP_SAMPLES`, `S12M_TIMECODE`, `DYNAMIC_HDR10_PLUS`, `DYNAMIC_HDR_SMPTE_2094_APP5` | the packet's frame's own, copied onto it alone (`decode.c` 1550–1596) |
+/// | `STRINGS_METADATA` | metadata of the packet's frame alone (`decode.c` 1538–1548) |
+/// | `H263_MB_INFO`, `QUALITY_STATS` | an encoder's account of the packet |
+/// | `JP_DUALMONO` | which channel of the packet's audio to use |
+/// | `SUBTITLE_POSITION`, `WEBVTT_IDENTIFIER`, `WEBVTT_SETTINGS` | the packet's own subtitle event or cue |
+/// | `MPEGTS_STREAM_ID` | the packet's PES stream id, for a muxer (`libavformat/mpegts.c` 1119) |
+/// | `ENCRYPTION_INFO` | how to decrypt the packet itself |
+/// | `PRFT` | the time the packet was produced |
+/// | `RTCP_SR` | the last sender report at the packet |
+/// | `FRAME_CROPPING` | the packet's frame's cropping, which no decoder reads from a packet |
+const RIDING_SIDE_DATA: &[AVPacketSideDataType] = &[
+  AVPacketSideDataType::AV_PKT_DATA_H263_MB_INFO,
+  AVPacketSideDataType::AV_PKT_DATA_REPLAYGAIN,
+  AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX,
+  AVPacketSideDataType::AV_PKT_DATA_STEREO3D,
+  AVPacketSideDataType::AV_PKT_DATA_AUDIO_SERVICE_TYPE,
+  AVPacketSideDataType::AV_PKT_DATA_QUALITY_STATS,
+  AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES,
+  AVPacketSideDataType::AV_PKT_DATA_JP_DUALMONO,
+  AVPacketSideDataType::AV_PKT_DATA_STRINGS_METADATA,
+  AVPacketSideDataType::AV_PKT_DATA_SUBTITLE_POSITION,
+  AVPacketSideDataType::AV_PKT_DATA_WEBVTT_IDENTIFIER,
+  AVPacketSideDataType::AV_PKT_DATA_WEBVTT_SETTINGS,
+  AVPacketSideDataType::AV_PKT_DATA_MPEGTS_STREAM_ID,
+  AVPacketSideDataType::AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
+  AVPacketSideDataType::AV_PKT_DATA_SPHERICAL,
+  AVPacketSideDataType::AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
+  AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INFO,
+  AVPacketSideDataType::AV_PKT_DATA_PRFT,
+  AVPacketSideDataType::AV_PKT_DATA_ICC_PROFILE,
+  AVPacketSideDataType::AV_PKT_DATA_S12M_TIMECODE,
+  AVPacketSideDataType::AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
+  AVPacketSideDataType::AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT,
+  AVPacketSideDataType::AV_PKT_DATA_FRAME_CROPPING,
+  AVPacketSideDataType::AV_PKT_DATA_3D_REFERENCE_DISPLAYS,
+  AVPacketSideDataType::AV_PKT_DATA_RTCP_SR,
+  AVPacketSideDataType::AV_PKT_DATA_EXIF,
+  AVPacketSideDataType::AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5,
+];
+
+/// Whether packet side data of `kind`, the raw `AVPacketSideDataType` it
+/// arrives as, may be taken up past its own packet: a kind of
+/// [`PERSISTING_SIDE_DATA`], and a kind of neither list — one a later
+/// FFmpeg names — every kind but those of [`RIDING_SIDE_DATA`]. The kind is compared as the integer it
+/// is, never formed into the bindings' enum, which a kind they do not name
+/// would make undefined behaviour.
+fn side_data_persists(kind: c_int) -> bool {
+  let listed = |table: &[AVPacketSideDataType]| table.iter().any(|&named| named as c_int == kind);
+  listed(PERSISTING_SIDE_DATA) || !listed(RIDING_SIDE_DATA)
+}
+
+/// The packet side data that says a payload is encrypted, or that its
+/// track's are: a packet carrying any is **opaque** to the bitstream's
+/// reading ([`marked_from_bitstream`]). These are every kind FFmpeg 9.0.1
+/// gives an encrypted payload (`libavcodec/packet.h` 241–252), and the only
+/// encryption side data it names:
+///
+/// | type | in FFmpeg 9.0.1 | what it says of the payload |
+/// |---|---|---|
+/// | `ENCRYPTION_INFO` | "encryption info for how to decrypt the packet" (`packet.h` 248–252); `mov` attaches it to each encrypted sample it does not decrypt itself, with no key given (`libavformat/mov.c` 8726–8736), and with a key decrypts the sample in place and attaches none (8726–8727) | ciphertext |
+/// | `ENCRYPTION_INIT_INFO` | a key system's "encryption initialization data" (`packet.h` 241–246), from `pssh` (`mov.c` 8064); libavformat 9.0.1 sets it on the stream (8148–8177), not on a packet | a protected track's |
+///
+/// Both stay in the persistence tables as well ([`RIDING_SIDE_DATA`],
+/// [`PERSISTING_SIDE_DATA`]), which answer the container's mark: this table
+/// answers whether the bitstream is read at all. On a stream's coded side
+/// data, either makes its track opaque from the open ([`encrypted_at_open`],
+/// which names the signals that come with no packet side data, and the one
+/// limit no signal answers).
+const ENCRYPTED_SIDE_DATA: &[AVPacketSideDataType] = &[
+  AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INFO,
+  AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO,
+];
+
+/// Whether `stream` is one FFmpeg names encrypted at the open, before any
+/// of its packets is read: **its payloads may be ciphertext with no packet
+/// side data to say so**, so its bitstream is never read, from its first
+/// packet on. The signals, by source in FFmpeg 9.0.1:
+///
+/// | signal | in FFmpeg 9.0.1 |
+/// |---|---|
+/// | the stream's coded side data holds a kind of [`ENCRYPTED_SIDE_DATA`] | `mov` puts a `pssh` box's `AV_PKT_DATA_ENCRYPTION_INIT_INFO` there (`libavformat/mov.c` 8064–8177) |
+/// | the stream's metadata names a key, `enc_key_id` | the name `matroska` gives a track's key (`libavformat/matroskadec.c` 2062–2073, 3274–3277); a stream of any container that names one is not read either |
+/// | the stream's `codec_tag` is `encv`, ISO/IEC 14496-12's protected video sample entry | **where a demuxer keeps it, which `mov` does not for a track this crate reads**: `mov` makes a sample entry's four-cc the stream's `codec_tag` (`mov.c` 3254–3256, 2812), and a protected entry's `frma` replaces it with the original four-cc as it names the codec (7615–7650, 7631). An `encv` entry without `frma` keeps the tag, and is of no codec FFmpeg names |
+///
+/// None is a proof of plaintext: a track under a protection FFmpeg names
+/// none of these for — OMA DRM 2's PDCF in `mov` — passes with no signal,
+/// which is why a container is read only where the caller declares its
+/// inputs plaintext ([`AUDITED_DEMUXERS`], [`reads_bitstreams_of`]). A
+/// signal only ever ends a reading; this reads every one alike, whatever
+/// the demuxer.
+///
+/// # Safety
+///
+/// `stream` is a live `AVStream` for the call, its `codecpar` and
+/// `metadata` with it: `codec_tag` is read; and `coded_side_data`, where not
+/// null and `nb_coded_side_data` is above 0, valid for that many entries,
+/// of which only each `type` is read, as the integer it is.
+unsafe fn encrypted_at_open(stream: *const AVStream) -> bool {
+  /// ISO/IEC 14496-12's protected video sample entry, as libavformat's
+  /// `MKTAG('e','n','c','v')` spells a four-cc: its first byte lowest.
+  const PROTECTED_VIDEO_ENTRY: u32 = u32::from_le_bytes(*b"encv");
+  // SAFETY: the caller's contract; `metadata` is the stream's own
+  // dictionary, read by `metadata_value` without being modified.
+  let metadata = unsafe { (*stream).metadata };
+  if !matches!(
+    unsafe { metadata_value(metadata, c"enc_key_id") },
+    MetadataValue::Absent
+  ) {
+    return true;
+  }
+  // SAFETY: the caller's contract; the three fields are a pointer and two
+  // integers of the stream's live parameters.
+  let (tag, entries, count) = unsafe {
+    let par = (*stream).codecpar;
+    if par.is_null() {
+      return false;
+    }
+    (
+      (*par).codec_tag,
+      (*par).coded_side_data,
+      (*par).nb_coded_side_data,
+    )
+  };
+  if tag == PROTECTED_VIDEO_ENTRY {
+    return true;
+  }
+  if entries.is_null() || count <= 0 {
+    return false;
+  }
+  (0..count as usize).any(|index| {
+    // **Never `&*entry`**, as `measure_parameters` reads the same array:
+    // `type` is an open C enum, so only its address is formed and the
+    // value read as the integer it is.
+    // SAFETY: `index` is below `nb_coded_side_data`, for which the array
+    // is valid per the caller's contract.
+    let kind = unsafe { read_unaligned(addr_of!((*entries.add(index)).type_).cast::<c_int>()) };
+    says_encrypted(kind)
+  })
+}
+
+/// **The encryption latch, at a packet's entry.** Where the packet
+/// `av_read_frame` just handed over carries encryption side data
+/// ([`ENCRYPTED_SIDE_DATA`]), its track's reading is dropped for good, then
+/// and there, before anything else becomes of the packet. So the first
+/// signal ends the reading whatever the packet's road — delivered, refused,
+/// parked, or discarded by a seek — and no later packet of the track is
+/// read, after a seek or before it. The raw `AVPacket`'s side-data types are
+/// read as the integers they are, never formed into the bindings' enum
+/// ([`carries_encryption`]).
+///
+/// **Every road a packet takes from `av_read_frame`, and the latch before
+/// it** ([`CarrierDemuxer::next_packet_impl`],
+/// [`CarrierDemuxer::seek_impl`]):
+///
+/// | road | what becomes of the packet | the latch |
+/// |---|---|---|
+/// | delivered | converted, marked from the bitstream where its track is read ([`marked_from_bitstream`]), and returned | before the conversion |
+/// | refused by its conversion: a payload over the packet limit, side data over its budget or malformed, flags the vocabulary cannot hold | dropped, the walk broken, and the error returned | before the conversion |
+/// | refused by an allocation (`CaptureFailed`, `SideDataAlloc`) | parked in `unconverted`, the error returned, and re-attempted at the next pull before anything is read; the latch does not run again | before the parking |
+/// | parked, then discarded by a successful seek | dropped by the seek | before the parking, so before the seek |
+/// | read while the caller's reader panicked | dropped: the session is terminal, the panic returned, and nothing is read again | before the panic is returned |
+/// | on a stream the track table does not describe, a stream added after the open among them | passed by, the walk broken; no such stream has a reading, since the readings are built at the open | runs, and finds no reading |
+/// | on a track with no reading: a demuxer neither read by default nor declared, a codec other than H.264 and HEVC, an attachment's duplicate, a track of unknown kind | delivered with the container's mark, or passed by | runs, and drops a reading where one exists |
+/// | carrying no payload | not delivered; its timing observed | before it is passed by |
+/// | `av_read_frame` answers an error, or the end of the file | no packet is handed over | — |
+/// | an attachment's packet, queued at the open (`pending`) | delivered first; an attachment track has no reading | — |
+/// | an injected read, in tests alone ([`InjectedRead`]) | as libavformat's packet, by the same roads | as above |
+fn latch_encryption(bitstreams: &mut [Option<NalStream>], packet: &Packet) {
+  // SAFETY: `packet` is live for the call, and `carries_encryption` reads
+  // its side-data array as its own contract states.
+  if unsafe { carries_encryption(packet) }
+    && let Some(reading) = bitstreams.get_mut(packet.stream())
+  {
+    *reading = None;
+  }
+}
+
+/// Whether the raw `packet` carries a kind of [`ENCRYPTED_SIDE_DATA`], each
+/// entry's `type` read as the integer it is.
+///
+/// # Safety
+///
+/// `packet` is live for the call: its `side_data`, where not null and
+/// `side_data_elems` is above 0, is valid for that many entries, of which
+/// only each `type` is read.
+unsafe fn carries_encryption(packet: &Packet) -> bool {
+  use ffmpeg_next::packet::Ref;
+  // SAFETY: the caller's contract; `side_data` and `side_data_elems` are
+  // plain fields of the live packet.
+  let (entries, count) = unsafe {
+    let raw = packet.as_ptr();
+    ((*raw).side_data, (*raw).side_data_elems)
+  };
+  if entries.is_null() || count <= 0 {
+    return false;
+  }
+  (0..count as usize).any(|index| {
+    // **Never `&*entry`**, as `encrypted_at_open` reads the coded side
+    // data: `type` is an open C enum, so only its address is formed and the
+    // value read as the integer it is.
+    // SAFETY: `index` is below `side_data_elems`, for which the array is
+    // valid per the caller's contract.
+    let kind = unsafe { read_unaligned(addr_of!((*entries.add(index)).type_).cast::<c_int>()) };
+    says_encrypted(kind)
+  })
+}
+
+/// Whether packet side data of `kind`, the raw `AVPacketSideDataType` it
+/// arrives as, is one of [`ENCRYPTED_SIDE_DATA`], compared as the integer
+/// it is, as [`side_data_persists`] compares.
+fn says_encrypted(kind: c_int) -> bool {
+  ENCRYPTED_SIDE_DATA
+    .iter()
+    .any(|&named| named as c_int == kind)
+}
+
+/// `packet`, its [`PacketFlags::DISPOSABLE`] set where its track's
+/// bitstream proves that nothing references its picture
+/// ([`NalStream::read_with_record`]) and cleared, whoever set it, where it
+/// carries side data that persists past it ([`PERSISTING_SIDE_DATA`]). The
+/// reading takes the packet with the `AV_PKT_DATA_NEW_EXTRADATA` it
+/// carries — the first such entry, as `av_packet_get_side_data` answers —
+/// as the decoder takes the two.
+///
+/// **Where a track is read, its reading's verdict is authoritative.** The
+/// packet is `DISPOSABLE` where the bitstream proves it and nowhere else:
+/// the container's own mark — MP4's `sdtp` — is cleared on every
+/// [`Verdict::Kept`](mediadecode::nal::Verdict::Kept), and on a corrupt
+/// packet. The container cannot see what the reading sees: a packet whose
+/// picture nothing references may still take up SEI state an earlier
+/// packet left ([`KeptReason::CarriedOver`](mediadecode::nal::KeptReason::CarriedOver)),
+/// and dropping it would hand that state to a later picture.
+///
+/// Every packet of a track is read, a corrupt one too, because the decoder
+/// reads it, and what it moves — the framing, the sub-layers its parameter
+/// sets declare — moves for the packets after; a corrupt packet is never
+/// marked. A track without a reading — a codec other than H.264 and HEVC,
+/// a track of a demuxer neither read by default nor declared plaintext by
+/// the caller ([`reads_bitstreams_of`]), a track FFmpeg names encrypted, or
+/// one whose reading an encrypted packet ended — keeps the container's
+/// mark, unless side data persists.
+///
+/// **An encrypted payload is opaque, and so is its track from then on.** A
+/// packet carrying encryption side data ([`ENCRYPTED_SIDE_DATA`]) is not
+/// read, and no bitstream mark is made from it: its bytes may be
+/// ciphertext, which can look like any NAL unit. And its track's reading is
+/// dropped for the rest of the stream, a seek included, since the plaintext
+/// it did not see may move the framing and the parameter sets the packets
+/// after are read by. **The signal is latched as the packet enters the
+/// demuxer** ([`latch_encryption`]), before its conversion, whatever becomes
+/// of it — delivered, refused, parked, or discarded by a seek; the check here
+/// stands behind the latch, for a packet converted with the side data it was
+/// read with. The container's own mark is the container's, and stays as the
+/// persistence tables answer it.
+fn marked_from_bitstream<D: AsRef<[u8]>>(
+  bitstream: Option<&mut Option<NalStream>>,
+  packet: mediadecode::packet::VideoPacket<crate::extras::VideoPacketExtra, D>,
+) -> mediadecode::packet::VideoPacket<crate::extras::VideoPacketExtra, D> {
+  const NEW_EXTRADATA: c_int = AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as c_int;
+  let side_data = packet.extra().side_data();
+  let persists = side_data
+    .iter()
+    .any(|entry| side_data_persists(entry.kind()));
+  let record = side_data
+    .iter()
+    .find(|entry| entry.kind() == NEW_EXTRADATA)
+    .map(crate::extras::SideDataEntry::data);
+  let encrypted = side_data.iter().any(|entry| says_encrypted(entry.kind()));
+  // The reading's verdict on this packet — whether it proves the packet
+  // disposable — where a reading gives one.
+  let verdict = match bitstream {
+    // Not read, and the track read no more.
+    Some(reading) if encrypted => {
+      *reading = None;
+      None
+    }
+    Some(Some(bitstream)) => Some(
+      bitstream
+        .read_with_record(packet.data().as_ref(), record)
+        .is_disposable(),
+    ),
+    _ => None,
+  };
+  let mut flags = packet.flags();
+  let disposable = !persists
+    && match verdict {
+      // The reading decides, the container's mark with it.
+      Some(proven) => proven && !flags.contains(PacketFlags::CORRUPT),
+      // No reading: the container's mark stands.
+      None => flags.contains(PacketFlags::DISPOSABLE),
+    };
+  flags.set(PacketFlags::DISPOSABLE, disposable);
+  if flags == packet.flags() {
+    packet
+  } else {
+    packet.with_flags(flags)
+  }
+}
+
+/// Tells each stream's reading of a seek, or of a seek attempted
+/// ([`NalStream::seeked`]).
+fn sought(bitstreams: &mut [Option<NalStream>]) {
+  for bitstream in bitstreams.iter_mut().flatten() {
+    bitstream.seeked();
+  }
 }
 
 /// Upper bound on the NUL search in [`metadata_value`].
@@ -4920,5 +5672,1656 @@ mod tests {
     assert_eq!((tb.num(), tb.den().get()), (1, 1_000_000));
     let target = Timestamp::new(1_500, Timebase::new(1, NonZeroI32::new(1000).expect("ms")));
     assert_eq!(target.rescale_to(tb).pts(), 1_500_000);
+  }
+
+  /// An H.264 packet of length-framed NAL units: an access unit
+  /// delimiter, then a B slice of `nal_ref_idc` `reference`.
+  fn avc_packet(reference: u8) -> Vec<u8> {
+    vec![
+      0,
+      0,
+      0,
+      2,
+      0x09,
+      0xF0,
+      0,
+      0,
+      0,
+      4,
+      (reference << 5) | 1,
+      0x9C,
+      0x84,
+      0x21,
+    ]
+  }
+
+  /// A minimal `avcC` of four-byte lengths: a Baseline sequence parameter
+  /// set of one macroblock coding frames only (`frame_mbs_only_flag` 1),
+  /// without gaps in `frame_num`, its VUI fixing a reorder depth of one
+  /// (`bitstream_restriction_flag` 1); and a picture parameter set.
+  fn avcc() -> Vec<u8> {
+    vec![
+      1, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0, 12, 0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x7A, 0x01, 0xB4, 0x11,
+      0x08, 0xA2, 0xC0, 1, 0, 4, 0x68, 0xEE, 0x3C, 0x80,
+    ]
+  }
+
+  /// Reads a reference packet, which the reading awaits after its opening
+  /// before it marks anything.
+  fn past_a_reference(bitstream: &mut Option<NalStream>) {
+    let read = marked_from_bitstream(Some(bitstream), video_packet(avc_packet(2), vec![]));
+    assert!(!read.flags().contains(PacketFlags::DISPOSABLE));
+  }
+
+  fn video_packet(
+    data: Vec<u8>,
+    side_data: Vec<crate::extras::SideDataEntry>,
+  ) -> mediadecode::packet::VideoPacket<crate::extras::VideoPacketExtra, Vec<u8>> {
+    mediadecode::packet::VideoPacket::new(
+      data,
+      crate::extras::VideoPacketExtra::new(0).with_side_data(side_data),
+    )
+  }
+
+  #[test]
+  fn a_non_reference_h264_packet_is_marked_and_a_reference_one_is_not() {
+    let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
+    let kept = marked_from_bitstream(Some(&mut bitstream), video_packet(avc_packet(2), vec![]));
+    assert!(!kept.flags().contains(PacketFlags::DISPOSABLE));
+    let marked = marked_from_bitstream(Some(&mut bitstream), video_packet(avc_packet(0), vec![]));
+    assert!(marked.flags().contains(PacketFlags::DISPOSABLE));
+    // The marks the packet already carries stay.
+    let keyed = video_packet(avc_packet(0), vec![]).with_flags(PacketFlags::KEY);
+    let keyed = marked_from_bitstream(Some(&mut bitstream), keyed);
+    assert_eq!(keyed.flags(), PacketFlags::KEY | PacketFlags::DISPOSABLE);
+  }
+
+  #[test]
+  fn a_corrupt_packet_is_read_but_never_marked_and_a_track_without_a_reading_keeps_its_mark() {
+    // A corrupt packet that switches the framing: the decoder reads it, so
+    // the reading follows, and nothing corrupt is marked.
+    let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
+    let annex = vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x01, 0x9C, 0x84, 0x21];
+    let corrupt = video_packet(annex.clone(), vec![]).with_flags(PacketFlags::CORRUPT);
+    let corrupt = marked_from_bitstream(Some(&mut bitstream), corrupt);
+    assert_eq!(corrupt.flags(), PacketFlags::CORRUPT);
+    assert_eq!(
+      bitstream.as_ref().and_then(NalStream::framing),
+      Some(mediadecode::nal::Framing::AnnexB)
+    );
+    let corrupt = video_packet(annex.clone(), vec![]).with_flags(PacketFlags::CORRUPT);
+    let corrupt = marked_from_bitstream(Some(&mut bitstream), corrupt);
+    assert_eq!(corrupt.flags(), PacketFlags::CORRUPT);
+    // Past a reference picture, the same packet uncorrupted is marked.
+    let reference = vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x41, 0x9C, 0x84, 0x21];
+    let read = marked_from_bitstream(Some(&mut bitstream), video_packet(reference, vec![]));
+    assert!(!read.flags().contains(PacketFlags::DISPOSABLE));
+    let read = marked_from_bitstream(Some(&mut bitstream), video_packet(annex, vec![]));
+    assert!(read.flags().contains(PacketFlags::DISPOSABLE));
+    // No reading: the packet keeps what the container said.
+    let mut unread: Option<NalStream> = None;
+    let passed = marked_from_bitstream(Some(&mut unread), video_packet(avc_packet(0), vec![]));
+    assert_eq!(passed.flags(), PacketFlags::empty());
+    let container = video_packet(avc_packet(0), vec![]).with_flags(PacketFlags::DISPOSABLE);
+    let passed = marked_from_bitstream(None, container);
+    assert_eq!(passed.flags(), PacketFlags::DISPOSABLE);
+  }
+
+  fn side_data(kind: c_int, data: &[u8]) -> crate::extras::SideDataEntry {
+    crate::extras::SideDataEntry::new(
+      kind,
+      crate::FfmpegBytes::try_copy_from_slice(data).expect("the side data's bytes"),
+    )
+  }
+
+  #[test]
+  fn new_extradata_on_a_packet_reframes_its_track_and_keeps_the_packet() {
+    // The track opened as Annex B; the packet brings an `avcC` of
+    // four-byte lengths and is read in it — and, carrying a configuration
+    // the decoder must see, is not marked.
+    let mut bitstream = Some(NalStream::new(NalCodec::H264, &[]));
+    let entry = side_data(
+      AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as c_int,
+      &avcc(),
+    );
+    let read = marked_from_bitstream(
+      Some(&mut bitstream),
+      video_packet(avc_packet(0), vec![entry]),
+    );
+    assert!(!read.flags().contains(PacketFlags::DISPOSABLE));
+    assert_eq!(
+      bitstream.as_ref().and_then(NalStream::framing),
+      Some(mediadecode::nal::Framing::Length(
+        mediadecode::nal::LengthSize::Four
+      ))
+    );
+    // The next packets carry none: past a reference picture, one is marked.
+    past_a_reference(&mut bitstream);
+    let marked = marked_from_bitstream(Some(&mut bitstream), video_packet(avc_packet(0), vec![]));
+    assert!(marked.flags().contains(PacketFlags::DISPOSABLE));
+  }
+
+  /// An `hvcC` of two-byte lengths holding `nals`, each after its two-byte
+  /// length, in one array.
+  fn hvcc(nals: &[&[u8]]) -> Vec<u8> {
+    let mut record = vec![0; 23];
+    record[0] = 1;
+    record[21] = 1;
+    record[22] = 1;
+    record.push(0x80 | 33);
+    record.extend_from_slice(&(nals.len() as u16).to_be_bytes());
+    for nal in nals {
+      record.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+      record.extend_from_slice(nal);
+    }
+    record
+  }
+
+  /// One HEVC picture's first slice segment of `nal_unit_type`, layer 0,
+  /// TemporalId 0, after its two-byte length.
+  fn hevc_packet(nal_unit_type: u8) -> Vec<u8> {
+    vec![0, 3, nal_unit_type << 1, 0x01, 0xAF]
+  }
+
+  #[test]
+  fn the_picture_that_takes_up_a_record_s_sei_is_not_marked() {
+    // An SPS of one sub-layer; a prefix SEI unit of film grain that does
+    // not persist.
+    let sps: &[u8] = &[0x42, 0x01, 0x01, 0x01, 0x60];
+    let grain: &[u8] = &[0x4E, 0x01, 0x13, 0x02, 0x00, 0x02, 0x80];
+    let mut bitstream = Some(NalStream::new(NalCodec::Hevc, &hvcc(&[sps])));
+    let disposable = |bitstream: &mut Option<NalStream>, data: Vec<u8>, entries| {
+      marked_from_bitstream(Some(bitstream), video_packet(data, entries))
+        .flags()
+        .contains(PacketFlags::DISPOSABLE)
+    };
+    // A CRA picture starts the sequence, so the decoder skips the RASL
+    // picture after it, and the film grain of the record that packet
+    // carries waits for the next picture decoded.
+    assert!(!disposable(&mut bitstream, hevc_packet(21), vec![]));
+    let record = side_data(
+      AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as c_int,
+      &hvcc(&[sps, grain]),
+    );
+    assert!(!disposable(&mut bitstream, hevc_packet(9), vec![record]));
+    assert!(!disposable(&mut bitstream, hevc_packet(0), vec![]));
+    // That picture took it up.
+    assert!(disposable(&mut bitstream, hevc_packet(0), vec![]));
+  }
+
+  /// `units`, each HEVC NAL unit after its two-byte length.
+  fn hevc_units(units: &[&[u8]]) -> Vec<u8> {
+    let mut packet = Vec::new();
+    for unit in units {
+      packet.extend_from_slice(&(unit.len() as u16).to_be_bytes());
+      packet.extend_from_slice(unit);
+    }
+    packet
+  }
+
+  /// LAW: **where a track is read, its reading's verdict is authoritative
+  /// over the container's mark**: a packet the container marks
+  /// `DISPOSABLE`, as `mov` marks one from `sdtp`, keeps the mark only where
+  /// the bitstream proves it. Every other verdict clears it, and so does a
+  /// corrupt packet. A track with no reading keeps the container's mark.
+  ///
+  /// Codex R8's counterexample. An HEVC CRA picture, then a prefix SEI unit
+  /// of film grain beside a RASL picture the decoder skips
+  /// (`hevc/hevcdec.c` 3542–3547), then a non-reference picture at the
+  /// highest sub-layer that the container marks. Decoding that picture
+  /// takes up the grain the skipped picture left
+  /// (`KeptReason::CarriedOver`), so dropping it would hand the grain to a
+  /// later picture: the mark goes. The picture after it is proven, and the
+  /// container's mark stands.
+  ///
+  /// PLANT: the container's mark left standing on a `Kept` verdict, as in
+  /// R8, turns this red at "the film grain's picture".
+  #[test]
+  fn a_reading_s_verdict_is_authoritative_over_the_container_s_mark() {
+    // An SPS of one sub-layer; a prefix SEI unit of film grain that does
+    // not persist; a RASL_N picture's first slice segment.
+    let sps: &[u8] = &[0x42, 0x01, 0x01, 0x01, 0x60];
+    let grain: &[u8] = &[0x4E, 0x01, 0x13, 0x02, 0x00, 0x02, 0x80];
+    let rasl: &[u8] = &[8 << 1, 0x01, 0xAF];
+    let sdtp = PacketFlags::DISPOSABLE;
+    let marked = |bitstream: &mut Option<NalStream>, data: Vec<u8>, flags: PacketFlags| {
+      marked_from_bitstream(
+        Some(bitstream),
+        video_packet(data, vec![]).with_flags(flags),
+      )
+      .flags()
+    };
+
+    let mut bitstream = Some(NalStream::new(NalCodec::Hevc, &hvcc(&[sps])));
+    assert_eq!(
+      marked(&mut bitstream, hevc_packet(21), PacketFlags::KEY),
+      PacketFlags::KEY,
+      "the CRA picture"
+    );
+    assert_eq!(
+      marked(
+        &mut bitstream,
+        hevc_units(&[grain, rasl]),
+        PacketFlags::empty()
+      ),
+      PacketFlags::empty(),
+      "the skipped picture and its grain"
+    );
+    assert_eq!(
+      marked(&mut bitstream, hevc_packet(0), sdtp),
+      PacketFlags::empty(),
+      "the film grain's picture: kept, and the container's mark goes"
+    );
+    assert_eq!(
+      marked(&mut bitstream, hevc_packet(0), sdtp),
+      sdtp,
+      "proven: the container's mark stands"
+    );
+    // A corrupt packet the container marks loses the mark where its track
+    // is read.
+    assert_eq!(
+      marked(&mut bitstream, hevc_packet(0), PacketFlags::CORRUPT | sdtp),
+      PacketFlags::CORRUPT,
+      "a corrupt packet"
+    );
+    // Any other verdict clears it too: a random-access picture.
+    let mut fresh = Some(NalStream::new(NalCodec::Hevc, &hvcc(&[sps])));
+    assert_eq!(
+      marked(&mut fresh, hevc_packet(21), PacketFlags::KEY | sdtp),
+      PacketFlags::KEY,
+      "a random-access picture the container marks"
+    );
+    // No reading: the container's mark stands, as the container gave it.
+    let mut unread: Option<NalStream> = None;
+    assert_eq!(
+      marked(&mut unread, hevc_packet(0), sdtp),
+      sdtp,
+      "no reading"
+    );
+    assert_eq!(
+      marked(&mut unread, hevc_packet(0), PacketFlags::CORRUPT | sdtp),
+      PacketFlags::CORRUPT | sdtp,
+      "no reading, a corrupt packet"
+    );
+  }
+
+  #[test]
+  fn side_data_that_persists_clears_the_mark_whoever_set_it() {
+    // A kind of neither table — one the bindings do not name — persists
+    // too.
+    let persisting = PERSISTING_SIDE_DATA
+      .iter()
+      .map(|&kind| kind as c_int)
+      .chain([
+        AVPacketSideDataType::AV_PKT_DATA_NB as c_int,
+        AVPacketSideDataType::AV_PKT_DATA_NB as c_int + 1,
+        -1,
+        c_int::MAX,
+      ]);
+    for kind in persisting {
+      // The bitstream's mark is not set...
+      let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
+      past_a_reference(&mut bitstream);
+      let read = marked_from_bitstream(
+        Some(&mut bitstream),
+        video_packet(avc_packet(0), vec![side_data(kind, &[1])]),
+      );
+      assert!(!read.flags().contains(PacketFlags::DISPOSABLE), "{kind}");
+      // ...and the container's is cleared, with a reading or without.
+      let container = video_packet(avc_packet(0), vec![side_data(kind, &[1])])
+        .with_flags(PacketFlags::DISPOSABLE | PacketFlags::KEY);
+      let cleared = marked_from_bitstream(Some(&mut bitstream), container);
+      assert_eq!(cleared.flags(), PacketFlags::KEY, "{kind}");
+      let container = video_packet(avc_packet(0), vec![side_data(kind, &[1])])
+        .with_flags(PacketFlags::DISPOSABLE);
+      let cleared = marked_from_bitstream(None, container);
+      assert_eq!(cleared.flags(), PacketFlags::empty(), "{kind}");
+    }
+    // Side data that rides with its packet leaves the mark to the
+    // bitstream — but for encryption's, which makes the packet opaque
+    // (`an_encrypted_packet_is_never_read_and_its_track_is_read_no_more`).
+    for &kind in RIDING_SIDE_DATA
+      .iter()
+      .filter(|&&kind| !says_encrypted(kind as c_int))
+    {
+      let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
+      past_a_reference(&mut bitstream);
+      let read = marked_from_bitstream(
+        Some(&mut bitstream),
+        video_packet(avc_packet(0), vec![side_data(kind as c_int, &[1])]),
+      );
+      assert!(read.flags().contains(PacketFlags::DISPOSABLE), "{kind:?}");
+    }
+  }
+
+  /// LAW: **an encrypted packet is never read, and its track is read no
+  /// more** — for each kind of encryption side data FFmpeg names
+  /// ([`ENCRYPTED_SIDE_DATA`]). The packet a reading would mark is not
+  /// marked; the reading is dropped; the track's later packets, which a
+  /// reading would mark, are not marked, before a seek or after it; and
+  /// another track reads on. The container's own mark stays as the
+  /// persistence tables answer it.
+  ///
+  /// PLANT: reading an encrypted packet as any other turns this red at
+  /// "not read"; skipping it without dropping the reading, at "the reading
+  /// is dropped".
+  #[test]
+  fn an_encrypted_packet_is_never_read_and_its_track_is_read_no_more() {
+    for &kind in ENCRYPTED_SIDE_DATA {
+      let kind = kind as c_int;
+      let mut bitstreams = vec![
+        Some(NalStream::new(NalCodec::H264, &avcc())),
+        Some(NalStream::new(NalCodec::H264, &avcc())),
+      ];
+      for bitstream in &mut bitstreams {
+        past_a_reference(bitstream);
+      }
+      // A non-reference picture's packet, which the reading would mark,
+      // encrypted.
+      let read = marked_from_bitstream(
+        bitstreams.get_mut(0),
+        video_packet(avc_packet(0), vec![side_data(kind, &[1])]),
+      );
+      assert!(
+        !read.flags().contains(PacketFlags::DISPOSABLE),
+        "{kind}: not read"
+      );
+      assert!(bitstreams[0].is_none(), "{kind}: the reading is dropped");
+      // The track's next packets are clear, and still not read.
+      for at in ["before a seek", "after a seek"] {
+        let read =
+          marked_from_bitstream(bitstreams.get_mut(0), video_packet(avc_packet(0), vec![]));
+        assert!(
+          !read.flags().contains(PacketFlags::DISPOSABLE),
+          "{kind}, {at}: read no more"
+        );
+        sought(&mut bitstreams);
+      }
+      // The other track reads on: past the seek, a reference picture
+      // again, then the non-reference one it marks.
+      past_a_reference(&mut bitstreams[1]);
+      let other = marked_from_bitstream(bitstreams.get_mut(1), video_packet(avc_packet(0), vec![]));
+      assert!(
+        other.flags().contains(PacketFlags::DISPOSABLE),
+        "{kind}: another track reads on"
+      );
+      // The container's mark: kept where the kind rides, cleared where it
+      // persists.
+      let container = video_packet(avc_packet(0), vec![side_data(kind, &[1])])
+        .with_flags(PacketFlags::DISPOSABLE);
+      let passed = marked_from_bitstream(bitstreams.get_mut(1), container);
+      assert_eq!(
+        passed.flags().contains(PacketFlags::DISPOSABLE),
+        !side_data_persists(kind),
+        "{kind}: the container's mark"
+      );
+      assert!(
+        bitstreams[1].is_none(),
+        "{kind}: that track is read no more either"
+      );
+    }
+  }
+
+  /// Writes `avcc()` into `par` as its extradata, padded as libavcodec
+  /// pads it, with the codec and medium of an H.264 video stream of 16 x 16
+  /// pictures.
+  ///
+  /// # Safety
+  ///
+  /// `par` is a live `AVCodecParameters` with no extradata yet.
+  unsafe fn as_h264(par: *mut ffmpeg_next::ffi::AVCodecParameters) {
+    use ffmpeg_next::ffi::{AV_INPUT_BUFFER_PADDING_SIZE, AVCodecID, AVMediaType, av_mallocz};
+
+    let record = avcc();
+    // SAFETY: the caller's contract; the allocation is the record's size
+    // and its padding, zeroed, and the record is copied into its front.
+    unsafe {
+      (*par).codec_type = AVMediaType::AVMEDIA_TYPE_VIDEO;
+      (*par).codec_id = AVCodecID::AV_CODEC_ID_H264;
+      (*par).width = 16;
+      (*par).height = 16;
+      let extradata = av_mallocz(record.len() + AV_INPUT_BUFFER_PADDING_SIZE as usize).cast::<u8>();
+      assert!(!extradata.is_null(), "the extradata");
+      ptr::copy_nonoverlapping(record.as_ptr(), extradata, record.len());
+      (*par).extradata = extradata;
+      (*par).extradata_size = record.len() as c_int;
+    }
+  }
+
+  /// Adds to `par`'s coded side data a key system's initialization, as
+  /// `mov` adds one from a `pssh` box (`libavformat/mov.c` 8148–8177): one
+  /// system of a 16-byte id with one 16-byte key id and no data, in
+  /// libavutil's layout (`libavutil/encryption_info.c` 164–174, 292–343).
+  ///
+  /// # Safety
+  ///
+  /// `par` is a live `AVCodecParameters`.
+  unsafe fn with_encryption_init_info(par: *mut ffmpeg_next::ffi::AVCodecParameters) {
+    use ffmpeg_next::ffi::av_packet_side_data_new;
+
+    let mut layout = Vec::new();
+    for word in [1u32, 16, 1, 16, 0] {
+      layout.extend_from_slice(&word.to_be_bytes());
+    }
+    layout.extend_from_slice(&[0x5A; 16]);
+    layout.extend_from_slice(&[0xA5; 16]);
+    // SAFETY: the caller's contract; the entry `av_packet_side_data_new`
+    // returns owns `layout.len()` writable bytes.
+    unsafe {
+      let entry = av_packet_side_data_new(
+        &mut (*par).coded_side_data,
+        &mut (*par).nb_coded_side_data,
+        AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO,
+        layout.len(),
+        0,
+      );
+      assert!(!entry.is_null(), "the side data");
+      ptr::copy_nonoverlapping(layout.as_ptr(), (*entry).data, layout.len());
+    }
+  }
+
+  /// The container format of libavformat's demuxer `name`, as a session
+  /// reads it at open.
+  fn named(name: &'static str) -> crate::ContainerFormat {
+    crate::ContainerFormat::new(Utf8Bytes::from_static(name), None)
+  }
+
+  /// The ISOBMFF demuxer's whole name.
+  const MOV: &str = "mov,mp4,m4a,3gp,3g2,mj2";
+
+  /// An open request declaring the demuxers `names` plaintext.
+  fn declaring(names: &[&str]) -> DemuxerOpen {
+    DemuxerOpen::new().with_plaintext_demuxers(
+      names
+        .iter()
+        .map(|name| DemuxerName::registered(name).expect("a demuxer FFmpeg registers"))
+        .collect(),
+    )
+  }
+
+  /// LAW: **a track FFmpeg names encrypted at the open is never read, its
+  /// demuxer declared or not** — a stream whose metadata names a key
+  /// (`enc_key_id`, as `matroska` names an encrypted track's), one whose
+  /// coded side data holds a key system's initialization (as `mov` holds a
+  /// `pssh` box's), and one whose `codec_tag` is the protected `encv`,
+  /// where a demuxer keeps it — beside a control stream, read where its
+  /// demuxer is declared and not by default. The context is a bare one,
+  /// read as `mov` would open it.
+  ///
+  /// PLANT: the metadata unread turns this red at "`enc_key_id`"; the side
+  /// data unread, at "`ENCRYPTION_INIT_INFO`"; the tag unread, at "`encv`".
+  #[test]
+  fn a_track_ffmpeg_names_encrypted_at_the_open_is_never_read() {
+    use ffmpeg_next::ffi::{avformat_alloc_context, avformat_new_stream};
+
+    ffmpeg_next::init().expect("ffmpeg init");
+    // SAFETY: a bare context, owned by the `Input` it is wrapped in, which
+    // frees it, its streams and their parameters and metadata; each stream
+    // is written whole before the context is read.
+    let input = unsafe {
+      let ctx = avformat_alloc_context();
+      assert!(!ctx.is_null(), "a context");
+      for signal in 0..4 {
+        let stream = avformat_new_stream(ctx, ptr::null());
+        assert!(!stream.is_null(), "a stream");
+        as_h264((*stream).codecpar);
+        match signal {
+          // A protected video sample entry's four-cc, where a demuxer
+          // keeps it.
+          3 => (*(*stream).codecpar).codec_tag = u32::from_le_bytes(*b"encv"),
+          1 => assert!(
+            av_dict_set(
+              &mut (*stream).metadata,
+              c"enc_key_id".as_ptr(),
+              c"WlpaWlpaWlpaWlpaWlpaWg==".as_ptr(),
+              0
+            ) >= 0,
+            "the metadata"
+          ),
+          2 => with_encryption_init_info((*stream).codecpar),
+          _ => {}
+        }
+      }
+      Input::wrap(ctx)
+    };
+    let request = declaring(&[MOV]);
+    let readings =
+      bitstreams(&input, Some(&named(MOV)), request.plaintext_demuxers()).expect("the readings");
+    assert!(readings[0].is_some(), "the control is read, declared");
+    assert!(readings[1].is_none(), "`enc_key_id`: never read");
+    assert!(readings[2].is_none(), "`ENCRYPTION_INIT_INFO`: never read");
+    assert!(readings[3].is_none(), "`encv`: never read");
+    let readings = bitstreams(&input, Some(&named(MOV)), &[]).expect("the readings");
+    assert!(
+      readings.iter().all(Option::is_none),
+      "by default, not even the control"
+    );
+  }
+
+  /// How a law's H.264 file frames its NAL units.
+  #[derive(Clone, Copy)]
+  enum Framed {
+    /// After four-byte lengths, its configuration `avcc()`.
+    Lengths,
+    /// After start codes, `avcc()`'s parameter sets after start codes its
+    /// configuration: the form a muxer of Annex B takes.
+    StartCodes,
+  }
+
+  /// `avcc()`'s parameter sets, each after a start code.
+  fn annex_b_parameter_sets() -> Vec<u8> {
+    let record = avcc();
+    let (sps, pps) = (&record[8..20], &record[23..27]);
+    [&[0, 0, 0, 1][..], sps, &[0, 0, 0, 1], pps].concat()
+  }
+
+  /// `packet`, its four-byte lengths each a start code.
+  fn annex_b(mut packet: Vec<u8>) -> Vec<u8> {
+    let mut at = 0;
+    while at + 4 <= packet.len() {
+      let length = u32::from_be_bytes(packet[at..at + 4].try_into().expect("four bytes")) as usize;
+      packet[at..at + 4].copy_from_slice(&[0, 0, 0, 1]);
+      at += 4 + length;
+    }
+    packet
+  }
+
+  /// Replaces `par`'s extradata with `record`, padded as libavcodec pads
+  /// it.
+  ///
+  /// # Safety
+  ///
+  /// `par` is a live `AVCodecParameters` whose extradata, if any, libavutil
+  /// allocated.
+  unsafe fn replace_extradata(par: *mut ffmpeg_next::ffi::AVCodecParameters, record: &[u8]) {
+    use ffmpeg_next::ffi::{AV_INPUT_BUFFER_PADDING_SIZE, av_free, av_mallocz};
+
+    // SAFETY: the caller's contract; the allocation is the record's size and
+    // its padding, zeroed, and the record is copied into its front.
+    unsafe {
+      av_free((*par).extradata.cast());
+      let extradata = av_mallocz(record.len() + AV_INPUT_BUFFER_PADDING_SIZE as usize).cast::<u8>();
+      assert!(!extradata.is_null(), "the extradata");
+      ptr::copy_nonoverlapping(record.as_ptr(), extradata, record.len());
+      (*par).extradata = extradata;
+      (*par).extradata_size = record.len() as c_int;
+    }
+  }
+
+  /// Writes, through libavformat's muxer `format`, an H.264 file at `path`:
+  /// its configuration `record`, then `packets` at 25 a second, the first a
+  /// key frame, each sent `DISPOSABLE` where `container_marks` says, so
+  /// that a muxer that writes the mark (`movenc`'s `sdtp`) writes it.
+  /// `signal` is applied to the stream before the header, and `options`
+  /// are the muxer's, every one taken.
+  fn write_h264(
+    path: &Path,
+    format: &str,
+    record: &[u8],
+    packets: &[Vec<u8>],
+    container_marks: &[bool],
+    signal: unsafe fn(*mut ffmpeg_next::ffi::AVStream),
+    options: &[(&str, &str)],
+  ) {
+    use ffmpeg_next as ff;
+
+    ff::init().expect("ffmpeg init");
+    let mut output = ff::format::output_as(&path, format).expect("an output");
+    {
+      let mut stream = output.add_stream(ff::codec::Id::None).expect("a stream");
+      stream.set_time_base((1, 25));
+      // SAFETY: the stream is live and its parameters are fresh: nothing
+      // else holds them, and the extradata `as_h264` writes is libavutil's.
+      unsafe {
+        let stream = stream.as_mut_ptr();
+        as_h264((*stream).codecpar);
+        replace_extradata((*stream).codecpar, record);
+        signal(stream);
+      }
+    }
+    let mut dictionary = ff::Dictionary::new();
+    for (key, value) in options {
+      dictionary.set(key, value);
+    }
+    {
+      let unused = output.write_header_with(dictionary).expect("the header");
+      assert_eq!(unused.iter().count(), 0, "every option taken");
+    }
+    let stream_tb = output.stream(0).expect("the stream").time_base();
+    for (index, data) in packets.iter().enumerate() {
+      let mut packet = ff::Packet::copy(data);
+      packet.set_stream(0);
+      packet.set_pts(Some(index as i64));
+      packet.set_dts(Some(index as i64));
+      packet.set_duration(1);
+      let mut flags = ff::packet::Flags::empty();
+      if index == 0 {
+        flags |= ff::packet::Flags::KEY;
+      }
+      if container_marks.get(index).copied().unwrap_or(false) {
+        flags |=
+          ff::packet::Flags::from_bits_retain(ffmpeg_next::ffi::AV_PKT_FLAG_DISPOSABLE as c_int);
+      }
+      packet.set_flags(flags);
+      packet.rescale_ts((1, 25), stream_tb);
+      packet.write_interleaved(&mut output).expect("a packet");
+    }
+    output.write_trailer().expect("the trailer");
+  }
+
+  /// The three packets of a law's H.264 file — a reference picture's, then
+  /// two non-reference ones (`avc_packet`) — and its configuration,
+  /// `framed`.
+  fn h264_of(framed: Framed) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let packets = [2u8, 0, 0].map(avc_packet);
+    match framed {
+      Framed::Lengths => (avcc(), packets.to_vec()),
+      Framed::StartCodes => (
+        annex_b_parameter_sets(),
+        packets.into_iter().map(annex_b).collect(),
+      ),
+    }
+  }
+
+  /// Writes through libavformat's muxer `format` an H.264 file at `path`
+  /// of `avcc()` and three packets — a reference picture's, then two
+  /// non-reference ones (`avc_packet`) — with `signal` applied to its
+  /// stream before the header; and answers whether the demuxer opens it,
+  /// with `request`, with a reading, and which packets it marks
+  /// DISPOSABLE.
+  fn marked_after_writing(
+    path: &Path,
+    format: &str,
+    signal: unsafe fn(*mut ffmpeg_next::ffi::AVStream),
+    request: &DemuxerOpen,
+  ) -> (bool, Vec<bool>) {
+    marked_after_writing_framed(path, format, signal, Framed::Lengths, request)
+  }
+
+  /// [`marked_after_writing`], its NAL units `framed`.
+  fn marked_after_writing_framed(
+    path: &Path,
+    format: &str,
+    signal: unsafe fn(*mut ffmpeg_next::ffi::AVStream),
+    framed: Framed,
+    request: &DemuxerOpen,
+  ) -> (bool, Vec<bool>) {
+    let (record, packets) = h264_of(framed);
+    write_h264(path, format, &record, &packets, &[], signal, &[]);
+    marks_of(path, request)
+  }
+
+  /// What a walk of a file's first track came to ([`walked`]).
+  #[derive(Debug, PartialEq, Eq)]
+  struct Walk {
+    /// Whether the track had a reading at the open.
+    read: bool,
+    /// Which of its video packets were marked DISPOSABLE.
+    marks: Vec<bool>,
+    /// Whether it still had a reading at the end of the file.
+    read_at_end: bool,
+  }
+
+  /// Opens the file at `path` through the demuxer, with `request`, and
+  /// walks it to its end ([`Walk`]).
+  fn walked(path: &Path, request: &DemuxerOpen) -> Walk {
+    let mut demuxer = CarrierDemuxer::<crate::Owned>::open_from_impl(path, request.clone())
+      .expect("the file opens");
+    let read = demuxer.bitstreams.first().is_some_and(Option::is_some);
+    let mut marks = Vec::new();
+    while let Some(packet) = demuxer.next_packet_impl().expect("a packet or the end") {
+      if let DemuxedPacket::Video(video) = packet {
+        marks.push(
+          video
+            .into_packet()
+            .flags()
+            .contains(PacketFlags::DISPOSABLE),
+        );
+      }
+    }
+    let read_at_end = demuxer.bitstreams.first().is_some_and(Option::is_some);
+    Walk {
+      read,
+      marks,
+      read_at_end,
+    }
+  }
+
+  /// Opens the file at `path` through the demuxer, with `request`, and
+  /// answers whether its first track has a reading, and which of its video
+  /// packets are marked DISPOSABLE.
+  fn marks_of(path: &Path, request: &DemuxerOpen) -> (bool, Vec<bool>) {
+    let Walk { read, marks, .. } = walked(path, request);
+    (read, marks)
+  }
+
+  /// No signal: the stream as written.
+  unsafe fn no_signal(_: *mut ffmpeg_next::ffi::AVStream) {}
+
+  /// LAW: **an MP4 is container-only by default, and read where its
+  /// demuxer is declared plaintext.** By default its track gets no reading,
+  /// and its packets carry the container's mark alone, as FFmpeg delivers
+  /// it — which, on an H.264 track, is none. `movenc` writes `sdtp`'s mark
+  /// for the last packet, sent `DISPOSABLE` (`libavformat/movenc.c`
+  /// 7360–7363, 3419–3420), and `mov` reads it onto that packet (`mov.c`
+  /// 11719–11723); but `mov` parses an H.264 track's headers as it reads
+  /// (3159–3160), and libavformat's parse rebuilds each packet's flags with
+  /// no `DISPOSABLE` (`demux.c` 1289). Declared (`mov,mp4,m4a,3gp,3g2,mj2`),
+  /// the same file is read and marked as the bitstream proves.
+  ///
+  /// PLANT: `mov` read by default turns this red at "by default"; the
+  /// declaration unread, at "declared".
+  #[test]
+  fn an_mp4_is_container_only_unless_its_demuxer_is_declared() {
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    let path = scratch.path().join("clear.mp4");
+    let (record, packets) = h264_of(Framed::Lengths);
+    write_h264(
+      &path,
+      "mp4",
+      &record,
+      &packets,
+      &[false, false, true],
+      no_signal,
+      &[],
+    );
+    assert_eq!(
+      marks_of(&path, &DemuxerOpen::new()),
+      (false, vec![false, false, false]),
+      "by default: no reading, and `sdtp`'s mark, which FFmpeg's parse of H.264 drops"
+    );
+    assert_eq!(
+      marks_of(&path, &declaring(&[MOV])),
+      (true, vec![false, true, true]),
+      "declared: read and marked"
+    );
+  }
+
+  /// LAW: **an MP4 whose stream carries a key system's initialization is
+  /// never read, its demuxer declared**, through `mov`'s own muxer and
+  /// demuxer: `movenc` writes the stream's `ENCRYPTION_INIT_INFO` as a
+  /// `pssh` box at the end of `moov` (`libavformat/movenc.c` 5175–5210,
+  /// 5449–5450), and `mov` reads it back onto the stream (`mov.c` 8064,
+  /// 8148–8177). The same file without it is read, its non-reference
+  /// packets marked.
+  ///
+  /// PLANT: the coded side data unread at the open turns this red at "a
+  /// `pssh` box".
+  #[test]
+  fn an_mp4_whose_stream_carries_a_key_systems_initialization_is_never_read() {
+    unsafe fn pssh(stream: *mut ffmpeg_next::ffi::AVStream) {
+      // SAFETY: `marked_after_writing` hands over a live stream.
+      unsafe { with_encryption_init_info((*stream).codecpar) };
+    }
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    let declared = declaring(&[MOV]);
+    assert_eq!(
+      marked_after_writing(
+        &scratch.path().join("clear.mp4"),
+        "mp4",
+        no_signal,
+        &declared
+      ),
+      (true, vec![false, true, true]),
+      "the control"
+    );
+    assert_eq!(
+      marked_after_writing(&scratch.path().join("pssh.mp4"), "mp4", pssh, &declared),
+      (false, vec![false, false, false]),
+      "a `pssh` box: never read"
+    );
+  }
+
+  /// LAW: **inside a declared demuxer, an encrypted sample is still
+  /// opaque.** `movenc` writes the MP4 under CENC (`encryption_scheme`
+  /// `cenc-aes-ctr`, `libavformat/movenc.c` 8387–8401, 8630–8636): a
+  /// protected track's `tenc`, and its samples' encryption info. `mov`,
+  /// given no key, attaches `ENCRYPTION_INFO` to every sample (`mov.c`
+  /// 8254–8258, 8726–8736) and names the track encrypted by nothing at the
+  /// open, so a declared track is read at the open, and its reading ends at
+  /// its first packet: nothing is marked. By default it is not read at all.
+  ///
+  /// PLANT: `ENCRYPTION_INFO` unread turns this red at "declared, under
+  /// CENC".
+  #[test]
+  fn a_declared_mp4_s_encrypted_samples_are_still_opaque() {
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    let path = scratch.path().join("cenc.mp4");
+    let (record, packets) = h264_of(Framed::Lengths);
+    write_h264(
+      &path,
+      "mp4",
+      &record,
+      &packets,
+      &[],
+      no_signal,
+      &[
+        ("encryption_scheme", "cenc-aes-ctr"),
+        ("encryption_key", "2b7e151628aed2a6abf7158809cf4f3c"),
+        ("encryption_kid", "000102030405060708090a0b0c0d0e0f"),
+      ],
+    );
+    assert_eq!(
+      walked(&path, &declaring(&[MOV])),
+      Walk {
+        read: true,
+        marks: vec![false, false, false],
+        read_at_end: false,
+      },
+      "declared, under CENC: opaque from its first packet"
+    );
+    assert_eq!(
+      marks_of(&path, &DemuxerOpen::new()),
+      (false, vec![false, false, false]),
+      "by default: never read"
+    );
+  }
+
+  /// `payload` as a packet of stream 0 carrying `AV_PKT_DATA_ENCRYPTION_INFO`,
+  /// as `mov` attaches it to a sample under an encryption index
+  /// (`libavformat/mov.c` 8726–8736), to be handed over whole
+  /// ([`InjectedRead::Built`]).
+  fn signalled(payload: &[u8]) -> Packet {
+    use ffmpeg_next::{ffi::av_packet_new_side_data, packet::Mut};
+
+    let mut packet = Packet::copy(payload);
+    // SAFETY: `packet` owns a live packet; the entry is FFmpeg's own
+    // allocation of 16 bytes, written only through the pointer it returns.
+    unsafe {
+      let entry = av_packet_new_side_data(
+        packet.as_mut_ptr(),
+        AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INFO,
+        16,
+      );
+      assert!(!entry.is_null(), "the side data");
+      ptr::write_bytes(entry, 0x5A, 16);
+    }
+    packet.set_stream(0);
+    packet.set_pts(Some(1));
+    packet.set_dts(Some(1));
+    packet.set_duration(1);
+    packet
+  }
+
+  /// Which of the video packets `demuxer` delivers from here to the end are
+  /// marked DISPOSABLE.
+  fn marks_to_the_end<C: crate::FfmpegCarrier + crate::CarrierOps>(
+    demuxer: &mut CarrierDemuxer<C>,
+  ) -> Vec<bool> {
+    let mut marks = Vec::new();
+    while let Some(packet) = demuxer.next_packet_impl().expect("a packet or the end") {
+      if let DemuxedPacket::Video(video) = packet {
+        marks.push(
+          video
+            .into_packet()
+            .flags()
+            .contains(PacketFlags::DISPOSABLE),
+        );
+      }
+    }
+    marks
+  }
+
+  /// LAW: **a signalled packet a limit refuses still ends its track's
+  /// reading** (Codex R11). A declared `mov` session is read past its
+  /// reference picture. Then a packet carrying `ENCRYPTION_INFO`, its payload
+  /// over the packet limit, is refused by its conversion and dropped. The
+  /// latch ran as the packet was read: the reading is gone, and the
+  /// plaintext non-reference packets after it are unread and unmarked.
+  ///
+  /// The signalled packet is an injected read ([`InjectedRead::Built`]),
+  /// which takes libavformat's road from the read on. A real CENC file
+  /// signals every sample, so it cannot put an unsignalled packet after a
+  /// signalled one, as a fragmented MOV that switches sample descriptions
+  /// can.
+  ///
+  /// PLANT: the latch moved back after the conversion, as in R11, turns
+  /// this red at "latched as it was read".
+  #[test]
+  fn a_signalled_packet_a_limit_refuses_still_ends_its_tracks_reading() {
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    let path = scratch.path().join("clear.mp4");
+    let (record, packets) = h264_of(Framed::Lengths);
+    write_h264(&path, "mp4", &record, &packets, &[], no_signal, &[]);
+    let limits =
+      DemuxLimits::new().with_packet(crate::limits::PacketLimits::new().with_max_packet_bytes(64));
+    let mut demuxer =
+      CarrierDemuxer::<crate::Owned>::open_from_impl(&path, declaring(&[MOV]).with_limits(limits))
+        .expect("the file opens");
+    let Some(DemuxedPacket::Video(first)) = demuxer.next_packet_impl().expect("a packet") else {
+      panic!("the reference picture's packet");
+    };
+    assert!(
+      !first
+        .into_packet()
+        .flags()
+        .contains(PacketFlags::DISPOSABLE),
+      "the reference picture"
+    );
+
+    demuxer
+      .injected_reads
+      .push_back(InjectedRead::Built(signalled(&[0; 128])));
+    let refused = demuxer.next_packet_impl().map(|packet| packet.is_some());
+    assert!(
+      matches!(refused, Err(DemuxError::PacketBuffer(_))),
+      "refused by the packet limit: {refused:?}"
+    );
+    assert!(demuxer.unconverted.is_none(), "dropped, not parked");
+    assert!(demuxer.bitstreams[0].is_none(), "latched as it was read");
+    assert_eq!(
+      marks_to_the_end(&mut demuxer),
+      vec![false, false],
+      "the plaintext after it, unread and unmarked"
+    );
+  }
+
+  /// LAW: **a signalled packet parked, then discarded by a seek, still ends
+  /// its track's reading** (Codex R11). In a declared `mov` session on the
+  /// view lane, a packet carrying `ENCRYPTION_INFO` is handed over whole
+  /// ([`InjectedRead::Built`]). Its conversion meets an allocator capped at
+  /// one byte (`av_max_alloc`, in a child process of its own), so its capture
+  /// fails, and the packet is parked to be re-attempted. A successful seek
+  /// then discards it. The latch ran as the packet was read: after the seek,
+  /// the file's packets — a reference picture, then two non-reference ones,
+  /// all plaintext — are unread and unmarked.
+  ///
+  /// PLANT: the latch skipped on the parking road, run only for a packet
+  /// dropped or delivered, turns this red at "latched before the parking".
+  #[test]
+  fn a_signalled_packet_parked_then_discarded_by_a_seek_still_ends_its_tracks_reading() {
+    mediaio_ffmpeg::test_support::in_subprocess(
+      "demuxer::tests::a_signalled_packet_parked_then_discarded_by_a_seek_still_ends_its_tracks_reading",
+      || {
+        let scratch = tempfile::tempdir().expect("a temp dir");
+        let path = scratch.path().join("clear.mp4");
+        let (record, packets) = h264_of(Framed::Lengths);
+        write_h264(&path, "mp4", &record, &packets, &[], no_signal, &[]);
+        let mut demuxer = CarrierDemuxer::<crate::View>::open_from_impl(&path, declaring(&[MOV]))
+          .expect("the file opens");
+        demuxer
+          .injected_reads
+          .push_back(InjectedRead::Built(signalled(&avc_packet(0))));
+
+        // SAFETY: in `in_subprocess`'s child, alone. The capped window is one
+        // pull, whose read moves a packet built before it and whose
+        // conversion checks every allocation it makes.
+        unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(1) };
+        let parked = demuxer.next_packet_impl().map(|packet| packet.is_some());
+        mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
+        assert!(
+          matches!(parked, Err(DemuxError::PacketBuffer(ref refused)) if parks_in_demux(refused.source())),
+          "refused by the allocator: {parked:?}"
+        );
+        assert!(demuxer.unconverted.is_some(), "parked, to be re-attempted");
+        assert!(
+          demuxer.bitstreams[0].is_none(),
+          "latched before the parking"
+        );
+
+        demuxer
+          .seek_impl(Timestamp::new(0, Timebase::HZ_8K))
+          .expect("a seek");
+        assert!(demuxer.unconverted.is_none(), "discarded by the seek");
+        assert_eq!(
+          marks_to_the_end(&mut demuxer),
+          vec![false, false, false],
+          "after the seek, the track read no more"
+        );
+        assert!(demuxer.bitstreams[0].is_none(), "its reading gone for good");
+      },
+    );
+  }
+
+  /// An ISO BMFF box of `kind`, holding `body`.
+  fn iso(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    [&(8 + body.len() as u32).to_be_bytes()[..], kind, body].concat()
+  }
+
+  /// An ISO BMFF full box of `kind`, version 0 and no flags, holding
+  /// `body`.
+  fn iso_full(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    iso(kind, &[&[0, 0, 0, 0][..], body].concat())
+  }
+
+  /// The box of `kind` among the boxes of `file[start..end]`, each of a
+  /// 32-bit size: its offset and its size.
+  fn iso_box(file: &[u8], start: usize, end: usize, kind: &[u8; 4]) -> (usize, usize) {
+    let mut at = start;
+    while at + 8 <= end {
+      let size = u32::from_be_bytes(file[at..at + 4].try_into().expect("four bytes")) as usize;
+      assert!(size >= 8 && at + size <= end, "a box of a 32-bit size");
+      if &file[at + 4..at + 8] == kind {
+        return (at, size);
+      }
+      at += size;
+    }
+    panic!("no `{}` box", String::from_utf8_lossy(kind));
+  }
+
+  /// The `sinf` of an OMA DRM 2 PDCF track (OMA-TS-DRM-DCF-V2_0): `frma`
+  /// naming `avc1`; `schm` of the scheme `odkm`, version `0x0200`; and
+  /// `schi` holding the `odkm` box — its `ohdr` of AES-128-CBC with RFC 2630
+  /// padding, a content id and no rights issuer, and its `odaf` of selective
+  /// encryption, no key indicator and a 16-byte IV.
+  fn oma_pdcf_sinf() -> Vec<u8> {
+    let content_id = b"cid:q753-r11@findit.example";
+    // EncryptionMethod AES_128_CBC, PaddingScheme RFC_2630, PlaintextLength.
+    let mut ohdr = vec![0x01, 0x01];
+    ohdr.extend_from_slice(&0u64.to_be_bytes());
+    // ContentIDLength, RightsIssuerURLLength, TextualHeadersLength.
+    ohdr.extend_from_slice(&(content_id.len() as u16).to_be_bytes());
+    ohdr.extend_from_slice(&[0, 0, 0, 0]);
+    ohdr.extend_from_slice(content_id);
+    // SelectiveEncryption, KeyIndicatorLength, IVLength.
+    let odaf = [0x80, 0, 16];
+    let odkm = iso_full(
+      b"odkm",
+      &[iso_full(b"ohdr", &ohdr), iso_full(b"odaf", &odaf)].concat(),
+    );
+    let schm = iso_full(b"schm", &[&b"odkm"[..], &0x0200u32.to_be_bytes()].concat());
+    iso(
+      b"sinf",
+      &[iso(b"frma", b"avc1"), schm, iso(b"schi", &odkm)].concat(),
+    )
+  }
+
+  /// Rewrites the MP4 at `path`, whose `moov` follows its samples, as an
+  /// OMA DRM 2 PDCF file: its first sample entry, `avc1`, becomes the
+  /// protected `encv`, holding [`oma_pdcf_sinf`] after its own boxes. No
+  /// chunk offset moves, since nothing before the samples grows.
+  fn protect_as_oma_pdcf(path: &Path) {
+    let mut file = std::fs::read(path).expect("the file");
+    let (mdat, _) = iso_box(&file, 0, file.len(), b"mdat");
+    let (moov, moov_size) = iso_box(&file, 0, file.len(), b"moov");
+    assert!(mdat < moov, "`moov` after the samples");
+    let (trak, trak_size) = iso_box(&file, moov + 8, moov + moov_size, b"trak");
+    let (mdia, mdia_size) = iso_box(&file, trak + 8, trak + trak_size, b"mdia");
+    let (minf, minf_size) = iso_box(&file, mdia + 8, mdia + mdia_size, b"minf");
+    let (stbl, stbl_size) = iso_box(&file, minf + 8, minf + minf_size, b"stbl");
+    let (stsd, _) = iso_box(&file, stbl + 8, stbl + stbl_size, b"stsd");
+    // `stsd`: its version and flags, an entry count, then the entries.
+    let entry = stsd + 16;
+    let entry_size =
+      u32::from_be_bytes(file[entry..entry + 4].try_into().expect("four bytes")) as usize;
+    assert_eq!(&file[entry + 4..entry + 8], b"avc1", "the sample entry");
+    let sinf = oma_pdcf_sinf();
+    for at in [moov, trak, mdia, minf, stbl, stsd, entry] {
+      let size = u32::from_be_bytes(file[at..at + 4].try_into().expect("four bytes"));
+      file[at..at + 4].copy_from_slice(&(size + sinf.len() as u32).to_be_bytes());
+    }
+    file[entry + 4..entry + 8].copy_from_slice(b"encv");
+    file.splice(entry + entry_size..entry + entry_size, sinf);
+    std::fs::write(path, file).expect("the protected file");
+  }
+
+  /// libavutil's AES-128 in CBC mode over `data`, whole blocks, under `key`
+  /// from `iv`: decrypting where `decrypt`.
+  fn aes_128_cbc(key: &[u8; 16], iv: &[u8], data: &[u8], decrypt: bool) -> Vec<u8> {
+    use ffmpeg_next::ffi::{av_aes_alloc, av_aes_crypt, av_aes_init, av_free};
+
+    assert_eq!(data.len() % 16, 0, "whole blocks");
+    let mut chain: [u8; 16] = iv.try_into().expect("a 16-byte IV");
+    let mut out = vec![0; data.len()];
+    // SAFETY: the context is allocated, initialized for a 128-bit key and
+    // freed here; `out` and `data` are both `data.len()` bytes, whole
+    // blocks, and `chain` the 16 bytes CBC chains through.
+    unsafe {
+      let aes = av_aes_alloc();
+      assert!(!aes.is_null(), "an AES context");
+      assert_eq!(
+        av_aes_init(aes, key.as_ptr(), 128, c_int::from(decrypt)),
+        0,
+        "the key"
+      );
+      av_aes_crypt(
+        aes,
+        out.as_mut_ptr(),
+        data.as_ptr(),
+        (data.len() / 16) as c_int,
+        chain.as_mut_ptr(),
+        c_int::from(decrypt),
+      );
+      av_free(aes.cast());
+    }
+    out
+  }
+
+  /// An H.264 reference picture's packet of one-byte lengths: an access
+  /// unit delimiter, then a slice of `nal_ref_idc` 2, 102 bytes in all.
+  fn one_byte_reference_packet() -> Vec<u8> {
+    let mut slice = vec![(2 << 5) | 1, 0x9C, 0x84, 0x21];
+    slice.resize(98, 0xAA);
+    [&[2, 0x09, 0xF0, slice.len() as u8][..], &slice].concat()
+  }
+
+  /// The OMA PDCF access units of [`write_oma_pdcf_mp4`]: each a reference
+  /// picture's packet, encrypted under `key` as OMA DRM 2 encrypts one —
+  /// its selective-encryption header (`0x80`, encrypted), its IV, then the
+  /// AES-128-CBC ciphertext of the packet padded by RFC 2630, 129 bytes in
+  /// all. Each IV, the encrypter's choice, begins with an H.264 slice's
+  /// first bytes: a reference one's for the first unit, and a
+  /// non-reference one's for the two after.
+  fn oma_pdcf_units(key: &[u8; 16]) -> Vec<Vec<u8>> {
+    let mut plaintext = one_byte_reference_packet();
+    let pad = 16 - plaintext.len() % 16;
+    plaintext.resize(plaintext.len() + pad, pad as u8);
+    [0x41u8, 0x01, 0x01]
+      .into_iter()
+      .enumerate()
+      .map(|(index, slice_header)| {
+        let mut iv = vec![slice_header, 0x9C, 0x84, 0x21, index as u8];
+        iv.resize(16, 0x5A);
+        let unit = [&[0x80][..], &iv, &aes_128_cbc(key, &iv, &plaintext, false)].concat();
+        assert_eq!(unit.len(), 129, "an OMA access unit");
+        unit
+      })
+      .collect()
+  }
+
+  /// Writes at `path` an MP4 of one H.264 track protected under OMA DRM 2's
+  /// PDCF, encrypted under `key`: `movenc` writes `avc1` with `avcC` of
+  /// one-byte lengths and the access units [`oma_pdcf_units`], and the file
+  /// is rewritten with the protected sample entry ([`protect_as_oma_pdcf`]).
+  fn write_oma_pdcf_mp4(path: &Path, key: &[u8; 16]) {
+    let mut record = avcc();
+    // lengthSizeMinusOne 0: one-byte lengths.
+    record[4] = 0xFC;
+    write_h264(
+      path,
+      "mp4",
+      &record,
+      &oma_pdcf_units(key),
+      &[],
+      no_signal,
+      &[],
+    );
+    protect_as_oma_pdcf(path);
+  }
+
+  /// LAW: **a track protected under OMA DRM 2's PDCF is read only where
+  /// its demuxer is declared, and its ciphertext is the caller's documented
+  /// risk.** Codex R10's counterexample, as a real file FFmpeg parses: an
+  /// `encv` sample entry whose `frma` names `avc1`, its `schm` scheme
+  /// `odkm`, its `schi` OMA's `odkm` box, and no `tenc`, `senc` or `pssh`;
+  /// its samples, the AES-128-CBC ciphertext of reference pictures behind
+  /// IVs the encrypter chose.
+  ///
+  /// FFmpeg 9.0.1 opens it as plain H.264: the `codec_tag` is `avc1`,
+  /// `frma`'s four-cc in place of `encv` (`libavformat/mov.c` 7631, 2812),
+  /// and nothing names it encrypted, at the open or on a packet. By default
+  /// it is not read, and nothing is marked. Declared, it is read, and with
+  /// one-byte lengths each unit's `0x80` header reads as a 128-byte NAL
+  /// unit led by its IV: the two IVs that begin as a non-reference slice
+  /// are marked, though each decrypts to a reference picture, which the
+  /// reading marks nowhere. That is the false mark
+  /// [`DemuxerOpen::plaintext_demuxers`] names as the caller's risk, and
+  /// the limit the audit names ([`AUDITED_DEMUXERS`]); pinned here, never
+  /// refused.
+  ///
+  /// PLANT: `mov` read by default turns this red at "OMA PDCF, by default";
+  /// the limit dropped from `mov`'s audit, at "the limit, named".
+  #[test]
+  fn an_oma_pdcf_track_is_read_only_where_declared_and_its_ciphertext_is_the_caller_s_risk() {
+    let key = [0x2B; 16];
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    let path = scratch.path().join("pdcf.3gp");
+    write_oma_pdcf_mp4(&path, &key);
+
+    // FFmpeg's reading of it: plain H.264, nothing named encrypted.
+    {
+      let demuxer = CarrierDemuxer::<crate::Owned>::open_from_impl(&path, declaring(&[MOV]))
+        .expect("the file opens");
+      let stream = demuxer.input.stream(0).expect("its stream");
+      let parameters = stream.parameters();
+      // SAFETY: the stream's parameters are live while `demuxer` is; the
+      // codec is read as the integer it is.
+      let (tag, codec) = unsafe {
+        let par = parameters.as_ptr();
+        (
+          (*par).codec_tag,
+          read_unaligned(addr_of!((*par).codec_id).cast::<i32>()),
+        )
+      };
+      assert_eq!(tag, u32::from_le_bytes(*b"avc1"), "`frma`'s four-cc");
+      assert_eq!(
+        codec,
+        ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264 as i32,
+        "H.264"
+      );
+      // SAFETY: the stream is live while `demuxer` is.
+      assert!(
+        !unsafe { encrypted_at_open(stream.as_ptr()) },
+        "named encrypted by nothing at the open"
+      );
+    }
+
+    assert_eq!(
+      marks_of(&path, &DemuxerOpen::new()),
+      (false, vec![false, false, false]),
+      "OMA PDCF, by default: never read"
+    );
+    assert_eq!(
+      walked(&path, &declaring(&[MOV])),
+      Walk {
+        read: true,
+        marks: vec![false, true, true],
+        read_at_end: true,
+      },
+      "OMA PDCF, declared: read, its ciphertext marked, no packet named encrypted"
+    );
+    // Each unit decrypts to a reference picture, which no reading marks.
+    let mut record = avcc();
+    record[4] = 0xFC;
+    let mut plain = Some(NalStream::new(NalCodec::H264, &record));
+    for unit in oma_pdcf_units(&key) {
+      let (iv, ciphertext) = unit[1..].split_at(16);
+      let mut packet = aes_128_cbc(&key, iv, ciphertext, true);
+      let pad = usize::from(*packet.last().expect("a block"));
+      packet.truncate(packet.len() - pad);
+      assert_eq!(packet, one_byte_reference_packet(), "the plaintext");
+      let read = marked_from_bitstream(Some(&mut plain), video_packet(packet, vec![]));
+      assert!(
+        !read.flags().contains(PacketFlags::DISPOSABLE),
+        "a reference picture, decrypted"
+      );
+    }
+    let mov = AUDITED_DEMUXERS
+      .iter()
+      .find(|row| row.name == MOV)
+      .expect("`mov`'s audit");
+    assert!(
+      mov.reading == Reading::Declared && mov.limits.contains("PDCF"),
+      "the limit, named"
+    );
+  }
+
+  /// An EBML element of Matroska: its id, its size as an eight-byte EBML
+  /// integer, then `data`.
+  fn ebml(id: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut element = id.to_vec();
+    element.extend_from_slice(&((1u64 << 56) | data.len() as u64).to_be_bytes());
+    element.extend_from_slice(data);
+    element
+  }
+
+  /// Writes at `path` a Matroska file of one H.264 track of `avcc()` and
+  /// three packets — a reference picture's, then two non-reference ones
+  /// (`avc_packet`) — whose `ContentEncryption` names no key id: the form
+  /// FFmpeg 9.0.1 passes through undecrypted with nothing but a log line
+  /// (`libavformat/matroskadec.c` 2074–2076). Built by hand, since
+  /// `matroskaenc` writes no encryption.
+  fn write_keyless_encrypted_matroska(path: &Path) {
+    let uint = |id: &[u8], value: u8| ebml(id, &[value]);
+    let header = ebml(
+      &[0x1A, 0x45, 0xDF, 0xA3],
+      &[
+        uint(&[0x42, 0x86], 1),
+        uint(&[0x42, 0xF7], 1),
+        uint(&[0x42, 0xF2], 4),
+        uint(&[0x42, 0xF3], 8),
+        ebml(&[0x42, 0x82], b"matroska"),
+        uint(&[0x42, 0x87], 4),
+        uint(&[0x42, 0x85], 2),
+      ]
+      .concat(),
+    );
+    let info = ebml(
+      &[0x15, 0x49, 0xA9, 0x66],
+      &ebml(&[0x2A, 0xD7, 0xB1], &[0x0F, 0x42, 0x40]),
+    );
+    // ContentEncodings: one encoding, of encryption (type 1), AES (5), and
+    // no ContentEncKeyID.
+    let encodings = ebml(
+      &[0x6D, 0x80],
+      &ebml(
+        &[0x62, 0x40],
+        &[
+          uint(&[0x50, 0x31], 0),
+          uint(&[0x50, 0x32], 1),
+          uint(&[0x50, 0x33], 1),
+          ebml(&[0x50, 0x35], &uint(&[0x47, 0xE1], 5)),
+        ]
+        .concat(),
+      ),
+    );
+    let track = ebml(
+      &[0xAE],
+      &[
+        uint(&[0xD7], 1),
+        uint(&[0x73, 0xC5], 1),
+        uint(&[0x83], 1),
+        ebml(&[0x86], b"V_MPEG4/ISO/AVC"),
+        ebml(&[0x63, 0xA2], &avcc()),
+        ebml(&[0xE0], &[uint(&[0xB0], 16), uint(&[0xBA], 16)].concat()),
+        encodings,
+      ]
+      .concat(),
+    );
+    let tracks = ebml(&[0x16, 0x54, 0xAE, 0x6B], &track);
+    let mut cluster = uint(&[0xE7], 0);
+    for (index, reference) in [2u8, 0, 0].into_iter().enumerate() {
+      let mut block = vec![0x81, 0, index as u8 * 40];
+      block.push(if index == 0 { 0x80 } else { 0 });
+      block.extend_from_slice(&avc_packet(reference));
+      cluster.extend(ebml(&[0xA3], &block));
+    }
+    let cluster = ebml(&[0x1F, 0x43, 0xB6, 0x75], &cluster);
+    let segment = ebml(&[0x18, 0x53, 0x80, 0x67], &[info, tracks, cluster].concat());
+    std::fs::write(path, [header, segment].concat()).expect("the file");
+  }
+
+  /// Writes at `path` an `ffconcat` playlist of the one file `child`, a
+  /// name beside it.
+  fn write_ffconcat(path: &Path, child: &str) {
+    std::fs::write(path, format!("ffconcat version 1.0\nfile {child}\n")).expect("the playlist");
+  }
+
+  /// LAW: **a `concat` input is read only where `concat` itself is
+  /// declared, whatever its child**: the demuxer opens each child with its
+  /// own demuxer and forwards its packets (`libavformat/concatdec.c`
+  /// 337–368), so the outer name says nothing of the child's, and a
+  /// declaration of the child's demuxer is none of `concat`'s.
+  ///
+  /// Codex R9's counterexample: the child is an H.264 Matroska file whose
+  /// `ContentEncryption` names no key id, which FFmpeg 9.0.1 passes through
+  /// undecrypted with nothing to say so. Through `concat`, with Matroska
+  /// declared, it is not read. And a child read alone — the MP4 control,
+  /// its demuxer declared — is not read through `concat` either, until
+  /// `concat` is declared, which declares every child.
+  ///
+  /// PLANT: a declaration of the child's demuxer read as `concat`'s turns
+  /// this red at "the encrypted Matroska child".
+  #[test]
+  fn a_concat_input_is_read_only_where_concat_is_declared() {
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    let keyless = scratch.path().join("keyless.mkv");
+    write_keyless_encrypted_matroska(&keyless);
+    assert_eq!(
+      marks_of(&keyless, &DemuxerOpen::new()),
+      (false, vec![false, false, false]),
+      "the encrypted Matroska file, opened alone by default"
+    );
+    let through = scratch.path().join("keyless.ffconcat");
+    write_ffconcat(&through, "keyless.mkv");
+    assert_eq!(
+      marks_of(&through, &declaring(&["matroska,webm"])),
+      (false, vec![false, false, false]),
+      "the encrypted Matroska child"
+    );
+    let mov = declaring(&[MOV]);
+    assert_eq!(
+      marked_after_writing(&scratch.path().join("clear.mp4"), "mp4", no_signal, &mov),
+      (true, vec![false, true, true]),
+      "the MP4 control, opened alone, declared"
+    );
+    let through = scratch.path().join("clear.ffconcat");
+    write_ffconcat(&through, "clear.mp4");
+    assert_eq!(
+      marks_of(&through, &mov),
+      (false, vec![false, false, false]),
+      "the MP4 child"
+    );
+    assert_eq!(
+      marks_of(&through, &declaring(&["concat"])),
+      (true, vec![false, true, true]),
+      "`concat` declared: every child"
+    );
+  }
+
+  /// LAW: **an ASF or WTV file is read only where its demuxer is
+  /// declared**: ASF content encryption is logged and named in the
+  /// container's metadata alone, its payload returned as stored
+  /// (`libavformat/asfdec_f.c` 764–800), and WTV's
+  /// `DSATTRIB_WMDRMProtectionInfo` (`wtvdec.c` 888–891) and a
+  /// DVB-scrambled stream's nonzero `EVENTID_DVBScramblingControlSpanningEvent`
+  /// control (836–842) are each logged, nothing more, so neither is read
+  /// by default ([`AUDITED_DEMUXERS`]). Each file is written through
+  /// FFmpeg's own muxer, of the packets the MP4 control reads and marks.
+  ///
+  /// PLANT: `asf` read by default turns this red at "an ASF file, by
+  /// default".
+  #[test]
+  fn an_asf_or_wtv_file_is_read_only_where_declared() {
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    // `wtvenc` takes H.264 in Annex B alone.
+    for (name, format, demuxer, framed) in [
+      ("an ASF file", "asf", "asf", Framed::Lengths),
+      ("a WTV file", "wtv", "wtv", Framed::StartCodes),
+    ] {
+      let path = scratch.path().join(format!("clear.{format}"));
+      let (read, marks) =
+        marked_after_writing_framed(&path, format, no_signal, framed, &DemuxerOpen::new());
+      assert!(!read, "{name}, by default: not read");
+      assert!(!marks.is_empty(), "{name}: its packets are delivered");
+      assert!(
+        marks.iter().all(|&marked| !marked),
+        "{name}, by default: nothing marked, {marks:?}"
+      );
+      // What the reading then marks is the packets' own: `asf` and `wtv`
+      // parse H.264 into packets of their own (`libavformat/asfdec_f.c`
+      // 462–463, `wtvdec.c` 580).
+      let (read, marks) = marks_of(&path, &declaring(&[demuxer]));
+      assert!(read, "{name}, declared: read, {marks:?}");
+    }
+  }
+
+  /// LAW: **a raw H.264 elementary stream is read and marked by default**:
+  /// `h264` is read with no declaration, plaintext by construction
+  /// ([`AUDITED_DEMUXERS`]). The stream is written by hand in Annex B — a
+  /// sequence and a picture parameter set, a reference picture, then four
+  /// non-reference ones — so FFmpeg's probe names it
+  /// (`libavformat/h264dec.c` 30–117), and its non-reference pictures are
+  /// marked.
+  ///
+  /// PLANT: `h264` declared-only turns this red at "a raw H.264 stream".
+  #[test]
+  fn a_raw_h264_stream_is_read_and_marked_by_default() {
+    // `avcc()`'s parameter sets; a B slice of `pps_id` 0, which the probe
+    // counts, of `nal_ref_idc` `reference`.
+    let sps: &[u8] = &[
+      0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x7A, 0x01, 0xB4, 0x11, 0x08, 0xA2, 0xC0,
+    ];
+    let pps: &[u8] = &[0x68, 0xEE, 0x3C, 0x80];
+    let slice = |reference: u8| vec![(reference << 5) | 1, 0x9E, 0x80];
+    let mut stream = Vec::new();
+    for unit in [sps, pps] {
+      stream.extend_from_slice(&[0, 0, 0, 1]);
+      stream.extend_from_slice(unit);
+    }
+    for reference in [2u8, 0, 0, 0, 0] {
+      stream.extend_from_slice(&[0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1]);
+      stream.extend_from_slice(&slice(reference));
+    }
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    let path = scratch.path().join("clear.h264");
+    std::fs::write(&path, stream).expect("the stream");
+    assert_eq!(
+      marks_of(&path, &DemuxerOpen::new()),
+      (true, vec![false, true, true, true, true]),
+      "a raw H.264 stream"
+    );
+  }
+
+  /// LAW: **a demuxer is read by default only where its audit says so —
+  /// the raw `h264` and `hevc` — and otherwise only where it is declared,
+  /// by its exact name** ([`reads_bitstreams_of`]); and **every row of the
+  /// audit is one**: a demuxer FFmpeg registers by its whole name
+  /// ([`DemuxerName::registered`]), no row twice, each saying how an
+  /// encrypted sample is signalled, and, for a declared one, what no
+  /// signal answers, each citing FFmpeg 9.0.1's sources, `file:lines`.
+  ///
+  /// A declaration of one demuxer reads no other; a word of a demuxer's
+  /// comma-list name is not its name, and cannot be declared; an unknown
+  /// name and a container with no name are not read.
+  ///
+  /// PLANT: the audit's `mov` row spelled `mp4` turns this red at "a
+  /// demuxer FFmpeg registers"; `mov` read by default, at "declared only".
+  #[test]
+  fn a_demuxer_is_read_by_default_or_where_declared_by_its_exact_name() {
+    for (index, row) in AUDITED_DEMUXERS.iter().enumerate() {
+      let declared = DemuxerName::registered(row.name).unwrap_or_else(|refused| {
+        panic!(
+          "{}: a demuxer FFmpeg registers, by its whole name: {refused}",
+          row.name
+        )
+      });
+      assert!(
+        AUDITED_DEMUXERS[..index]
+          .iter()
+          .all(|other| other.name != row.name),
+        "{}: one row",
+        row.name
+      );
+      assert!(!row.signals.is_empty(), "{}: its signals", row.name);
+      assert_eq!(
+        row.limits.is_empty(),
+        row.reading == Reading::Default,
+        "{}: its limits, where it may be declared",
+        row.name
+      );
+      assert!(!row.sources.is_empty(), "{}: its sources", row.name);
+      for source in row.sources {
+        let (file, lines) = source.split_once(':').expect("file:lines");
+        assert!(
+          file.starts_with("libavformat/") && (file.ends_with(".c") || file.ends_with(".h")),
+          "{}: {source}",
+          row.name
+        );
+        assert!(
+          lines.split('-').all(|line| line.parse::<u32>().is_ok()),
+          "{}: {source}",
+          row.name
+        );
+      }
+      let format = named(row.name);
+      match row.reading {
+        Reading::Default => assert!(
+          reads_bitstreams_of(Some(&format), &[]),
+          "{}: read",
+          row.name
+        ),
+        Reading::Declared => {
+          assert!(
+            !reads_bitstreams_of(Some(&format), &[]),
+            "{}: declared only",
+            row.name
+          );
+          assert!(
+            reads_bitstreams_of(Some(&format), &[declared]),
+            "{}: read, declared",
+            row.name
+          );
+        }
+      }
+    }
+    for name in ["h264", "hevc"] {
+      assert!(
+        reads_bitstreams_of(Some(&named(name)), &[]),
+        "{name}: read by default"
+      );
+    }
+    let mov = DemuxerName::registered(MOV).expect("`mov`");
+    for name in [
+      "matroska,webm",
+      "concat",
+      "mpegts",
+      "flv",
+      "avi",
+      "mov",
+      "mp4",
+      "not a demuxer",
+    ] {
+      assert!(
+        !reads_bitstreams_of(Some(&named(name)), &[mov]),
+        "{name}: not read for `mov`'s declaration"
+      );
+    }
+    for word in ["mov", "mp4", "webm"] {
+      assert!(
+        DemuxerName::registered(word).is_err(),
+        "{word}: a word, never declared"
+      );
+    }
+    assert!(
+      !reads_bitstreams_of(None, &[mov]),
+      "a container with no name"
+    );
+  }
+
+  /// LAW: **a Matroska or WebM track is read only where its demuxer is
+  /// declared**, through `matroskaenc` and `matroskadec`: by default a
+  /// clear H.264 track is not read and nothing in it is marked; declared
+  /// (`matroska,webm`), it is read and marked. A track whose
+  /// `ContentEncryption` names no key id, which FFmpeg 9.0.1 passes through
+  /// undecrypted with nothing to say so, is read where Matroska is
+  /// declared: the caller's documented risk ([`AUDITED_DEMUXERS`]).
+  ///
+  /// PLANT: `matroska,webm` read by default turns this red at "a Matroska
+  /// file, by default".
+  #[test]
+  fn a_matroska_track_is_read_only_where_declared() {
+    let scratch = tempfile::tempdir().expect("a temp dir");
+    let path = scratch.path().join("clear.mkv");
+    assert_eq!(
+      marked_after_writing(&path, "matroska", no_signal, &DemuxerOpen::new()),
+      (false, vec![false, false, false]),
+      "a Matroska file, by default: never read, nothing marked"
+    );
+    let declared = declaring(&["matroska,webm"]);
+    assert_eq!(
+      marks_of(&path, &declared),
+      (true, vec![false, true, true]),
+      "a Matroska file, declared"
+    );
+    let keyless = scratch.path().join("keyless.mkv");
+    write_keyless_encrypted_matroska(&keyless);
+    assert_eq!(
+      marks_of(&keyless, &declared),
+      (true, vec![false, true, true]),
+      "a keyless encrypted Matroska file, declared: read, the caller's risk"
+    );
+  }
+
+  #[test]
+  fn every_side_data_type_ffmpeg_names_rides_or_persists_and_not_both() {
+    // The tables name every kind FFmpeg 9 names, the floor this crate
+    // builds against.
+    let named = AVPacketSideDataType::AV_PKT_DATA_NB as c_int;
+    assert_eq!(
+      (PERSISTING_SIDE_DATA.len() + RIDING_SIDE_DATA.len()) as c_int,
+      named,
+      "every kind of {named}"
+    );
+    for kind in 0..named {
+      let persisting = PERSISTING_SIDE_DATA
+        .iter()
+        .filter(|&&listed| listed as c_int == kind)
+        .count();
+      let riding = RIDING_SIDE_DATA
+        .iter()
+        .filter(|&&listed| listed as c_int == kind)
+        .count();
+      assert_eq!(persisting + riding, 1, "{kind}");
+      assert_eq!(side_data_persists(kind), persisting == 1, "{kind}");
+    }
+  }
+
+  #[test]
+  fn a_seek_reaches_every_reading() {
+    // One reading whose framing moved and one whose did not: after a seek
+    // the first marks nothing, the second reads on.
+    let mut moved = NalStream::new(NalCodec::H264, &avcc());
+    moved.reconfigure(&[0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28]);
+    let still = NalStream::new(NalCodec::H264, &avcc());
+    let mut bitstreams = vec![Some(moved), None, Some(still)];
+    sought(&mut bitstreams);
+    assert_eq!(bitstreams[0].as_ref().and_then(NalStream::framing), None);
+    assert_eq!(
+      bitstreams[2].as_ref().and_then(NalStream::framing),
+      Some(mediadecode::nal::Framing::Length(
+        mediadecode::nal::LengthSize::Four
+      ))
+    );
   }
 }

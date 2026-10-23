@@ -22,11 +22,11 @@ homepage     = "https://github.com/findit-studio/mediaio"
 [workspace.dependencies]
 # Workspace-internal crates — referenced by sibling members via workspace inheritance.
 mediadecode = { version = "0.19", path = "mediadecode", default-features = false }
-mediadecode-ffmpeg = { version = "0.19", path = "mediadecode-ffmpeg", default-features = false }
+mediadecode-ffmpeg = { version = "0.20", path = "mediadecode-ffmpeg", default-features = false }
 mediadecode-webcodecs = { version = "0.19", path = "mediadecode-webcodecs", default-features = false }
 mediaencode = { version = "0.19", path = "mediaencode", default-features = false }
-mediaencode-ffmpeg = { version = "0.19", path = "mediaencode-ffmpeg", default-features = false }
-mediaio-ffmpeg = { version = "0.19", path = "mediaio-ffmpeg", default-features = false }
+mediaencode-ffmpeg = { version = "0.20", path = "mediaencode-ffmpeg", default-features = false }
+mediaio-ffmpeg = { version = "0.20", path = "mediaio-ffmpeg", default-features = false }
 mediaio-timeline = { version = "0.4", path = "mediaio-timeline" }
 mediaspine  = { version = "0.1", path = "mediaspine", default-features = false }
 mediaframe  = { version = "0.12", default-features = false, features = ["frame"] }
@@ -39,6 +39,11 @@ thiserror   = { version = "2", default-features = false }
 smol-bytes  = { version = "0.1", default-features = false, features = ["std"] }
 triomphe    = { version = "0.1", default-features = false, features = ["std"] }
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format"] }
+# The bindings `ffmpeg-next` builds on, depended on directly by
+# `mediaio-ffmpeg` only for their `links` metadata: Cargo hands a build
+# script `DEP_FFMPEG_*`, the linked FFmpeg's release among it, only from a
+# direct dependency, and that build script refuses an FFmpeg older than 9.
+ffmpeg-sys-next = { version = "9", default-features = false }
 tracing     = { version = "0.1", default-features = false }
 libc        = "0.2"
 

@@ -11,6 +11,26 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-10-23
+
+### Added
+
+- **`nal`**, re-exported from `mediaspine` 0.1.1 beside the rest of its
+  vocabulary: `NalStream` reads whether an H.264 or HEVC packet's NAL
+  units prove that nothing references its picture, for
+  `PacketFlags::DISPOSABLE`.
+
+### Changed
+
+- **`PacketFlags::DISPOSABLE` is the container's mark or the
+  bitstream's**, and the bitstream's verdict decides wherever a demuxer
+  reads a track. Its contract is unchanged — absent means unknown — but a
+  demuxer that reads the bitstream, as `mediadecode-ffmpeg`'s now does,
+  marks more H.264 and HEVC packets than the container does, so a
+  consumer that drops them decodes fewer pictures. Its promise is pixels:
+  no later picture's pixels change, and nothing is promised of a later
+  frame's best-effort timestamp; a frame's own pts is the exact one.
+
 ## [0.19.0] - 2026-10-16
 
 The vocabulary moves to its own crate,
