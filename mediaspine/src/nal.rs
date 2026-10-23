@@ -15,6 +15,26 @@
 //! message headers of an SEI unit, and the bytes of each NAL unit of a
 //! length-framed packet, for a start code. It allocates nothing.
 //!
+//! # What the mark promises
+//!
+//! **Pixels, and nothing more.** Dropping a disposable packet changes no
+//! later picture's pixels. It does not promise a later frame's best-effort
+//! timestamp. FFmpeg guesses one for every frame it outputs, choosing the
+//! frame's pts or its packet's dts by counts it keeps across every frame
+//! output before (`guess_correct_pts`, `libavcodec/decode.c` 296–319 in
+//! FFmpeg 9.0.1, its counts at 88–91; called for each frame at 694–696, and
+//! reset only at the opening and at a flush, 2087–2090 and 2373–2376). A
+//! frame dropped before the decoder leaves the counts, so it can move the
+//! guess for a frame after it: with kept frames at (pts, dts) (10, 0) and
+//! (100, 2), and between them a dropped one at (10, 1), the last frame's
+//! guess is 2 with the dropped one decoded and 100 without. A packet
+//! FFmpeg's own `sdtp` marks (`AV_PKT_FLAG_DISPOSABLE`, "frames that can be
+//! discarded by the decoder", `libavcodec/packet.h` 665–669, set at
+//! `libavformat/mov.c` 11719–11723) has the same property, since the guess
+//! reads no flag. A frame's own pts — the pts of the packet its picture
+//! came in — moves for no other packet: that is the timestamp a consumer
+//! reads to be exact.
+//!
 //! # The decoder
 //!
 //! The question is FFmpeg's, asked of its own H.264 and HEVC decoders as
@@ -242,7 +262,8 @@
 //! # What a non-reference picture writes
 //!
 //! A packet is disposable only where dropping it changes no later
-//! picture's pixels, order or timestamps. The census of the state FFmpeg
+//! picture's pixels ([what the mark promises](#what-the-mark-promises)).
+//! The census of the state FFmpeg
 //! 9.0.1 writes while it decodes a picture nothing references, under any
 //! threading and `skip_frame` (at `nonref` and above FFmpeg skips such a
 //! picture itself, `h264dec.c` 626–628, `hevc/hevcdec.c` 3766–3767):
@@ -259,7 +280,7 @@
 //! | H.264 `non_gray` | any intra slice, `h264_slice.c` 2032–2034; cleared by a flush, `h264dec.c` 492 | whether a later picture that references a gray frame filling a gap uses another, `h264_refs.c` 410–419 | where a slice may be intra, an intra slice in a packet kept since the opening or the last seek ([`KeptReason::AwaitingIntraSlice`]) |
 //! | H.264 `frame_recovered`, `recovery_frame` | `h264_slice.c` 1645–1677, 1374–1376 | no: only a reference picture or IDR moves them, and a recovery point SEI keeps its packet | — |
 //! | H.264 field pairing: `first_field`, `droppable`, `picture_structure` | `h264_slice.c` 1397–1520 | the second field's frame | every SPS: frames only ([`KeptReason::MaybeField`]) |
-//! | H.264 `prev_interlaced_frame` | `h264_slice.c` 1196–1235 | a later frame's interlaced flag, not its pixels, order or timestamps | — |
+//! | H.264 `prev_interlaced_frame` | `h264_slice.c` 1196–1235 | a later frame's interlaced flag, not its pixels | — |
 //! | H.264 SEI state | reset per access unit, `h264dec.c` 593–598 | no: a riding SEI is one the picture alone takes up ([SEI](#sei)) | — |
 //! | HEVC `poc_tid0` | TemporalId-0 pictures but SLNR, RASL, RADL, `hevc/hevcdec.c` 3297–3306 | no | — |
 //! | HEVC `no_rasl_output_flag`, which skips RASL pictures | IRAP pictures, `hevc/hevcdec.c` 3283–3287, 3545–3546 | no | — |

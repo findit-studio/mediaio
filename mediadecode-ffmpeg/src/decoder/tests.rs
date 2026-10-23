@@ -3505,3 +3505,56 @@ fn on_videotoolbox_a_hidden_vp9_frame_ends_cleanly_at_every_skip_level() {
     }
   }
 }
+
+/// LAW: **dropping a packet before the decoder can move a later frame's
+/// best-effort timestamp, and never its pts** — which is why
+/// [`DISPOSABLE`](mediadecode::packet::PacketFlags::DISPOSABLE) promises a
+/// later picture's pixels and not its best-effort timestamp.
+///
+/// libavcodec guesses the best-effort timestamp from counts kept across
+/// every frame it outputs (`guess_correct_pts`, `libavcodec/decode.c`
+/// 296–319), whatever marked a packet: three rawvideo pictures at
+/// (pts, dts) (10, 0), (10, 1) and (100, 2), the second repeating the
+/// first's pts, count one faulty pts against no faulty dts, so the third's
+/// guess is its dts, 2. Dropped before the decoder, the second counts
+/// nothing, and the third's guess is its pts, 100. Its pts is 100 either
+/// way.
+#[test]
+fn dropping_a_packet_can_move_a_later_best_effort_timestamp_and_never_a_pts() {
+  // (pts, best-effort timestamp) of each picture decoded from `stamps`.
+  let decoded = |stamps: &[(i64, i64)]| -> Vec<(Option<i64>, i64)> {
+    let mut dec = VideoDecoder::from_software_for_test(
+      raw_parameters(RAW_SIDE),
+      crate::limits::DecoderLimits::default(),
+      /*auditioning=*/ false,
+    )
+    .expect("a software-backed rawvideo decoder");
+    stamps
+      .iter()
+      .map(|&(pts, dts)| {
+        let mut packet = raw_packet(0x33);
+        packet.set_pts(Some(pts));
+        packet.set_dts(Some(dts));
+        dec.state.inner.send_packet(&packet).expect("taken");
+        let mut picture = frame::Video::empty();
+        dec
+          .state
+          .inner
+          .receive_frame(&mut picture)
+          .expect("its picture");
+        // SAFETY: `picture` owns a live frame libavcodec just wrote;
+        // `best_effort_timestamp` is a plain `int64_t`.
+        let guess = unsafe { (*picture.as_ptr()).best_effort_timestamp };
+        (picture.pts(), guess)
+      })
+      .collect()
+  };
+  let kept = decoded(&[(10, 0), (10, 1), (100, 2)]);
+  let dropped = decoded(&[(10, 0), (100, 2)]);
+  assert_eq!(kept[2], (Some(100), 2), "the second decoded: {kept:?}");
+  assert_eq!(
+    dropped[1],
+    (Some(100), 100),
+    "the second dropped: {dropped:?}"
+  );
+}

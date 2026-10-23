@@ -45,6 +45,13 @@ bitflags! {
     /// bitstream's. Dropping the packet loses its own picture and no
     /// other (FFmpeg `AV_PKT_FLAG_DISPOSABLE`).
     ///
+    /// **The promise is pixels:** dropping the packet changes no later
+    /// picture's pixels. It does not promise a later frame's best-effort
+    /// timestamp, which a decoder may guess from every frame it output
+    /// before — FFmpeg's does ([`nal`](crate::nal#what-the-mark-promises)),
+    /// for a packet the container marks as for one the bitstream does. A
+    /// frame's own pts, its packet's, is the exact one.
+    ///
     /// **The container's mark.** In libavformat 9.0.1 one demuxer sets
     /// it: MP4/MOV, from `sdtp`, for a sample nothing depends on
     /// (`libavformat/mov.c` 11720–11723). Matroska's own discardable bit

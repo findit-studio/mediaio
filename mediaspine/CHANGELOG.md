@@ -84,7 +84,10 @@ Its versions are its own: they do not move with the rest of the family's.
   bitstream's**: nothing references this picture. Its contract is
   unchanged — absent means unknown — and a demuxer that reads the
   bitstream sets it on more H.264 and HEVC packets than the container
-  marks.
+  marks. Its promise is pixels: dropping a marked packet changes no later
+  picture's pixels, and promises nothing of a later frame's best-effort
+  timestamp, which a decoder may guess from every frame before; a frame's
+  own pts is the exact one.
 
 ## [0.1.0] - 2026-10-16
 

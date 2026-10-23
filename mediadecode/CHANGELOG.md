@@ -26,7 +26,9 @@ The sibling FFmpeg adapter has its own log at
   bitstream's.** Its contract is unchanged — absent means unknown — but a
   demuxer that reads the bitstream, as `mediadecode-ffmpeg`'s now does,
   marks more H.264 and HEVC packets than the container does, so a
-  consumer that drops them decodes fewer pictures.
+  consumer that drops them decodes fewer pictures. Its promise is pixels:
+  no later picture's pixels change, and nothing is promised of a later
+  frame's best-effort timestamp; a frame's own pts is the exact one.
 
 ## [0.19.0] - 2026-10-16
 

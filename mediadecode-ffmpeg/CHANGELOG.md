@@ -35,7 +35,12 @@ The backend-agnostic core it adapts has its own log at
   nowhere before. An H.264 stream whose sequence parameter set codes
   fields, lets `frame_num` jump, or leaves the reorder depth to FFmpeg's
   guess (no `bitstream_restriction_flag`) is marked nowhere. The flag's
-  contract is unchanged — absent means unknown.
+  contract is unchanged — absent means unknown — and its promise is
+  pixels: dropping a marked packet changes no later picture's pixels, but
+  may move a later frame's best-effort timestamp
+  (`VideoFrameExtra::best_effort_timestamp`, FFmpeg's guess from every
+  frame decoded before), as dropping a packet `sdtp` marks may. A
+  consumer reads the frame's `pts`, its packet's, for the exact one.
 - **The FFmpeg this crate builds against is still 5.1 or later.** The
   side-data kinds FFmpeg 7.0 to 9.0 added are named only where the linked
   FFmpeg names them: the build script reads the linked release from
