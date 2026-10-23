@@ -1,10 +1,13 @@
 //! [`ContainerFormat`] — what libavformat decided the bytes are wrapped
-//! in, surfaced as the demuxer's own word.
+//! in, surfaced as the demuxer's own word — and [`DemuxerName`], a
+//! demuxer the linked libavformat registers, named by a caller.
 //!
 //! Read once from `AVFormatContext.iformat` while the session is opened
 //! and kept for its life: libavformat picks the demuxer during
 //! `avformat_open_input` and never changes it, so re-reading could only
 //! answer the same thing more expensively.
+
+use core::{fmt, str::FromStr};
 
 use smol_bytes::Utf8Bytes;
 
@@ -102,6 +105,13 @@ impl ContainerFormat {
     self.name.split(',').filter(|word| !word.is_empty())
   }
 
+  /// Whether this is the demuxer `demuxer`: its [`name`](Self::name) is
+  /// `demuxer`'s, whole and exactly.
+  #[inline]
+  pub fn is(&self, demuxer: DemuxerName) -> bool {
+    self.name() == demuxer.as_str()
+  }
+
   /// Reads the format out of a live `AVFormatContext`, or `None` where
   /// it carries no `iformat` or the table's name is not readable text.
   ///
@@ -150,6 +160,153 @@ impl ContainerFormat {
       .map(Utf8Bytes::from_static);
     Some(Self::new(name, long_name))
   }
+}
+
+/// A demuxer the linked libavformat registers, by its whole name: an
+/// `AVInputFormat.name` exactly as libavformat spells it — the comma list
+/// where FFmpeg registers one demuxer for a family,
+/// `"mov,mp4,m4a,3gp,3g2,mj2"`, and never a word of it.
+///
+/// **Made only from a name the linked libavformat registers**
+/// ([`Self::registered`], and [`FromStr`] with it): a name no demuxer goes
+/// by, whole, is refused by name ([`UnregisteredDemuxer`]). So a value
+/// always names a demuxer that can open an input, and it compares with a
+/// session's [`ContainerFormat`] exactly ([`ContainerFormat::is`]).
+///
+/// The text is libavformat's own, borrowed from its static demuxer table,
+/// which lives for the process: never copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DemuxerName(&'static str);
+
+impl DemuxerName {
+  /// The demuxer the linked libavformat registers as `name`, whole.
+  ///
+  /// The registry is walked with `av_demuxer_iterate`, and `name`
+  /// compared with each demuxer's `AVInputFormat.name` exactly, case and
+  /// all.
+  ///
+  /// # Errors
+  ///
+  /// [`UnregisteredDemuxer`], naming `name`, where no demuxer is named
+  /// `name` whole: a name FFmpeg does not register, one this build of
+  /// libavformat leaves out, and a word of a family's comma list, such as
+  /// `mov`, whose whole name [`UnregisteredDemuxer::word_of`] gives.
+  pub fn registered(name: &str) -> Result<Self, UnregisteredDemuxer> {
+    let mut word_of = None;
+    for registered in registered_demuxers() {
+      if registered == name {
+        return Ok(Self(registered));
+      }
+      if word_of.is_none() && registered.split(',').any(|word| word == name) {
+        word_of = Some(Self(registered));
+      }
+    }
+    Err(UnregisteredDemuxer {
+      name: Utf8Bytes::from(name),
+      word_of,
+    })
+  }
+
+  /// The demuxer's whole name, as libavformat spells it.
+  #[inline]
+  pub const fn as_str(&self) -> &'static str {
+    self.0
+  }
+}
+
+impl fmt::Display for DemuxerName {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(self.0)
+  }
+}
+
+impl AsRef<str> for DemuxerName {
+  #[inline]
+  fn as_ref(&self) -> &str {
+    self.0
+  }
+}
+
+impl FromStr for DemuxerName {
+  type Err = UnregisteredDemuxer;
+
+  /// [`DemuxerName::registered`].
+  ///
+  /// # Errors
+  ///
+  /// [`UnregisteredDemuxer`], as [`DemuxerName::registered`] refuses.
+  fn from_str(name: &str) -> Result<Self, Self::Err> {
+    Self::registered(name)
+  }
+}
+
+/// Why a name is no [`DemuxerName`]: no demuxer the linked libavformat
+/// registers goes by it, whole. Made by [`DemuxerName::registered`] alone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnregisteredDemuxer {
+  name: Utf8Bytes,
+  word_of: Option<DemuxerName>,
+}
+
+impl UnregisteredDemuxer {
+  /// The name refused, as it was given.
+  #[inline]
+  pub fn name(&self) -> &str {
+    self.name.as_str()
+  }
+
+  /// The demuxer whose comma-list name holds the refused one as a word,
+  /// where one does: `mov,mp4,m4a,3gp,3g2,mj2` for `mov`. Its whole name
+  /// is the one to give.
+  #[inline]
+  pub const fn word_of(&self) -> Option<DemuxerName> {
+    self.word_of
+  }
+}
+
+impl fmt::Display for UnregisteredDemuxer {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(
+      f,
+      "no demuxer the linked FFmpeg registers is named {:?}",
+      self.name()
+    )?;
+    match self.word_of {
+      Some(whole) => write!(
+        f,
+        ": it is a word of {:?}, the demuxer's whole name",
+        whole.0
+      ),
+      None => Ok(()),
+    }
+  }
+}
+
+impl core::error::Error for UnregisteredDemuxer {}
+
+/// Every name a demuxer of the linked libavformat goes by, whole, in the
+/// order `av_demuxer_iterate` answers them. A demuxer whose name is not
+/// readable text, which FFmpeg's table holds none of, is passed over.
+fn registered_demuxers() -> impl Iterator<Item = &'static str> {
+  let mut opaque = core::ptr::null_mut();
+  core::iter::from_fn(move || {
+    loop {
+      // SAFETY: `opaque` is the iteration state `av_demuxer_iterate` keeps,
+      // started null and handed back as it left it; each demuxer it answers
+      // is a `static const` entry of libavformat's own table.
+      let demuxer = unsafe { ffmpeg_next::ffi::av_demuxer_iterate(&mut opaque) };
+      if demuxer.is_null() {
+        return None;
+      }
+      // SAFETY: a non-null entry lives for the process, its `name` a
+      // NUL-terminated string literal of that table, or null, which the
+      // reader answers `None`.
+      if let Some(name) = unsafe { crate::ffi::table_text((*demuxer).name, FORMAT_TEXT_MAX_BYTES) }
+      {
+        return Some(name);
+      }
+    }
+  })
 }
 
 #[cfg(test)]

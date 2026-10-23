@@ -26,20 +26,20 @@
 //! |---|---|---|---|---|
 //! | every schema with metadata | — | `metadata`: a dictionary; `name`: a string | `serializableObjectWithMetadata.cpp:21–22` | metadata a plain dictionary, walked |
 //! | `Timeline.1` | `tracks`: a `Stack.1` | `global_start_time`: a `RationalTime.1`, or null | `timeline.cpp:30–31` | as read |
-//! | every item | — | `source_range`: a `TimeRange.1`, or null; `effects`: effects; `markers`: markers; `enabled`: a boolean | `item.cpp:175–178` | each marker a `Marker.2`* |
+//! | every item | — | `source_range`: a `TimeRange.1`, or null; `effects`: effects; `markers`: markers; `enabled`: a boolean; from 0.18, `color`: a `Color.1`, or null | `item.cpp:175–178`; 0.18.1 `item.cpp:181` | each marker a `Marker.2`* |
 //! | `Stack.1` | `children`: composables | an item's | `stack.cpp:32`, `composition.cpp:191` | children tracks, stacks, clips and gaps* |
 //! | `Track.1` | `kind`: a string; `children`: composables | an item's | `track.cpp:34`, `composition.cpp:191` | each transition between two items* |
 //! | `Clip.2` | `media_references`: a dictionary of media references; `active_media_reference_key`: a string | an item's | `clip.cpp:141–144` | the references a plain dictionary, the active key one of them* |
 //! | `Clip.1` | — | `media_reference` | upgraded to a `Clip.2`, anything but a media reference read as missing (`typeRegistry.cpp:99–117`) | the reference null or a media reference* |
 //! | `Gap.1` | — | an item's | `gap.cpp:43` | as read |
-//! | `Transition.1` | `in_offset`, `out_offset`: `RationalTime.1`; `transition_type`: a string | metadata and name | `transition.cpp:33–35` | offsets of zero or more* |
+//! | `Transition.1` | `in_offset`, `out_offset`: `RationalTime.1`; `transition_type`: a string | metadata and name; at `main`, `enabled`: a boolean | `transition.cpp:33–35`; `transition.cpp:38` at `00c22fa` | offsets of zero or more* |
 //! | `Marker.2` | `marked_range`: a `TimeRange.1` | `color`, `comment`: strings | `marker.cpp:27–29` | as read |
 //! | every media reference | — | `available_range`: a `TimeRange.1`, or null; `available_image_bounds`: a `Box2d.1`, or null | `mediaReference.cpp:30–33` | as read |
 //! | `ExternalReference.1` | `target_url`: a string | a reference's | `externalReference.cpp:23` | as read |
 //! | `MissingReference.1` | — | a reference's | `missingReference.cpp:28` | as read |
 //! | `GeneratorReference.1` | `generator_kind`: a string; `parameters`: a dictionary | a reference's | `generatorReference.cpp:26–27` | the parameters a plain dictionary, walked |
 //! | `ImageSequenceReference.1` | `target_url_base`, `name_prefix`, `name_suffix`: strings; `start_frame`, `frame_step`, `frame_zero_padding`: whole numbers; `rate`: a number; `missing_frame_policy`: `error`, `black` or `hold` | a reference's | `imageSequenceReference.cpp:195–233` | as read |
-//! | `Effect.1`, `TimeEffect.1` | `effect_name`: a string | metadata and name | `effect.cpp:23` | as read |
+//! | `Effect.1`, `TimeEffect.1` | `effect_name`: a string | metadata and name; from 0.18, `enabled`: a boolean | `effect.cpp:23`; 0.18.1 `effect.cpp:26` | as read |
 //! | `LinearTimeWarp.1`, `FreezeFrame.1` | `time_scalar`: a number; an effect's | an effect's | `linearTimeWarp.cpp:23` | as read |
 //! | `RationalTime.1` | `rate`, `value`: numbers | — | `deserialization.cpp:575–581` | a positive, finite rate; a finite value* |
 //! | `TimeRange.1` | `start_time`, `duration`: `RationalTime.1` | — | `deserialization.cpp:582–589` | a duration of zero or more* |
@@ -69,9 +69,15 @@
 //!   no reader before 0.15 reads, must be an object under `Legacy`, walked
 //!   as any other.
 //! - A marker's `comment` is read from 0.16 (readers before keep it as a
-//!   field they do not know, and write it back); an item's `color`, and an
-//!   effect's `enabled`, from 0.18 (0.18.1 `item.cpp:181`; `effect.cpp:26`
-//!   at `main`).
+//!   field they do not know, and write it back); an item's `color`, an
+//!   optional `Color` that a `Color.1` or null fills, and an effect's
+//!   `enabled`, a boolean, from 0.18 (0.18.1 `item.cpp:181`,
+//!   `effect.cpp:26`); a transition's `enabled`, a boolean, at `main`
+//!   (`transition.cpp:38` at `00c22fa`). A boolean member's reader takes no
+//!   null: it fetches the key as a `bool`, and a null is a type mismatch
+//!   (0.18.1 `deserialization.cpp:377–415`). Under `V0_15Plus` the check
+//!   holds each of the three to its type; under `Legacy`, whose readers
+//!   keep them as keys they do not know, it walks them untyped.
 //!
 //! # Every dictionary
 //!
@@ -114,10 +120,9 @@
 //! media key among the references, every transition between two items,
 //! every marker a `Marker.2` — the one marker schema the readers 0.12 to
 //! 0.18.1 know — and a `Clip.1`'s reference a media reference or null,
-//! where a reader from 0.15 reads anything else as missing. Keys no reader
-//! of the target requires and this crate never writes are walked but not
-//! typed: a newer reader's `color` on an item or `enabled` on a transition
-//! or an effect.
+//! where a reader from 0.15 reads anything else as missing. A key no reader
+//! of the target reads is walked but not typed: under `Legacy`, a newer
+//! reader's `color` on an item or `enabled` on a transition or an effect.
 
 use std::{collections::BTreeSet, format};
 
@@ -135,6 +140,28 @@ const NAMED: &[&str] = &["metadata", "name"];
 
 /// The keys every item reads, beside [`NAMED`].
 const ITEM: &[&str] = &["source_range", "effects", "markers", "enabled"];
+
+/// The keys a reader of `target` reads on every item beside [`NAMED`] and
+/// [`ITEM`]: under [`OtioTarget::V0_15Plus`], 0.18's `color` (0.18.1
+/// `item.cpp:181`); none of the readers before 0.15 reads more.
+const fn item_newer(target: OtioTarget) -> &'static [&'static str] {
+  match target {
+    OtioTarget::V0_15Plus => &["color"],
+    OtioTarget::Legacy => &[],
+  }
+}
+
+/// The keys a reader of `target` reads on an effect or a transition beside
+/// those every reader reads: under [`OtioTarget::V0_15Plus`], `enabled` —
+/// an effect's from 0.18 (0.18.1 `effect.cpp:26`), a transition's at `main`
+/// (`transition.cpp:38` at `00c22fa`); none of the readers before 0.15
+/// reads it.
+const fn enabled_newer(target: OtioTarget) -> &'static [&'static str] {
+  match target {
+    OtioTarget::V0_15Plus => &["enabled"],
+    OtioTarget::Legacy => &[],
+  }
+}
 
 const MEDIA_REFERENCES: &[&str] = &[
   "ExternalReference.1",
@@ -232,7 +259,12 @@ fn stack(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
   for (index, child) in array(children, &at)?.iter().enumerate() {
     composable(child, &format!("{at}[{index}]"), target, false)?;
   }
-  others(members, path, target, &[NAMED, ITEM, &["children"]])
+  others(
+    members,
+    path,
+    target,
+    &[NAMED, ITEM, item_newer(target), &["children"]],
+  )
 }
 
 fn track(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
@@ -262,7 +294,12 @@ fn track(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
       return Err(shape(&here, "a transition between two items"));
     }
   }
-  others(members, path, target, &[NAMED, ITEM, &["kind", "children"]])
+  others(
+    members,
+    path,
+    target,
+    &[NAMED, ITEM, item_newer(target), &["kind", "children"]],
+  )
 }
 
 fn composable(value: &Value, path: &str, target: OtioTarget, in_track: bool) -> Result<(), Shape> {
@@ -273,7 +310,7 @@ fn composable(value: &Value, path: &str, target: OtioTarget, in_track: bool) -> 
     "Stack.1" => stack(value, path, target),
     "Gap.1" => {
       item(members, path, target)?;
-      others(members, path, target, &[NAMED, ITEM])
+      others(members, path, target, &[NAMED, ITEM, item_newer(target)])
     }
     "Clip.1" => clip1(members, path, target),
     "Clip.2" if target == OtioTarget::V0_15Plus => clip2(members, path, target),
@@ -304,7 +341,12 @@ fn clip1(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape>
       reference(value, &at)?;
     }
   }
-  others(members, path, target, &[NAMED, ITEM, &["media_reference"]])
+  others(
+    members,
+    path,
+    target,
+    &[NAMED, ITEM, item_newer(target), &["media_reference"]],
+  )
 }
 
 fn clip2(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape> {
@@ -330,6 +372,7 @@ fn clip2(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape>
     &[
       NAMED,
       ITEM,
+      item_newer(target),
       &["media_references", "active_media_reference_key"],
     ],
   )
@@ -423,11 +466,18 @@ fn transition(members: &Members, path: &str, target: OtioTarget) -> Result<(), S
   length(out_offset, &at, target)?;
   let (kind, at) = required(members, path, "transition_type")?;
   string(kind, &at)?;
+  if target == OtioTarget::V0_15Plus {
+    optional(members, path, "enabled", boolean)?;
+  }
   others(
     members,
     path,
     target,
-    &[NAMED, &["in_offset", "out_offset", "transition_type"]],
+    &[
+      NAMED,
+      &["in_offset", "out_offset", "transition_type"],
+      enabled_newer(target),
+    ],
   )
 }
 
@@ -450,10 +500,23 @@ fn item(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape> 
     }
     Ok(())
   })?;
-  optional(members, path, "enabled", |value, at| match value {
+  optional(members, path, "enabled", boolean)?;
+  // From 0.18 an item's color is an optional `Color`: a `Color.1`, or null.
+  if target == OtioTarget::V0_15Plus {
+    optional(members, path, "color", |value, at| {
+      nullable(value, at, |value, at| color(value, at, target))
+    })?;
+  }
+  Ok(())
+}
+
+/// A boolean, which a reader fetches as a `bool`, a null among what it
+/// refuses.
+fn boolean(value: &Value, path: &str) -> Result<(), Shape> {
+  match value {
     Value::Bool(_) => Ok(()),
-    _ => Err(shape(at, "a boolean")),
-  })
+    _ => Err(shape(path, "a boolean")),
+  }
 }
 
 /// A `Marker.2`: its name and metadata, its color and comment strings, and
@@ -490,7 +553,15 @@ fn effect(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
     number(scalar, &at)?;
   }
   let scalar: &[&str] = if warp { &["time_scalar"] } else { &[] };
-  others(members, path, target, &[NAMED, &["effect_name"], scalar])
+  if target == OtioTarget::V0_15Plus {
+    optional(members, path, "enabled", boolean)?;
+  }
+  others(
+    members,
+    path,
+    target,
+    &[NAMED, &["effect_name"], scalar, enabled_newer(target)],
+  )
 }
 
 fn named(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape> {

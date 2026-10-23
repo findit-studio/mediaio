@@ -6,10 +6,13 @@
 //! only where the bitstream itself proves that nothing references the
 //! packet's picture and that nothing else the packet carries is needed
 //! later. Anything it cannot prove keeps the packet ([`Verdict::Kept`]),
-//! with the reason. A demuxer ORs the verdict into
-//! [`PacketFlags::DISPOSABLE`](crate::packet::PacketFlags::DISPOSABLE)
-//! beside the container's own mark, so the fact is the same whichever
-//! container carried the stream.
+//! with the reason. Where a demuxer reads a track, the verdict decides
+//! [`PacketFlags::DISPOSABLE`](crate::packet::PacketFlags::DISPOSABLE): it
+//! is set on a disposable packet alone, and the container's own mark is
+//! cleared on every other verdict, since the container cannot see what the
+//! bitstream holds — a picture nothing references may still take up what
+//! an earlier packet left ([`KeptReason::CarriedOver`]). A track the
+//! demuxer does not read carries the container's mark alone.
 //!
 //! It reads NAL unit headers, the first bytes of an HEVC parameter set, the
 //! message headers of an SEI unit, and the bytes of each NAL unit of a
@@ -617,7 +620,15 @@ impl fmt::Display for KeptReason {
 /// none of the track's packets after one: the plaintext it never saw may
 /// move the framing and the parameter sets they are read by.
 /// `mediadecode-ffmpeg`'s demuxer drops a track's reading at its first
-/// packet that carries encryption side data.
+/// packet that carries encryption side data, builds none for a track
+/// FFmpeg names encrypted at the open, and reads a container's tracks only
+/// where its caller declares that demuxer's inputs plaintext — by default
+/// the raw `h264` and `hevc` streams alone — since FFmpeg 9.0.1 passes some
+/// ciphertext with nothing public to say so: an MP4 track protected under
+/// OMA DRM 2's PDCF, Matroska's encryption without a key id, ASF's and
+/// WTV's, MXF's, and a `concat` input's child, among them. A declaration
+/// is its caller's assertion that none of the inputs it opens is such
+/// content, and the risk of it the caller's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NalStream {
   codec: NalCodec,

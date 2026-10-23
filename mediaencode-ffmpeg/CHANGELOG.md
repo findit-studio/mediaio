@@ -5,7 +5,9 @@ crate are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-The family releases in lockstep.
+The FFmpeg-dependent crates — `mediaio-ffmpeg`, `mediadecode-ffmpeg`,
+`mediaencode-ffmpeg` and `mediaio` — release in lockstep; every other
+crate moves only when it changes.
 
 ## [0.21.0] - unreleased
 
@@ -14,7 +16,7 @@ The family releases in lockstep.
 - Released in lockstep with the FFmpeg crates at 0.21.0, on
   `mediaio-ffmpeg` 0.21.0. Nothing in this crate changed.
 
-## [0.20.0] - unreleased
+## [0.20.0] - 2026-10-23
 
 ### Changed
 

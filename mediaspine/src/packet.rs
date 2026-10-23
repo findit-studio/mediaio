@@ -54,24 +54,45 @@ bitflags! {
     ///
     /// **The container's mark.** In libavformat 9.0.1 one demuxer sets
     /// it: MP4/MOV, from `sdtp`, for a sample nothing depends on
-    /// (`libavformat/mov.c` 11720–11723). Matroska's own discardable bit
-    /// is NOT mapped (`libavformat/matroskadec.c` reads the block's
-    /// keyframe bit alone, 4319–4320).
+    /// (`libavformat/mov.c` 11719–11723). It reaches a packet only on a
+    /// track libavformat does not parse as it reads: `mov` parses an H.264
+    /// track's headers (3159–3160), and the parse rebuilds each packet's
+    /// flags without the mark (`libavformat/demux.c` 1289), so no H.264
+    /// packet of MP4 carries it. Matroska's own discardable bit is NOT
+    /// mapped (`libavformat/matroskadec.c` reads the block's keyframe bit
+    /// alone, 4319–4320).
     ///
     /// **The bitstream's.** For H.264 and HEVC, a demuxer also marks
     /// every packet whose NAL units prove it — a non-reference picture,
     /// or an HEVC sub-layer non-reference picture at the highest temporal
     /// sub-layer, with nothing beside it a later picture needs
-    /// ([`nal::NalStream`](crate::nal::NalStream)) — in any container. No
-    /// other codec's bitstream is read, and no encrypted payload: a demuxer
-    /// reads no packet that carries encryption side data, and nothing of
-    /// its track after it, nor any packet of a track its container names
+    /// ([`nal::NalStream`](crate::nal::NalStream)). **Where it reads a
+    /// track, the bitstream's verdict decides**: the bit is set on a packet
+    /// the bitstream proves and on no other, the container's mark cleared
+    /// on every other verdict and on a corrupt packet, since a picture
+    /// nothing references may still take up what an earlier packet left. A
+    /// track it does not read carries the container's mark alone. No other
+    /// codec's bitstream is read, and no encrypted payload: a demuxer reads
+    /// no packet that carries encryption side data, and nothing of its
+    /// track after it, nor any packet of a track its container names
     /// encrypted at the open.
     ///
-    /// **A named limit:** an MXF file whose essence is encrypted and read
-    /// without a key is outside the bitstream's mark. libavformat 9.0.1
-    /// returns that ciphertext with nothing that says so
-    /// (`libavformat/mxfdec.c` 656–726), and no guess is made at it.
+    /// **A container's bitstream is read only where the caller declares its
+    /// demuxer's inputs plaintext.** FFmpeg cannot prove a container's
+    /// payload plaintext — an MP4 track protected under OMA DRM 2's PDCF
+    /// reaches the demuxer as ciphertext, with nothing public to say so — so
+    /// `mediadecode-ffmpeg`'s demuxer reads by default the raw `h264` and
+    /// `hevc` elementary streams alone, plaintext by construction, and a
+    /// container's tracks only where its caller names that demuxer among
+    /// those whose inputs it declares plaintext
+    /// (`DemuxerOpen::plaintext_demuxers`). Every other demuxer is
+    /// container-only, and its packets are never marked from the bitstream.
+    /// **The declaration is the caller's assertion, and its risk the
+    /// caller's:** an encrypted input's ciphertext, read as a bitstream, can
+    /// look like a picture nothing references, and be marked falsely. Inside
+    /// a declared demuxer every encryption signal FFmpeg gives still ends a
+    /// reading; what no signal answers is named, by demuxer, with the
+    /// option.
     ///
     /// **Never with side data a decoder takes up past the packet** — a
     /// new configuration, a parameter change: dropping such a packet

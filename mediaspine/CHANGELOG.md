@@ -7,7 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with the rest of the family's.
 
-## [0.1.1] - unreleased
+## [0.1.1] - 2026-10-23
 
 ### Added
 
@@ -84,12 +84,19 @@ Its versions are its own: they do not move with the rest of the family's.
   bitstream's**: nothing references this picture. Its contract is
   unchanged — absent means unknown — and a demuxer that reads the
   bitstream sets it on more H.264 and HEVC packets than the container
-  marks. Its promise is pixels: dropping a marked packet changes no later
+  marks. Where a demuxer reads a track, the bitstream's verdict decides:
+  the container's mark is cleared on every other verdict. Its promise is pixels: dropping a marked packet changes no later
   picture's pixels, and promises nothing of a later frame's best-effort
   timestamp, which a decoder may guess from every frame before; a frame's
-  own pts is the exact one. No encrypted payload is read for it, and one
-  limit is named: an MXF file whose essence is encrypted and read without
-  a key is outside its guarantee.
+  own pts is the exact one. A container's bitstream is read for it only
+  where the caller declares its demuxer's inputs plaintext: by default the
+  raw `h264` and `hevc` streams alone are read, since FFmpeg cannot prove a
+  container's payload plaintext — an MP4 track under OMA DRM 2's PDCF
+  reaches the demuxer as ciphertext with nothing to say so. The
+  declaration is the caller's assertion, and its risk; inside a declared
+  demuxer every encryption signal FFmpeg gives still ends a reading. The
+  container's own mark reaches a packet only on a track libavformat does
+  not parse as it reads: never on an H.264 track of MP4.
 
 ## [0.1.0] - 2026-10-16
 

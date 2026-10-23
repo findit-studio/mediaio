@@ -5,8 +5,9 @@ crate are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
-`mediaencode`, `mediaencode-ffmpeg` and `mediaio` — releases in lockstep.
+The FFmpeg-dependent crates — `mediaio-ffmpeg`, `mediadecode-ffmpeg`,
+`mediaencode-ffmpeg` and `mediaio` — release in lockstep; every other
+crate moves only when it changes.
 
 ## [0.21.0] - unreleased
 
@@ -28,7 +29,7 @@ Released in lockstep with `mediadecode-ffmpeg` 0.21.0.
   Which levels a decoder reads is the decoder's: a level is a request,
   never a promise that no picture comes.
 
-## [0.20.0] - unreleased
+## [0.20.0] - 2026-10-23
 
 ### Changed
 
@@ -41,6 +42,19 @@ Released in lockstep with `mediadecode-ffmpeg` 0.21.0.
   63.1, FFmpeg 9.0's), names the release it found instead, and says where
   to point the build. This crate now depends on `ffmpeg-sys-next` directly
   for that metadata alone, enabling no feature of it.
+
+### Added
+
+- **`DemuxerName`: a demuxer the linked FFmpeg registers, by its whole
+  name** — an `AVInputFormat.name` exactly as libavformat spells it, the
+  comma list where FFmpeg registers one demuxer for a family
+  (`mov,mp4,m4a,3gp,3g2,mj2`), never a word of it. It is made only from
+  a name the linked libavformat registers (`DemuxerName::registered`, and
+  `FromStr`), found with `av_demuxer_iterate`, and borrows libavformat's
+  own static text. Any other name is refused by name with
+  `UnregisteredDemuxer`, which gives the whole name to use where the
+  refused one is a word of it. `ContainerFormat::is` tells whether a
+  session's format is that demuxer.
 
 ## [0.19.0] - 2026-10-16
 

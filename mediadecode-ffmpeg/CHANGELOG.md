@@ -153,35 +153,58 @@ crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
     constructors keep their signatures and behaviour, each opening the
     request its arguments spell.
 
-## [0.20.0] - unreleased
+## [0.20.0] - 2026-10-23
 
 ### Changed
 
 - **The demuxer marks `PacketFlags::DISPOSABLE` from the bitstream.**
-  Beside the container's own mark (MP4's `sdtp`), a video packet of an
-  H.264 or HEVC track is marked where its NAL units prove that nothing
-  references its picture (`mediadecode::nal`): a non-reference H.264
-  picture, or an HEVC sub-layer non-reference picture at the highest
-  temporal sub-layer, with nothing beside it a later picture needs — in
-  any container, read with the `AV_PKT_DATA_NEW_EXTRADATA` it carries as
-  the decoder takes the two, and told of every seek. Every packet is
-  read, a corrupt one too, as the decoder reads it; a corrupt one is never
-  marked. **A packet carrying side data that persists past it — a new
-  configuration, a parameter change, a palette, captions, and any type
-  this build does not name — is never `DISPOSABLE`: the container's mark
-  is cleared there too.** **An encrypted payload is never read:** a
-  packet carrying `AV_PKT_DATA_ENCRYPTION_INFO` or
+  A video packet of an H.264 or HEVC track is marked where its NAL units
+  prove that nothing references its picture (`mediadecode::nal`): a
+  non-reference H.264 picture, or an HEVC sub-layer non-reference picture
+  at the highest temporal sub-layer, with nothing beside it a later
+  picture needs, read with the `AV_PKT_DATA_NEW_EXTRADATA` it carries as
+  the decoder takes the two, and told of every seek. **Where a track is
+  read, its reading decides: the container's own mark (MP4's `sdtp`) is
+  cleared on every other verdict**, since a picture nothing references
+  may still take up SEI state an earlier packet left — film grain a
+  skipped RASL picture's SEI left, for one. A track not read keeps the
+  container's mark, as FFmpeg delivers it, which on an H.264 track of MP4
+  is none: libavformat parses its headers as it reads, and rebuilds each
+  packet's flags without the mark. Every packet is read, a corrupt one
+  too, as the decoder reads it; a corrupt one is never marked. **A packet
+  carrying side data that persists past it — a new configuration, a
+  parameter change, a palette, captions, and any type this build does not
+  name — is never `DISPOSABLE`: the container's mark is cleared there
+  too.** **A container is read only where the caller declares its
+  demuxer's inputs plaintext** (`DemuxerOpen::plaintext_demuxers`).
+  FFmpeg cannot prove a container's payload plaintext — an MP4 track
+  protected under OMA DRM 2's PDCF reaches the demuxer as ciphertext,
+  `frma` having replaced its `encv` four-cc, with nothing public to say
+  so — so by default the raw `h264` and `hevc` elementary streams alone
+  are read, plaintext by construction, and every other demuxer, `mov`
+  among them, is container-only. **The declaration is the caller's
+  assertion, and its risk the caller's:** that no input it opens through
+  a declared demuxer is encrypted content to be decrypted downstream; an
+  encrypted input's ciphertext, read as a bitstream, can be marked
+  falsely. **Inside a declared demuxer an encrypted payload is never
+  read:** a packet carrying `AV_PKT_DATA_ENCRYPTION_INFO` or
   `AV_PKT_DATA_ENCRYPTION_INIT_INFO` gets no bitstream mark, and its
   track's reading stops there for the rest of the stream, a seek
-  included; and a track FFmpeg names encrypted at the open — a Matroska
-  track's `enc_key_id`, a stream's `ENCRYPTION_INIT_INFO` from `pssh` — is
-  never read at all. **A named limit:** an MXF file whose essence is
-  encrypted and read without a key is outside the reading's guarantee,
-  since libavformat returns its ciphertext with nothing that says so.
-  **More packets are marked DISPOSABLE on H.264
-  and HEVC, so a consumer that drops them decodes fewer pictures**: two in
-  three of a Sony XAVC original, which carries no `sdtp` and was marked
-  nowhere before. An H.264 stream whose sequence parameter set codes
+  included, latched as the packet is read, whatever becomes of it
+  (delivered, refused by a limit, parked, or discarded by a seek); and a
+  track FFmpeg names encrypted at the open — a stream's
+  `ENCRYPTION_INIT_INFO` from `pssh`, its `enc_key_id`, or a `codec_tag`
+  of `encv` — is never read at all. What no signal answers is named, by
+  demuxer, with the option: in `mov`, a protection scheme with no CENC
+  index and no `pssh`, such as PDCF, and a protected sample description
+  that is not the track's first; in Matroska and WebM, encryption without
+  a key id; in ASF, WTV, MXF and MPEG-TS, every encryption; through
+  `concat`, `hls` and `dash`, every input they open. **More packets are
+  marked DISPOSABLE on the raw H.264 and HEVC streams, and on the H.264
+  and HEVC tracks of a declared container, so a consumer that drops them
+  decodes fewer pictures**: two in three of a Sony XAVC original, which
+  carries no `sdtp` and was marked nowhere before, where `mov` is
+  declared. An H.264 stream whose sequence parameter set codes
   fields, lets `frame_num` jump, or leaves the reorder depth to FFmpeg's
   guess (no `bitstream_restriction_flag`) is marked nowhere. The flag's
   contract is unchanged — absent means unknown — and its promise is
@@ -198,6 +221,21 @@ crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
   FFmpeg 9 packet side-data kind is named as its headers name it: no
   version gates, and a kind a later FFmpeg adds persists, so its packet is
   never `DISPOSABLE`.
+
+### Added
+
+- **`DemuxerOpen`, one open road for the demuxer**, holding every
+  optional of its construction — the session's `DemuxLimits`, and the
+  demuxers whose inputs the caller declares plaintext — each with a
+  getter, a consuming `with_*` and an in-place `set_*`, and
+  `#[non_exhaustive]`, so a later optional joins the request, not the
+  constructor list. `CarrierDemuxer::open_from(path, request)` and
+  `open_reader_from(reader, url, request)` open it; `open`, `open_with`,
+  `open_reader` and `open_reader_with` keep their signatures, each opening
+  the request its arguments spell, which declares no demuxer.
+- `DemuxerName` and `UnregisteredDemuxer`, re-exported from
+  `mediaio-ffmpeg` 0.20.0: a demuxer the linked FFmpeg registers, by its
+  whole name, and the refusal, by name, of a name it does not register.
 
 ## [0.19.0] - 2026-10-16
 
