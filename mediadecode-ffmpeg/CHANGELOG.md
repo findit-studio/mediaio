@@ -41,6 +41,20 @@ The backend-agnostic core it adapts has its own log at
   packet is never `DISPOSABLE`. `MEDIADECODE_FFMPEG_GATE_CEILING=6.1`
   (any `<major>.<minor>`) builds the gates as for an older release.
 
+### Fixed
+
+- **A hardware probe no longer fails a backend over an edit list's
+  pre-roll.** libavcodec decodes a packet flagged `AV_PKT_FLAG_DISCARD`
+  and drops its frame at every `skip_frame` level, so a run of them proves
+  no backend. The probe counts the packets that can give a picture: an end
+  after none is the stream's end — the backend that opened is committed,
+  and `DecodePath::Auto` ends on software — and a run longer than the
+  probe's 256 packets keeps it auditioning, up to 4096 packets and 64 MiB,
+  until a packet that can give a picture arrives. Before, the standalone
+  probe and `DecodePath::AnyHardware` answered `AllBackendsFailed`, and
+  `Auto` left a hardware decoder the pictures after the pre-roll would have
+  proved.
+
 ### Added
 
 - **`DecoderOptions`, how a video decoder decodes**: libavcodec's

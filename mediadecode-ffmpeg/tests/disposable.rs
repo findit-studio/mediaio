@@ -777,3 +777,157 @@ fn every_picture_skipped_ends_cleanly_under_all_within_and_past_the_probe_size()
     a_stream_with_no_picture_to_give_ends_cleanly(Discard::All, |_| true, feed);
   }
 }
+
+/// `packets`, the first `discarded` of them flagged `AV_PKT_FLAG_DISCARD`
+/// as an edit list's pre-roll is (`libavformat/mov.c` 4545–4567,
+/// 11674–11675): decoded, and their frames dropped.
+#[cfg(target_vendor = "apple")]
+fn pre_rolled(packets: &[VideoPacket], discarded: usize) -> Vec<VideoPacket> {
+  packets
+    .iter()
+    .enumerate()
+    .map(|(index, packet)| {
+      let flags = packet.flags();
+      let packet = packet.clone();
+      if index < discarded {
+        packet.with_flags(flags | PacketFlags::DISCARD)
+      } else {
+        packet
+      }
+    })
+    .collect()
+}
+
+/// The pts of every picture an `Auto` session delivers for `packets`,
+/// sorted, and whether it ended on software.
+#[cfg(target_vendor = "apple")]
+fn auto_pictures(
+  parameters: &ffmpeg_next::codec::Parameters,
+  timebase: Timebase,
+  options: DecoderOptions,
+  packets: &[VideoPacket],
+) -> (Vec<i64>, bool) {
+  let mut auto = FfmpegVideoStreamDecoder::open_from(
+    VideoStreamDecoderOpen::new().with_options(options),
+    parameters.clone(),
+    timebase,
+    DecoderLimits::default(),
+  )
+  .expect("open on Auto");
+  assert!(!auto.is_software(), "Auto probes hardware");
+  let mut frame = empty_owned_video_frame();
+  let mut pictures = Vec::new();
+  let mut take = |auto: &mut FfmpegVideoStreamDecoder, frame: &mut VideoFrame| {
+    while let Received::Produced = auto.receive_frame(frame).expect("decode cleanly") {
+      pictures.push(frame.pts().expect("a picture's pts").pts());
+    }
+  };
+  for packet in packets {
+    loop {
+      match auto.send_packet(packet).expect("decode cleanly") {
+        Sent::Accepted => break,
+        Sent::MustDrain => take(&mut auto, &mut frame),
+      }
+    }
+    take(&mut auto, &mut frame);
+  }
+  while let Sent::MustDrain = auto.send_eof().expect("decode cleanly") {
+    take(&mut auto, &mut frame);
+  }
+  take(&mut auto, &mut frame);
+  pictures.sort_unstable();
+  (pictures, auto.is_software())
+}
+
+/// Edit-list pre-roll alone, under `Default` and `Nothing`: every packet
+/// flagged `AV_PKT_FLAG_DISCARD`, decoded and its frame dropped
+/// (`libavcodec/decode.c` 1584–1586, 464–466), so no packet can give a
+/// picture. Within the probe's 256 packets and past them, the clean end
+/// with none is the stream's end — no `AllBackendsFailed` — on the
+/// standalone probe, `AnyHardware` and `Auto`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_fragment_of_pre_roll_alone_ends_cleanly_under_default_and_nothing() {
+  use mediadecode_ffmpeg::{VideoDecoder, VideoDecoderOpen};
+
+  let Some(path) = fixture("01_pandas_muted.mp4") else {
+    return;
+  };
+  let (timebase, parameters, packets) = video_packets(&path);
+  assert!(packets.len() > 256);
+  for skip in [Discard::Default, Discard::Nothing] {
+    let options = DecoderOptions::new().with_skip_frame(skip);
+    for count in [120, packets.len()] {
+      let fragment = pre_rolled(&packets[..count], count);
+      let request = VideoDecoderOpen::new()
+        .with_timebase(Some(timebase))
+        .with_options(options);
+      let probing =
+        VideoDecoder::open_from(request, parameters.clone()).expect("open on the probe");
+      assert_eq!(
+        delivered(probing, &fragment),
+        Vec::<i64>::new(),
+        "{skip}, {count}: the probe"
+      );
+      let every: Vec<&VideoPacket> = fragment.iter().collect();
+      let pictures = session_pictures(
+        VideoStreamDecoderOpen::new()
+          .with_path(DecodePath::AnyHardware)
+          .with_options(options),
+        timebase,
+        &parameters,
+        &every,
+        |_| (),
+      );
+      assert!(pictures.is_empty(), "{skip}, {count}: AnyHardware");
+      let (pictures, _) = auto_pictures(&parameters, timebase, options, &fragment);
+      assert!(pictures.is_empty(), "{skip}, {count}: Auto");
+    }
+  }
+}
+
+/// Edit-list pre-roll past the probe's 256 packets, then pictures: the
+/// probe auditions past the pre-roll, which proves nothing, to the first
+/// picture after it, so the hardware decoder is kept and every picture
+/// after the pre-roll is produced — on the standalone probe, `AnyHardware`
+/// and `Auto`, which stays on hardware.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn pre_roll_past_the_probe_then_pictures_keeps_the_hardware_decoder() {
+  use mediadecode_ffmpeg::{VideoDecoder, VideoDecoderOpen};
+
+  let Some(path) = fixture("01_pandas_muted.mp4") else {
+    return;
+  };
+  let (timebase, parameters, packets) = video_packets(&path);
+  let discarded = 270;
+  assert!(discarded > 256 && discarded < packets.len());
+  let stream = pre_rolled(&packets, discarded);
+  let mut shown: Vec<i64> = packets[discarded..]
+    .iter()
+    .map(|packet| packet.pts().expect("a packet's pts").pts())
+    .collect();
+  shown.sort_unstable();
+
+  let request = VideoDecoderOpen::new().with_timebase(Some(timebase));
+  let probing = VideoDecoder::open_from(request, parameters.clone()).expect("open on the probe");
+  assert_eq!(delivered(probing, &stream), shown, "the probe");
+
+  let every: Vec<&VideoPacket> = stream.iter().collect();
+  let pictures = session_pictures(
+    VideoStreamDecoderOpen::new().with_path(DecodePath::AnyHardware),
+    timebase,
+    &parameters,
+    &every,
+    |_| (),
+  );
+  assert_eq!(
+    pictures.into_keys().collect::<Vec<_>>(),
+    shown,
+    "AnyHardware"
+  );
+
+  let (pictures, software) = auto_pictures(&parameters, timebase, DecoderOptions::new(), &stream);
+  assert_eq!(pictures, shown, "Auto");
+  assert!(!software, "Auto keeps the hardware decoder");
+}

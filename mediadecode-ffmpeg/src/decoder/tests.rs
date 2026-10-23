@@ -1374,6 +1374,11 @@ fn auditioning_decoder() -> VideoDecoder {
 /// to fall back to software, which is exactly what should happen when
 /// no hardware backend could decode this stream.
 ///
+/// Its history holds a packet that can give a picture. A candidate fed
+/// none — nothing at all, or edit-list pre-roll alone — proves nothing by
+/// producing nothing, and its end is the stream's
+/// (`an_end_after_pre_roll_alone_is_the_streams_end_at_every_skip_level`).
+///
 /// The decoder is software-backed so the lane actually runs; what is
 /// under test is the classification and the road it selects, neither of
 /// which is backend-specific.
@@ -1381,6 +1386,9 @@ fn auditioning_decoder() -> VideoDecoder {
 fn a_candidate_past_the_end_that_produced_nothing_fails_the_probe() {
   let mut dec = auditioning_decoder();
   assert_eq!(dec.phase(), SessionPhase::Auditioning);
+  // Constructed as the phase is, below: the history the candidate was
+  // replayed held a packet that can give a picture.
+  dec.probe.as_mut().expect("on trial").decodable_packets = 1;
 
   // **The latch is set directly, and the reason matters.** Reaching
   // this phase through `send_eof` would also hand the flush packet to
@@ -2997,5 +3005,132 @@ fn a_candidate_is_replayed_copies_and_the_history_stays_the_probes_own() {
     dec.backend(),
     Backend::Cuda,
     "and that candidate is still live"
+  );
+}
+
+/// One picture's packet, every byte `fill`, flagged `AV_PKT_FLAG_DISCARD`:
+/// edit-list pre-roll, which libavcodec decodes and whose frame it drops.
+fn discarded(fill: u8) -> Packet {
+  let mut packet = raw_packet(fill);
+  // SAFETY: `packet` owns a live `AVPacket`; `flags` is a plain `c_int`.
+  unsafe { (*packet.as_mut_ptr()).flags |= ffmpeg_next::ffi::AV_PKT_FLAG_DISCARD };
+  packet
+}
+
+/// Sends every one of `packets` to `dec`, each taken: a pre-roll packet's
+/// frame is dropped as it is decoded, so none waits to be drained.
+fn send_all(dec: &mut VideoDecoder, packets: &[Packet]) {
+  for (index, packet) in packets.iter().enumerate() {
+    // SAFETY: `raw_packet`'s, every byte written and the padding zeroed;
+    // `packets` outlives every read of it and nothing writes through it.
+    let sent = unsafe { dec.send_av_packet(packet) };
+    assert!(
+      matches!(sent, Ok(Sent::Accepted)),
+      "packet {index} of {}: {sent:?}",
+      packets.len()
+    );
+  }
+}
+
+/// LAW: **an end after nothing but edit-list pre-roll proves nothing, and
+/// is never the candidate failing** — at every skip level, `Default` and
+/// `Nothing` among them, within the probe's 256 packets and past them.
+///
+/// libavcodec decodes a packet flagged `AV_PKT_FLAG_DISCARD` and drops its
+/// frame (`decode.c` 1584–1586, 464–466), so a candidate fed nothing else
+/// reaches a clean end with no picture having done all it was asked.
+///
+/// PLANT: dropping the count of packets that can give a picture
+/// ([`ProbeState::undecided`] never true) turns this red, past the probe at
+/// its 257th packet and within it at the end.
+#[test]
+fn an_end_after_pre_roll_alone_is_the_streams_end_at_every_skip_level() {
+  for (count, skip) in [
+    (120, crate::Discard::Default),
+    (300, crate::Discard::Default),
+    (120, crate::Discard::Nothing),
+    (300, crate::Discard::Nothing),
+  ] {
+    let mut dec = raw_auditioning_decoder();
+    dec.options = crate::DecoderOptions::new().with_skip_frame(skip);
+    let packets: Vec<Packet> = (0..count).map(|index| discarded(index as u8)).collect();
+    send_all(&mut dec, &packets);
+    let probe = dec.probe.as_ref().expect("still on trial");
+    assert_eq!(
+      (
+        probe.buffered_packets.len(),
+        probe.preroll_packets,
+        probe.decodable_packets
+      ),
+      (count, count, 0),
+      "{skip}, {count}: every packet held, none able to give a picture"
+    );
+    assert_eq!(dec.send_eof().expect("the end taken"), Sent::Accepted);
+    let mut frame = crate::Frame::empty().expect("frame slot");
+    assert_eq!(
+      dec
+        .receive_frame(&mut frame)
+        .expect("the stream's end, not a backend's failure"),
+      Received::Ended,
+      "{skip}, {count}"
+    );
+    assert!(
+      dec.probe.is_none(),
+      "{skip}, {count}: the candidate is committed"
+    );
+  }
+}
+
+/// LAW: **a run of pre-roll is bounded, and at its bound the probe ends as
+/// at a clean end with no picture**: the standalone probe commits the
+/// candidate, and a probe that hands an empty end back — the stream
+/// decoder's `Auto` — hands its history back for software to replay.
+#[test]
+fn a_run_of_pre_roll_past_its_bound_commits_or_hands_back() {
+  let packets: Vec<Packet> = (0..=MAX_PROBE_PREROLL_PACKETS)
+    .map(|index| discarded(index as u8))
+    .collect();
+
+  let mut committing = raw_auditioning_decoder();
+  send_all(&mut committing, &packets);
+  assert!(
+    committing.probe.is_none(),
+    "committed at the bound, the packet past it taken"
+  );
+
+  let mut handing_back = raw_auditioning_decoder();
+  handing_back.hand_back_an_empty_end();
+  let (within, past) = packets.split_at(MAX_PROBE_PREROLL_PACKETS);
+  send_all(&mut handing_back, within);
+  // SAFETY: as in `send_all`.
+  let Err(Error::AllBackendsFailed(handed)) = (unsafe { handing_back.send_av_packet(&past[0]) })
+  else {
+    panic!("the probe hands its history back at the bound");
+  };
+  assert_eq!(handed.unconsumed_packets().len(), MAX_PROBE_PREROLL_PACKETS);
+}
+
+/// LAW: **pre-roll does not count against the probe's ceiling, which
+/// counts from the first packet that can give a picture**: a packet that
+/// can, after more pre-roll than the ceiling holds, is still auditioned.
+#[test]
+fn a_picture_after_pre_roll_past_the_ceiling_is_still_auditioned() {
+  let mut dec = raw_auditioning_decoder();
+  let mut packets: Vec<Packet> = (0..=MAX_PROBE_PACKETS)
+    .map(|index| discarded(index as u8))
+    .collect();
+  packets.push(raw_packet(0x5A));
+  send_all(&mut dec, &packets);
+  let probe = dec
+    .probe
+    .as_ref()
+    .expect("still on trial, the picture to come");
+  assert_eq!(
+    (
+      probe.buffered_packets.len(),
+      probe.preroll_packets,
+      probe.decodable_packets
+    ),
+    (MAX_PROBE_PACKETS + 2, MAX_PROBE_PACKETS + 1, 1)
   );
 }
