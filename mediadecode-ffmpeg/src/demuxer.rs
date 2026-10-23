@@ -286,12 +286,13 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// [`Self::next_packet_impl`] marks a video packet
   /// [`DISPOSABLE`](mediadecode::packet::PacketFlags::DISPOSABLE) where
   /// its NAL units prove that nothing references its picture
-  /// ([`mediadecode::nal`]) and nowhere else, in any container, the
-  /// container's mark cleared on every other verdict, and clears the mark
-  /// where the packet carries side data that persists past it
-  /// ([`marked_from_bitstream`]). Built at open from each stream's codec
-  /// and extradata ([`bitstreams`]); told of every seek ([`sought`]);
-  /// dropped for good at a track's first packet whose payload is encrypted
+  /// ([`mediadecode::nal`]) and nowhere else, the container's mark cleared
+  /// on every other verdict, and clears the mark where the packet carries
+  /// side data that persists past it ([`marked_from_bitstream`]). Built at
+  /// open from each stream's codec and extradata ([`bitstreams`]), in every
+  /// container but Matroska and WebM, whose plaintext nothing establishes
+  /// ([`reads_bitstreams_of`]); told of every seek ([`sought`]); dropped
+  /// for good at a track's first packet whose payload is encrypted
   /// ([`ENCRYPTED_SIDE_DATA`]), and never built for a track FFmpeg names
   /// encrypted at the open ([`encrypted_at_open`]).
   bitstreams: Vec<Option<NalStream>>,
@@ -577,7 +578,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     // `max_streams`.
     let measured =
       Measured::new(count).map_err(|_| DemuxError::TrackTableAlloc(TrackTableAlloc::new(count)))?;
-    let bitstreams = bitstreams(&input)?;
+    let bitstreams = bitstreams(&input, format.as_ref())?;
     Ok(Self {
       input,
       tracks,
@@ -3057,19 +3058,26 @@ const fn is_attachment_disposition(disposition: c_int) -> bool {
 /// Each stream's reading of its H.264 or HEVC bitstream, by stream
 /// index: a [`NalStream`] for a video stream of either codec, built from
 /// its extradata, and `None` for every other stream, whose packets carry
-/// the container's mark alone — and for a stream FFmpeg names encrypted at
-/// the open ([`encrypted_at_open`]), opaque from its first packet.
+/// the container's mark alone. `None` too for every stream of a container
+/// whose plaintext nothing establishes ([`reads_bitstreams_of`]: the
+/// format libavformat opened the input as, `format`), and for a stream
+/// FFmpeg names encrypted at the open ([`encrypted_at_open`]), opaque from
+/// its first packet.
 ///
 /// The codec and the medium are read as the raw integers they are, as
 /// [`build_tracks`] reads them; the extradata is borrowed, not copied —
 /// the reading keeps only its framing and the sub-layers its parameter
 /// sets declare.
-fn bitstreams(input: &Input) -> Result<Vec<Option<NalStream>>, DemuxError> {
+fn bitstreams(
+  input: &Input,
+  format: Option<&crate::ContainerFormat>,
+) -> Result<Vec<Option<NalStream>>, DemuxError> {
   let count = input.streams().len();
   let mut out = Vec::new();
   out
     .try_reserve_exact(count)
     .map_err(|_| DemuxError::TrackTableAlloc(TrackTableAlloc::new(count)))?;
+  let readable = reads_bitstreams_of(format);
   for stream in input.streams() {
     let parameters = stream.parameters();
     // SAFETY: the stream's parameters are live for this iteration.
@@ -3083,7 +3091,7 @@ fn bitstreams(input: &Input) -> Result<Vec<Option<NalStream>>, DemuxError> {
       CodecId::HEVC => Some(NalCodec::Hevc),
       _ => None,
     }
-    .filter(|_| boundary::media_kind_of(&parameters).is_video())
+    .filter(|_| readable && boundary::media_kind_of(&parameters).is_video())
     // SAFETY: the stream is live for this iteration, and its metadata and
     // parameters with it.
     .filter(|_| !unsafe { encrypted_at_open(stream.as_ptr()) })
@@ -3106,6 +3114,34 @@ fn bitstreams(input: &Input) -> Result<Vec<Option<NalStream>>, DemuxError> {
     out.push(nal);
   }
   Ok(out)
+}
+
+/// The demuxers whose files this crate reads no bitstream of: FFmpeg
+/// 9.0.1's two Matroska demuxers, by the names they go by
+/// (`libavformat/matroskadec.c` 5024–5025 and 5036–5037).
+const UNREAD_DEMUXERS: &[&str] = &["matroska", "webm", "webm_dash_manifest"];
+
+/// Whether a track of the container `format` may have its bitstream read:
+/// whether its plaintext is established, by source, for every track
+/// FFmpeg names no encryption of.
+///
+/// **No Matroska or WebM track is read.** FFmpeg 9.0.1's Matroska demuxer
+/// names a track's `ContentEncryption` only by its key id, as the stream's
+/// `enc_key_id` metadata (`libavformat/matroskadec.c` 2063–2073,
+/// 3274–3277). One without a key id has its scope cleared and its blocks
+/// passed through undecrypted, with nothing but a log line to say so
+/// (2074–2076), and so does a track of more than one encoding (2055–2058).
+/// Nothing public establishes a Matroska track's plaintext, so none is
+/// read. And Matroska's own discardable bit is not mapped (4319–4320
+/// read the keyframe bit alone), so a Matroska or WebM packet carries no
+/// `DISPOSABLE` mark at all.
+///
+/// A container libavformat gives no name (`format` is `None`) is not read
+/// either: nothing says it is not one of those. Every other container is
+/// read, and its encryption is answered by packet ([`ENCRYPTED_SIDE_DATA`])
+/// and by stream ([`encrypted_at_open`]).
+fn reads_bitstreams_of(format: Option<&crate::ContainerFormat>) -> bool {
+  format.is_some_and(|format| !format.names().any(|name| UNREAD_DEMUXERS.contains(&name)))
 }
 
 /// The packet side data a decoder may take up past its own packet: a
@@ -3242,7 +3278,7 @@ const ENCRYPTED_SIDE_DATA: &[AVPacketSideDataType] = &[
 /// | demuxer | how it names the track encrypted |
 /// |---|---|
 /// | `mov` | a `pssh` box (`libavformat/mov.c` 8064) puts `AV_PKT_DATA_ENCRYPTION_INIT_INFO` in the stream's coded side data (8148–8177), any kind of [`ENCRYPTED_SIDE_DATA`] being read here alike |
-/// | `matroska` | a track's `ContentEncryption` with a key id leaves its blocks undecrypted (`libavformat/matroskadec.c` 2063–2073) and names the key in the stream's `enc_key_id` metadata (3274–3277) |
+/// | any | the stream's `enc_key_id` metadata, the name `matroska` gives a track's key (`libavformat/matroskadec.c` 2063–2073, 3274–3277): a Matroska track is never read in any case ([`reads_bitstreams_of`]), and a stream of any container that names a key is not read either |
 ///
 /// **A named limit:** an MXF file whose essence is encrypted and read
 /// without a key is outside the reading's guarantee. libavformat returns
@@ -3318,8 +3354,10 @@ fn says_encrypted(kind: c_int) -> bool {
 /// reads it, and what it moves — the framing, the sub-layers its parameter
 /// sets declare — moves for the packets after; a corrupt packet is never
 /// marked. A track without a reading — a codec other than H.264 and HEVC,
-/// a track FFmpeg names encrypted, or one whose reading an encrypted packet
-/// ended — keeps the container's mark, unless side data persists.
+/// a track of a container whose plaintext nothing establishes
+/// ([`reads_bitstreams_of`]), a track FFmpeg names encrypted, or one whose
+/// reading an encrypted packet ended — keeps the container's mark, unless
+/// side data persists.
 ///
 /// **An encrypted payload is opaque, and so is its track from then on.** A
 /// packet carrying encryption side data ([`ENCRYPTED_SIDE_DATA`]) is not
@@ -5723,11 +5761,18 @@ mod tests {
     }
   }
 
+  /// The container format of libavformat's demuxer `name`, as a session
+  /// reads it at open.
+  fn named(name: &'static str) -> crate::ContainerFormat {
+    crate::ContainerFormat::new(Utf8Bytes::from_static(name), None)
+  }
+
   /// LAW: **a track FFmpeg names encrypted at the open is never read** —
   /// a stream whose metadata names a key (`enc_key_id`, as `matroska`
   /// names an encrypted track's), and one whose coded side data holds a key
   /// system's initialization (as `mov` holds a `pssh` box's) — beside a
-  /// control stream, read as ever.
+  /// control stream, read as ever. The context is a bare one, read as `mov`
+  /// would open it.
   ///
   /// PLANT: the metadata unread turns this red at "`enc_key_id`"; the side
   /// data unread, at "`ENCRYPTION_INIT_INFO`".
@@ -5762,7 +5807,8 @@ mod tests {
       }
       Input::wrap(ctx)
     };
-    let readings = bitstreams(&input).expect("the readings");
+    let readings =
+      bitstreams(&input, Some(&named("mov,mp4,m4a,3gp,3g2,mj2"))).expect("the readings");
     assert!(readings[0].is_some(), "the control is read");
     assert!(readings[1].is_none(), "`enc_key_id`: never read");
     assert!(readings[2].is_none(), "`ENCRYPTION_INIT_INFO`: never read");
@@ -5857,42 +5903,40 @@ mod tests {
     );
   }
 
-  /// LAW: **a Matroska track whose stream names a key is never read**,
-  /// through `matroska`'s own muxer and demuxer. `matroskadec` names an
-  /// encrypted track's key in the stream's `enc_key_id` metadata
-  /// (`matroskadec.c` 3274–3277); `matroskaenc` writes no encryption, so
-  /// the law sets the same metadata as a stream tag, which `matroskadec`
-  /// reads into the same dictionary (1838–1842). The same file without it
-  /// is read, its non-reference packets marked.
+  /// LAW: **no Matroska or WebM track is read, so none carries a
+  /// `DISPOSABLE` mark**. FFmpeg 9.0.1 names a Matroska track's encryption
+  /// only by its key id, and passes the blocks of an encryption without one
+  /// through undecrypted, with nothing public to say so
+  /// (`libavformat/matroskadec.c` 2055–2058, 2063–2076). So nothing
+  /// establishes a Matroska track's plaintext ([`reads_bitstreams_of`]), and
+  /// Matroska maps no discardable bit of its own (4319–4320).
   ///
-  /// PLANT: the metadata unread at the open turns this red at "an
-  /// `enc_key_id`".
+  /// Written through `matroskaenc` and read back through `matroskadec`, a
+  /// clear H.264 track is not read and nothing in it is marked. The same
+  /// packets through `mov`, the control, are read and marked. By name: both
+  /// of FFmpeg's Matroska demuxers, and a container with no name, read
+  /// nothing; `mov` is read.
+  ///
+  /// PLANT: the Matroska demuxers read as any other turns this red at "a
+  /// Matroska file".
   #[test]
-  fn a_matroska_track_whose_stream_names_a_key_is_never_read() {
-    unsafe fn key_id(stream: *mut ffmpeg_next::ffi::AVStream) {
-      // SAFETY: `marked_after_writing` hands over a live stream, whose
-      // metadata dictionary `av_dict_set` may create.
-      let set = unsafe {
-        av_dict_set(
-          &mut (*stream).metadata,
-          c"enc_key_id".as_ptr(),
-          c"WlpaWlpaWlpaWlpaWlpaWg==".as_ptr(),
-          0,
-        )
-      };
-      assert!(set >= 0, "the metadata");
-    }
+  fn no_matroska_or_webm_track_is_read() {
     let scratch = tempfile::tempdir().expect("a temp dir");
     assert_eq!(
-      marked_after_writing(&scratch.path().join("clear.mkv"), "matroska", no_signal),
+      marked_after_writing(&scratch.path().join("clear.mp4"), "mp4", no_signal),
       (true, vec![false, true, true]),
       "the control"
     );
     assert_eq!(
-      marked_after_writing(&scratch.path().join("key.mkv"), "matroska", key_id),
+      marked_after_writing(&scratch.path().join("clear.mkv"), "matroska", no_signal),
       (false, vec![false, false, false]),
-      "an `enc_key_id`: never read"
+      "a Matroska file: never read, nothing marked"
     );
+    for name in ["matroska,webm", "webm_dash_manifest"] {
+      assert!(!reads_bitstreams_of(Some(&named(name))), "{name}");
+    }
+    assert!(!reads_bitstreams_of(None), "a container with no name");
+    assert!(reads_bitstreams_of(Some(&named("mov,mp4,m4a,3gp,3g2,mj2"))));
   }
 
   #[test]

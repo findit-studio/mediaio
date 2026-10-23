@@ -620,7 +620,10 @@ impl fmt::Display for KeptReason {
 /// none of the track's packets after one: the plaintext it never saw may
 /// move the framing and the parameter sets they are read by.
 /// `mediadecode-ffmpeg`'s demuxer drops a track's reading at its first
-/// packet that carries encryption side data.
+/// packet that carries encryption side data, builds none for a track
+/// FFmpeg names encrypted at the open, and reads no Matroska or WebM track
+/// at all: FFmpeg 9.0.1 passes a Matroska encryption without a key id
+/// through undecrypted, with nothing public to say so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NalStream {
   codec: NalCodec,

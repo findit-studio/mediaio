@@ -353,13 +353,15 @@ for end-to-end demuxer-driven runs that cover all three streams.
   marked `PacketFlags::DISPOSABLE` where its NAL units prove that
   nothing references it (`mediadecode::nal`) — a non-reference picture,
   or an HEVC sub-layer non-reference picture at the highest temporal
-  sub-layer, with nothing beside it a later picture needs — in any
-  container, and only there: where a track is read, its reading
-  decides, the container's own mark (MP4's `sdtp`) with it. A track not
-  read — another codec's — keeps the container's mark. A Sony XAVC
-  original, which carries no `sdtp`, has two pictures in three marked; a
-  consumer that keeps only reference pictures drops them before they are
-  decoded.
+  sub-layer, with nothing beside it a later picture needs — and only
+  there: where a track is read, its reading decides, the container's own
+  mark (MP4's `sdtp`) with it. A track not read keeps the container's
+  mark: another codec's, and every Matroska and WebM track, since
+  FFmpeg 9 gives no public signal of a Matroska encryption without a key
+  id; Matroska maps no discardable bit, so its packets are never marked.
+  A Sony XAVC original, which carries no `sdtp`, has two pictures in
+  three marked; a consumer that keeps only reference pictures drops them
+  before they are decoded.
 - **Codec identity**: `CodecId` — the number FFmpeg keys on, with
   `name()` / `long_name()` reading libavcodec's own descriptor table
   for the word beside it (`"h264"`, `"aac"`), so a stored track row can

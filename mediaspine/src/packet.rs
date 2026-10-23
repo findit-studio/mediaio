@@ -62,21 +62,27 @@ bitflags! {
     /// every packet whose NAL units prove it — a non-reference picture,
     /// or an HEVC sub-layer non-reference picture at the highest temporal
     /// sub-layer, with nothing beside it a later picture needs
-    /// ([`nal::NalStream`](crate::nal::NalStream)) — in any container.
-    /// **Where it reads a track, the bitstream's verdict decides**: the bit
-    /// is set on a packet the bitstream proves and on no other, the
-    /// container's mark cleared on every other verdict and on a corrupt
-    /// packet, since a picture nothing references may still take up what an
-    /// earlier packet left. A track it does not read carries the
-    /// container's mark alone. No other codec's bitstream is read, and no
-    /// encrypted payload: a demuxer reads no packet that carries encryption
-    /// side data, and nothing of its track after it, nor any packet of a
-    /// track its container names encrypted at the open.
+    /// ([`nal::NalStream`](crate::nal::NalStream)). **Where it reads a
+    /// track, the bitstream's verdict decides**: the bit is set on a packet
+    /// the bitstream proves and on no other, the container's mark cleared
+    /// on every other verdict and on a corrupt packet, since a picture
+    /// nothing references may still take up what an earlier packet left. A
+    /// track it does not read carries the container's mark alone. No other
+    /// codec's bitstream is read, and no encrypted payload: a demuxer reads
+    /// no packet that carries encryption side data, and nothing of its
+    /// track after it, nor any packet of a track its container names
+    /// encrypted at the open.
     ///
-    /// **A named limit:** an MXF file whose essence is encrypted and read
-    /// without a key is outside the bitstream's mark. libavformat 9.0.1
-    /// returns that ciphertext with nothing that says so
-    /// (`libavformat/mxfdec.c` 656–726), and no guess is made at it.
+    /// **Named limits.** No Matroska or WebM track is read: FFmpeg 9.0.1
+    /// names a Matroska track's encryption only by its key id, and passes
+    /// one without a key id through undecrypted with nothing public to say
+    /// so (`libavformat/matroskadec.c` 2055–2058, 2063–2076), so nothing
+    /// establishes a Matroska track's plaintext; with no discardable bit
+    /// mapped either, a Matroska or WebM packet carries no mark at all. And
+    /// an MXF file whose essence is encrypted and read without a key is
+    /// outside the bitstream's mark: libavformat 9.0.1 returns that
+    /// ciphertext with nothing that says so (`libavformat/mxfdec.c`
+    /// 656–726), and no guess is made at it.
     ///
     /// **Never with side data a decoder takes up past the packet** — a
     /// new configuration, a parameter change: dropping such a packet

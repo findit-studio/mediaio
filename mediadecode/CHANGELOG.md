@@ -18,7 +18,7 @@ The sibling FFmpeg adapter has its own log at
 - **`nal`**, re-exported from `mediaspine` 0.1.1 beside the rest of its
   vocabulary: `NalStream` reads whether an H.264 or HEVC packet's NAL
   units prove that nothing references its picture, for
-  `PacketFlags::DISPOSABLE` in any container.
+  `PacketFlags::DISPOSABLE`.
 
 ### Changed
 
