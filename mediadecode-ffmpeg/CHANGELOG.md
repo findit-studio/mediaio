@@ -25,23 +25,28 @@ The backend-agnostic core it adapts has its own log at
   may still take up SEI state an earlier packet left — film grain a
   skipped RASL picture's SEI left, for one. A track not read keeps the
   container's mark. Every packet is read, a corrupt one too, as the
-  decoder reads it; a corrupt one is never marked. **A packet carrying side data that persists past it — a new
-  configuration, a parameter change, a palette, captions, and any type
-  this build does not name — is never `DISPOSABLE`: the container's mark
-  is cleared there too.** **An encrypted payload is never read:** a
+  decoder reads it; a corrupt one is never marked. **A packet carrying
+  side data that persists past it — a new configuration, a parameter
+  change, a palette, captions, and any type this build does not name — is
+  never `DISPOSABLE`: the container's mark is cleared there too.** **An encrypted payload is never read:** a
   packet carrying `AV_PKT_DATA_ENCRYPTION_INFO` or
   `AV_PKT_DATA_ENCRYPTION_INIT_INFO` gets no bitstream mark, and its
   track's reading stops there for the rest of the stream, a seek
   included; and a track FFmpeg names encrypted at the open — a stream's
   `ENCRYPTION_INIT_INFO` from `pssh`, or its `enc_key_id` — is never read
-  at all. **No Matroska or WebM track is read**: FFmpeg 9 names a
-  Matroska track's encryption only by its key id and passes one without
-  a key id through undecrypted with nothing public to say so, so nothing
-  establishes a Matroska track's plaintext; and with no discardable bit
-  mapped, a Matroska or WebM packet is never `DISPOSABLE`. **A named
-  limit:** an MXF file whose essence is encrypted and read without a key
-  is outside the reading's guarantee, since libavformat returns its
-  ciphertext with nothing that says so.
+  at all, nor one whose sample entry is `mov`'s protected `encv`.
+  **Only a demuxer on an audited allowlist is read**: `mov` (MP4 and
+  QuickTime) and the raw `h264` and `hevc` elementary streams, each row
+  proving by FFmpeg 9.0.1's source how an encrypted sample is signalled
+  there, or why none can be. Every other demuxer is container-only, and
+  its packets are never `DISPOSABLE`: `concat`, `hls` and `dash`, whose
+  outer name says nothing of the child they forward; Matroska and WebM,
+  whose encryption without a key id FFmpeg passes through undecrypted
+  with nothing public to say so; ASF and WTV, whose encryption it only
+  logs or names in container metadata; MXF; MPEG-TS; and every one not
+  audited. **A named limit:** a `mov` track's protected sample
+  description that is not its first is outside the reading's guarantee,
+  since FFmpeg reads the first description's protection alone.
   **More packets are marked DISPOSABLE on H.264
   and HEVC, so a consumer that drops them decodes fewer pictures**: two in
   three of a Sony XAVC original, which carries no `sdtp` and was marked

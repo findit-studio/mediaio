@@ -88,11 +88,11 @@ Its versions are its own: they do not move with the rest of the family's.
   the container's mark is cleared on every other verdict. Its promise is pixels: dropping a marked packet changes no later
   picture's pixels, and promises nothing of a later frame's best-effort
   timestamp, which a decoder may guess from every frame before; a frame's
-  own pts is the exact one. No encrypted payload is read for it, and the
-  limits are named: no Matroska or WebM track is read, since FFmpeg 9
-  gives no public signal of a Matroska encryption without a key id; and
-  an MXF file whose essence is encrypted and read without a key is outside
-  its guarantee.
+  own pts is the exact one. No encrypted payload is read for it: only a
+  demuxer on an audited allowlist is read (`mov`, and the raw `h264` and
+  `hevc`), and every other demuxer is container-only. One limit is named:
+  a `mov` track's protected sample description that is not its first is
+  outside its guarantee.
 
 ## [0.1.0] - 2026-10-16
 

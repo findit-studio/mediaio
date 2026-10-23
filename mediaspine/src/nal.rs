@@ -621,9 +621,11 @@ impl fmt::Display for KeptReason {
 /// move the framing and the parameter sets they are read by.
 /// `mediadecode-ffmpeg`'s demuxer drops a track's reading at its first
 /// packet that carries encryption side data, builds none for a track
-/// FFmpeg names encrypted at the open, and reads no Matroska or WebM track
-/// at all: FFmpeg 9.0.1 passes a Matroska encryption without a key id
-/// through undecrypted, with nothing public to say so.
+/// FFmpeg names encrypted at the open, and reads a track only of a demuxer
+/// on its audited allowlist — `mov`, and the raw `h264` and `hevc` — since
+/// FFmpeg 9.0.1 passes the ciphertext of others with nothing public to say
+/// so: Matroska's encryption without a key id, ASF's and WTV's, MXF's, and
+/// a `concat` input's child, among them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NalStream {
   codec: NalCodec,

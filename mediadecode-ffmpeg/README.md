@@ -355,10 +355,14 @@ for end-to-end demuxer-driven runs that cover all three streams.
   or an HEVC sub-layer non-reference picture at the highest temporal
   sub-layer, with nothing beside it a later picture needs — and only
   there: where a track is read, its reading decides, the container's own
-  mark (MP4's `sdtp`) with it. A track not read keeps the container's
-  mark: another codec's, and every Matroska and WebM track, since
-  FFmpeg 9 gives no public signal of a Matroska encryption without a key
-  id; Matroska maps no discardable bit, so its packets are never marked.
+  mark (MP4's `sdtp`) with it. **Only a demuxer on an audited allowlist
+  is read**: `mov` (MP4 and QuickTime), whose protected sample entry,
+  `pssh` and per-sample encryption info are read, and the raw `h264` and
+  `hevc` elementary streams, plaintext by construction. Every other
+  demuxer is container-only, since FFmpeg 9 passes their ciphertext with
+  nothing public to say so: `concat`, `hls`, `dash`, Matroska and WebM,
+  ASF, WTV, MXF, MPEG-TS and every one not audited. FFmpeg marks a
+  container's packets in `mov` alone, so theirs are never marked.
   A Sony XAVC original, which carries no `sdtp`, has two pictures in
   three marked; a consumer that keeps only reference pictures drops them
   before they are decoded.
