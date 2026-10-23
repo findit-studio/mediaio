@@ -6561,3 +6561,103 @@ fn on_trial_a_send_taken_with_the_candidates_error_goes_to_the_next_in_the_same_
     "its picture, once"
   );
 }
+
+/// `AV_PIX_FMT_NONE`, as the raw integer: a download-format list's
+/// terminator, and so an empty list's first entry.
+const NONE_LISTED: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE as i32;
+
+/// Downloads where every backend lists nothing to download into.
+fn nothing_listed(_: Backend) -> Option<i32> {
+  Some(NONE_LISTED)
+}
+
+/// Downloads where VAAPI lists nothing to download into, and CUDA delivers.
+fn vaapi_lists_nothing(backend: Backend) -> Option<i32> {
+  (backend == Backend::Vaapi).then_some(NONE_LISTED)
+}
+
+/// LAW: **a backend that lists no CPU layout to download into is unfit,
+/// naming `AV_PIX_FMT_NONE`, and no errno is made for it anywhere in the
+/// record** (the ruling on R3's decision 2). Its download-format list is
+/// empty — the terminator first, as VAAPI's is with no device format and
+/// D3D11VA's on an opaque surface — so it offers nothing to download into:
+/// its unfitness for this caller, never a failure.
+/// - **On trial**, each candidate is left unfit. With none left, the probe
+///   is exhausted, and every attempt is `DownloadFormatUnsupported` naming
+///   `AV_PIX_FMT_NONE`, with no `Error::Ffmpeg` among them and every packet
+///   back.
+/// - **Where the next candidate delivers**, the advance hands it the
+///   history whole: every picture, once, in order.
+/// - **A backend pinned alone** answers it by name.
+///
+/// The message names the case.
+///
+/// PLANT: the synthesized `EINVAL` restored for an empty list turns this red
+/// at "unfit, naming NONE".
+#[test]
+fn a_backend_that_lists_no_download_format_is_unfit_and_no_errno_is_made() {
+  let sent = [0x11u8, 0x22];
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  {
+    let _downloads = DownloadsForTest::set(nothing_listed);
+    let mut dec = vaapi_then_cuda();
+    send_all(&mut dec, &sent.map(raw_packet));
+    let exhausted = dec.receive_frame(&mut frame);
+    let Err(Error::ProbeExhausted(exhausted)) = exhausted else {
+      panic!("the probe exhausted: {exhausted:?}");
+    };
+    let attempts: Vec<_> = exhausted
+      .attempts()
+      .iter()
+      .map(|(backend, attempt)| (*backend, attempt.as_ref()))
+      .collect();
+    assert!(
+      matches!(
+        attempts.as_slice(),
+        [
+          (Backend::Vaapi, Error::DownloadFormatUnsupported(a)),
+          (Backend::Cuda, Error::DownloadFormatUnsupported(b)),
+        ] if a.format() == NONE_LISTED && b.format() == NONE_LISTED
+      ),
+      "each candidate unfit, naming NONE, and no errno anywhere: {attempts:?}"
+    );
+    assert_eq!(
+      fills(exhausted.unconsumed_packets()),
+      sent.to_vec(),
+      "every packet back, in order"
+    );
+  }
+  {
+    let _downloads = DownloadsForTest::set(vaapi_lists_nothing);
+    let mut dec = vaapi_then_cuda();
+    send_all(&mut dec, &sent.map(raw_packet));
+    let first = dec.receive_frame(&mut frame);
+    assert!(
+      matches!(first, Ok(Received::Produced)),
+      "the next candidate delivers: {first:?}"
+    );
+    assert_eq!(
+      (dec.backend(), dec.session_kind()),
+      (Backend::Cuda, SessionKind::Committed),
+      "committed on its first delivered picture"
+    );
+    let mut pictures = vec![frame.row(0, 0).expect("a gray picture")[0]];
+    pictures.extend(delivered(&mut dec, &mut frame));
+    assert_eq!(
+      pictures, sent,
+      "the history whole: every picture, once, in order"
+    );
+  }
+  let _downloads = DownloadsForTest::set(nothing_listed);
+  let mut dec = raw_pinned_decoder();
+  send_all(&mut dec, &[raw_packet(0x11)]);
+  let received = dec.receive_frame(&mut frame);
+  let Err(Error::DownloadFormatUnsupported(layout)) = received else {
+    panic!("a pinned backend answers it by name: {received:?}");
+  };
+  assert_eq!(layout.format(), NONE_LISTED, "naming NONE");
+  assert!(
+    layout.to_string().contains("lists no CPU pixel format"),
+    "the message names the case: {layout}"
+  );
+}

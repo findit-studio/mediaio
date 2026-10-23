@@ -61,13 +61,17 @@ crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
   `false` then, `hardware_inner()` is `None`, and every entry answers
   `Error::Spent`. A failed fallback used to leave the exhausted hardware
   decoder in place, and the next end drove a second fallback.
-- **BREAKING: a picture whose download chose a CPU layout a `Frame` cannot
-  carry is no delivery, and on trial its backend is unfit for the
-  stream.** The layout is the first the backend lists for a download, as
-  libavutil's own allocating road picks it, and this crate keeps that
-  choice — a driver's conversion to another layout can lose samples — and
-  reads it before any transfer. Such a layout used to be
-  read as the backend failing, with a synthesized `AVERROR(EINVAL)`. Now
+- **BREAKING: a picture whose download would choose a CPU layout a
+  `Frame` cannot carry, or for which the backend lists no layout at all, is
+  no delivery, and on trial its backend is unfit for the stream.** The
+  layout is the first the backend lists for a download, as libavutil's own
+  allocating road picks it, and this crate keeps that choice — a driver's
+  conversion to another layout can lose samples — and reads it before any
+  transfer. A backend that lists none (VAAPI with no device format,
+  D3D11VA on an opaque surface) offers nothing to download into, and is
+  unfit the same way, `DownloadFormatUnsupported` naming `AV_PIX_FMT_NONE`.
+  Such a layout used to be read as the backend failing, with a synthesized
+  `AVERROR(EINVAL)`. Now
   the probe records the unfitness, naming the layout and never an errno,
   and leaves the backend as it leaves a failed one, the history replayed
   whole into the next. With no backend left the probe ends in

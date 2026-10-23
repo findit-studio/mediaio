@@ -104,11 +104,11 @@ pub enum Error {
   #[error(transparent)]
   FrameBudgetExceeded(#[from] FrameBudgetExceeded),
 
-  /// A committed decoder's picture downloaded in a CPU layout a
-  /// [`Frame`](crate::Frame) cannot carry: a decoder past its probe, or a
-  /// backend pinned alone. On trial, the layout is the candidate's
-  /// unfitness for the stream, and the probe leaves it. See
-  /// [`DownloadFormatUnsupported`].
+  /// A committed decoder's picture whose download would choose a CPU layout
+  /// a [`Frame`](crate::Frame) cannot carry, or for which the backend lists
+  /// no layout at all: a decoder past its probe, or a backend pinned alone.
+  /// On trial, either is the candidate's unfitness for the stream, and the
+  /// probe leaves it. See [`DownloadFormatUnsupported`].
   #[error(transparent)]
   DownloadFormatUnsupported(#[from] DownloadFormatUnsupported),
 
@@ -261,9 +261,11 @@ pub enum FallbackOrigin {
 /// - **A failure** is the backend's own answer, to its open or to one of its
 ///   own calls (a send, a receive, a download), as the error it was.
 /// - **An unfitness** is a backend that decoded a picture whose download
-///   chose a CPU layout a [`Frame`](crate::Frame) cannot carry:
-///   [`Error::DownloadFormatUnsupported`], naming the layout. The backend
-///   failed nothing, and no errno is made for it.
+///   would choose a CPU layout a [`Frame`](crate::Frame) cannot carry, or
+///   for which it lists no layout at all:
+///   [`Error::DownloadFormatUnsupported`], naming the layout, or
+///   `AV_PIX_FMT_NONE` where it lists none. The backend failed nothing, and
+///   no errno is made for it.
 ///
 /// The probe ends in this error whatever its last attempt was, with every
 /// attempt and every packet of its history, on every road it runs on: the
@@ -358,8 +360,9 @@ impl ProbeExhausted {
   }
   /// Each backend's attempt, in the order tried: its own answer, as the
   /// error it was, or its unfitness for the stream,
-  /// [`Error::DownloadFormatUnsupported`] naming the layout of the picture
-  /// it decoded. An attempt may have been unfit rather than failed.
+  /// [`Error::DownloadFormatUnsupported`] naming the layout the download of
+  /// the picture it decoded would choose, or `AV_PIX_FMT_NONE` where it lists
+  /// none. An attempt may have been unfit rather than failed.
   #[inline]
   pub fn attempts(&self) -> &[(Backend, Box<Error>)] {
     &self.attempts
@@ -680,7 +683,8 @@ impl HwTransferTooLarge {
 
 /// Payload for [`Error::DownloadFormatUnsupported`]: a picture's hardware
 /// download would choose a CPU layout [`Frame`](crate::Frame) cannot carry,
-/// and this is the raw `AVPixelFormat` it would choose.
+/// and this is the raw `AVPixelFormat` it would choose — or the backend lists
+/// no layout at all to download into, and this is `AV_PIX_FMT_NONE`.
 ///
 /// The layout is the first of the formats the backend's frames context
 /// offers (`av_hwframe_transfer_get_formats`), as libavutil's own
@@ -688,6 +692,12 @@ impl HwTransferTooLarge {
 /// before any transfer and allocating the destination in it itself. A
 /// conversion a driver makes to another layout can lose samples (4:2:2 to
 /// 4:2:0), and some backends offer their surface's own layout alone.
+///
+/// **A backend that lists nothing** — VAAPI where its device lists no
+/// format, D3D11VA for an opaque surface — offers no CPU layout to download
+/// into. That is its unfitness for this caller, no failure: it is this
+/// payload with [`Self::format`] `AV_PIX_FMT_NONE` (`-1`), and no errno is
+/// made for it.
 ///
 /// **Such a picture is no delivery**, and a candidate commits at its first
 /// delivered picture. So the layout means one of two things:
@@ -703,27 +713,46 @@ impl HwTransferTooLarge {
 ///   picture: a mid-stream reconfiguration to a layout a `Frame` cannot
 ///   carry, a candidate committed on a packet the probe could not keep, or a
 ///   backend pinned alone, which no probe ever held.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the hardware download would choose pixel format {format}, which a Frame cannot carry")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DownloadFormatUnsupported {
   format: i32,
 }
 
 impl DownloadFormatUnsupported {
   /// Constructs a `DownloadFormatUnsupported` payload for the raw
-  /// `AVPixelFormat` the download would choose.
+  /// `AVPixelFormat` the download would choose, `AV_PIX_FMT_NONE` where the
+  /// backend lists none.
   #[inline]
   pub const fn new(format: i32) -> Self {
     Self { format }
   }
   /// The raw `AVPixelFormat` the download would choose, as the integer
   /// FFmpeg listed: never formed into the bindings' enum, which a value they
-  /// do not name would make undefined behaviour.
+  /// do not name would make undefined behaviour. `AV_PIX_FMT_NONE` (`-1`)
+  /// where the backend lists no layout at all.
   #[inline]
   pub const fn format(&self) -> i32 {
     self.format
   }
 }
+
+impl core::fmt::Display for DownloadFormatUnsupported {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    if self.format == ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE as i32 {
+      f.write_str(
+        "the hardware backend lists no CPU pixel format to download into (AV_PIX_FMT_NONE)",
+      )
+    } else {
+      write!(
+        f,
+        "the hardware download would choose pixel format {}, which a Frame cannot carry",
+        self.format
+      )
+    }
+  }
+}
+
+impl std::error::Error for DownloadFormatUnsupported {}
 
 /// Payload for [`Error::HwSurfaceTooLarge`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

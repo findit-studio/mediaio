@@ -72,7 +72,7 @@ pub use open::VideoDecoderOpen;
 /// | the candidate's answer | the probe |
 /// |---|---|
 /// | a picture delivered: downloaded in a layout a [`Frame`] carries, its properties copied | commits it |
-/// | a picture whose download chose a CPU layout a [`Frame`] cannot carry | no delivery: the candidate is unfit for the stream, recorded so with the layout named, never an errno ([`Error::DownloadFormatUnsupported`] in [`ProbeExhausted::attempts`]), and left as a failed one is: the next backend is tried with the whole history |
+/// | a picture whose download would choose a CPU layout a [`Frame`] cannot carry, or none at all (the backend lists no layout to download into) | no delivery: the candidate is unfit for the stream, recorded so with the layout named, never an errno ([`Error::DownloadFormatUnsupported`] in [`ProbeExhausted::attempts`]), and left as a failed one is: the next backend is tried with the whole history |
 /// | its own error: its opening, a send, a receive or a download failing, or its `get_format` declining the surface pool it declared ([`Error::HwSurfaceTooLarge`]) | fails it, and the next backend is tried with the whole history |
 /// | `ENOMEM` from a send, which leaves unknown whether it took the packet (`libavcodec/decode.c` 748–757) | the same: it is left, its answer the errno as libavcodec returned it, and the next backend is tried with the whole history, which never holds a packet whose send was ambiguous. With a refusal of this crate's own latched beside it, the candidate can be neither kept nor charged, and the decoder ends ([`Error::AmbiguousSend`]) |
 /// | the end taken, then libavcodec's `AVERROR_EOF` with no refusal latched | a successful empty completion: commits it, and the stream has ended |
@@ -289,8 +289,8 @@ pub struct VideoDecoder {
 /// | receive | `AVERROR_EOF` past the end, no refusal latched: a clean empty completion | `Committed` | `Ended` | the backlog what the history still owed: nothing |
 /// | receive | the candidate's own error, or a surface refusal | leaves the candidate | as leaving answers | — |
 /// | receive | this crate's own refusal latched (the frame budget) | `Trial` | the refusal | — |
-/// | receive | a picture whose download would choose a layout a [`Frame`] cannot carry | leaves the candidate, unfit ([`Attempt::Unfit`]) | as leaving answers | the caller's frame cleared |
-/// | receive | a picture the backend cannot download: its transfer fails, it lists no format, or its list fails other than for memory | leaves the candidate | as leaving answers | the caller's frame cleared |
+/// | receive | a picture whose download would choose a layout a [`Frame`] cannot carry, or for which the backend lists none (`AV_PIX_FMT_NONE`) | leaves the candidate, unfit ([`Attempt::Unfit`]), naming the layout | as leaving answers | the caller's frame cleared |
+/// | receive | a picture the backend cannot download: its transfer fails, or its list fails other than for memory | leaves the candidate | as leaving answers | the caller's frame cleared |
 /// | receive | a picture over the frame limit ([`Error::HwTransferTooLarge`]), or one whose destination's allocation, format list (`ENOMEM`) or properties' copy fails | `Trial` | that error, this crate's own | no delivery: nothing charged |
 /// | receive | a picture delivered | `Committed` | `Produced` | the history's unfed rest becomes the backlog |
 /// | flush | — | `Trial` | — | the decoder flushed; the history forgotten; the end open again |
@@ -329,7 +329,7 @@ pub struct VideoDecoder {
 /// | receive | `EAGAIN`, nothing owed | `Committed` | `NeedsInput`, or `Ended` once the end was given | — |
 /// | receive | `AVERROR_EOF` | `Committed` | `Ended` | — |
 /// | receive | the decoder's error, a refusal | `Committed` | that error | — |
-/// | receive | a picture whose download would choose a layout a [`Frame`] cannot carry | `Committed` | [`Error::DownloadFormatUnsupported`] | no delivery |
+/// | receive | a picture whose download would choose a layout a [`Frame`] cannot carry, or for which the backend lists none | `Committed` | [`Error::DownloadFormatUnsupported`], naming the layout or `AV_PIX_FMT_NONE` | no delivery |
 /// | receive | a picture the backend cannot download; one over the frame limit; a destination, list or properties' failure | `Committed` | that error | no delivery |
 /// | receive | a picture delivered | `Committed` | `Produced` | — |
 /// | flush | — | `Committed` | — | the decoder flushed; the backlog and the end dropped |
@@ -758,8 +758,9 @@ pub(crate) enum Attempt {
   /// own calls.
   Failed(BackendAnswer),
   /// The candidate was unfit for the stream: it decoded a picture, and the
-  /// CPU layout its download chose is one a [`Frame`] cannot carry. It
-  /// failed nothing, and no errno is made for it.
+  /// CPU layout its download would choose is one a [`Frame`] cannot carry,
+  /// or it lists none to download into (`AV_PIX_FMT_NONE`). It failed
+  /// nothing, and no errno is made for it.
   Unfit(crate::error::DownloadFormatUnsupported),
 }
 
@@ -2217,7 +2218,9 @@ impl VideoDecoder {
       let answer = match self.live_mut() {
         Some(decoder) => send(&mut decoder.inner, Sending::Packet(packet)),
         // Unreachable: `Gate::Live` is a live decoder, by the match above.
-        // Answered as libavutil's own "internal bug", never looped on.
+        // Answered as libavutil's own "internal bug", never looped on, and
+        // returned from this entry as it is: it reaches no road that records
+        // an attempt or leaves a candidate, so it is never charged.
         None => return Err(Error::Ffmpeg(ffmpeg_next::Error::Bug)),
       };
 
@@ -2389,7 +2392,8 @@ impl VideoDecoder {
       }
       let answer = match self.live_mut() {
         Some(decoder) => send(&mut decoder.inner, Sending::End),
-        // Unreachable, as on `send_packet`.
+        // Unreachable, as on `send_packet`, and returned as it is, never
+        // charged.
         None => return Err(Error::Ffmpeg(ffmpeg_next::Error::Bug)),
       };
       match answer {
@@ -2453,10 +2457,11 @@ impl VideoDecoder {
   /// download would cost more than the caller's frame limit
   /// ([`Error::HwTransferTooLarge`]), or whose properties this crate cannot
   /// copy, is no delivery and charges nothing: the error is this crate's own,
-  /// and a candidate on trial stays on trial. A picture whose download chose
-  /// a layout a `Frame` cannot carry is no delivery either: on trial, the
-  /// candidate is unfit, and the probe leaves it as above; from a committed
-  /// decoder, it is [`Error::DownloadFormatUnsupported`].
+  /// and a candidate on trial stays on trial. A picture whose download would
+  /// choose a layout a `Frame` cannot carry, or for which the backend lists
+  /// none, is no delivery either: on trial, the candidate is unfit, and the
+  /// probe leaves it as above; from a committed decoder, it is
+  /// [`Error::DownloadFormatUnsupported`].
   ///
   /// This crate is hardware-only: there is no software fallback inside the
   /// decoder. When every backend in the probe order has been exhausted —
@@ -2512,7 +2517,8 @@ impl VideoDecoder {
           decoder.inner.receive_frame(&mut self.hw_frame)
         }
         // Unreachable: the gate leaves only a live decoder here. Answered as
-        // libavutil's own "internal bug", never looped on.
+        // libavutil's own "internal bug", never looped on, and returned from
+        // this entry as it is, never charged.
         Session::Owed(_) | Session::Exhausted(_) | Session::Ended(_) => {
           return Err(Error::Ffmpeg(ffmpeg_next::Error::Bug));
         }
@@ -2722,13 +2728,17 @@ impl VideoDecoder {
 
   /// The format a picture's download would choose, read before any transfer
   /// ([`download_format_of`]); in a test, the stand-in's
-  /// ([`DOWNLOAD_FOR_TEST`]), which names an uncarriable layout, or hands
-  /// the picture over by reference.
+  /// ([`DOWNLOAD_FOR_TEST`]): the first entry of the list it stands in for,
+  /// mapped as a backend's is ([`download_format_from`]), or a picture handed
+  /// over by reference.
   fn download_format(&self) -> std::result::Result<DownloadFormat, TransferFailure> {
     #[cfg(test)]
-    if let Some(layout_of) = DOWNLOAD_FOR_TEST.with(core::cell::Cell::get) {
-      return match layout_of(self.backend()) {
-        Some(format) => Err(TransferFailure::Layout(format)),
+    if let Some(first_listed) = DOWNLOAD_FOR_TEST.with(core::cell::Cell::get) {
+      let none = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE as libc::c_int;
+      return match first_listed(self.backend()) {
+        // The list's terminator first is a list with nothing in it, as
+        // libavutil's terminated list has it.
+        Some(first) => download_format_from(Ok((first != none).then_some(first))),
         None => Ok(DownloadFormat::Unpicked),
       };
     }
@@ -2763,11 +2773,12 @@ impl VideoDecoder {
   /// - **Delivered**: the candidate is committed, its picture produced.
   /// - **The backend's transfer failed** (`av_hwframe_transfer_data` into a
   ///   destination this crate allocated, which libavutil hands to the
-  ///   backend's own callback), or **the backend names no download
-  ///   format**: the backend's own answer, routed by the shared policy — on
-  ///   trial, the candidate leaves.
-  /// - **The layout it would choose is one a [`Frame`] cannot carry**, read
-  ///   before any transfer: no delivery. On trial, the candidate is unfit
+  ///   backend's own callback), or its download-format list answered an
+  ///   error code other than `ENOMEM`: the backend's own answer, routed by
+  ///   the shared policy — on trial, the candidate leaves.
+  /// - **The layout it would choose is one a [`Frame`] cannot carry, or the
+  ///   backend lists none** (`AV_PIX_FMT_NONE`), read before any transfer:
+  ///   no delivery. On trial, the candidate is unfit
   ///   for the stream: recorded so, naming the layout ([`Attempt::Unfit`]),
   ///   and left as a failed candidate is, the next tried with the history
   ///   whole, or the probe exhausted ([`Error::ProbeExhausted`]). Committed,
@@ -3693,28 +3704,8 @@ enum DownloadFormat {
 /// as libavutil's own allocating road reads it: the first of the formats the
 /// backend lists for a download (`av_hwframe_transfer_get_formats`,
 /// `AV_HWFRAME_TRANSFER_DIRECTION_FROM`; `libavutil/hwcontext.c` 419–424 in
-/// FFmpeg 9.0.1).
-///
-/// - **A format a [`Frame`] carries**: [`DownloadFormat::Picked`].
-/// - **One it cannot carry**: [`TransferFailure::Layout`], before any
-///   transfer, naming it — on trial the candidate is unfit (the ruling on
-///   Codex R8's finding 5).
-/// - **No format at all**, a list that is empty — VAAPI's where its device
-///   lists no format, D3D11VA's for an opaque surface
-///   (`hwcontext_d3d11va.c`, "Actual access would fail"): the backend's own
-///   answer, that it cannot download this picture, as
-///   [`TransferFailure::Download`] with the `EINVAL` libavutil's road
-///   answers for it (`av_frame_get_buffer` of `AV_PIX_FMT_NONE`, 424 and
-///   430).
-/// - **The list not made**: `ENOMEM`, its allocation — the only failure the
-///   four backends this crate opens answer (`hwcontext_videotoolbox.c`
-///   331–333, `hwcontext_vaapi.c`, `hwcontext_cuda.c`,
-///   `hwcontext_d3d11va.c`: each allocates the list and answers nothing
-///   else) — says nothing of whether the backend can download, and is this
-///   crate's own, charged to no backend: [`TransferFailure::Unattributed`].
-///   Any other code is the backend's answer: `ENOSYS`, for a backend type
-///   that lists nothing (392–393), which none of the four is.
-/// - **No frames context**: [`DownloadFormat::Unpicked`].
+/// FFmpeg 9.0.1), mapped by [`download_format_from`]. No frames context:
+/// [`DownloadFormat::Unpicked`].
 ///
 /// # Safety
 ///
@@ -3733,6 +3724,39 @@ unsafe fn download_format_of(
   let first = unsafe {
     crate::ffi::visit_hwframe_download_formats(frames_ctx, core::ops::ControlFlow::Break)
   };
+  download_format_from(first)
+}
+
+/// What the first entry of a backend's download-format list makes the
+/// download: `Ok(Some(_))` the first format listed, `Ok(None)` a list with
+/// nothing in it, `Err` libavutil's own error code
+/// ([`crate::ffi::visit_hwframe_download_formats`]).
+///
+/// - **A format a [`Frame`] carries**: [`DownloadFormat::Picked`].
+/// - **One it cannot carry**: [`TransferFailure::Layout`], before any
+///   transfer, naming it — on trial the candidate is unfit (the ruling on
+///   Codex R8's finding 5).
+/// - **No format at all**, a list that is empty — VAAPI's where its device
+///   lists no format, D3D11VA's for an opaque surface
+///   (`hwcontext_d3d11va.c`, "Actual access would fail"): **the backend
+///   offers no CPU layout to download into, which is its unfitness for this
+///   caller and no failure** — [`TransferFailure::Layout`] naming
+///   `AV_PIX_FMT_NONE`, so on trial the candidate is unfit and left with the
+///   history whole, and committed it is the decoder's
+///   [`Error::DownloadFormatUnsupported`]. No errno is made for it (the
+///   ruling on R3's decision 2).
+/// - **The list not made**: `ENOMEM`, its allocation — the only failure the
+///   four backends this crate opens answer (`hwcontext_videotoolbox.c`
+///   331–333, `hwcontext_vaapi.c`, `hwcontext_cuda.c`,
+///   `hwcontext_d3d11va.c`: each allocates the list and answers nothing
+///   else) — says nothing of whether the backend can download, and is this
+///   crate's own, charged to no backend: [`TransferFailure::Unattributed`].
+///   Any other code is FFmpeg's own answer from the backend's callback, the
+///   backend's as returned ([`TransferFailure::Download`]): `ENOSYS`, for a
+///   backend type that lists nothing (392–393), which none of the four is.
+fn download_format_from(
+  first: std::result::Result<Option<libc::c_int>, libc::c_int>,
+) -> std::result::Result<DownloadFormat, TransferFailure> {
   match first {
     Ok(Some(format)) => {
       if crate::frame::is_supported_cpu_pix_fmt(&crate::boundary::from_av_pixel_format(format)) {
@@ -3745,9 +3769,12 @@ unsafe fn download_format_of(
         Err(TransferFailure::Layout(format))
       }
     }
-    Ok(None) => Err(TransferFailure::Download(ffmpeg_next::Error::Other {
-      errno: libc::EINVAL,
-    })),
+    Ok(None) => {
+      tracing::warn!("hwdecode: the backend lists no pixel format to download into");
+      Err(TransferFailure::Layout(
+        ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE as libc::c_int,
+      ))
+    }
     Err(rc) => {
       let e = ffmpeg_next::Error::from(rc);
       if is_errno(&e, libc::ENOMEM) {
@@ -3992,11 +4019,16 @@ pub(crate) fn whitelisted_side_data_kind(
 #[cfg(test)]
 thread_local! {
   /// A law's stand-in for the download ([`VideoDecoder::download`]), on this
-  /// thread: for the candidate's backend, the CPU layout its download chooses
-  /// that a [`Frame`] cannot carry, or `None` for a delivery. A
-  /// software-backed candidate decodes CPU pictures, which
-  /// `av_hwframe_transfer_data` refuses, so a delivery hands its picture over
-  /// by reference ([`delivered_for_test`]).
+  /// thread. For the candidate's backend, it answers one of two things:
+  ///
+  /// - **`Some(first)`**: the first entry of the download-format list the
+  ///   picture's download would read, mapped as a backend's list is
+  ///   ([`download_format_from`]). It is a layout a [`Frame`] cannot carry,
+  ///   or `AV_PIX_FMT_NONE`, the list's terminator first, for a backend that
+  ///   lists nothing to download into.
+  /// - **`None`**: a delivery. A software-backed candidate decodes CPU
+  ///   pictures, which `av_hwframe_transfer_data` refuses, so its picture is
+  ///   handed over by reference ([`delivered_for_test`]).
   pub(crate) static DOWNLOAD_FOR_TEST: core::cell::Cell<Option<fn(Backend) -> Option<i32>>> =
     const { core::cell::Cell::new(None) };
 }
@@ -4009,10 +4041,11 @@ pub(crate) struct DownloadsForTest;
 #[cfg(test)]
 impl DownloadsForTest {
   /// Downloads stand-ins answer for this thread's decoders until the value
-  /// drops: for each backend, `layout_of` its download's uncarriable layout,
-  /// or `None` for a delivery.
-  pub(crate) fn set(layout_of: fn(Backend) -> Option<i32>) -> Self {
-    DOWNLOAD_FOR_TEST.with(|cell| cell.set(Some(layout_of)));
+  /// drops: for each backend, `first_listed` the first entry of its
+  /// download-format list — an uncarriable layout, or `AV_PIX_FMT_NONE` for
+  /// an empty list — or `None` for a delivery ([`DOWNLOAD_FOR_TEST`]).
+  pub(crate) fn set(first_listed: fn(Backend) -> Option<i32>) -> Self {
+    DOWNLOAD_FOR_TEST.with(|cell| cell.set(Some(first_listed)));
     Self
   }
 }
@@ -4055,12 +4088,12 @@ fn delivered_for_test(
 enum TransferFailure {
   /// The backend's own answer: its transfer into a destination this crate
   /// allocated, which libavutil hands to the backend's callback
-  /// (`av_hwframe_transfer_data`), or a download-format list that names no
-  /// format.
+  /// (`av_hwframe_transfer_data`), or its download-format list's error code
+  /// other than `ENOMEM`.
   Download(ffmpeg_next::Error),
   /// The format the download would choose, the first the backend lists, is
   /// one a [`Frame`] cannot carry, read before any transfer: the raw
-  /// `AVPixelFormat`.
+  /// `AVPixelFormat` — `AV_PIX_FMT_NONE` where the backend lists none.
   Layout(i32),
   /// An allocation no backend answered for: the destination's buffers
   /// (`av_frame_get_buffer`), or the download-format list's `ENOMEM`. This
@@ -4075,10 +4108,13 @@ impl core::fmt::Display for TransferFailure {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     match self {
       Self::Download(e) => write!(f, "the download failed: {e}"),
-      Self::Layout(format) => write!(
-        f,
-        "the download would choose pixel format {format}, which a Frame cannot carry"
-      ),
+      Self::Layout(format) => {
+        write!(
+          f,
+          "{}",
+          crate::error::DownloadFormatUnsupported::new(*format)
+        )
+      }
       Self::Unattributed(e) => write!(f, "the download's destination could not be made: {e}"),
       Self::Properties(e) => write!(f, "the frame's properties could not be copied: {e}"),
     }
