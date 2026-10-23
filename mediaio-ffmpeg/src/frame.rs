@@ -395,6 +395,8 @@ struct PlaneInfo {
 ///   validation — if FFmpeg's auto-pick produces a format outside this
 ///   set, treat as a backend failure so probe advances rather than
 ///   collapsing on an unusable frame.
+/// - that decoder's probe-replay drain path, `drain_into_pending`,
+///   which refuses to queue an unusable candidate frame.
 pub fn is_supported_cpu_pix_fmt(pix_fmt: &PixelFormat) -> bool {
   matches!(
     pix_fmt,
@@ -553,8 +555,9 @@ pub(crate) fn plane_row_bytes_for(
 /// Number of rows in `plane` for a frame of `frame_height` and the given
 /// pixel format. `None` for formats not in the supported HW-output set.
 ///
-/// Crate-internal: the row accessors read it, so they and
-/// [`is_supported_cpu_pix_fmt`] keep one chroma-subsampling table.
+/// Crate-internal so the decoder's probe-replay accountant can compute
+/// per-frame byte sizes without re-implementing the chroma-subsampling
+/// table.
 pub(crate) fn plane_height_for(
   pix_fmt: &PixelFormat,
   plane: usize,

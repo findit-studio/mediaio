@@ -83,10 +83,6 @@ use crate::{
   frame::alloc_av_video_frame,
 };
 
-mod open;
-
-pub use open::VideoStreamDecoderOpen;
-
 /// Which decode path a video session takes — the choice
 /// [`CarrierVideoStreamDecoder::open_as`] is given.
 ///
@@ -95,11 +91,7 @@ pub use open::VideoStreamDecoderOpen;
 /// - [`Auto`](Self::Auto): before the first picture, the platform's
 ///   hardware backends in probe order, the packets taken so far replayed
 ///   across them; when none takes the stream, software, the same packets
-///   replayed into it. After it, the decoder that produced it. Only the
-///   backends' own answers are its cue for software, never the probe's
-///   own limits: a packet the probe cannot keep for a replay commits the
-///   backend that takes it, picture or none (see
-///   [`VideoDecoder`](crate::VideoDecoder)).
+///   replayed into it. After it, the decoder that produced it.
 /// - [`AnyHardware`](Self::AnyHardware): the same probe, and never
 ///   software — when no backend takes the stream,
 ///   [`Error::AllBackendsFailed`] hands back the packets the probe took.
@@ -267,10 +259,6 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// `AVCodecContext`s it opens — HW candidates, the SW fallback, and
   /// any decoder a later probe advance builds all get the same number.
   limits: DecoderLimits,
-  /// How every `AVCodecContext` this session opens decodes — HW
-  /// candidates, the SW fallback and a later probe advance's alike
-  /// ([`crate::DecoderOptions`]).
-  options: crate::DecoderOptions,
   /// `true` once `send_eof` has been called on the active decoder.
   /// Used to propagate EOF to the SW decoder when fallback fires
   /// during the drain phase — without this, codecs that hold tail
@@ -479,7 +467,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     time_base: Timebase,
     limits: DecoderLimits,
   ) -> Result<Self, Error> {
-    Self::open_from_impl(VideoStreamDecoderOpen::new(), parameters, time_base, limits)
+    Self::open_as_impl(parameters, time_base, limits, DecodePath::Auto)
   }
 
   /// [`Self::open_impl`], with the decode path chosen rather than
@@ -490,42 +478,25 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     limits: DecoderLimits,
     path: DecodePath,
   ) -> Result<Self, Error> {
-    Self::open_from_impl(
-      VideoStreamDecoderOpen::new().with_path(path),
+    Self::open_as_in(
       parameters,
       time_base,
       limits,
-    )
-  }
-
-  /// The session `request` names: the one road `open` and `open_as`
-  /// take.
-  pub(crate) fn open_from_impl(
-    request: VideoStreamDecoderOpen,
-    parameters: Parameters,
-    time_base: Timebase,
-    limits: DecoderLimits,
-  ) -> Result<Self, Error> {
-    Self::open_from_in(
-      request,
-      parameters,
-      time_base,
-      limits,
+      path,
       crate::backend::probe_order(),
     )
   }
 
-  /// [`Self::open_from_impl`] with the probe order named — the
-  /// platform's own for every public constructor, and an empty one for
-  /// the lane that stands on a platform with no hardware backend at all.
-  pub(crate) fn open_from_in(
-    request: VideoStreamDecoderOpen,
+  /// [`Self::open_as_impl`] with the probe order named — the platform's
+  /// own for every public constructor, and an empty one for the lane
+  /// that stands on a platform with no hardware backend at all.
+  pub(crate) fn open_as_in(
     parameters: Parameters,
     time_base: Timebase,
     limits: DecoderLimits,
+    path: DecodePath,
     order: &[Backend],
   ) -> Result<Self, Error> {
-    let (path, options) = (request.path(), request.options());
     // ffmpeg-next's `Parameters` carries an optional `owner: Rc<dyn Any>`
     // (when constructed from `stream.parameters()` it points back at
     // the demuxer's `AVStream`). Upstream marks the type `Send`
@@ -547,13 +518,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let hw_scratch = Frame::empty()?;
     let sw_scratch = alloc_av_video_frame()?;
     let state = match path {
-      // The probe, under every skip policy: it weighs its candidates'
-      // answers alone, and a clean end with no picture completes one
-      // (see `VideoDecoder`).
       DecodePath::Auto => match VideoDecoder::open_probing(
         try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
         limits,
-        options,
         Some(time_base),
         order,
       ) {
@@ -561,7 +528,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         Err(Error::AllBackendsFailed(_)) => {
           // Open-time HW exhaustion: no rescued packets (open didn't
           // see any). Just open SW directly from our owned copy.
-          let sw = open_sw_decoder(&owned_parameters, limits, options, Some(time_base))?;
+          let sw = open_sw_decoder(&owned_parameters, limits, Some(time_base))?;
           DecodeState::Sw(sw)
         }
         Err(other) => return Err(other),
@@ -573,7 +540,6 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       DecodePath::AnyHardware => DecodeState::Hw(Box::new(VideoDecoder::open_probing(
         try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
         limits,
-        options,
         Some(time_base),
         order,
       )?)),
@@ -582,24 +548,20 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // arm a pin: an open that fails is the answer, where `Auto` would
       // have read the same failure as a reason to look elsewhere.
       DecodePath::Hardware(backend) => {
-        DecodeState::Hw(Box::new(VideoDecoder::open_with_limits_timed_in(
+        DecodeState::Hw(Box::new(VideoDecoder::open_with_limits_timed(
           try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
           backend,
           limits,
-          options,
-          Some(time_base),
+          time_base,
         )?))
       }
       // The software decoder, opened on purpose rather than reached by
       // degrading. `DecodeState::Sw` is terminal, so this session has
       // nothing to keep it on its path but the shape of the state
       // machine itself.
-      DecodePath::Software => DecodeState::Sw(open_sw_decoder(
-        &owned_parameters,
-        limits,
-        options,
-        Some(time_base),
-      )?),
+      DecodePath::Software => {
+        DecodeState::Sw(open_sw_decoder(&owned_parameters, limits, Some(time_base))?)
+      }
     };
     Ok(Self {
       state,
@@ -611,7 +573,6 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       eof_sent: false,
       time_base,
       limits,
-      options,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -895,12 +856,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     unconsumed_packets: &[ffmpeg_next::Packet],
     eof_pending: bool,
   ) -> Result<(), Error> {
-    let mut sw = open_sw_decoder(
-      &self.parameters,
-      self.limits,
-      self.options,
-      Some(self.time_base),
-    )?;
+    let mut sw = open_sw_decoder(&self.parameters, self.limits, Some(self.time_base))?;
     // Bound before the decoder is mutably borrowed, so the error
     // closures below can still consult it.
     let sw_state = sw.state();
@@ -1120,28 +1076,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     time_base: Timebase,
     path: DecodePath,
   ) -> Result<Self, Error> {
-    Self::from_hw_inner_for_test_from(
-      hw,
-      VideoStreamDecoderOpen::new().with_path(path),
-      parameters,
-      time_base,
-    )
-  }
-
-  /// [`Self::from_hw_inner_for_test_as`], with the session's whole open
-  /// request named: the seam through which a probe-era fallback's
-  /// options are proved.
-  pub(crate) fn from_hw_inner_for_test_from(
-    hw: Box<dyn HwInner>,
-    request: VideoStreamDecoderOpen,
-    parameters: Parameters,
-    time_base: Timebase,
-  ) -> Result<Self, Error> {
     let limits = DecoderLimits::default();
     let owned_parameters = try_clone_parameters(&parameters, limits.max_codec_parameter_bytes())?;
     Ok(Self {
       state: DecodeState::Hw(hw),
-      path: request.path(),
+      path,
       parameters: owned_parameters,
       hw_scratch: Frame::empty()?,
       sw_scratch: alloc_av_video_frame()?,
@@ -1149,7 +1088,6 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       eof_sent: false,
       time_base,
       limits,
-      options: request.options(),
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -1638,45 +1576,6 @@ macro_rules! video_lane_face {
         Self::open_as_impl(parameters, time_base, limits, path)
       }
 
-      /// Opens the session `request` names for `parameters`. This is the
-      /// one road [`open`](Self::open) and [`open_as`](Self::open_as)
-      /// take.
-      ///
-      /// The request's [`DecodePath`] chooses the decoder, as
-      /// [`open_as`](Self::open_as) describes. Its
-      /// [`DecoderOptions`](crate::DecoderOptions) (libavcodec's
-      /// `skip_frame`, `skip_loop_filter` and `skip_idct`) are written
-      /// into every video `AVCodecContext` the session opens: each
-      /// hardware candidate the probe builds, the software decoder, and a
-      /// fallback's.
-      ///
-      /// **The options are not the road for a picture cadence.** A packet
-      /// the demuxer marks
-      /// [`DISPOSABLE`](mediadecode::packet::PacketFlags::DISPOSABLE) is
-      /// dropped before it is sent. On a temporally scalable HEVC stream,
-      /// [`Discard::NonReference`](crate::Discard::NonReference) also
-      /// skips pictures a higher sub-layer references, which the mark
-      /// never does. See [`crate::options`].
-      ///
-      /// # Errors
-      ///
-      /// As [`open_as`](Self::open_as), on the request's path.
-      pub fn open_from(
-        request: VideoStreamDecoderOpen,
-        parameters: Parameters,
-        time_base: Timebase,
-        limits: DecoderLimits,
-      ) -> Result<Self, Error> {
-        Self::open_from_impl(request, parameters, time_base, limits)
-      }
-
-      /// How this session decodes: the options it was opened with
-      /// ([`VideoStreamDecoderOpen::options`]), libavcodec's defaults for
-      /// [`open`](Self::open) and [`open_as`](Self::open_as).
-      pub const fn options(&self) -> crate::DecoderOptions {
-        self.options
-      }
-
       /// Whether this decoder is currently running on software.
       pub const fn is_software(&self) -> bool {
         self.is_software_impl()
@@ -1767,7 +1666,6 @@ video_lane_face!(crate::View, crate::Owned);
 fn open_sw_decoder(
   parameters: &Parameters,
   limits: DecoderLimits,
-  options: crate::DecoderOptions,
   pkt_timebase: Option<Timebase>,
 ) -> Result<SwDecoder, Error> {
   // Use the checked codec-context builder — ffmpeg-next's
@@ -1776,7 +1674,7 @@ fn open_sw_decoder(
   // running `avcodec_parameters_to_context` against it. Under
   // memory pressure that's C-level UB; `build_codec_context`
   // surfaces the OOM as an error instead.
-  let (ctx, callback_state) = build_codec_context(parameters, limits, options, pkt_timebase)?;
+  let (ctx, callback_state) = build_codec_context(parameters, limits, pkt_timebase)?;
   // Opened without forming a bindgen enum from FFmpeg memory: the codec
   // is resolved off a raw `codec_id`, and the medium is proved off a raw
   // `codec_type`. See `crate::decoder::ensure_codec_type`.

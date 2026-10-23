@@ -78,6 +78,8 @@
 //! | `judge_buffer` | `AVFrame.width/height` at `get_buffer2` | the software allocation's **cost** | **correct**: measured, libavcodec hands this hook the frame at *coded* extent (1920x1088, aligned 1920x1090, 2,092,831 bytes), and the footprint prices those aligned dims against `max_frame_bytes`. Logical extent is not this seat's question — `max_pixels` is enforced by `ff_set_dimensions` against the **raw** dims, which is the semantics it has |
 //! | `get_hw_format` | `AVCodecContext.coded_width/height` | the hardware pool | **correct, and new**: the display dims `max_pixels` was checked against are blind to it |
 //! | `judge_hw_transfer` | the frames-context pool dims | the transfer's CPU destination | **was display — repriced** |
+//! | `estimate_transfer_bytes` | the frames-context pool dims | the probe's pending budget | correct already, and its doc named this trap first |
+//! | `drain_into_pending` (two sites) | `AVFrame.width/height` | **nothing** — log fields only | benign |
 //! | `VideoDecoder::width/height` | the decoder's display dims | nothing; a public accessor | correct — display is what a caller is asking for |
 //! | `copy_out_planes` | the converted frame's own extent | the plane copy | correct — a decoded CPU frame's extent *is* its allocation |
 //!

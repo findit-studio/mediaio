@@ -2,7 +2,6 @@ use super::*;
 // `Packet::as_mut_ptr` lives on this trait; the lanes below write raw
 // packet fields the way libavformat would.
 use ffmpeg_next::codec::packet::Mut as PacketMut;
-use ffmpeg_next::ffi::AVCodecID;
 
 #[test]
 fn no_codec_for_unknown_id() {
@@ -223,6 +222,208 @@ fn packet_side_data_count_reports_attached_entries() {
   assert_eq!(packet_side_data_count(&packet), 2);
 }
 
+/// `cpu_frame_bytes` must refuse to size a frame whose first plane has
+/// a negative `linesize`. Pre-fix, the loop break treated negative the
+/// same as zero (FFmpeg's "no more populated planes" sentinel), so a
+/// vertically-flipped frame returned `Some(0)` and `drain_into_pending`
+/// would queue it as a 0-byte allocation — letting up to
+/// `MAX_PROBE_PENDING_FRAMES` such frames bypass the configured byte
+/// budget entirely.
+#[test]
+fn cpu_frame_bytes_rejects_negative_first_plane_linesize() {
+  let mut f = frame::Video::empty();
+  // SAFETY: f is freshly allocated; we set `format` to NV12 and the
+  // first plane's linesize negative (FFmpeg's vertical-flip convention).
+  // No backing data buffer is allocated — cpu_frame_bytes must reject
+  // before any pointer dereference.
+  unsafe {
+    let raw = f.as_mut_ptr();
+    (*raw).format = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+    (*raw).width = 1920;
+    (*raw).height = 1080;
+    (*raw).linesize[0] = -1920;
+    (*raw).linesize[1] = -1920;
+  }
+  assert!(
+    cpu_frame_bytes(&f).is_none(),
+    "negative linesize must be unsizeable, not Some(0)"
+  );
+}
+
+/// Build a synthetic `AVHWFramesContext`-backed `AVBufferRef` for
+/// tests. The buffer's data is a zeroed `AVHWFramesContext` with only
+/// `width` and `height` populated — enough for [`hw_frames_ctx_dimensions`]
+/// / [`estimate_transfer_bytes`] to read the allocated dims.
+///
+/// Returned ref has refcount 1; transfer ownership into
+/// `AVFrame.hw_frames_ctx` and let `av_frame_unref` (called by
+/// `frame::Video::Drop`) free it via `av_buffer_default_free`.
+fn make_hw_frames_ctx_ref(w: i32, h: i32) -> *mut ffmpeg_next::ffi::AVBufferRef {
+  use ffmpeg_next::ffi::av_buffer_alloc;
+  use std::mem::size_of;
+
+  // SAFETY: `av_buffer_alloc(n)` returns a fresh `AVBufferRef` whose
+  // `.data` points to `n` bytes of allocator-supplied storage. We
+  // zero the AVHWFramesContext and write only `width` / `height`,
+  // which is all the helpers we test read.
+  unsafe {
+    let buf = av_buffer_alloc(size_of::<AVHWFramesContext>());
+    assert!(!buf.is_null(), "av_buffer_alloc returned NULL");
+    let data = (*buf).data as *mut AVHWFramesContext;
+    std::ptr::write_bytes(data, 0, 1);
+    (*data).width = w;
+    (*data).height = h;
+    buf
+  }
+}
+
+/// Sanity-check the positive path with a real allocation: an
+/// `av_buffer_alloc`'d 4096-byte plane attached as `buf[0]` must
+/// surface as `Some(4096)`.
+#[test]
+fn cpu_frame_bytes_sums_buf_sizes() {
+  use ffmpeg_next::ffi::av_buffer_alloc;
+
+  let mut f = frame::Video::empty();
+  // SAFETY: av_buffer_alloc returns a fresh AVBufferRef. Attaching it
+  // to AVFrame.buf[0] transfers ownership to the frame; av_frame_unref
+  // on Drop releases it.
+  let buf0 = unsafe { av_buffer_alloc(4096) };
+  let buf1 = unsafe { av_buffer_alloc(2048) };
+  assert!(!buf0.is_null() && !buf1.is_null());
+  unsafe {
+    let raw = f.as_mut_ptr();
+    (*raw).buf[0] = buf0;
+    (*raw).buf[1] = buf1;
+    // Positive linesize so the negative-stride rejection doesn't fire.
+    (*raw).linesize[0] = 256;
+  }
+  assert_eq!(cpu_frame_bytes(&f), Some(4096 + 2048));
+}
+
+/// A frame with no populated `buf` entries — the empty-frame state
+/// `Frame::empty()` produces — must return `Some(0)`. (Pre-fix this
+/// case was sized via the linesize×plane_height table; the new
+/// `buf[i].size` accounting handles it without a special branch.)
+#[test]
+fn cpu_frame_bytes_zero_for_empty_frame() {
+  let f = frame::Video::empty();
+  assert_eq!(cpu_frame_bytes(&f), Some(0));
+}
+
+/// `cpu_frame_bytes` must size against the underlying
+/// `AVBufferRef.size`, not `linesize × plane_height_for(AVFrame.height)`.
+/// On a cropped or heavily aligned stream the underlying buffer can
+/// be far larger than `AVFrame.height` (display) suggests — a
+/// height-based formula under-counts the allocation by
+/// `allocated_height / display_height` and lets the real
+/// allocation slip past `max_probe_pending_bytes`.
+///
+/// Build a 256-byte buffer, attach it as `buf[0]`, but set
+/// `AVFrame.height` to 1 to simulate a cropped display. The
+/// `buf[i].size` accounting must report 256, not `linesize * 1`.
+#[test]
+fn cpu_frame_bytes_uses_buf_size_independent_of_display_height() {
+  use ffmpeg_next::ffi::av_buffer_alloc;
+
+  let buf0 = unsafe { av_buffer_alloc(256) };
+  assert!(!buf0.is_null());
+
+  let mut f = frame::Video::empty();
+  unsafe {
+    let raw = f.as_mut_ptr();
+    (*raw).format = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+    // Display dims tiny — pre-fix would have used `height = 1` to
+    // size the plane and reported `linesize * 1` ≪ 256.
+    (*raw).width = 1;
+    (*raw).height = 1;
+    (*raw).linesize[0] = 32;
+    (*raw).buf[0] = buf0;
+  }
+  assert_eq!(
+    cpu_frame_bytes(&f),
+    Some(256),
+    "cropped/aligned frames must be sized by buf[i].size, not display dims"
+  );
+}
+
+/// `estimate_transfer_bytes` must read `hw_frames_ctx.width / .height`
+/// (allocated dims) — not `AVFrame.width / .height` (display dims).
+/// Verify with a synthetic frames context that disagrees with the
+/// frame's display dims by 80×.
+#[test]
+fn estimate_transfer_bytes_reads_alloc_dims_from_hw_frames_ctx() {
+  let buf = make_hw_frames_ctx_ref(8192, 8192);
+  let mut f = frame::Video::empty();
+  unsafe {
+    let raw = f.as_mut_ptr();
+    // Display dims: 100×100 — pre-fix the estimate was 80 KB. After
+    // the fix it must be 8192×8192×8 = 512 MiB.
+    (*raw).width = 100;
+    (*raw).height = 100;
+    (*raw).hw_frames_ctx = buf;
+  }
+  assert_eq!(
+    estimate_transfer_bytes(&f),
+    Some(8192usize * 8192 * WORST_CASE_BYTES_PER_PIXEL),
+  );
+}
+
+/// A frame with no `hw_frames_ctx` cannot have its allocation extent
+/// proved — the helper returns `None` so the probe-replay caller
+/// fails the candidate rather than under-counting from display dims.
+/// (This is the exact attack the cap is meant to prevent.)
+#[test]
+fn estimate_transfer_bytes_returns_none_without_hw_frames_ctx() {
+  let mut f = frame::Video::empty();
+  unsafe {
+    let raw = f.as_mut_ptr();
+    (*raw).width = 1920;
+    (*raw).height = 1080;
+    // hw_frames_ctx stays null.
+  }
+  assert!(estimate_transfer_bytes(&f).is_none());
+}
+
+/// Non-positive `hw_frames_ctx` dimensions also surface as `None` —
+/// a corrupt or malformed HW pool descriptor must not get a free
+/// pass.
+#[test]
+fn estimate_transfer_bytes_rejects_non_positive_alloc_dimensions() {
+  let mut f = frame::Video::empty();
+  let buf = make_hw_frames_ctx_ref(0, 1080);
+  unsafe {
+    (*f.as_mut_ptr()).hw_frames_ctx = buf;
+  }
+  assert!(estimate_transfer_bytes(&f).is_none());
+}
+
+/// 8K HDR P010 has actual ~96 MiB resident size; the estimate should
+/// over-charge it (the right side to err on for a memory cap) while
+/// still fitting within the configurable
+/// [`DEFAULT_MAX_PROBE_PENDING_BYTES`] cap (256 MiB) for a single
+/// frame so a default-configured decoder is not forced to reject 8K
+/// streams outright.
+#[test]
+fn estimate_transfer_bytes_8k_fits_default_cap() {
+  let buf = make_hw_frames_ctx_ref(7680, 4320);
+  let mut f = frame::Video::empty();
+  unsafe {
+    (*f.as_mut_ptr()).hw_frames_ctx = buf;
+  }
+  let estimate = estimate_transfer_bytes(&f).expect("8K is sizable");
+  assert!(
+    estimate <= DEFAULT_MAX_PROBE_PENDING_BYTES,
+    "8K estimate {estimate} must fit DEFAULT_MAX_PROBE_PENDING_BYTES \
+     {DEFAULT_MAX_PROBE_PENDING_BYTES}; otherwise the default cap rejects \
+     even a single 8K frame at probe time"
+  );
+  assert!(
+    estimate > 96 * 1024 * 1024,
+    "estimate must over-charge real 8K P010 to bound the worst case; got {estimate}"
+  );
+}
+
 /// `PartialBuildState`'s `Drop` must be a no-op when both pointers are
 /// null — the disarmed-by-`into_owned` post-state. A panic / double-free
 /// here would break the success path of every `build_state` call.
@@ -273,28 +474,31 @@ fn partial_build_state_into_owned_disarms_and_returns_originals() {
   }
 }
 
-/// `send_packet` must never leave a probe alive past a packet its history
-/// does not hold. The wrong order is `state.inner.send_packet → cap check
-/// → keep auditioning` — the packet is in FFmpeg's state but missing from
-/// `buffered_packets`, so a later runtime exhaustion would surface
-/// `unconsumed_packets` without it and a non-seekable caller could not
-/// rebuild the input stream.
+/// `send_packet` must NOT consume the packet through the active
+/// decoder if the probe rescue cannot record it. The wrong order is
+/// `state.inner.send_packet → cap check → abandon probe → return
+/// Ok` — by the time the probe is abandoned the packet is already
+/// in FFmpeg's state but missing from `buffered_packets`, so a
+/// later runtime exhaustion would surface `unconsumed_packets`
+/// without that packet and a non-seekable caller could not rebuild
+/// the input stream.
 ///
-/// At the byte ceiling the packet cannot be recorded, so it is the trial's
-/// last: sent with the history whole, and the candidate that takes it is
-/// committed at once, the probe — and any exhaustion that could lose the
-/// packet — going with it. Refused, the candidate fails and the next is
-/// tried with the history whole (the software-backed laws
-/// `the_ceiling_commits_the_candidate_once_it_takes_the_packet_past_it` and
-/// `a_candidate_that_refuses_the_packet_past_the_ceiling_fails_and_the_next_takes_the_whole_history`
-/// run both roads on any machine).
+/// Post-fix the pre-flight runs first: cap overflow returns
+/// `Err(AllBackendsFailed)` *before* `state.inner.send_packet` is
+/// called, the packet stays in the caller's hand, and the rescue
+/// history is the consistent record up to (but not including) it.
+///
+/// `pending_frames` are still preserved across the bailout — they
+/// belong to the active backend (possibly a candidate `advance_probe`
+/// just committed) and the caller can drain them via `receive_frame`
+/// before switching to software.
 ///
 /// Live HW required: a real `VideoDecoder` is the only way to
 /// construct a valid `DecoderState` (its `Drop` invokes FFmpeg
 /// cleanup).
 #[test]
 #[ignore = "requires HWDECODE_SAMPLE_VIDEO and a working hardware backend"]
-fn a_packet_past_the_byte_ceiling_commits_the_candidate_that_takes_it() {
+fn cap_overflow_does_not_consume_packet_and_preserves_pending() {
   use ffmpeg_next::{format, media};
 
   let path = std::env::var_os("HWDECODE_SAMPLE_VIDEO")
@@ -319,19 +523,33 @@ fn a_packet_past_the_byte_ceiling_commits_the_candidate_that_takes_it() {
     "probe must be active immediately after open"
   );
 
-  // Pre-stage one buffered packet, as the candidate has been fed it, and
-  // push the byte counter to its ceiling so the very next send_packet is
-  // past it.
-  {
-    let probe = decoder.probe.as_mut().expect("probe present");
-    probe.buffered_packets.push(Packet::new(8));
-    probe.fed = probe.buffered_packets.len();
-    probe.buffered_bytes = MAX_PROBE_PACKET_BYTES;
-  }
+  // Inject sentinel frames as if `advance_probe` had drained them from
+  // a freshly-committed candidate during this same send_packet call.
+  decoder.pending_frames.push_back(frame::Video::empty());
+  decoder.pending_frames.push_back(frame::Video::empty());
+  let pending_before = decoder.pending_frames.len();
 
-  // Find the first video packet and feed it: the candidate takes it, and
-  // is committed with it.
-  let mut taken = false;
+  // Pre-stage one buffered packet so we can verify the rescue history
+  // is returned unchanged (not silently extended with the triggering
+  // packet, and not dropped). Sized to push the byte counter to its
+  // ceiling so the very next send_packet trips the byte/packet cap.
+  let pre_existing = Packet::new(8);
+  decoder
+    .probe
+    .as_mut()
+    .expect("probe present")
+    .buffered_packets
+    .push(pre_existing);
+  decoder
+    .probe
+    .as_mut()
+    .expect("probe present")
+    .buffered_bytes = MAX_PROBE_PACKET_BYTES;
+
+  // Find the first video packet and feed it. The pre-flight must
+  // surface AllBackendsFailed; `state.inner.send_packet` must NOT be
+  // called on this packet.
+  let mut hit_bailout = false;
   for (s, packet) in input.packets() {
     if s.index() != stream_index {
       continue;
@@ -339,22 +557,45 @@ fn a_packet_past_the_byte_ceiling_commits_the_candidate_that_takes_it() {
     // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote it and
     // its padding, and nothing writes through it afterwards.
     match unsafe { decoder.send_av_packet(&packet) } {
-      Ok(Sent::Accepted) => {
-        taken = true;
+      Err(Error::AllBackendsFailed(p)) => {
+        let attempts = p.attempts();
+        let unconsumed_packets = p.unconsumed_packets();
+        assert_eq!(
+          unconsumed_packets.len(),
+          1,
+          "rescue history must contain the pre-existing packet only — \
+           the triggering packet must NOT have been consumed"
+        );
+        assert_eq!(
+          unconsumed_packets[0].size(),
+          8,
+          "the pre-existing packet must come back unmodified"
+        );
+        assert!(
+          attempts.is_empty(),
+          "no backend failure occurred; attempts must be empty when \
+           bailout fires from cap overflow alone"
+        );
+        hit_bailout = true;
         break;
       }
-      other => panic!("the candidate takes the packet past the ceiling, got {other:?}"),
+      Ok(_) => panic!("send_packet must bail out when probe is at the byte cap"),
+      Err(other) => panic!("expected AllBackendsFailed bailout, got {other:?}"),
     }
   }
-  assert!(taken, "expected a video packet to send past the ceiling");
+  assert!(
+    hit_bailout,
+    "expected at least one send_packet to trip the cap-overflow bailout"
+  );
 
   assert!(
     decoder.probe.is_none(),
-    "the candidate that took the packet past the ceiling is committed"
+    "probe must be abandoned after cap overflow"
   );
-  assert!(
-    decoder.backlog.is_empty(),
-    "the candidate had been fed the whole history, so nothing is owed it"
+  assert_eq!(
+    decoder.pending_frames.len(),
+    pending_before,
+    "pending_frames belong to the active backend; abandon must not drop them"
   );
 }
 
@@ -407,9 +648,7 @@ fn all_backends_failed_returns_buffered_packets_to_caller() {
   // Trigger advance_probe directly with a synthetic non-transient
   // error. The exhaustion branch must take ownership of the
   // buffered packets and surface them via `unconsumed_packets`.
-  let result = decoder.advance_probe(BackendAnswer::of_call(Error::Ffmpeg(
-    ffmpeg_next::Error::InvalidData,
-  )));
+  let result = decoder.advance_probe(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
   match result {
     Err(Error::AllBackendsFailed(p)) => {
       let attempts = p.attempts();
@@ -492,13 +731,11 @@ fn all_backends_failed_preserves_earlier_open_failures() {
     let probe = decoder.probe.as_mut().expect("probe present");
     probe
       .attempts
-      .push((earlier_backend, BackendAnswer::of_open(synthetic_earlier)));
+      .push((earlier_backend, Box::new(synthetic_earlier)));
     probe.remaining_backends.clear(); // force exhaustion on next advance.
   }
 
-  let result = decoder.advance_probe(BackendAnswer::of_call(Error::Ffmpeg(
-    ffmpeg_next::Error::InvalidData,
-  )));
+  let result = decoder.advance_probe(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
   match result {
     Err(Error::AllBackendsFailed(p)) => {
       let attempts = p.attempts();
@@ -549,8 +786,8 @@ fn the_transfer_judge_prices_the_pool_not_the_display() {
   // pool is what `av_hwframe_transfer_data` sizes from, so a judge
   // reading `AVFrame.width` would price 100x100 = 10,000 pixels and
   // wave through an 8192x8192 allocation — the shape this crate's own
-  // pool reader (`hw_frames_ctx_dimensions_raw`) was written for, and
-  // which the first cut of this judge reached past it to reproduce.
+  // `hw_frames_ctx_dimensions` was written for, and which the first cut
+  // of this judge reached past it to reproduce.
   let frame = hw_frame_with_pool(100, 100, 8192, 8192);
 
   // Priced at the pool, an 8192x8192 surface is at least 64 Mpx, so a
@@ -1121,43 +1358,38 @@ fn auditioning_decoder() -> VideoDecoder {
   .expect("a software-backed candidate on trial")
 }
 
-/// **Regression: a candidate that has been handed the end and still asks
-/// for input is a candidate failing — never `NeedsInput`, never `Ended`.**
+/// **Regression: a candidate that has been handed the end and produced
+/// nothing is a candidate failing — never `NeedsInput`, never `Ended`.**
 ///
 /// The arm that had no name until [`SessionPhase`] gave it one. The
 /// probe replays its buffered history *and* the recorded end into each
 /// candidate, so a candidate can be sitting on a stream that is already
 /// over. Asked for a frame it answers `EAGAIN`, and every reading of
 /// that was wrong: `NeedsInput` asks the caller for input it does not
-/// have and the send gates refuse, while `Ended` takes a broken drain —
-/// libavcodec answers a drained decoder `AVERROR_EOF` — for a finished
-/// one, and stops the probe from trying the next backend.
+/// have and the send gates refuse, while `Ended` credits a backend that
+/// never decoded a thing and stops the probe from trying the next one.
 ///
 /// It is the probe's business, and the probe says so: with no backend
 /// left to advance to, [`Error::AllBackendsFailed`] — the caller's cue
 /// to fall back to software, which is exactly what should happen when
 /// no hardware backend could decode this stream.
 ///
-/// `AVERROR_EOF` there is the other answer, and the opposite verdict: a
-/// clean, empty completion that commits the candidate
-/// (`a_clean_end_completes_the_candidate_whatever_it_was_fed`).
-///
 /// The decoder is software-backed so the lane actually runs; what is
 /// under test is the classification and the road it selects, neither of
 /// which is backend-specific.
 #[test]
-fn a_candidate_that_asks_for_input_past_the_end_fails_the_probe() {
+fn a_candidate_past_the_end_that_produced_nothing_fails_the_probe() {
   let mut dec = auditioning_decoder();
   assert_eq!(dec.phase(), SessionPhase::Auditioning);
 
   // **The latch is set directly, and the reason matters.** Reaching
   // this phase through `send_eof` would also hand the flush packet to
   // libavcodec, which then answers `AVERROR_EOF` — a different arm,
-  // the clean end. The arm under test is the *other* one: a candidate
-  // that has been replayed a history and an end and still answers
-  // `EAGAIN`, which is precisely the state `advance_probe` leaves a
-  // candidate in mid-replay. The phase is the subject here, so the
-  // phase is what is constructed.
+  // and one that already routed to the probe correctly. The arm under
+  // test is the *other* one: a candidate that has been replayed a
+  // history and an end and still answers `EAGAIN`, which is precisely
+  // the state `advance_probe` leaves a candidate in mid-replay. The
+  // phase is the subject here, so the phase is what is constructed.
   dec.eof_sent = true;
   assert_eq!(
     dec.phase(),
@@ -1173,7 +1405,7 @@ fn a_candidate_that_asks_for_input_past_the_end_fails_the_probe() {
        send gates refuse, so nothing can satisfy it",
     ),
     Ok(Received::Ended) => panic!(
-      "took a candidate that broke the drain for one that finished it, \
+      "credited a candidate that never decoded a frame with ending the stream, \
        stopping the probe from trying the next backend",
     ),
     Ok(Received::Produced) => panic!("a candidate fed only the end produced a frame"),
@@ -1740,7 +1972,7 @@ fn the_probe_advances_on_every_failure_as_before() {
   ] {
     let dec = auditioning_decoder();
     match dec.hw_failure(failure, BareVerdict::CandidateFailure) {
-      HwRoute::Advance(BackendAnswer(Error::Ffmpeg(e))) => assert_eq!(e, failure),
+      HwRoute::Advance(Error::Ffmpeg(e)) => assert_eq!(e, failure),
       HwRoute::Advance(other) => panic!("{failure:?}: advanced with {other:?}"),
       HwRoute::Report(err) => {
         panic!("{failure:?}: a candidate's failure must advance the probe, got Report({err:?})")
@@ -1903,13 +2135,8 @@ fn the_packet_timebase_reaches_the_codec_context() {
   };
   let limits = crate::limits::DecoderLimits::default();
   let read_back = |declared: Option<mediadecode::Timebase>| {
-    let (ctx, _state) = build_codec_context(
-      &parameters(),
-      limits,
-      crate::DecoderOptions::new(),
-      declared,
-    )
-    .expect("a context is allocated");
+    let (ctx, _state) =
+      build_codec_context(&parameters(), limits, declared).expect("a context is allocated");
     // SAFETY: `ctx` owns a live `AVCodecContext` for this borrow, and
     // `pkt_timebase` is a public `AVRational` field.
     let raw = unsafe { (*ctx.as_ptr()).pkt_timebase };
@@ -1935,353 +2162,6 @@ fn the_packet_timebase_reaches_the_codec_context() {
   assert_eq!(read_back(Some(unset)), (0, 1));
 }
 
-/// **The decoder's options reach the codec context.** Each of the three
-/// `AVDiscard` settings is written as the value it names, every value of
-/// each; and the defaults leave libavcodec's own, `AVDISCARD_DEFAULT`.
-#[test]
-fn every_discard_value_reaches_the_codec_context() {
-  ffmpeg_next::init().expect("ffmpeg init");
-
-  let mut parameters = ffmpeg_next::codec::Parameters::new();
-  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; both
-  // fields written are plain scalars.
-  unsafe {
-    let raw = parameters.as_mut_ptr();
-    (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
-    (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
-  }
-  let read_back = |options: crate::DecoderOptions| {
-    let (ctx, state) = build_codec_context(
-      &parameters,
-      crate::limits::DecoderLimits::default(),
-      options,
-      None,
-    )
-    .expect("a context is allocated");
-    // SAFETY: `ctx` owns a live `AVCodecContext` for this borrow; the
-    // three are `AVDiscard` fields, read as the integers they are.
-    let raw = unsafe {
-      let ctx = ctx.as_ptr();
-      (
-        ptr::addr_of!((*ctx).skip_frame).cast::<i32>().read(),
-        ptr::addr_of!((*ctx).skip_loop_filter).cast::<i32>().read(),
-        ptr::addr_of!((*ctx).skip_idct).cast::<i32>().read(),
-      )
-    };
-    drop(ctx);
-    drop(state);
-    raw
-  };
-  assert_eq!(read_back(crate::DecoderOptions::new()), (0, 0, 0));
-  for value in crate::Discard::ALL {
-    let av = value.as_av() as i32;
-    let one = crate::DecoderOptions::new();
-    assert_eq!(read_back(one.with_skip_frame(value)), (av, 0, 0), "{value}");
-    assert_eq!(
-      read_back(one.with_skip_loop_filter(value)),
-      (0, av, 0),
-      "{value}"
-    );
-    assert_eq!(read_back(one.with_skip_idct(value)), (0, 0, av), "{value}");
-  }
-}
-
-/// **The open request starts at [`VideoDecoder::open`]'s and sets each
-/// optional**, consuming and in place alike, and back to the probe and an
-/// untimed decoder.
-#[test]
-fn the_open_request_starts_at_opens_and_sets_each_optional() {
-  use std::num::NonZeroI32;
-
-  let request = VideoDecoderOpen::new();
-  assert_eq!(request, VideoDecoderOpen::default());
-  assert_eq!(
-    (
-      request.backend(),
-      request.limits(),
-      request.timebase(),
-      request.options()
-    ),
-    (
-      None,
-      crate::limits::DecoderLimits::new(),
-      None,
-      crate::DecoderOptions::new()
-    )
-  );
-
-  let limits = crate::limits::DecoderLimits::new().with_max_packet_bytes(12_345);
-  let timebase = mediadecode::Timebase::new(1, NonZeroI32::new(1_000).expect("non-zero"));
-  let options = crate::DecoderOptions::new().with_skip_frame(crate::Discard::NonReference);
-  let built = request
-    .with_backend(Some(Backend::VideoToolbox))
-    .with_limits(limits)
-    .with_timebase(Some(timebase))
-    .with_options(options);
-  assert_eq!(
-    (
-      built.backend(),
-      built.limits(),
-      built.timebase(),
-      built.options()
-    ),
-    (Some(Backend::VideoToolbox), limits, Some(timebase), options)
-  );
-  let mut set = VideoDecoderOpen::new();
-  set
-    .set_backend(Some(Backend::VideoToolbox))
-    .set_limits(limits)
-    .set_timebase(Some(timebase))
-    .set_options(options);
-  assert_eq!(set, built);
-  set.set_backend(None).set_timebase(None);
-  assert_eq!(
-    set,
-    VideoDecoderOpen::new()
-      .with_limits(limits)
-      .with_options(options)
-  );
-}
-
-/// Codec parameters naming H.264 video and nothing more: enough for a
-/// context to open.
-#[cfg(target_vendor = "apple")]
-fn h264_parameters() -> codec::Parameters {
-  let mut parameters = codec::Parameters::new();
-  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; both
-  // fields written are plain scalars.
-  unsafe {
-    let raw = parameters.as_mut_ptr();
-    (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
-    (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
-  }
-  parameters
-}
-
-/// **The probe runs from the open under every skip level, `All` among
-/// them**: a level is the codec's to honour — VP9 reads none, and
-/// `libdav1d` decodes key pictures under `All` — so no level commits a
-/// backend before its answers, and the stream decoder's `Auto` probes
-/// hardware under each.
-///
-/// PLANT: a commit at the open under `All` turns this red at "`all`: the
-/// probe runs"; `Auto` opening software under `All`, at "`all`: `Auto`
-/// probes hardware".
-#[cfg(target_vendor = "apple")]
-#[test]
-fn the_probe_runs_from_the_open_under_every_skip_level() {
-  ffmpeg_next::init().expect("ffmpeg init");
-  let timebase = mediadecode::Timebase::new(1, core::num::NonZeroI32::new(25).expect("non-zero"));
-  for skip in crate::Discard::ALL {
-    let options = crate::DecoderOptions::new().with_skip_frame(skip);
-    let opened = VideoDecoder::open_probing(
-      h264_parameters(),
-      crate::limits::DecoderLimits::default(),
-      options,
-      None,
-      backend::probe_order(),
-    )
-    .expect("the decoder opens");
-    assert_eq!(
-      opened.phase(),
-      SessionPhase::Auditioning,
-      "{skip}: the probe runs"
-    );
-    assert_eq!(opened.backend(), Backend::VideoToolbox, "{skip}");
-
-    let auto = crate::FfmpegOwnedVideoStreamDecoder::open_from(
-      crate::VideoStreamDecoderOpen::new().with_options(options),
-      h264_parameters(),
-      timebase,
-      crate::limits::DecoderLimits::default(),
-    )
-    .expect("the session opens");
-    assert!(!auto.is_software(), "{skip}: `Auto` probes hardware");
-  }
-}
-
-/// What a decoder opened as, read the way the two laws below read it:
-/// whether it probes, its backend and its limits; the packet timebase and
-/// the three skips its context holds, as raw integers; and the options it
-/// reports.
-#[cfg(target_vendor = "apple")]
-type Opened = (
-  bool,
-  Backend,
-  crate::limits::DecoderLimits,
-  (i32, i32),
-  (i32, i32, i32),
-  crate::DecoderOptions,
-);
-
-#[cfg(target_vendor = "apple")]
-fn opened(decoder: Result<VideoDecoder>) -> Opened {
-  let decoder = decoder.expect("the decoder opens");
-  // SAFETY: `decoder.state.inner` owns a live, opened `AVCodecContext` for
-  // this borrow; `pkt_timebase` is a public `AVRational` field, and the
-  // three skips are `AVDiscard` fields, read as the integers they are.
-  let (timebase, skips) = unsafe {
-    let ctx = decoder.state.inner.as_ptr();
-    (
-      ((*ctx).pkt_timebase.num, (*ctx).pkt_timebase.den),
-      (
-        ptr::addr_of!((*ctx).skip_frame).cast::<i32>().read(),
-        ptr::addr_of!((*ctx).skip_loop_filter).cast::<i32>().read(),
-        ptr::addr_of!((*ctx).skip_idct).cast::<i32>().read(),
-      ),
-    )
-  };
-  (
-    decoder.probe.is_some(),
-    decoder.backend(),
-    decoder.frame_limits,
-    timebase,
-    skips,
-    decoder.options(),
-  )
-}
-
-/// **What the open request names reaches the decoder it opens**, on the
-/// probe and on a pinned backend, untimed and timed:
-///
-/// - the options and the packet timebase are written into the context;
-/// - the limits are held;
-/// - the probe is present exactly when no backend is pinned;
-/// - the options are reported.
-///
-/// On Apple targets, over VideoToolbox. It is the probe's one backend
-/// there, and it opens a context without asking for hardware: its device
-/// is created with nothing to create (`libavutil/hwcontext_videotoolbox.c`
-/// 829–838 in FFmpeg 9.0.1), and the decoder's session waits for the
-/// first picture.
-#[cfg(target_vendor = "apple")]
-#[test]
-fn the_open_request_reaches_the_decoder_on_both_roads() {
-  use std::num::NonZeroI32;
-
-  ffmpeg_next::init().expect("ffmpeg init");
-
-  // A different value in each skip, so a setting written into another's
-  // field is seen.
-  let options = crate::DecoderOptions::new()
-    .with_skip_frame(crate::Discard::NonReference)
-    .with_skip_loop_filter(crate::Discard::All)
-    .with_skip_idct(crate::Discard::NonKey);
-  let limits = crate::limits::DecoderLimits::new().with_max_packet_bytes(12_345);
-  let milliseconds = mediadecode::Timebase::new(1, NonZeroI32::new(1_000).expect("non-zero"));
-  for pinned in [None, Some(Backend::VideoToolbox)] {
-    for (timebase, written) in [(None, (0, 1)), (Some(milliseconds), (1, 1_000))] {
-      let request = VideoDecoderOpen::new()
-        .with_backend(pinned)
-        .with_limits(limits)
-        .with_timebase(timebase)
-        .with_options(options);
-      assert_eq!(
-        opened(VideoDecoder::open_from(request, h264_parameters())),
-        (
-          pinned.is_none(),
-          Backend::VideoToolbox,
-          limits,
-          written,
-          (8, 48, 32),
-          options
-        ),
-        "{request:?}"
-      );
-    }
-  }
-}
-
-/// **Each of the eight `open*` constructors opens the request its
-/// arguments spell**: the probe or the pinned backend, the limits and the
-/// packet timebase it names, and libavcodec's options.
-///
-/// On Apple targets, over VideoToolbox, for the reason the law above
-/// gives.
-#[cfg(target_vendor = "apple")]
-#[test]
-fn each_open_constructor_opens_the_request_it_spells() {
-  use std::num::NonZeroI32;
-
-  ffmpeg_next::init().expect("ffmpeg init");
-
-  let parameters = h264_parameters;
-  let default = crate::limits::DecoderLimits::default();
-  let limits = crate::limits::DecoderLimits::new().with_max_packet_bytes(12_345);
-  let milliseconds = mediadecode::Timebase::new(1, NonZeroI32::new(1_000).expect("non-zero"));
-  let (untimed, timed) = ((0, 1), (1, 1_000));
-  let pinned = Backend::VideoToolbox;
-  let cases = [
-    (
-      "open",
-      opened(VideoDecoder::open(parameters())),
-      (true, default, untimed),
-    ),
-    (
-      "open_timed",
-      opened(VideoDecoder::open_timed(parameters(), milliseconds)),
-      (true, default, timed),
-    ),
-    (
-      "open_with_frame_limits",
-      opened(VideoDecoder::open_with_frame_limits(parameters(), limits)),
-      (true, limits, untimed),
-    ),
-    (
-      "open_with_frame_limits_timed",
-      opened(VideoDecoder::open_with_frame_limits_timed(
-        parameters(),
-        limits,
-        milliseconds,
-      )),
-      (true, limits, timed),
-    ),
-    (
-      "open_with",
-      opened(VideoDecoder::open_with(parameters(), pinned)),
-      (false, default, untimed),
-    ),
-    (
-      "open_with_timed",
-      opened(VideoDecoder::open_with_timed(
-        parameters(),
-        pinned,
-        milliseconds,
-      )),
-      (false, default, timed),
-    ),
-    (
-      "open_with_limits",
-      opened(VideoDecoder::open_with_limits(parameters(), pinned, limits)),
-      (false, limits, untimed),
-    ),
-    (
-      "open_with_limits_timed",
-      opened(VideoDecoder::open_with_limits_timed(
-        parameters(),
-        pinned,
-        limits,
-        milliseconds,
-      )),
-      (false, limits, timed),
-    ),
-  ];
-  for (name, opened, (probing, limits, timebase)) in cases {
-    assert_eq!(
-      opened,
-      (
-        probing,
-        pinned,
-        limits,
-        timebase,
-        (0, 0, 0),
-        crate::DecoderOptions::new()
-      ),
-      "{name}"
-    );
-  }
-}
-
 /// **A context this crate builds decodes on one thread.** Nothing here
 /// sets `thread_count` or `thread_type`, and FFmpeg's own default is one
 /// thread, so the allocator judge and the `get_format` callback run on
@@ -2300,13 +2180,9 @@ fn a_context_this_crate_builds_decodes_on_one_thread() {
     (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
     (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
   }
-  let (ctx, state) = build_codec_context(
-    &parameters,
-    crate::limits::DecoderLimits::default(),
-    crate::DecoderOptions::new(),
-    None,
-  )
-  .expect("a context is allocated");
+  let (ctx, state) =
+    build_codec_context(&parameters, crate::limits::DecoderLimits::default(), None)
+      .expect("a context is allocated");
   // SAFETY: `ctx` owns a live `AVCodecContext` for this borrow, and
   // `thread_count` is a plain integer field.
   let threads = unsafe { (*ctx.as_ptr()).thread_count };
@@ -2361,27 +2237,7 @@ const RAW_PICTURE: usize = (RAW_SIDE * RAW_SIDE) as usize;
 /// (`avcodec_send_packet`, `libavcodec/decode.c` 745–758 in FFmpeg
 /// 9.0.1): two sends taken, and no back pressure.
 fn raw_auditioning_decoder() -> VideoDecoder {
-  raw_auditioning_decoder_with(RAW_SIDE, crate::DecoderOptions::new())
-}
-
-/// [`raw_auditioning_decoder`], its pictures `side` pixels square and its
-/// context opened with `options`.
-fn raw_auditioning_decoder_with(side: i32, options: crate::DecoderOptions) -> VideoDecoder {
   ffmpeg_next::init().expect("ffmpeg init");
-  let parameters = raw_parameters(side);
-  let codec = find_decoder(&parameters).expect("rawvideo");
-  VideoDecoder::from_software_for_test_as(
-    parameters,
-    codec,
-    crate::limits::DecoderLimits::default(),
-    options,
-    /*auditioning=*/ true,
-  )
-  .expect("a software-backed rawvideo candidate on trial")
-}
-
-/// Codec parameters naming rawvideo `GRAY8` pictures `side` pixels square.
-fn raw_parameters(side: i32) -> codec::Parameters {
   let mut parameters = ffmpeg_next::codec::Parameters::new();
   // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; every
   // field written is a plain scalar.
@@ -2389,33 +2245,16 @@ fn raw_parameters(side: i32) -> codec::Parameters {
     let raw = parameters.as_mut_ptr();
     (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
     (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_RAWVIDEO;
-    (*raw).width = side;
-    (*raw).height = side;
+    (*raw).width = RAW_SIDE;
+    (*raw).height = RAW_SIDE;
     (*raw).format = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_GRAY8 as i32;
   }
-  parameters
-}
-
-/// `parameters` carrying `bytes` of zeroed extradata, which the bounded
-/// copy weighs with its padding (`measure_parameters`) and rawvideo reads
-/// only for a trailing `BottomUp` (`rawdec.c`).
-fn with_extradata(mut parameters: codec::Parameters, bytes: usize) -> codec::Parameters {
-  let padded = bytes + ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
-  // SAFETY: `parameters` owns a live `AVCodecParameters` with no
-  // extradata; the allocation is libavutil's, zeroed, padded as FFmpeg
-  // requires, and freed with the parameters.
-  unsafe {
-    let raw = parameters.as_mut_ptr();
-    assert!(
-      (*raw).extradata.is_null(),
-      "parameters with no extradata yet"
-    );
-    let extradata = ffmpeg_next::ffi::av_mallocz(padded).cast::<u8>();
-    assert!(!extradata.is_null(), "the extradata");
-    (*raw).extradata = extradata;
-    (*raw).extradata_size = bytes as i32;
-  }
-  parameters
+  VideoDecoder::from_software_for_test(
+    parameters,
+    crate::limits::DecoderLimits::default(),
+    /*auditioning=*/ true,
+  )
+  .expect("a software-backed rawvideo candidate on trial")
 }
 
 /// One picture's packet, every byte `fill`.
@@ -2603,30 +2442,29 @@ fn a_rescued_packet_keeps_the_bytes_it_was_sent_with() {
   }
 }
 
-/// LAW: **a copy the probe cannot make is no backend's answer: the packet
-/// is sent, and the candidate that takes it is committed** — with no
-/// [`Error::AllBackendsFailed`], since no backend failed.
+/// LAW: **a copy the probe cannot make refuses the send by name, before
+/// libavcodec sees the packet, and leaves the packet with the caller.**
 ///
-/// The history cannot keep the packet, so it is the trial's last
-/// ([`Unkept::Copy`]): sent with the history whole, taken, and the
-/// candidate committed. A failure after is that decoder's own, with no
-/// history to replay.
+/// The refusal is the probe's own, as at its byte ceiling:
+/// [`Error::AllBackendsFailed`] with the history recorded so far and no
+/// attempt, since no backend failed. The session stays where it was, on
+/// the same backend and no longer on trial.
 ///
-/// The allocator fails the copy, through `av_max_alloc` in a child process
-/// of its own: capped at 512 bytes, the payload `av_packet_make_writable`
-/// copies into (8,192 bytes and the padding) is not allocated, while what
-/// libavcodec allocates to take a refcounted packet is.
+/// The allocator fails it, through `av_max_alloc` in a child process of
+/// its own: capped at 512 bytes, `av_packet_ref`'s `AVBufferRef` is
+/// still allocated and the payload `av_packet_make_writable` copies into
+/// (8,192 bytes and the padding) is not.
 ///
-/// PLANT: the copy failure answering `AllBackendsFailed` before the packet
-/// is sent, as in 0.19.0, turns this red at "sent and committed".
+/// PLANT: `av_packet_make_writable` skipped in [`try_clone_packet`]
+/// turns this red at "refused by name".
 #[test]
-fn a_copy_the_probe_cannot_make_sends_its_packet_and_commits() {
+fn a_copy_the_probe_cannot_make_refuses_the_send_by_name() {
   use mediaio_ffmpeg::test_support::{
     cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations,
   };
 
   in_subprocess(
-    "decoder::tests::a_copy_the_probe_cannot_make_sends_its_packet_and_commits",
+    "decoder::tests::a_copy_the_probe_cannot_make_refuses_the_send_by_name",
     || {
       let mut dec = raw_auditioning_decoder();
       let first = raw_packet(0x11);
@@ -2637,158 +2475,77 @@ fn a_copy_the_probe_cannot_make_sends_its_packet_and_commits() {
         Sent::Accepted
       );
 
-      let uncopied = crate::boundary::try_packet_copy(&[0x77; 8192]).expect("a packet");
+      let mut refused = crate::boundary::try_packet_copy(&[0x77; 8192]).expect("a packet");
       // SAFETY: in `in_subprocess`'s child, alone. The capped window runs one send:
       // the probe's copy goes through `try_clone_packet`, which checks both of
       // its calls, and libavcodec checks its own allocations.
       unsafe { cap_ffmpeg_allocations(512) };
-      // SAFETY: `try_packet_copy` wrote every byte and zeroed the padding, and nothing writes
-      // through it while the decoder may still read it.
-      let answer = unsafe { dec.send_av_packet(&uncopied) };
+      // SAFETY: `try_packet_copy` wrote every byte and zeroed the padding; the probe refuses
+      // the packet before libavcodec sees it.
+      let answer = unsafe { dec.send_av_packet(&refused) };
       uncap_ffmpeg_allocations();
 
+      let Err(Error::AllBackendsFailed(p)) = answer else {
+        panic!("a copy that cannot be made is refused by name, got {answer:?}");
+      };
       assert!(
-        matches!(answer, Ok(Sent::Accepted)),
-        "sent and committed: {answer:?}"
+        p.attempts().is_empty(),
+        "the probe's own refusal: no backend failed, got {:?}",
+        p.attempts(),
       );
-      assert_eq!(dec.phase(), SessionPhase::Streaming, "committed");
-      // Both pictures are the committed candidate's: the first, then the
-      // one whose packet the probe could not copy.
-      let mut picture = frame::Video::empty();
-      dec
-        .state
-        .inner
-        .receive_frame(&mut picture)
-        .expect("the first picture");
-      dec
-        .state
-        .inner
-        .receive_frame(&mut picture)
-        .expect("the uncopied packet's picture");
-      assert_eq!(picture.data(0)[0], 0x77, "decoded from the packet sent");
+      let history = p.into_unconsumed_packets();
+      assert!(
+        history.len() == 1 && holds(&history[0], 0x11),
+        "the history recorded before the refusal, without the refused packet",
+      );
+
+      // The packet is the caller's again: neither the copy that failed
+      // nor libavcodec holds a reference to it.
+      assert_eq!(
+        payload_of(&refused).1,
+        1,
+        "nothing else references the packet"
+      );
+      assert!(holds(&refused, 0x77), "its bytes untouched");
+      refused.data_mut().expect("a payload").fill(0x78);
+
+      // The same backend, no longer on trial; and libavcodec never saw
+      // the packet. Offered now it is taken, where a decoder already
+      // holding one packet beside a waiting picture answers back
+      // pressure (`decode.c` 746–747).
+      assert_eq!(dec.phase(), SessionPhase::Streaming);
+      assert_eq!(
+        // SAFETY: every byte written and the padding zeroed (`try_packet_copy`'s); the caller
+        // wrote the payload while no decoder held it — the probe refused it and libavcodec
+        // never saw it — and nothing writes it again.
+        unsafe { dec.send_av_packet(&refused) }.expect("offered again"),
+        Sent::Accepted,
+        "libavcodec never saw the refused packet",
+      );
     },
   );
 }
 
-/// `packet` with `entries` side-data entries of one kind, attached past
-/// FFmpeg's API — which holds a packet to one entry per kind
-/// (`av_packet_add_side_data`, `libavcodec/packet.c` 197–228) — as a packet
-/// built by hand would carry them. Each is a byte of
-/// `AV_PKT_DATA_MPEGTS_STREAM_ID`, which no decoder reads; the array and
-/// each entry are libavutil allocations, which the packet's unref frees.
-fn with_side_data_entries(mut packet: Packet, entries: usize) -> Packet {
-  use ffmpeg_next::ffi::{AVPacketSideData, AVPacketSideDataType, av_malloc, av_mallocz};
-
-  // SAFETY: `packet` owns a live `AVPacket` with no side data; the array
-  // is allocated for `entries` descriptors and every one is written before
-  // the packet holds it, each `data` a live one-byte allocation.
-  unsafe {
-    let raw = packet.as_mut_ptr();
-    assert!((*raw).side_data.is_null(), "a packet with no side data yet");
-    let array =
-      av_malloc(entries * core::mem::size_of::<AVPacketSideData>()).cast::<AVPacketSideData>();
-    assert!(!array.is_null(), "the descriptor array");
-    for index in 0..entries {
-      let data = av_mallocz(1).cast::<u8>();
-      assert!(!data.is_null(), "an entry's byte");
-      array.add(index).write(AVPacketSideData {
-        data,
-        size: 1,
-        type_: AVPacketSideDataType::AV_PKT_DATA_MPEGTS_STREAM_ID,
-      });
-    }
-    (*raw).side_data = array;
-    (*raw).side_data_elems = entries as i32;
-  }
-  packet
-}
-
-/// LAW: **a packet of more side-data entries than the probe copies is no
-/// backend's answer: it is sent, and the candidate that takes it is
-/// committed** — with no [`Error::AllBackendsFailed`]. And a candidate
-/// that refuses it fails on its own refusal, as on any packet: the next is
-/// replayed the history and takes it.
+/// LAW: **a candidate is replayed copies, and the history stays the
+/// probe's own.**
 ///
-/// The packet is never copied ([`Unkept::SideData`]); libavcodec takes it
-/// as it takes any, one entry per kind (`av_packet_copy_props`).
-///
-/// PLANT: the side-data cap answering `AllBackendsFailed` before the
-/// packet is sent, as in 0.19.0, turns this red at "sent and committed".
-#[test]
-fn a_packet_of_more_side_data_entries_than_the_probe_copies_is_sent_and_commits() {
-  let crowded = || with_side_data_entries(raw_packet(0x5A), MAX_PROBE_PACKET_SIDE_DATA_ENTRIES + 1);
-  assert_eq!(
-    packet_side_data_count(&crowded()),
-    MAX_PROBE_PACKET_SIDE_DATA_ENTRIES + 1
-  );
-
-  // Taken: committed, its picture the candidate's.
-  let mut dec = raw_auditioning_decoder();
-  send_all(&mut dec, &[discarded(0x11)]);
-  let packet = crowded();
-  // SAFETY: `raw_packet`'s payload, every byte written and the padding
-  // zeroed; its side data `with_side_data_entries` wrote whole; nothing
-  // writes through it while the decoder may still read it.
-  let sent = unsafe { dec.send_av_packet(&packet) };
-  assert!(
-    matches!(sent, Ok(Sent::Accepted)),
-    "sent and committed: {sent:?}"
-  );
-  assert_eq!(dec.phase(), SessionPhase::Streaming, "committed");
-  assert!(
-    holds_a_picture(&mut dec),
-    "its picture, the committed candidate's"
-  );
-
-  // Refused, by a candidate of 32 x 32 pictures it is short of: the next
-  // candidate, built in software from the probe's 16 x 16 parameters, is
-  // replayed the history and takes it.
-  let mut dec = raw_auditioning_decoder_with(32, crate::DecoderOptions::new());
-  {
-    let probe = dec.probe.as_mut().expect("on trial");
-    probe.parameters = raw_parameters(RAW_SIDE);
-    probe.build = VideoDecoder::software_state_for_test;
-    probe.remaining_backends = vec![Backend::Cuda];
-    probe.buffered_packets = vec![discarded(0x11)];
-    probe.fed = 1;
-    probe.buffered_bytes = RAW_PICTURE;
-  }
-  // SAFETY: as above.
-  let sent = unsafe { dec.send_av_packet(&packet) };
-  assert!(
-    matches!(sent, Ok(Sent::Accepted)),
-    "the next candidate took it: {sent:?}"
-  );
-  assert_eq!(dec.backend(), Backend::Cuda, "the next candidate's");
-  assert_eq!(dec.phase(), SessionPhase::Streaming, "and committed");
-}
-
-/// LAW: **a candidate is replayed the history itself, and the history is
-/// released from every decoder before it goes back to the caller.**
-///
-/// `avcodec_send_packet` takes a reference to what it is sent and may hold
-/// it past the call (`libavcodec/decode.c` 745–758 in FFmpeg 9.0.1). The
-/// replay sends the history's own packets ([`feed_into`]), so the candidate
-/// shares their buffers and no copy is made: none that could fail, and none
-/// for the probe to pay twice. When the candidate fails in its turn and the
-/// probe exhausts, the history goes to the caller as owned, mutable
-/// packets, so the session first flushes the decoder that holds them
-/// (`avcodec_flush_buffers`, `libavcodec/avcodec.c` 409–412, and
-/// `decode.c` 2370–2379) and clears its frame scratch
-/// ([`VideoDecoder::release_history`]): the caller's `&mut [u8]` covers
-/// bytes no decoder holds.
+/// `avcodec_send_packet` takes a reference to what it is sent and may
+/// hold it past the call (`libavcodec/decode.c` 748 and 754). A
+/// candidate replayed the history's own packets would share their
+/// buffers for as long as it holds them, and a candidate the probe
+/// commits stays the session's: when it fails in its turn and the
+/// history goes to the caller, the caller's `&mut [u8]` would cover
+/// bytes a live decoder reads.
 ///
 /// The candidate is opened in software through
-/// [`VideoDecoder::advance_probe_with`]. Two packets: rawvideo's picture of
-/// the first refers to that packet's own buffer (`rawdec.c` 226–244), and
-/// the second waits in libavcodec's queue behind it, so the replay asks for
-/// no drain.
+/// [`VideoDecoder::advance_probe_with`]. Two packets, so the replay
+/// leaves one picture waiting and one packet held, and asks for no
+/// drain.
 ///
-/// PLANT: the exhaustion handing the history back without
-/// [`VideoDecoder::release_history`] turns this red at "referenced by the
-/// rescued packet alone".
+/// PLANT: the replay sending the history's own packet turns this red
+/// at "the candidate holds none of the history".
 #[test]
-fn a_candidate_is_replayed_the_history_itself_and_it_is_released_before_it_goes_back() {
+fn a_candidate_is_replayed_copies_and_the_history_stays_the_probes_own() {
   let mut dec = raw_auditioning_decoder();
   dec
     .probe
@@ -2798,32 +2555,44 @@ fn a_candidate_is_replayed_the_history_itself_and_it_is_released_before_it_goes_
     .push(Backend::Cuda);
   let fills = [0x11u8, 0x22];
   let sent: Vec<Packet> = fills.iter().map(|&fill| raw_packet(fill)).collect();
-  send_all(&mut dec, &sent);
+  for packet in &sent {
+    // SAFETY: `raw_packet` is `try_packet_copy`'s, every byte written and the padding zeroed,
+    // and nothing writes through it while the decoder may still read it.
+    assert_eq!(
+      unsafe { dec.send_av_packet(packet) }.expect("taken"),
+      Sent::Accepted
+    );
+  }
 
   dec
     .advance_probe_with(
-      BackendAnswer::of_call(Error::Ffmpeg(ffmpeg_next::Error::InvalidData)),
+      Error::Ffmpeg(ffmpeg_next::Error::InvalidData),
       VideoDecoder::software_state_for_test,
     )
-    .expect("the candidate takes the replay and is installed");
+    .expect("the candidate takes the replay and is committed");
   assert_eq!(
     dec.backend(),
     Backend::Cuda,
     "the candidate is the session's"
   );
-  let probe = dec.probe.as_ref().expect("still on trial: no picture yet");
-  assert_eq!(probe.fed, fills.len(), "it took the whole history");
-  for (packet, &fill) in probe.buffered_packets.iter().zip(&fills) {
+  for (packet, &fill) in dec
+    .probe
+    .as_ref()
+    .expect("still on trial: no picture yet")
+    .buffered_packets
+    .iter()
+    .zip(&fills)
+  {
     assert_eq!(
       payload_of(packet).1,
-      2,
-      "{fill:#04x}: the history's own packet, shared with the candidate — no copy",
+      1,
+      "{fill:#04x}: the candidate holds none of the history",
     );
   }
 
   // The candidate fails in its turn, on the first picture asked for, and
   // the history goes to the caller while the candidate stays the
-  // session's.
+  // session's, holding what it was replayed.
   let mut frame = crate::Frame::empty().expect("frame slot");
   let Err(Error::AllBackendsFailed(p)) = dec.receive_frame(&mut frame) else {
     panic!("the candidate fails on a CPU frame, and the probe exhausts");
@@ -2854,1070 +2623,5 @@ fn a_candidate_is_replayed_the_history_itself_and_it_is_released_before_it_goes_
     dec.backend(),
     Backend::Cuda,
     "and that candidate is still live"
-  );
-}
-
-/// LAW: **the attempt log is in the order the backends were tried**: the
-/// candidate that failed first, then each the probe tried after it — though
-/// the first is recorded only once the probe leaves it.
-///
-/// The next candidate is built from 32 × 32 parameters, so the 16 × 16
-/// picture it is replayed is short of one, and it refuses it (`rawdec.c`
-/// 342–346).
-///
-/// PLANT: the failed candidate's answer appended when the probe leaves it,
-/// after the refusals it led to, turns this red at "in the order tried".
-#[test]
-fn the_attempt_log_is_in_the_order_the_backends_were_tried() {
-  let mut dec = raw_auditioning_decoder();
-  let first = dec.backend();
-  {
-    let probe = dec.probe.as_mut().expect("on trial");
-    probe.parameters = raw_parameters(32);
-    probe.build = VideoDecoder::software_state_for_test;
-    probe.remaining_backends = vec![Backend::Cuda];
-    probe.buffered_packets = vec![raw_packet(0x11)];
-    probe.fed = 1;
-    probe.buffered_bytes = RAW_PICTURE;
-  }
-  let Err(Error::AllBackendsFailed(p)) = dec.advance_probe(BackendAnswer::of_call(Error::Ffmpeg(
-    ffmpeg_next::Error::InvalidData,
-  ))) else {
-    panic!("the next candidate refuses its replay, and the probe exhausts");
-  };
-  let tried: Vec<Backend> = p.attempts().iter().map(|(backend, _)| *backend).collect();
-  assert_eq!(tried, vec![first, Backend::Cuda], "in the order tried");
-  assert!(
-    matches!(
-      *p.attempts()[0].1,
-      Error::Ffmpeg(ffmpeg_next::Error::InvalidData)
-    ),
-    "the first candidate's own answer: {:?}",
-    p.attempts()
-  );
-}
-
-/// A [`BuildCandidate`] that opens the candidate in software and then caps
-/// every FFmpeg allocation at 512 bytes, so the replay runs under the cap:
-/// the allocator of
-/// [`a_replay_makes_no_copy_so_one_that_could_not_be_made_charges_no_backend`].
-fn software_state_then_capped(
-  parameters: codec::Parameters,
-  codec: Codec,
-  backend: Backend,
-  limits: crate::limits::DecoderLimits,
-  options: crate::DecoderOptions,
-  pkt_timebase: Option<mediadecode::Timebase>,
-) -> std::result::Result<DecoderState, BuildFailure> {
-  let built = VideoDecoder::software_state_for_test(
-    parameters,
-    codec,
-    backend,
-    limits,
-    options,
-    pkt_timebase,
-  );
-  // SAFETY: built only by that law, in `in_subprocess`'s child, alone; the
-  // law lifts the cap as soon as the advance returns. The replay sends
-  // packets and checks what libavcodec answers, and libavcodec checks its
-  // own allocations.
-  unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(512) };
-  built
-}
-
-/// LAW: **a replay makes no copy, so an allocator that could make none
-/// installs the candidate** — no backend charged for it, and no
-/// [`Error::AllBackendsFailed`].
-///
-/// Codex R7: the replay copied each packet before sending it, and a copy
-/// that could not be made was recorded as the next candidate's failure — a
-/// backend charged for a packet it never saw. The replay sends the
-/// history's own packets now ([`feed_into`]).
-///
-/// The allocator is capped once the candidate is built, through
-/// `av_max_alloc` in a child process of its own: at 512 bytes the copy of
-/// an 8,192-byte payload cannot be allocated, while what libavcodec
-/// allocates to take a refcounted packet, and rawvideo to decode one, can.
-///
-/// PLANT: the replay sending a copy of each packet
-/// ([`try_clone_packet`](crate::boundary::try_clone_packet)), a copy that
-/// cannot be made refusing the replay, turns this red at "installed".
-#[test]
-fn a_replay_makes_no_copy_so_one_that_could_not_be_made_charges_no_backend() {
-  use mediaio_ffmpeg::test_support::{in_subprocess, uncap_ffmpeg_allocations};
-
-  in_subprocess(
-    "decoder::tests::a_replay_makes_no_copy_so_one_that_could_not_be_made_charges_no_backend",
-    || {
-      let mut dec = raw_auditioning_decoder();
-      dec
-        .probe
-        .as_mut()
-        .expect("on trial")
-        .remaining_backends
-        .push(Backend::Cuda);
-      let fills = [0x11u8, 0x22];
-      let sent: Vec<Packet> = fills
-        .iter()
-        .map(|&fill| crate::boundary::try_packet_copy(&[fill; 8192]).expect("a packet"))
-        .collect();
-      send_all(&mut dec, &sent);
-
-      let advanced = dec.advance_probe_with(
-        BackendAnswer::of_call(Error::Ffmpeg(ffmpeg_next::Error::InvalidData)),
-        software_state_then_capped,
-      );
-      uncap_ffmpeg_allocations();
-
-      assert!(advanced.is_ok(), "installed: {advanced:?}");
-      assert_eq!(
-        dec.backend(),
-        Backend::Cuda,
-        "the candidate is the session's"
-      );
-      let probe = dec.probe.as_ref().expect("on trial");
-      assert_eq!(probe.fed, fills.len(), "it took the whole history");
-      assert_eq!(
-        probe.attempts.len(),
-        1,
-        "the failed backend's answer alone: {:?}",
-        probe.attempts,
-      );
-      assert!(
-        holds_a_picture(&mut dec),
-        "the candidate decodes what it was replayed"
-      );
-    },
-  );
-}
-
-/// LAW: **a replay drains nothing, so no queue can be exhausted**: a
-/// candidate replayed a history of more pictures than the probe's queue
-/// held (16) is installed, and every picture reaches the caller in order,
-/// the rest of the history fed as the caller drains.
-///
-/// Codex R7: the replay drained each picture into a queue whose frame and
-/// byte caps answered `ENOMEM`, recorded as the candidate's failure — a
-/// candidate that had produced pictures, charged for this crate's own
-/// queue. The replay stops where the candidate first has output for the
-/// caller ([`feed_into`]), and the candidate is fed the rest on the road
-/// the caller drains by ([`VideoDecoder::feed`]).
-///
-/// The pictures are read from the candidate itself, as
-/// [`VideoDecoder::receive_frame`] reads them: a software candidate's frame
-/// cannot cross the hardware download.
-///
-/// PLANT: the replay refusing to go on where the candidate has output for
-/// the caller — its `EAGAIN` answered with the `ENOMEM` a full queue
-/// answered — turns this red at "installed".
-#[test]
-fn a_replay_drains_nothing_so_a_long_history_charges_no_backend() {
-  const PICTURES: usize = 40;
-  let mut dec = raw_auditioning_decoder();
-  {
-    let probe = dec.probe.as_mut().expect("on trial");
-    probe.remaining_backends = vec![Backend::Cuda];
-    probe.build = VideoDecoder::software_state_for_test;
-    probe.buffered_packets = (0..PICTURES).map(|index| raw_packet(index as u8)).collect();
-    probe.fed = PICTURES;
-    probe.buffered_bytes = PICTURES * RAW_PICTURE;
-  }
-  dec
-    .advance_probe(BackendAnswer::of_call(Error::Ffmpeg(
-      ffmpeg_next::Error::InvalidData,
-    )))
-    .expect("installed");
-  assert_eq!(dec.backend(), Backend::Cuda, "the candidate's");
-  let probe = dec.probe.as_ref().expect("on trial");
-  assert_eq!(
-    probe.fed, 2,
-    "the replay stopped at the candidate's first output: a picture waiting, a packet queued \
-     behind it"
-  );
-  assert_eq!(probe.attempts.len(), 1, "the failed backend's answer alone");
-
-  let mut picture = frame::Video::empty();
-  let mut delivered = Vec::new();
-  loop {
-    match dec.state.inner.receive_frame(&mut picture) {
-      Ok(()) => delivered.push(picture.data(0)[0]),
-      Err(e) if is_eagain(&e) && dec.owes() => {
-        let fed = dec.feed().expect("the candidate takes what it is owed");
-        assert!(fed.taken > 0, "a decoder that asks for input takes some");
-      }
-      Err(e) if is_eagain(&e) => break,
-      Err(e) => panic!("picture {}: {e}", delivered.len()),
-    }
-  }
-  assert_eq!(
-    delivered,
-    (0..PICTURES).map(|index| index as u8).collect::<Vec<u8>>(),
-    "every picture, in order"
-  );
-  assert_eq!(
-    dec.probe.as_ref().map(|probe| probe.fed),
-    Some(PICTURES),
-    "the whole history fed, and the candidate still on trial"
-  );
-}
-
-/// LAW: **a copy of this crate's own that an advance cannot make is
-/// surfaced as it is, the backend still to try and the history kept** — no
-/// backend charged, and no [`Error::AllBackendsFailed`].
-///
-/// A candidate is built from a copy of the probe's parameters
-/// (`try_clone_parameters`), bounded by the decoder's own limits. A bound
-/// below what the parameters weigh refuses the copy by name
-/// ([`Error::ParametersTooLarge`]), the next backend would need the same
-/// copy, and that backend has answered nothing.
-///
-/// PLANT: the copy's failure recorded as the next backend's answer and that
-/// backend taken out of the order, as a refusal to build is, turns this red
-/// at "surfaced as it is".
-#[test]
-fn a_copy_an_advance_cannot_make_keeps_the_next_backend_and_the_history() {
-  let mut dec = raw_auditioning_decoder();
-  {
-    let probe = dec.probe.as_mut().expect("on trial");
-    probe.parameters = with_extradata(raw_parameters(RAW_SIDE), 64);
-    probe.remaining_backends = vec![Backend::Cuda];
-    probe.build = VideoDecoder::software_state_for_test;
-    probe.buffered_packets = vec![raw_packet(0x11)];
-    probe.fed = 1;
-    probe.buffered_bytes = RAW_PICTURE;
-  }
-  let failed = || BackendAnswer::of_call(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
-
-  // Below what 64 bytes of extradata and its padding weigh.
-  dec.frame_limits = crate::limits::DecoderLimits::new().with_max_codec_parameter_bytes(16);
-  let answer = dec.advance_probe(failed());
-  assert!(
-    matches!(answer, Err(Error::ParametersTooLarge(_))),
-    "surfaced as it is: {answer:?}"
-  );
-  let probe = dec.probe.as_ref().expect("still on trial");
-  assert_eq!(
-    probe.remaining_backends,
-    vec![Backend::Cuda],
-    "the backend still to try"
-  );
-  assert_eq!(probe.buffered_packets.len(), 1, "the history");
-  assert!(
-    probe.attempts.is_empty(),
-    "no backend charged: {:?}",
-    probe.attempts
-  );
-
-  // With the bound back, the advance goes on to that backend.
-  dec.frame_limits = crate::limits::DecoderLimits::new();
-  dec.advance_probe(failed()).expect("installed");
-  assert_eq!(dec.backend(), Backend::Cuda, "the backend kept");
-}
-
-/// A [`BuildCandidate`] whose allocator fails while it builds: every FFmpeg
-/// allocation over 512 bytes, so the codec context
-/// (`avcodec_alloc_context3`) cannot be made — the allocator of
-/// [`a_context_an_advance_cannot_allocate_keeps_the_next_backend`].
-fn software_state_under_a_cap(
-  parameters: codec::Parameters,
-  codec: Codec,
-  backend: Backend,
-  limits: crate::limits::DecoderLimits,
-  options: crate::DecoderOptions,
-  pkt_timebase: Option<mediadecode::Timebase>,
-) -> std::result::Result<DecoderState, BuildFailure> {
-  // SAFETY: built only by that law, in `in_subprocess`'s child, alone, and
-  // the cap is lifted before this returns; `build_codec_context` checks the
-  // context it allocates.
-  unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(512) };
-  let built = VideoDecoder::software_state_for_test(
-    parameters,
-    codec,
-    backend,
-    limits,
-    options,
-    pkt_timebase,
-  );
-  mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
-  built
-}
-
-/// LAW: **a codec context this crate cannot allocate for a candidate is
-/// surfaced as it is, the backend still to try and the history kept** — no
-/// backend charged, and no [`Error::AllBackendsFailed`]. The context is this
-/// crate's own allocation, the same for every backend
-/// ([`BuildFailure::Local`]).
-///
-/// PLANT: a failure of this crate's own while the candidate is built,
-/// recorded as that backend's refusal, turns this red at "surfaced as it
-/// is".
-#[test]
-fn a_context_an_advance_cannot_allocate_keeps_the_next_backend() {
-  use mediaio_ffmpeg::test_support::in_subprocess;
-
-  in_subprocess(
-    "decoder::tests::a_context_an_advance_cannot_allocate_keeps_the_next_backend",
-    || {
-      let mut dec = raw_auditioning_decoder();
-      {
-        let probe = dec.probe.as_mut().expect("on trial");
-        probe.remaining_backends = vec![Backend::Cuda];
-        probe.buffered_packets = vec![raw_packet(0x11)];
-        probe.fed = 1;
-        probe.buffered_bytes = RAW_PICTURE;
-      }
-      let answer = dec.advance_probe_with(
-        BackendAnswer::of_call(Error::Ffmpeg(ffmpeg_next::Error::InvalidData)),
-        software_state_under_a_cap,
-      );
-      assert!(
-        matches!(
-          answer,
-          Err(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })) if errno == libc::ENOMEM
-        ),
-        "surfaced as it is: {answer:?}"
-      );
-      let probe = dec.probe.as_ref().expect("still on trial");
-      assert_eq!(
-        probe.remaining_backends,
-        vec![Backend::Cuda],
-        "the backend still to try"
-      );
-      assert_eq!(probe.buffered_packets.len(), 1, "the history");
-      assert!(
-        probe.attempts.is_empty(),
-        "no backend charged: {:?}",
-        probe.attempts
-      );
-    },
-  );
-}
-
-/// LAW: **an open whose codec context cannot be allocated answers that
-/// failure, and charges no backend** — the probe's open road, where
-/// [`a_context_an_advance_cannot_allocate_keeps_the_next_backend`] is its
-/// advance's.
-///
-/// No backend this machine has is named, so without the cap every one
-/// refuses at the open and the probe answers
-/// [`Error::AllBackendsFailed`]. Under it, the context fails first.
-///
-/// PLANT: the open recording a failure of this crate's own while it builds
-/// as that backend's answer, and going on, turns this red at "answered as
-/// it is".
-#[test]
-fn an_open_whose_context_cannot_be_allocated_charges_no_backend() {
-  use mediaio_ffmpeg::test_support::{
-    cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations,
-  };
-
-  in_subprocess(
-    "decoder::tests::an_open_whose_context_cannot_be_allocated_charges_no_backend",
-    || {
-      ffmpeg_next::init().expect("ffmpeg init");
-      let order = [Backend::Cuda, Backend::Vaapi];
-      let open = || {
-        VideoDecoder::open_probing(
-          raw_parameters(RAW_SIDE),
-          crate::limits::DecoderLimits::new(),
-          crate::DecoderOptions::new(),
-          None,
-          &order,
-        )
-      };
-      assert!(
-        matches!(open(), Err(Error::AllBackendsFailed(_))),
-        "the control: every backend refuses"
-      );
-      // SAFETY: in `in_subprocess`'s child, alone; the open checks what it
-      // allocates, and the cap is lifted as it returns.
-      unsafe { cap_ffmpeg_allocations(512) };
-      let opened = open();
-      uncap_ffmpeg_allocations();
-      assert!(
-        matches!(
-          opened,
-          Err(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })) if errno == libc::ENOMEM
-        ),
-        "answered as it is: {:?}",
-        opened.as_ref().map(|_| ())
-      );
-    },
-  );
-}
-
-/// LAW: **an open whose own copy of the parameters cannot be made answers
-/// that failure, and charges no backend** — not
-/// [`Error::AllBackendsFailed`], which is the cue for software, and which
-/// the same bound would refuse there too.
-///
-/// PLANT: the copy's failure recorded as the backend's answer and the probe
-/// going on, as before this round, turns this red at "answered as it is".
-#[test]
-fn an_open_whose_own_copy_cannot_be_made_charges_no_backend() {
-  ffmpeg_next::init().expect("ffmpeg init");
-  let opened = VideoDecoder::open_probing(
-    with_extradata(raw_parameters(RAW_SIDE), 64),
-    crate::limits::DecoderLimits::new().with_max_codec_parameter_bytes(16),
-    crate::DecoderOptions::new(),
-    None,
-    &[Backend::Cuda, Backend::Vaapi],
-  );
-  assert!(
-    matches!(opened, Err(Error::ParametersTooLarge(_))),
-    "answered as it is: {:?}",
-    opened.as_ref().map(|_| ())
-  );
-}
-
-/// LAW: **a picture commits its candidate before any limit of this crate's
-/// is applied to it**: a picture whose download would cost more than the
-/// caller's frame limit answers [`Error::HwTransferTooLarge`] from a
-/// committed decoder — never [`Error::AllBackendsFailed`], never an
-/// advance.
-///
-/// Codex R7: the replay's frame check refused a picture a candidate had
-/// produced, and recorded the refusal as the candidate's failure. The
-/// limit is the caller's; the picture is the decoder's proof.
-///
-/// The limit is lowered once VideoToolbox has opened and declared its
-/// surface pool under the default. `get_format` prices that pool against
-/// the budget its callback state holds, so the picture is decoded and
-/// reaches the transfer judge, which reads the decoder's limits
-/// ([`judge_hw_transfer`]). VideoToolbox prices the two alike — its
-/// downloads offer the pool's own layout alone (`vt_transfer_get_formats`,
-/// `libavutil/hwcontext_videotoolbox.c` 327–340 in FFmpeg 9.0.1) — so a
-/// limit set at the open is met at the pool instead; a backend whose
-/// downloads offer a wider layout than its pool meets it here. The control
-/// decodes the same picture under the default.
-///
-/// PLANT: the judge's refusal advancing the probe, as a candidate's
-/// failure, turns this red at "from a committed decoder".
-#[cfg(target_vendor = "apple")]
-#[test]
-#[ignore = "decodes VP9 on VideoToolbox, which a virtual machine may not offer"]
-fn on_videotoolbox_a_picture_over_the_frame_limit_is_a_committed_decoders_error() {
-  ffmpeg_next::init().expect("ffmpeg init");
-  let opened = || {
-    let mut dec =
-      VideoDecoder::open(coded_parameters(AVCodecID::AV_CODEC_ID_VP9)).expect("open on the probe");
-    assert_eq!(dec.backend(), Backend::VideoToolbox);
-    send_all(&mut dec, &[coded(&VP9_KEY_FRAME)]);
-    assert_eq!(
-      dec.phase(),
-      SessionPhase::Auditioning,
-      "on trial: no picture yet"
-    );
-    dec
-  };
-  let mut frame = crate::Frame::empty().expect("frame slot");
-
-  // The control: the picture, under the default.
-  let mut dec = opened();
-  assert_eq!(
-    dec.receive_frame(&mut frame).expect("the picture"),
-    Received::Produced
-  );
-
-  // The subject: the same picture, over the limit.
-  let mut dec = opened();
-  dec.frame_limits = crate::limits::DecoderLimits::new()
-    .with_frame(crate::FrameLimits::new().with_max_frame_bytes(1024));
-  let received = dec.receive_frame(&mut frame);
-  assert!(
-    matches!(received, Err(Error::HwTransferTooLarge(_))),
-    "the caller's limit, by name, from a committed decoder: {received:?}"
-  );
-  assert_eq!(
-    dec.phase(),
-    SessionPhase::Streaming,
-    "committed on its picture"
-  );
-  assert_eq!(
-    dec.backend(),
-    Backend::VideoToolbox,
-    "the backend that decoded it"
-  );
-}
-
-/// One picture's packet, every byte `fill`, flagged `AV_PKT_FLAG_DISCARD`:
-/// edit-list pre-roll, which libavcodec decodes and whose frame it drops.
-fn discarded(fill: u8) -> Packet {
-  let mut packet = raw_packet(fill);
-  // SAFETY: `packet` owns a live `AVPacket`; `flags` is a plain `c_int`.
-  unsafe { (*packet.as_mut_ptr()).flags |= ffmpeg_next::ffi::AV_PKT_FLAG_DISCARD };
-  packet
-}
-
-/// Sends every one of `packets` to `dec`, each taken: a pre-roll packet's
-/// frame is dropped as it is decoded, so none waits to be drained.
-fn send_all(dec: &mut VideoDecoder, packets: &[Packet]) {
-  for (index, packet) in packets.iter().enumerate() {
-    // SAFETY: `raw_packet`'s, every byte written and the padding zeroed;
-    // `packets` outlives every read of it and nothing writes through it.
-    let sent = unsafe { dec.send_av_packet(packet) };
-    assert!(
-      matches!(sent, Ok(Sent::Accepted)),
-      "packet {index} of {}: {sent:?}",
-      packets.len()
-    );
-  }
-}
-
-/// LAW: **a clean end completes the candidate, whatever it was fed** —
-/// nothing at all, edit-list pre-roll alone, or a picture that decodes to
-/// no output. The candidate took the end and drained to libavcodec's own
-/// `AVERROR_EOF` with no refusal latched: a successful empty completion,
-/// never the candidate failing, and the stream ends on it.
-///
-/// PLANT: routing a clean end past the end to the candidate failing again
-/// turns this red at every feed.
-#[test]
-fn a_clean_end_completes_the_candidate_whatever_it_was_fed() {
-  let fed: [(&str, VideoDecoder, Vec<Packet>); 3] = [
-    ("nothing", auditioning_decoder(), Vec::new()),
-    ("pre-roll", raw_auditioning_decoder(), vec![discarded(0x11)]),
-    (
-      "a hidden VP9 frame",
-      auditioning_by_name("vp9", AVCodecID::AV_CODEC_ID_VP9, crate::Discard::Default),
-      vec![coded(&hidden(VP9_KEY_FRAME))],
-    ),
-  ];
-  for (what, mut dec, packets) in fed {
-    send_all(&mut dec, &packets);
-    assert_eq!(
-      dec.send_eof().expect("the end taken"),
-      Sent::Accepted,
-      "{what}"
-    );
-    assert_eq!(dec.phase(), SessionPhase::AuditioningPastEnd, "{what}");
-    let mut frame = crate::Frame::empty().expect("frame slot");
-    assert_eq!(
-      dec
-        .receive_frame(&mut frame)
-        .expect("a clean end, not a backend's failure"),
-      Received::Ended,
-      "{what}"
-    );
-    assert_eq!(
-      dec.phase(),
-      SessionPhase::Draining,
-      "{what}: the candidate is committed"
-    );
-  }
-}
-
-/// LAW: **an end after nothing but edit-list pre-roll completes the
-/// candidate at every skip level**, within the probe's 256 packets and
-/// past them.
-///
-/// libavcodec decodes a packet flagged `AV_PKT_FLAG_DISCARD` and drops its
-/// frame (`decode.c` 464–466), so a candidate fed nothing else reaches a
-/// clean end with no picture having done all it was asked. Within the
-/// ceiling the end completes it; past it, the 257th packet does, taken.
-#[test]
-fn an_end_after_pre_roll_alone_completes_the_candidate_at_every_skip_level() {
-  for skip in crate::Discard::ALL {
-    for count in [120, 300] {
-      let mut dec =
-        raw_auditioning_decoder_with(RAW_SIDE, crate::DecoderOptions::new().with_skip_frame(skip));
-      let packets: Vec<Packet> = (0..count).map(|index| discarded(index as u8)).collect();
-      send_all(&mut dec, &packets);
-      assert_eq!(
-        dec.probe.as_ref().map(|probe| probe.buffered_packets.len()),
-        (count <= MAX_PROBE_PACKETS).then_some(count),
-        "{skip}, {count}: on trial with every packet held, or committed at the ceiling"
-      );
-      assert_eq!(dec.send_eof().expect("the end taken"), Sent::Accepted);
-      let mut frame = crate::Frame::empty().expect("frame slot");
-      assert_eq!(
-        dec
-          .receive_frame(&mut frame)
-          .expect("the stream's end, not a backend's failure"),
-        Received::Ended,
-        "{skip}, {count}"
-      );
-      assert!(
-        dec.probe.is_none(),
-        "{skip}, {count}: the candidate is committed"
-      );
-    }
-  }
-}
-
-/// LAW: **at the probe's ceiling the candidate is committed once it takes
-/// the packet past it** — in packets and in bytes — with no failure claimed
-/// for a backend that has failed nothing; and the picture of that packet is
-/// the committed candidate's.
-///
-/// PLANT: the ceiling answering `AllBackendsFailed` before the packet is
-/// sent, as before this round, turns this red at "taken, and committed".
-#[test]
-fn the_ceiling_commits_the_candidate_once_it_takes_the_packet_past_it() {
-  // In packets: 256 of pre-roll held, then a picture.
-  let mut dec = raw_auditioning_decoder();
-  let preroll: Vec<Packet> = (0..MAX_PROBE_PACKETS)
-    .map(|index| discarded(index as u8))
-    .collect();
-  send_all(&mut dec, &preroll);
-  assert_eq!(
-    dec.probe.as_ref().map(|probe| probe.buffered_packets.len()),
-    Some(MAX_PROBE_PACKETS),
-    "on trial at the ceiling"
-  );
-  let past = raw_packet(0x5A);
-  // SAFETY: `raw_packet`'s, every byte written and the padding zeroed, and
-  // nothing writes through it while the decoder may still read it.
-  let sent = unsafe { dec.send_av_packet(&past) };
-  assert!(
-    matches!(sent, Ok(Sent::Accepted)),
-    "taken, and committed: {sent:?}"
-  );
-  assert_eq!(dec.phase(), SessionPhase::Streaming);
-  assert!(
-    holds_a_picture(&mut dec),
-    "its picture, the committed candidate's"
-  );
-
-  // In bytes: a history whose bytes the next packet would carry past
-  // 64 MiB.
-  let mut dec = raw_auditioning_decoder();
-  {
-    let probe = dec.probe.as_mut().expect("on trial");
-    probe.buffered_packets.push(discarded(0x22));
-    probe.fed = 1;
-    probe.buffered_bytes = MAX_PROBE_PACKET_BYTES;
-  }
-  // SAFETY: as above.
-  let sent = unsafe { dec.send_av_packet(&past) };
-  assert!(
-    matches!(sent, Ok(Sent::Accepted)),
-    "taken, and committed: {sent:?}"
-  );
-  assert_eq!(dec.phase(), SessionPhase::Streaming);
-}
-
-/// LAW: **a candidate that refuses the packet past the ceiling fails, and
-/// the next backend is tried with the whole history** — never committed
-/// before that packet's answer.
-///
-/// The candidate on trial is a rawvideo decoder of 32 × 32 pictures, so a
-/// packet of 16 × 16 is short of a picture and refused (`rawdec.c`
-/// 342–346); the probe's own parameters, from which it builds the next
-/// candidate in software, say 16 × 16. The history, held to the ceiling,
-/// is constructed as it stands: 256 packets of pre-roll.
-///
-/// PLANT: committing at the ceiling before the packet is sent, as the
-/// last round did, turns this red at "the next candidate took it":
-/// the refusal is reported plain, and no other backend is tried.
-#[test]
-fn a_candidate_that_refuses_the_packet_past_the_ceiling_fails_and_the_next_takes_the_whole_history()
-{
-  let history = || {
-    (0..MAX_PROBE_PACKETS)
-      .map(|index| discarded(index as u8))
-      .collect::<Vec<Packet>>()
-  };
-  let at_the_ceiling = |remaining: Vec<Backend>| {
-    let mut dec = raw_auditioning_decoder_with(32, crate::DecoderOptions::new());
-    let probe = dec.probe.as_mut().expect("on trial");
-    probe.parameters = raw_parameters(RAW_SIDE);
-    probe.build = VideoDecoder::software_state_for_test;
-    probe.remaining_backends = remaining;
-    probe.buffered_packets = history();
-    probe.fed = MAX_PROBE_PACKETS;
-    probe.buffered_bytes = MAX_PROBE_PACKETS * RAW_PICTURE;
-    dec
-  };
-  let past = raw_packet(0x5A);
-
-  // A backend left: it is replayed the whole history, takes the packet
-  // past the ceiling, and is committed with it.
-  let mut dec = at_the_ceiling(vec![Backend::Cuda]);
-  // SAFETY: `raw_packet`'s, every byte written and the padding zeroed, and
-  // nothing writes through it while the decoder may still read it.
-  let sent = unsafe { dec.send_av_packet(&past) };
-  assert!(
-    matches!(sent, Ok(Sent::Accepted)),
-    "the next candidate took it: {sent:?}"
-  );
-  assert_eq!(dec.backend(), Backend::Cuda, "the next candidate's");
-  assert_eq!(dec.phase(), SessionPhase::Streaming, "and committed");
-  assert!(
-    holds_a_picture(&mut dec),
-    "its picture, the committed candidate's"
-  );
-
-  // None left: the whole history comes back, with the refusal that
-  // failed the candidate, and the packet stays the caller's.
-  let mut dec = at_the_ceiling(Vec::new());
-  // SAFETY: as above.
-  let Err(Error::AllBackendsFailed(p)) = (unsafe { dec.send_av_packet(&past) }) else {
-    panic!("the candidate fails on its own refusal, and the probe exhausts");
-  };
-  assert_eq!(p.attempts().len(), 1, "{:?}", p.attempts());
-  assert!(
-    matches!(
-      *p.attempts()[0].1,
-      Error::Ffmpeg(ffmpeg_next::Error::Other { errno }) if errno == libc::EINVAL
-    ),
-    "the candidate's own refusal: {:?}",
-    p.attempts()
-  );
-  assert_eq!(
-    p.unconsumed_packets().len(),
-    MAX_PROBE_PACKETS,
-    "the whole history"
-  );
-}
-
-/// LAW: **a flush mid-probe forgets the history whole, and the ceiling
-/// counts from it**: every count the probe keeps of its history is reset
-/// with the packets ([`ProbeState::forget_history`]), and the candidate is
-/// still on trial.
-///
-/// PLANT: a flush that keeps the packets turns this red at "forgotten".
-#[test]
-fn a_flush_mid_probe_forgets_the_history_and_the_ceiling_counts_from_it() {
-  let held = |dec: &VideoDecoder| {
-    dec
-      .probe
-      .as_ref()
-      .map(|probe| (probe.buffered_packets.len(), probe.buffered_bytes))
-  };
-  let preroll = |count: usize| {
-    (0..count)
-      .map(|index| discarded(index as u8))
-      .collect::<Vec<Packet>>()
-  };
-  let mut dec = raw_auditioning_decoder();
-  send_all(&mut dec, &preroll(200));
-  assert_eq!(held(&dec), Some((200, 200 * RAW_PICTURE)));
-  dec.flush();
-  assert_eq!(held(&dec), Some((0, 0)), "forgotten, and still on trial");
-  // 256 after the flush are held: 456 since the open.
-  send_all(&mut dec, &preroll(MAX_PROBE_PACKETS));
-  assert_eq!(
-    held(&dec),
-    Some((MAX_PROBE_PACKETS, MAX_PROBE_PACKETS * RAW_PICTURE)),
-    "the ceiling counts from the flush"
-  );
-  // The 257th after it is past the ceiling, taken, and commits.
-  send_all(&mut dec, &preroll(1));
-  assert_eq!(held(&dec), None, "committed at the ceiling");
-}
-
-/// A 64 × 64 VP9 key frame, profile 0: libvpx 1.16's grey picture at its
-/// lowest quality (`ffmpeg -f lavfi -i color=c=gray:s=64x64 -frames:v 1
-/// -c:v libvpx-vp9 -crf 63 -b:v 0 -auto-alt-ref 0 -lag-in-frames 0`). Its
-/// first byte, `0x82`, holds the frame marker, profile 0, a key frame,
-/// `show_frame` 1 and no error resilience.
-const VP9_KEY_FRAME: [u8; 26] = [
-  0x82, 0x49, 0x83, 0x42, 0x00, 0x03, 0xF0, 0x03, 0xF6, 0x00, 0x38, 0x24, 0x1C, 0x19, 0x70, 0x00,
-  0x00, 0x30, 0x60, 0x00, 0x00, 0x27, 0x82, 0x70, 0x00, 0x00,
-];
-
-/// `frame` with its `show_frame` bit cleared: a hidden frame, decoded into
-/// the references and output never (`vp9.c` 1818–1821). On a key frame the
-/// header reads on unchanged past the bit (556–566).
-fn hidden(mut frame: [u8; 26]) -> [u8; 26] {
-  frame[0] &= !0b10;
-  frame
-}
-
-/// A 64 × 64 AV1 temporal unit — a temporal delimiter, a sequence header
-/// and one shown key frame — as SVT-AV1 4.2 encodes a grey picture at its
-/// lowest quality (`ffmpeg -f lavfi -i color=c=gray:s=64x64 -frames:v 1
-/// -c:v libsvtav1 -crf 63 -preset 12`).
-const AV1_KEY_FRAME: [u8; 29] = [
-  0x12, 0x00, 0x0A, 0x0B, 0x02, 0x00, 0x00, 0x05, 0x15, 0x7F, 0xFC, 0x4A, 0xF9, 0x00, 0x40, 0x32,
-  0x0C, 0x10, 0x00, 0xF3, 0x82, 0x3F, 0xFE, 0x69, 0x83, 0x00, 0x00, 0x05, 0x80,
-];
-
-/// A packet of `bytes`, every byte written and the padding zeroed.
-fn coded(bytes: &[u8]) -> Packet {
-  crate::boundary::try_packet_copy(bytes).expect("a submittable packet")
-}
-
-/// Codec parameters naming `id` video of 64 × 64 pixels, and nothing more.
-fn coded_parameters(id: AVCodecID) -> codec::Parameters {
-  let mut parameters = codec::Parameters::new();
-  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; every
-  // field written is a plain scalar.
-  unsafe {
-    let raw = parameters.as_mut_ptr();
-    (*raw).codec_type = AVMediaType::AVMEDIA_TYPE_VIDEO;
-    (*raw).codec_id = id;
-    (*raw).width = 64;
-    (*raw).height = 64;
-  }
-  parameters
-}
-
-/// A decoder on trial with no backend left to advance to, over
-/// libavcodec's decoder `name` for `id`, its `skip_frame` at `skip`; or
-/// `None` where this FFmpeg links no decoder of that name.
-fn maybe_auditioning_by_name(
-  name: &str,
-  id: AVCodecID,
-  skip: crate::Discard,
-) -> Option<VideoDecoder> {
-  ffmpeg_next::init().expect("ffmpeg init");
-  let codec = ffmpeg_next::decoder::find_by_name(name)?;
-  Some(
-    VideoDecoder::from_software_for_test_as(
-      coded_parameters(id),
-      codec,
-      crate::limits::DecoderLimits::default(),
-      crate::DecoderOptions::new().with_skip_frame(skip),
-      /*auditioning=*/ true,
-    )
-    .expect("a software-backed candidate on trial"),
-  )
-}
-
-/// [`maybe_auditioning_by_name`], for a decoder every FFmpeg build links.
-fn auditioning_by_name(name: &str, id: AVCodecID, skip: crate::Discard) -> VideoDecoder {
-  maybe_auditioning_by_name(name, id, skip).unwrap_or_else(|| panic!("FFmpeg links {name}"))
-}
-
-/// Asks `dec` for pictures until it says otherwise, and answers how many
-/// came and what it said then.
-fn pictures(dec: &mut VideoDecoder) -> (usize, Result<Received>) {
-  let mut frame = crate::Frame::empty().expect("frame slot");
-  let mut count = 0;
-  loop {
-    match dec.receive_frame(&mut frame) {
-      Ok(Received::Produced) => count += 1,
-      other => return (count, other),
-    }
-  }
-}
-
-/// Whether the candidate's own decoder has a picture to give: libavcodec's
-/// answer, read short of this crate's transfer, which a software
-/// candidate's CPU frame cannot cross
-/// (`a_candidate_is_replayed_the_history_itself_and_it_is_released_before_it_goes_back`).
-fn holds_a_picture(dec: &mut VideoDecoder) -> bool {
-  let mut picture = frame::Video::empty();
-  dec.state.inner.receive_frame(&mut picture).is_ok()
-}
-
-/// LAW: **a VP9 stream of hidden frames ends the trial in a clean, empty
-/// completion, at every skip level** — and a shown one gives its picture at
-/// every level, `All` among them: FFmpeg 9.0.1's VP9 decoder reads no
-/// `skip_frame` at all, so no level foretells what it gives.
-///
-/// A software candidate's picture cannot cross this crate's transfer
-/// (`a_candidate_is_replayed_the_history_itself_and_it_is_released_before_it_goes_back`),
-/// so the shown one is read from libavcodec ([`holds_a_picture`]).
-///
-/// A hidden frame is decoded into the references and never output
-/// (`vp9.c` 1818–1821): a candidate fed one alone has done all it was
-/// asked when its end comes.
-///
-/// PLANT: routing a clean end past the end to the candidate failing again
-/// turns this red at "hidden".
-#[test]
-fn a_hidden_vp9_frame_ends_the_trial_cleanly_at_every_skip_level() {
-  for skip in crate::Discard::ALL {
-    let mut dec = auditioning_by_name("vp9", AVCodecID::AV_CODEC_ID_VP9, skip);
-    send_all(&mut dec, &[coded(&hidden(VP9_KEY_FRAME))]);
-    assert_eq!(dec.send_eof().expect("the end taken"), Sent::Accepted);
-    let (count, end) = pictures(&mut dec);
-    assert!(
-      count == 0 && matches!(end, Ok(Received::Ended)),
-      "{skip}, hidden: {count} pictures, then {end:?}"
-    );
-    assert_eq!(dec.phase(), SessionPhase::Draining, "{skip}: committed");
-
-    let mut dec = auditioning_by_name("vp9", AVCodecID::AV_CODEC_ID_VP9, skip);
-    send_all(&mut dec, &[coded(&VP9_KEY_FRAME)]);
-    assert!(holds_a_picture(&mut dec), "{skip}, shown: its picture");
-  }
-}
-
-/// LAW: **the native AV1 decoder answers for itself under every skip
-/// level**, and the probe takes its answer, never the level's.
-///
-/// It reads `NonIntra`, `NonKey` and `All` alone, before it asks for a
-/// pixel format (`av1dec.c` 1166–1171, 1173–1179), and it decodes nothing
-/// without a hardware accelerator: asked for a format in software, it
-/// answers `ENOSYS` (677–682). So a key frame under `All` is skipped, and
-/// the end completes the candidate cleanly; under every other level, the
-/// key frame — key and intra, so `NonKey` and `NonIntra` keep it — reaches
-/// that answer, and the candidate fails on its own error.
-#[test]
-fn the_native_av1_decoder_answers_for_itself_under_every_skip_level() {
-  for skip in crate::Discard::ALL {
-    let mut dec = auditioning_by_name("av1", AVCodecID::AV_CODEC_ID_AV1, skip);
-    let tu = coded(&AV1_KEY_FRAME);
-    // SAFETY: `coded`'s, every byte written and the padding zeroed, and
-    // nothing writes through it while the decoder may still read it.
-    let sent = unsafe { dec.send_av_packet(&tu) };
-    if skip == crate::Discard::All {
-      assert!(matches!(sent, Ok(Sent::Accepted)), "{skip}: {sent:?}");
-      assert_eq!(dec.send_eof().expect("the end taken"), Sent::Accepted);
-      let (count, end) = pictures(&mut dec);
-      assert!(
-        count == 0 && matches!(end, Ok(Received::Ended)),
-        "{skip}: {count} pictures, then {end:?}"
-      );
-      assert_eq!(dec.phase(), SessionPhase::Draining, "{skip}: committed");
-    } else {
-      let Err(Error::AllBackendsFailed(p)) = sent else {
-        panic!("{skip}: the candidate fails on its own error, got {sent:?}");
-      };
-      assert!(
-        matches!(
-          p.attempts(),
-          [(_, error)] if matches!(
-            **error,
-            Error::Ffmpeg(ffmpeg_next::Error::Other { errno }) if errno == libc::ENOSYS
-          )
-        ),
-        "{skip}: {:?}",
-        p.attempts()
-      );
-    }
-  }
-}
-
-/// LAW: **`libdav1d` gives its key picture under every skip level, `All`
-/// among them**: it decodes key frames alone under `NonKey` and `All`
-/// alike (`libdav1d.c` 236–243). `All` is no promise that no picture
-/// comes, and a shortcut that took it for one was wrong here too.
-///
-/// Where this FFmpeg links no `libdav1d` (the CI build does not), the law
-/// has nothing to stand on and says so.
-#[test]
-fn libdav1d_gives_its_key_picture_under_every_skip_level() {
-  for skip in crate::Discard::ALL {
-    let Some(mut dec) = maybe_auditioning_by_name("libdav1d", AVCodecID::AV_CODEC_ID_AV1, skip)
-    else {
-      eprintln!("skip: this FFmpeg links no libdav1d");
-      return;
-    };
-    send_all(&mut dec, &[coded(&AV1_KEY_FRAME)]);
-    assert_eq!(dec.send_eof().expect("the end taken"), Sent::Accepted);
-    assert!(holds_a_picture(&mut dec), "{skip}: its key picture");
-  }
-}
-
-/// LAW: **on VideoToolbox, a VP9 stream of hidden frames ends cleanly on
-/// the hardware decoder at every skip level** — the standalone probe, and
-/// the stream decoder's `Auto`, which stays on hardware — and a shown one
-/// gives its picture there.
-///
-/// VideoToolbox's VP9 decoder declines a 16 × 16 picture, so the frames
-/// are 64 × 64; and a virtual machine may offer no VP9 decoder at all, so
-/// the law runs where one is asked for.
-#[cfg(target_vendor = "apple")]
-#[test]
-#[ignore = "decodes VP9 on VideoToolbox, which a virtual machine may not offer"]
-fn on_videotoolbox_a_hidden_vp9_frame_ends_cleanly_at_every_skip_level() {
-  use mediadecode::decoder::VideoStreamDecoder;
-
-  ffmpeg_next::init().expect("ffmpeg init");
-  let timebase = mediadecode::Timebase::new(1, core::num::NonZeroI32::new(25).expect("non-zero"));
-  for skip in crate::Discard::ALL {
-    let options = crate::DecoderOptions::new().with_skip_frame(skip);
-    for (what, frame, shown) in [
-      ("hidden", hidden(VP9_KEY_FRAME), 0),
-      ("shown", VP9_KEY_FRAME, 1),
-    ] {
-      let mut dec = VideoDecoder::open_from(
-        VideoDecoderOpen::new().with_options(options),
-        coded_parameters(AVCodecID::AV_CODEC_ID_VP9),
-      )
-      .expect("open on the probe");
-      send_all(&mut dec, &[coded(&frame)]);
-      assert_eq!(dec.send_eof().expect("the end taken"), Sent::Accepted);
-      let (count, end) = pictures(&mut dec);
-      assert!(
-        count == shown && matches!(end, Ok(Received::Ended)),
-        "{skip}, {what}: {count} pictures, then {end:?}"
-      );
-      assert_eq!(dec.backend(), Backend::VideoToolbox, "{skip}, {what}");
-      assert_eq!(dec.phase(), SessionPhase::Draining, "{skip}, {what}");
-
-      let mut auto = crate::FfmpegOwnedVideoStreamDecoder::open_from(
-        crate::VideoStreamDecoderOpen::new().with_options(options),
-        coded_parameters(AVCodecID::AV_CODEC_ID_VP9),
-        timebase,
-        crate::limits::DecoderLimits::default(),
-      )
-      .expect("open on Auto");
-      let packet = mediadecode::packet::VideoPacket::new(
-        crate::FfmpegBytes::try_copy_from_slice(&frame).expect("the packet's bytes"),
-        crate::extras::VideoPacketExtra::new(0),
-      )
-      .with_pts(Some(mediadecode::Timestamp::new(0, timebase)));
-      assert_eq!(auto.send_packet(&packet).expect("taken"), Sent::Accepted);
-      assert_eq!(auto.send_eof().expect("the end taken"), Sent::Accepted);
-      let mut picture = crate::empty_owned_video_frame();
-      let mut count = 0;
-      while let Received::Produced = auto.receive_frame(&mut picture).expect("decode cleanly") {
-        count += 1;
-      }
-      assert_eq!(count, shown, "{skip}, {what}: Auto");
-      assert!(
-        !auto.is_software(),
-        "{skip}, {what}: Auto stays on hardware"
-      );
-    }
-  }
-}
-
-/// LAW: **dropping a packet before the decoder can move a later frame's
-/// best-effort timestamp, and never its pts** — which is why
-/// [`DISPOSABLE`](mediadecode::packet::PacketFlags::DISPOSABLE) promises a
-/// later picture's pixels and not its best-effort timestamp.
-///
-/// libavcodec guesses the best-effort timestamp from counts kept across
-/// every frame it outputs (`guess_correct_pts`, `libavcodec/decode.c`
-/// 296–319), whatever marked a packet: three rawvideo pictures at
-/// (pts, dts) (10, 0), (10, 1) and (100, 2), the second repeating the
-/// first's pts, count one faulty pts against no faulty dts, so the third's
-/// guess is its dts, 2. Dropped before the decoder, the second counts
-/// nothing, and the third's guess is its pts, 100. Its pts is 100 either
-/// way.
-#[test]
-fn dropping_a_packet_can_move_a_later_best_effort_timestamp_and_never_a_pts() {
-  // (pts, best-effort timestamp) of each picture decoded from `stamps`.
-  let decoded = |stamps: &[(i64, i64)]| -> Vec<(Option<i64>, i64)> {
-    let mut dec = VideoDecoder::from_software_for_test(
-      raw_parameters(RAW_SIDE),
-      crate::limits::DecoderLimits::default(),
-      /*auditioning=*/ false,
-    )
-    .expect("a software-backed rawvideo decoder");
-    stamps
-      .iter()
-      .map(|&(pts, dts)| {
-        let mut packet = raw_packet(0x33);
-        packet.set_pts(Some(pts));
-        packet.set_dts(Some(dts));
-        dec.state.inner.send_packet(&packet).expect("taken");
-        let mut picture = frame::Video::empty();
-        dec
-          .state
-          .inner
-          .receive_frame(&mut picture)
-          .expect("its picture");
-        // SAFETY: `picture` owns a live frame libavcodec just wrote;
-        // `best_effort_timestamp` is a plain `int64_t`.
-        let guess = unsafe { (*picture.as_ptr()).best_effort_timestamp };
-        (picture.pts(), guess)
-      })
-      .collect()
-  };
-  let kept = decoded(&[(10, 0), (10, 1), (100, 2)]);
-  let dropped = decoded(&[(10, 0), (100, 2)]);
-  assert_eq!(kept[2], (Some(100), 2), "the second decoded: {kept:?}");
-  assert_eq!(
-    dropped[1],
-    (Some(100), 100),
-    "the second dropped: {dropped:?}"
   );
 }

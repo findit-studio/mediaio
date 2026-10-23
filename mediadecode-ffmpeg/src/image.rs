@@ -60,14 +60,6 @@
 //! reset between calls rather than reopened: a container with a dozen
 //! cover images (Matroska attachments, timed thumbnails exported by
 //! hand) decodes them through one decoder.
-//!
-//! # No `DecoderOptions`
-//!
-//! The context opens with libavcodec's own `skip_frame`,
-//! `skip_loop_filter` and `skip_idct`, and this decoder takes no
-//! [`DecoderOptions`](crate::DecoderOptions). A still is one packet in
-//! and one picture out, so `skip_frame` could only make it answer
-//! nothing.
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{codec::Parameters, frame};
@@ -137,10 +129,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
   ) -> Result<Self, ImageDecodeError> {
     // Use the checked codec-context builder — `Context::from_parameters`
     // is OOM-UB-prone (see `crate::decoder::build_codec_context`).
-    // libavcodec's own skips: see the module docs' "No `DecoderOptions`".
     let (ctx, callback_state) =
-      build_codec_context(&parameters, limits, crate::DecoderOptions::new(), None)
-        .map_err(ImageDecodeError::Decode)?;
+      build_codec_context(&parameters, limits, None).map_err(ImageDecodeError::Decode)?;
     // **Opened without ever forming a bindgen enum from FFmpeg memory.**
     // `Context::decoder().video()` looks cheap and is not: it resolves
     // the codec by reading `AVCodecParameters.codec_id` as the bindgen

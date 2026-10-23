@@ -2206,139 +2206,6 @@ fn the_software_path_opens_without_probing_anything() {
   );
 }
 
-/// **The session's open request starts at `open`'s and sets each
-/// optional**, consuming and in place alike.
-#[test]
-fn the_sessions_open_request_starts_at_opens_and_sets_each_optional() {
-  let request = VideoStreamDecoderOpen::new();
-  assert_eq!(request, VideoStreamDecoderOpen::default());
-  assert_eq!(
-    (request.path(), request.options()),
-    (DecodePath::Auto, crate::DecoderOptions::new())
-  );
-  let options = crate::DecoderOptions::new().with_skip_frame(crate::Discard::NonReference);
-  let built = request
-    .with_path(DecodePath::Software)
-    .with_options(options);
-  assert_eq!(
-    (built.path(), built.options()),
-    (DecodePath::Software, options)
-  );
-  let mut set = VideoStreamDecoderOpen::new();
-  set.set_path(DecodePath::Software).set_options(options);
-  assert_eq!(set, built);
-}
-
-/// The three skips the session's active decoder context holds, raw: the
-/// hardware decoder's, or the software one's.
-fn session_skips(dec: &FfmpegVideoStreamDecoder) -> (i32, i32, i32) {
-  match &dec.state {
-    DecodeState::Hw(hw) => hw
-      .as_video_decoder()
-      .expect("the real hardware decoder, not a fake")
-      .skips_for_test(),
-    // SAFETY: `sw.decoder` owns a live, opened context for this borrow.
-    DecodeState::Sw(sw) => unsafe { crate::decoder::skips_of(sw.decoder.as_ptr()) },
-  }
-}
-
-/// **The session's open request reaches every context the session
-/// opens**, on every road, and is reported by `options()`:
-///
-/// - the software path;
-/// - `Auto` with no backend to probe, which opens software at once;
-/// - the probe-era fallback, after a hardware probe exhausts before its
-///   first picture;
-/// - on Apple targets, `Auto`, `AnyHardware` and the pin over
-///   VideoToolbox, which opens a context without asking for hardware.
-///
-/// `open` and `open_as` name no options and leave libavcodec's defaults.
-#[test]
-fn the_sessions_request_reaches_every_context_it_opens() {
-  let (w, h) = (64u32, 48u32);
-  let clip = encode_synthetic_clip(w, h, 8, 4);
-  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
-  // A different value in each skip, so a setting written into another's
-  // field is seen.
-  let options = crate::DecoderOptions::new()
-    .with_skip_frame(crate::Discard::NonReference)
-    .with_skip_loop_filter(crate::Discard::All)
-    .with_skip_idct(crate::Discard::NonKey);
-  let named = ((8, 48, 32), options);
-  let request = |path| {
-    VideoStreamDecoderOpen::new()
-      .with_path(path)
-      .with_options(options)
-  };
-  let read = |dec: &FfmpegVideoStreamDecoder| (session_skips(dec), dec.options());
-
-  let software = FfmpegVideoStreamDecoder::open_from(
-    request(DecodePath::Software),
-    clip.parameters.clone(),
-    tb,
-    DecoderLimits::default(),
-  )
-  .expect("the software path opens");
-  assert!(software.is_software());
-  assert_eq!(read(&software), named, "the software path");
-
-  let at_once = FfmpegVideoStreamDecoder::open_from_in(
-    request(DecodePath::Auto),
-    clip.parameters.clone(),
-    tb,
-    DecoderLimits::default(),
-    &[],
-  )
-  .expect("Auto opens software where no hardware backend exists");
-  assert!(at_once.is_software());
-  assert_eq!(read(&at_once), named, "Auto with no backend");
-
-  // A probe that takes the first packet into its history and exhausts on
-  // the second: the session falls back, replaying the first.
-  let mut fallen = FfmpegVideoStreamDecoder::from_hw_inner_for_test_from(
-    Box::new(FakeHw::failing(w, h, 0, 1)),
-    request(DecodePath::Auto),
-    clip.parameters.clone(),
-    tb,
-  )
-  .expect("build a test decoder");
-  crate::accepted(fallen.send_packet(&pushed(&clip, 0)), "send_packet");
-  assert!(fallen.is_hardware(), "still on the probe");
-  crate::accepted(fallen.send_packet(&pushed(&clip, 1)), "send_packet");
-  assert!(fallen.is_software(), "the probe's exhaustion fell back");
-  assert_eq!(read(&fallen), named, "the probe-era fallback");
-
-  #[cfg(target_vendor = "apple")]
-  for path in [
-    DecodePath::Auto,
-    DecodePath::AnyHardware,
-    DecodePath::Hardware(Backend::VideoToolbox),
-  ] {
-    let hardware = FfmpegVideoStreamDecoder::open_from(
-      request(path),
-      clip.parameters.clone(),
-      tb,
-      DecoderLimits::default(),
-    )
-    .expect("VideoToolbox opens a context");
-    assert!(hardware.is_hardware(), "{path:?}");
-    assert_eq!(read(&hardware), named, "{path:?}");
-  }
-
-  let defaults = ((0, 0, 0), crate::DecoderOptions::new());
-  let bare = FfmpegVideoStreamDecoder::open(clip.parameters.clone(), tb, DecoderLimits::default())
-    .expect("the bare constructor opens");
-  assert_eq!(read(&bare), defaults, "open");
-  let pinned_software = FfmpegVideoStreamDecoder::open_as(
-    clip.parameters.clone(),
-    tb,
-    DecoderLimits::default(),
-    DecodePath::Software,
-  )
-  .expect("the software path opens");
-  assert_eq!(read(&pinned_software), defaults, "open_as");
-}
-
 /// `Auto` is the old constructor, unmoved — the promise `open_as` is
 /// built on. Both sessions are asked the same questions and answer the
 /// same way, on whatever path this machine's probe lands them.
@@ -2607,13 +2474,8 @@ struct ScriptedHw {
 impl ScriptedHw {
   fn new(parameters: &Parameters) -> Self {
     Self {
-      sw: super::open_sw_decoder(
-        parameters,
-        DecoderLimits::default(),
-        crate::DecoderOptions::new(),
-        None,
-      )
-      .expect("FFmpeg's own decoder for the stream"),
+      sw: super::open_sw_decoder(parameters, DecoderLimits::default(), None)
+        .expect("FFmpeg's own decoder for the stream"),
       failing_sends: Vec::new(),
       failing_pictures: Vec::new(),
       failing_eof: None,
@@ -3102,11 +2964,11 @@ fn any_hardware_refuses_at_open_on_a_platform_with_no_hardware_backend() {
   let clip = encode_synthetic_clip(w, h, 8, 4);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
 
-  match FfmpegVideoStreamDecoder::open_from_in(
-    VideoStreamDecoderOpen::new().with_path(DecodePath::AnyHardware),
+  match FfmpegVideoStreamDecoder::open_as_in(
     clip.parameters.clone(),
     tb,
     DecoderLimits::default(),
+    DecodePath::AnyHardware,
     &[],
   ) {
     Ok(dec) => panic!(
@@ -3132,11 +2994,11 @@ fn any_hardware_refuses_at_open_on_a_platform_with_no_hardware_backend() {
     Err(other) => panic!("expected the probe's exhaustion, got {other:?}"),
   }
 
-  let auto = FfmpegVideoStreamDecoder::open_from_in(
-    VideoStreamDecoderOpen::new(),
+  let auto = FfmpegVideoStreamDecoder::open_as_in(
     clip.parameters.clone(),
     tb,
     DecoderLimits::default(),
+    DecodePath::Auto,
     &[],
   )
   .expect("Auto opens software where no hardware backend exists");

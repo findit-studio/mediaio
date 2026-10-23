@@ -22,22 +22,6 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   to point the build. This crate now depends on `ffmpeg-sys-next` directly
   for that metadata alone, enabling no feature of it.
 
-### Added
-
-- **`options`: how a decoder decodes, beside what it may spend.**
-  `DecoderOptions` carries libavcodec's three `AVDiscard` settings —
-  `skip_frame`, `skip_loop_filter` and `skip_idct` — each a `Discard`,
-  FFmpeg's seven values (`Nothing`, `Default`, `NonReference`,
-  `Bidirectional`, `NonIntra`, `NonKey`, `All`), written and read as
-  FFmpeg's option constants (`none` … `all`, any case on reading;
-  `ParseDiscardError` for any other name). The defaults are libavcodec's.
-  `DecoderLimits` stays what a decoder may spend; these are decode
-  behaviour, and `mediadecode-ffmpeg` writes them into every video
-  `AVCodecContext` a decoder opened with them opens, through each video
-  decoder's open request (`VideoStreamDecoderOpen`, `VideoDecoderOpen`).
-  Which levels a decoder reads is the decoder's: a level is a request,
-  never a promise that no picture comes.
-
 ## [0.19.0] - 2026-10-16
 
 ### Added

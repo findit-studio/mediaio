@@ -343,19 +343,6 @@ for end-to-end demuxer-driven runs that cover all three streams.
   picture's own error; when to stop trusting a hardware session is the
   caller's policy. `is_hardware()` / `is_software()` stay the live
   reading of where a session is.
-- **Decoder options**: `DecoderOptions` — libavcodec's `skip_frame`,
-  `skip_loop_filter` and `skip_idct`, each a `Discard` (FFmpeg's
-  `AVDiscard`: `none` … `all`), written into every video codec context
-  a decoder opens. Each video decoder takes them in its open request:
-  the stream decoder through `FfmpegVideoStreamDecoder::open_from` and
-  `VideoStreamDecoderOpen`, which also names the `DecodePath`; the
-  standalone `VideoDecoder` through `VideoDecoder::open_from` and
-  `VideoDecoderOpen`, which also names the probe or a pinned backend,
-  the limits and the packet timebase. They are decode behaviour, not
-  limits: `DecoderLimits` stays what a decoder may spend. `skip_frame` is
-  not the road for a picture cadence — see the demuxer's `DISPOSABLE`
-  mark below — and on a temporally scalable HEVC stream `noref` also
-  skips pictures a higher sub-layer references.
 - **Demuxer**: `FfmpegDemuxer` — `mediadecode`'s `Demuxer` over
   `libavformat`, opened from a path (`open`) or from any
   `Read + Seek` byte source through a custom `AVIOContext`

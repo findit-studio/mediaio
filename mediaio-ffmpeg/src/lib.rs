@@ -36,7 +36,6 @@ pub mod frame;
 pub mod limits;
 #[doc(hidden)]
 pub mod measured;
-pub mod options;
 mod pixdesc;
 #[doc(hidden)]
 pub mod reader_guard;
@@ -91,7 +90,6 @@ pub use limits::{
   DEFAULT_MAX_TOTAL_CODEC_PARAMETER_BYTES, DEFAULT_MAX_TOTAL_STREAM_METADATA_BYTES, DecoderLimits,
   DemuxLimits, FrameLimits, PacketLimits,
 };
-pub use options::{DecoderOptions, Discard, ParseDiscardError};
 #[cfg(feature = "resample")]
 #[cfg_attr(docsrs, doc(cfg(feature = "resample")))]
 pub use resampler::{
