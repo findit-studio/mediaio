@@ -3223,3 +3223,76 @@ fn l38_a_video_track_over_audio_parameters_is_refused_at_open() {
   );
   assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
 }
+
+/// One ADTS frame of AAC LC at 48 kHz whose channels are its program
+/// config element's — channel configuration 0 — no CRC, `payload` after
+/// its header.
+fn adts_with(payload: &[u8]) -> Vec<u8> {
+  let len = 7 + payload.len();
+  let fields: [(u64, u32); 15] = [
+    (0xFFF, 12),
+    (0, 1),
+    (0, 2),
+    (1, 1),
+    (1, 2),
+    (3, 4),
+    (0, 1),
+    (0, 3),
+    (0, 1),
+    (0, 1),
+    (0, 1),
+    (0, 1),
+    (len as u64, 13),
+    (0x7FF, 11),
+    (0, 2),
+  ];
+  let header = fields
+    .iter()
+    .fold(0u64, |bits, &(value, width)| (bits << width) | value);
+  [&header.to_be_bytes()[1..], payload].concat()
+}
+
+/// A program config element naming no element and no comment: its element
+/// id 5, tag 0, AAC LC at sample rate index 3, every count zero, no
+/// mixdown, the byte alignment and a comment of no bytes — six bytes.
+const BARE_PCE: [u8; 6] = [0xA0, 0x98, 0, 0, 0, 0];
+
+/// **L39 — a first ADTS frame whose program config element runs past its
+/// payload, or ends it, is refused by name, the packet untouched** (table
+/// F of the census): `aac_adtstoasc` consumes the element with no check
+/// that it fits and leaves the packet a negative size, or an empty one
+/// (`aac_adtstoasc.c` 80–95 in FFmpeg 9.0.1). Into MP4 and Matroska, over
+/// a transport stream's AAC track, which states no configuration: an
+/// element cut a byte short, and one with nothing after it, are refused;
+/// the whole element with its raw data after it is converted.
+///
+/// PLANT: reading the element's id alone, as before, admits the cut one.
+#[test]
+fn l39_a_truncated_program_config_element_is_refused() {
+  let Some(corpus) = Corpus::new() else { return };
+  let ts = corpus.transport_stream();
+  let (_, frames) = first_track(&ts, TrackKind::Audio, 1);
+  let frame = audio_of(&frames[0]);
+  for (container, name) in [
+    (ContainerName::MP4, "l39.mp4"),
+    (ContainerName::MATROSKA, "l39.mkv"),
+  ] {
+    let mut muxer = muxer_into(
+      &output(&corpus, name),
+      container.clone(),
+      table_of(&ts, TrackKind::Audio),
+    );
+    for element in [&BARE_PCE[..5], &BARE_PCE[..]] {
+      let cut = audio_at(&audio_holding(&frame, &adts_with(element)), 0);
+      let (refusal, back) = by_container(muxer.write_audio(cut.clone()));
+      assert_eq!(refusal, payload(PayloadRule::AdtsFrame), "{container}");
+      untouched!(cut, back);
+    }
+    let whole = [&BARE_PCE[..], &[0x21, 0x10, 0x05]].concat();
+    muxer
+      .write_audio(audio_at(&audio_holding(&frame, &adts_with(&whole)), 0))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a whole element, its raw data after it");
+    muxer.finish().expect("finished");
+  }
+}

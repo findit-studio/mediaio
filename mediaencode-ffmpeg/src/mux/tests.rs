@@ -797,10 +797,98 @@ fn an_adts_frame_is_one_the_automatic_filter_converts_whole() {
     "nothing after the header"
   );
   // A first frame whose channels are its program config element's opens
-  // its payload with one, element id 5; a later frame is not asked.
-  assert!(adts_frame(&adts(20, false, 3, 0, 0, 0b1010_0000), true));
-  assert!(!adts_frame(&adts(20, false, 3, 0, 0, 0x21), true));
+  // its payload with one, element id 5, whole and with bytes after it; a
+  // later frame is not asked.
+  let with = |payload: &[u8]| {
+    let mut frame = adts(7 + payload.len(), false, 3, 0, 0, 0);
+    frame[7..].copy_from_slice(payload);
+    frame
+  };
+  let element = pce(&[], b"");
+  assert_eq!(pce_span(&element), Some(element.len()));
+  assert!(adts_frame(
+    &with(&[element.as_slice(), &[0x21; 6]].concat()),
+    true
+  ));
+  assert!(
+    !adts_frame(&with(&element), true),
+    "a program config element that ends the payload leaves it empty"
+  );
+  assert!(
+    !adts_frame(&with(&element[..element.len() - 1]), true),
+    "one that runs past it"
+  );
+  let commented = pce(&[], b"a comment of 22 bytes.");
+  assert!(
+    !adts_frame(
+      &with(&[&commented[..commented.len() - 4], &[0x21; 3]].concat()),
+      true
+    ),
+    "a comment longer than what is left"
+  );
+  assert!(adts_frame(
+    &with(&[commented.as_slice(), &[0x21]].concat()),
+    true
+  ));
+  assert!(
+    !adts_frame(&adts(20, false, 3, 0, 0, 0x21), true),
+    "no element id 5"
+  );
   assert!(adts_frame(&adts(20, false, 3, 0, 0, 0x21), false));
+}
+
+/// A program config element, as AAC writes one into a raw data block: its
+/// element id, tag 0, AAC LC at sample rate index 3, the front, side,
+/// back, LFE, data and coupling elements `counts` names — each written as
+/// zeros — no mixdown, the byte alignment, then `comment`.
+fn pce(counts: &[u32], comment: &[u8]) -> Vec<u8> {
+  fn put(bits: &mut Vec<bool>, value: u64, width: u32) {
+    for bit in (0..width).rev() {
+      bits.push(value >> bit & 1 == 1);
+    }
+  }
+  let mut bits: Vec<bool> = Vec::new();
+  put(&mut bits, 5, 3);
+  put(&mut bits, 0, 4);
+  put(&mut bits, 1, 2);
+  put(&mut bits, 3, 4);
+  // Front, side, back (4 bits), LFE (2), data (3), coupling (4).
+  let widths = [4, 4, 4, 2, 3, 4];
+  let mut elements = 0;
+  for (index, width) in widths.into_iter().enumerate() {
+    let count = counts.get(index).copied().unwrap_or(0);
+    put(&mut bits, u64::from(count), width);
+    elements += count * if index == 3 || index == 4 { 4 } else { 5 };
+  }
+  put(&mut bits, 0, 3);
+  for _ in 0..elements {
+    bits.push(false);
+  }
+  while bits.len() % 8 != 0 {
+    bits.push(false);
+  }
+  put(&mut bits, comment.len() as u64, 8);
+  for &byte in comment {
+    put(&mut bits, u64::from(byte), 8);
+  }
+  bits
+    .chunks(8)
+    .map(|byte| byte.iter().fold(0u8, |acc, &bit| acc << 1 | u8::from(bit)))
+    .collect()
+}
+
+/// **A program config element's span is read as the filter reads it**:
+/// through every element its counts name, the byte alignment and its
+/// comment.
+#[test]
+fn a_program_config_elements_span_is_read_as_the_filter_reads_it() {
+  // 37 bits before the elements, then 5 front elements of 5 bits and 2
+  // LFE ones of 4: 70 bits, aligned to 72; then the comment's size, and
+  // its 3 bytes.
+  let element = pce(&[5, 0, 0, 2], b"abc");
+  assert_eq!(element.len(), 9 + 1 + 3);
+  assert_eq!(pce_span(&element), Some(13));
+  assert_eq!(pce_span(&[0x21, 0, 0]), None, "element id 1");
 }
 
 /// **VP9's hidden frames are held and joined as the superframe filter holds

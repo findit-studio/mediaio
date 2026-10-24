@@ -179,6 +179,23 @@
 //! | data | data | data, or none |
 //! | attachment | attachment; or video — an attached picture, as libavformat's demuxers deliver cover art (`ff_add_attached_pic`, `demux_utils.c` 107–140), which MP4's cover road and Matroska's attachment road both take | any: the codec names the file |
 //! | unknown | refused by its own name ([`MuxOpenError::UnknownTrackKind`]) | — |
+//!
+//! ## F. AAC's program config element
+//!
+//! MP4's and Matroska's AAC with no configuration, the automatic filters
+//! on: `aac_adtstoasc` makes the track's configuration from its first
+//! frame, and where that frame's channel configuration is 0, from the
+//! program config element opening its payload — which it consumes with
+//! no check that it fits (`aac_adtstoasc.c` 80–95; `mpeg4audio_copy_pce.h`
+//! 38–67). Its reader reads zeros past the packet, inside the padding
+//! every packet carries, so nothing is read out of bounds; what it leaves
+//! is the packet's size less the span it read.
+//!
+//! | what the filter reads | what it assumes | here ([`PayloadRule::AdtsFrame`]) |
+//! |---|---|---|
+//! | the element id, 3 bits | 5, a program config element | refused otherwise |
+//! | the element — its tag, object type and sampling index, the front, side, back, LFE, data and coupling counts, the three mixdowns, 5 bits for each front, side, back and coupling element and 4 for each LFE and data one — then the byte alignment, the comment's size and its bytes | that the span fits the payload: past it, the packet is left a negative size, written so | the span bound-parsed as the filter reads it ([`pce_span`]), refused where it runs past the payload |
+//! | the raw data after it | that some is left: a span that ends the payload leaves an empty packet | refused where nothing is left |
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -805,10 +822,12 @@ pub enum PayloadRule {
   /// its sync word, a sample rate the table names, a frame length of at
   /// least its header and the packet's own, no CRC over several raw data
   /// blocks, bytes after the header and its CRC and, on the track's first
-  /// frame, a channel configuration or a program config element opening
-  /// its payload. The filter refuses any other after taking it
-  /// (`aac_adtstoasc.c` 39–128; `adts_header.c` 30–74), or, of a packet
-  /// longer than its frame, strips the first header alone (70–73).
+  /// frame, a channel configuration, or a program config element opening
+  /// its payload whole with bytes after it. The filter refuses any other
+  /// after taking it (`aac_adtstoasc.c` 39–128; `adts_header.c` 30–74),
+  /// or, of a packet longer than its frame, strips the first header alone
+  /// (70–73), or, of a program config element running past its payload,
+  /// writes the packet at a negative size (94–95).
   #[error("the packet is not one ADTS frame the automatic filter converts whole")]
   AdtsFrame,
   /// MP4 PCM: not a whole number of frames — channels times bytes per
@@ -1658,7 +1677,8 @@ impl Filter {
 /// the first header alone (70–73); no CRC over several raw data blocks
 /// (63–68); bytes after the header and its CRC (70–72); and, on the
 /// track's `first` frame, a channel configuration, or a program config
-/// element — element id 5 — opening the payload (80–90).
+/// element opening the payload, whole, with bytes after it
+/// ([`pce_span`]; table F of the census, see [the module](self)).
 fn adts_frame(bytes: &[u8], first: bool) -> bool {
   let mut bits = Bits { bytes, at: 0 };
   if bytes.len() < 7 || bits.read(12) != 0xFFF {
@@ -1685,7 +1705,48 @@ fn adts_frame(bytes: &[u8], first: bool) -> bool {
     && frame_length == bytes.len()
     && (crc_absent || blocks == 0)
     && bytes.len() > header
-    && !(first && channels == 0 && bytes[header] >> 5 != 5)
+    && !(first
+      && channels == 0
+      && !pce_span(&bytes[header..]).is_some_and(|span| span < bytes.len() - header))
+}
+
+/// The bytes the program config element opening `payload` spans — its
+/// element id, the element and its comment, through the byte alignment
+/// before the comment — read as `aac_adtstoasc` and `ff_copy_pce_data`
+/// read it (`aac_adtstoasc.c` 80–95; `mpeg4audio_copy_pce.h` 38–67 in
+/// FFmpeg 9.0.1), or `None` where the payload opens with another element
+/// than one, element id 5. The filter consumes exactly this span and no
+/// more, with no check that it fits: a span past the payload leaves the
+/// packet a negative size, and one that ends it leaves it empty (94–95),
+/// so a first frame is converted whole only where the span is shorter
+/// than its payload.
+fn pce_span(payload: &[u8]) -> Option<usize> {
+  let mut bits = Bits {
+    bytes: payload,
+    at: 0,
+  };
+  if bits.read(3) != 5 {
+    return None;
+  }
+  // The element's tag, object type and sampling index.
+  bits.skip(10);
+  // Front, side and back elements, then LFE, data and coupling ones: five
+  // bits each but LFE's and data's, four.
+  let mut five_bit = bits.read(4) + bits.read(4) + bits.read(4);
+  let four_bit = bits.read(2) + bits.read(3);
+  five_bit += bits.read(4);
+  // The mono, stereo and matrix mixdowns, each flagged.
+  for width in [4, 4, 3] {
+    if bits.read(1) == 1 {
+      bits.skip(width);
+    }
+  }
+  bits.skip(usize::try_from(five_bit * 5 + four_bit * 4).ok()?);
+  // `align_get_bits`, over the reader that opened at the payload.
+  bits.at = bits.at.div_ceil(8) * 8;
+  let comment = usize::try_from(bits.read(8)).ok()?;
+  bits.skip(comment * 8);
+  Some(bits.at / 8)
 }
 
 /// What VP9's automatic filter does with a packet of `bytes`, given the

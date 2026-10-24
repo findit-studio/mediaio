@@ -87,6 +87,12 @@ crate moves only when it changes.
   packed code does not unpack to itself, reported; no flag the report
   names as dropped handed to libavformat, so MP4 makes no cover of a
   timed track.
+- **AAC's program config element is bound-parsed.** On MP4's and
+  Matroska's AAC with no configuration, the first ADTS frame whose
+  channels are its program config element's is admitted only where the
+  whole element, its comment included, ends before its payload does: the
+  automatic filter consumes it with no check, leaving a negative or empty
+  packet (`PayloadRule::AdtsFrame`).
 - **A track's kind is judged against its media type** before any stream
   is added (`MuxOpenError::MediaTypeMismatch`): a timed track's against
   its ticket's media type and its codec's own descriptor; an attachment's
