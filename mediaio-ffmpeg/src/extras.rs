@@ -1031,6 +1031,31 @@ pub enum PictureType {
   Bi,
 }
 
+/// libavcodec's name for the packet side-data type `kind` — `"New
+/// Extradata"`, `"Skip Samples"` — or `None` where this build names no
+/// such type (`av_packet_side_data_name`).
+///
+/// Asked as the integer the type is on the wire, never formed into
+/// `AVPacketSideDataType`, whose discriminant set is this build's: a
+/// packet from a newer demuxer may carry a type it does not name.
+pub fn packet_side_data_name(kind: i32) -> Option<&'static str> {
+  // SAFETY: the redeclared shim takes the type as a plain `c_int` and
+  // answers null or one of libavcodec's string literals, NUL-terminated
+  // and live for the process — the contract `table_text` is given. No
+  // name is longer than the bound.
+  unsafe {
+    crate::ffi::table_text(
+      crate::ffi::c_shims::av_packet_side_data_name(kind),
+      PACKET_SIDE_DATA_NAME_MAX_BYTES,
+    )
+  }
+}
+
+/// Bound on the NUL search in [`packet_side_data_name`]: libavcodec's
+/// longest name is under fifty bytes, and the bound only keeps a skewed
+/// table from turning the walk into an unbounded read.
+const PACKET_SIDE_DATA_NAME_MAX_BYTES: usize = 256;
+
 /// Raw side-data entry carrying the FFmpeg type id and the unparsed
 /// byte buffer. Type ids correspond to FFmpeg's
 /// `AV_FRAME_DATA_*` / `AV_PKT_DATA_*` constants — see
@@ -1981,6 +2006,24 @@ impl std::fmt::Debug for TrackExtra {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// **A packet side-data type is named as libavcodec names it**, asked as
+  /// the integer it is; a type this build names none of has no name.
+  #[test]
+  fn a_packet_side_data_type_is_named_as_libavcodec_names_it() {
+    use ffmpeg_next::ffi::AVPacketSideDataType as T;
+    assert_eq!(
+      packet_side_data_name(T::AV_PKT_DATA_NEW_EXTRADATA as i32),
+      Some("New Extradata")
+    );
+    assert_eq!(
+      packet_side_data_name(T::AV_PKT_DATA_SKIP_SAMPLES as i32),
+      Some("Skip Samples")
+    );
+    for unnamed in [-1, T::AV_PKT_DATA_NB as i32, i32::MAX] {
+      assert_eq!(packet_side_data_name(unnamed), None, "{unnamed}");
+    }
+  }
 
   #[test]
   fn defaults_construct() {

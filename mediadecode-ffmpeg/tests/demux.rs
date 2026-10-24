@@ -188,6 +188,41 @@ fn a_track_row_carries_its_codec_parameters_and_attachment_identity() {
   }
 }
 
+/// **The row carries the disposition the container declared**: the
+/// portable disposition is, bit for bit, the raw set the backend's
+/// extras keep — and cover art arrives marked as the attached picture it
+/// is, which is what a muxer needs to write it back as one.
+#[test]
+fn a_track_row_carries_the_containers_disposition() {
+  use mediadecode::demuxer::TrackDisposition;
+
+  let Some(corpus) = Corpus::new() else { return };
+  for path in [corpus.multi_track_mkv(), corpus.cover_art_mp3()] {
+    let demuxer = FfmpegDemuxer::open(&path).expect("open");
+    for row in demuxer.tracks() {
+      assert_eq!(
+        row.disposition().to_u32(),
+        row.extra().disposition() as u32,
+        "the portable set is the extras' raw set, for {:?}",
+        row.kind(),
+      );
+    }
+  }
+  let cover = FfmpegDemuxer::open(&corpus.cover_art_mp3()).expect("open mp3");
+  let picture = cover
+    .tracks()
+    .iter()
+    .find(|row| row.kind() == TrackKind::Attachment)
+    .expect("the cover art row");
+  assert!(
+    picture
+      .disposition()
+      .contains(TrackDisposition::ATTACHED_PIC),
+    "cover art is declared an attached picture, got {:?}",
+    picture.disposition(),
+  );
+}
+
 /// **The container word reaches a door** (issue #42) — libavformat's own
 /// identification of the bytes, on the session, in the shape a
 /// content-addressed row can store.

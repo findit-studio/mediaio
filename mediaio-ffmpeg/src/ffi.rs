@@ -936,6 +936,97 @@ pub(crate) mod c_shims {
       formats: *mut *mut c_int,
       flags: c_int,
     ) -> c_int;
+
+    /// `AVCodecID` as `c_int`: whether a muxer can store a codec — `1`
+    /// yes, `0` no, negative when the muxer cannot tell. libavformat
+    /// answers every integer (its tag tables are searched, never
+    /// indexed).
+    pub(crate) fn avformat_query_codec(
+      ofmt: *const ffmpeg_next::ffi::AVOutputFormat,
+      codec_id: c_int,
+      std_compliance: c_int,
+    ) -> c_int;
+
+    /// `AVCodecID` as `c_int`: the tag a muxer's table gives a codec,
+    /// written to `tag`; answers `0` when the table names none.
+    pub(crate) fn av_codec_get_tag2(
+      tags: *const *const ffmpeg_next::ffi::AVCodecTag,
+      id: c_int,
+      tag: *mut libc::c_uint,
+    ) -> c_int;
+
+    /// Returns `AVCodecID` as `c_int`: the codec a muxer's table names
+    /// for a tag — `AV_CODEC_ID_NONE` where none — so an id this build's
+    /// bindings do not name is never formed into the enum.
+    pub(crate) fn av_codec_get_id(
+      tags: *const *const ffmpeg_next::ffi::AVCodecTag,
+      tag: libc::c_uint,
+    ) -> c_int;
+
+    /// `AVCodecID` as `c_int`: the bits one sample of the codec takes
+    /// where its samples have a fixed size, else `0` — libavcodec answers
+    /// every integer from a `switch` over the ids it names.
+    pub(crate) fn av_get_bits_per_sample(codec_id: c_int) -> c_int;
+
+    /// `AVPacketSideDataType` as `c_int`: libavcodec's name for a packet
+    /// side-data type, or null for a type it does not name — answered for
+    /// every integer from a `switch` over the types it names
+    /// (`libavcodec/packet.c` 269–317 in FFmpeg 9.0.1). Each name is a
+    /// string literal of libavcodec's, live and unwritten for the process.
+    pub(crate) fn av_packet_side_data_name(kind: c_int) -> *const libc::c_char;
+
+    /// `libavutil/hdr_dynamic_metadata.h`, which ffmpeg-sys-next 9.0.1
+    /// binds no part of: a zeroed `AVDynamicHDRPlus` of the linked
+    /// libavutil's own size, which it writes to `size` — 0 with a failed
+    /// allocation, answered as null (`hdr_dynamic_metadata.c` 36–44 in
+    /// FFmpeg 9.0.1). The struct stays opaque here: the pointer is read as
+    /// bytes and freed with `av_free`, never formed into a Rust type.
+    pub(crate) fn av_dynamic_hdr_plus_alloc(size: *mut usize) -> *mut libc::c_void;
+
+    /// As [`av_dynamic_hdr_plus_alloc`], for `AVDynamicHDRSmpte2094App5`
+    /// (`hdr_dynamic_metadata.c` 397–405).
+    pub(crate) fn av_dynamic_hdr_smpte2094_app5_alloc(size: *mut usize) -> *mut libc::c_void;
+
+    /// Parses an ITU-T T.35 HDR10+ payload of `size` bytes into the struct
+    /// `s` points at, answering 0 or a negative code
+    /// (`hdr_dynamic_metadata.c` 59–235): it refuses a payload past
+    /// `AV_HDR_PLUS_MAX_PAYLOAD_SIZE` bytes, copies the rest into a padded
+    /// buffer of its own, and writes only the struct's fields.
+    pub(crate) fn av_dynamic_hdr_plus_from_t35(
+      s: *mut libc::c_void,
+      data: *const u8,
+      size: usize,
+    ) -> c_int;
+
+    /// As [`av_dynamic_hdr_plus_from_t35`], for SMPTE ST 2094 application
+    /// 5 (`hdr_dynamic_metadata.c` 429–561), which copies the payload into
+    /// a padded buffer of its own first.
+    pub(crate) fn av_dynamic_hdr_smpte2094_app5_from_t35(
+      s: *mut libc::c_void,
+      data: *const u8,
+      size: usize,
+    ) -> c_int;
+
+    /// Serializes the `AVDynamicHDRPlus` `s` points at into the ITU-T T.35
+    /// HDR10+ payload (`hdr_dynamic_metadata.c` 237–395): into `*data`
+    /// where it is not null and `*size` bytes hold the payload, its size
+    /// written to `*size`. It trusts every count and divisor. The laws
+    /// alone call it, as the oracle the checks are held to.
+    #[cfg(test)]
+    pub(crate) fn av_dynamic_hdr_plus_to_t35(
+      s: *const libc::c_void,
+      data: *mut *mut u8,
+      size: *mut usize,
+    ) -> c_int;
+
+    /// As [`av_dynamic_hdr_plus_to_t35`], for SMPTE ST 2094 application 5
+    /// (`hdr_dynamic_metadata.c` 563–706).
+    #[cfg(test)]
+    pub(crate) fn av_dynamic_hdr_smpte2094_app5_to_t35(
+      s: *const libc::c_void,
+      data: *mut *mut u8,
+      size: *mut usize,
+    ) -> c_int;
   }
 }
 

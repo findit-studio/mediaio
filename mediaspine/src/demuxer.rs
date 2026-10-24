@@ -24,6 +24,15 @@ use crate::{
   packet::{AudioPacket, PacketFlags, SubtitlePacket, VideoPacket},
 };
 
+/// A track's disposition: the `AV_DISPOSITION_*` hints a container
+/// declares for it — the default track of its kind, a forced subtitle
+/// track, commentary, the hearing-impaired variant, cover art.
+///
+/// `mediaframe`'s bit set, carried whole: an unnamed bit round-trips
+/// as the bit it is (`from_u32` keeps every bit), so a container's
+/// newer flag survives a backend older than it.
+pub use mediaframe::disposition::TrackDisposition;
+
 // Nothing in this module owns an allocation: the whole demux tier,
 // `Demuxer` included, is `core`-only. What a session's track table
 // costs is the backend's own choice, made at `Demuxer::TrackHandle`
@@ -803,11 +812,13 @@ pub struct TrackInfo<E: DemuxAdapter> {
   filename: Option<E::Text>,
   mime_type: Option<E::Text>,
   language: Option<E::Text>,
+  disposition: TrackDisposition,
   extra: E::TrackExtra,
 }
 
 impl<E: DemuxAdapter> TrackInfo<E> {
-  /// Constructs a `TrackInfo`. Identity metadata defaults to `None`.
+  /// Constructs a `TrackInfo`. Identity metadata defaults to `None`,
+  /// and the disposition to the empty set.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(timebase: Timebase, params: TrackParams<E>, extra: E::TrackExtra) -> Self {
     Self {
@@ -817,6 +828,7 @@ impl<E: DemuxAdapter> TrackInfo<E> {
       filename: None,
       mime_type: None,
       language: None,
+      disposition: TrackDisposition::empty(),
       extra,
     }
   }
@@ -908,6 +920,18 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   pub const fn language(&self) -> Option<&E::Text> {
     self.language.as_ref()
   }
+  /// Returns the track's disposition, as the **container declares**
+  /// it — the empty set where it declares none.
+  ///
+  /// Like [`language`](Self::language), a reading rather than a
+  /// reckoning: the bits the file wrote, carried whole (an unnamed bit
+  /// included), and never inferred — a container that marks no track
+  /// the default leaves every row without
+  /// [`TrackDisposition::DEFAULT`], whatever a player would pick.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn disposition(&self) -> TrackDisposition {
+    self.disposition
+  }
   /// Returns the backend-specific extras.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn extra(&self) -> &E::TrackExtra {
@@ -950,6 +974,13 @@ impl<E: DemuxAdapter> TrackInfo<E> {
     self.language = v;
     self
   }
+  /// Sets the container's declared disposition (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_disposition(mut self, v: TrackDisposition) -> Self {
+    self.disposition = v;
+    self
+  }
 
   /// Sets the duration in place.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -975,6 +1006,12 @@ impl<E: DemuxAdapter> TrackInfo<E> {
     self.language = v;
     self
   }
+  /// Sets the container's declared disposition in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_disposition(&mut self, v: TrackDisposition) -> &mut Self {
+    self.disposition = v;
+    self
+  }
 }
 
 // `Debug` is hand-written for the same reason as `TrackParams`'s:
@@ -996,6 +1033,7 @@ where
       .field("filename", &self.filename)
       .field("mime_type", &self.mime_type)
       .field("language", &self.language)
+      .field("disposition", &self.disposition)
       .field("extra", &self.extra)
       .finish()
   }

@@ -11,6 +11,17 @@ crate moves only when it changes.
 
 ## [Unreleased]
 
+## [0.21.1] - unreleased
+
+### Added
+
+- **The `ffmpeg` feature's write adapter is `mediaencode-ffmpeg` 0.21.1,
+  with the FFmpeg muxer** (`ffmpeg::encode`): open a container by name,
+  refusals by name, a report of what a container drops, and packets by
+  copy. `encode` is `mediaencode` 0.19.1, whose muxers refuse a packet
+  presented before it is decoded (`MuxRefusal::PtsBeforeDts`,
+  `check_presentation_order`). See their changelogs.
+
 ## [0.21.0] - 2026-10-24
 
 ### Changed

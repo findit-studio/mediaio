@@ -606,6 +606,82 @@ pub enum PacketBuildError {
   SendSideDataTooLarge(#[from] SendSideDataTooLarge),
 }
 
+/// What a builder of a packet into FFmpeg refuses that the packet alone
+/// decides, before it allocates anything ([`check_packet_build`]) — each
+/// [`PacketBuildError`]'s variant of the same name.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PacketRefusal {
+  /// The packet is marked `AV_PKT_FLAG_TRUSTED`.
+  #[error(transparent)]
+  TrustedPayload(#[from] crate::buffer::TrustedPayload),
+  /// The side-data list is over the read side's caps.
+  #[error(transparent)]
+  SendSideDataTooLarge(#[from] SendSideDataTooLarge),
+  /// The payload is over the session's budget.
+  #[error(transparent)]
+  SendPayloadTooLarge(#[from] SendPayloadTooLarge),
+  /// A side-data type the linked library does not name.
+  #[error(transparent)]
+  UnknownSideData(#[from] UnknownSideData),
+}
+
+impl From<PacketRefusal> for PacketBuildError {
+  fn from(refusal: PacketRefusal) -> Self {
+    match refusal {
+      PacketRefusal::TrustedPayload(payload) => Self::TrustedPayload(payload),
+      PacketRefusal::SendSideDataTooLarge(payload) => Self::SendSideDataTooLarge(payload),
+      PacketRefusal::SendPayloadTooLarge(payload) => Self::SendPayloadTooLarge(payload),
+      PacketRefusal::UnknownSideData(payload) => Self::UnknownSideData(payload),
+    }
+  }
+}
+
+/// Every refusal the builders of a packet into FFmpeg make that the packet
+/// alone decides — its flags, `flags`; its payload's length, `len`; its
+/// side data, `side_data`; the session's budget, `limits` — in the order
+/// they make them and before anything is allocated: the trusted flag
+/// ([`refuse_trusted`]), the side-data caps ([`check_side_data_budget`]),
+/// the payload's budget, and every side-data type the linked library names.
+/// What a builder can still fail is its allocations alone.
+///
+/// The one judgment the builders make, shared: each calls it first, and a
+/// muxer asks it with the packet still in hand, to refuse by name what the
+/// builder would refuse after the packet was taken.
+pub fn check_packet_build(
+  flags: MdPacketFlags,
+  len: usize,
+  side_data: &[SideDataEntry],
+  limits: PacketLimits,
+) -> std::result::Result<(), PacketRefusal> {
+  // Before the budget and before the allocation: an uncarriable payload is
+  // not made carriable by fitting.
+  refuse_trusted(flags, len)?;
+  // And the annotations, judged whole before the body is allocated — a
+  // list that cannot be carried should not cost a packet first.
+  check_side_data_budget(side_data)?;
+  // **The into-FFmpeg budget, before the allocation.** `try_packet_copy`
+  // duplicates the bytes into a fresh `AVPacket` and checks only that they
+  // fit `c_int`. Without this the configured ceiling was dead on the road
+  // a caller feeds a decoder directly: bytes the demux boundary would have
+  // refused went straight into libavcodec.
+  if len > limits.max_packet_bytes() {
+    return Err(PacketRefusal::SendPayloadTooLarge(
+      SendPayloadTooLarge::new(len, limits.max_packet_bytes()),
+    ));
+  }
+  // Admitted by the linked library's own word, asked as the integer, as
+  // `attach_side_data` asks it again.
+  if let Some(entry) = side_data
+    .iter()
+    .find(|entry| !crate::ffi::runtime_names_side_data(entry.kind()))
+  {
+    return Err(PacketRefusal::UnknownSideData(UnknownSideData::new(
+      entry.kind(),
+    )));
+  }
+  Ok(())
+}
+
 /// Judges the **whole** side-data list before a byte of it is
 /// allocated.
 ///
@@ -624,11 +700,11 @@ pub enum PacketBuildError {
 /// So the caps are the read side's, applied here, before anything is
 /// allocated — including the body, because a list that cannot be
 /// carried should not cost a packet allocation first.
-fn check_side_data_budget(entries: &[SideDataEntry]) -> Result<(), PacketBuildError> {
+fn check_side_data_budget(entries: &[SideDataEntry]) -> Result<(), PacketRefusal> {
   use crate::convert::{SIDE_DATA_MAX_ENTRIES, SIDE_DATA_MAX_TOTAL_BYTES};
 
   if entries.len() > SIDE_DATA_MAX_ENTRIES {
-    return Err(PacketBuildError::SendSideDataTooLarge(
+    return Err(PacketRefusal::SendSideDataTooLarge(
       SendSideDataTooLarge::new_entries(entries.len(), SIDE_DATA_MAX_ENTRIES),
     ));
   }
@@ -636,7 +712,7 @@ fn check_side_data_budget(entries: &[SideDataEntry]) -> Result<(), PacketBuildEr
   for entry in entries {
     total = total.saturating_add(entry.data().len());
     if total > SIDE_DATA_MAX_TOTAL_BYTES {
-      return Err(PacketBuildError::SendSideDataTooLarge(
+      return Err(PacketRefusal::SendSideDataTooLarge(
         SendSideDataTooLarge::new_bytes(total, SIDE_DATA_MAX_TOTAL_BYTES),
       ));
     }
@@ -704,9 +780,9 @@ impl SendSideDataTooLarge {
 ///
 /// See [`crate::buffer::TrustedPayload`] for why the flag makes the
 /// payload uncarriable rather than merely suspicious.
-fn refuse_trusted(flags: MdPacketFlags, len: usize) -> std::result::Result<(), PacketBuildError> {
+fn refuse_trusted(flags: MdPacketFlags, len: usize) -> std::result::Result<(), PacketRefusal> {
   if flags.bits() & crate::buffer::TRUSTED_BIT != 0 {
-    return Err(PacketBuildError::TrustedPayload(
+    return Err(PacketRefusal::TrustedPayload(
       crate::buffer::TrustedPayload::new(len),
     ));
   }
@@ -982,28 +1058,19 @@ pub unsafe fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierO
 /// [`BodyRoute::Submission`] the packet returned may share the carrier's
 /// buffer, and nothing may write through it, shallow-clone it, or hand
 /// it to a caller. With [`BodyRoute::Copy`] there is nothing to prove.
-unsafe fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+pub(crate) unsafe fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &mediaspine::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
 ) -> std::result::Result<Packet, PacketBuildError> {
   let body = packet.data().as_ref();
-  // Before the budget and before the allocation: an uncarriable
-  // payload is not made carriable by fitting.
-  refuse_trusted(packet.flags(), body.len())?;
-  // And the annotations, judged whole before the body is allocated —
-  // a list that cannot be carried should not cost a packet first.
-  check_side_data_budget(packet.extra().side_data())?;
-  // **The into-FFmpeg budget, before the allocation.** `try_packet_copy`
-  // duplicates these bytes into a fresh `AVPacket` and checks only that
-  // they fit `c_int`. Without this the configured ceiling was dead on
-  // the road a caller feeds a decoder directly: bytes the demux
-  // boundary would have refused went straight into libavcodec.
-  if body.len() > limits.max_packet_bytes() {
-    return Err(PacketBuildError::SendPayloadTooLarge(
-      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
-    ));
-  }
+  // Everything the packet alone decides, before anything is allocated.
+  check_packet_build(
+    packet.flags(),
+    body.len(),
+    packet.extra().side_data(),
+    limits,
+  )?;
   // SAFETY: this builder's own contract, forwarded for `route`. Nothing
   // below writes the payload: side data, timestamps, flags and the
   // stream index all live outside it.
@@ -1101,28 +1168,19 @@ pub unsafe fn with_ffmpeg_audio_packet<C: crate::FfmpegCarrier + crate::CarrierO
 /// [`BodyRoute::Submission`] the packet returned may share the carrier's
 /// buffer, and nothing may write through it, shallow-clone it, or hand
 /// it to a caller. With [`BodyRoute::Copy`] there is nothing to prove.
-unsafe fn build_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+pub(crate) unsafe fn build_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &mediaspine::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
 ) -> std::result::Result<Packet, PacketBuildError> {
   let body = packet.data().as_ref();
-  // Before the budget and before the allocation: an uncarriable
-  // payload is not made carriable by fitting.
-  refuse_trusted(packet.flags(), body.len())?;
-  // And the annotations, judged whole before the body is allocated —
-  // a list that cannot be carried should not cost a packet first.
-  check_side_data_budget(packet.extra().side_data())?;
-  // **The into-FFmpeg budget, before the allocation.** `try_packet_copy`
-  // duplicates these bytes into a fresh `AVPacket` and checks only that
-  // they fit `c_int`. Without this the configured ceiling was dead on
-  // the road a caller feeds a decoder directly: bytes the demux
-  // boundary would have refused went straight into libavcodec.
-  if body.len() > limits.max_packet_bytes() {
-    return Err(PacketBuildError::SendPayloadTooLarge(
-      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
-    ));
-  }
+  // Everything the packet alone decides, before anything is allocated.
+  check_packet_build(
+    packet.flags(),
+    body.len(),
+    packet.extra().side_data(),
+    limits,
+  )?;
   // SAFETY: this builder's own contract, forwarded for `route`. Nothing
   // below writes the payload: side data, timestamps, flags and the
   // stream index all live outside it.
@@ -1220,28 +1278,19 @@ pub unsafe fn with_ffmpeg_subtitle_packet<C: crate::FfmpegCarrier + crate::Carri
 /// [`BodyRoute::Submission`] the packet returned may share the carrier's
 /// buffer, and nothing may write through it, shallow-clone it, or hand
 /// it to a caller. With [`BodyRoute::Copy`] there is nothing to prove.
-unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+pub(crate) unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &mediaspine::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
 ) -> std::result::Result<Packet, PacketBuildError> {
   let body = packet.data().as_ref();
-  // Before the budget and before the allocation: an uncarriable
-  // payload is not made carriable by fitting.
-  refuse_trusted(packet.flags(), body.len())?;
-  // And the annotations, judged whole before the body is allocated —
-  // a list that cannot be carried should not cost a packet first.
-  check_side_data_budget(packet.extra().side_data())?;
-  // **The into-FFmpeg budget, before the allocation.** `try_packet_copy`
-  // duplicates these bytes into a fresh `AVPacket` and checks only that
-  // they fit `c_int`. Without this the configured ceiling was dead on
-  // the road a caller feeds a decoder directly: bytes the demux
-  // boundary would have refused went straight into libavcodec.
-  if body.len() > limits.max_packet_bytes() {
-    return Err(PacketBuildError::SendPayloadTooLarge(
-      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
-    ));
-  }
+  // Everything the packet alone decides, before anything is allocated.
+  check_packet_build(
+    packet.flags(),
+    body.len(),
+    packet.extra().side_data(),
+    limits,
+  )?;
   // SAFETY: this builder's own contract, forwarded for `route`. Nothing
   // below writes the payload: side data, timestamps, flags and the
   // stream index all live outside it.
@@ -1253,6 +1302,65 @@ unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   if let Some(d) = packet.duration() {
     out.set_duration(d.pts());
   }
+  write_md_flags(&mut out, packet.flags());
+  out.set_stream(packet.extra().stream_index() as usize);
+  Ok(out)
+}
+
+/// [`build_video_packet`] for a timed-data packet — the muxer's road
+/// for a data track. A data packet's decode time is its presentation
+/// time, so only the presentation timestamp is set here.
+///
+/// # Safety
+///
+/// [`build_video_packet`]'s, for `route`.
+pub(crate) unsafe fn build_data_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  packet: &DataPacket<DataPacketExtra, C::Buffer>,
+  limits: PacketLimits,
+  route: BodyRoute,
+) -> std::result::Result<Packet, PacketBuildError> {
+  let body = packet.data().as_ref();
+  // Everything the packet alone decides, before anything is allocated.
+  check_packet_build(
+    packet.flags(),
+    body.len(),
+    packet.extra().side_data(),
+    limits,
+  )?;
+  // SAFETY: this builder's own contract, forwarded for `route`. Nothing
+  // below writes the payload.
+  let mut out = unsafe { C::packet_body(packet.data(), route) }?;
+  attach_side_data(&mut out, packet.extra().side_data())?;
+  if let Some(ts) = packet.pts() {
+    out.set_pts(Some(ts.pts()));
+  }
+  if let Some(d) = packet.duration() {
+    out.set_duration(d.pts());
+  }
+  write_md_flags(&mut out, packet.flags());
+  out.set_stream(packet.extra().stream_index() as usize);
+  Ok(out)
+}
+
+/// [`build_video_packet`] for an attachment's one packet — the muxer's
+/// road for cover art, which a container that keeps an attached picture
+/// takes as a packet. It carries no timestamp and no side data.
+///
+/// # Safety
+///
+/// [`build_video_packet`]'s, for `route`.
+pub(crate) unsafe fn build_attachment_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  packet: &AttachmentPacket<AttachmentPacketExtra, C::Buffer>,
+  limits: PacketLimits,
+  route: BodyRoute,
+) -> std::result::Result<Packet, PacketBuildError> {
+  let body = packet.data().as_ref();
+  // Everything the packet alone decides, before anything is allocated: an
+  // attachment's packet carries no side data.
+  check_packet_build(packet.flags(), body.len(), &[], limits)?;
+  // SAFETY: this builder's own contract, forwarded for `route`. Nothing
+  // below writes the payload.
+  let mut out = unsafe { C::packet_body(packet.data(), route) }?;
   write_md_flags(&mut out, packet.flags());
   out.set_stream(packet.extra().stream_index() as usize);
   Ok(out)
@@ -4278,6 +4386,59 @@ mod tests {
         FfmpegBytes::copy_from_slice(&[9u8, 8, 7]),
       )]),
     )
+  }
+
+  /// **The one judgment the builders share is theirs, and answers first**:
+  /// [`check_packet_build`] refuses what every builder refuses — the trusted
+  /// flag, the side-data caps, the payload's budget, an unnamed kind — in
+  /// that order, and each builder answers exactly what it answers, before it
+  /// allocates anything.
+  #[test]
+  fn the_builders_share_one_judgment_of_what_a_packet_alone_decides() {
+    let limits = PacketLimits::default().with_max_packet_bytes(4);
+    let unnamed = |kind: i32, body: &[u8]| {
+      mediaspine::packet::VideoPacket::new(
+        FfmpegBytes::copy_from_slice(body),
+        VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(
+          kind,
+          FfmpegBytes::copy_from_slice(&[1u8]),
+        )]),
+      )
+    };
+    // The budget before the kind: a payload of 8 under a budget of 4, of an
+    // unnamed kind.
+    let both = unnamed(-1, &[0u8; 8]);
+    let judged = check_packet_build(both.flags(), 8, both.extra().side_data(), limits);
+    assert!(matches!(
+      judged,
+      Err(PacketRefusal::SendPayloadTooLarge(payload)) if payload.limit() == 4
+    ));
+    assert_eq!(
+      ffmpeg_packet_from_owned_video_packet(&both, limits).map(|_| ()),
+      Err(PacketBuildError::from(judged.expect_err("refused"))),
+      "the builder answers the same"
+    );
+    // The kind, once the payload fits.
+    let kind_only = unnamed(-1, &[0u8; 2]);
+    assert!(matches!(
+      check_packet_build(kind_only.flags(), 2, kind_only.extra().side_data(), limits),
+      Err(PacketRefusal::UnknownSideData(payload)) if payload.kind() == -1
+    ));
+    // The trusted flag first of all.
+    let trusted = both
+      .clone()
+      .with_flags(MdPacketFlags::from_bits_retain(crate::buffer::TRUSTED_BIT));
+    assert!(matches!(
+      check_packet_build(trusted.flags(), 8, trusted.extra().side_data(), limits),
+      Err(PacketRefusal::TrustedPayload(_))
+    ));
+    // Nothing to refuse: a named kind, a payload within the budget.
+    let fine =
+      packet_with_side_data_kind(ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_A53_CC as i32);
+    assert_eq!(
+      check_packet_build(fine.flags(), 1, fine.extra().side_data(), limits),
+      Ok(())
+    );
   }
 
   #[test]

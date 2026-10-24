@@ -109,8 +109,9 @@ use mediadecode::{
   demuxer::{
     AttachmentPacket, AttachmentTrackPacket, AttachmentTrackParams, AudioTrackPacket,
     AudioTrackParams, Chapter, ContainerDuration, DataTrackPacket, DataTrackParams, DemuxedPacket,
-    Demuxer, DurationSource, MeasuredEnd, SubtitleTrackPacket, SubtitleTrackParams, TrackIndex,
-    TrackInfo, TrackKind, TrackParams, UnknownTrackParams, VideoTrackPacket, VideoTrackParams,
+    Demuxer, DurationSource, MeasuredEnd, SubtitleTrackPacket, SubtitleTrackParams,
+    TrackDisposition, TrackIndex, TrackInfo, TrackKind, TrackParams, UnknownTrackParams,
+    VideoTrackPacket, VideoTrackParams,
   },
   nal::{NalCodec, NalStream},
   packet::PacketFlags,
@@ -447,6 +448,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
   /// as [`DemuxError::ReaderPanic`], carrying the panic's message. The
   /// session is terminal from that point: the `AVIOContext`'s error
   /// state is sticky and the reader's own state is unknown.
+  ///
+  /// An error the reader returns is reduced to its OS code or kind inside
+  /// that same `catch_unwind`, its payload dropped there — ffmpeg-next
+  /// drops a returned error inside its callback — so a payload whose
+  /// `Drop` panics is a reader panic like any other.
   pub(crate) fn open_reader_impl<R: Read + Seek + Send + 'static>(
     reader: R,
     filename: Option<&str>,
@@ -2705,7 +2711,12 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
       // wrote is what is read — see
       // [`TrackInfo::language`](mediadecode::demuxer::TrackInfo::language)
       // for why nothing folds it here.
-      .with_language(text(c"language")?);
+      .with_language(text(c"language")?)
+      // The container's own bits, carried whole — the same raw set the
+      // extras keep — so a remux writes back what was declared. The
+      // `c_int` is reinterpreted, not converted: a set with the sign bit
+      // is a set of bits, and `from_u32` keeps every one.
+      .with_disposition(TrackDisposition::from_u32(disposition as u32));
 
     // Capture the attachment payload now, so the queue is complete
     // before a single timed packet has been read. Every attachment
@@ -5019,6 +5030,72 @@ mod tests {
           Err(DemuxError::ReaderPanic(_)) => {}
           Err(other) => panic!("expected ReaderPanic, got {other:?}"),
           Ok(_) => panic!("a reader that only panics cannot open a container"),
+        }
+      },
+    );
+  }
+
+  /// An error's payload whose destructor panics — safe code, returned
+  /// rather than raised.
+  #[derive(Debug)]
+  struct HostileErrorPayload;
+
+  impl core::fmt::Display for HostileErrorPayload {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      f.write_str("an error whose payload panics when dropped")
+    }
+  }
+
+  impl std::error::Error for HostileErrorPayload {}
+
+  impl Drop for HostileErrorPayload {
+    fn drop(&mut self) {
+      panic!("the error's payload exploded");
+    }
+  }
+
+  /// A reader whose every call returns an error carrying that payload.
+  struct ReturnsAHostileError;
+
+  impl std::io::Read for ReturnsAHostileError {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+      Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        HostileErrorPayload,
+      ))
+    }
+  }
+
+  impl std::io::Seek for ReturnsAHostileError {
+    fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+      Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        HostileErrorPayload,
+      ))
+    }
+  }
+
+  #[test]
+  fn a_reader_error_with_a_hostile_payload_does_not_abort_the_process() {
+    // In its own process, for the reason the law above gives. ffmpeg-next
+    // drops the error a reader returns inside its `extern "C"` read
+    // callback; the guard reduces the error inside its `catch_unwind`
+    // first, so the payload's panic is latched and named as the reader's
+    // panic instead of unwinding into C.
+    mediaio_ffmpeg::test_support::in_subprocess(
+      "demuxer::tests::a_reader_error_with_a_hostile_payload_does_not_abort_the_process",
+      || {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let opened =
+          CarrierDemuxer::<crate::Owned>::open_reader(ReturnsAHostileError, Some("x.mkv"));
+        std::panic::set_hook(previous);
+        match opened {
+          Err(DemuxError::ReaderPanic(panic)) => {
+            assert_eq!(panic.message(), "the error's payload exploded");
+          }
+          Err(other) => panic!("expected ReaderPanic, got {other:?}"),
+          Ok(_) => panic!("a reader that only fails cannot open a container"),
         }
       },
     );

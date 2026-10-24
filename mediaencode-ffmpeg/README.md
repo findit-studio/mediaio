@@ -3,10 +3,70 @@
 </div>
 
 The FFmpeg write adapter of the mediaio family: it implements the
-`mediaencode` faces over libavcodec and libavformat. In this release it
-is the gate every encoder will be opened through: the encoder-by-name
-catalogue and its GPL rule. The muxer and the encoders themselves
-arrive in the following releases.
+`mediaencode` faces over libavcodec and libavformat. In this release:
+the **muxer**, over libavformat, and the gate every encoder will be
+opened through — the encoder-by-name catalogue and its GPL rule. The
+encoders themselves arrive in the following releases.
+
+## The muxer
+
+`FfmpegMuxer` writes any container libavformat names (`ContainerName`)
+into a caller's `Write + Seek`, from the track table a remux collects —
+one `TrackDescription` per track, each with the `CodecTicket` its codec
+parameters are rebuilt from, an attachment track with its one file.
+
+- **Opening judges the whole table first.** What the container cannot
+  take at all is refused by name, with nothing written: a codec the
+  muxer says it cannot store, a Matroska attachment without a filename
+  or a MIME type, a chapter that runs backwards. What it can take only
+  by dropping something is written, and the loss is **reported**
+  (`MuxReport`): a font MP4 has no place for, a language MP4 cannot
+  spell, a disposition flag the container has no field for. The report
+  covers Matroska, WebM and MP4; another container opens the same way,
+  without the report's claims.
+- **Attachments**: Matroska keeps each with its filename, MIME type and
+  language, but no disposition flag; MP4 keeps a JPEG, PNG or BMP as
+  cover art, the picture alone. The report names each field a road
+  drops — a cover's filename and MIME type among them.
+- **Writing keeps the face's rules, then the container's.** A packet
+  for no track, of the wrong kind, without a decode time, decoded before
+  the last or presented before it is decoded is refused by the face's
+  name — presentation judged, as libavformat judges it, on the counts in
+  the stream's time base, so two times that count to one tick are
+  written. A time the stream cannot count, or one that lands on
+  libavformat's no-timestamp value (`FfmpegMuxRefusal::Unrepresentable`),
+  and an equal decode time on a strict container's video or audio
+  stream — MP4 — (`FfmpegMuxRefusal::RepeatedDts`) are refused by the
+  muxer's own. Every refusal hands the packet back untouched.
+- **Every rule libavformat applies to a packet is accounted for** in
+  Matroska, WebM and MP4, at FFmpeg 9.0.1: libavformat interleaves
+  packets before its muxer sees them, so a muxer's own refusal comes
+  after taking the packet, often while writing another. Each rule is
+  refused by name first — the container's timing rules
+  (`FfmpegMuxRefusal`) and its rules over a packet's bytes and side data
+  (`FfmpegMuxRefusal::Payload`, `PayloadRule`) — or reported at open,
+  where the container writes a track's packets in a form of its own
+  (`Uncarried::Rewritten`, `Rewrite`), or written and read back as handed
+  over. MP4's durations, which it keeps only as the distances between
+  packets, are reported as they are lost, in the muxer's own `report`.
+- **libavformat's automatic bitstream filters run, each reported.** As
+  `ffmpeg -c copy` runs them: AAC's ADTS headers stripped where the track
+  states no configuration, VP9's hidden frames joined into superframes,
+  PGS segments joined into display sets — each named for its track at
+  open (`Uncarried::Filtered`). libavformat inserts a filter at a track's
+  first packet, so the first packet decides, and the muxer admits only
+  what the filter converts. `MuxOptions::set_automatic_filters(false)`
+  turns them off, and the refusals by name apply instead.
+- **Packet side data a container has no place for is reported**, by
+  name, for its track (`Uncarried::SideData`), from a table of what each
+  container writes; where the source does not settle a kind's fate, it is
+  reported as possibly dropped.
+- **What a header or trailer would refuse is refused at open**: TrueHD
+  into MP4, RealMedia's codecs into Matroska, MP4 PCM of a channel layout
+  it cannot write (`MuxOpenError`).
+- **Packets are copied into libavformat**, never lent, and a sink that
+  panics is caught before C sees the unwind, named in the muxer's fault,
+  and never called again.
 
 It builds against **FFmpeg 9** or newer, the family's floor: no older
 release is supported, and `mediaio-ffmpeg`'s build script refuses one by

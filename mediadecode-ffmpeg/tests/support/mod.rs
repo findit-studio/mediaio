@@ -404,6 +404,44 @@ impl Corpus {
     out
   }
 
+  /// A Matroska file that states everything a remux has to keep: H.264
+  /// video, AAC audio tagged `jpn`, SubRip cues tagged `ger` and
+  /// declared forced, an attached font under its filename and MIME type,
+  /// and the two titled chapters of [`Self::chaptered_mkv`] — the source
+  /// the muxer's lossless lane copies into Matroska and reads back.
+  #[rustfmt::skip]
+  pub fn remux_source_mkv(&self) -> PathBuf {
+    let out = self.path("remux-source.mkv");
+    if out.exists() {
+      return out;
+    }
+    let font = self.path("remux-font.ttf");
+    std::fs::write(&font, FONT_PAYLOAD).expect("write attachment payload");
+    let subs = self.subrip();
+    let sidecar = self.path("remux-chapters.ffmeta");
+    std::fs::write(&sidecar, FFMETADATA_CHAPTERS).expect("writing the chapter sidecar");
+
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=8",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=8",
+      "-i", subs.to_str().expect("utf-8 path"),
+      "-i", sidecar.to_str().expect("utf-8 path"),
+      "-map", "0:v", "-map", "1:a", "-map", "2:s",
+      "-map_metadata", "3", "-map_chapters", "3",
+      "-c:v", "libx264", "-preset", "ultrafast", "-g", "25", "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-ac", "2", "-ar", "48000",
+      "-c:s", "srt",
+      "-metadata:s:a:0", "language=jpn",
+      "-metadata:s:s:0", "language=ger",
+      "-disposition:s:0", "forced",
+      "-attach", font.to_str().expect("utf-8 path"),
+      "-metadata:s:t", "mimetype=application/x-truetype-font",
+      "-metadata:s:t", "filename=font.ttf",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
   /// A SubRip file, written by hand.
   ///
   /// **The queue-backed demuxer family.** `srtdec` — like SubViewer,
@@ -928,6 +966,81 @@ pub fn raw_header_durations(path: &Path) -> Vec<Option<(i64, i32, i32)>> {
     avformat_close_input(&mut context);
     out
   }
+}
+
+/// A remux written against the two faces alone — `mediadecode`'s
+/// `Demuxer` and `mediaencode`'s `Muxer` — with no backend type in it.
+///
+/// The attachments the demuxer hands out first; the table built from
+/// the handles the demuxer keeps, each row borrowed and none consumed,
+/// with the side-data carrier the muxer takes (`side_data`, the one
+/// backend-shaped thing a remux supplies); the muxer opened with the
+/// table and the demuxer's chapters; every timed packet written; the
+/// container finished.
+///
+/// Shared by `mediadecode-ffmpeg`'s `generic_remux` lane, over a muxer
+/// that records, and `mediaencode-ffmpeg`'s `mux` lane, over the FFmpeg
+/// muxer — one remux over both.
+pub fn remux<Dm, M, S>(
+  demuxer: &mut Dm,
+  side_data: impl Fn(&mediadecode::demuxer::TrackInfo<Dm::Adapter>) -> S,
+  open: impl FnOnce(
+    Vec<mediaencode::mediaspine::track::TrackDescription<Dm::Adapter, Dm::Buffer, S>>,
+    &[mediadecode::demuxer::Chapter<Dm::Adapter>],
+  ) -> M,
+) where
+  Dm: mediadecode::demuxer::Demuxer,
+  Dm::Error: std::fmt::Debug,
+  M: mediaencode::Muxer<Adapter = Dm::Adapter, Buffer = Dm::Buffer>,
+  M::Refusal: std::fmt::Debug,
+  M::Error: std::fmt::Debug,
+{
+  use mediadecode::demuxer::{DemuxAttachmentPacket, DemuxedPacket};
+  use mediaencode::mediaspine::track::TrackDescription;
+
+  // A demuxer hands out every attachment before its first timed packet.
+  let mut files: Vec<Option<DemuxAttachmentPacket<Dm::Adapter, Dm::Buffer>>> =
+    demuxer.tracks().iter().map(|_| None).collect();
+  let mut first = None;
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    match packet {
+      DemuxedPacket::Attachment(attachment) => {
+        let (track, payload) = attachment.into_parts();
+        files[track.get()] = Some(payload);
+      }
+      timed => {
+        first = Some(timed);
+        break;
+      }
+    }
+  }
+
+  // The table, from the handles the session keeps: `&**row` is the row a
+  // handle shares, borrowed.
+  let table = demuxer
+    .tracks()
+    .iter()
+    .zip(files)
+    .map(|(row, file)| TrackDescription::from_track_info(&**row, file, side_data(&**row)))
+    .collect::<Result<Vec<_>, _>>()
+    .expect("every row describes a track");
+
+  // A refusal hands the packet back; the lane only needs to know there
+  // was one, so the packet is dropped from the error before it is shown.
+  let mut muxer = open(table, demuxer.chapters());
+  if let Some(packet) = first {
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("the first timed packet");
+  }
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("a timed packet");
+  }
+  muxer.finish().expect("the container is finished");
 }
 
 /// Asserts a submission was taken, and answers nothing.
