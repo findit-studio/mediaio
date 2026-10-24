@@ -655,7 +655,11 @@ fn a_failed_write_is_named_the_sinks_at_the_header_a_packet_and_the_trailer() {
     let full = std::sync::Arc::clone(&sink.full);
     full.store(full_from_the_start, std::sync::atomic::Ordering::Relaxed);
     let mut output = Output::open(sink, container).expect("open");
-    let ticket = if container == "mp4" { &mov_text } else { &subrip };
+    let ticket = if container == "mp4" {
+      &mov_text
+    } else {
+      &subrip
+    };
     output
       .add_stream(&StreamSpec::new(ticket, millis()))
       .expect("a stream");

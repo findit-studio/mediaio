@@ -150,6 +150,35 @@
 //! (`vp9_superframe.c` 169; `pgs_frame_merge.c` 132–136), and the first
 //! frame AAC's filter converts has its new extradata replaced by the
 //! configuration the filter makes (`aac_adtstoasc.c` 98–103).
+//!
+//! # The preflight census
+//!
+//! **The rule:** for every byte this muxer hands libavformat, it
+//! establishes before the handoff every precondition FFmpeg 9.0.1's
+//! consuming code relies on. A check libavformat makes only after it has
+//! taken a packet — in a muxer's write, in a bitstream filter, at the
+//! trailer — is made here first, and refused by name with the packet
+//! untouched; where the check needs the whole stream, the refusal comes at
+//! the first packet that decides it. Every change a container makes that
+//! the caller did not ask for is reported. The tables below are that
+//! census, each row from the source; `movenc.c` and `matroskaenc.c` are
+//! `libavformat/`'s, the filters `libavcodec/bsf/`'s.
+//!
+//! ## D. A track's kind and its media type
+//!
+//! Judged before any stream is added ([`MuxOpenError::MediaTypeMismatch`]):
+//! a timed track's stream is made of its ticket's media type, and its
+//! packets are judged by the track's kind, so the two must agree, and the
+//! codec's own descriptor with them (`avcodec_get_type`).
+//!
+//! | kind | the ticket's media type | the codec's descriptor |
+//! |---|---|---|
+//! | video | video | video, or none in this build |
+//! | audio | audio | audio, or none |
+//! | subtitle | subtitle | subtitle, or none |
+//! | data | data | data, or none |
+//! | attachment | attachment; or video — an attached picture, as libavformat's demuxers deliver cover art (`ff_add_attached_pic`, `demux_utils.c` 107–140), which MP4's cover road and Matroska's attachment road both take | any: the codec names the file |
+//! | unknown | refused by its own name ([`MuxOpenError::UnknownTrackKind`]) | — |
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -882,6 +911,19 @@ pub enum MuxOpenError {
   /// The track's ticket names another codec than its description.
   #[error("track {}'s codec parameters are for another codec", .track.get())]
   TicketMismatch {
+    /// The track.
+    track: TrackIndex,
+  },
+  /// A track whose kind is not its parameters' media type, or not its
+  /// codec's — a video track over an audio stream's parameters. Its stream
+  /// would be made of the ticket's media type ([`StreamMedia::Timed`]),
+  /// and its packets judged by the track's kind, so it is refused before
+  /// any stream is added (table D of the census, see [the module](self)).
+  /// An attachment's own two roads are the exceptions: an attachment
+  /// stream, or a cover made from an attached picture, which libavformat's
+  /// demuxers deliver as a video stream.
+  #[error("track {}'s kind is not its parameters' media type", .track.get())]
+  MediaTypeMismatch {
     /// The track.
     track: TrackIndex,
   },
@@ -2856,6 +2898,15 @@ fn judge<W, D: AsRef<[u8]>>(
   if codec.raw() != description.side_data().codec_id() {
     return Err(MuxOpenError::TicketMismatch { track });
   }
+  if description.kind() != TrackKind::Unknown
+    && !media_type_agrees(
+      description.kind(),
+      description.side_data().codec_type(),
+      codec.media_type(),
+    )
+  {
+    return Err(MuxOpenError::MediaTypeMismatch { track });
+  }
   let nul = |text: Option<&Utf8Bytes>, which: OutputText| match text {
     Some(text) if text.as_str().contains('\0') => {
       Err(MuxOpenError::TextWithNul { track, text: which })
@@ -2899,6 +2950,28 @@ fn judge<W, D: AsRef<[u8]>>(
     }
   };
   Ok((road, losses(family, road, track, description)))
+}
+
+/// Whether a track of `kind` agrees with its ticket's media type
+/// `ticket` and its codec's `codec` (`None` where libavcodec has no
+/// descriptor for it) — table D of the census (see [the module](self)):
+/// a timed track's kind is both; an attachment's ticket is an attachment
+/// stream's, or a video stream's — an attached picture, as libavformat's
+/// demuxers deliver cover art (`ff_add_attached_pic`, `demux_utils.c`
+/// 107–140 in FFmpeg 9.0.1) — whatever its codec, which names the file.
+fn media_type_agrees(kind: TrackKind, ticket: i32, codec: Option<i32>) -> bool {
+  use ffmpeg_next::ffi::AVMediaType as M;
+  let media = match kind {
+    TrackKind::Video => M::AVMEDIA_TYPE_VIDEO,
+    TrackKind::Audio => M::AVMEDIA_TYPE_AUDIO,
+    TrackKind::Subtitle => M::AVMEDIA_TYPE_SUBTITLE,
+    TrackKind::Data => M::AVMEDIA_TYPE_DATA,
+    TrackKind::Attachment => {
+      return ticket == M::AVMEDIA_TYPE_ATTACHMENT as i32 || ticket == M::AVMEDIA_TYPE_VIDEO as i32;
+    }
+    _ => return false,
+  } as i32;
+  ticket == media && codec.is_none_or(|codec| codec == media)
 }
 
 /// The extradata a timed track's stream will hold: the description's

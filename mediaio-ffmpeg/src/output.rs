@@ -125,6 +125,7 @@
 //! |---|---|---|
 //! | `CodecId::mime_type` (`codec_id.rs`) | the codec descriptor's `mime_types`, its first entry, the text | the descriptor a static table entry of libavcodec's or null; a non-null list holds at least its terminating null; the text bounded (`table_text`) |
 //! | `CodecId::intra_only` | the descriptor's media type and `props` | as above, the media type read as an integer |
+//! | `CodecId::media_type` | the descriptor's media type | as above |
 //! | `CodecId::bits_per_sample` | `av_get_bits_per_sample` through a shim taking `c_int` | no bindgen enum formed; libavcodec answers 0 for a codec it does not know |
 //! | `packet_side_data_name` (`extras.rs`) | `av_packet_side_data_name` through a shim taking `c_int` | as above; null for a type it does not name, the text bounded |
 //! | the boundary's builders, `build_data_packet` and `build_attachment_packet` among them (`boundary.rs`) | the carrier's payload, copied (`packet_body` on the copy road), its side data attached | each builder's contract, forwarded: on the copy road nothing is lent, so there is nothing to prove |

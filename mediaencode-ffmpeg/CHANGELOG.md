@@ -87,6 +87,10 @@ crate moves only when it changes.
   packed code does not unpack to itself, reported; no flag the report
   names as dropped handed to libavformat, so MP4 makes no cover of a
   timed track.
+- **A track's kind is judged against its media type** before any stream
+  is added (`MuxOpenError::MediaTypeMismatch`): a timed track's against
+  its ticket's media type and its codec's own descriptor; an attachment's
+  against an attachment stream's or an attached picture's.
 - **The muxing context's vocabulary is this crate's public face.**
   `OutputCall`, `OutputError`, `OutputPhase` and `OutputText` are
   re-exported from `mediaio-ffmpeg`'s `output` module, which that crate

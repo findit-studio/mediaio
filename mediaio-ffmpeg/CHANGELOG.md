@@ -13,6 +13,10 @@ crate moves only when it changes.
 
 ### Added
 
+- `CodecId::media_type`: the media type libavcodec's descriptor gives a
+  codec, as the integer it stores, or `None` where the build has no
+  descriptor for the id.
+
 - **The write crossing**: `output::Output`, libavformat's muxing
   context owned in Rust over a caller's `Write + Seek`, for
   `mediaencode-ffmpeg`'s muxer. It takes no pointer from a caller, so

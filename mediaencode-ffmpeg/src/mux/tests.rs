@@ -1141,3 +1141,54 @@ fn the_automatic_filters_are_those_libavformat_inserts() {
   }
   assert!(!header_refuses(Family::Other, CodecId::TRUEHD));
 }
+
+#[test]
+fn a_tracks_kind_agrees_with_its_media_type_as_table_d_says() {
+  use ffmpeg_next::ffi::AVMediaType as M;
+  let (video, audio, subtitle, data, attachment) = (
+    M::AVMEDIA_TYPE_VIDEO as i32,
+    M::AVMEDIA_TYPE_AUDIO as i32,
+    M::AVMEDIA_TYPE_SUBTITLE as i32,
+    M::AVMEDIA_TYPE_DATA as i32,
+    M::AVMEDIA_TYPE_ATTACHMENT as i32,
+  );
+  for (kind, media) in [
+    (TrackKind::Video, video),
+    (TrackKind::Audio, audio),
+    (TrackKind::Subtitle, subtitle),
+    (TrackKind::Data, data),
+  ] {
+    assert!(media_type_agrees(kind, media, Some(media)), "{kind:?}");
+    assert!(
+      media_type_agrees(kind, media, None),
+      "{kind:?}: no descriptor"
+    );
+    for other in [video, audio, subtitle, data, attachment] {
+      if other != media {
+        assert!(
+          !media_type_agrees(kind, other, Some(media)),
+          "{kind:?}: the ticket's {other}"
+        );
+        assert!(
+          !media_type_agrees(kind, media, Some(other)),
+          "{kind:?}: the codec's {other}"
+        );
+      }
+    }
+  }
+  // An attachment: an attachment stream's or an attached picture's
+  // parameters, whatever the codec.
+  assert!(media_type_agrees(
+    TrackKind::Attachment,
+    attachment,
+    Some(attachment)
+  ));
+  assert!(media_type_agrees(TrackKind::Attachment, video, Some(video)));
+  assert!(media_type_agrees(TrackKind::Attachment, attachment, None));
+  assert!(!media_type_agrees(
+    TrackKind::Attachment,
+    audio,
+    Some(audio)
+  ));
+  assert!(!media_type_agrees(TrackKind::Unknown, video, Some(video)));
+}

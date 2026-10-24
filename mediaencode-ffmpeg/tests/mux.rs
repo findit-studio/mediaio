@@ -3172,3 +3172,54 @@ fn l37_a_muxer_dropped_mid_file_frees_its_sink_once() {
     "the packet the queue held was freed, never written",
   );
 }
+
+/// **L38 — a track whose kind is not its parameters' media type is
+/// refused at open, and nothing is written** (table D of the census): a
+/// video track over an AAC stream's parameters, which libavformat would
+/// make an audio stream of while the muxer judged its packets as video.
+///
+/// PLANT: without the check in `judge`, Matroska opens over it.
+#[test]
+fn l38_a_video_track_over_audio_parameters_is_refused_at_open() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let demuxer = FfmpegOwnedDemuxer::open(&source).expect("open");
+  let row = |kind: TrackKind| {
+    demuxer
+      .tracks()
+      .iter()
+      .find(|row| row.kind() == kind)
+      .expect("a track of the kind")
+  };
+  let pixel_format = match row(TrackKind::Video).params() {
+    TrackParams::Video(params) => params.pixel_format().clone(),
+    other => panic!("expected video parameters, got {other:?}"),
+  };
+  let audio = row(TrackKind::Audio);
+  let video_over_audio = TrackDescription::new(
+    millis(),
+    TrackParams::Video(mediaencode::mediaspine::demuxer::VideoTrackParams::new(
+      CodecId::AAC,
+      64,
+      64,
+      pixel_format,
+      None,
+    )),
+    ticket(audio),
+  )
+  .expect("a description");
+  let target = output(&corpus, "l38.mkv");
+  let refused = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MATROSKA,
+    vec![video_over_audio],
+    &[],
+    PacketLimits::default(),
+  );
+  assert!(
+    matches!(refused, Err(MuxOpenError::MediaTypeMismatch { track }) if track.get() == 0),
+    "{:?}",
+    refused.map(drop)
+  );
+  assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+}

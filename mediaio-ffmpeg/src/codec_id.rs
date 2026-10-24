@@ -186,6 +186,25 @@ impl CodecId {
     !audio_or_video || props & ffmpeg_next::ffi::AV_CODEC_PROP_INTRA_ONLY != 0
   }
 
+  /// The media type libavcodec's descriptor gives this codec —
+  /// `AVMEDIA_TYPE_*`, as the integer `AVCodecDescriptor.type` stores it
+  /// (`avcodec_get_type`) — or `None` where this build has no descriptor
+  /// for the id.
+  pub fn media_type(self) -> Option<i32> {
+    let descriptor = self.descriptor();
+    if descriptor.is_null() {
+      return None;
+    }
+    // SAFETY: as [`Self::intra_only`]: the descriptor is a static table
+    // entry of libavcodec's, its media type read through `addr_of!` as the
+    // integer it is stored as, so no bindgen enum is formed from it.
+    Some(unsafe {
+      core::ptr::addr_of!((*descriptor).type_)
+        .cast::<i32>()
+        .read_unaligned()
+    })
+  }
+
   /// The bits one sample of this codec takes where its samples have a
   /// fixed size — 16 for `PCM_S16LE` — else `0`
   /// (`av_get_bits_per_sample`).
