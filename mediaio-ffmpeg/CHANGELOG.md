@@ -30,10 +30,18 @@ crate moves only when it changes.
   ffmpeg-next drops a returned error inside its `extern "C"` callback,
   where a payload whose `Drop` panics aborted the process. That panic is
   now latched and named like any other.
-- `Output::into_sink` hands the sink back only when every byte reached
-  it: a write the sink failed, which the I/O context keeps and writes
-  nothing after, is read there after the last flush and reported
-  (`OutputError::SinkWrite`), whatever the sink's own flush answers.
+- A write the sink fails is named the sink's at the call that met it
+  (`OutputError::SinkWrite`): the I/O context keeps it and writes nothing
+  after it, and every `Output` call that reached libavformat — the header,
+  a packet, the trailer — reads it there once libavformat returns, after
+  a panic and a failed seek and before libavformat's own error. The
+  header answers success over a write its own last flush failed, and a
+  packet and the trailer answer it as libavformat's code; both are now
+  the sink's. `Output::into_sink` reads it once more after the last
+  flush, so it hands the sink back only when every byte reached it,
+  whatever the sink's own flush answers — from any phase: before the
+  trailer it frees the context as dropping it does and hands back a
+  container without its trailer.
 - A seek the sink fails is kept by the writer guard
   (`writer_guard::SeekRecord`, the third handle `GuardedWriter::new`
   answers), which libavformat does not do: a muxer going back to patch

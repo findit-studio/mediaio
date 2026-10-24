@@ -87,6 +87,12 @@ crate moves only when it changes.
   packed code does not unpack to itself, reported; no flag the report
   names as dropped handed to libavformat, so MP4 makes no cover of a
   timed track.
+- **The muxing context's vocabulary is this crate's public face.**
+  `OutputCall`, `OutputError`, `OutputPhase` and `OutputText` are
+  re-exported from `mediaio-ffmpeg`'s `output` module, which that crate
+  hides from its documentation; the FFmpeg crates move in lockstep, and
+  the hidden marking there licenses no change this crate's face would
+  carry unmarked — a change to them is a change to this crate's API.
 - The encoders arrive in the following releases.
 
 ## [0.21.0] - 2026-10-24

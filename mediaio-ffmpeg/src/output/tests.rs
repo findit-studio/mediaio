@@ -577,8 +577,8 @@ impl Seek for Full {
 /// though its own flush succeeds.** The header's bytes reach the sink in
 /// a write that fails as a full disk fails it; the I/O context keeps that
 /// error and writes nothing after it, and `into_sink` reports it rather
-/// than hand back a sink missing the header — whatever libavformat's
-/// header call answered.
+/// than hand back a sink missing the header — whatever the header's own
+/// call was answered (it names the same write: the law above).
 #[test]
 fn a_failed_write_is_reported_when_the_sink_is_handed_back() {
   ffmpeg_next::init().expect("ffmpeg init");
@@ -596,6 +596,234 @@ fn a_failed_write_is_reported_when_the_sink_is_handed_back() {
     ),
     other => panic!("expected the failed write reported, got {other:?}"),
   }
+}
+
+/// A buffer whose writes fail as a full disk fails them once its switch
+/// is thrown; it seeks and flushes as a buffer does.
+#[derive(Debug, Default)]
+struct FillsUp {
+  bytes: Cursor<Vec<u8>>,
+  full: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Write for FillsUp {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    if self.full.load(std::sync::atomic::Ordering::Relaxed) {
+      return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+    }
+    self.bytes.write(buf)
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    Ok(())
+  }
+}
+
+impl Seek for FillsUp {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.bytes.seek(pos)
+  }
+}
+
+/// The failed write a full disk answers, as the I/O context keeps it.
+fn enospc() -> ffmpeg_next::Error {
+  ffmpeg_next::Error::from(ffmpeg_next::ffi::AVERROR(libc::ENOSPC))
+}
+
+/// **A write the sink fails is named the sink's at the call that met it —
+/// the header, a packet, the trailer — never libavformat's.** The header
+/// flushes its bytes only after it has read the I/O context's error
+/// (`mux.c` 482–486 in FFmpeg 9.0.1), so libavformat answers it success
+/// over a sink that took none of them; a packet's write and the trailer
+/// answer the failed write as libavformat's own code (751–752, 1270–1272).
+/// Each call reads the I/O context's error after the panic and the seek
+/// records, and names it [`OutputError::SinkWrite`]. The packet is MP4's,
+/// which writes each sample as it comes; Matroska holds its packets in a
+/// cluster, which reaches the sink at the trailer — the third case.
+///
+/// PLANT: without that read in `sink_fault`, the header answers `Ok` and
+/// the packet and the trailer `Ffmpeg(ENOSPC)`.
+#[test]
+fn a_failed_write_is_named_the_sinks_at_the_header_a_packet_and_the_trailer() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let subrip = subrip();
+  let mov_text = ticket(
+    ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE,
+    CodecId::MOV_TEXT,
+  );
+  let open = |container: &str, full_from_the_start: bool| {
+    let sink = FillsUp::default();
+    let full = std::sync::Arc::clone(&sink.full);
+    full.store(full_from_the_start, std::sync::atomic::Ordering::Relaxed);
+    let mut output = Output::open(sink, container).expect("open");
+    let ticket = if container == "mp4" { &mov_text } else { &subrip };
+    output
+      .add_stream(&StreamSpec::new(ticket, millis()))
+      .expect("a stream");
+    (output, full)
+  };
+  let named = |what: &str, answer: Result<(), OutputError>| match answer {
+    Err(OutputError::SinkWrite(error)) => assert_eq!(error, enospc(), "{what}"),
+    other => panic!("{what}: expected the sink's failed write named, got {other:?}"),
+  };
+
+  // At the header: nothing of it reaches the sink.
+  let (mut output, _) = open("matroska", true);
+  named("the header", output.write_header());
+  assert_eq!(output.phase(), OutputPhase::Failed);
+  named("the sink handed back", output.into_sink().map(drop));
+
+  // At a packet: the header was written; the cue's sample meets a full
+  // disk. A 16-bit length, then the text: how `mov_text` frames a cue.
+  let (mut output, full) = open("mp4", false);
+  output.write_header().expect("the header");
+  full.store(true, std::sync::atomic::Ordering::Relaxed);
+  named(
+    "a packet",
+    output.write_packet::<crate::Owned>(
+      0,
+      OutputPacket::Subtitle(&cue(b"\x00\x05a cue", 0)),
+      times(0),
+      PacketLimits::default(),
+    ),
+  );
+  named("the sink handed back", output.into_sink().map(drop));
+
+  // At the trailer: the header and every cue were written, the cues into
+  // the cluster Matroska holds until it ends.
+  let (mut output, full) = open("matroska", false);
+  output.write_header().expect("the header");
+  for pts in [0, 1000] {
+    output
+      .write_packet::<crate::Owned>(
+        0,
+        OutputPacket::Subtitle(&cue(b"a cue", pts)),
+        times(pts),
+        PacketLimits::default(),
+      )
+      .expect("a cue");
+  }
+  full.store(true, std::sync::atomic::Ordering::Relaxed);
+  named("the trailer", output.write_trailer());
+  assert_eq!(output.phase(), OutputPhase::Finished);
+  named("the sink handed back", output.into_sink().map(drop));
+}
+
+/// What reached a [`Counted`] sink, kept outside it.
+#[derive(Debug, Default)]
+struct Tally {
+  written: std::sync::Mutex<Vec<u8>>,
+  flushes: std::sync::atomic::AtomicU32,
+  drops: std::sync::atomic::AtomicU32,
+}
+
+/// A buffer that keeps a tally of what reaches it: the bytes written, its
+/// flushes and its own drop.
+#[derive(Debug, Default)]
+struct Counted {
+  bytes: Cursor<Vec<u8>>,
+  tally: std::sync::Arc<Tally>,
+}
+
+impl Write for Counted {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    let written = self.bytes.write(buf)?;
+    self
+      .tally
+      .written
+      .lock()
+      .expect("the tally")
+      .extend_from_slice(&buf[..written]);
+    Ok(written)
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    self
+      .tally
+      .flushes
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+  }
+}
+
+impl Seek for Counted {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.bytes.seek(pos)
+  }
+}
+
+impl Drop for Counted {
+  fn drop(&mut self) {
+    self
+      .tally
+      .drops
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
+/// **A context dropped mid-file frees everything once, and writes nothing
+/// it had not written.** Two SubRip streams, the header written and one
+/// cue handed to the first — held in libavformat's interleaving queue, as
+/// the second has none — then the context is dropped while writing, its
+/// trailer never asked for. `avformat_free_context` runs the muxer's
+/// `deinit` and frees the queued packet (`avformat.c` 148–200 in FFmpeg
+/// 9.0.1); then the I/O context drops: what it still buffers goes through
+/// the guard, the sink's flush runs once, and the sink is dropped once.
+/// The sink holds the header and not the cue.
+///
+/// PLANT: a `Drop` without its `ManuallyDrop::drop` of the I/O context
+/// leaves the sink alive (`drops` 0, `flushes` 0); a `Drop` that writes the
+/// trailer before it frees writes the held cue.
+#[test]
+fn a_context_dropped_mid_file_frees_once_and_writes_nothing_it_held() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let ticket = subrip();
+  let sink = Counted::default();
+  let tally = std::sync::Arc::clone(&sink.tally);
+  let mut output = Output::open(sink, "matroska").expect("open");
+  let first = output
+    .add_stream(&StreamSpec::new(&ticket, millis()))
+    .expect("a stream");
+  output
+    .add_stream(&StreamSpec::new(&ticket, millis()))
+    .expect("a second stream");
+  output.write_header().expect("the header");
+  let held = b"a cue the interleaving queue holds";
+  output
+    .write_packet::<crate::Owned>(
+      first,
+      OutputPacket::Subtitle(&cue(held, 0)),
+      times(0),
+      PacketLimits::default(),
+    )
+    .expect("a cue");
+  assert_eq!(output.phase(), OutputPhase::Writing);
+  assert_eq!(
+    tally.drops.load(std::sync::atomic::Ordering::Relaxed),
+    0,
+    "the sink lives as long as the context",
+  );
+
+  drop(output);
+
+  assert_eq!(
+    tally.drops.load(std::sync::atomic::Ordering::Relaxed),
+    1,
+    "the sink is dropped once, with the context",
+  );
+  assert_eq!(
+    tally.flushes.load(std::sync::atomic::Ordering::Relaxed),
+    1,
+    "and flushed once before it",
+  );
+  let written = tally.written.lock().expect("the tally");
+  assert_eq!(
+    &written[..4],
+    &[0x1A, 0x45, 0xDF, 0xA3],
+    "the header was written"
+  );
+  assert!(
+    !written.windows(held.len()).any(|window| window == held),
+    "the cue the queue held was freed, never written",
+  );
 }
 
 /// A buffer that refuses to seek back before where it stands, as a pipe

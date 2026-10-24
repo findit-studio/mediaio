@@ -2964,3 +2964,211 @@ fn l35_vp9_hidden_frames_join_a_superframe() {
     "each as handed over"
   );
 }
+
+/// A file whose writes fail as a full disk fails them once its switch is
+/// thrown; it seeks and flushes as a file does.
+struct FillsUp {
+  file: File,
+  full: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Write for FillsUp {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    if self.full.load(Ordering::Relaxed) {
+      return Err(io::Error::from_raw_os_error(ENOSPC));
+    }
+    self.file.write(buf)
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    self.file.flush()
+  }
+}
+
+impl Seek for FillsUp {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.file.seek(pos)
+  }
+}
+
+/// `ENOSPC`, as the platform numbers it.
+const ENOSPC: i32 = ffmpeg_next::util::error::ENOSPC;
+
+/// **L36 — a write the sink fails is named the sink's where the muxer met
+/// it: at the header, the open's fault; at the trailer, the finish's.**
+/// Over a sink full from the start the header's bytes never land, and the
+/// open faults at [`MuxStage::Header`] naming [`OutputError::SinkWrite`] —
+/// libavformat answers success there, its flush following its check
+/// (`mux.c` 482–486 in FFmpeg 9.0.1). Over one that fills up after the last
+/// packet, `finish` faults at [`MuxStage::Trailer`], naming the same.
+///
+/// PLANT: without the base's read of the I/O context's error at every
+/// call, the open succeeds over the full sink and the trailer's fault
+/// names `Ffmpeg(ENOSPC)`.
+#[test]
+fn l36_a_failed_write_is_named_the_sinks_at_the_header_and_the_trailer() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let video = owned_video_and_font(&source, 3).video;
+  let sink = |name: &str, full: bool| {
+    let full = Arc::new(std::sync::atomic::AtomicBool::new(full));
+    (
+      FillsUp {
+        file: File::create(output(&corpus, name)).expect("create"),
+        full: Arc::clone(&full),
+      },
+      full,
+    )
+  };
+  let names_the_write = |error: &OutputError| match error {
+    OutputError::SinkWrite(error) => {
+      assert_eq!(
+        *error,
+        ffmpeg_next::Error::from(ffmpeg_next::ffi::AVERROR(ENOSPC))
+      );
+    }
+    other => panic!("expected the sink's failed write, got {other:?}"),
+  };
+
+  let (full_sink, _) = sink("l36-header.mkv", true);
+  match FfmpegOwnedMuxer::open(
+    full_sink,
+    ContainerName::MATROSKA,
+    video_table(&source),
+    &[],
+    PacketLimits::default(),
+  ) {
+    Err(MuxOpenError::Fault(fault)) => {
+      assert_eq!(fault.stage(), MuxStage::Header);
+      names_the_write(fault.error());
+    }
+    other => panic!("expected the header's fault, got {:?}", other.map(drop)),
+  }
+
+  let (filling, full) = sink("l36-trailer.mkv", false);
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    filling,
+    ContainerName::MATROSKA,
+    video_table(&source),
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  for (index, packet) in video.iter().enumerate() {
+    let at = 40 * index as i64;
+    muxer
+      .write_video(restamped(packet, 0, Some(at), Some(at)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  full.store(true, Ordering::Relaxed);
+  let fault = muxer.finish().expect_err("the disk is full");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  names_the_write(fault.error());
+}
+
+/// What reached a [`Tallied`] sink, kept outside it.
+#[derive(Default)]
+struct Tally {
+  written: std::sync::Mutex<Vec<u8>>,
+  flushes: AtomicU32,
+  drops: AtomicU32,
+}
+
+/// A file that keeps a tally of what reaches it: the bytes written, its
+/// flushes and its own drop.
+struct Tallied {
+  file: File,
+  tally: Arc<Tally>,
+}
+
+impl Write for Tallied {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    let written = self.file.write(buf)?;
+    self
+      .tally
+      .written
+      .lock()
+      .expect("the tally")
+      .extend_from_slice(&buf[..written]);
+    Ok(written)
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    self.tally.flushes.fetch_add(1, Ordering::Relaxed);
+    self.file.flush()
+  }
+}
+
+impl Seek for Tallied {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.file.seek(pos)
+  }
+}
+
+impl Drop for Tallied {
+  fn drop(&mut self) {
+    self.tally.drops.fetch_add(1, Ordering::Relaxed);
+  }
+}
+
+/// **L37 — a muxer dropped mid-file frees its sink once and writes nothing
+/// it held.** A video and an audio track of the multi-track file; one video
+/// packet written — held in libavformat's interleaving queue, as the audio
+/// track has none yet — and the muxer dropped, `finish` never called. The
+/// context goes first, with the muxer's `deinit` and the queued packet,
+/// then the I/O context: the sink is flushed once and dropped once, and it
+/// holds Matroska's header and not the packet.
+///
+/// PLANT: a `Drop` on the base's context that leaves its I/O context
+/// undropped keeps the sink alive (`drops` 0).
+#[test]
+fn l37_a_muxer_dropped_mid_file_frees_its_sink_once() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let video = owned_video_and_font(&source, 1).video;
+  let table = {
+    let demuxer = FfmpegOwnedDemuxer::open(&source).expect("open");
+    [TrackKind::Video, TrackKind::Audio]
+      .into_iter()
+      .map(|kind| {
+        let row = demuxer
+          .tracks()
+          .iter()
+          .find(|row| row.kind() == kind)
+          .expect("a track of the kind");
+        TrackDescription::from_track_info(&**row, None, ticket(row)).expect("a description")
+      })
+      .collect::<Vec<_>>()
+  };
+  let tally = Arc::new(Tally::default());
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    Tallied {
+      file: File::create(output(&corpus, "l37.mkv")).expect("create"),
+      tally: Arc::clone(&tally),
+    },
+    ContainerName::MATROSKA,
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  let held = restamped(&video[0], 0, Some(0), Some(0));
+  let bytes = held.packet().data().as_ref().to_vec();
+  muxer
+    .write_video(held)
+    .map_err(|error| error.map_packet(drop))
+    .expect("a packet the queue holds");
+  assert_eq!(tally.drops.load(Ordering::Relaxed), 0);
+
+  drop(muxer);
+
+  assert_eq!(tally.drops.load(Ordering::Relaxed), 1, "dropped once");
+  assert_eq!(tally.flushes.load(Ordering::Relaxed), 1, "flushed once");
+  let written = tally.written.lock().expect("the tally");
+  assert_eq!(&written[..4], &[0x1A, 0x45, 0xDF, 0xA3], "the header");
+  assert!(
+    !written
+      .windows(bytes.len())
+      .any(|window| window == bytes.as_slice()),
+    "the packet the queue held was freed, never written",
+  );
+}

@@ -33,9 +33,15 @@
 //! folded it into. A panicked sink is never called again.
 //!
 //! A write the sink fails is kept by the I/O context, which writes
-//! nothing after it; [`Output::into_sink`] reads it there and reports it
-//! ([`OutputError::SinkWrite`]), so a sink missing bytes is never handed
-//! back as a whole one.
+//! nothing after it (`writeout`, `libavformat/aviobuf.c` 136–166 in FFmpeg
+//! 9.0.1). libavformat answers it as its own error where it reads it — a
+//! packet's write and the trailer do (`mux.c` 751–752, 1270–1272) — and
+//! answers success where it does not: the header flushes its bytes only
+//! after it has read it (`mux.c` 482–486). Every call that reached
+//! libavformat reads it once libavformat returns, and names it the sink's
+//! ([`OutputError::SinkWrite`]), and [`Output::into_sink`] reads it once
+//! more after its last flush — so a sink missing bytes is never handed
+//! back as a whole one, nor its failure named libavformat's.
 //!
 //! A seek the sink fails is kept by the guard, which libavformat does not
 //! do ([`SeekRecord`](crate::writer_guard::SeekRecord)): a muxer going
@@ -43,8 +49,18 @@
 //! wrong place. The guard writes nothing after it, and every call that
 //! reached libavformat names it once libavformat returns, whatever
 //! libavformat answered ([`OutputError::SinkSeek`]) — so a container
-//! whose patches went missing never ends in `Ok`. A panic is named first,
-//! then a failed seek, then libavformat's own error.
+//! whose patches went missing never ends in `Ok`.
+//!
+//! **The order, at every call that reached libavformat:** a panic first,
+//! then a failed seek, then a failed write, then libavformat's own error.
+//! The guard refuses every write after a panic or a failed seek, and the
+//! I/O context keeps that refusal as its failed write, so the cause is
+//! named ahead of its echo. On the containers this family writes,
+//! nothing but the sink's write sets the I/O context's error: the one
+//! other writer of it, an allocation `avio_vprintf` fails (`aviobuf.c`
+//! 1185–1203), is reached on the sink's context only by muxers that print
+//! into it — MP4's ISMV manifest (`movenc.c` 5457–5496) and text muxers,
+//! none of them Matroska's or MP4's.
 //!
 //! # Ownership and lifetime
 //!
@@ -54,6 +70,7 @@
 //! | what | allocated by | owned by | freed by |
 //! |---|---|---|---|
 //! | the `AVFormatContext` (`ctx`) | `avformat_alloc_output_context2`, in [`Output::open`] | the `Output`, alone (`NonNull`) | `avformat_free_context`, exactly once: in `Drop`, or in [`Output::into_sink`], which holds `self` in `ManuallyDrop` so `Drop` never runs after it. Always before the I/O context: a muxer's `deinit` may still reach `pb` |
+//! | the rebuilt `AVCodecParameters` a stream's parameters are copied from | `avcodec_parameters_alloc` and its copies, inside [`CodecTicket::rebuild`] (null-checked there) | this crate, for the length of [`Output::add_stream`] (the ticket's `Parameters`) | `avcodec_parameters_free`, in `Parameters`' `Drop`: just after the copy, or on each early return before it |
 //! | each stream, its `codecpar`, its metadata | `avformat_new_stream`; `avcodec_parameters_copy` (extradata, side data, channel map); `av_dict_set` (a copy of each key and value) | the context | `avformat_free_context` |
 //! | a stream's replaced extradata | `av_mallocz`, padded, in `replace_extradata`; the copied extradata it replaces is freed by `av_freep` first | the stream's `codecpar` | `avformat_free_context` |
 //! | a chapter and its title | `av_mallocz` (zeroed, as `avpriv_new_chapter` makes one) and `av_dict_set`, in [`Output::add_chapter`] | this crate until `av_dynarray_add_nofree` takes it; then the context | before that, `free_chapter` (`av_dict_free`, `av_free`) on each failure; after, `avformat_free_context`, which frees each chapter and the array |
@@ -68,6 +85,7 @@
 //! |---|---|---|
 //! | a refusal in `open` | before `avformat_alloc_output_context2`, nothing is allocated; after a failed one, the `StreamIo` drops (it flushes nothing, then the sink's flush through the guard, then frees) and the sink with it | `ctx` is null on failure and owns nothing of this crate's |
 //! | the file finished: `write_trailer`, then `into_sink` | the context freed; `avio_flush`; `AVIOContext.error` read; `into_inner` frees the buffer and the I/O context and hands back the guard; the sink's flush; then the latch, the seek record, the write error and the flush error are named, in that order, or the sink is handed back | each field is moved out of the `ManuallyDrop<Self>` once (`ptr::read`) and never used through it again; `pb` is read after the context that pointed at it is gone, and before `into_inner` frees it |
+//! | `into_sink` before the trailer — from `Building`, `Writing` or `Failed` | exactly the file-finished road: the context freed (from `Writing`, the muxer's `deinit` and the queued packets with it, as in `Drop`), then the I/O context flushed, read and freed, and the sink handed back holding what was written — a container without its trailer, which no phase check refuses: the call is the caller's way to take the sink back from any phase | as above; nothing in the road depends on the phase |
 //! | an error from any call | the call answers it, and the context stays as the phase says; a call out of order is refused before libavformat is reached (a second trailer would run a muxer's trailer over state its first freed) | the phase |
 //! | a panic in the sink, in any callback | caught by the guard under `catch_unwind`, latched, answered to C as an I/O error; every later call into the sink answers an error without reaching it; the context names the panic first | the panic never reaches the `extern "C"` frame; nothing is freed while a callback runs |
 //! | an error whose payload panics when dropped | reduced inside the guard's `catch_unwind` to its OS code or kind, the payload dropped there and its panic latched | what reaches C owns nothing |
@@ -84,6 +102,7 @@
 //! |---|---|---|
 //! | `open` | `av_guess_format`; the static muxer's `flags`; `avformat_alloc_output_context2`; `ctx.pb` and `ctx.flags` written | a NUL-terminated name live for the call; a non-null static muxer; a valid out-pointer, null on failure; the I/O context outlives the context, and is the caller's (`AVFMT_FLAG_CUSTOM_IO`) |
 //! | `container`, `strict_decode_times`, `shifts_early_times` | the static muxer's `name` (bounded, `table_text`) and `flags` | `oformat` is never null on a context `open` returned |
+//! | `sink_fault` | the I/O context's `error` (`pb`, kept from `open`) | the I/O context the `Output` owns, live as long as it is; a plain `int` libavformat writes only inside the `&mut self` calls, read after they return |
 //! | `query_codec` | `avformat_query_codec` through a shim taking the codec id as `c_int` | no bindgen enum formed from an integer; libavformat searches its tag tables, never indexes them |
 //! | `streams`, `stream`, `stream_time_base` | `nb_streams`; `streams[index]`; a stream's `time_base` | `index < nb_streams`, checked first |
 //! | `stream_codec` | a stream's `codecpar` fields, the codec id and media type as integers, the extradata as `extradata_size` bytes; `av_get_audio_frame_duration2` | libavutil's allocation, null when empty; the call reads plain fields and writes nothing |
@@ -119,13 +138,14 @@
 //! `Nul`, `ExtradataTooLarge`, `TooManyChapters`, `NoSuchStream`,
 //! `OutOfOrder`, `TimeBase`, `Build`, `Parameters`). A call that reached
 //! the sink names the sink's fault before libavformat's answer: a panic
-//! first, then a failed seek, whatever libavformat answered.
+//! first, then a failed seek, then a failed write, whatever libavformat
+//! answered.
 //!
 //! | call | reached from | its failures | named as |
 //! |---|---|---|---|
 //! | `av_guess_format` | `open` | null | `UnknownContainer` |
 //! | `StreamIo::from_write_seek`: `av_mallocz`, `avio_alloc_context` | `open` | `ENOMEM` | `Ffmpeg` |
-//! | `avformat_alloc_output_context2` | `open` | a negative code, or a null context | `Ffmpeg` (at least `-1` when it answers success with no context) |
+//! | `avformat_alloc_output_context2` | `open` | a negative code, or a null context | `Ffmpeg` (`AVERROR_UNKNOWN` were it to answer success with no context, which `mux.c` 95–159 never does) |
 //! | `avformat_query_codec` | `query_codec` | a negative code: libavformat cannot tell | `CodecQuery::Unknown` |
 //! | `avformat_new_stream` | `add_stream` | null | `Ffmpeg(ENOMEM)`; nothing added |
 //! | `avcodec_parameters_copy` | `add_stream` | a negative code (an allocation) | `Ffmpeg`; the context `Failed`, a stream half made |
@@ -135,12 +155,15 @@
 //! | `av_mallocz`, `av_dynarray_add_nofree` | `add_chapter` | null; a negative code | `Ffmpeg(ENOMEM)`; `Ffmpeg`, the chapter freed |
 //! | `av_get_audio_frame_duration2` | `stream_codec` | none: zero for a codec it does not know | — |
 //! | the ticket's rebuild (`avcodec_parameters_alloc` and its copies) | `add_stream` | its allocations, its limits | `Parameters`, before any stream is added |
+//! | `avcodec_parameters_free`, in the rebuilt `Parameters`' `Drop` | `add_stream` | none | — |
 //! | the copy road: `av_new_packet`, `av_packet_new_side_data` | `write_packet` | an allocation; a limit; side data libavcodec cannot name | `Build`, before libavformat is reached |
-//! | `avformat_write_header` | `write_header` | a negative code; the sink's panic or failed seek | the sink's fault, else `Ffmpeg`; the context `Failed` |
-//! | `av_interleaved_write_frame` | `write_packet` | a negative code; the sink's | the sink's fault, else `Ffmpeg` |
-//! | `av_write_trailer` | `write_trailer` | a negative code; the sink's | the sink's fault, else `Ffmpeg`; the context `Finished` either way |
+//! | `avformat_write_header` | `write_header` | a negative code; the sink's panic, failed seek or failed write — the last read from the I/O context, as the header's own flush follows its check of it (`mux.c` 482–486) | the sink's fault, else `Ffmpeg`; the context `Failed` |
+//! | `av_interleaved_write_frame` | `write_packet` | a negative code; the sink's panic, failed seek or failed write (`mux.c` 751–752 answers the last as its own) | the sink's fault, else `Ffmpeg` |
+//! | `av_packet_unref`, in the blank `Packet`'s `Drop` | `write_packet` | none: a no-op on the packet `av_interleaved_write_frame` left blank | — |
+//! | `av_write_trailer` | `write_trailer` | a negative code; the sink's panic, failed seek or failed write (`mux.c` 1270–1272 answers the last as its own) | the sink's fault, else `Ffmpeg`; the context `Finished` either way |
 //! | `avio_flush` and `AVIOContext.error` | `into_sink` | the first failed write, which the I/O context keeps | `SinkWrite`, after a panic and a failed seek |
 //! | the sink's `flush`, through the guard | `into_sink` | its `io::Error` | `Sink`, last |
+//! | `av_dict_free`, `av_free`, in `free_chapter` | `add_chapter`, on each failure before the array takes the chapter | none | — |
 //! | `avformat_free_context`, `StreamIo`'s `Drop` and `into_inner` (`av_freep`, `avio_context_free`) | `into_sink`, `Drop` | none | — |
 
 use core::{
@@ -161,10 +184,11 @@ use ffmpeg_next::{
   ffi::{
     AV_DISPOSITION_ATTACHED_PIC, AV_INPUT_BUFFER_PADDING_SIZE, AVChapter, AVCodecParameters,
     AVFMT_FLAG_AUTO_BSF, AVFMT_FLAG_CUSTOM_IO, AVFMT_NOFILE, AVFMT_NOTIMESTAMPS, AVFMT_TS_NEGATIVE,
-    AVFMT_TS_NONSTRICT, AVFormatContext, AVRational, AVStream, av_dict_free, av_dict_set,
-    av_dynarray_add_nofree, av_free, av_freep, av_guess_format, av_interleaved_write_frame,
-    av_mallocz, av_write_trailer, avcodec_parameters_copy, avformat_alloc_output_context2,
-    avformat_free_context, avformat_new_stream, avformat_write_header, avio_flush,
+    AVFMT_TS_NONSTRICT, AVFormatContext, AVIOContext, AVRational, AVStream, av_dict_free,
+    av_dict_set, av_dynarray_add_nofree, av_free, av_freep, av_guess_format,
+    av_interleaved_write_frame, av_mallocz, av_write_trailer, avcodec_parameters_copy,
+    avformat_alloc_output_context2, avformat_free_context, avformat_new_stream,
+    avformat_write_header, avio_flush,
   },
   format::context::StreamIo,
   packet::Mut,
@@ -334,7 +358,10 @@ pub enum OutputError {
   /// A write into the caller's sink failed, so bytes meant for it are
   /// not in it — whatever its own flush says. The I/O context keeps the
   /// first failed write's error (`AVIOContext.error`) and writes nothing
-  /// after it; [`Output::into_sink`] reads it there after its last flush.
+  /// after it; every call that reached libavformat reads it there once
+  /// libavformat returns, and [`Output::into_sink`] once more after its
+  /// last flush. The error is the sink's, as ffmpeg-next's write callback
+  /// handed it to C (see [the module](self)).
   #[error("a write into the sink failed, so bytes meant for it are missing: {0}")]
   SinkWrite(#[source] ffmpeg_next::Error),
   /// libavformat's own error.
@@ -587,6 +614,9 @@ pub struct Output<W> {
   /// The I/O context over the guarded sink. `ctx.pb` points at it, and
   /// `AVFMT_FLAG_CUSTOM_IO` keeps libavformat from closing it.
   io: ManuallyDrop<StreamIo>,
+  /// The `AVIOContext` `io` owns — `ctx.pb` — kept so that `&self` can
+  /// read the failed write it keeps. Owns nothing: freed with `io`.
+  pb: NonNull<AVIOContext>,
   /// The writer guard's latch, to name a sink's panic.
   latch: Arc<PanicLatch>,
   /// The writer guard's record of a failed seek, to name it.
@@ -742,9 +772,9 @@ impl<W> Output<W> {
   }
 
   /// libavformat's `code`, named — the sink's panic first, if it raised
-  /// one, then a seek it failed: libavformat reports either as the I/O
-  /// error the guard answered, folded into whatever it was doing, or not
-  /// at all.
+  /// one, then a seek it failed, then a write it failed: libavformat
+  /// reports each as the I/O error the guard or the sink answered, folded
+  /// into whatever it was doing, or not at all.
   fn fault(&self, code: c_int) -> OutputError {
     self
       .sink_fault()
@@ -752,17 +782,27 @@ impl<W> Output<W> {
   }
 
   /// What the sink did that libavformat cannot be trusted to report: a
-  /// panic, else a failed seek.
+  /// panic, else a failed seek, else a failed write — the first the I/O
+  /// context kept (see [the module](self)).
   fn sink_fault(&self) -> Option<OutputError> {
     if let Some(message) = self.latch.message() {
       return Some(OutputError::SinkPanic { message });
     }
-    self.seeks.failure().map(OutputError::SinkSeek)
+    if let Some(error) = self.seeks.failure() {
+      return Some(OutputError::SinkSeek(error));
+    }
+    // SAFETY: `pb` is the I/O context `io` owns, live for as long as this
+    // value is (it is freed only by `Drop` or `into_sink`, which consume
+    // it); `error` is a plain `int` field libavformat writes only inside
+    // the calls this type makes through `&mut self`, which have returned.
+    let written = unsafe { (*self.pb.as_ptr()).error };
+    (written < 0).then(|| OutputError::SinkWrite(ffmpeg_next::Error::from(written)))
   }
 
   /// libavformat's answer `status` to a call that reached the sink, named:
   /// the sink's own fault first, whatever libavformat answered — a muxer
-  /// may carry on past a seek it failed and answer success — then
+  /// may carry on past a seek it failed and answer success, and the
+  /// header answers success over a write its own last flush failed — then
   /// libavformat's error.
   fn settled(&self, status: c_int) -> Result<(), OutputError> {
     match self.sink_fault() {
@@ -815,6 +855,13 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
 
     let (guarded, latch, seeks) = GuardedWriter::new(sink);
     let mut io = StreamIo::from_write_seek(guarded)?;
+    // `from_write_seek` answers a live I/O context or an error, so the
+    // pointer is never null; checked rather than assumed, before anything
+    // else is allocated.
+    let pb =
+      NonNull::new(io.as_mut_ptr()).ok_or(OutputError::Ffmpeg(ffmpeg_next::Error::Other {
+        errno: libc::ENOMEM,
+      }))?;
     let mut ctx: *mut AVFormatContext = ptr::null_mut();
     // SAFETY: `ctx` is a valid out-pointer; `oformat` is the static muxer
     // just found, so the two names may be null. On failure libavformat
@@ -822,9 +869,15 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     let status =
       unsafe { avformat_alloc_output_context2(&mut ctx, oformat, ptr::null(), ptr::null()) };
     let Some(ctx) = NonNull::new(ctx).filter(|_| status >= 0) else {
-      return Err(OutputError::Ffmpeg(ffmpeg_next::Error::from(
-        status.min(-1),
-      )));
+      // A success with no context is one `avformat_alloc_output_context2`
+      // never answers (`mux.c` 95–159); named as libavformat's unknown
+      // error, not as an errno it did not report.
+      let code = if status < 0 {
+        status
+      } else {
+        ffmpeg_next::ffi::AVERROR_UNKNOWN
+      };
+      return Err(OutputError::Ffmpeg(ffmpeg_next::Error::from(code)));
     };
     // SAFETY: `ctx` is the live context just allocated, and nothing else
     // holds it. `pb` is set to the I/O context this value keeps alive
@@ -832,12 +885,13 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     // first — and `AVFMT_FLAG_CUSTOM_IO` tells libavformat the I/O
     // context is the caller's, so it never closes or frees it.
     unsafe {
-      (*ctx.as_ptr()).pb = io.as_mut_ptr();
+      (*ctx.as_ptr()).pb = pb.as_ptr();
       (*ctx.as_ptr()).flags |= AVFMT_FLAG_CUSTOM_IO;
     }
     Ok(Self {
       ctx,
       io: ManuallyDrop::new(io),
+      pb,
       latch,
       seeks,
       phase: OutputPhase::Building,
@@ -1161,6 +1215,16 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
   /// says so. A seek it failed, at any point, comes next
   /// ([`OutputError::SinkSeek`]): what libavformat placed after it is
   /// missing, however the rest went.
+  ///
+  /// **From any phase.** Called before the trailer — while the context is
+  /// being built, while it is writing, or after a step failed — it frees
+  /// the context exactly as dropping it does (from
+  /// [`OutputPhase::Writing`], the muxer's `deinit` and the packets still
+  /// queued for interleaving go with it), and hands back the sink holding
+  /// what was written: a container without its trailer, answered `Ok`
+  /// when nothing failed. No phase is refused: this is how a caller takes
+  /// its sink back from wherever the context is, and the muxer above
+  /// writes the trailer first.
   pub fn into_sink(self) -> Result<W, OutputError> {
     let this = ManuallyDrop::new(self);
     // SAFETY: `this` is never dropped, so each field is moved out exactly
