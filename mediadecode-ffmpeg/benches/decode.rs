@@ -209,7 +209,7 @@ fn bench_decode(c: &mut Criterion) {
         }
         Some(dec.backend())
       }
-      Err(mediadecode_ffmpeg::Error::AllBackendsFailed(_)) => None,
+      Err(mediadecode_ffmpeg::Error::ProbeExhausted(_)) => None,
       Err(e) => panic!("mediadecode-ffmpeg HW probe: {e}"),
     }
   };

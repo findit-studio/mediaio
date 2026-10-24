@@ -437,31 +437,29 @@ fn the_widest_inputs_the_types_admit_neither_overflow_nor_panic() {
   );
 }
 
-/// A download failure latches the **key**, not the stage.
+/// Standing down leaves the request standing.
 ///
-/// The decoder calls this when a fitted surface was produced and then
-/// would not cross to the CPU — the stage's own failure, which must not
-/// reject a working hardware decode. With nothing built there is
-/// nothing to latch, and the standing request survives either way, so a
-/// caller who asks for a different size gets a fresh attempt rather
-/// than a session quietly dead for good.
+/// The stage stands itself down for reasons of its own — a frame it cannot
+/// scale — and the frame goes out full size. With nothing built there is
+/// nothing to retire, and the standing request survives either way, so a
+/// caller who asks for a different size gets a fresh attempt rather than a
+/// session quietly dead for good.
 #[test]
-fn latching_a_download_failure_leaves_the_request_standing() {
+fn standing_down_leaves_the_request_standing() {
   let mut stage = ScaledOutput::new();
-  // Nothing built yet: latching is a no-op rather than a panic or a
+  // Nothing built yet: standing down is a no-op rather than a panic or a
   // state that refuses everything afterwards.
-  stage.latch_failure();
+  stage.stand_down();
   assert_eq!(stage.requested(), None);
 
   assert!(stage.request((512, 288), (1920, 1080)).is_supported());
-  stage.latch_failure();
+  stage.stand_down();
   assert_eq!(
     stage.requested(),
     Some((512, 288)),
-    "the caller's request outlives a download failure"
+    "the caller's request outlives a stand-down"
   );
-  // And a later, different request is still accepted — the latch rides
-  // the key, and the key carries the requested size.
+  // And a later, different request is still accepted.
   assert!(stage.request((256, 144), (1920, 1080)).is_supported());
   assert_eq!(stage.requested(), Some((256, 144)));
 }
@@ -484,9 +482,9 @@ fn a_broken_promise_is_observable_and_a_new_request_renews_it() {
   assert!(stage.request((512, 288), (1920, 1080)).is_supported());
   assert!(stage.promise_stands());
 
-  // The decoder's fitted-download retry latches, and that is a frame
-  // the caller receives full size.
-  stage.latch_failure();
+  // The stage stands down for a frame, and that is a frame the caller
+  // receives full size.
+  stage.stand_down();
   assert!(
     !stage.promise_stands(),
     "a frame went out unfitted, so the capability word must stop promising"
@@ -510,7 +508,7 @@ fn a_broken_promise_is_observable_and_a_new_request_renews_it() {
 fn a_refused_request_renews_nothing_and_returns_to_full_size() {
   let mut stage = ScaledOutput::new();
   assert!(stage.request((512, 288), (1920, 1080)).is_supported());
-  stage.latch_failure();
+  stage.stand_down();
   assert!(!stage.promise_stands());
   // An upscale is refused, so it cannot quietly renew what it never
   // accepted.
@@ -596,7 +594,7 @@ fn a_broken_promise_stops_the_staging_too() {
   assert!(stage.staging_armed());
 
   // One frame the stage could not honor.
-  stage.latch_failure();
+  stage.stand_down();
   assert!(!stage.promise_stands(), "the caller is told");
   assert!(
     !stage.staging_armed(),
@@ -621,7 +619,7 @@ fn a_broken_promise_stops_the_staging_too() {
 fn a_refused_request_does_not_rearm_the_stage() {
   let mut stage = ScaledOutput::new();
   assert!(stage.request((512, 288), (1920, 1080)).is_supported());
-  stage.latch_failure();
+  stage.stand_down();
   assert!(!stage.staging_armed());
   assert!(!stage.request((3840, 2160), (1920, 1080)).is_supported());
   assert!(

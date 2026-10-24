@@ -136,8 +136,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
   ) -> Result<Self, SubtitleDecodeError> {
     // Use the checked codec-context builder — `Context::from_parameters`
     // is OOM-UB-prone (see `crate::decoder::build_codec_context`).
-    let (ctx, callback_state) = build_codec_context(&parameters, limits, Some(time_base))
-      .map_err(SubtitleDecodeError::Decode)?;
+    let (ctx, callback_state) = build_codec_context(
+      &parameters,
+      limits,
+      crate::DecoderOptions::new(),
+      Some(time_base),
+    )
+    .map_err(SubtitleDecodeError::Decode)?;
     // Opened without forming a bindgen enum from FFmpeg memory: the codec
     // is resolved off a raw `codec_id`, and the medium is proved off a raw
     // `codec_type`. See `crate::decoder::ensure_codec_type`.

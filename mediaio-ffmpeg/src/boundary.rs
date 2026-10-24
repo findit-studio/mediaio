@@ -932,7 +932,7 @@ pub fn ffmpeg_packet_from_owned_video_packet(
 /// a claim about this function, and a decoder that kept what it is sent
 /// by reference and handed it back would carry the shared body past it.
 /// The video decoder's hardware probe is that recorder: it keeps every
-/// accepted packet in a rescue history, which `AllBackendsFailed` — or
+/// accepted packet in a rescue history, which `ProbeExhausted` — or
 /// a failed fallback's `FallbackFailed` — hands to the caller as owned,
 /// **mutable** `Packet`s. It records copies of its own
 /// (`boundary::try_clone_packet`), so nothing in that history addresses
@@ -2694,6 +2694,14 @@ pub unsafe fn attachment_packet_from_ffmpeg(
 /// charged `src` charges the copy the same bytes. On failure the partial
 /// clone is dropped, which releases the reference it took.
 ///
+/// **A source with no payload is copied with none**, its properties and
+/// side data alone (`av_packet_copy_props`): `av_packet_ref` and
+/// `av_packet_make_writable` would point the copy's `data` at a buffer of
+/// padding (`packet.c` 452–460 and 521–533), and `avcodec_send_packet`
+/// refuses data with no size (`libavcodec/decode.c` 742–743) where it takes
+/// the side-data-only source. So a decoder takes the copy as it takes
+/// `src`.
+///
 /// **`unsafe`, as every crossing that reads a foreign `ffmpeg_next`
 /// packet's storage is.** `av_packet_make_writable` copies a shared or
 /// read-only payload byte for byte, and `av_packet_ref` copies one that
@@ -2719,6 +2727,28 @@ pub unsafe fn try_clone_packet(src: &Packet) -> std::result::Result<Packet, ffmp
   use ffmpeg_next::packet::{Mut, Ref};
 
   let mut dst = Packet::empty();
+  // **A packet with no payload is copied with none.** `av_packet_ref` gives
+  // a source with no buffer one of its own, padding alone, and
+  // `av_packet_make_writable` one with a shared buffer, and each points the
+  // copy's `data` at it (`libavcodec/packet.c` 452–460 and 521–533 in
+  // FFmpeg 9.0.1): a side-data-only packet, which `avcodec_send_packet`
+  // takes, would copy to data with no size, which it refuses before it
+  // references it (`libavcodec/decode.c` 742–743). So the copy is the
+  // source's properties and side data alone (`av_packet_copy_props`,
+  // `packet.c` 397–432), and libavcodec takes it as it takes the source.
+  //
+  // SAFETY: `src` is live; `data` is a plain field.
+  if unsafe { (*src.as_ptr()).data }.is_null() {
+    // SAFETY: `dst` is blank; `av_packet_copy_props` copies `src`'s
+    // properties and each side-data entry's bytes — written, per this
+    // function's own `# Safety` — and on failure frees what it copied,
+    // leaving `dst` blank (`packet.c` 413–427).
+    let ret = unsafe { ffmpeg_next::ffi::av_packet_copy_props(dst.as_mut_ptr(), src.as_ptr()) };
+    if ret < 0 {
+      return Err(ffmpeg_next::Error::from(ret));
+    }
+    return Ok(dst);
+  }
   // SAFETY: dst is a freshly zero-initialized Packet (av_init_packet inside
   // Packet::empty); av_packet_ref initializes its data fields from src's
   // refcounted buffer, or returns AVERROR(ENOMEM) and leaves dst blank

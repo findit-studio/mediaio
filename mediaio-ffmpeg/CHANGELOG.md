@@ -9,6 +9,37 @@ The FFmpeg-dependent crates — `mediaio-ffmpeg`, `mediadecode-ffmpeg`,
 `mediaencode-ffmpeg` and `mediaio` — release in lockstep; every other
 crate moves only when it changes.
 
+## [0.21.0] - 2026-10-24
+
+Released in lockstep with `mediadecode-ffmpeg` 0.21.0.
+
+### Fixed
+
+- **`try_clone_packet` copies a packet with no payload with none**, its
+  properties and side data alone. `av_packet_ref` and
+  `av_packet_make_writable` gave the copy of a side-data-only packet a
+  buffer of padding and data with no size, which `avcodec_send_packet`
+  refuses (`AVERROR(EINVAL)`, `libavcodec/decode.c` 742–743 in FFmpeg
+  9.0.1) where it takes the source: `mediadecode-ffmpeg`'s hardware probe,
+  which records such copies, replayed one into the next backend and failed
+  it.
+
+### Added
+
+- **`options`: how a decoder decodes, beside what it may spend.**
+  `DecoderOptions` carries libavcodec's three `AVDiscard` settings —
+  `skip_frame`, `skip_loop_filter` and `skip_idct` — each a `Discard`,
+  FFmpeg's seven values (`Nothing`, `Default`, `NonReference`,
+  `Bidirectional`, `NonIntra`, `NonKey`, `All`), written and read as
+  FFmpeg's option constants (`none` … `all`, any case on reading;
+  `ParseDiscardError` for any other name). The defaults are libavcodec's.
+  `DecoderLimits` stays what a decoder may spend; these are decode
+  behaviour, and `mediadecode-ffmpeg` writes them into every video
+  `AVCodecContext` a decoder opened with them opens, through each video
+  decoder's open request (`VideoStreamDecoderOpen`, `VideoDecoderOpen`).
+  Which levels a decoder reads is the decoder's: a level is a request,
+  never a promise that no picture comes.
+
 ## [0.20.0] - 2026-10-23
 
 ### Changed

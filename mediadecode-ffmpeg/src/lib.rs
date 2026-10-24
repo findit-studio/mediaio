@@ -27,7 +27,7 @@ mod vtscale;
 // always used; the public ones are re-exported under the same names.
 #[cfg(test)]
 use mediaio_ffmpeg::view;
-pub use mediaio_ffmpeg::{boundary, channel_layout, convert, extras, limits, ticket};
+pub use mediaio_ffmpeg::{boundary, channel_layout, convert, extras, limits, options, ticket};
 use mediaio_ffmpeg::{buffer, ffi, footprint, frame, measured, reader_guard, text};
 
 pub use mediaio_ffmpeg::{
@@ -38,22 +38,22 @@ pub use mediaio_ffmpeg::{
   DEFAULT_MAX_PACKET_BYTES, DEFAULT_MAX_PIXELS, DEFAULT_MAX_PROBE_BYTES, DEFAULT_MAX_STREAMS,
   DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES, DEFAULT_MAX_TOTAL_CHAPTER_TITLE_BYTES,
   DEFAULT_MAX_TOTAL_CODEC_PARAMETER_BYTES, DEFAULT_MAX_TOTAL_STREAM_METADATA_BYTES, DataPacket,
-  DecoderLimits, DemuxLimits, DemuxedPacket, DemuxerName, DolbyVisionConfig, Ffmpeg, FfmpegBuffer,
-  FfmpegBytes, FfmpegCarrier, Frame, FrameLimits, ImageFrame, MediaKind, Owned,
-  OwnedAttachmentPacket, OwnedAudioFrame, OwnedAudioPacket, OwnedDataPacket, OwnedDemuxedPacket,
-  OwnedImageFrame, OwnedSubtitleFrame, OwnedSubtitlePacket, OwnedVideoFrame, OwnedVideoPacket,
-  PacketBufferError, PacketBuildError, PacketLimits, ParametersChannelMap, ParametersError,
-  ParametersLayoutShape, Ratio, SampleFormat, SendPayloadTooLarge, SendSideDataTooLarge,
-  SubtitleFrame, SubtitlePacket, TrackInfo, TrackParams, TrustedPayload, UnregisteredDemuxer,
-  VideoFrame, VideoPacket, View, attachment_packet_from_ffmpeg, audio_packet_from_ffmpeg,
-  audio_packet_from_ffmpeg_in, channel_layout_description_from_ffmpeg, channel_layout_from_ffmpeg,
-  channel_order_from_ffmpeg, data_packet_from_ffmpeg_in, empty_audio_frame,
-  empty_owned_audio_frame, empty_owned_subtitle_frame, empty_owned_video_frame,
-  empty_subtitle_frame, empty_video_frame, ffmpeg_packet_from_audio_packet,
-  ffmpeg_packet_from_owned_audio_packet, ffmpeg_packet_from_owned_subtitle_packet,
-  ffmpeg_packet_from_owned_video_packet, ffmpeg_packet_from_subtitle_packet,
-  ffmpeg_packet_from_video_packet, from_av_pixel_format, is_hardware_pix_fmt,
-  owned_attachment_packet_from_ffmpeg, owned_audio_packet_from_ffmpeg_in,
+  DecoderLimits, DecoderOptions, DemuxLimits, DemuxedPacket, DemuxerName, Discard,
+  DolbyVisionConfig, Ffmpeg, FfmpegBuffer, FfmpegBytes, FfmpegCarrier, Frame, FrameLimits,
+  ImageFrame, MediaKind, Owned, OwnedAttachmentPacket, OwnedAudioFrame, OwnedAudioPacket,
+  OwnedDataPacket, OwnedDemuxedPacket, OwnedImageFrame, OwnedSubtitleFrame, OwnedSubtitlePacket,
+  OwnedVideoFrame, OwnedVideoPacket, PacketBufferError, PacketBuildError, PacketLimits,
+  ParametersChannelMap, ParametersError, ParametersLayoutShape, ParseDiscardError, Ratio,
+  SampleFormat, SendPayloadTooLarge, SendSideDataTooLarge, SubtitleFrame, SubtitlePacket,
+  TrackInfo, TrackParams, TrustedPayload, UnregisteredDemuxer, VideoFrame, VideoPacket, View,
+  attachment_packet_from_ffmpeg, audio_packet_from_ffmpeg, audio_packet_from_ffmpeg_in,
+  channel_layout_description_from_ffmpeg, channel_layout_from_ffmpeg, channel_order_from_ffmpeg,
+  data_packet_from_ffmpeg_in, empty_audio_frame, empty_owned_audio_frame,
+  empty_owned_subtitle_frame, empty_owned_video_frame, empty_subtitle_frame, empty_video_frame,
+  ffmpeg_packet_from_audio_packet, ffmpeg_packet_from_owned_audio_packet,
+  ffmpeg_packet_from_owned_subtitle_packet, ffmpeg_packet_from_owned_video_packet,
+  ffmpeg_packet_from_subtitle_packet, ffmpeg_packet_from_video_packet, from_av_pixel_format,
+  is_hardware_pix_fmt, owned_attachment_packet_from_ffmpeg, owned_audio_packet_from_ffmpeg_in,
   owned_data_packet_from_ffmpeg_in, owned_subtitle_packet_from_ffmpeg_in,
   owned_video_packet_from_ffmpeg_in, subtitle_packet_from_ffmpeg, subtitle_packet_from_ffmpeg_in,
   video_packet_from_ffmpeg, video_packet_from_ffmpeg_in,
@@ -118,7 +118,7 @@ pub type FfmpegVideoStreamDecoder = video::CarrierVideoStreamDecoder<View>;
 pub type FfmpegOwnedVideoStreamDecoder = video::CarrierVideoStreamDecoder<Owned>;
 pub use audio::{AudioDecodeError, CarrierAudioStreamDecoder};
 pub use backend::Backend;
-pub use decoder::VideoDecoder;
+pub use decoder::{VideoDecoder, VideoDecoderOpen};
 pub use demuxer::{
   CarrierDemuxer, ChapterAlloc, ChapterTimebaseInvalid, ChapterTitleAlloc,
   ChapterTitleBudgetExhausted, ChapterTitleTooLong, DemuxError, DemuxerOpen, ProbeBudgetExhausted,
@@ -126,11 +126,12 @@ pub use demuxer::{
   TrackTableAlloc, TrackTimebaseInvalid,
 };
 pub use error::{
-  Error, FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge, HwTransferTooLarge, Result,
+  DownloadFormatUnsupported, Error, FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge,
+  HwTransferTooLarge, Result, Spent,
 };
 pub use image::{CarrierImageDecoder, Corrupt, CorruptSource, ImageDecodeError, InputTooLarge};
 pub use subtitle::{CarrierSubtitleStreamDecoder, SubtitleDecodeError};
-pub use video::{CarrierVideoStreamDecoder, DecodePath, VideoDecodeError};
+pub use video::{CarrierVideoStreamDecoder, DecodePath, VideoDecodeError, VideoStreamDecoderOpen};
 
 /// Asserts a submission was taken, and answers nothing.
 ///

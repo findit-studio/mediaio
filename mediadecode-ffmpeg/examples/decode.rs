@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   let mut decoder = match VideoDecoder::open(stream.parameters()) {
     Ok(d) => d,
-    Err(mediadecode_ffmpeg::Error::AllBackendsFailed(p)) => {
+    Err(mediadecode_ffmpeg::Error::ProbeExhausted(p)) => {
       let attempts = p.attempts();
       eprintln!(
         "no hardware backend available; tried {} backend(s):",

@@ -9,6 +9,13 @@ The FFmpeg-dependent crates — `mediaio-ffmpeg`, `mediadecode-ffmpeg`,
 `mediaencode-ffmpeg` and `mediaio` — release in lockstep; every other
 crate moves only when it changes.
 
+## [0.21.0] - 2026-10-24
+
+### Changed
+
+- Released in lockstep with the FFmpeg crates at 0.21.0, on
+  `mediaio-ffmpeg` 0.21.0. Nothing in this crate changed.
+
 ## [0.20.0] - 2026-10-23
 
 ### Changed
