@@ -128,6 +128,8 @@
 //! | `CodecId::media_type` | the descriptor's media type | as above |
 //! | `CodecId::bits_per_sample` | `av_get_bits_per_sample` through a shim taking `c_int` | no bindgen enum formed; libavcodec answers 0 for a codec it does not know |
 //! | `packet_side_data_name` (`extras.rs`) | `av_packet_side_data_name` through a shim taking `c_int` | as above; null for a type it does not name, the text bounded |
+//! | `hdr_metadata::check_hdr10_plus`, `check_smpte2094_app5` | the linked libavutil's struct size, through its allocator (redeclared shims), the struct freed at once; the entry itself read through the mirrors' offsets as integers, with no `unsafe` | the allocator answers a zeroed struct or null, and writes its size to a valid out-pointer |
+//! | `hdr_metadata::hdr10_plus_from_t35`, `smpte2094_app5_from_t35` | the struct libavutil parses from a payload, copied out as its bytes | the payload live for the call, its length passed; the struct zeroed by its allocator and freed exactly once |
 //! | the boundary's builders, `build_data_packet` and `build_attachment_packet` among them (`boundary.rs`) | the carrier's payload, copied (`packet_body` on the copy road), its side data attached | each builder's contract, forwarded: on the copy road nothing is lent, so there is nothing to prove |
 //!
 //! # Every FFmpeg call, its failures, and whose they are

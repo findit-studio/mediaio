@@ -87,6 +87,19 @@ crate moves only when it changes.
   packed code does not unpack to itself, reported; no flag the report
   names as dropped handed to libavformat, so MP4 makes no cover of a
   timed track.
+- **The sizes libavformat counts in 32 bits are counted first, wide.**
+  VP9's superframe — the hidden frames the automatic filter holds and the
+  frame shown that joins them, which it sums in 32 bits and allocates by
+  — is refused at the frame that decides it would pass libavcodec's
+  largest packet (`PayloadRule::SuperframeSize`; past 4 GiB the filter's
+  sum wrapped and its copy ran past the allocation); in another container,
+  where the filter may run, a VP9 frame larger than a seventh of it. A PGS
+  display set the filter would grow past it (`DisplaySetSize`); a packet
+  whose Annex B rewrite would pass it (`RewrittenSize`); a Matroska block
+  larger than half of what a cluster's buffer holds beside 5 MiB, which
+  Matroska would write cut (`ClusterSize`); an MP4 TTML paragraph that
+  would take the document MP4 joins at the trailer past it
+  (`DocumentSize`).
 - **HDR metadata side data is checked exactly before Matroska casts it.**
   On a Matroska or WebM video track, an HDR10+ or SMPTE ST 2094 APP5
   entry is admitted only as the linked libavutil's struct, whole, that its

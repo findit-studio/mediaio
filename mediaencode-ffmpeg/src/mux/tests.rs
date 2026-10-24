@@ -944,52 +944,82 @@ fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
   let start = PgsState::default();
   let (pcs, end, ods) = (segment(0x16, 8), segment(0x80, 0), segment(0x15, 4));
   let whole = [pcs.clone(), ods.clone(), end.clone()].concat();
-  assert_eq!(pgs_frame_merge(start, &whole), Ok((start, true)));
+  assert_eq!(
+    pgs_frame_merge(start, &whole, PACKET_BYTES_MAX),
+    Ok((start, true))
+  );
   let held = PgsState {
     holding: true,
     presentation: true,
+    bytes: pcs.len() as u64,
   };
-  assert_eq!(pgs_frame_merge(start, &pcs), Ok((held, true)));
   assert_eq!(
-    pgs_frame_merge(held, &[ods.clone(), end.clone()].concat()),
+    pgs_frame_merge(start, &pcs, PACKET_BYTES_MAX),
+    Ok((held, true))
+  );
+  assert_eq!(
+    pgs_frame_merge(held, &[ods.clone(), end.clone()].concat(), PACKET_BYTES_MAX),
     Ok((start, false)),
     "the set is timed by its presentation segment's packet"
   );
   let unpresented = PgsState {
     holding: true,
     presentation: false,
+    bytes: ods.len() as u64,
   };
-  assert_eq!(pgs_frame_merge(start, &ods), Ok((unpresented, false)));
   assert_eq!(
-    pgs_frame_merge(unpresented, &end),
+    pgs_frame_merge(start, &ods, PACKET_BYTES_MAX),
+    Ok((unpresented, false))
+  );
+  assert_eq!(
+    pgs_frame_merge(unpresented, &end, PACKET_BYTES_MAX),
     Err(PayloadRule::PgsSegments)
   );
   assert_eq!(
-    pgs_frame_merge(start, &[ods.clone(), end.clone()].concat()),
+    pgs_frame_merge(
+      start,
+      &[ods.clone(), end.clone()].concat(),
+      PACKET_BYTES_MAX
+    ),
     Err(PayloadRule::PgsSegments),
     "a whole set with no presentation segment"
   );
   assert_eq!(
-    pgs_frame_merge(start, &pcs[..6]),
+    pgs_frame_merge(start, &pcs[..6], PACKET_BYTES_MAX),
     Err(PayloadRule::PgsSegments),
     "a segment past the packet"
   );
   assert_eq!(
-    pgs_frame_merge(start, &[pcs.clone(), pcs.clone(), end.clone()].concat()),
+    pgs_frame_merge(
+      start,
+      &[pcs.clone(), pcs.clone(), end.clone()].concat(),
+      PACKET_BYTES_MAX
+    ),
     Err(PayloadRule::PgsSegments),
     "two presentation segments in a set"
   );
   assert_eq!(
-    pgs_frame_merge(start, &[segment(0x16, 2), end.clone()].concat()),
+    pgs_frame_merge(
+      start,
+      &[segment(0x16, 2), end.clone()].concat(),
+      PACKET_BYTES_MAX
+    ),
     Err(PayloadRule::PgsSegments),
     "a presentation segment shorter than 11 bytes"
   );
   assert_eq!(
-    pgs_frame_merge(start, &[whole.clone(), whole.clone()].concat()),
+    pgs_frame_merge(
+      start,
+      &[whole.clone(), whole.clone()].concat(),
+      PACKET_BYTES_MAX
+    ),
     Ok((start, true)),
     "two sets in one packet"
   );
-  assert_eq!(pgs_frame_merge(start, &[]), Err(PayloadRule::Empty));
+  assert_eq!(
+    pgs_frame_merge(start, &[], PACKET_BYTES_MAX),
+    Err(PayloadRule::Empty)
+  );
 }
 
 /// **MP4's PCM takes the channel layouts its `chnl` box writes**: every
@@ -1279,4 +1309,86 @@ fn a_tracks_kind_agrees_with_its_media_type_as_table_d_says() {
     Some(audio)
   ));
   assert!(!media_type_agrees(TrackKind::Unknown, video, Some(video)));
+}
+
+/// **A VP9 run is refused at the frame that decides its superframe would
+/// pass the limit** — table B of the census, the limit lowered from
+/// libavcodec's largest packet to 100 bytes (the seam): `merge_superframe`
+/// sums the frames in 32 bits and allocates by the sum, so past the limit
+/// the sum wraps or the allocation is refused after the frames were taken.
+/// A hidden frame is refused where no frame shown after it could join the
+/// run within the limit; a frame shown, where its superframe passes it.
+///
+/// PLANT: counting the held frames alone, as before, admits all three.
+#[test]
+fn a_vp9_run_past_the_limit_is_refused_at_the_frame_that_decides_it() {
+  // Frames of 40 bytes: a size byte each in the index, marker twice.
+  assert_eq!(superframe_bytes(80 + 10, 40, 3), 90 + 2 + 3);
+  // A frame of 300 bytes: two bytes a size.
+  assert_eq!(superframe_bytes(300, 300, 1), 300 + 2 + 2);
+  // Past 16 MiB, four bytes a size; and no wrap at 4 GiB.
+  assert_eq!(superframe_bytes(5 << 30, 1 << 30, 5), (5 << 30) + 2 + 4 * 5);
+  let limit = 100;
+  let held = vp9_run((0, 0, 0), 1, 40, limit).expect("one hidden frame of 40");
+  assert_eq!(held, (40, 40));
+  let held =
+    vp9_run((1, held.0, held.1), 2, 40, limit).expect("two: 80, and a byte could join them");
+  assert_eq!(held, (80, 40));
+  assert_eq!(
+    vp9_run((2, held.0, held.1), 3, 40, limit),
+    Err(PayloadRule::SuperframeSize),
+    "a third: no frame shown after it could join them within 100"
+  );
+  assert_eq!(
+    vp9_run((2, held.0, held.1), 0, 20, limit),
+    Err(PayloadRule::SuperframeSize),
+    "a frame shown of 20 joins them at 105"
+  );
+  assert_eq!(
+    vp9_run((2, held.0, held.1), 0, 10, limit),
+    Ok((0, 0)),
+    "a frame shown of 10 joins them at 95"
+  );
+  assert_eq!(
+    vp9_run((0, 0, 0), 0, 1000, limit),
+    Ok((0, 0)),
+    "a frame shown alone passes"
+  );
+  // At the real limit, three frames of a gigabyte: the third is refused.
+  let gib = 1 << 30;
+  let held = vp9_run((0, 0, 0), 1, gib, PACKET_BYTES_MAX).expect("a gigabyte");
+  let held = vp9_run((1, held.0, held.1), 2, gib - 1024, PACKET_BYTES_MAX).expect("two");
+  assert_eq!(
+    vp9_run((2, held.0, held.1), 3, gib, PACKET_BYTES_MAX),
+    Err(PayloadRule::SuperframeSize)
+  );
+}
+
+/// **A PGS display set past the limit is refused at the packet that would
+/// grow it there** — the limit lowered to 20 bytes (the seam).
+#[test]
+fn a_pgs_display_set_past_the_limit_is_refused() {
+  let (pcs, end, ods) = (segment(0x16, 8), segment(0x80, 0), segment(0x15, 4));
+  let start = PgsState::default();
+  // 11 bytes held, then 7 more and the end's 3: 21.
+  let (held, _) = pgs_frame_merge(start, &pcs, 20).expect("the presentation segment, held");
+  assert_eq!(
+    pgs_frame_merge(held, &[ods.clone(), end.clone()].concat(), 20),
+    Err(PayloadRule::DisplaySetSize)
+  );
+  assert_eq!(
+    pgs_frame_merge(held, &[ods.clone(), end.clone()].concat(), 21),
+    Ok((start, false))
+  );
+  // A whole set passes as it is, held by nothing.
+  let whole = [pcs, ods, end].concat();
+  assert_eq!(pgs_frame_merge(start, &whole, 20), Ok((start, true)));
+}
+
+/// **The Annex B rewrite is bounded by a byte more for each start code.**
+#[test]
+fn the_annex_b_rewrite_is_bounded_by_its_start_codes() {
+  assert_eq!(length_prefixed_bytes(&[0, 0, 1, 9, 9, 0, 0, 1, 8]), 9 + 2);
+  assert_eq!(length_prefixed_bytes(&[0, 0, 0, 1, 9]), 5 + 1);
+  assert_eq!(length_prefixed_bytes(&[1, 2, 3]), 3);
 }

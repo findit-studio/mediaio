@@ -190,6 +190,27 @@
 //! | two entries of one kind | libavcodec keeps one: the later's bytes in the earlier's place (`packet.c` 197–227), the earlier dropped unsaid | refused in every container ([`PayloadRule::SideDataRepeated`]) |
 //! | the stream's own, coded side data | the ticket's, mirrored from a demuxer's parameters ([`CodecTicket::mirror`] is its only constructor): libavformat's and libavcodec's structs at their own sizes; MP4 casts Dolby Vision's only under the strict compliance "unofficial" (`movenc.c` 2999–3006), which the context never sets; MP4's frame cropping is table C's | — |
 //!
+//! ## B. The bitstream filters, and the sizes libavformat counts
+//!
+//! Every automatic filter libavformat inserts, and every size the packet
+//! path computes in 32 bits, with the bound held here — libavcodec's
+//! largest packet ([`PACKET_BYTES_MAX`], `INT_MAX` less the padding, less
+//! one) unless another is named. Each bound is counted in `u64` before
+//! anything is handed over.
+//!
+//! | what | where, and its arithmetic | here |
+//! |---|---|---|
+//! | `vp9_superframe` | MP4, Matroska, WebM, VP9: joins up to six hidden frames with the next one shown, summing their sizes in 32 bits and allocating by the sum (`vp9_superframe.c` 52–98, 151–155): past 4 GiB the sum wraps and the copy runs past the allocation; below it `av_new_packet` refuses after taking the frames | the run's bytes counted wide: a hidden frame refused where no frame shown after it could join the run within the bound, a frame shown where its superframe passes it ([`PayloadRule::SuperframeSize`]); the count's own rule beside it ([`PayloadRule::Superframe`]) |
+//! | `vp9_superframe`, another container | IVF and MOV's other modes insert it (`ivfenc.c` 42; `movenc.c` 9147) | a frame larger than a seventh of the bound refused ([`PayloadRule::SuperframeSize`]): no seven of the rest pass it |
+//! | `pgs_frame_merge` | Matroska PGS: grows the set it holds by each packet's segments (`av_grow_packet`, `pgs_frame_merge.c` 137–140), refusing past the bound after taking them | the set's bytes counted, refused at the packet that would pass it ([`PayloadRule::DisplaySetSize`]) |
+//! | `aac_adtstoasc` | MP4 and Matroska AAC with no configuration: shrinks a frame by its header, the first also by its program config element, unchecked | table F; nothing grows |
+//! | the others any muxer inserts: `h264_mp4toannexb`, `hevc_mp4toannexb`, `vvc_mp4toannexb` (MPEG-TS, the raw muxers), `extract_extradata` (FLV), `av1_metadata` (IVF, OBU), `pcm_rechunk` (DAUD, GXF, MXF), `eia608_to_smpte436m` (MCC, MXF) | each sizes what it writes with checked arithmetic or from its options (`h264_mp4toannexb.c` 420–424; `hevc_mp4toannexb.c` 199–206; `vvc_mp4toannexb.c` 287–294; `extract_extradata.c` 412–419; `pcm_rechunk.c` 57) | nothing to hold; reached only in containers of which nothing else is claimed |
+//! | the Annex B rewrite | MP4 (H.264, HEVC, VVC, LCEVC) and Matroska and WebM (H.264, HEVC, VVC) over an Annex B configuration: each start code becomes a 4-byte length, the size summed in an `int` (`nal_parse_units`, `nal.c` 74–111); MP4's HEVC under `hvc1` through a dynamic buffer of at most `INT_MAX` (`aviobuf.c` 1281–1311) | its upper bound — the packet and a byte for each start code — held to the bound ([`PayloadRule::RewrittenSize`]) |
+//! | Matroska's cluster | written into a dynamic buffer of at most `INT_MAX`, refused past it and the cluster written cut; a new one once the last passes 5 MiB, two blocks at most written after that check (`matroskaenc.c` 2746–2749, 3213–3271) | each block — its payload as written and its side data — at most half of what is left beside 5 MiB and 64 KiB (`MATROSKA_BLOCK_BYTES_MAX`, [`PayloadRule::ClusterSize`]) |
+//! | WebVTT's lines | Matroska and WebM: the cue, its identifier and its settings summed, refused past `INT_MAX` (`matroskaenc.c` 2828–2853) | within the cluster's bound |
+//! | MP4's joined TTML | libavcodec's TTML encoder's paragraphs, joined at the trailer into one document in a dynamic buffer and then one packet (`movenc_ttml.c` 236–317) | the document's bytes counted — each paragraph and its element, and the header its configuration and language make — and refused at the paragraph that would pass the bound ([`PayloadRule::DocumentSize`]) |
+//! | the payload and side data copied in | `av_new_packet` and `av_packet_new_side_data` refuse past the bound (`libavcodec/packet.c` 83–95, 231–250), after the muxer's own budget ([`PacketLimits`]) | a fault before libavformat is reached ([`OutputError::Build`]), the packet not handed back |
+//!
 //! ## D. A track's kind and its media type
 //!
 //! Judged before any stream is added ([`MuxOpenError::MediaTypeMismatch`]):
@@ -306,6 +327,51 @@ enum Family {
   Mp4,
   Other,
 }
+
+/// The most bytes libavcodec allocates a packet of: `packet_alloc` refuses
+/// `INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE` and more (`libavcodec/packet.c`
+/// 83–95 in FFmpeg 9.0.1), and `av_grow_packet` grows none past it
+/// (121–127). Every size this muxer's mirrors of libavformat's arithmetic
+/// bound — a superframe, a display set, a rewritten packet, a joined
+/// document — is held to it (table B of the census, see [the
+/// module](self)).
+const PACKET_BYTES_MAX: u64 = i32::MAX as u64 - 65;
+
+/// The most bytes Matroska and WebM take of one block — its payload as
+/// written and the side data written with it — so that a cluster holds
+/// them. Matroska writes a cluster into a dynamic buffer of at most
+/// `INT_MAX` bytes (`dyn_buf_write`, `aviobuf.c` 1281–1311), which refuses
+/// a write past it and leaves the cluster cut; it starts a new cluster once
+/// the last passes 5 MiB (`matroskaenc.c` 2746–2749, 3213–3245), and
+/// writes up to two blocks after that check — the audio packet it held
+/// back, then the packet (3253–3271). So two blocks and 5 MiB fit, with 64 KiB to
+/// spare for a cluster's own elements.
+const MATROSKA_BLOCK_BYTES_MAX: u64 = (i32::MAX as u64 - 5 * 1024 * 1024 - 64 * 1024) / 2;
+
+/// What a Matroska block adds to its payload and side data, at most: its
+/// group, header, duration and padding elements, a WebVTT cue's two line
+/// breaks, and each block addition's own elements (`mkv_write_block`,
+/// `matroskaenc.c` 2864–3010).
+const MATROSKA_BLOCK_OVERHEAD: u64 = 4 * 1024;
+
+/// VP9 in a container this release does not know, the automatic filters
+/// on: the largest frame a superframe of seven — the most
+/// `vp9_superframe` joins (`MAX_CACHE`, `vp9_superframe.c` 28, 151–155) —
+/// can hold within [`PACKET_BYTES_MAX`], its index of four-byte sizes
+/// beside it. Such a container may insert the filter (IVF, `ivfenc.c`
+/// 42; MOV's other modes, `movenc.c` 9147), and nothing else is claimed of
+/// it.
+const VP9_FRAME_BYTES_ELSEWHERE: u64 = (PACKET_BYTES_MAX - 2 - 4 * 7) / 7;
+
+/// What MP4's joined TTML document adds per paragraph, at most: its `<p>`
+/// element and its two times (`ttml_write_packet`, `ttmlenc.c` 161–181;
+/// `ttml_write_time`, 67–80).
+const TTML_PARAGRAPH_OVERHEAD: u64 = 160;
+
+/// What the document adds around its paragraphs beside the strings the
+/// track's configuration and language give it: its header and footer
+/// (`ttml_header_text`, `ttml_footer_text`, `ttmlenc.c` 53–65).
+const TTML_DOCUMENT_OVERHEAD: u64 = 1024;
 
 /// How a muxer opens: the bound on what it copies of each packet, and
 /// whether libavformat's automatic bitstream filters run (see [the
@@ -951,6 +1017,47 @@ pub enum PayloadRule {
     "the packet's SMPTE 2094 APP5 side data is not a struct Matroska writes whole and reads back"
   )]
   DynamicHdrApp5,
+  /// VP9, the automatic filters on: a frame whose superframe — with the
+  /// hidden frames the filter holds — would pass the largest packet
+  /// libavcodec allocates. The filter sums the frames' sizes in 32 bits
+  /// and copies them into what it allocated by that sum
+  /// (`merge_superframe`, `vp9_superframe.c` 52–98): past 4 GiB the sum
+  /// wraps and the copy runs past the allocation, and below it
+  /// `av_new_packet` refuses the superframe after the frames were taken.
+  /// Refused at the frame that decides it: a hidden frame no frame shown
+  /// after it could join within the bound, or the frame shown that would
+  /// pass it. In another container, where the filter may run, a frame
+  /// larger than a seventh of the bound.
+  #[error("the VP9 superframe the automatic filter would join is larger than a packet holds")]
+  SuperframeSize,
+  /// Matroska PGS, the automatic filters on: segments whose display set,
+  /// with what the filter holds of it, would pass the largest packet
+  /// `av_grow_packet` makes, which refuses it after the segments were
+  /// taken (`pgs_frame_merge.c` 137–140; `libavcodec/packet.c` 121–127).
+  #[error("the PGS display set the automatic filter would join is larger than a packet holds")]
+  DisplaySetSize,
+  /// MP4, Matroska and WebM, a track whose packets are rewritten from
+  /// Annex B to length prefixes ([`Rewrite::LengthPrefixed`]): a packet
+  /// whose rewritten size — a 4-byte length for each start code — would
+  /// pass what the rewriter counts in its `int` (`nal_parse_units`,
+  /// `nal.c` 74–111) and the dynamic buffer it writes into holds
+  /// (`aviobuf.c` 1281–1311).
+  #[error("the packet, rewritten with length prefixes, is larger than the rewriter counts")]
+  RewrittenSize,
+  /// Matroska and WebM: a packet whose block — its payload as written and
+  /// the side data written with it — is larger than a cluster's buffer
+  /// takes beside the block before it (`MATROSKA_BLOCK_BYTES_MAX`; table B
+  /// of the census): the buffer refuses the write, and the cluster is
+  /// written cut.
+  #[error("the packet is larger than a Matroska cluster holds")]
+  ClusterSize,
+  /// MP4 TTML from libavcodec's TTML encoder: a paragraph that would take
+  /// the document MP4 joins the track's paragraphs into at the trailer
+  /// ([`Rewrite::ParagraphsJoined`]) past the largest packet libavcodec
+  /// allocates, which the trailer refuses (`movenc_ttml.c` 236–317).
+  /// Refused at the paragraph that would pass it.
+  #[error("the TTML paragraph would take the document MP4 joins past what a packet holds")]
+  DocumentSize,
   /// Two side-data entries of one kind. libavcodec keeps one entry a kind:
   /// a later one's bytes replace the earlier one's in its place
   /// (`av_packet_add_side_data`, `libavcodec/packet.c` 197–227 in FFmpeg
@@ -1117,6 +1224,9 @@ struct TrackState {
   cue_end: Option<i128>,
   /// MP4 AC-3 and E-AC-3: what MP4 has learned of the track's frames.
   ac3: Ac3State,
+  /// MP4 TTML from libavcodec's TTML encoder: the bytes of the document
+  /// MP4 joins its paragraphs into, so far.
+  document: u64,
 }
 
 /// The rows of the packet-rule table one track's packets meet in its
@@ -1163,6 +1273,17 @@ struct PacketRules {
   /// Matroska and WebM video: HDR10+ and APP5 side data is a struct the
   /// writer serializes whole (table A of the census).
   hdr_metadata: bool,
+  /// MP4, Matroska and WebM: the packets are rewritten from Annex B to
+  /// length prefixes, which the rewriter counts in an `int`.
+  length_prefixed: bool,
+  /// Matroska and WebM: each block fits a cluster's buffer.
+  matroska_block: bool,
+  /// Another container, VP9, the automatic filters on: the largest frame a
+  /// superframe of seven holds.
+  vp9_frame_max: Option<u64>,
+  /// MP4 TTML from libavcodec's TTML encoder: the bytes the joined
+  /// document takes beside its paragraphs.
+  ttml_document: Option<u64>,
 }
 
 /// The earliest time a container writes without moving every stream, in
@@ -1181,13 +1302,15 @@ impl PacketRules {
   /// The rules `family`'s packet path applies to a timed track of `kind`
   /// whose stream holds `codec`, counted in `time_base`; `shifts` says
   /// whether libavformat moves early times in this container
-  /// ([`Output::shifts_early_times`]).
+  /// ([`Output::shifts_early_times`]), and `filters` whether its automatic
+  /// filters run.
   fn settle(
     family: Family,
     kind: TrackKind,
     codec: &StreamCodec,
     time_base: Timebase,
     shifts: bool,
+    filters: bool,
   ) -> Self {
     let id = codec.codec();
     let mp4 = family == Family::Mp4;
@@ -1227,6 +1350,11 @@ impl PacketRules {
       webvtt: either_matroska && id == CodecId::WEBVTT,
       ac3: (mp4 && (id == CodecId::AC3 || id == CodecId::EAC3)).then_some(id == CodecId::EAC3),
       hdr_metadata: either_matroska && kind == TrackKind::Video,
+      length_prefixed: length_prefixed(family, id, codec.extradata()),
+      matroska_block: either_matroska,
+      vp9_frame_max: (family == Family::Other && filters && id == CodecId::VP9)
+        .then_some(VP9_FRAME_BYTES_ELSEWHERE),
+      ttml_document: None,
     }
   }
 }
@@ -1673,8 +1801,9 @@ enum Filter {
   /// `aac_adtstoasc`, and whether it has converted the track's first
   /// frame.
   Adts { converted: bool },
-  /// `vp9_superframe`, and how many hidden frames it holds.
-  Vp9 { held: u8 },
+  /// `vp9_superframe`, and the hidden frames it holds: how many, their
+  /// bytes, and the largest's.
+  Vp9 { held: u8, bytes: u64, largest: u64 },
   /// `pgs_frame_merge`, and what it holds of a display set.
   Pgs(PgsState),
 }
@@ -1694,7 +1823,11 @@ impl Filter {
     } else if codec == CodecId::AAC && extradata.is_empty() && mp4_or_matroska {
       Self::Adts { converted: false }
     } else if codec == CodecId::VP9 && (mp4_or_matroska || family == Family::WebM) {
-      Self::Vp9 { held: 0 }
+      Self::Vp9 {
+        held: 0,
+        bytes: 0,
+        largest: 0,
+      }
     } else if codec == CodecId::HDMV_PGS_SUBTITLE && family == Family::Matroska {
       Self::Pgs(PgsState::default())
     } else {
@@ -1722,10 +1855,30 @@ impl Filter {
         Ok((Self::Adts { converted: true }, true))
       }
       Self::Adts { .. } => Err(PayloadRule::AdtsFrame),
-      Self::Vp9 { held } => {
-        vp9_superframe(held, bytes).map(|(held, own)| (Self::Vp9 { held }, own))
+      Self::Vp9 {
+        held,
+        bytes: sum,
+        largest,
+      } => {
+        let (next, own) = vp9_superframe(held, bytes)?;
+        let run = vp9_run(
+          (held, sum, largest),
+          next,
+          bytes.len() as u64,
+          PACKET_BYTES_MAX,
+        )?;
+        Ok((
+          Self::Vp9 {
+            held: next,
+            bytes: run.0,
+            largest: run.1,
+          },
+          own,
+        ))
       }
-      Self::Pgs(state) => pgs_frame_merge(state, bytes).map(|(state, own)| (Self::Pgs(state), own)),
+      Self::Pgs(state) => {
+        pgs_frame_merge(state, bytes, PACKET_BYTES_MAX).map(|(state, own)| (Self::Pgs(state), own))
+      }
     }
   }
 }
@@ -1860,12 +2013,50 @@ fn vp9_superframe(held: u8, bytes: &[u8]) -> Result<(u8, bool), PayloadRule> {
   }
 }
 
+/// The bytes the hidden frames VP9's filter holds come to after a packet of
+/// `len` bytes: `before` the frames held, their bytes and the largest's,
+/// and `after` how many it holds once it has taken the packet
+/// ([`vp9_superframe`]) — or the superframe the run would make passing
+/// `limit` ([`PayloadRule::SuperframeSize`]). A frame held is refused where
+/// no frame shown after it — one byte at the least — could join the run
+/// within the limit; a frame shown, where its superframe passes it. The
+/// limit is [`PACKET_BYTES_MAX`]; the laws lower it.
+fn vp9_run(
+  (held, bytes, largest): (u8, u64, u64),
+  after: u8,
+  len: u64,
+  limit: u64,
+) -> Result<(u64, u64), PayloadRule> {
+  if after > held {
+    let (bytes, largest) = (bytes + len, largest.max(len));
+    if superframe_bytes(bytes + 1, largest.max(1), u64::from(after) + 1) > limit {
+      return Err(PayloadRule::SuperframeSize);
+    }
+    return Ok((bytes, largest));
+  }
+  if held > 0 && superframe_bytes(bytes + len, largest.max(len), u64::from(held) + 1) > limit {
+    return Err(PayloadRule::SuperframeSize);
+  }
+  Ok((0, 0))
+}
+
+/// The bytes `merge_superframe` allocates for `frames` frames of `sum`
+/// bytes, the largest `largest` (`vp9_superframe.c` 52–65): the frames,
+/// then the index — a marker, each frame's size in as many bytes as the
+/// largest's bit length needs (`av_log2(max) >> 3`, plus one), the marker
+/// again. Counted wide: the filter's own `unsigned` sum wraps past 4 GiB.
+fn superframe_bytes(sum: u64, largest: u64, frames: u64) -> u64 {
+  let size_bytes = u64::from(largest.max(1).ilog2() / 8) + 1;
+  sum + 2 + size_bytes * frames
+}
+
 /// What the PGS filter holds of a display set: whether it holds any of its
-/// segments, and whether one was its presentation segment.
+/// segments, whether one was its presentation segment, and their bytes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PgsState {
   holding: bool,
   presentation: bool,
+  bytes: u64,
 }
 
 /// What PGS's automatic filter does with a packet of `bytes`, given what
@@ -1876,10 +2067,17 @@ struct PgsState {
 /// (132–136) — or the rule the packet breaks: empty, which the filter drops
 /// (87–90), or segments it would write marked corrupt — a display set it
 /// completes with no presentation segment (59–68), or segments that do not
-/// parse (93–130). Each segment is a type byte and a big-endian 16-bit
-/// length; a presentation segment, of type `0x16`, is one per display set
-/// and at least 11 bytes; one of type `0x80` ends the set.
-fn pgs_frame_merge(state: PgsState, bytes: &[u8]) -> Result<(PgsState, bool), PayloadRule> {
+/// parse (93–130) — or the display set it would grow past `limit`
+/// ([`PayloadRule::DisplaySetSize`]; `av_grow_packet`, 137–140). Each
+/// segment is a type byte and a big-endian 16-bit length; a presentation
+/// segment, of type `0x16`, is one per display set and at least 11 bytes;
+/// one of type `0x80` ends the set. The limit is [`PACKET_BYTES_MAX`]; the
+/// laws lower it.
+fn pgs_frame_merge(
+  state: PgsState,
+  bytes: &[u8],
+  limit: u64,
+) -> Result<(PgsState, bool), PayloadRule> {
   if bytes.is_empty() {
     return Err(PayloadRule::Empty);
   }
@@ -1925,6 +2123,12 @@ fn pgs_frame_merge(state: PgsState, bytes: &[u8]) -> Result<(PgsState, bool), Pa
       _ => {}
     }
     own |= presentation;
+    // The filter grows the set it holds by what it takes of the packet: the
+    // segments to the set's end, or all of them (137–140).
+    let held = state.bytes + end.unwrap_or(rest.len()) as u64;
+    if held > limit {
+      return Err(PayloadRule::DisplaySetSize);
+    }
     match end {
       Some(size) => {
         if !state.presentation {
@@ -1935,6 +2139,7 @@ fn pgs_frame_merge(state: PgsState, bytes: &[u8]) -> Result<(PgsState, bool), Pa
       }
       None => {
         state.holding = true;
+        state.bytes = held;
         rest = &[];
       }
     }
@@ -2241,6 +2446,8 @@ struct Learned {
   cue_end: Option<i128>,
   /// MP4 AC-3 and E-AC-3: what MP4 has learned of the frames.
   ac3: Option<Ac3State>,
+  /// MP4 TTML from libavcodec's TTML encoder: the joined document's bytes.
+  document: Option<u64>,
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
@@ -2416,7 +2623,18 @@ where
           let time_base = output
             .stream_time_base(stream)
             .map_err(|error| MuxFault::new(MuxStage::Header, error))?;
-          rules = PacketRules::settle(family, kind, &codec, time_base, shifts);
+          rules = PacketRules::settle(family, kind, &codec, time_base, shifts, filters);
+          // MP4 joins the paragraphs of libavcodec's TTML encoder into one
+          // document at the trailer, its header made of the configuration's
+          // strings and the language (`ttmlenc.c` 124–158).
+          if family == Family::Mp4
+            && codec.codec() == CodecId::TTML
+            && codec.extradata().starts_with(b"lavc-ttmlenc")
+          {
+            let language = tracks[index].language().map_or(0, |tag| tag.as_str().len());
+            rules.ttml_document =
+              Some((codec.extradata().len() + language) as u64 + TTML_DOCUMENT_OVERHEAD);
+          }
           sides = SideRules::of(family, kind, &codec);
           Some((stream, time_base))
         }
@@ -2451,6 +2669,7 @@ where
         written: false,
         cue_end: None,
         ac3: Ac3State::default(),
+        document: rules.ttml_document.unwrap_or(0),
       });
     }
 
@@ -2655,6 +2874,9 @@ where
     }
     if let Some(ac3) = plan.learned.ac3 {
       state.ac3 = ac3;
+    }
+    if let Some(document) = plan.learned.document {
+      state.document = document;
     }
     self.report.uncarried.extend(plan.uncarried);
     Ok(())
@@ -2879,7 +3101,45 @@ fn check_packet_rules(
       }
     }
   }
-  Ok(Learned { cue_end, ac3 })
+  // The sizes the container's arithmetic holds the packet to, as written.
+  let len = payload.bytes.len() as u64;
+  let written = if rules.length_prefixed {
+    let rewritten = length_prefixed_bytes(payload.bytes);
+    if rewritten > PACKET_BYTES_MAX {
+      return refused(PayloadRule::RewrittenSize);
+    }
+    rewritten
+  } else {
+    len
+  };
+  if rules.matroska_block {
+    let side: u64 = payload
+      .side_data
+      .iter()
+      .map(|entry| entry.data().len() as u64)
+      .sum();
+    if written + side + MATROSKA_BLOCK_OVERHEAD > MATROSKA_BLOCK_BYTES_MAX {
+      return refused(PayloadRule::ClusterSize);
+    }
+  }
+  if rules.vp9_frame_max.is_some_and(|most| len > most) {
+    return refused(PayloadRule::SuperframeSize);
+  }
+  let document = match rules.ttml_document {
+    Some(_) => {
+      let document = state.document + len + TTML_PARAGRAPH_OVERHEAD;
+      if document > PACKET_BYTES_MAX {
+        return refused(PayloadRule::DocumentSize);
+      }
+      Some(document)
+    }
+    None => None,
+  };
+  Ok(Learned {
+    cue_end,
+    ac3,
+    document,
+  })
 }
 
 /// The rule an HDR metadata entry Matroska's writer would cast breaks, if
@@ -3207,6 +3467,45 @@ fn annex_b(extradata: &[u8]) -> bool {
   extradata.starts_with(&[0, 0, 1]) || extradata.starts_with(&[0, 0, 0, 1])
 }
 
+/// Whether `family` rewrites a track of `codec` whose configuration is
+/// `extradata` from Annex B to length prefixes ([`Rewrite::LengthPrefixed`]).
+/// MP4 reads an H.264 or LCEVC configuration whose first byte is not 1 —
+/// an `avcC`'s version — as Annex B (`movenc.c` 7087–7089, 7141–7142), and
+/// an HEVC or VVC one longer than 6 bytes opening on a start code
+/// (7108–7109, 7129–7130); Matroska an H.264 one opening on a start code,
+/// an HEVC one so longer than 6 bytes, a VVC one 6 or more
+/// (`matroskaenc.c` 3574–3582).
+fn length_prefixed(family: Family, codec: CodecId, extradata: &[u8]) -> bool {
+  match family {
+    Family::Mp4 => match codec {
+      c if c == CodecId::H264 || c == CodecId::LCEVC => {
+        extradata.first().is_some_and(|&first| first != 1)
+      }
+      c if c == CodecId::HEVC || c == CodecId::VVC => extradata.len() > 6 && annex_b(extradata),
+      _ => false,
+    },
+    Family::Matroska | Family::WebM => match codec {
+      c if c == CodecId::H264 => annex_b(extradata),
+      c if c == CodecId::HEVC => extradata.len() > 6 && annex_b(extradata),
+      c if c == CodecId::VVC => extradata.len() >= 6 && annex_b(extradata),
+      _ => false,
+    },
+    Family::Other => false,
+  }
+}
+
+/// An upper bound on the bytes the Annex B rewriter makes of `bytes`
+/// (`nal_parse_units`, `nal.c` 74–111): each start code it finds becomes a
+/// 4-byte length, and the bytes between them are kept or trimmed, so the
+/// rewritten packet is its bytes and at most one more for each `00 00 01`.
+fn length_prefixed_bytes(bytes: &[u8]) -> u64 {
+  let starts = bytes
+    .windows(3)
+    .filter(|window| *window == [0, 0, 1])
+    .count();
+  (bytes.len() + starts) as u64
+}
+
 /// Whether Matroska writes a default duration for a timed track of `kind`
 /// whose stream libavformat holds as `stream`, at `frame_rate`: a video
 /// track's from its frame rate, an audio track's from the samples its
@@ -3236,30 +3535,7 @@ fn rewrites(
   let mp4 = family == Family::Mp4;
   let matroska = family == Family::Matroska;
   let either_matroska = matroska || family == Family::WebM;
-  // MP4 reads an H.264 or LCEVC configuration whose first byte is not 1
-  // — an `avcC`'s version — as Annex B (`movenc.c` 7087–7089, 7141–7142),
-  // and an HEVC or VVC one longer than 6 bytes opening on a start code
-  // (7108–7109, 7129–7130); Matroska an H.264 one opening on a start code,
-  // an HEVC one so longer than 6 bytes, a VVC one 6 or more
-  // (`matroskaenc.c` 3574–3582).
-  let annex = if mp4 {
-    match codec {
-      c if c == CodecId::H264 || c == CodecId::LCEVC => {
-        extradata.first().is_some_and(|&first| first != 1)
-      }
-      c if c == CodecId::HEVC || c == CodecId::VVC => extradata.len() > 6 && annex_b(extradata),
-      _ => false,
-    }
-  } else if either_matroska {
-    match codec {
-      c if c == CodecId::H264 => annex_b(extradata),
-      c if c == CodecId::HEVC => extradata.len() > 6 && annex_b(extradata),
-      c if c == CodecId::VVC => extradata.len() >= 6 && annex_b(extradata),
-      _ => false,
-    }
-  } else {
-    false
-  };
+  let annex = length_prefixed(family, codec, extradata);
   let ttml_encoder = extradata.starts_with(b"lavc-ttmlenc");
   [
     (annex, Rewrite::LengthPrefixed),
