@@ -936,56 +936,97 @@ fn segment(kind: u8, payload: usize) -> Vec<u8> {
 }
 
 /// **PGS segments are joined into display sets as the filter joins them**:
-/// a whole set passes; a set across packets is held to its end, timed by
-/// its presentation segment's packet; a set completed with no presentation
-/// segment, segments that do not parse, and an empty packet are refused.
+/// a whole set passes as it is; a set across packets is held to its end,
+/// timed by its presentation segment's packet and put out with that
+/// packet's side data; a set completed with no presentation segment,
+/// segments that do not parse, and an empty packet are refused.
 #[test]
 fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
   let start = PgsState::default();
   let (pcs, end, ods) = (segment(0x16, 8), segment(0x80, 0), segment(0x15, 4));
   let whole = [pcs.clone(), ods.clone(), end.clone()].concat();
+  let out = |reaches, largest: Option<usize>, held: Option<usize>| Step {
+    reaches,
+    largest: largest.map(|bytes| bytes as u64),
+    held: held.map(|bytes| bytes as u64),
+  };
   assert_eq!(
-    pgs_frame_merge(start, &whole, PACKET_BYTES_MAX),
-    Ok((start, true))
+    pgs_frame_merge(start, &whole, 0, PACKET_BYTES_MAX),
+    Ok((start, out(true, Some(whole.len()), None)))
   );
+  // The presentation segment's packet carries 100 bytes of side data, which
+  // the set is put out with.
   let held = PgsState {
     holding: true,
     presentation: true,
     bytes: pcs.len() as u64,
+    side: 100,
+    packets: 1,
   };
   assert_eq!(
-    pgs_frame_merge(start, &pcs, PACKET_BYTES_MAX),
-    Ok((held, true))
+    pgs_frame_merge(start, &pcs, 100, PACKET_BYTES_MAX),
+    Ok((held, out(true, None, Some(pcs.len() + 3 + 100))))
   );
   assert_eq!(
-    pgs_frame_merge(held, &[ods.clone(), end.clone()].concat(), PACKET_BYTES_MAX),
-    Ok((start, false)),
-    "the set is timed by its presentation segment's packet"
+    pgs_frame_merge(
+      held,
+      &[ods.clone(), end.clone()].concat(),
+      7,
+      PACKET_BYTES_MAX
+    ),
+    Ok((start, out(false, Some(whole.len() + 100), None))),
+    "the set is timed by its presentation segment's packet, and takes its side data"
   );
   let unpresented = PgsState {
     holding: true,
     presentation: false,
     bytes: ods.len() as u64,
+    side: 0,
+    packets: 1,
   };
   assert_eq!(
-    pgs_frame_merge(start, &ods, PACKET_BYTES_MAX),
-    Ok((unpresented, false))
+    pgs_frame_merge(start, &ods, 9, PACKET_BYTES_MAX),
+    Ok((unpresented, out(false, None, Some(ods.len() + 3))))
   );
   assert_eq!(
-    pgs_frame_merge(unpresented, &end, PACKET_BYTES_MAX),
+    pgs_frame_merge(
+      PgsState {
+        packets: 2,
+        bytes: 2 * ods.len() as u64,
+        ..unpresented
+      },
+      &pcs,
+      5,
+      PACKET_BYTES_MAX
+    ),
+    Ok((
+      PgsState {
+        holding: true,
+        presentation: true,
+        bytes: (2 * ods.len() + pcs.len()) as u64,
+        side: 5,
+        packets: 3,
+      },
+      out(true, None, Some(2 * ods.len() + pcs.len() + 3 + 5))
+    )),
+    "a third packet joins the set, its presentation segment with it"
+  );
+  assert_eq!(
+    pgs_frame_merge(unpresented, &end, 0, PACKET_BYTES_MAX),
     Err(PayloadRule::PgsSegments)
   );
   assert_eq!(
     pgs_frame_merge(
       start,
       &[ods.clone(), end.clone()].concat(),
+      0,
       PACKET_BYTES_MAX
     ),
     Err(PayloadRule::PgsSegments),
     "a whole set with no presentation segment"
   );
   assert_eq!(
-    pgs_frame_merge(start, &pcs[..6], PACKET_BYTES_MAX),
+    pgs_frame_merge(start, &pcs[..6], 0, PACKET_BYTES_MAX),
     Err(PayloadRule::PgsSegments),
     "a segment past the packet"
   );
@@ -993,6 +1034,7 @@ fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
     pgs_frame_merge(
       start,
       &[pcs.clone(), pcs.clone(), end.clone()].concat(),
+      0,
       PACKET_BYTES_MAX
     ),
     Err(PayloadRule::PgsSegments),
@@ -1002,6 +1044,7 @@ fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
     pgs_frame_merge(
       start,
       &[segment(0x16, 2), end.clone()].concat(),
+      0,
       PACKET_BYTES_MAX
     ),
     Err(PayloadRule::PgsSegments),
@@ -1011,13 +1054,27 @@ fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
     pgs_frame_merge(
       start,
       &[whole.clone(), whole.clone()].concat(),
+      4,
       PACKET_BYTES_MAX
     ),
-    Ok((start, true)),
-    "two sets in one packet"
+    Ok((start, out(true, Some(whole.len() + 4), None))),
+    "two sets in one packet, each put out with its side data"
+  );
+  // A set completed, and the start of the next held, from one packet.
+  assert_eq!(
+    pgs_frame_merge(
+      held,
+      &[ods.clone(), end.clone(), pcs.clone()].concat(),
+      2,
+      PACKET_BYTES_MAX
+    ),
+    Ok((
+      PgsState { side: 2, ..held },
+      out(true, Some(whole.len() + 100), Some(pcs.len() + 3 + 2))
+    ))
   );
   assert_eq!(
-    pgs_frame_merge(start, &[], PACKET_BYTES_MAX),
+    pgs_frame_merge(start, &[], 0, PACKET_BYTES_MAX),
     Err(PayloadRule::Empty)
   );
 }
@@ -1215,38 +1272,118 @@ fn each_container_keeps_the_side_data_it_has_a_place_for() {
   );
 }
 
-/// **The automatic filters are those libavformat inserts**: AAC's in MP4
-/// and Matroska for a track with no configuration, VP9's in MP4, Matroska
-/// and WebM, PGS's in Matroska; none with the filters off, and none
-/// claimed of another container.
+/// **The filters are those each muxer inserts, by grep 1 and 2 of the
+/// census** (table B): IVF's VP9 at its start, the filters on or off;
+/// Matroska's, WebM's and the MOV family's at the first packet, with them
+/// on; AVIF's none; AAC's in MP4 and Matroska for a track with no
+/// configuration, and in FLV, LATM and MOV's other modes undecided until
+/// the first packet; PGS's in Matroska's video muxer, and neither AAC's nor
+/// PGS's in its audio one; PCM rechunked in DAUD, GXF and MXF.
 #[test]
-fn the_automatic_filters_are_those_libavformat_inserts() {
+fn the_filters_are_those_each_muxer_inserts() {
   use AutomaticFilter as A;
-  let named =
-    |family, codec, extradata: &[u8], on| Filter::settle(family, codec, extradata, on).named();
-  for family in [Family::Mp4, Family::Matroska] {
+  let settle = |muxer: &str, mime: Option<&str>, codec, extradata: &[u8], on| {
+    Filter::settle(
+      Sites::of(muxer, mime),
+      Family::of(muxer),
+      codec,
+      extradata,
+      on,
+    )
+  };
+  let vp9 = Filter::Vp9 {
+    held: 0,
+    bytes: 0,
+    largest: 0,
+  };
+  for on in [true, false] {
     assert_eq!(
-      named(family, CodecId::AAC, &[], true),
-      Some(A::AacAdtsToAsc)
+      settle("ivf", None, CodecId::VP9, &[], on),
+      vp9,
+      "IVF, on {on}"
     );
-    assert_eq!(named(family, CodecId::AAC, &[0x11, 0x90], true), None);
   }
-  for family in [Family::Mp4, Family::Matroska, Family::WebM] {
+  for muxer in [
+    "matroska", "webm", "mov", "3gp", "mp4", "psp", "3g2", "ipod", "ismv", "f4v",
+  ] {
+    assert_eq!(settle(muxer, None, CodecId::VP9, &[], true), vp9, "{muxer}");
     assert_eq!(
-      named(family, CodecId::VP9, &[], true),
-      Some(A::Vp9Superframe)
+      settle(muxer, None, CodecId::VP9, &[], false),
+      Filter::None,
+      "{muxer}"
+    );
+  }
+  for muxer in ["avif", "mpegts", "flv", "nut"] {
+    assert_eq!(
+      settle(muxer, None, CodecId::VP9, &[], true),
+      Filter::None,
+      "{muxer}"
+    );
+  }
+  for muxer in ["mp4", "matroska"] {
+    let filter = settle(muxer, None, CodecId::AAC, &[], true);
+    assert_eq!(filter.named(), Some(A::AacAdtsToAsc), "{muxer}");
+    assert_eq!(
+      settle(muxer, None, CodecId::AAC, &[0x11, 0x90], true),
+      Filter::None,
+      "{muxer}: a configured track takes raw AAC alone"
+    );
+  }
+  for muxer in ["flv", "latm", "mov", "ipod"] {
+    assert_eq!(
+      settle(muxer, None, CodecId::AAC, &[0x11, 0x90], true),
+      Filter::AdtsUndecided {
+        configured: true,
+        parses: true
+      },
+      "{muxer}"
+    );
+    assert_eq!(
+      settle(muxer, None, CodecId::AAC, &[], true).named(),
+      None,
+      "{muxer}: undecided at open"
     );
   }
   assert_eq!(
-    named(Family::Matroska, CodecId::HDMV_PGS_SUBTITLE, &[], true),
+    settle(
+      "matroska",
+      Some("audio/x-matroska"),
+      CodecId::AAC,
+      &[],
+      true
+    ),
+    Filter::None,
+    "Matroska's audio muxer, reached only without the video one"
+  );
+  assert_eq!(
+    settle(
+      "matroska",
+      Some("video/x-matroska"),
+      CodecId::HDMV_PGS_SUBTITLE,
+      &[],
+      true
+    )
+    .named(),
     Some(A::PgsFrameMerge)
   );
   assert_eq!(
-    named(Family::Mp4, CodecId::HDMV_PGS_SUBTITLE, &[], true),
-    None
+    settle(
+      "matroska",
+      Some("audio/x-matroska"),
+      CodecId::HDMV_PGS_SUBTITLE,
+      &[],
+      true
+    ),
+    Filter::None
   );
-  assert_eq!(named(Family::Matroska, CodecId::VP9, &[], false), None);
-  assert_eq!(named(Family::Other, CodecId::VP9, &[], true), None);
+  assert_eq!(
+    settle("mp4", None, CodecId::HDMV_PGS_SUBTITLE, &[], true),
+    Filter::None
+  );
+  for muxer in ["daud", "gxf", "mxf", "mxf_d10", "mxf_opatom"] {
+    assert!(Sites::of(muxer, None).rechunk, "{muxer}");
+  }
+  assert!(!Sites::of("wav", None).rechunk);
   assert_eq!(A::AacAdtsToAsc.name(), "aac_adtstoasc");
   assert_eq!(A::Vp9Superframe.to_string(), "vp9_superframe");
   assert_eq!(A::PgsFrameMerge.name(), "pgs_frame_merge");
@@ -1258,6 +1395,139 @@ fn the_automatic_filters_are_those_libavformat_inserts() {
     assert!(header_refuses(Family::WebM, codec), "{codec:?}");
   }
   assert!(!header_refuses(Family::Other, CodecId::TRUEHD));
+  // AAC's configuration made by its filter only where it is inserted.
+  assert!(!configuration_missing(
+    Family::Matroska,
+    CodecId::AAC,
+    &[],
+    true
+  ));
+  assert!(configuration_missing(
+    Family::Matroska,
+    CodecId::AAC,
+    &[],
+    false
+  ));
+}
+
+/// **AAC's filter is mirrored as it converts, in every container it is
+/// inserted in**: a configured track's raw packet passes; a frame is
+/// stripped of its header; the first converted, of channel configuration 0,
+/// of its program config element too — which, running past its payload,
+/// would be put out at a negative size, and is refused in every container,
+/// while one that ends it is refused in MP4 and Matroska alone, which take
+/// a frame whole; the track's first packet decides elsewhere.
+#[test]
+fn aacs_filter_is_mirrored_as_it_converts() {
+  let frame = adts(20, false, 3, 2, 0, 0x21);
+  assert_eq!(
+    aac_conversion(&frame, true, false),
+    Some(AacConversion::Frame {
+      frame: 20,
+      output: 13
+    })
+  );
+  assert_eq!(
+    aac_conversion(&[0x21, 0x10, 0x05], true, true),
+    Some(AacConversion::Passed),
+    "raw, on a configured track"
+  );
+  assert_eq!(
+    aac_conversion(&[0x21], true, true),
+    None,
+    "too small to pass"
+  );
+  assert_eq!(aac_conversion(&frame[..6], false, false), None);
+  // Two frames in a packet: converted, the second's header kept — the
+  // filter's own way, which MP4 and Matroska refuse.
+  let two = [frame.clone(), frame.clone()].concat();
+  assert_eq!(
+    aac_conversion(&two, false, false),
+    Some(AacConversion::Frame {
+      frame: 20,
+      output: 33
+    })
+  );
+  let with = |payload: &[u8]| {
+    let mut frame = adts(7 + payload.len(), false, 3, 0, 0, 0);
+    frame[7..].copy_from_slice(payload);
+    frame
+  };
+  let element = pce(&[], b"");
+  let past = with(&element[..element.len() - 1]);
+  assert_eq!(
+    aac_conversion(&past, true, false),
+    Some(AacConversion::Frame {
+      frame: past.len(),
+      output: -1
+    }),
+    "a program config element a byte past its payload"
+  );
+  let ends = with(&element);
+  let some = |filter: Filter, bytes: &[u8]| filter.step(bytes, 0, PACKET_BYTES_MAX);
+  let elsewhere = Filter::AdtsUndecided {
+    configured: false,
+    parses: false,
+  };
+  let known = Filter::Adts {
+    converted: false,
+    configured: false,
+    whole: true,
+  };
+  for filter in [elsewhere, known] {
+    assert_eq!(
+      some(filter, &past).map(|_| ()),
+      Err(PayloadRule::AdtsFrame),
+      "{filter:?}"
+    );
+  }
+  assert!(some(elsewhere, &ends).is_ok(), "put out empty, elsewhere");
+  assert_eq!(
+    some(known, &ends).map(|_| ()),
+    Err(PayloadRule::AdtsFrame),
+    "MP4 and Matroska take a frame whole"
+  );
+  // Elsewhere, a first packet that opens with no ADTS header inserts no
+  // filter, for good; one that does inserts it, converted.
+  let (next, step) = some(elsewhere, &[0x21, 0x10, 0x05]).expect("raw");
+  assert_eq!((next, step.reaches), (Filter::None, true));
+  let (next, _) = some(elsewhere, &frame).expect("a frame");
+  assert_eq!(
+    next,
+    Filter::Adts {
+      converted: true,
+      configured: false,
+      whole: false
+    }
+  );
+  assert!(some(next, &two).is_ok(), "two frames, the filter's own way");
+  // A configuration libavcodec does not parse fails the filter's start.
+  assert_eq!(
+    some(
+      Filter::AdtsUndecided {
+        configured: true,
+        parses: false
+      },
+      &frame
+    )
+    .map(|_| ()),
+    Err(PayloadRule::AdtsFrame)
+  );
+  assert!(
+    some(
+      Filter::AdtsUndecided {
+        configured: true,
+        parses: false
+      },
+      &[0x21, 0x10, 0x05]
+    )
+    .is_ok(),
+    "a raw first packet inserts no filter"
+  );
+  // The first conversion's new extradata is the filter's.
+  assert!(first_conversion(elsewhere, &frame));
+  assert!(!first_conversion(elsewhere, &[0x21, 0x10, 0x05]));
+  assert!(!first_conversion(next, &frame));
 }
 
 #[test]
@@ -1357,24 +1627,69 @@ fn a_vp9_run_past_the_limit_is_refused_at_the_frame_that_decides_it() {
 }
 
 /// **A PGS display set past the limit is refused at the packet that would
-/// grow it there** — the limit lowered to 20 bytes (the seam).
+/// grow it there, or that leaves it no room for its end segment** — the
+/// limit lowered to 20 bytes (the seam).
 #[test]
 fn a_pgs_display_set_past_the_limit_is_refused() {
   let (pcs, end, ods) = (segment(0x16, 8), segment(0x80, 0), segment(0x15, 4));
   let start = PgsState::default();
   // 11 bytes held, then 7 more and the end's 3: 21.
-  let (held, _) = pgs_frame_merge(start, &pcs, 20).expect("the presentation segment, held");
+  let (held, _) = pgs_frame_merge(start, &pcs, 0, 20).expect("the presentation segment, held");
   assert_eq!(
-    pgs_frame_merge(held, &[ods.clone(), end.clone()].concat(), 20),
+    pgs_frame_merge(held, &[ods.clone(), end.clone()].concat(), 0, 20),
     Err(PayloadRule::DisplaySetSize)
   );
+  assert!(pgs_frame_merge(held, &[ods.clone(), end.clone()].concat(), 0, 21).is_ok());
+  // 11 and 7 held leave 2 bytes, where no end segment fits.
   assert_eq!(
-    pgs_frame_merge(held, &[ods.clone(), end.clone()].concat(), 21),
-    Ok((start, false))
+    pgs_frame_merge(held, &ods, 0, 20),
+    Err(PayloadRule::DisplaySetSize)
   );
+  assert!(pgs_frame_merge(held, &ods, 0, 21).is_ok());
   // A whole set passes as it is, held by nothing.
   let whole = [pcs, ods, end].concat();
-  assert_eq!(pgs_frame_merge(start, &whole, 20), Ok((start, true)));
+  assert!(pgs_frame_merge(start, &whole, 0, 20).is_ok());
+}
+
+/// **VP9's filter puts out each superframe sized with the hidden frames it
+/// holds, its index and the shown frame's side data, and what it holds is
+/// sized at the least it can come to** — the outputs Matroska's block
+/// bound is held to.
+#[test]
+fn vp9s_filter_puts_out_superframes_sized_with_what_it_holds() {
+  let vp9 = Filter::Vp9 {
+    held: 0,
+    bytes: 0,
+    largest: 0,
+  };
+  let hidden = [0x80, 1, 1, 1];
+  let shown = [0x82, 2, 2];
+  let (vp9, step) = vp9.step(&hidden, 50, PACKET_BYTES_MAX).expect("held");
+  assert_eq!(
+    step,
+    Step {
+      reaches: false,
+      largest: None,
+      held: Some(4 + 1 + 2 + 2),
+    },
+    "four bytes held and a byte shown, their index of two sizes"
+  );
+  let (vp9, step) = vp9.step(&shown, 30, PACKET_BYTES_MAX).expect("joined");
+  assert_eq!(
+    step,
+    Step {
+      reaches: true,
+      largest: Some(4 + 3 + 2 + 2 + 30),
+      held: None,
+    },
+    "the superframe, with the shown frame's side data"
+  );
+  let (_, step) = vp9.step(&shown, 30, PACKET_BYTES_MAX).expect("alone");
+  assert_eq!(
+    step.largest,
+    Some(3 + 30),
+    "a frame shown alone passes as it is"
+  );
 }
 
 /// **The Annex B rewrite is bounded by a byte more for each start code.**
@@ -1503,4 +1818,17 @@ fn mp4s_ac3_refuses_a_first_frame_dac3_does_not_define() {
   assert!(ac3_packet(after, false, &frame(9)).is_ok(), "a later frame");
   // E-AC-3's dec3 carries no such bound.
   assert!(ac3_packet(Ac3State::default(), true, &frame(9)).is_ok());
+}
+
+/// **PCM rechunking's sample size is counted as its start counts it**, in
+/// C's `int`: 33 554 431 channels of 64 bits fit, one more does not.
+#[test]
+fn pcm_rechunkings_sample_size_is_counted_in_an_int() {
+  assert!(!rechunk_overflows(2, 16));
+  assert!(!rechunk_overflows(33_554_431, 64));
+  assert!(rechunk_overflows(33_554_432, 64));
+  assert!(
+    !rechunk_overflows(i32::MAX, 0),
+    "no fixed width: no filter takes it"
+  );
 }

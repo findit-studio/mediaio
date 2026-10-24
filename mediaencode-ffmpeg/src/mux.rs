@@ -44,7 +44,8 @@
 //! `MP4` opens MP4's muxer and meets every rule MP4's does. Any other
 //! muxer opens the same way and libavformat decides what it writes; an
 //! attachment is not handed to it (and is reported), and nothing else is
-//! claimed about what it keeps.
+//! claimed about what it keeps but what a bitstream filter it inserts,
+//! which this muxer mirrors, converts or drops (table B).
 //!
 //! # Writing: the face's refusals, then the container's
 //!
@@ -89,8 +90,9 @@
 //!
 //! Another container is opened the same way and keeps the generic rules —
 //! duration, key frame and decode order, and libavformat's shift of early
-//! times — and nothing else is claimed of it: not its automatic filters,
-//! nor its side data.
+//! times — and the rules of every filter it inserts that this muxer
+//! mirrors (table B); nothing else is claimed of it, nor of its side data
+//! beyond what such a filter drops.
 //!
 //! # The automatic filters
 //!
@@ -102,29 +104,34 @@
 //!
 //! - MP4 and Matroska strip AAC's ADTS headers where the track states no
 //!   configuration, making it from the first frame's header;
-//! - MP4, Matroska and WebM join VP9's hidden frames, with the next frame
-//!   the stream shows, into superframes;
+//! - MP4, Matroska, WebM, MOV's other modes and IVF join VP9's hidden
+//!   frames, with the next frame the stream shows, into superframes;
 //! - Matroska joins PGS segments into display sets.
 //!
-//! **The first packet decides.** libavformat inserts a track's filter when
-//! it writes the track's first packet (`check_bitstream`, `mux.c`
-//! 1056–1073): VP9's and PGS's always, AAC's only where that packet opens
-//! with an ADTS header (`movenc.c` 9138–9151; `matroskaenc.c` 3630–3646).
-//! This muxer admits on such a track only what the filter converts, so the
-//! report at open stays true: an AAC track with no configuration takes one
-//! ADTS frame a packet ([`PayloadRule::AdtsFrame`]), and one whose
-//! configuration is stated takes raw AAC alone ([`PayloadRule::AdtsHeader`]).
-//! What a filter would refuse after taking it is refused first, by name
-//! ([`PayloadRule::Superframe`], [`PayloadRule::PgsSegments`]), and a packet
-//! a filter holds, its times, flags and side data dropped — a hidden VP9
-//! frame, a PGS packet without its display set's presentation segment —
-//! meets none of the rules of its times.
+//! **The first packet decides.** libavformat inserts most filters when it
+//! writes a track's first packet (`check_bitstream`, `mux.c` 1056–1073):
+//! VP9's and PGS's always, AAC's only where that packet opens with an ADTS
+//! header (`movenc.c` 9138–9151; `matroskaenc.c` 3630–3646). This muxer
+//! admits on such a track in MP4 and Matroska only what the filter
+//! converts, so the report at open stays true: an AAC track with no
+//! configuration takes one ADTS frame a packet ([`PayloadRule::AdtsFrame`]),
+//! and one whose configuration is stated takes raw AAC alone
+//! ([`PayloadRule::AdtsHeader`]); in another container that inserts AAC's
+//! filter, the first packet decides as it does for libavformat. What a
+//! filter would refuse after taking it is refused first, by name
+//! ([`PayloadRule::Superframe`], [`PayloadRule::PgsSegments`],
+//! [`PayloadRule::AdtsFrame`]), every packet it puts out is sized before any
+//! of it is handed over (table B), and a packet a filter holds, its times,
+//! flags and side data dropped — a hidden VP9 frame, a PGS packet without
+//! its display set's presentation segment — meets none of the rules of its
+//! times.
 //!
-//! A caller turns them off ([`MuxOptions::set_automatic_filters`]), and
-//! every packet is then written as it was handed over or refused by name:
-//! AAC with no configuration is refused at open
-//! ([`MuxOpenError::ConfigurationMissing`]), an ADTS packet anywhere
-//! ([`PayloadRule::AdtsHeader`]).
+//! A caller turns them off ([`MuxOptions::set_automatic_filters`]), and no
+//! filter is then inserted at a first packet: AAC with no configuration is
+//! refused at open ([`MuxOpenError::ConfigurationMissing`]), an ADTS packet
+//! anywhere ([`PayloadRule::AdtsHeader`]). A filter a muxer inserts at its
+//! start runs either way — IVF's VP9 superframes (`ivf_init`, `ivfenc.c`
+//! 42) — and is mirrored and reported either way.
 //!
 //! # The side-data table
 //!
@@ -195,21 +202,44 @@
 //!
 //! ## B. The bitstream filters, and the sizes libavformat counts
 //!
-//! Every automatic filter libavformat inserts, and every size the packet
-//! path computes in 32 bits, with the bound held here — libavcodec's
-//! largest packet ([`PACKET_BYTES_MAX`], `INT_MAX` less the padding, less
-//! one) unless another is named. Each bound is counted in `u64` before
-//! anything is handed over.
+//! **The filters**, found by the two mechanisms that insert one — every
+//! `ff_stream_add_bitstream_filter` call in libavformat, by the function it
+//! is in, and every muxer's `check_bitstream` (#82's R5 greps them, with
+//! their output): in a muxer's `init` or header, whatever
+//! `AVFMT_FLAG_AUTO_BSF` says; in its `check_bitstream`, at a track's first
+//! packet and only with it set (`check_bitstream`, `mux.c` 1056–1073), one
+//! filter a stream (1301). A filter's own refusals after it takes a packet
+//! are silent: libavformat logs them and goes on (1132–1140). The muxers
+//! that hand their packets on to others — DASH, segment, tee, WHIP, and
+//! every other that writes no byte stream of its own — are refused at open;
+//! the muxers nested in a byte stream's — MPEG-TS's ADTS and LATM for raw
+//! AAC, RTP MPEG-TS's MPEG-TS, image2pipe's GIF, FITS and AVIF, MP4's TTML
+//! writer — insert none this table does not name. Each filter is mirrored
+//! by the muxer libavformat resolved ([`Family::of`] names it), and every
+//! packet it puts out is sized before any it is made of is handed over.
+//!
+//! | filter | inserted by | when, for | what it puts out, and its arithmetic | here |
+//! |---|---|---|---|---|
+//! | `vp9_superframe` | IVF (`ivf_init`, `ivfenc.c` 42) | its start, whatever the option; VP9 | a superframe of the frames it holds — at most six hidden and the one shown — and its index of their sizes, summed in `unsigned` and allocated by the sum (`vp9_superframe.c` 34–98, 151–155): past 4 GiB the sum wraps and the copy runs past the allocation, below it `av_new_packet` refuses after taking the frames | mirrored with the filters on or off: the run counted wide, a hidden frame refused where no frame shown after it could join the run within the bound, a frame shown where its superframe passes it ([`PayloadRule::SuperframeSize`]); the filter's own refusals ([`PayloadRule::Superframe`]); reported ([`AutomaticFilter::Vp9Superframe`]) |
+//! | `vp9_superframe` | Matroska, WebM, the MOV family — MOV, 3GP, MP4, PSP, 3G2, iPod, ISMV, F4V, every muxer whose `check_bitstream` is MOV's (`mkv_check_bitstream`, `matroskaenc.c` 3639; `mov_check_bitstream`, `movenc.c` 9147) | the first packet, `AUTO_BSF`; VP9 | as above | as above, with the filters on |
+//! | `aac_adtstoasc` | Matroska's video muxer, the MOV family, FLV, LATM (`matroskaenc.c` 3634–3637; `movenc.c` 9144–9145; `flvenc.c` 1491–1493; `latmenc.c` 255–257) | the first packet, `AUTO_BSF`, where it opens with an ADTS header of more than two bytes; AAC | each frame less its header and CRC; the first converted, of channel configuration 0, less the program config element opening its payload too, consumed with no check that it fits, so that a packet the element runs past is put out at a negative size (`aac_adtstoasc.c` 54–96); raw packets passed on a configured track (51–52); its start refuses a configuration libavcodec does not parse (130–144) | MP4 and Matroska: ADTS frames alone, whole, on a track with no configuration, raw AAC alone on one with it (table F); another container: the first packet decides, and the filter's refusals and its output's size are held to ([`PayloadRule::AdtsFrame`]) |
+//! | `pgs_frame_merge` | Matroska's video muxer (`matroskaenc.c` 3640–3642) | the first packet, `AUTO_BSF`; PGS | display sets — the segments it holds and the packet's, several from one packet — grown by `av_grow_packet`, which refuses past the bound after taking them (`pgs_frame_merge.c` 93–157) | mirrored: each set counted, with room for its end segment, refused at the packet past which none fits ([`PayloadRule::DisplaySetSize`]) |
+//! | `pcm_rechunk` | DAUD (`daud_init`, `daudenc.c` 44), GXF (`gxf_write_header`, `gxfenc.c` 724), MXF, MXF D-10, MXF OP-Atom (`mxf_init`, `mxfenc.c` 3081) | the start; an audio track — of PCM alone, which libavcodec admits to it (`av_bsf_init`, `libavcodec/bsf.c` 154–170) | packets of a fixed count of samples (`pcm_rechunk.c` 123–186); its start multiplies the channels by the bits per sample in `int`, and refuses a size past `INT_MAX` over it (49–58) | the product held at open ([`MuxOpenError::SampleSize`]); its packets are its options' |
+//! | `av1_metadata`, `td=insert` | IVF (`ivfenc.c` 46); OBU (`rawenc.c` 572) | IVF's start, whatever the option; OBU's first packet, `AUTO_BSF`; AV1 | the OBUs read and written back by CBS, each unit's write buffer at most `INT_MAX / 8` (`cbs.c` 342–372), the fragment summed in `size_t` (`cbs_av1.c` 1245–1265) and handed on as an `int` (`cbs.c` 472–474), which only shrinks it | nothing to hold; its refusals are the container's own |
+//! | `eia608_to_smpte436m` | MCC (`mcc_init`, `mccenc.c` 434), MXF (`mxf_init`, `mxfenc.c` 3104) | the start; EIA-608 | one ANC packet of at most 255 bytes, of at most 80 triples (`eia608_to_smpte436m.c` 168–209, 227) | nothing to hold |
+//! | `extract_extradata` | FLV (`flvenc.c` 1501) | the first packet, `AUTO_BSF`, no configuration; H.264, HEVC, VVC, AV1, MPEG-4 | the packet less its parameter sets, each sum within the packet's or against `INT_MAX` (`extract_extradata.c` 102–116, 412–419) | nothing to hold |
+//! | `h264_mp4toannexb`, `hevc_mp4toannexb`, `vvc_mp4toannexb` | MPEG-TS (`mpegtsenc.c` 2331), MXF (`mxfenc.c` 3636), the raw H.264, VVC and HEVC muxers (`rawenc.c` 391, 416, 441) | the first packet, `AUTO_BSF`, of length prefixes; H.264, HEVC, VVC | start codes for lengths, parameter sets before an IDR, counted in 64 bits against `INT_MAX` (`h264_mp4toannexb.c` 291, 420–424; `hevc_mp4toannexb.c` 199–206; `vvc_mp4toannexb.c` 287–294) | nothing to hold |
+//!
+//! **The sizes libavformat counts**, every size the packet path computes in
+//! 32 bits, with the bound held here — libavcodec's largest packet
+//! ([`PACKET_BYTES_MAX`], `INT_MAX` less the padding, less one) unless
+//! another is named. Each bound is counted in `u64` before anything is
+//! handed over.
 //!
 //! | what | where, and its arithmetic | here |
 //! |---|---|---|
-//! | `vp9_superframe` | MP4, Matroska, WebM, VP9: joins up to six hidden frames with the next one shown, summing their sizes in 32 bits and allocating by the sum (`vp9_superframe.c` 52–98, 151–155): past 4 GiB the sum wraps and the copy runs past the allocation; below it `av_new_packet` refuses after taking the frames | the run's bytes counted wide: a hidden frame refused where no frame shown after it could join the run within the bound, a frame shown where its superframe passes it ([`PayloadRule::SuperframeSize`]); the count's own rule beside it ([`PayloadRule::Superframe`]) |
-//! | `vp9_superframe`, another container | IVF and MOV's other modes insert it (`ivfenc.c` 42; `movenc.c` 9147) | a frame larger than a seventh of the bound refused ([`PayloadRule::SuperframeSize`]): no seven of the rest pass it |
-//! | `pgs_frame_merge` | Matroska PGS: grows the set it holds by each packet's segments (`av_grow_packet`, `pgs_frame_merge.c` 137–140), refusing past the bound after taking them | the set's bytes counted, refused at the packet that would pass it ([`PayloadRule::DisplaySetSize`]) |
-//! | `aac_adtstoasc` | MP4 and Matroska AAC with no configuration: shrinks a frame by its header, the first also by its program config element, unchecked | table F; nothing grows |
-//! | the others any muxer inserts: `h264_mp4toannexb`, `hevc_mp4toannexb`, `vvc_mp4toannexb` (MPEG-TS, the raw muxers), `extract_extradata` (FLV), `av1_metadata` (IVF, OBU), `pcm_rechunk` (DAUD, GXF, MXF), `eia608_to_smpte436m` (MCC, MXF) | each sizes what it writes with checked arithmetic or from its options (`h264_mp4toannexb.c` 420–424; `hevc_mp4toannexb.c` 199–206; `vvc_mp4toannexb.c` 287–294; `extract_extradata.c` 412–419; `pcm_rechunk.c` 57) | nothing to hold; reached only in containers of which nothing else is claimed |
 //! | the Annex B rewrite | MP4 (H.264, HEVC, VVC, LCEVC) and Matroska and WebM (H.264, HEVC, VVC) over an Annex B configuration: each start code becomes a 4-byte length, the size summed in an `int` (`nal_parse_units`, `nal.c` 74–111); MP4's HEVC under `hvc1` through a dynamic buffer of at most `INT_MAX` (`aviobuf.c` 1281–1311) | its upper bound — the packet and a byte for each start code — held to the bound ([`PayloadRule::RewrittenSize`]) |
-//! | Matroska's cluster | written into a dynamic buffer of at most `INT_MAX`, refused past it and the cluster written cut; a new one once the last passes 5 MiB, two blocks at most written after that check (`matroskaenc.c` 2746–2749, 3213–3271) | each block — its payload as written and its side data — at most half of what is left beside 5 MiB and 64 KiB (`MATROSKA_BLOCK_BYTES_MAX`, [`PayloadRule::ClusterSize`]) |
+//! | Matroska's cluster | written into a dynamic buffer of at most `INT_MAX`, refused past it and the cluster written cut; a new one once the last passes 5 MiB, two blocks at most written after that check (`matroskaenc.c` 2746–2749, 3213–3271) | each block — the packet as written, or each one its filter puts out, VP9's superframe and PGS's display set with the side data they take, and what the filter holds at the least it can come to — its payload and side data at most half of what is left beside 5 MiB and 64 KiB, less its own elements (`MATROSKA_BLOCK_BYTES_MAX`, [`PayloadRule::ClusterSize`]) |
 //! | WebVTT's lines | Matroska and WebM: the cue, its identifier and its settings summed, refused past `INT_MAX` (`matroskaenc.c` 2828–2853) | within the cluster's bound |
 //! | MP4's joined TTML | libavcodec's TTML encoder's paragraphs, joined at the trailer into one document in a dynamic buffer and then one packet (`movenc_ttml.c` 236–317) | the document's bytes counted — each paragraph and its element, and the header its configuration and language make — and refused at the paragraph that would pass the bound ([`PayloadRule::DocumentSize`]) |
 //! | the payload and side data copied in | `av_new_packet` and `av_packet_new_side_data` refuse past the bound (`libavcodec/packet.c` 83–95, 231–250), after the muxer's own budget ([`PacketLimits`]) | a fault before libavformat is reached ([`OutputError::Build`]), the packet not handed back |
@@ -470,9 +500,9 @@ impl Family {
 
 /// The most bytes libavcodec allocates a packet of: `packet_alloc` refuses
 /// `INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE` and more (`libavcodec/packet.c`
-/// 83–95 in FFmpeg 9.0.1), and `av_grow_packet` grows none past it
-/// (121–127). Every size this muxer's mirrors of libavformat's arithmetic
-/// bound — a superframe, a display set, a rewritten packet, a joined
+/// 83–95 in FFmpeg 9.0.1), and `av_grow_packet` grows none more than a byte
+/// past it (121–127). Every size this muxer's mirrors of libavformat's
+/// arithmetic bound — a filter's every output, a rewritten packet, a joined
 /// document — is held to it (table B of the census, see [the
 /// module](self)).
 const PACKET_BYTES_MAX: u64 = i32::MAX as u64 - 65;
@@ -494,15 +524,6 @@ const MATROSKA_BLOCK_BYTES_MAX: u64 = (i32::MAX as u64 - 5 * 1024 * 1024 - 64 * 
 /// `matroskaenc.c` 2864–3010).
 const MATROSKA_BLOCK_OVERHEAD: u64 = 4 * 1024;
 
-/// VP9 in a container this release does not know, the automatic filters
-/// on: the largest frame a superframe of seven — the most
-/// `vp9_superframe` joins (`MAX_CACHE`, `vp9_superframe.c` 28, 151–155) —
-/// can hold within [`PACKET_BYTES_MAX`], its index of four-byte sizes
-/// beside it. Such a container may insert the filter (IVF, `ivfenc.c`
-/// 42; MOV's other modes, `movenc.c` 9147), and nothing else is claimed of
-/// it.
-const VP9_FRAME_BYTES_ELSEWHERE: u64 = (PACKET_BYTES_MAX - 2 - 4 * 7) / 7;
-
 /// What MP4's joined TTML document adds per paragraph, at most: its `<p>`
 /// element and its two times (`ttml_write_packet`, `ttmlenc.c` 161–181;
 /// `ttml_write_time`, 67–80).
@@ -520,6 +541,26 @@ const TTML_DOCUMENT_OVERHEAD: u64 = 1024;
 pub struct MuxOptions {
   limits: PacketLimits,
   automatic_filters: bool,
+  bounds: Bounds,
+}
+
+/// The sizes the muxer holds what libavformat makes of a packet to: a
+/// filter's every output and a rewritten packet, at most libavcodec's
+/// largest packet; a Matroska block's payload and side data, at most its
+/// share of a cluster less the block's own elements (table B of the
+/// census, see [the module](self)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Bounds {
+  packet: u64,
+  block: u64,
+}
+
+impl Bounds {
+  /// libavcodec's and Matroska's own bounds.
+  const REAL: Self = Self {
+    packet: PACKET_BYTES_MAX,
+    block: MATROSKA_BLOCK_BYTES_MAX - MATROSKA_BLOCK_OVERHEAD,
+  };
 }
 
 impl Default for MuxOptions {
@@ -536,6 +577,7 @@ impl MuxOptions {
     Self {
       limits: PacketLimits::new(),
       automatic_filters: true,
+      bounds: Bounds::REAL,
     }
   }
 
@@ -546,8 +588,11 @@ impl MuxOptions {
 
   /// Whether libavformat's automatic bitstream filters run: on, a
   /// container converts the packets they convert, and each conversion is
-  /// reported for its track ([`Uncarried::Filtered`]); off, every packet
-  /// is written as it was handed over, or refused by name.
+  /// reported for its track ([`Uncarried::Filtered`]); off, no filter is
+  /// inserted at a track's first packet. A filter a muxer inserts at its
+  /// start runs either way — IVF's VP9 superframes, reported as on — and so
+  /// does its every rule here (table B of the census, see [the
+  /// module](self)).
   pub const fn automatic_filters(&self) -> bool {
     self.automatic_filters
   }
@@ -577,11 +622,37 @@ impl MuxOptions {
     self.automatic_filters = on;
     self
   }
+
+  /// Lowers the bounds the muxer holds what libavformat makes of a packet
+  /// to — libavcodec's largest packet, `packet`, and the bytes of a
+  /// Matroska block's payload and side data, `block` — never raising either
+  /// past its real one: the laws' seam, which shows a bound without
+  /// gigabytes of packets. A muxer opened with it refuses what libavformat
+  /// would take.
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_bounds(mut self, packet: u64, block: u64) -> Self {
+    let real = Bounds::REAL;
+    self.bounds = Bounds {
+      packet: if packet < real.packet {
+        packet
+      } else {
+        real.packet
+      },
+      block: if block < real.block {
+        block
+      } else {
+        real.block
+      },
+    };
+    self
+  }
 }
 
-/// One of libavformat's automatic bitstream filters, inserted for a track
-/// when the container writes its first packet ([`Uncarried::Filtered`]) —
-/// each from its source in FFmpeg 9.0.1.
+/// One of libavformat's bitstream filters a muxer inserts for a track —
+/// when it writes the track's first packet, or at its start
+/// ([`Uncarried::Filtered`]; table B of the census, see [the
+/// module](self)) — each from its source in FFmpeg 9.0.1.
 ///
 /// Marked `#[non_exhaustive]`: a filter a later release learns of joins as
 /// a variant.
@@ -595,7 +666,9 @@ pub enum AutomaticFilter {
   /// made from the first frame's, with its program config element where
   /// the header names none (`aac_adtstoasc.c` 39–128).
   AacAdtsToAsc,
-  /// `vp9_superframe`, for VP9 in MP4, Matroska and WebM: a frame the
+  /// `vp9_superframe`, for VP9 in MP4, Matroska, WebM and MOV's other
+  /// modes, the automatic filters on, and in IVF, which inserts it at its
+  /// start whatever they say: a frame the
   /// stream does not show is held, and joined with the next frame it shows
   /// into one superframe, which takes that frame's times, flags and side
   /// data — the held frames' own are dropped — and any still held when the
@@ -709,11 +782,12 @@ pub enum Uncarried {
     /// What the container does to the track's packets.
     rewrite: Rewrite,
   },
-  /// Packets one of libavformat's automatic bitstream filters converts
-  /// before the container sees them — the filter, named
-  /// ([`AutomaticFilter`]). Reported at open: libavformat inserts a
-  /// track's filter at its first packet, and this muxer admits on the
-  /// track only the packets that filter converts (see [the module](self)).
+  /// Packets one of libavformat's bitstream filters converts before the
+  /// container sees them — the filter, named ([`AutomaticFilter`]).
+  /// Reported at open, where the filter is known there: a muxer inserts it
+  /// at its start, or libavformat at the track's first packet where this
+  /// muxer admits on the track only the packets that filter converts (see
+  /// [the module](self), table B).
   Filtered {
     /// The track.
     track: TrackIndex,
@@ -1151,6 +1225,14 @@ pub enum PayloadRule {
   /// or, of a packet longer than its frame, strips the first header alone
   /// (70–73), or, of a program config element running past its payload,
   /// writes the packet at a negative size (94–95).
+  ///
+  /// In another container whose first packet inserts the filter — FLV,
+  /// LATM, MOV's other modes (table B) — a packet the filter refuses after
+  /// taking it, one whose program config element runs past its payload,
+  /// which it would put out at a negative size, and, on a configured
+  /// track, the ADTS packet that inserts it where libavcodec does not parse
+  /// the configuration, which fails the filter's start
+  /// (`aac_adtstoasc.c` 130–144).
   #[error("the packet is not one ADTS frame the automatic filter converts whole")]
   AdtsFrame,
   /// MP4 PCM: not a whole number of frames — channels times bytes per
@@ -1270,23 +1352,24 @@ pub enum PayloadRule {
     "the packet's SMPTE 2094 APP5 side data is not a struct Matroska writes whole and reads back"
   )]
   DynamicHdrApp5,
-  /// VP9, the automatic filters on: a frame whose superframe — with the
-  /// hidden frames the filter holds — would pass the largest packet
-  /// libavcodec allocates. The filter sums the frames' sizes in 32 bits
-  /// and copies them into what it allocated by that sum
+  /// VP9, wherever the superframe filter is inserted (table B): a frame
+  /// whose superframe — with the hidden frames the filter holds — would pass
+  /// the largest packet libavcodec allocates. The filter sums the frames'
+  /// sizes in 32 bits and copies them into what it allocated by that sum
   /// (`merge_superframe`, `vp9_superframe.c` 52–98): past 4 GiB the sum
   /// wraps and the copy runs past the allocation, and below it
   /// `av_new_packet` refuses the superframe after the frames were taken.
   /// Refused at the frame that decides it: a hidden frame no frame shown
   /// after it could join within the bound, or the frame shown that would
-  /// pass it. In another container, where the filter may run, a frame
-  /// larger than a seventh of the bound.
+  /// pass it.
   #[error("the VP9 superframe the automatic filter would join is larger than a packet holds")]
   SuperframeSize,
   /// Matroska PGS, the automatic filters on: segments whose display set,
   /// with what the filter holds of it, would pass the largest packet
   /// `av_grow_packet` makes, which refuses it after the segments were
-  /// taken (`pgs_frame_merge.c` 137–140; `libavcodec/packet.c` 121–127).
+  /// taken (`pgs_frame_merge.c` 137–140; `libavcodec/packet.c` 121–127) —
+  /// or would leave it no room for its end segment, so that no packet after
+  /// could complete it.
   #[error("the PGS display set the automatic filter would join is larger than a packet holds")]
   DisplaySetSize,
   /// MP4, Matroska and WebM, a track whose packets are rewritten from
@@ -1298,10 +1381,12 @@ pub enum PayloadRule {
   #[error("the packet, rewritten with length prefixes, is larger than the rewriter counts")]
   RewrittenSize,
   /// Matroska and WebM: a packet whose block — its payload as written and
-  /// the side data written with it — is larger than a cluster's buffer
-  /// takes beside the block before it (`MATROSKA_BLOCK_BYTES_MAX`; table B
-  /// of the census): the buffer refuses the write, and the cluster is
-  /// written cut.
+  /// the side data written with it, or each block its track's filter puts
+  /// out with it, VP9's superframe and PGS's display set, and what the
+  /// filter holds at the least it can come to — is larger than a cluster's
+  /// buffer takes beside the block before it (`MATROSKA_BLOCK_BYTES_MAX`;
+  /// table B of the census): the buffer refuses the write after the
+  /// filter took the packets, and the cluster is written cut.
   #[error("the packet is larger than a Matroska cluster holds")]
   ClusterSize,
   /// MP4 TTML from libavcodec's TTML encoder: a paragraph that would take
@@ -1386,6 +1471,16 @@ pub enum MuxOpenError {
     /// The track.
     track: TrackIndex,
   },
+  /// An audio track of a muxer that rechunks PCM at its start — DAUD, GXF
+  /// and the MXF muxers insert `pcm_rechunk` (table B of the census, see
+  /// [the module](self)) — whose channels times its codec's bits per sample
+  /// pass C's `int`, which the filter's start multiplies them in, an
+  /// overflow (`pcm_rechunk.c` 49–50 in FFmpeg 9.0.1).
+  #[error("track {}'s sample size passes what PCM rechunking counts in an int", .track.get())]
+  SampleSize {
+    /// The track.
+    track: TrackIndex,
+  },
   /// An attachment with no filename, which Matroska requires
   /// (`matroskaenc.c` 2538–2543 in FFmpeg 9.0.1).
   #[error("attachment track {} has no filename, which Matroska requires", .track.get())]
@@ -1414,10 +1509,12 @@ pub enum MuxOpenError {
   /// 7024–7041, 7087–7158); Matroska and WebM refuse every AV1 packet of a
   /// track with none (`matroskaenc.c` 3098–3109). An AAC track's comes,
   /// with the automatic filters on, from the ADTS header of its first
-  /// frame ([`AutomaticFilter::AacAdtsToAsc`]); with them off it is
-  /// refused here: Matroska refuses every AAC packet of a track with none
-  /// (3080–3083), and MP4 writes its decoder configuration from the track's
-  /// alone (`mov_write_esds_tag`, `movenc.c` 765–816; 7412–7429).
+  /// frame ([`AutomaticFilter::AacAdtsToAsc`]); with them off — or in a
+  /// build whose Matroska muxer is its audio one alone, which inserts no
+  /// AAC filter (table B) — it is refused here: Matroska refuses every AAC
+  /// packet of a track with none (3080–3083), and MP4 writes its decoder
+  /// configuration from the track's alone (`mov_write_esds_tag`, `movenc.c`
+  /// 765–816; 7412–7429).
   #[error("track {} carries no configuration for {codec:?}, which this container needs", .track.get())]
   ConfigurationMissing {
     /// The track.
@@ -1571,9 +1668,6 @@ struct PacketRules {
   length_prefixed: bool,
   /// Matroska and WebM: each block fits a cluster's buffer.
   matroska_block: bool,
-  /// Another container, VP9, the automatic filters on: the largest frame a
-  /// superframe of seven holds.
-  vp9_frame_max: Option<u64>,
   /// MP4 TTML from libavcodec's TTML encoder: the bytes the joined
   /// document takes beside its paragraphs.
   ttml_document: Option<u64>,
@@ -1615,15 +1709,13 @@ impl PacketRules {
   /// The rules `family`'s packet path applies to a timed track of `kind`
   /// whose stream holds `codec`, counted in `time_base`; `shifts` says
   /// whether libavformat moves early times in this container
-  /// ([`Output::shifts_early_times`]), and `filters` whether its automatic
-  /// filters run.
+  /// ([`Output::shifts_early_times`]).
   fn settle(
     family: Family,
     kind: TrackKind,
     codec: &StreamCodec,
     time_base: Timebase,
     shifts: bool,
-    filters: bool,
   ) -> Self {
     let id = codec.codec();
     let mp4 = family == Family::Mp4;
@@ -1665,8 +1757,6 @@ impl PacketRules {
       hdr_metadata: either_matroska && kind == TrackKind::Video,
       length_prefixed: length_prefixed(family, id, codec.extradata()),
       matroska_block: either_matroska,
-      vp9_frame_max: (family == Family::Other && filters && id == CodecId::VP9)
-        .then_some(VP9_FRAME_BYTES_ELSEWHERE),
       ttml_document: None,
       new_extradata: if mp4 && id == CodecId::OPUS {
         ExtradataRule::OpusHead
@@ -2137,18 +2227,107 @@ fn ac3_packet(state: Ac3State, eac3: bool, bytes: &[u8]) -> Result<Ac3State, Pay
   Ok(next)
 }
 
-/// The automatic filter libavformat inserts for a track at its first
-/// packet, and what it holds between packets — mirrored, so that a packet
-/// the filter would refuse after taking it is refused first, and the
-/// times, flags and side data it drops are known (see [the module](self)).
+/// When libavformat inserts a filter for a track (table B of the census,
+/// see [the module](self)): at the muxer's start — its `init`, or its
+/// header — whatever `AVFMT_FLAG_AUTO_BSF` says; or at the track's first
+/// packet, through the muxer's `check_bitstream`, only with it set
+/// (`check_bitstream`, `mux.c` 1056–1073 in FFmpeg 9.0.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Insertion {
+  Start,
+  FirstPacket,
+}
+
+/// The filters the muxer libavformat resolved inserts that this muxer
+/// mirrors — by the muxer's own name, and for the name two muxers share,
+/// the MIME type that tells them apart (table B of the census, see [the
+/// module](self)).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Sites {
+  /// `vp9_superframe`: IVF's at its start (`ivf_init`, `ivfenc.c` 42);
+  /// Matroska's, WebM's and the MOV family's at a VP9 track's first packet
+  /// (`mkv_check_bitstream`, `matroskaenc.c` 3639; `mov_check_bitstream`,
+  /// `movenc.c` 9147).
+  vp9: Option<Insertion>,
+  /// `aac_adtstoasc`, at an AAC track's first packet where it opens with
+  /// an ADTS header: Matroska's video muxer's, the MOV family's, FLV's and
+  /// LATM's (`matroskaenc.c` 3634–3637; `movenc.c` 9144–9145; `flvenc.c`
+  /// 1491–1493; `latmenc.c` 255–257).
+  aac: bool,
+  /// `pgs_frame_merge`, at a PGS track's first packet: Matroska's video
+  /// muxer's (`matroskaenc.c` 3640–3642).
+  pgs: bool,
+  /// `pcm_rechunk`, at the start, for an audio track: DAUD's, GXF's and
+  /// the MXF muxers' (`daudenc.c` 44; `gxfenc.c` 724; `mxfenc.c` 3081).
+  rechunk: bool,
+}
+
+impl Sites {
+  /// The MOV family: every muxer whose `check_bitstream` is MOV's
+  /// (`movenc.c` 9343–9512). AVIF's, the last of the file, has none.
+  const MOV: [&'static str; 8] = ["mov", "3gp", "mp4", "psp", "3g2", "ipod", "ismv", "f4v"];
+
+  /// The filters the muxer named `muxer`, of MIME type `mime`, inserts. The
+  /// audio muxer named `matroska` (`audio/x-matroska`) is reached only in a
+  /// build without the video one, where `CONFIG_MATROSKA_MUXER` is 0 and
+  /// `mkv_check_bitstream` inserts neither AAC's filter nor PGS's
+  /// (`matroskaenc.c` 3634, 3640).
+  fn of(muxer: &str, mime: Option<&str>) -> Self {
+    let mov = Self::MOV.contains(&muxer);
+    let matroska = muxer == "matroska";
+    let matroska_video = matroska && mime != Some("audio/x-matroska");
+    Self {
+      vp9: if muxer == "ivf" {
+        Some(Insertion::Start)
+      } else if matroska || muxer == "webm" || mov {
+        Some(Insertion::FirstPacket)
+      } else {
+        None
+      },
+      aac: matroska_video || mov || muxer == "flv" || muxer == "latm",
+      pgs: matroska_video,
+      rechunk: matches!(muxer, "daud" | "gxf" | "mxf" | "mxf_d10" | "mxf_opatom"),
+    }
+  }
+
+  /// Whether a filter inserted so is inserted, the automatic filters `on`
+  /// or off.
+  const fn inserts(insertion: Option<Insertion>, on: bool) -> bool {
+    match insertion {
+      Some(Insertion::Start) => true,
+      Some(Insertion::FirstPacket) => on,
+      None => false,
+    }
+  }
+}
+
+/// The automatic filter libavformat inserts for a track, and what it holds
+/// between packets — mirrored, so that a packet the filter would refuse
+/// after taking it is refused first, every packet it puts out is sized
+/// before any it is made of is handed over, and the times, flags and side
+/// data it drops are known (table B of the census, see [the module](self)).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Filter {
   /// None: every packet reaches the container as it was handed over.
   #[default]
   None,
-  /// `aac_adtstoasc`, and whether it has converted the track's first
-  /// frame.
-  Adts { converted: bool },
+  /// `aac_adtstoasc` in another container than MP4 and Matroska, not yet
+  /// inserted: the track's first packet decides — the filter is inserted
+  /// where it opens with an ADTS header of more than two bytes, and never
+  /// otherwise (`check_bitstream`, `mux.c` 1063–1068). Whether the track
+  /// has a configuration, and whether libavcodec parses it: the filter's
+  /// start refuses one it does not (`aac_adtstoasc_init`,
+  /// `aac_adtstoasc.c` 130–144).
+  AdtsUndecided { configured: bool, parses: bool },
+  /// `aac_adtstoasc`: whether it has converted a frame — the first it
+  /// converts takes the program config element's road — whether the track
+  /// has a configuration, which raw packets then pass by, and whether each
+  /// packet must be one frame whole (MP4's and Matroska's rule, table F).
+  Adts {
+    converted: bool,
+    configured: bool,
+    whole: bool,
+  },
   /// `vp9_superframe`, and the hidden frames it holds: how many, their
   /// bytes, and the largest's.
   Vp9 { held: u8, bytes: u64, largest: u64 },
@@ -2156,95 +2335,195 @@ enum Filter {
   Pgs(PgsState),
 }
 
+/// What a track's filter does with a packet ([`Filter::step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Step {
+  /// Whether the packet's own times, flags and side data reach the
+  /// container: not where the filter holds the packet.
+  reaches: bool,
+  /// The largest packet the filter puts out with this one — its payload's
+  /// bytes and its side data's — or `None` where it puts out none.
+  largest: Option<u64>,
+  /// What the packets the filter holds after this one come to at the
+  /// least, once put out — VP9's superframe of them and a frame of a byte,
+  /// PGS's display set and its end segment — or `None` where it holds none.
+  held: Option<u64>,
+}
+
 impl Filter {
-  /// The filter libavformat inserts for a timed track of `codec` whose
-  /// stream holds `extradata` in `family`, the automatic filters `on`
-  /// (`mov_check_bitstream`, `movenc.c` 9138–9151; `mkv_check_bitstream`,
-  /// `matroskaenc.c` 3630–3646, which WebM shares, storing neither AAC nor
-  /// PGS). AAC's is inserted only where the track's first packet opens with
-  /// an ADTS header: this muxer requires one of a track with no
-  /// configuration, and refuses it on any other ([`PayloadRule::AdtsHeader`]).
-  fn settle(family: Family, codec: CodecId, extradata: &[u8], on: bool) -> Self {
-    let mp4_or_matroska = family == Family::Mp4 || family == Family::Matroska;
-    if !on {
-      Self::None
-    } else if codec == CodecId::AAC && extradata.is_empty() && mp4_or_matroska {
-      Self::Adts { converted: false }
-    } else if codec == CodecId::VP9 && (mp4_or_matroska || family == Family::WebM) {
+  /// The filter the muxer libavformat resolved inserts for a timed track
+  /// of `codec` whose stream holds `extradata`, the automatic filters `on`,
+  /// by `sites`, the muxer's (table B of the census). MP4 and Matroska take
+  /// ADTS frames alone on an AAC track with no configuration, one a packet,
+  /// so its filter is inserted at its first ([`PayloadRule::AdtsFrame`]),
+  /// and raw AAC alone on one with it ([`PayloadRule::AdtsHeader`]), so it
+  /// never is; another container's first packet decides.
+  fn settle(sites: Sites, family: Family, codec: CodecId, extradata: &[u8], on: bool) -> Self {
+    if codec == CodecId::VP9 && Sites::inserts(sites.vp9, on) {
       Self::Vp9 {
         held: 0,
         bytes: 0,
         largest: 0,
       }
-    } else if codec == CodecId::HDMV_PGS_SUBTITLE && family == Family::Matroska {
+    } else if codec == CodecId::AAC && sites.aac && on {
+      match (family, extradata.is_empty()) {
+        (Family::Mp4 | Family::Matroska, true) => Self::Adts {
+          converted: false,
+          configured: false,
+          whole: true,
+        },
+        (Family::Mp4 | Family::Matroska, false) => Self::None,
+        (_, empty) => Self::AdtsUndecided {
+          configured: !empty,
+          parses: audio_specific_config_parses(extradata),
+        },
+      }
+    } else if codec == CodecId::HDMV_PGS_SUBTITLE && sites.pgs && on {
       Self::Pgs(PgsState::default())
     } else {
       Self::None
     }
   }
 
-  /// The filter, named.
+  /// The filter, named, where it is known at open.
   const fn named(self) -> Option<AutomaticFilter> {
     match self {
-      Self::None => None,
+      Self::None | Self::AdtsUndecided { .. } => None,
       Self::Adts { .. } => Some(AutomaticFilter::AacAdtsToAsc),
       Self::Vp9 { .. } => Some(AutomaticFilter::Vp9Superframe),
       Self::Pgs(_) => Some(AutomaticFilter::PgsFrameMerge),
     }
   }
 
-  /// Holds a packet of `bytes` to the filter: answers what the filter holds
-  /// after it, and whether the packet's own times, flags and side data
-  /// reach the container — or the rule it breaks.
-  fn step(self, bytes: &[u8]) -> Result<(Self, bool), PayloadRule> {
+  /// Holds a packet of `bytes`, carrying `side` bytes of side data, to the
+  /// filter, every packet it puts out held to `limit` — libavcodec's
+  /// largest packet, which the laws lower: answers what the filter holds
+  /// after it and what it puts out ([`Step`]), or the rule it breaks.
+  fn step(self, bytes: &[u8], side: u64, limit: u64) -> Result<(Self, Step), PayloadRule> {
+    let len = bytes.len() as u64;
+    let passed = Step {
+      reaches: true,
+      largest: Some(len + side),
+      held: None,
+    };
     match self {
-      Self::None => Ok((self, true)),
-      Self::Adts { converted } if adts_frame(bytes, !converted) => {
-        Ok((Self::Adts { converted: true }, true))
+      Self::None => Ok((self, passed)),
+      // An ADTS header of more than two bytes inserts the filter, which
+      // takes the packet (`mux.c` 1063–1068); anything else, never.
+      Self::AdtsUndecided { configured, parses } => {
+        if bytes.len() > 2 && u16::from_be_bytes([bytes[0], bytes[1]]) & 0xfff0 == 0xfff0 {
+          if configured && !parses {
+            return Err(PayloadRule::AdtsFrame);
+          }
+          Self::Adts {
+            converted: false,
+            configured,
+            whole: false,
+          }
+          .step(bytes, side, limit)
+        } else {
+          Ok((Self::None, passed))
+        }
       }
-      Self::Adts { .. } => Err(PayloadRule::AdtsFrame),
+      Self::Adts {
+        converted,
+        configured,
+        whole,
+      } => match aac_conversion(bytes, !converted, configured) {
+        Some(AacConversion::Passed) => Ok((self, passed)),
+        Some(AacConversion::Frame { frame, output })
+          if output >= 0 && (!whole || (frame == bytes.len() && output > 0)) =>
+        {
+          Ok((
+            Self::Adts {
+              converted: true,
+              configured,
+              whole,
+            },
+            passed,
+          ))
+        }
+        _ => Err(PayloadRule::AdtsFrame),
+      },
       Self::Vp9 {
         held,
         bytes: sum,
         largest,
       } => {
         let (next, own) = vp9_superframe(held, bytes)?;
-        let run = vp9_run(
-          (held, sum, largest),
-          next,
-          bytes.len() as u64,
-          PACKET_BYTES_MAX,
-        )?;
+        let run = vp9_run((held, sum, largest), next, len, limit)?;
+        let step = if own {
+          // A frame shown alone, or a superframe, passes as it is; a frame
+          // shown after hidden ones makes their superframe, which takes its
+          // side data (`vp9_superframe.c` 148–150, 163–175).
+          let out = if held == 0 {
+            len
+          } else {
+            superframe_bytes(sum + len, largest.max(len), u64::from(held) + 1)
+          };
+          Step {
+            reaches: true,
+            largest: Some(out + side),
+            held: None,
+          }
+        } else {
+          Step {
+            reaches: false,
+            largest: None,
+            held: Some(superframe_bytes(
+              run.0 + 1,
+              run.1.max(1),
+              u64::from(next) + 1,
+            )),
+          }
+        };
         Ok((
           Self::Vp9 {
             held: next,
             bytes: run.0,
             largest: run.1,
           },
-          own,
+          step,
         ))
       }
       Self::Pgs(state) => {
-        pgs_frame_merge(state, bytes, PACKET_BYTES_MAX).map(|(state, own)| (Self::Pgs(state), own))
+        pgs_frame_merge(state, bytes, side, limit).map(|(state, step)| (Self::Pgs(state), step))
       }
     }
   }
 }
 
-/// Whether `bytes` is one ADTS frame `aac_adtstoasc` converts whole
-/// (`aac_adtstoasc.c` 39–128, over `ff_adts_header_parse`, `adts_header.c`
-/// 30–74, in FFmpeg 9.0.1): its sync word; a sample rate index the table
-/// names, below 13 (`mpeg4audio_sample_rates.h`); a frame length of at
-/// least the header's 7 bytes, and the packet's own, as the filter strips
-/// the first header alone (70–73); no CRC over several raw data blocks
-/// (63–68); bytes after the header and its CRC (70–72); and, on the
-/// track's `first` frame, a channel configuration, or a program config
-/// element opening the payload, whole, with bytes after it
-/// ([`pce_span`]; table F of the census, see [the module](self)).
-fn adts_frame(bytes: &[u8], first: bool) -> bool {
+/// What `aac_adtstoasc` makes of a packet it takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AacConversion {
+  /// A raw packet on a configured track, passed as it is
+  /// (`aac_adtstoasc.c` 51–52).
+  Passed,
+  /// One frame converted: its header's frame length, and the bytes put out
+  /// — the payload after the header and its CRC, less, on the first frame
+  /// converted with channel configuration 0, the program config element
+  /// opening it, which the filter consumes with no check that it fits
+  /// (80–95), so that the bytes put out may be fewer than none.
+  Frame { frame: usize, output: i64 },
+}
+
+/// What `aac_adtstoasc` does with a packet of `bytes` (`aac_adtstoasc.c`
+/// 39–128, over `ff_adts_header_parse`, `adts_header.c` 30–74, in FFmpeg
+/// 9.0.1), the track `configured` or not, the packet the `first` it would
+/// convert: [`AacConversion`], or `None` where the filter refuses it — a
+/// packet shorter than a header (54–55); no sync word, a sample rate index
+/// the table does not name (13 and past, `mpeg4audio_sample_rates.h`), a
+/// frame length below the header's 7 bytes (`adts_header.c` 37–60); a CRC
+/// over several raw data blocks (63–68); nothing after the header and its
+/// CRC (70–72); on the first, a payload that does not open with a program
+/// config element where the channel configuration is 0 (80–90).
+fn aac_conversion(bytes: &[u8], first: bool, configured: bool) -> Option<AacConversion> {
+  if configured && bytes.len() >= 2 && u16::from_be_bytes([bytes[0], bytes[1]]) >> 4 != 0xfff {
+    return Some(AacConversion::Passed);
+  }
   let mut bits = Bits { bytes, at: 0 };
   if bytes.len() < 7 || bits.read(12) != 0xFFF {
-    return false;
+    return None;
   }
   // The id and the layer.
   bits.skip(3);
@@ -2257,19 +2536,69 @@ fn adts_frame(bytes: &[u8], first: bool) -> bool {
   let channels = bits.read(3);
   // The originality, home and copyright bits.
   bits.skip(4);
-  let frame_length = bits.read(13) as usize;
+  let frame = bits.read(13) as usize;
   // The buffer fullness.
   bits.skip(11);
   let blocks = bits.read(2);
   let header = if crc_absent { 7 } else { 9 };
-  sample_rate < 13
-    && frame_length >= 7
-    && frame_length == bytes.len()
-    && (crc_absent || blocks == 0)
-    && bytes.len() > header
-    && !(first
-      && channels == 0
-      && !pce_span(&bytes[header..]).is_some_and(|span| span < bytes.len() - header))
+  if sample_rate >= 13 || frame < 7 || (!crc_absent && blocks > 0) || bytes.len() <= header {
+    return None;
+  }
+  let payload = (bytes.len() - header) as i64;
+  let output = if first && channels == 0 {
+    payload - pce_span(&bytes[header..])? as i64
+  } else {
+    payload
+  };
+  Some(AacConversion::Frame { frame, output })
+}
+
+/// Whether `bytes` is one ADTS frame `aac_adtstoasc` converts whole, as
+/// MP4 and Matroska take AAC on a track with no configuration
+/// (table F of the census, see [the module](self)): a frame the filter
+/// converts ([`aac_conversion`]) whose length is the packet's own — the
+/// filter strips the first header alone (`aac_adtstoasc.c` 70–73) — and
+/// which leaves some bytes: on the track's `first` frame, the program
+/// config element where the channel configuration names none is shorter
+/// than its payload ([`pce_span`]). [`Filter::step`] holds such a track's
+/// packets to it.
+#[cfg(test)]
+fn adts_frame(bytes: &[u8], first: bool) -> bool {
+  matches!(
+    aac_conversion(bytes, first, false),
+    Some(AacConversion::Frame { frame, output }) if frame == bytes.len() && output > 0
+  )
+}
+
+/// Whether a packet of `bytes` is the first frame AAC's `filter` converts —
+/// the one whose new extradata the filter replaces with the configuration
+/// it makes (`aac_adtstoasc.c` 98–103): an ADTS frame, where the filter has
+/// converted none, or where the track's first packet inserts it.
+fn first_conversion(filter: Filter, bytes: &[u8]) -> bool {
+  match filter {
+    Filter::Adts {
+      converted: false,
+      configured,
+      ..
+    } => matches!(
+      aac_conversion(bytes, true, configured),
+      Some(AacConversion::Frame { .. })
+    ),
+    Filter::AdtsUndecided { .. } => {
+      bytes.len() > 2 && u16::from_be_bytes([bytes[0], bytes[1]]) & 0xfff0 == 0xfff0
+    }
+    _ => false,
+  }
+}
+
+/// Whether `pcm_rechunk`'s start would count the sample size of a stream
+/// of `channels`, its codec's samples `bits` wide, past C's `int`: the two
+/// multiplied in `int` (`pcm_rechunk.c` 49–50 in FFmpeg 9.0.1). The filter
+/// takes PCM alone (`av_bsf_init`, `libavcodec/bsf.c` 154–170), of a byte a
+/// sample or more, so its division by that size — over 8 — never divides
+/// by zero (57).
+fn rechunk_overflows(channels: i32, bits: u32) -> bool {
+  i64::from(channels) * i64::from(bits) > i64::from(i32::MAX)
 }
 
 /// The bytes the program config element opening `payload` spans — its
@@ -2399,38 +2728,50 @@ fn superframe_bytes(sum: u64, largest: u64, frames: u64) -> u64 {
 }
 
 /// What the PGS filter holds of a display set: whether it holds any of its
-/// segments, whether one was its presentation segment, and their bytes.
+/// segments, whether one was its presentation segment, their bytes, the
+/// side data's bytes of the packet that held the presentation segment —
+/// the set is put out with that packet's side data (`pgs_frame_merge.c`
+/// 132–136) — and how many packets' segments it holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PgsState {
   holding: bool,
   presentation: bool,
   bytes: u64,
+  side: u64,
+  packets: u64,
 }
 
-/// What PGS's automatic filter does with a packet of `bytes`, given what
-/// it holds of a display set (`frame_merge_filter`, `pgs_frame_merge.c`
-/// 70–157 in FFmpeg 9.0.1): answers what it holds after it, and whether the
-/// packet's own times, flags and side data reach the container — a display
-/// set takes those of the packet holding its presentation segment
-/// (132–136) — or the rule the packet breaks: empty, which the filter drops
-/// (87–90), or segments it would write marked corrupt — a display set it
-/// completes with no presentation segment (59–68), or segments that do not
-/// parse (93–130) — or the display set it would grow past `limit`
-/// ([`PayloadRule::DisplaySetSize`]; `av_grow_packet`, 137–140). Each
-/// segment is a type byte and a big-endian 16-bit length; a presentation
-/// segment, of type `0x16`, is one per display set and at least 11 bytes;
-/// one of type `0x80` ends the set. The limit is [`PACKET_BYTES_MAX`]; the
-/// laws lower it.
+/// The fewest bytes a held display set is completed with: an end segment,
+/// its type and its 16-bit length of 0.
+const PGS_END_SEGMENT_BYTES: u64 = 3;
+
+/// What PGS's automatic filter does with a packet of `bytes`, carrying
+/// `side` bytes of side data, given what it holds of a display set
+/// (`frame_merge_filter`, `pgs_frame_merge.c` 70–157 in FFmpeg 9.0.1):
+/// answers what it holds after it and what it puts out ([`Step`]) — a
+/// display set takes the times, flags and side data of the packet holding
+/// its presentation segment (132–136), and one packet may complete several
+/// — or the rule the packet breaks: empty, which the filter drops (87–90),
+/// or segments it would write marked corrupt — a display set it completes
+/// with no presentation segment (59–68), or segments that do not parse
+/// (93–130) — or a display set it would grow past `limit`
+/// ([`PayloadRule::DisplaySetSize`]; `av_grow_packet`, 137–140), refused at
+/// the packet after which no end segment fits. Each segment is a type byte
+/// and a big-endian 16-bit length; a presentation segment, of type `0x16`,
+/// is one per display set and at least 11 bytes; one of type `0x80` ends
+/// the set. The limit is [`PACKET_BYTES_MAX`]; the laws lower it.
 fn pgs_frame_merge(
   state: PgsState,
   bytes: &[u8],
+  side: u64,
   limit: u64,
-) -> Result<(PgsState, bool), PayloadRule> {
+) -> Result<(PgsState, Step), PayloadRule> {
   if bytes.is_empty() {
     return Err(PayloadRule::Empty);
   }
   let mut state = state;
   let mut own = false;
+  let mut largest: Option<u64> = None;
   let mut rest = bytes;
   // The filter takes a packet's display sets one at a time, the rest of
   // the packet after each (143–148).
@@ -2458,41 +2799,75 @@ fn pgs_frame_merge(
       }
     }
     match end {
-      // 122–123: a whole display set, nothing held: written as it is.
+      // 122–123: a whole display set, nothing held: put out as it is, with
+      // the packet's own times and side data.
       Some(size) if !state.holding && size == rest.len() => {
-        return if state.presentation {
-          Ok((PgsState::default(), true))
-        } else {
-          Err(PayloadRule::PgsSegments)
-        };
+        if !state.presentation {
+          return Err(PayloadRule::PgsSegments);
+        }
+        largest = Some(largest.map_or(rest.len() as u64 + side, |most| {
+          most.max(rest.len() as u64 + side)
+        }));
+        return Ok((
+          PgsState::default(),
+          Step {
+            reaches: true,
+            largest,
+            held: None,
+          },
+        ));
       }
       // 124–130: segments that stop parsing before the packet ends.
       None if at != rest.len() => return Err(PayloadRule::PgsSegments),
       _ => {}
     }
     own |= presentation;
+    // The set takes the side data of the packet holding its presentation
+    // segment: this one's, or the one the filter took it from.
+    let set_side = if presentation { side } else { state.side };
     // The filter grows the set it holds by what it takes of the packet: the
     // segments to the set's end, or all of them (137–140).
     let held = state.bytes + end.unwrap_or(rest.len()) as u64;
-    if held > limit {
-      return Err(PayloadRule::DisplaySetSize);
-    }
     match end {
       Some(size) => {
+        if held > limit {
+          return Err(PayloadRule::DisplaySetSize);
+        }
         if !state.presentation {
           return Err(PayloadRule::PgsSegments);
         }
+        largest = Some(largest.map_or(held + set_side, |most| most.max(held + set_side)));
         state = PgsState::default();
         rest = &rest[size..];
       }
       None => {
-        state.holding = true;
-        state.bytes = held;
+        // A set no end segment can complete within the limit is lost: the
+        // packet that leaves it so decides it.
+        if held + PGS_END_SEGMENT_BYTES > limit {
+          return Err(PayloadRule::DisplaySetSize);
+        }
+        state = PgsState {
+          holding: true,
+          presentation: state.presentation,
+          bytes: held,
+          side: set_side,
+          packets: state.packets + 1,
+        };
         rest = &[];
       }
     }
   }
-  Ok((state, own))
+  let held = state
+    .holding
+    .then(|| state.bytes + PGS_END_SEGMENT_BYTES + if state.presentation { state.side } else { 0 });
+  Ok((
+    state,
+    Step {
+      reaches: own,
+      largest,
+      held,
+    },
+  ))
 }
 
 /// The channels ISO/IEC 23001-8 gives a position, as MP4's `chnl` box
@@ -2804,6 +3179,7 @@ pub struct CarrierMuxer<W, C> {
   container: ContainerName,
   tracks: Vec<TrackState>,
   limits: PacketLimits,
+  bounds: Bounds,
   /// What the open answered, then what writing has learned.
   report: MuxReport,
   _carrier: PhantomData<fn() -> C>,
@@ -2861,6 +3237,7 @@ where
   ) -> Result<(Self, MuxReport), MuxOpenError> {
     let limits = options.limits();
     let filters = options.automatic_filters();
+    let bounds = options.bounds;
     let mut output = Output::open(sink, container.as_str()).map_err(|error| match error {
       OutputError::UnknownContainer { .. } | OutputError::Nul { .. } => {
         MuxOpenError::UnknownContainer {
@@ -2875,6 +3252,8 @@ where
     // The muxer libavformat resolved the name to, by its own name: the
     // caller's spelling is matched case-insensitively.
     let family = Family::of(output.container());
+    // The filters that muxer inserts (table B).
+    let sites = Sites::of(output.container(), output.container_mime_type());
     let mut report = MuxReport::default();
     // The automatic filters as the caller chose: on unless turned off, as
     // libavformat and `ffmpeg -c copy` have them. In a container whose
@@ -2891,7 +3270,7 @@ where
     let mut lost = Vec::with_capacity(tracks.len());
     for (index, description) in tracks.iter().enumerate() {
       let track = TrackIndex::new(index);
-      let (road, losses) = judge(&output, family, track, description, filters)?;
+      let (road, losses) = judge(&output, family, sites, track, description, filters)?;
       roads.push(road);
       lost.push(losses);
     }
@@ -2926,6 +3305,14 @@ where
           let codec = output
             .stream_codec(stream)
             .map_err(|error| MuxFault::new(MuxStage::Stream { track }, error))?;
+          // `pcm_rechunk`'s start counts an audio track's sample size in
+          // `int` (table B), as the stream holds it.
+          if sites.rechunk
+            && kind == TrackKind::Audio
+            && rechunk_overflows(codec.channels(), codec.codec().bits_per_sample())
+          {
+            return Err(MuxOpenError::SampleSize { track });
+          }
           Some((stream, codec))
         }
       };
@@ -2947,7 +3334,7 @@ where
       report.uncarried.append(&mut lost[index]);
       let mut filter = Filter::None;
       if let (Road::Timed, Some((_, codec))) = (road, &stream) {
-        filter = Filter::settle(family, codec.codec(), codec.extradata(), filters);
+        filter = Filter::settle(sites, family, codec.codec(), codec.extradata(), filters);
         report.uncarried.extend(
           filter
             .named()
@@ -2998,7 +3385,7 @@ where
           let time_base = output
             .stream_time_base(stream)
             .map_err(|error| MuxFault::new(MuxStage::Header, error))?;
-          rules = PacketRules::settle(family, kind, &codec, time_base, shifts, filters);
+          rules = PacketRules::settle(family, kind, &codec, time_base, shifts);
           // MP4 joins the paragraphs of libavcodec's TTML encoder into one
           // document at the trailer, its header made of the configuration's
           // strings and the language (`ttmlenc.c` 124–158).
@@ -3054,6 +3441,7 @@ where
         container,
         tracks: track_states,
         limits,
+        bounds,
         report: report.clone(),
         _carrier: PhantomData,
       },
@@ -3188,10 +3576,16 @@ where
     // refusals come first, and a packet it holds — its times, flags and
     // side data dropped — meets no rule libavformat and the container apply
     // to the times of what the filter puts out.
-    let (filter, reaches) = state
+    let side: u64 = payload
+      .side_data
+      .iter()
+      .map(|entry| entry.data().len() as u64)
+      .sum();
+    let (filter, step) = state
       .filter
-      .step(payload.bytes)
+      .step(payload.bytes, side, self.bounds.packet)
       .map_err(|rule| Refusal::Container(FfmpegMuxRefusal::Payload { track, rule }))?;
+    let reaches = step.reaches;
     // libavformat's rule, exactly: nothing is checked while the last
     // decode time is zero — its counter starts there — and a repeat is
     // refused after any other.
@@ -3217,14 +3611,15 @@ where
         duration_ticks,
       },
       payload,
-      reaches,
+      step,
+      self.bounds,
     )
     .map_err(Refusal::Container)?;
     let uncarried = learned_losses(
       state,
       track,
       &self.report.uncarried,
-      payload.side_data,
+      payload,
       dts_ticks,
       reaches,
     );
@@ -3288,10 +3683,11 @@ fn learned_losses(
   state: &TrackState,
   track: TrackIndex,
   reported: &[Uncarried],
-  side_data: &[SideDataEntry],
+  payload: Payload<'_>,
   dts_ticks: i64,
   reaches: bool,
 ) -> Vec<Uncarried> {
+  let (payload_bytes, side_data) = (payload.bytes, payload.side_data);
   let mut lines = Vec::new();
   let mut push = |line: Uncarried| {
     if !reported.contains(&line) && !lines.contains(&line) {
@@ -3310,7 +3706,7 @@ fn learned_losses(
     });
   }
   for entry in side_data {
-    let replaced = matches!(state.filter, Filter::Adts { converted: false })
+    let replaced = first_conversion(state.filter, payload_bytes)
       && entry.kind() == AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
     let fate = if !reaches || replaced {
       Some(SideDataFate::Dropped)
@@ -3403,15 +3799,19 @@ fn check_times(
 }
 
 /// Holds a packet the face admitted to the rows of the packet-rule table
-/// its track meets ([`PacketRules`]), in the table's order; answers what
-/// the container learns of the track from it, for the next one's judgment.
+/// its track meets ([`PacketRules`]), in the table's order — `step` what
+/// its track's filter does with it, `bounds` the sizes held to (table B);
+/// answers what the container learns of the track from it, for the next
+/// one's judgment.
 fn check_packet_rules(
   state: &TrackState,
   time_base: Timebase,
   timed: Timed,
   payload: Payload<'_>,
-  reaches: bool,
+  step: Step,
+  bounds: Bounds,
 ) -> Result<Learned, FfmpegMuxRefusal> {
+  let reaches = step.reaches;
   let rules = &state.rules;
   let Timed {
     track,
@@ -3478,7 +3878,7 @@ fn check_packet_rules(
   {
     // AAC's filter replaces the first frame's with the configuration it
     // makes (`aac_adtstoasc.c` 98–103).
-    let replaced = matches!(state.filter, Filter::Adts { converted: false });
+    let replaced = first_conversion(state.filter, payload.bytes);
     let taken = match rules.new_extradata {
       ExtradataRule::Any => true,
       ExtradataRule::OpusHead => opus_head_written(new),
@@ -3517,7 +3917,7 @@ fn check_packet_rules(
   let len = payload.bytes.len() as u64;
   let written = if rules.length_prefixed {
     let rewritten = length_prefixed_bytes(payload.bytes);
-    if rewritten > PACKET_BYTES_MAX {
+    if rewritten > bounds.packet {
       return refused(PayloadRule::RewrittenSize);
     }
     rewritten
@@ -3525,22 +3925,32 @@ fn check_packet_rules(
     len
   };
   if rules.matroska_block {
-    let side: u64 = payload
-      .side_data
-      .iter()
-      .map(|entry| entry.data().len() as u64)
-      .sum();
-    if written + side + MATROSKA_BLOCK_OVERHEAD > MATROSKA_BLOCK_BYTES_MAX {
+    // Every block the container writes of the packet — the packet as
+    // written, or each packet the track's filter puts out with it — and
+    // what the filter holds, at the least it can come to (table B).
+    let blocks = match state.filter {
+      Filter::None => {
+        let side: u64 = payload
+          .side_data
+          .iter()
+          .map(|entry| entry.data().len() as u64)
+          .sum();
+        [Some(written + side), None]
+      }
+      _ => [step.largest, step.held],
+    };
+    if blocks
+      .into_iter()
+      .flatten()
+      .any(|block| block > bounds.block)
+    {
       return refused(PayloadRule::ClusterSize);
     }
-  }
-  if rules.vp9_frame_max.is_some_and(|most| len > most) {
-    return refused(PayloadRule::SuperframeSize);
   }
   let document = match rules.ttml_document {
     Some(_) => {
       let document = state.document + len + TTML_PARAGRAPH_OVERHEAD;
-      if document > PACKET_BYTES_MAX {
+      if document > bounds.packet {
         return refused(PayloadRule::DocumentSize);
       }
       Some(document)
@@ -3728,6 +4138,7 @@ impl<W, C> fmt::Debug for CarrierMuxer<W, C> {
 fn judge<W, D: AsRef<[u8]>>(
   output: &Output<W>,
   family: Family,
+  sites: Sites,
   track: TrackIndex,
   description: &TrackDescription<Ffmpeg, D, CodecTicket>,
   filters: bool,
@@ -3787,7 +4198,12 @@ fn judge<W, D: AsRef<[u8]>>(
       if output.query_codec(codec) == CodecQuery::NotCarried || header_refuses(family, codec) {
         return Err(MuxOpenError::CodecNotCarried { track, codec });
       }
-      if configuration_missing(family, codec, stream_extradata(description), filters) {
+      if configuration_missing(
+        family,
+        codec,
+        stream_extradata(description),
+        sites.aac && filters,
+      ) {
         return Err(MuxOpenError::ConfigurationMissing { track, codec });
       }
       if configuration_invalid(family, codec, stream_extradata(description)) {
@@ -3844,13 +4260,19 @@ fn stream_extradata<D: AsRef<[u8]>>(
 }
 
 /// Whether `family` needs a configuration `codec`'s track does not carry
-/// ([`MuxOpenError::ConfigurationMissing`]): AAC's only with the automatic
-/// `filters` off, as with them on its first ADTS header makes one.
-fn configuration_missing(family: Family, codec: CodecId, extradata: &[u8], filters: bool) -> bool {
+/// ([`MuxOpenError::ConfigurationMissing`]): AAC's only where its automatic
+/// filter is not inserted (`aac_filtered`), as where it is its first ADTS
+/// header makes one.
+fn configuration_missing(
+  family: Family,
+  codec: CodecId,
+  extradata: &[u8],
+  aac_filtered: bool,
+) -> bool {
   if !extradata.is_empty() {
     return false;
   }
-  let aac = codec == CodecId::AAC && !filters;
+  let aac = codec == CodecId::AAC && !aac_filtered;
   match family {
     // H.264, HEVC, VVC, LCEVC and EVC take the first packet as their
     // configuration (`movenc.c` 7024–7041); AV1's `av1C` and ALAC's atom

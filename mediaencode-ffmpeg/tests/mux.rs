@@ -4117,3 +4117,190 @@ fn l47_webm_spelled_in_capitals_meets_webms_rules() {
   assert_eq!(refusal, payload(PayloadRule::Superframe));
   untouched!(seventh, back);
 }
+
+/// A VP9 frame of `len` bytes, `shown` or hidden, the rest `tag`.
+fn vp9_frame(len: usize, shown: bool, tag: u8) -> Vec<u8> {
+  let mut bytes = vec![tag; len];
+  // The frame marker and profile 0, then show-existing, frame type and
+  // show bits.
+  bytes[0] = if shown { 0x82 } else { 0x80 };
+  bytes
+}
+
+/// **L48 — IVF joins VP9's hidden frames whether the automatic filters run
+/// or not, and the run is bounded either way** (table B of the census):
+/// IVF inserts `vp9_superframe` at its start (`ivf_init`, `ivfenc.c` 42),
+/// not at a track's first packet, so turning the filters off leaves it in
+/// place — and its conversion is reported. With libavcodec's largest packet
+/// lowered to 100 bytes (the seam), a third hidden frame of 40, which no
+/// frame shown after it could join within 100, is refused by name, the
+/// packet untouched; a shown frame of 10 joins the two held, and the file
+/// holds their one superframe.
+///
+/// PLANT: IVF's filter taken as inserted at the first packet admits the
+/// third hidden frame.
+#[test]
+fn l48_ivfs_vp9_superframes_are_bounded_with_the_filters_off() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = vp9_webm(&corpus);
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  let track = TrackIndex::new(0);
+  let target = output(&corpus, "l48.ivf");
+  let (mut muxer, report) = FfmpegOwnedMuxer::open_with(
+    File::create(&target).expect("create"),
+    ContainerName::new("ivf"),
+    table_of(&source, TrackKind::Video),
+    &[],
+    filters(false).with_lowered_bounds(100, u64::MAX),
+  )
+  .expect("open");
+  assert_eq!(
+    report.uncarried(),
+    &[Uncarried::Filtered {
+      track,
+      filter: AutomaticFilter::Vp9Superframe
+    }],
+    "inserted at IVF's start, the filters off"
+  );
+  for (at, tag) in [(0, 1), (40, 2)] {
+    muxer
+      .write_video(video_at(
+        &video_holding(&frame, &vp9_frame(40, false, tag)),
+        Some(at),
+        at,
+      ))
+      .map_err(|error| error.map_packet(drop))
+      .expect("held");
+  }
+  let third = video_at(
+    &video_holding(&frame, &vp9_frame(40, false, 3)),
+    Some(80),
+    80,
+  );
+  let (refusal, back) = by_container(muxer.write_video(third.clone()));
+  assert_eq!(refusal, payload(PayloadRule::SuperframeSize));
+  untouched!(third, back);
+  muxer
+    .write_video(video_at(
+      &video_holding(&frame, &vp9_frame(10, true, 9)),
+      Some(80),
+      80,
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("joins the two held");
+  muxer.finish().expect("finished");
+  let written = &packets(&target)[0];
+  assert_eq!(written.len(), 1, "one superframe");
+  let mut joined = [
+    vp9_frame(40, false, 1),
+    vp9_frame(40, false, 2),
+    vp9_frame(10, true, 9),
+  ]
+  .concat();
+  joined.extend([0xC2, 40, 40, 10, 0xC2]);
+  assert_eq!(written[0].bytes, joined);
+}
+
+/// **L49 — Matroska bounds every block its filters put out, not the packet
+/// handed over** (table B): VP9's superframe is one block of every frame it
+/// joins. With a block's payload lowered to 100 bytes (the seam), hidden
+/// frames of 40 — each within it — are refused at the third, which no frame
+/// shown after it could join within the bound, the packet untouched before
+/// any of it is taken; a shown frame of 20, which would join the two at
+/// 105, is refused too, and one of 10 joins them at 95.
+///
+/// PLANT: the block bound held to the packet handed over admits the third
+/// hidden frame.
+#[test]
+fn l49_matroska_bounds_the_blocks_its_filters_put_out() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = vp9_webm(&corpus);
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  let target = output(&corpus, "l49.mkv");
+  let mut muxer = muxer_with(
+    &target,
+    ContainerName::MATROSKA,
+    table_of(&source, TrackKind::Video),
+    MuxOptions::new().with_lowered_bounds(u64::MAX, 100),
+  );
+  for (at, tag) in [(0, 1), (40, 2)] {
+    muxer
+      .write_video(video_at(
+        &video_holding(&frame, &vp9_frame(40, false, tag)),
+        Some(at),
+        at,
+      ))
+      .map_err(|error| error.map_packet(drop))
+      .expect("held");
+  }
+  for offered in [vp9_frame(40, false, 3), vp9_frame(20, true, 4)] {
+    let packet = video_at(&video_holding(&frame, &offered), Some(80), 80);
+    let (refusal, back) = by_container(muxer.write_video(packet.clone()));
+    assert_eq!(refusal, payload(PayloadRule::ClusterSize), "{offered:?}");
+    untouched!(packet, back);
+  }
+  muxer
+    .write_video(video_at(
+      &video_holding(&frame, &vp9_frame(10, true, 9)),
+      Some(80),
+      80,
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("joins the two held");
+  muxer.finish().expect("finished");
+  assert_eq!(packets(&target)[0].len(), 1, "one superframe");
+}
+
+/// **L50 — AAC's filter in another container is mirrored as it converts**
+/// (table B): FLV inserts `aac_adtstoasc` at an AAC track's first packet
+/// where it opens with an ADTS header (`flv_check_bitstream`, `flvenc.c`
+/// 1491–1493), and the filter consumes a first frame's program config
+/// element with no check that it fits. Over the transport stream's AAC,
+/// which states no configuration: an element cut a byte short — put out at
+/// size −1 — is refused by name, the packet untouched; one that ends its
+/// payload is put out empty, the filter's own way, and admitted. A raw
+/// first packet inserts no filter, for good: an ADTS packet after it is
+/// bytes.
+///
+/// PLANT: FLV taken off AAC's filter sites admits the cut element.
+#[test]
+fn l50_aacs_filter_is_mirrored_in_another_container() {
+  let Some(corpus) = Corpus::new() else { return };
+  let ts = corpus.transport_stream();
+  let (_, frames) = first_track(&ts, TrackKind::Audio, 1);
+  let frame = audio_of(&frames[0]);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l50.flv"),
+    ContainerName::new("flv"),
+    table_of(&ts, TrackKind::Audio),
+  );
+  let cut = audio_at(&audio_holding(&frame, &adts_with(&BARE_PCE[..5])), 0);
+  let (refusal, back) = by_container(muxer.write_audio(cut.clone()));
+  assert_eq!(refusal, payload(PayloadRule::AdtsFrame));
+  untouched!(cut, back);
+  muxer
+    .write_audio(audio_at(&audio_holding(&frame, &adts_with(&BARE_PCE)), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("an element that ends its payload, put out empty");
+  muxer.finish().expect("finished");
+
+  let mut muxer = muxer_into(
+    &output(&corpus, "l50-raw.flv"),
+    ContainerName::new("flv"),
+    table_of(&ts, TrackKind::Audio),
+  );
+  muxer
+    .write_audio(audio_at(&audio_holding(&frame, &[0x21, 0x10, 0x05]), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a raw first packet");
+  muxer
+    .write_audio(audio_at(
+      &audio_holding(&frame, &adts_with(&BARE_PCE[..5])),
+      21,
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("no filter: bytes");
+  muxer.finish().expect("finished");
+}

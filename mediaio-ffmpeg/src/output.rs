@@ -101,7 +101,7 @@
 //! | site | what is read or written | the contract |
 //! |---|---|---|
 //! | `open` | `av_guess_format`; the static muxer's `flags`; `avformat_alloc_output_context2`; `ctx.pb` and `ctx.flags` written | a NUL-terminated name live for the call; a non-null static muxer; a valid out-pointer, null on failure; the I/O context outlives the context, and is the caller's (`AVFMT_FLAG_CUSTOM_IO`) |
-//! | `container`, `strict_decode_times`, `shifts_early_times` | the static muxer's `name` (bounded, `table_text`) and `flags` | `oformat` is never null on a context `open` returned |
+//! | `container`, `container_mime_type`, `strict_decode_times`, `shifts_early_times` | the static muxer's `name` and `mime_type` (each bounded, `table_text`, the MIME type null where unstated) and `flags` | `oformat` is never null on a context `open` returned |
 //! | `sink_fault` | the I/O context's `error` (`pb`, kept from `open`) | the I/O context the `Output` owns, live as long as it is; a plain `int` libavformat writes only inside the `&mut self` calls, read after they return |
 //! | `query_codec` | `avformat_query_codec` through a shim taking the codec id as `c_int` | no bindgen enum formed from an integer; libavformat searches its tag tables, never indexes them |
 //! | `streams`, `stream`, `stream_time_base` | `nb_streams`; `streams[index]`; a stream's `time_base` | `index < nb_streams`, checked first |
@@ -651,6 +651,20 @@ impl<W> Output<W> {
     unsafe {
       let oformat = (*self.ctx.as_ptr()).oformat;
       crate::ffi::table_text((*oformat).name, 256).unwrap_or("")
+    }
+  }
+
+  /// The muxer's MIME type — `"video/x-matroska"` — where it states one:
+  /// what tells apart two muxers of one name, as libavformat's two
+  /// `"matroska"` muxers are told apart (`matroskaenc.c` 3715–3800 in FFmpeg
+  /// 9.0.1).
+  pub fn container_mime_type(&self) -> Option<&'static str> {
+    // SAFETY: as [`Self::container`]; `mime_type` is null or a
+    // NUL-terminated literal in libavformat's static tables, and
+    // `table_text` answers `None` for null.
+    unsafe {
+      let oformat = (*self.ctx.as_ptr()).oformat;
+      crate::ffi::table_text((*oformat).mime_type, 256)
     }
   }
 
