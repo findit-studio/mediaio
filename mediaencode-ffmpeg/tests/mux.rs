@@ -4304,3 +4304,105 @@ fn l50_aacs_filter_is_mirrored_in_another_container() {
     .expect("no filter: bytes");
   muxer.finish().expect("finished");
 }
+
+/// `fields`, each `(value, width)`, written most significant bit first and
+/// padded with zeros to a byte; a field wider than 64 bits is zeros above.
+fn bit_payload(fields: &[(u64, u32)]) -> Vec<u8> {
+  let mut bits = Vec::new();
+  for &(value, width) in fields {
+    for bit in (0..width).rev() {
+      bits.push(bit < 64 && value >> bit & 1 == 1);
+    }
+  }
+  bits
+    .chunks(8)
+    .map(|byte| {
+      byte
+        .iter()
+        .chain(core::iter::repeat(&false))
+        .take(8)
+        .fold(0u8, |acc, &bit| acc << 1 | u8::from(bit))
+    })
+    .collect()
+}
+
+/// **L51 — HDR10+ reaches Matroska exactly where libavutil writes and reads
+/// it back whole** (table A of the census; Codex R4's findings 2 and 7). Two
+/// windows with no peak table, no percentile and every tone mapping and
+/// saturation flag zero — 360 bits declared, 358 written, in 45 bytes
+/// either way, the reader reading the two missing flags from the padding's
+/// zeros — is admitted, and reads back as itself; one window with a 3 × 3
+/// targeted peak table and neither flag — 169 bits declared, 168 written,
+/// its 22nd byte never written — is refused by name, the packet untouched.
+#[test]
+fn l51_hdr10_plus_reaches_matroska_where_libavutil_round_trips_it() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  use mediaio_ffmpeg::hdr_metadata::hdr10_plus_from_t35;
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, video) = first_track(&source, TrackKind::Video, 2);
+  let with = |index: usize, entry: Option<&[u8]>| {
+    let at = 40 * index as i64;
+    let mut packet = video_of(&video[index])
+      .with_pts(Some(ms(at)))
+      .with_dts(Some(ms(at)));
+    packet.extra_mut().set_side_data(
+      entry
+        .map(|entry| side(T::AV_PKT_DATA_DYNAMIC_HDR10_PLUS, entry))
+        .into_iter()
+        .collect(),
+    );
+    VideoTrackPacket::new(TrackIndex::new(0), packet)
+  };
+  // The version, two windows, the second's geometry, the luminance and no
+  // peak table, two windows' statistics, no mastering table, then nothing.
+  let zero_windows = hdr10_plus_from_t35(&bit_payload(&[
+    (1, 8),
+    (2, 2),
+    (0, 153),
+    (0, 27),
+    (0, 1),
+    (0, 82),
+    (0, 82),
+    (0, 1),
+  ]))
+  .expect("libavutil parses the two windows");
+  // The version, one window, the luminance, a 3 × 3 targeted peak table,
+  // the window's statistics, no mastering table, then its two flags clear.
+  let unwritten = hdr10_plus_from_t35(&bit_payload(&[
+    (1, 8),
+    (1, 2),
+    (0, 27),
+    (1, 1),
+    (3, 5),
+    (3, 5),
+    (0, 36),
+    (0, 82),
+    (0, 1),
+    (0, 2),
+  ]))
+  .expect("libavutil parses the window");
+  let target = output(&corpus, "l51.mkv");
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::MATROSKA,
+    table_of(&source, TrackKind::Video),
+  );
+  let refused = with(0, Some(&unwritten));
+  let (refusal, back) = by_container(muxer.write_video(refused.clone()));
+  assert_eq!(refusal, payload(PayloadRule::DynamicHdrPlus));
+  untouched!(refused, back);
+  muxer
+    .write_video(with(0, Some(&zero_windows)))
+    .map_err(|error| error.map_packet(drop))
+    .expect("two windows of nothing, written whole");
+  muxer
+    .write_video(with(1, None))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a packet");
+  muxer.finish().expect("finished");
+  assert!(
+    side_data_of(&target)[0].contains(&(T::AV_PKT_DATA_DYNAMIC_HDR10_PLUS as i32, zero_windows)),
+    "the two windows read back as themselves"
+  );
+}

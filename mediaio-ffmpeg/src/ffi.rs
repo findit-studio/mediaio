@@ -1006,6 +1006,27 @@ pub(crate) mod c_shims {
       data: *const u8,
       size: usize,
     ) -> c_int;
+
+    /// Serializes the `AVDynamicHDRPlus` `s` points at into the ITU-T T.35
+    /// HDR10+ payload (`hdr_dynamic_metadata.c` 237–395): into `*data`
+    /// where it is not null and `*size` bytes hold the payload, its size
+    /// written to `*size`. It trusts every count and divisor. The laws
+    /// alone call it, as the oracle the checks are held to.
+    #[cfg(test)]
+    pub(crate) fn av_dynamic_hdr_plus_to_t35(
+      s: *const libc::c_void,
+      data: *mut *mut u8,
+      size: *mut usize,
+    ) -> c_int;
+
+    /// As [`av_dynamic_hdr_plus_to_t35`], for SMPTE ST 2094 application 5
+    /// (`hdr_dynamic_metadata.c` 563–706).
+    #[cfg(test)]
+    pub(crate) fn av_dynamic_hdr_smpte2094_app5_to_t35(
+      s: *const libc::c_void,
+      data: *mut *mut u8,
+      size: *mut usize,
+    ) -> c_int;
   }
 }
 

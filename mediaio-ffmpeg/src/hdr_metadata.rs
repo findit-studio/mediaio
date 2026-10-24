@@ -55,17 +55,29 @@
 //!   whole number of its field's unit, so that it reads back as that
 //!   number over the unit — the same value;
 //! - every flag is 0 or 1;
-//! - what the writer writes the reader reads in the same place: HDR10+'s
-//!   writer writes 1 for the application version whatever the struct
-//!   holds, and writes a window's saturation flag inside its tone
-//!   mapping, where the reader reads it after; APP5's writer writes each
-//!   image's curves by its own count, where the reader copies the first
-//!   image's;
-//! - the payload is of a size its writer takes.
+//! - the payload is of a size its writer takes, and every byte of it is one
+//!   the writer writes: HDR10+'s serializer sizes a window's saturation flag
+//!   and weight whether or not it writes them — inside the window's tone
+//!   mapping alone (`hdr_dynamic_metadata.c` 262–296, 373–387) — and a byte
+//!   it sizes past what it writes goes out as whatever the caller's buffer
+//!   held, which in Matroska's is uninitialized ([`HdrMetadataError::Uninitialized`]);
+//! - what the writer writes the reader reads back as the struct's own:
+//!   HDR10+'s writer writes 1 for the application version whatever the
+//!   struct holds; its tone mapping is written by the writer's exact bit
+//!   schedule and read by the reader's, which reads every window's
+//!   saturation flag after its tone mapping, from whatever follows where
+//!   the writer wrote none — the two are run, and the entry admitted
+//!   exactly where the reader reads back every field (`check_hdr10_plus`);
+//!   APP5's writer writes each image's curves by its own count, where the
+//!   reader copies the first image's.
 //!
-//! A field the payload does not carry — the T.35 country code, the first
-//! window's geometry, an element past its count, a field its flag leaves
-//! out — is not judged: it is not written, and reads back zero.
+//! Nothing stricter is asked: an entry admitted is one the writer writes
+//! whole and the reader reads back as itself, and one refused is not — or
+//! is one whose writing C would make undefined (a count past its array, a
+//! zero divisor, an overflow). A field the payload does not carry — the
+//! T.35 country code, the first window's geometry, an element past its
+//! count, a field its flag leaves out — is not judged: it is not written,
+//! and reads back zero.
 
 use core::{
   ffi::c_void,
@@ -228,6 +240,10 @@ pub enum HdrMetadataError {
   /// A payload of a size its writer refuses.
   #[error("the payload is of a size its writer refuses")]
   Unwritable,
+  /// A payload its writer sizes past the bits it writes: the bytes after
+  /// go out as whatever the buffer held.
+  #[error("the writer sizes the payload past what it writes, the rest left unwritten")]
+  Uninitialized,
   /// libavutil refused the T.35 payload, with this code.
   #[error("libavutil refused the payload ({0})")]
   Parse(i32),
@@ -272,10 +288,10 @@ enum Unit {
   Wide(i64),
 }
 
-/// Whether `(num, den)` scaled by `unit` is written as itself in `bits`:
-/// a nonzero denominator, no overflow where C makes one, a whole number of
-/// the unit, from 0 below `2^bits`.
-fn scaled((num, den): (i32, i32), unit: Unit, bits: u32) -> Result<(), HdrMetadataError> {
+/// The integer `(num, den)` scaled by `unit` is written as in `bits`,
+/// where it is written as itself: a nonzero denominator, no overflow where
+/// C makes one, a whole number of the unit, from 0 below `2^bits`.
+fn written((num, den): (i32, i32), unit: Unit, bits: u32) -> Result<u32, HdrMetadataError> {
   if den == 0 {
     return Err(HdrMetadataError::Divisor);
   }
@@ -300,10 +316,17 @@ fn scaled((num, den): (i32, i32), unit: Unit, bits: u32) -> Result<(), HdrMetada
     }
   };
   if (0..1i64 << bits).contains(&quotient) {
-    Ok(())
+    // Below `2^bits`, at most 27: it fits.
+    Ok(quotient as u32)
   } else {
     Err(HdrMetadataError::Value)
   }
+}
+
+/// Whether `(num, den)` scaled by `unit` is written as itself in `bits`
+/// ([`written`]).
+fn scaled(rational: (i32, i32), unit: Unit, bits: u32) -> Result<(), HdrMetadataError> {
+  written(rational, unit, bits).map(drop)
 }
 
 /// A flag the writer writes in one bit.
@@ -518,50 +541,163 @@ pub fn check_hdr10_plus(bytes: &[u8]) -> Result<(), HdrMetadataError> {
   }
   // Each window's tone mapping (373–388): the knee point in 12 bits over
   // 4095, up to 15 anchors in 10 bits over 1023, and the saturation weight
-  // in 6 bits over 8, each in `int`. The serializer writes the saturation
-  // flag inside the tone mapping; the reader reads it after (224–231). So
-  // a window without tone mapping reads back as itself only where it is
-  // the last — the reader then reads its saturation flag from the zero
-  // bits the serializer pads with — and has no saturation mapping.
-  for w in 0..windows {
-    let tone = flag(fields.u8(window!(w, tone_mapping_flag)))?;
-    let saturation = flag(fields.u8(window!(w, color_saturation_mapping_flag)))?;
-    if tone {
-      for knee in [window!(w, knee_point_x), window!(w, knee_point_y)] {
-        scaled(fields.rational(knee), Unit::Int(4095), 12)?;
+  // in 6 bits over 8, each in `int`, as the serializer writes it inside the
+  // window's tone mapping — and as the reader reads it back (198–232),
+  // which reads the saturation flag and weight after the tone mapping,
+  // whatever it held. The weight of a window without tone mapping is not
+  // written, nor its arithmetic made; the reader may still read one back.
+  let mut maps = [ToneMap::default(); 3];
+  for (w, map) in maps.iter_mut().enumerate().take(windows) {
+    map.tone = flag(fields.u8(window!(w, tone_mapping_flag)))?;
+    map.saturation = flag(fields.u8(window!(w, color_saturation_mapping_flag)))?;
+    if map.tone {
+      for (k, knee) in [window!(w, knee_point_x), window!(w, knee_point_y)]
+        .into_iter()
+        .enumerate()
+      {
+        map.knee[k] = written(fields.rational(knee), Unit::Int(4095), 12)?;
       }
       let anchors = usize::from(fields.u8(window!(w, num_bezier_curve_anchors)));
       if anchors > 15 {
         return Err(HdrMetadataError::Count);
       }
+      map.anchors = anchors as u8;
       for i in 0..anchors {
-        scaled(
+        map.anchor[i] = written(
           fields.rational(window!(w, bezier_curve_anchors) + i * size_of::<Rational>()),
           Unit::Int(1023),
           10,
         )?;
       }
-      if saturation {
-        scaled(
-          fields.rational(window!(w, color_saturation_weight)),
-          Unit::Int(8),
-          6,
-        )?;
-      }
-    } else if w + 1 < windows || saturation {
-      return Err(HdrMetadataError::Syntax);
+    }
+    if map.saturation {
+      let unit = if map.tone {
+        Unit::Int(8)
+      } else {
+        Unit::Wide(8)
+      };
+      map.weight = written(
+        fields.rational(window!(w, color_saturation_weight)),
+        unit,
+        6,
+      )?;
     }
   }
-  if hdr10_plus_payload_bytes(&fields, windows) > HDR_PLUS_MAX_PAYLOAD {
+  let maps = &maps[..windows];
+  // The serializer sizes the payload by its own sum, which it asserts
+  // (262–298), and writes its saturation flags and weights inside the tone
+  // mapping alone: a byte it sizes past the bits it writes goes out as
+  // whatever the caller's buffer held — Matroska's is on its stack,
+  // uninitialized (`matroskaenc.c` 2870–2969).
+  let declared = hdr10_plus_payload_bits(&fields, windows);
+  if declared.div_ceil(8) > HDR_PLUS_MAX_PAYLOAD {
     return Err(HdrMetadataError::Unwritable);
+  }
+  let tone_bits = |map: &ToneMap| {
+    let tone = if map.tone {
+      28 + 10 * usize::from(map.anchors)
+    } else {
+      0
+    };
+    1 + tone + 1 + if map.saturation { 6 } else { 0 }
+  };
+  let section: usize = maps.iter().map(tone_bits).sum();
+  let unwritten: usize = maps
+    .iter()
+    .filter(|map| !map.tone)
+    .map(|map| 1 + if map.saturation { 6 } else { 0 })
+    .sum();
+  if (declared - unwritten).div_ceil(8) != declared.div_ceil(8) {
+    return Err(HdrMetadataError::Uninitialized);
+  }
+  // The reader reads the bits the serializer wrote, then the zeros it pads
+  // the last byte with (`flush_put_bits`), to the payload's end; every field
+  // before the tone mapping reads back as written.
+  let mut bits = Vec::with_capacity(8 * declared.div_ceil(8));
+  for map in maps {
+    put(&mut bits, u32::from(map.tone), 1);
+    if map.tone {
+      put(&mut bits, map.knee[0], 12);
+      put(&mut bits, map.knee[1], 12);
+      put(&mut bits, u32::from(map.anchors), 4);
+      for &anchor in &map.anchor[..usize::from(map.anchors)] {
+        put(&mut bits, anchor, 10);
+      }
+      put(&mut bits, u32::from(map.saturation), 1);
+      if map.saturation {
+        put(&mut bits, map.weight, 6);
+      }
+    }
+  }
+  bits.resize(8 * declared.div_ceil(8) - (declared - section), false);
+  if read_tone_maps(&bits, windows).as_deref() != Some(maps) {
+    return Err(HdrMetadataError::Syntax);
   }
   Ok(())
 }
 
-/// The bytes HDR10+'s serializer sizes its payload at, by its own sum
+/// One window's tone mapping and saturation, as the integers HDR10+'s
+/// serializer writes them — a field its flag leaves out, zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ToneMap {
+  tone: bool,
+  knee: [u32; 2],
+  anchors: u8,
+  anchor: [u32; 15],
+  saturation: bool,
+  weight: u32,
+}
+
+/// Appends `value`'s low `width` bits to `bits`, most significant first.
+fn put(bits: &mut Vec<bool>, value: u32, width: u32) {
+  for bit in (0..width).rev() {
+    bits.push(value >> bit & 1 == 1);
+  }
+}
+
+/// HDR10+'s reader of the tone mapping, over `bits`, the payload's from
+/// where it begins (`av_dynamic_hdr_plus_from_t35`, `hdr_dynamic_metadata.c`
+/// 198–232 in FFmpeg 9.0.1): each window's tone mapping flag; with it, the
+/// knee point, the anchor count and the anchors; then, whatever the flag,
+/// the saturation flag and its weight — or `None` where the bits run out
+/// first, which the reader refuses (`get_bits_left`).
+fn read_tone_maps(bits: &[bool], windows: usize) -> Option<Vec<ToneMap>> {
+  let mut at = 0;
+  let mut read = |width: usize| {
+    let field = bits.get(at..at + width)?;
+    at += width;
+    Some(
+      field
+        .iter()
+        .fold(0u32, |value, &bit| value << 1 | u32::from(bit)),
+    )
+  };
+  let mut maps = Vec::with_capacity(windows);
+  for _ in 0..windows {
+    let mut map = ToneMap {
+      tone: read(1)? == 1,
+      ..ToneMap::default()
+    };
+    if map.tone {
+      map.knee = [read(12)?, read(12)?];
+      map.anchors = read(4)? as u8;
+      for i in 0..usize::from(map.anchors) {
+        map.anchor[i] = read(10)?;
+      }
+    }
+    map.saturation = read(1)? == 1;
+    if map.saturation {
+      map.weight = read(6)?;
+    }
+    maps.push(map);
+  }
+  Some(maps)
+}
+
+/// The bits HDR10+'s serializer sizes its payload at, by its own sum
 /// (`hdr_dynamic_metadata.c` 262–296) — within the counts
 /// [`check_hdr10_plus`] admits, never past what it asserts.
-fn hdr10_plus_payload_bytes(fields: &Fields<'_>, windows: usize) -> usize {
+fn hdr10_plus_payload_bits(fields: &Fields<'_>, windows: usize) -> usize {
   let table = |flag: usize, rows: usize, cols: usize| {
     if fields.u8(flag) == 0 {
       0
@@ -609,7 +745,7 @@ fn hdr10_plus_payload_bytes(fields: &Fields<'_>, windows: usize) -> usize {
       bits += 6;
     }
   }
-  bits.div_ceil(8)
+  bits
 }
 
 /// The offset of APP5's `field`, at `[a]` or `[a][c]` where given.
@@ -693,11 +829,14 @@ pub fn check_smpte2094_app5(bytes: &[u8]) -> Result<(), HdrMetadataError> {
     } else if mixing_type(a) != mixing_type(0)
       || (mixing_type(0) == 3
         && (0..6).any(|k| {
-          coefficient_flag(a, k) != coefficient_flag(0, k) || coefficient(a, k) != coefficient(0, k)
+          coefficient_flag(a, k) != coefficient_flag(0, k)
+            || (coefficient_flag(0, k) != 0 && coefficient(a, k) != coefficient(0, k))
         }))
     {
       // The reader copies the first image's mixing for every later one
-      // (515–523), which the serializer does not write.
+      // (515–523), which the serializer does not write: its type, its flags,
+      // and the coefficients they name — one a flag leaves out reads back
+      // zero, copied or not.
       return Err(HdrMetadataError::Syntax);
     }
     if a == 0 || !common_curve {
