@@ -923,3 +923,104 @@ fn a_seek_the_sink_refuses_is_named_and_never_ends_in_ok() {
     }
   }
 }
+
+/// A [`ForwardOnly`] buffer that keeps a [`Tally`] of what reaches it.
+#[derive(Debug, Default)]
+struct CountedForwardOnly {
+  bytes: ForwardOnly,
+  tally: std::sync::Arc<Tally>,
+}
+
+impl Write for CountedForwardOnly {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    self.bytes.write(buf)
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    self
+      .tally
+      .flushes
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+  }
+}
+
+impl Seek for CountedForwardOnly {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.bytes.seek(pos)
+  }
+}
+
+impl Drop for CountedForwardOnly {
+  fn drop(&mut self) {
+    self
+      .tally
+      .drops
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
+/// **After a seek the sink failed, nothing reaches it again — its flush
+/// included, in `into_sink` and in the context's drop alike.** MP4's trailer
+/// goes back to patch its `mdat` size through a sink that refuses every
+/// seek back (as above); then the sink is taken back, or the context is
+/// dropped. Either way the sink is flushed never and dropped once: a flush
+/// would commit what it buffered at a position the failure left unknown.
+///
+/// PLANT: a flush let through after the record reaches the sink once, on
+/// each road.
+#[test]
+fn no_flush_reaches_the_sink_after_a_failed_seek() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let ticket = ticket(
+    ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE,
+    CodecId::MOV_TEXT,
+  );
+  for hand_back in [true, false] {
+    let sink = CountedForwardOnly::default();
+    let tally = std::sync::Arc::clone(&sink.tally);
+    let mut output = Output::open(sink, "mp4").expect("open");
+    let stream = output
+      .add_stream(&StreamSpec::new(&ticket, millis()))
+      .expect("a stream");
+    output.write_header().expect("the header");
+    let mut text = 1000u16.to_be_bytes().to_vec();
+    text.extend([b'x'; 1000]);
+    for index in 0..40 {
+      let pts = index * 1000;
+      let cue = SubtitlePacket::new(
+        FfmpegBytes::copy_from_slice(&text),
+        SubtitlePacketExtra::new(0),
+      )
+      .with_pts(Some(ms(pts)))
+      .with_duration(Some(ms(500)));
+      output
+        .write_packet::<crate::Owned>(
+          stream,
+          OutputPacket::Subtitle(&cue),
+          times(pts),
+          PacketLimits::default(),
+        )
+        .expect("a cue");
+    }
+    assert!(matches!(
+      output.write_trailer(),
+      Err(OutputError::SinkSeek(_))
+    ));
+    if hand_back {
+      assert!(matches!(output.into_sink(), Err(OutputError::SinkSeek(_))));
+    } else {
+      drop(output);
+    }
+    let count = |of: &std::sync::atomic::AtomicU32| of.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+      count(&tally.flushes),
+      0,
+      "hand back {hand_back}: never flushed"
+    );
+    assert_eq!(
+      count(&tally.drops),
+      1,
+      "hand back {hand_back}: dropped once"
+    );
+  }
+}

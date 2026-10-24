@@ -31,8 +31,28 @@
 //!
 //! **So is a sink that failed a seek** ([`SeekRecord`]). libavformat keeps
 //! no record of a failed seek, and a muxer patching what it wrote earlier
-//! may write on regardless, into the wrong place; the guard records the
-//! failure, refuses every later write and seek, and the context names it.
+//! may write on regardless, into the wrong place; and a `Seek` that fails,
+//! of any kind, says nothing of where it left the sink. The guard records
+//! every failure, refuses every later call — write, seek and flush — and
+//! the context names it.
+//!
+//! # Every entry into the sink
+//!
+//! The guard is the one way into the caller's sink: `Output` builds its
+//! I/O context over it alone (`StreamIo::from_write_seek`), and hands back
+//! the sink only out of it. Each road in, by what calls it, and what the
+//! guard asks before it lets the call through:
+//!
+//! | entry | called from | asked first |
+//! |---|---|---|
+//! | [`Write::write`] | ffmpeg-next's `write` callback, which loops it over the buffer libavformat hands it (`stream_io.rs` 323–347), for every `avio_flush` and every buffer libavformat fills — at the header, a packet, the trailer, `into_sink` (`output.rs`), `StreamIo::into_inner` and its `Drop` (240, 269) | the latch, then the seek record |
+//! | [`Seek::seek`], any `SeekFrom` | the `seek` callback, for `avio_seek`'s positioning (`stream_io.rs` 374–394), and for `AVSEEK_SIZE`, which asks `stream_position` — `seek(SeekFrom::Current(0))` — then `SeekFrom::End(0)`, then `SeekFrom::Start` back (358–372) | the latch, then the seek record; a failure of any kind recorded but an interrupted one, which did nothing and is asked again (388–391) |
+//! | [`Write::flush`] | `into_sink`, once the I/O context is flushed (`output.rs`); `StreamIo`'s `Drop`, through `flush_stream` (`stream_io.rs` 270–272, 405–407), when the context is dropped | the latch, then the seek record |
+//! | [`Seek::stream_position`] and the other provided methods | anyone holding the guard | their defaults, over the three above |
+//!
+//! [`GuardedWriter::into_inner`] calls nothing: it hands the sink back. A
+//! sink's own `Drop` — a `BufWriter` flushing its buffer — is the sink's,
+//! run when the caller's value is dropped, and no call of the guard's.
 //!
 //! The guard cannot help under `panic = "abort"`, where no unwind exists
 //! to catch; that is a whole-binary choice the caller makes.
@@ -56,19 +76,20 @@ use crate::reader_guard::{InertError, PanicLatch};
 /// `AVIOContext.error` (`aviobuf.c` 236–319 in FFmpeg 9.0.1) — and a
 /// muxer patching a header it wrote earlier may ignore the answer and
 /// write on, into the wrong place. So the guard keeps the first failed
-/// positioning seek here and, from then on, refuses every write and every
-/// seek, so nothing more lands where it does not belong; the context
-/// reports it once libavformat returns.
+/// seek here and, from then on, refuses every write, every seek and every
+/// flush, so nothing more reaches the sink; the context reports it once
+/// libavformat returns.
 ///
-/// A positioning seek is an absolute one, `SeekFrom::Start`: the only kind
-/// `avio_seek` asks for, the offset made absolute first (`aviobuf.c`
-/// 303–317 in FFmpeg 9.0.1). The size probe — ffmpeg-next's answer to
-/// `AVSEEK_SIZE`, and `avio_size`'s own fallback (326–347) — asks
-/// `SeekFrom::Current` and `SeekFrom::End`, which libavformat survives
-/// failing: those are not kept. Each moves the sink back with a
-/// `SeekFrom::Start` only once its `SeekFrom::End` succeeded, so a failure
-/// there leaves the sink where the probe moved it — misplaced, and kept
-/// like any other.
+/// **Every failed seek, of any kind.** `Seek` promises nothing of where a
+/// failed seek leaves the sink, so no failure can prove the position
+/// unchanged — but an interrupted one, which by its kind's word did nothing
+/// and is asked again: not `avio_seek`'s positioning (`SeekFrom::Start`, the offset
+/// made absolute first, `aviobuf.c` 303–317), nor the size probe —
+/// ffmpeg-next's answer to `AVSEEK_SIZE`, `SeekFrom::Current(0)`,
+/// `SeekFrom::End(0)` and `SeekFrom::Start` back (`stream_io.rs` 358–372),
+/// and `avio_size`'s own fallback by `SEEK_END` (`aviobuf.c` 326–347) —
+/// which libavformat survives failing, while the sink it leaves misplaced
+/// would take the next write where it does not belong.
 #[derive(Debug, Default)]
 pub struct SeekRecord {
   failed: AtomicBool,
@@ -183,7 +204,8 @@ impl<W> GuardedWriter<W> {
 }
 
 impl<W> GuardedWriter<W> {
-  /// Refuses a write or a seek once a seek has failed ([`SeekRecord`]).
+  /// Refuses a write, a seek or a flush once a seek has failed
+  /// ([`SeekRecord`]).
   fn positioned(&self) -> io::Result<()> {
     if self.seeks.is_set() {
       Err(io::Error::other(
@@ -201,9 +223,10 @@ impl<W: Write> Write for GuardedWriter<W> {
     self.guard(|inner| inner.write(buf))
   }
 
-  /// A flush writes nothing libavformat placed, so it runs after a failed
-  /// seek too: the sink's own buffers are the caller's.
+  /// A flush after a failed seek would commit what the sink buffered at a
+  /// position the failure left unknown: refused, as a write is.
   fn flush(&mut self) -> io::Result<()> {
+    self.positioned()?;
     self.guard(|inner| inner.flush())
   }
 }
@@ -212,8 +235,12 @@ impl<W: Seek> Seek for GuardedWriter<W> {
   fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
     self.positioned()?;
     let sought = self.guard(|inner| inner.seek(pos));
-    // A positioning seek that failed is kept; a panic is the latch's.
-    if let (Err(error), SeekFrom::Start(_)) = (&sought, pos)
+    // Every seek that failed is kept, of whatever kind — but one
+    // interrupted, which by `io::ErrorKind::Interrupted`'s word did nothing
+    // and is to be asked again, as ffmpeg-next asks it (`stream_io.rs`
+    // 388–391); a panic is the latch's.
+    if let Err(error) = &sought
+      && error.kind() != io::ErrorKind::Interrupted
       && !self.latch.is_latched()
     {
       self.seeks.record(InertError::of(error));
@@ -478,12 +505,11 @@ mod tests {
     }
   }
 
-  /// **A positioning seek that fails is kept, and nothing more is
-  /// written or sought.** The seek back fails with the sink's own error,
-  /// which the record keeps — its code, owning nothing — and every later
-  /// write and seek is refused without reaching the sink, so nothing lands
-  /// where it does not belong. A flush still runs: it writes nothing
-  /// libavformat placed. Nothing is latched: a failed seek is no panic.
+  /// **A positioning seek that fails is kept, and nothing more reaches the
+  /// sink.** The seek back fails with the sink's own error, which the record
+  /// keeps — its code, owning nothing — and every later write, seek and
+  /// flush is refused without reaching the sink, so nothing lands where it
+  /// does not belong. Nothing is latched: a failed seek is no panic.
   #[test]
   fn a_failed_positioning_seek_is_kept_and_nothing_more_is_written() {
     let (mut guarded, latch, seeks) = GuardedWriter::new(ForwardOnly::default());
@@ -496,29 +522,102 @@ mod tests {
     assert!(kept.get_ref().is_none(), "kept owning nothing");
     assert!(guarded.write(b"patch").is_err(), "no write after it");
     assert!(guarded.seek(SeekFrom::Start(6)).is_err(), "no seek either");
-    guarded.flush().expect("a flush still runs");
+    assert!(guarded.flush().is_err(), "nor a flush");
     assert!(latch.message().is_none(), "a failed seek is not a panic");
     let sink = guarded.into_inner();
     assert_eq!(sink.bytes.into_inner(), b"header", "only what came before");
-    // The write, the failed seek and the flush: nothing else reached it.
-    assert_eq!(sink.calls, 3);
+    // The write and the failed seek: nothing else reached it.
+    assert_eq!(sink.calls, 2);
   }
 
-  /// **A size probe that fails is not kept.** ffmpeg-next answers
-  /// libavformat's `AVSEEK_SIZE` with a `SeekFrom::Current` and a
-  /// `SeekFrom::End`, which libavformat survives failing; the sink stays
-  /// writable. The probe of a sink that can measure itself goes there and
-  /// back, as the default `stream_position` does, and keeps nothing.
+  /// A sink whose `SeekFrom::Current` or `SeekFrom::End` fails — the size
+  /// probe's two first questions — and counts every call that reaches it.
+  struct FailsTo {
+    current: bool,
+    end: bool,
+    calls: u32,
+  }
+
+  impl Write for FailsTo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+      self.calls += 1;
+      Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+      self.calls += 1;
+      Ok(())
+    }
+  }
+
+  impl Seek for FailsTo {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+      self.calls += 1;
+      match pos {
+        SeekFrom::Current(_) if self.current => Err(io::Error::from_raw_os_error(libc::EIO)),
+        SeekFrom::End(_) if self.end => Err(io::Error::from_raw_os_error(libc::ESPIPE)),
+        _ => Ok(0),
+      }
+    }
+  }
+
+  /// **A size probe that fails is kept, and nothing more reaches the
+  /// sink.** ffmpeg-next answers libavformat's `AVSEEK_SIZE` with
+  /// `stream_position` — `SeekFrom::Current(0)` — then `SeekFrom::End(0)`;
+  /// either failing leaves the sink where nothing says, so each is terminal
+  /// as a positioning seek is: no write, seek or flush reaches the sink
+  /// after it.
   #[test]
-  fn a_size_probe_that_fails_is_not_kept() {
-    let (mut guarded, _, seeks) = GuardedWriter::new(ForwardOnly::default());
-    guarded.write_all(b"abcd").expect("write");
-    assert!(guarded.seek(SeekFrom::Current(-1)).is_err());
-    assert!(guarded.seek(SeekFrom::End(-2)).is_err());
-    assert!(seeks.failure().is_none(), "a probe's failure is not kept");
-    assert_eq!(guarded.stream_position().expect("where it stands"), 4);
-    guarded.write_all(b"e").expect("still writable");
-    assert_eq!(guarded.into_inner().bytes.into_inner(), b"abcde");
+  fn a_size_probe_that_fails_is_kept_and_terminal() {
+    for (current, end, code) in [(true, false, libc::EIO), (false, true, libc::ESPIPE)] {
+      let (mut guarded, latch, seeks) = GuardedWriter::new(FailsTo {
+        current,
+        end,
+        calls: 0,
+      });
+      let probe = if current {
+        guarded.stream_position()
+      } else {
+        guarded.seek(SeekFrom::End(0))
+      };
+      assert!(probe.is_err(), "the probe fails");
+      assert_eq!(
+        seeks.failure().and_then(|error| error.raw_os_error()),
+        Some(code),
+        "kept"
+      );
+      assert!(guarded.write(b"more").is_err());
+      assert!(guarded.seek(SeekFrom::Start(0)).is_err());
+      assert!(guarded.flush().is_err());
+      assert!(latch.message().is_none());
+      assert_eq!(guarded.into_inner().calls, 1, "only the probe reached it");
+    }
+  }
+
+  /// **An interrupted seek is not kept**: it did nothing, and the next one
+  /// reaches the sink — as ffmpeg-next asks it again.
+  #[test]
+  fn an_interrupted_seek_is_not_kept() {
+    struct Interrupting {
+      once: bool,
+      calls: u32,
+    }
+    impl Seek for Interrupting {
+      fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+        self.calls += 1;
+        if std::mem::replace(&mut self.once, false) {
+          return Err(io::ErrorKind::Interrupted.into());
+        }
+        Ok(0)
+      }
+    }
+    let (mut guarded, _, seeks) = GuardedWriter::new(Interrupting {
+      once: true,
+      calls: 0,
+    });
+    assert!(guarded.seek(SeekFrom::Start(0)).is_err(), "interrupted");
+    assert!(seeks.failure().is_none(), "not kept");
+    assert_eq!(guarded.seek(SeekFrom::Start(0)).expect("asked again"), 0);
+    assert_eq!(guarded.into_inner().calls, 2);
   }
 
   /// **A seek that panics is the latch's, not the record's**: the panic
