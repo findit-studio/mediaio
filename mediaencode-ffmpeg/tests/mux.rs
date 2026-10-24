@@ -3971,3 +3971,149 @@ fn l44_what_a_container_adds_or_drops_of_the_table_is_reported() {
     vec![1, 2]
   );
 }
+
+/// The report at open of `table` under `container`, and the muxer.
+fn opened(
+  target: &Path,
+  container: ContainerName,
+  table: Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>>,
+) -> (FfmpegOwnedMuxer<File>, Vec<Uncarried>) {
+  let (muxer, report) = FfmpegOwnedMuxer::open(
+    File::create(target).expect("create"),
+    container,
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  (muxer, report.uncarried().to_vec())
+}
+
+/// **L45 — MP4 spelled in any case is MP4**: libavformat matches a muxer's
+/// name case-insensitively (`av_match_name`), so `MP4` and `Mp4` open the
+/// muxer named `mp4`, and the muxer is judged by that name — MP4's 32-bit
+/// fields refused as under `mp4`, its report the same.
+#[test]
+fn l45_mp4_spelled_in_any_case_meets_mp4s_rules() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, packets) = first_track(&source, TrackKind::Video, 2);
+  let track = TrackIndex::new(0);
+  let past = ms(PAST_I32_SECONDS * 1000);
+  let (_, canonical) = opened(
+    &output(&corpus, "l45-canonical.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Video),
+  );
+  for spelling in ["MP4", "Mp4"] {
+    let (mut muxer, report) = opened(
+      &output(&corpus, &format!("l45-{spelling}.mp4")),
+      ContainerName::new(spelling),
+      table_of(&source, TrackKind::Video),
+    );
+    assert_eq!(report, canonical, "{spelling}: the report at open");
+    muxer
+      .write_video(video_at(&video_of(&packets[0]), Some(0), 0))
+      .expect("the first packet");
+    let gap = video_at(&video_of(&packets[1]), Some(past.pts()), past.pts());
+    let (refusal, back) = by_container(muxer.write_video(gap.clone()));
+    assert_eq!(
+      refusal,
+      FfmpegMuxRefusal::DtsGap { track, dts: past },
+      "{spelling}"
+    );
+    untouched!(gap, back);
+    let long = video_at(
+      &video_of(&packets[1]).with_duration(Some(past)),
+      Some(40),
+      40,
+    );
+    let (refusal, _) = by_container(muxer.write_video(long));
+    assert_eq!(
+      refusal,
+      FfmpegMuxRefusal::DurationTooLong {
+        track,
+        duration: past
+      },
+      "{spelling}"
+    );
+    muxer.finish().expect("finished");
+  }
+}
+
+/// **L46 — Matroska spelled in capitals is Matroska**: `MATROSKA` opens the
+/// muxer named `matroska`, and its presentation rule holds — an AAC packet
+/// inside the codec delay before zero admitted, one before it refused — and
+/// its report is the one under `matroska`.
+#[test]
+fn l46_matroska_spelled_in_capitals_meets_matroskas_rules() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, audio) = first_track(&source, TrackKind::Audio, 1);
+  let track = TrackIndex::new(0);
+  let (_, canonical) = opened(
+    &output(&corpus, "l46-canonical.mkv"),
+    ContainerName::MATROSKA,
+    table_of(&source, TrackKind::Audio),
+  );
+  let (mut muxer, report) = opened(
+    &output(&corpus, "l46.mkv"),
+    ContainerName::new("MATROSKA"),
+    table_of(&source, TrackKind::Audio),
+  );
+  assert_eq!(report, canonical, "the report at open");
+  let below = audio_at(&audio_of(&audio[0]), -22);
+  let (refusal, back) = by_container(muxer.write_audio(below.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::BeforeZero {
+      track,
+      timestamp: ms(-22)
+    }
+  );
+  untouched!(below, back);
+  muxer
+    .write_audio(audio_at(&audio_of(&audio[0]), -21))
+    .map_err(|error| error.map_packet(drop))
+    .expect("within the codec delay, as Matroska writes it");
+  muxer.finish().expect("finished");
+}
+
+/// **L47 — WebM spelled in capitals is WebM**: `WEBM` opens the muxer named
+/// `webm`; its report names VP9's superframe filter as under `webm`, and the
+/// filter's rule holds — a seventh hidden frame in a row refused.
+#[test]
+fn l47_webm_spelled_in_capitals_meets_webms_rules() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = vp9_webm(&corpus);
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  let hidden = [0x80, 3, 3];
+  let track = TrackIndex::new(0);
+  let (_, canonical) = opened(
+    &output(&corpus, "l47-canonical.webm"),
+    ContainerName::WEBM,
+    table_of(&source, TrackKind::Video),
+  );
+  let (mut muxer, report) = opened(
+    &output(&corpus, "l47.webm"),
+    ContainerName::new("WEBM"),
+    table_of(&source, TrackKind::Video),
+  );
+  assert_eq!(report, canonical, "the report at open");
+  assert!(report.contains(&Uncarried::Filtered {
+    track,
+    filter: AutomaticFilter::Vp9Superframe
+  }));
+  for index in 0..6 {
+    let at = 40 * index;
+    muxer
+      .write_video(video_at(&video_holding(&frame, &hidden), Some(at), at))
+      .map_err(|error| error.map_packet(drop))
+      .expect("up to six hidden frames held");
+  }
+  let seventh = video_at(&video_holding(&frame, &hidden), Some(240), 240);
+  let (refusal, back) = by_container(muxer.write_video(seventh.clone()));
+  assert_eq!(refusal, payload(PayloadRule::Superframe));
+  untouched!(seventh, back);
+}

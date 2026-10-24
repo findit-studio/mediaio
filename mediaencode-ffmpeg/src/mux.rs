@@ -38,7 +38,10 @@
 //! ([`Uncarried::Filename`], [`Uncarried::MimeType`]).
 //!
 //! The report covers what this release knows of each container — the
-//! constants on [`ContainerName`]: Matroska, WebM and MP4. Any other
+//! constants on [`ContainerName`]: Matroska, WebM and MP4. A container is
+//! known by the muxer libavformat resolves its name to, never by the
+//! name's spelling: libavformat matches a name case-insensitively, so
+//! `MP4` opens MP4's muxer and meets every rule MP4's does. Any other
 //! muxer opens the same way and libavformat decides what it writes; an
 //! attachment is not handed to it (and is reported), and nothing else is
 //! claimed about what it keeps.
@@ -399,8 +402,10 @@ use smol_bytes::Utf8Bytes;
 /// A libavformat muxer's short name — the container a muxer writes.
 ///
 /// An open set, as libavformat's own is: any name `ffmpeg -f` takes
-/// opens. The constants are the containers whose losses this release
-/// reports (see [the module](self)).
+/// opens, in any case — libavformat matches names case-insensitively. The
+/// constants are the containers whose losses this release reports (see
+/// [the module](self)), and any spelling of one is judged as that
+/// container: the muxer is known by the name libavformat resolves it to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerName(Utf8Bytes);
 
@@ -423,16 +428,6 @@ impl ContainerName {
   pub fn as_str(&self) -> &str {
     self.0.as_str()
   }
-
-  /// What this release knows of the container.
-  fn family(&self) -> Family {
-    match self.as_str() {
-      "matroska" => Family::Matroska,
-      "webm" => Family::WebM,
-      "mp4" => Family::Mp4,
-      _ => Family::Other,
-    }
-  }
 }
 
 impl fmt::Display for ContainerName {
@@ -449,6 +444,28 @@ enum Family {
   WebM,
   Mp4,
   Other,
+}
+
+impl Family {
+  /// What this release knows of the muxer libavformat resolved a name to,
+  /// by that muxer's own name ([`Output::container`], its
+  /// `AVOutputFormat.name`) — never by the caller's spelling.
+  /// `av_guess_format` matches a short name case-insensitively
+  /// (`av_match_name`, `libavutil/avstring.c` 346–367; `format.c` 79–115 in
+  /// FFmpeg 9.0.1), so `MP4` opens the muxer named `mp4` and meets its every
+  /// rule. Two muxers are named `matroska`, the video one and the audio one
+  /// (`matroskaenc.c` 3715–3741, 3777–3800); both are Matroska's writer, and
+  /// the name reaches the second only in a build without the first
+  /// (`allformats.c` 274–275: `av_guess_format` keeps the first of equal
+  /// matches).
+  fn of(muxer: &str) -> Self {
+    match muxer {
+      "matroska" => Self::Matroska,
+      "webm" => Self::WebM,
+      "mp4" => Self::Mp4,
+      _ => Self::Other,
+    }
+  }
 }
 
 /// The most bytes libavcodec allocates a packet of: `packet_alloc` refuses
@@ -2855,7 +2872,9 @@ where
       },
       error => MuxOpenError::Fault(MuxFault::new(MuxStage::Open, error)),
     })?;
-    let family = container.family();
+    // The muxer libavformat resolved the name to, by its own name: the
+    // caller's spelling is matched case-insensitively.
+    let family = Family::of(output.container());
     let mut report = MuxReport::default();
     // The automatic filters as the caller chose: on unless turned off, as
     // libavformat and `ffmpeg -c copy` have them. In a container whose
