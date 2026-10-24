@@ -45,6 +45,103 @@
 //! libavformat answered ([`OutputError::SinkSeek`]) — so a container
 //! whose patches went missing never ends in `Ok`. A panic is named first,
 //! then a failed seek, then libavformat's own error.
+//!
+//! # Ownership and lifetime
+//!
+//! Every allocation an [`Output`] makes or hands libavformat, who owns it,
+//! and what frees it:
+//!
+//! | what | allocated by | owned by | freed by |
+//! |---|---|---|---|
+//! | the `AVFormatContext` (`ctx`) | `avformat_alloc_output_context2`, in [`Output::open`] | the `Output`, alone (`NonNull`) | `avformat_free_context`, exactly once: in `Drop`, or in [`Output::into_sink`], which holds `self` in `ManuallyDrop` so `Drop` never runs after it. Always before the I/O context: a muxer's `deinit` may still reach `pb` |
+//! | each stream, its `codecpar`, its metadata | `avformat_new_stream`; `avcodec_parameters_copy` (extradata, side data, channel map); `av_dict_set` (a copy of each key and value) | the context | `avformat_free_context` |
+//! | a stream's replaced extradata | `av_mallocz`, padded, in `replace_extradata`; the copied extradata it replaces is freed by `av_freep` first | the stream's `codecpar` | `avformat_free_context` |
+//! | a chapter and its title | `av_mallocz` (zeroed, as `avpriv_new_chapter` makes one) and `av_dict_set`, in [`Output::add_chapter`] | this crate until `av_dynarray_add_nofree` takes it; then the context | before that, `free_chapter` (`av_dict_free`, `av_free`) on each failure; after, `avformat_free_context`, which frees each chapter and the array |
+//! | the `AVIOContext` and its buffer | `StreamIo::from_write_seek` (ffmpeg-next): `av_mallocz` (32 KiB), `avio_alloc_context` | the `StreamIo`, held in `ManuallyDrop` by the `Output`; `ctx.pb` borrows it, and `AVFMT_FLAG_CUSTOM_IO` keeps libavformat from closing or freeing it | `StreamIo`'s `Drop` (`avio_flush`, the sink's flush through the guard, `av_freep` of the buffer, `avio_context_free`), dropped after the context; or `StreamIo::into_inner` in [`Output::into_sink`] |
+//! | the opaque: the boxed [`GuardedWriter`] over the caller's sink | `Box::into_raw`, inside `StreamIo` | the `StreamIo` | `Box::from_raw` in `StreamIo`'s `Drop`, dropping the sink; or in `into_inner`, which hands the sink back |
+//! | the panic latch and the seek record | `GuardedWriter::new` | shared by the guard and the `Output` (`Arc`: two owners) | the last of the two |
+//! | a packet | the boundary's builders on the copy road ([`BodyRoute::Copy`]): `av_new_packet` and the payload copied, `av_packet_new_side_data` for each entry | this crate, until `av_interleaved_write_frame` takes its reference into the interleaving queue, which leaves the packet blank, even on error | the blank `Packet` drops; libavformat frees the queued reference when it writes it, at the trailer, or in `avformat_free_context` |
+//!
+//! **Every road out:**
+//!
+//! | road | what runs, in order | why nothing is freed twice or read after it is freed |
+//! |---|---|---|
+//! | a refusal in `open` | before `avformat_alloc_output_context2`, nothing is allocated; after a failed one, the `StreamIo` drops (it flushes nothing, then the sink's flush through the guard, then frees) and the sink with it | `ctx` is null on failure and owns nothing of this crate's |
+//! | the file finished: `write_trailer`, then `into_sink` | the context freed; `avio_flush`; `AVIOContext.error` read; `into_inner` frees the buffer and the I/O context and hands back the guard; the sink's flush; then the latch, the seek record, the write error and the flush error are named, in that order, or the sink is handed back | each field is moved out of the `ManuallyDrop<Self>` once (`ptr::read`) and never used through it again; `pb` is read after the context that pointed at it is gone, and before `into_inner` frees it |
+//! | an error from any call | the call answers it, and the context stays as the phase says; a call out of order is refused before libavformat is reached (a second trailer would run a muxer's trailer over state its first freed) | the phase |
+//! | a panic in the sink, in any callback | caught by the guard under `catch_unwind`, latched, answered to C as an I/O error; every later call into the sink answers an error without reaching it; the context names the panic first | the panic never reaches the `extern "C"` frame; nothing is freed while a callback runs |
+//! | an error whose payload panics when dropped | reduced inside the guard's `catch_unwind` to its OS code or kind, the payload dropped there and its panic latched | what reaches C owns nothing |
+//! | a failed seek | kept by the guard; every later write and seek refused; named by every call that reached libavformat, whatever libavformat answered | — |
+//! | the `Output` dropped, at any point — mid-file, after an error, while the caller unwinds | `avformat_free_context` (the muxer's `deinit`, the queued packets freed), then the `StreamIo` drops: buffered bytes flushed through the guard, which writes nothing after a panic or a failed seek, then the sink's flush, then the frees | the context is freed before the I/O context its `pb` points at, and each exactly once |
+//!
+//! # Every `unsafe` read and write
+//!
+//! No `unsafe fn` is public here; each block's contract is established
+//! inside the block's function, and its `SAFETY` comment says how. By
+//! site:
+//!
+//! | site | what is read or written | the contract |
+//! |---|---|---|
+//! | `open` | `av_guess_format`; the static muxer's `flags`; `avformat_alloc_output_context2`; `ctx.pb` and `ctx.flags` written | a NUL-terminated name live for the call; a non-null static muxer; a valid out-pointer, null on failure; the I/O context outlives the context, and is the caller's (`AVFMT_FLAG_CUSTOM_IO`) |
+//! | `container`, `strict_decode_times`, `shifts_early_times` | the static muxer's `name` (bounded, `table_text`) and `flags` | `oformat` is never null on a context `open` returned |
+//! | `query_codec` | `avformat_query_codec` through a shim taking the codec id as `c_int` | no bindgen enum formed from an integer; libavformat searches its tag tables, never indexes them |
+//! | `streams`, `stream`, `stream_time_base` | `nb_streams`; `streams[index]`; a stream's `time_base` | `index < nb_streams`, checked first |
+//! | `stream_codec` | a stream's `codecpar` fields, the codec id and media type as integers, the extradata as `extradata_size` bytes; `av_get_audio_frame_duration2` | libavutil's allocation, null when empty; the call reads plain fields and writes nothing |
+//! | `set_automatic_filters` | `ctx.flags` (`AVFMT_FLAG_AUTO_BSF`) | read by libavformat only when it writes a packet |
+//! | `add_stream` | `avformat_new_stream`; `avcodec_parameters_copy`; the media type written as an integer; `replace_extradata`; `settle_codec_tag`; `stream_copy_audio_rule`; the stream's `time_base`, `disposition`, `sample_aspect_ratio`, `avg_frame_rate`; `av_dict_set` | the stream just added, its `codecpar` its own; the ticket's parameters live and null-checked; extradata whose size with its padding fits an `int`, judged first; no `DONT_STRDUP`, so the texts are copied |
+//! | `replace_extradata` | `av_freep` of the old extradata; `av_mallocz`; the copy | the old one null or libavutil's; a fresh allocation of `bytes.len()` plus the padding, which cannot overlap `bytes` |
+//! | `settle_codec_tag` | the parameters' tag and codec id; the muxer's `codec_tag` list; `av_codec_get_id`, `av_codec_get_tag2` through shims taking integers; the tag cleared | the list null or libavformat's static, null-terminated tables |
+//! | `stream_copy_audio_rule` | the media type, the codec id and `block_align` | plain fields, the enums read as integers |
+//! | `add_chapter` | `nb_chapters`; `av_mallocz`; the chapter's fields; `av_dict_set`; `av_dynarray_add_nofree`; `nb_chapters` written | the count as the `int` the call takes, `c_int::MAX` refused; the chapter ours alone until the array takes it |
+//! | `free_chapter` | `av_dict_free`, `av_free` | a chapter this module allocated and no array took |
+//! | `write_header`, `write_trailer` | `avformat_write_header`, `av_write_trailer` | the phase allows exactly one of each, in order |
+//! | `write_packet` | the boundary's builders, on the copy road; the packet's `stream_index`; `av_interleaved_write_frame` | every builder copies, so nothing a caller holds is lent; a stream of this context; the reference taken over, the packet left blank |
+//! | `into_sink` | the fields moved out of `ManuallyDrop`; `avformat_free_context`; `avio_flush`; `AVIOContext.error` | each field moved once; the context freed before the I/O context; `pb` live until `into_inner` |
+//! | `Drop` | `avformat_free_context`; `ManuallyDrop::drop` of the I/O context | each exactly once, the context first |
+//! | `unsafe impl Send` | — | the context and the I/O context are heap allocations reached only through `&mut self`; the sink is `W: Send` |
+//!
+//! And the other reads of FFmpeg the muxer reaches, outside this module:
+//!
+//! | site | what is read | the contract |
+//! |---|---|---|
+//! | `CodecId::mime_type` (`codec_id.rs`) | the codec descriptor's `mime_types`, its first entry, the text | the descriptor a static table entry of libavcodec's or null; a non-null list holds at least its terminating null; the text bounded (`table_text`) |
+//! | `CodecId::intra_only` | the descriptor's media type and `props` | as above, the media type read as an integer |
+//! | `CodecId::bits_per_sample` | `av_get_bits_per_sample` through a shim taking `c_int` | no bindgen enum formed; libavcodec answers 0 for a codec it does not know |
+//! | `packet_side_data_name` (`extras.rs`) | `av_packet_side_data_name` through a shim taking `c_int` | as above; null for a type it does not name, the text bounded |
+//! | the boundary's builders, `build_data_packet` and `build_attachment_packet` among them (`boundary.rs`) | the carrier's payload, copied (`packet_body` on the copy road), its side data attached | each builder's contract, forwarded: on the copy road nothing is lent, so there is nothing to prove |
+//!
+//! # Every FFmpeg call, its failures, and whose they are
+//!
+//! An [`OutputError`] says whose a failure is: the caller's sink
+//! (`SinkPanic`, `SinkSeek`, `SinkWrite`, `Sink`), libavformat's own
+//! answer (`Ffmpeg`), or a refusal this crate makes of the caller's input
+//! before libavformat is reached (`UnknownContainer`, `NoByteStream`,
+//! `Nul`, `ExtradataTooLarge`, `TooManyChapters`, `NoSuchStream`,
+//! `OutOfOrder`, `TimeBase`, `Build`, `Parameters`). A call that reached
+//! the sink names the sink's fault before libavformat's answer: a panic
+//! first, then a failed seek, whatever libavformat answered.
+//!
+//! | call | reached from | its failures | named as |
+//! |---|---|---|---|
+//! | `av_guess_format` | `open` | null | `UnknownContainer` |
+//! | `StreamIo::from_write_seek`: `av_mallocz`, `avio_alloc_context` | `open` | `ENOMEM` | `Ffmpeg` |
+//! | `avformat_alloc_output_context2` | `open` | a negative code, or a null context | `Ffmpeg` (at least `-1` when it answers success with no context) |
+//! | `avformat_query_codec` | `query_codec` | a negative code: libavformat cannot tell | `CodecQuery::Unknown` |
+//! | `avformat_new_stream` | `add_stream` | null | `Ffmpeg(ENOMEM)`; nothing added |
+//! | `avcodec_parameters_copy` | `add_stream` | a negative code (an allocation) | `Ffmpeg`; the context `Failed`, a stream half made |
+//! | `av_mallocz`, after `av_freep` of the old extradata | `replace_extradata` | null | `Ffmpeg(ENOMEM)`; `Failed` |
+//! | `av_codec_get_id`, `av_codec_get_tag2` | `settle_codec_tag` | none: an answer | — |
+//! | `av_dict_set` | `add_stream`, `add_chapter` | a negative code (an allocation) | `Ffmpeg`; in `add_stream` the context `Failed`; in `add_chapter` the chapter not yet taken is freed, and the context still being built |
+//! | `av_mallocz`, `av_dynarray_add_nofree` | `add_chapter` | null; a negative code | `Ffmpeg(ENOMEM)`; `Ffmpeg`, the chapter freed |
+//! | `av_get_audio_frame_duration2` | `stream_codec` | none: zero for a codec it does not know | — |
+//! | the ticket's rebuild (`avcodec_parameters_alloc` and its copies) | `add_stream` | its allocations, its limits | `Parameters`, before any stream is added |
+//! | the copy road: `av_new_packet`, `av_packet_new_side_data` | `write_packet` | an allocation; a limit; side data libavcodec cannot name | `Build`, before libavformat is reached |
+//! | `avformat_write_header` | `write_header` | a negative code; the sink's panic or failed seek | the sink's fault, else `Ffmpeg`; the context `Failed` |
+//! | `av_interleaved_write_frame` | `write_packet` | a negative code; the sink's | the sink's fault, else `Ffmpeg` |
+//! | `av_write_trailer` | `write_trailer` | a negative code; the sink's | the sink's fault, else `Ffmpeg`; the context `Finished` either way |
+//! | `avio_flush` and `AVIOContext.error` | `into_sink` | the first failed write, which the I/O context keeps | `SinkWrite`, after a panic and a failed seek |
+//! | the sink's `flush`, through the guard | `into_sink` | its `io::Error` | `Sink`, last |
+//! | `avformat_free_context`, `StreamIo`'s `Drop` and `into_inner` (`av_freep`, `avio_context_free`) | `into_sink`, `Drop` | none | — |
 
 use core::{
   ffi::{c_int, c_uint, c_void},

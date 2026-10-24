@@ -8,6 +8,16 @@
 //! one file. Packets are copied into libavformat, never lent
 //! ([`mediaio_ffmpeg::output`]).
 //!
+//! **This module holds no `unsafe`.** It reaches FFmpeg through the base
+//! alone: the muxing context ([`mediaio_ffmpeg::output::Output`], whose
+//! documentation carries the census — what it owns and frees on every
+//! road, every `unsafe` read and write, every FFmpeg call and whose its
+//! failures are), the codec ids' descriptor reads (`CodecId::intra_only`,
+//! `CodecId::bits_per_sample`), and the side-data names
+//! ([`packet_side_data_name`](mediaio_ffmpeg::extras::packet_side_data_name)).
+//! What it refuses before any of them is reached is its own, by name
+//! ([`FfmpegMuxRefusal`], [`MuxOpenError`]).
+//!
 //! # Opening: refusals by name, losses in a report
 //!
 //! [`CarrierMuxer::open`] judges the whole table before it writes a byte.
