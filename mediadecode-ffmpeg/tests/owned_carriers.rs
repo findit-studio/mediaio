@@ -2753,7 +2753,7 @@ fn a_cropped_stream_is_judged_on_what_it_allocates_not_what_it_displays() {
   // owns, and the probe turns it back into a name.
   let refusal = decode_under(CEILING)
     .expect_err("the cropped stream was judged on its display extent, not its allocation");
-  let mediadecode_ffmpeg::Error::AllBackendsFailed(failed) = &refusal else {
+  let mediadecode_ffmpeg::Error::ProbeExhausted(failed) = &refusal else {
     panic!("expected a backend failure, got {refusal:?}");
   };
   let named = failed
@@ -2877,7 +2877,7 @@ fn every_hardware_exit_names_the_coded_surface_refusal() {
   fn named(e: &Error) -> Option<mediadecode_ffmpeg::HwSurfaceTooLarge> {
     match e {
       Error::HwSurfaceTooLarge(p) => Some(*p),
-      Error::AllBackendsFailed(f) => f.attempts().iter().find_map(|(_, inner)| named(inner)),
+      Error::ProbeExhausted(f) => f.attempts().iter().find_map(|(_, inner)| named(inner)),
       _ => None,
     }
   }
@@ -3060,7 +3060,7 @@ fn a_byte_refused_frame_is_named_on_every_software_road() {
   fn named(e: &Error) -> Option<FrameBudgetExceeded> {
     match e {
       Error::FrameBudgetExceeded(p) => Some(*p),
-      Error::AllBackendsFailed(f) => f.attempts().iter().find_map(|(_, inner)| named(inner)),
+      Error::ProbeExhausted(f) => f.attempts().iter().find_map(|(_, inner)| named(inner)),
       _ => None,
     }
   }
@@ -3167,7 +3167,7 @@ fn the_software_video_road_names_its_budget_refusals() {
   fn named(e: &Error) -> Option<FrameBudgetExceeded> {
     match e {
       Error::FrameBudgetExceeded(p) => Some(*p),
-      Error::AllBackendsFailed(f) => f.attempts().iter().find_map(|(_, inner)| named(inner)),
+      Error::ProbeExhausted(f) => f.attempts().iter().find_map(|(_, inner)| named(inner)),
       _ => None,
     }
   }

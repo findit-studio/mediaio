@@ -234,32 +234,34 @@ fn second() -> Timebase {
   tb(1, 1)
 }
 
-/// Codex round 3's first case: a timeline at one frame a second, a gap of
-/// 2^53 - 1 seconds, then a clip one second long whose medium counts thirds
-/// of a second, from `third` thirds.
+/// Codex round 3's first case, a second earlier: a timeline at one frame a
+/// second, a gap of 2^53 - 2 seconds, then a clip two seconds long whose
+/// medium counts thirds of a second, from `third` thirds. Codex's gap,
+/// 2^53 - 1 seconds, is one OpenTimelineIO 0.17 reads as 2^53 - 2
+/// (`a_count_opentimelineio_0_17_reads_as_another_is_refused_by_name`).
 fn after_a_long_gap(third: i64) -> Timeline {
   Timeline::new("t", Rate::hz(1)).with_track(video([placed(
     "a",
-    TimeRange::new(third, third + 3, tb(1, 3)),
-    TimeRange::new(TWO_53 - 1, TWO_53, second()),
+    TimeRange::new(third, third + 6, tb(1, 3)),
+    TimeRange::new(TWO_53 - 2, TWO_53, second()),
   )]))
 }
 
 #[test]
 fn a_clip_whose_ruler_is_finer_than_the_track_before_it_is_placed_where_opentimelineio_places_it() {
   // OpenTimelineIO starts the clip's place at zero in the clip's own rate,
-  // three a second, and adds the gap there: 3 · (2^53 - 1), which an f64
-  // holds as one less — the clip a third of a second early. Every count
+  // three a second, and adds the gap there: 3 · (2^53 - 2), which an f64
+  // holds as two less — the clip two thirds of a second early. Every count
   // written is within 2^53. From a third past a second no whole ruler
   // coarser than thirds holds the clip: refused, at the clip, the track's
   // second child, with the count OpenTimelineIO would round.
-  let thirds = 3 * (i128::from(TWO_53) - 1);
+  let thirds = 3 * (i128::from(TWO_53) - 2);
   assert_eq!(
     refused(&after_a_long_gap(4)),
     (Spot::TrackPosition(ChildAt::new(0, 1)), thirds, Rate::hz(3))
   );
   let gap = Read {
-    value: (TWO_53 - 1) as f64,
+    value: (TWO_53 - 2) as f64,
     rate: 1.0,
   };
   let reads = Read {
@@ -267,13 +269,13 @@ fn a_clip_whose_ruler_is_finer_than_the_track_before_it_is_placed_where_opentime
     rate: 3.0,
   }
   .plus(gap);
-  assert_eq!(reads.value as i128, thirds - 1);
+  assert_eq!(reads.value as i128, thirds - 2);
 }
 
 #[test]
 fn a_clip_a_coarser_whole_ruler_holds_is_written_in_it_and_placed_exactly() {
   // From a whole second, whole seconds hold the clip: it is written in them,
-  // the track is one ruler, and OpenTimelineIO places the clip at 2^53 - 1
+  // the track is one ruler, and OpenTimelineIO places the clip at 2^53 - 2
   // and ends it at 2^53, exactly.
   let timeline = after_a_long_gap(3);
   let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
@@ -290,7 +292,7 @@ fn a_clip_a_coarser_whole_ruler_holds_is_written_in_it_and_placed_exactly() {
         rate: 1.0
       },
       Read {
-        value: 1.0,
+        value: 2.0,
         rate: 1.0
       }
     )
@@ -299,7 +301,7 @@ fn a_clip_a_coarser_whole_ruler_holds_is_written_in_it_and_placed_exactly() {
     value: value as f64,
     rate: 1.0,
   };
-  assert_eq!(place(&kids, 1), (seconds(TWO_53 - 1), seconds(TWO_53)));
+  assert_eq!(place(&kids, 1), (seconds(TWO_53 - 2), seconds(TWO_53)));
   assert_eq!(track_duration(&kids), seconds(TWO_53));
 }
 
@@ -357,6 +359,10 @@ fn a_mixed_rate_track_whose_derived_places_are_whole_is_written_and_read_back_ex
 }
 
 #[test]
+#[cfg_attr(
+  miri,
+  ignore = "too heavy for Miri on a 32-bit target; the laws Miri runs reach its every branch"
+)]
 fn the_goldens_read_back_put_every_clip_on_its_record() {
   // The law timeline, mixed 23.976 fps frames and 48 kHz samples: read back
   // as OpenTimelineIO reads it, `b` starts at frame 96 and `a-sound` at
@@ -535,7 +541,8 @@ fn handles(outgoing: i64, incoming: i64, into: u64, out: u64) -> Timeline {
 #[test]
 fn a_visible_range_a_transitions_handle_widens_past_2_53_is_refused() {
   // The outgoing source [2^53 - 1, 2^53) plays on a second past its end:
-  // OpenTimelineIO's visible range of `a` ends at 2^53 + 1, read as 2^53.
+  // OpenTimelineIO's visible range of `a` ends at 2^53 + 1, read as 2^53 —
+  // refused.
   let past = i128::from(TWO_53) + 1;
   assert_eq!(
     refused(&handles(TWO_53 - 1, 0, 0, 1)),
@@ -551,7 +558,8 @@ fn a_visible_range_a_transitions_handle_widens_past_2_53_is_refused() {
 #[test]
 fn a_visible_range_inside_the_bound_is_written_and_read_back_exactly() {
   // One second earlier the handle ends `a`'s visible range at 2^53 itself,
-  // and the incoming one starts at -2^53: both read back exactly.
+  // and the incoming one starts at 1 - 2^53, its source from 2 - 2^53: both
+  // read back exactly.
   let text = to_otio(&handles(TWO_53 - 2, 0, 0, 1), OtioTarget::V0_15Plus).unwrap();
   let seconds = |value: i64| Read {
     value: value as f64,
@@ -561,23 +569,28 @@ fn a_visible_range_inside_the_bound_is_written_and_read_back_exactly() {
     visible(&kids(&text, 0), 0),
     (seconds(TWO_53 - 2), seconds(TWO_53))
   );
-  let text = to_otio(&handles(0, 1 - TWO_53, 1, 0), OtioTarget::V0_15Plus).unwrap();
+  let text = to_otio(&handles(0, 2 - TWO_53, 1, 0), OtioTarget::V0_15Plus).unwrap();
   assert_eq!(
     visible(&kids(&text, 0), 2),
-    (seconds(-TWO_53), seconds(2 - TWO_53))
+    (seconds(1 - TWO_53), seconds(3 - TWO_53))
   );
 }
 
 /// Codex round 3's third case: at one frame a second from `start`, one
 /// clip one second long.
 fn one_second_from(start: i64) -> Timeline {
+  seconds_long_from(start, 1)
+}
+
+/// At one frame a second from `start`, one clip `seconds` long.
+fn seconds_long_from(start: i64, seconds: i64) -> Timeline {
   let second = second();
   Timeline::new("t", Rate::hz(1))
     .with_start(Timestamp::new(start, second))
     .with_track(video([placed(
       "a",
-      TimeRange::new(0, 1, second),
-      TimeRange::new(0, 1, second),
+      TimeRange::new(0, seconds, second),
+      TimeRange::new(0, seconds, second),
     )]))
 }
 
@@ -597,7 +610,8 @@ fn a_place_from_the_global_start_past_2_53_is_refused() {
 
 #[test]
 fn a_global_start_whose_end_stays_within_2_53_is_written_and_read_back_exactly() {
-  let text = to_otio(&one_second_from(TWO_53 - 1), OtioTarget::V0_15Plus).unwrap();
+  // From 2^53 - 2 a clip two seconds long ends at 2^53.
+  let text = to_otio(&seconds_long_from(TWO_53 - 2, 2), OtioTarget::V0_15Plus).unwrap();
   let root = json::parse(&text).unwrap();
   let start = read(&member(&root, "global_start_time"));
   let kids = kids(&text, 0);
@@ -1492,15 +1506,23 @@ fn after_a_gap_ends(start: i64) -> i128 {
 #[test]
 fn a_childs_range_from_the_global_start_opentimelineio_ends_more_than_half_a_tick_off_is_written_in_the_edit_rate()
  {
-  // Codex round 7's case. Planned in 1 582ths, `a`'s place from the global
-  // start by `operator+` is exact at both ends. But OpenTimelineIO moves a
-  // child's range with its own duration kept (`composition.cpp` 357–359),
-  // and ends it at that duration plus the moved start rescaled to 1 582ths
-  // (`timeRange.h` 105–108): a product past 2^63, rounded, then divided —
-  // 2 109/2 753 of a tick off. The edit rate, a ruler the timeline counts
-  // in, holds `a`: written in it, nothing is rescaled, and the range reads
-  // back exactly.
-  let start = -9_007_199_254_444_572;
+  // Codex round 7's case. From Codex's own start, -9 007 199 254 444 572,
+  // which OpenTimelineIO 0.17's reader misreads written `<digits>.0`, the
+  // export writes the start as its integer, which that reader reads exactly,
+  // and the timeline reads back. Planned in 1 582ths, `a`'s place from the
+  // global start by `operator+` is exact at both ends. But OpenTimelineIO
+  // moves a child's range with its own duration kept (`composition.cpp`
+  // 357–359), and ends it at that duration plus the moved start rescaled to
+  // 1 582ths (`timeRange.h` 105–108): a product past 2^63, rounded, then
+  // divided — 1 907/2 753 of a tick off. The edit rate, a ruler the timeline
+  // counts in, holds `a`: written in it, nothing is rescaled, and the range
+  // reads back exactly. 66 frames earlier, below, as from Codex's.
+  let codex = -9_007_199_254_444_572;
+  let text = to_otio(&after_a_gap_from(codex), OtioTarget::V0_15Plus).unwrap();
+  assert!(text.contains("\"value\": -9007199254444572\n"), "{text}");
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  assert_eq!(from_otio(&text), Ok(after_a_gap_from(codex)));
+  let start = -9_007_199_254_444_638;
   let text = to_otio(&after_a_gap_from(start), OtioTarget::V0_15Plus).unwrap();
   assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
   let frames = |value: i64| Read {
@@ -1524,8 +1546,8 @@ fn a_childs_range_from_the_global_start_opentimelineio_ends_more_than_half_a_tic
   assert_eq!(Read::end_inclusive(moved, duration), frames(end - 1));
   // In OpenTimelineIO's arithmetic, planned in 1 582ths: the global start
   // added to either end of the place, exact; the range from the moved start
-  // ending at -5 175 949 578 497 585 ticks, where exactly it ends at
-  // -5 175 949 578 497 586 + 644/2 753, and its last tick a tick before, as
+  // ending at -5 175 949 578 497 623 ticks, where exactly it ends at
+  // -5 175 949 578 497 624 + 846/2 753, and its last tick a tick before, as
   // far off.
   let ticks = Read {
     value: 10_692_738.0,
@@ -1540,18 +1562,18 @@ fn a_childs_range_from_the_global_start_opentimelineio_ends_more_than_half_a_tic
   assert_eq!(global.plus(Read::end(place, ticks)), frames(end));
   let moved = global.plus(place);
   let exact = after_a_gap_ends(start);
-  assert_eq!(exact, -14_249_389_189_603_853_614);
+  assert_eq!(exact, -14_249_389_189_603_958_026);
   assert_eq!(
     Read::end(moved, ticks),
     Read {
-      value: -5_175_949_578_497_585.0,
+      value: -5_175_949_578_497_623.0,
       rate: 1582.0
     }
   );
-  assert_eq!(Read::end(moved, ticks).value as i128 * 2753 - exact, 2109);
+  assert_eq!(Read::end(moved, ticks).value as i128 * 2753 - exact, 1907);
   assert_eq!(
     Read::end_inclusive(moved, ticks).value as i128 * 2753 - (exact - 2753),
-    2109
+    1907
   );
 }
 
@@ -1559,9 +1581,9 @@ fn a_childs_range_from_the_global_start_opentimelineio_ends_more_than_half_a_tic
 fn a_childs_range_from_the_global_start_a_frame_later_is_written_in_its_own_ruler() {
   // A frame later the moved start rescales to the same double, and the
   // exact end moves on 1 582/2 753 of a tick: OpenTimelineIO ends the range
-  // 527/2 753 of a tick from it, inside half a tick. `a` keeps its own
+  // 325/2 753 of a tick from it, inside half a tick. `a` keeps its own
   // 1 582ths, and the range reads back to the nearest tick exactly.
-  let start = -9_007_199_254_444_571;
+  let start = -9_007_199_254_444_637;
   let text = to_otio(&after_a_gap_from(start), OtioTarget::V0_15Plus).unwrap();
   assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
   let ticks = |value: i64| Read {
@@ -1582,7 +1604,7 @@ fn a_childs_range_from_the_global_start_a_frame_later_is_written_in_its_own_rule
   let exact = after_a_gap_ends(start);
   within_half_a_tick(Read::end(moved, duration), exact, 2753);
   within_half_a_tick(Read::end_inclusive(moved, duration), exact - 2753, 2753);
-  assert_eq!(Read::end(moved, duration).value as i128 * 2753 - exact, 527);
+  assert_eq!(Read::end(moved, duration).value as i128 * 2753 - exact, 325);
 }
 
 /// One frame every two seconds: the edit rate of Codex round 7's second and

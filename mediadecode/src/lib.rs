@@ -31,7 +31,7 @@ pub mod future;
 // a `mediaspine::` path names. (`demuxer` is this crate's own module: it
 // re-exports the vocabulary's demux types beside the `Demuxer` face.)
 pub use mediaspine::{
-  adapter, cfa, color, frame, packet, pixel_format, resampler, rhythm, subtitle,
+  adapter, cfa, color, frame, nal, packet, pixel_format, resampler, rhythm, subtitle,
 };
 
 pub use mediaspine::{PixelFormat, Received, Sent};

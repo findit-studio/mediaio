@@ -29,6 +29,8 @@ mod diff;
 #[cfg(any(feature = "std", feature = "alloc"))]
 mod layout;
 #[cfg(any(feature = "std", feature = "alloc"))]
+mod marker;
+#[cfg(any(feature = "std", feature = "alloc"))]
 mod metadata;
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
@@ -57,7 +59,10 @@ pub use diff::{Ambiguous, Change, ChangeKind, Delta, Side, diff};
 pub use layout::{Item, Layout, TrackLayout, layout};
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
-pub use metadata::Metadata;
+pub use marker::{Marker, MarkerColor};
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+pub use metadata::{Metadata, ReaderMetadata};
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub use schema::Schema;
@@ -70,8 +75,8 @@ pub use transition::{Transition, TransitionKind};
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub use validate::{
-  ClipAt, ClipPair, ClipRange, Edge, EdgeAt, IdClash, Mismatch, Place, RangeAt, Refusal,
-  TransitionAt, validate,
+  ClipAt, ClipPair, ClipRange, Edge, EdgeAt, IdClash, MarkerAt, MetadataAt, Mismatch, NamespaceAt,
+  Place, RangeAt, Refusal, TransitionAt, validate,
 };
 
 // The time words the model is written in, so a caller needs no `mediatime`

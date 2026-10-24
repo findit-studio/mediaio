@@ -31,7 +31,7 @@ fn auto_open_decodes_at_least_one_frame() {
 
   let mut decoder = match VideoDecoder::open(stream.parameters()) {
     Ok(d) => d,
-    Err(mediadecode_ffmpeg::Error::AllBackendsFailed(p)) => {
+    Err(mediadecode_ffmpeg::Error::ProbeExhausted(p)) => {
       eprintln!(
         "skipping: no hardware backend available ({} attempts)",
         p.attempts().len()

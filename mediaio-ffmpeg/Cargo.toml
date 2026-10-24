@@ -1,6 +1,6 @@
 [package]
 name        = "mediaio-ffmpeg"
-version     = "0.19.0"
+version     = "0.21.0"
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
@@ -40,6 +40,11 @@ mediaspine  = { workspace = true, features = ["alloc"] }
 # pin above.
 mediaframe  = { workspace = true, features = ["alloc"] }
 ffmpeg-next = { workspace = true }
+# For its `links` metadata alone, which the build script reads for the
+# linked FFmpeg's release and refuses one older than 9, the family's floor.
+# No code uses it: the bindings come through `ffmpeg-next`, and this
+# enables no feature of them.
+ffmpeg-sys-next = { workspace = true }
 derive_more = { workspace = true, features = ["is_variant", "try_unwrap", "unwrap"] }
 smol-bytes  = { workspace = true }
 triomphe    = { workspace = true }

@@ -493,28 +493,6 @@ impl ScaledOutput {
     self.request
   }
 
-  /// Latch the standing session as refused, after something *outside*
-  /// this stage proved its output unusable.
-  ///
-  /// The one caller is the decoder's download road: a fitted surface
-  /// can be produced perfectly and still fail to cross to the CPU — an
-  /// unsupported destination pixel format, a metadata copy that runs
-  /// out of memory. That is the stage's problem to own, not the
-  /// backend's, so the decoder retries the original full-size frame and
-  /// tells the stage here to stop offering this key.
-  ///
-  /// **A latch on the key, not a switch on the stage.** The refusal
-  /// travels with the stream-and-size the session was built for, so a
-  /// caller who later requests a *different* size gets a fresh attempt
-  /// rather than a session silently dead for good. With nothing built,
-  /// there is nothing to latch and this does nothing.
-  pub(crate) fn latch_failure(&mut self) {
-    // The frame the caller is about to receive is the full-size one, so
-    // the promise did not hold for it, and the stage stops here until
-    // it is asked again.
-    self.stand_down();
-  }
-
   /// Drop the standing request and everything built for it, returning
   /// the session to full coded size from the next picture.
   ///

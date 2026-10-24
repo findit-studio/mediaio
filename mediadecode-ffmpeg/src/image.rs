@@ -60,6 +60,14 @@
 //! reset between calls rather than reopened: a container with a dozen
 //! cover images (Matroska attachments, timed thumbnails exported by
 //! hand) decodes them through one decoder.
+//!
+//! # No `DecoderOptions`
+//!
+//! The context opens with libavcodec's own `skip_frame`,
+//! `skip_loop_filter` and `skip_idct`, and this decoder takes no
+//! [`DecoderOptions`](crate::DecoderOptions). A still is one packet in
+//! and one picture out, so `skip_frame` could only make it answer
+//! nothing.
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{codec::Parameters, frame};
@@ -129,8 +137,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
   ) -> Result<Self, ImageDecodeError> {
     // Use the checked codec-context builder — `Context::from_parameters`
     // is OOM-UB-prone (see `crate::decoder::build_codec_context`).
+    // libavcodec's own skips: see the module docs' "No `DecoderOptions`".
     let (ctx, callback_state) =
-      build_codec_context(&parameters, limits, None).map_err(ImageDecodeError::Decode)?;
+      build_codec_context(&parameters, limits, crate::DecoderOptions::new(), None)
+        .map_err(ImageDecodeError::Decode)?;
     // **Opened without ever forming a bindgen enum from FFmpeg memory.**
     // `Context::decoder().video()` looks cheap and is not: it resolves
     // the codec by reading `AVCodecParameters.codec_id` as the bindgen
@@ -251,22 +261,28 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
     // Through the software funnel: a frame the allocator judge refused
     // surfaces named, not as the `EINVAL` a corrupt file also produces.
     let state: *const crate::ffi::CallbackState = self._callback_state.as_ptr();
+    // Through the one door ([`crate::decoder::send`]): one packet of the
+    // caller's, and its answer is the payload's, whatever its class.
+    //
     // SAFETY: `state` is the pointer the codec context holds, owned by
     // `self._callback_state` until after the context is freed.
-    self
-      .decoder
-      .send_packet(&av_pkt)
-      .map_err(|e| ImageDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) }))?;
+    let refused = |e| ImageDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) });
+    match crate::decoder::send(&mut self.decoder, crate::decoder::Sending::Packet(&av_pkt)) {
+      crate::decoder::Acceptance::Accepted => {}
+      crate::decoder::Acceptance::NotAccepted(e)
+      | crate::decoder::Acceptance::Ambiguous(e)
+      | crate::decoder::Acceptance::AcceptedWithError(e) => return Err(refused(e)),
+    }
     // Every still codec answers its one packet with its one frame, but
     // it is entitled to want the end of the stream first — so the EOF
     // goes in before the drain rather than after a speculative
     // `receive_frame` that would have to interpret `EAGAIN`.
-    //
-    // SAFETY: as above.
-    self
-      .decoder
-      .send_eof()
-      .map_err(|e| ImageDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) }))?;
+    match crate::decoder::send(&mut self.decoder, crate::decoder::Sending::End) {
+      crate::decoder::Acceptance::Accepted => {}
+      crate::decoder::Acceptance::NotAccepted(e)
+      | crate::decoder::Acceptance::Ambiguous(e)
+      | crate::decoder::Acceptance::AcceptedWithError(e) => return Err(refused(e)),
+    }
     if let Err(e) = self.decoder.receive_frame(&mut self.scratch) {
       self.decoder.flush();
       // Funnelled, then classified — the same two steps every receive

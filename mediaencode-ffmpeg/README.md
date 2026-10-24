@@ -68,6 +68,10 @@ parameters are rebuilt from, an attachment track with its one file.
   panics is caught before C sees the unwind, named in the muxer's fault,
   and never called again.
 
+It builds against **FFmpeg 9** or newer, the family's floor: no older
+release is supported, and `mediaio-ffmpeg`'s build script refuses one by
+name.
+
 ## Encoders by name
 
 An encoder is named by its FFmpeg name and passes two gates. The first

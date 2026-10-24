@@ -23,6 +23,7 @@ pub mod color;
 pub mod demuxer;
 pub mod frame;
 pub mod hdr;
+pub mod nal;
 pub mod packet;
 pub mod pixel_format;
 pub mod resampler;

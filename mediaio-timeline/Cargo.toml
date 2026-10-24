@@ -1,13 +1,13 @@
 [package]
 name        = "mediaio-timeline"
-version     = "0.2.0"
+version     = "0.4.0"
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 homepage.workspace     = true
 documentation = "https://docs.rs/mediaio-timeline"
-description = "The editing timeline as data: tracks, clips at explicit record positions, gain and fades, dissolves; validation that refuses by name, a diff, and OpenTimelineIO export. Pure Rust, no_std + alloc, no FFmpeg."
+description = "The editing timeline as data: tracks, clips at explicit record positions, gain and fades, dissolves, markers; validation that refuses by name, a diff, and OpenTimelineIO export with its exact read-back. Pure Rust, no_std + alloc, no FFmpeg."
 keywords   = ["timeline", "otio", "editing", "media", "no-std"]
 categories = ["multimedia", "multimedia::video", "multimedia::audio", "no-std"]
 

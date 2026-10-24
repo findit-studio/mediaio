@@ -5,8 +5,9 @@ crate are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
-`mediaencode`, `mediaencode-ffmpeg` and `mediaio` — releases in lockstep.
+The FFmpeg-dependent crates — `mediaio-ffmpeg`, `mediadecode-ffmpeg`,
+`mediaencode-ffmpeg` and `mediaio` — release in lockstep; every other
+crate moves only when it changes.
 
 ## [Unreleased]
 
@@ -63,6 +64,64 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
 - `extras::packet_side_data_name`: libavcodec's name for a packet
   side-data type, asked as the integer it is on the wire, or `None`
   where this build names no such type.
+
+## [0.21.0] - 2026-10-24
+
+Released in lockstep with `mediadecode-ffmpeg` 0.21.0.
+
+### Fixed
+
+- **`try_clone_packet` copies a packet with no payload with none**, its
+  properties and side data alone. `av_packet_ref` and
+  `av_packet_make_writable` gave the copy of a side-data-only packet a
+  buffer of padding and data with no size, which `avcodec_send_packet`
+  refuses (`AVERROR(EINVAL)`, `libavcodec/decode.c` 742–743 in FFmpeg
+  9.0.1) where it takes the source: `mediadecode-ffmpeg`'s hardware probe,
+  which records such copies, replayed one into the next backend and failed
+  it.
+
+### Added
+
+- **`options`: how a decoder decodes, beside what it may spend.**
+  `DecoderOptions` carries libavcodec's three `AVDiscard` settings —
+  `skip_frame`, `skip_loop_filter` and `skip_idct` — each a `Discard`,
+  FFmpeg's seven values (`Nothing`, `Default`, `NonReference`,
+  `Bidirectional`, `NonIntra`, `NonKey`, `All`), written and read as
+  FFmpeg's option constants (`none` … `all`, any case on reading;
+  `ParseDiscardError` for any other name). The defaults are libavcodec's.
+  `DecoderLimits` stays what a decoder may spend; these are decode
+  behaviour, and `mediadecode-ffmpeg` writes them into every video
+  `AVCodecContext` a decoder opened with them opens, through each video
+  decoder's open request (`VideoStreamDecoderOpen`, `VideoDecoderOpen`).
+  Which levels a decoder reads is the decoder's: a level is a request,
+  never a promise that no picture comes.
+
+## [0.20.0] - 2026-10-23
+
+### Changed
+
+- **BREAKING: FFmpeg 9 is the floor, for this crate and every crate of the
+  family built on it** — `mediadecode-ffmpeg`, `mediaencode-ffmpeg`, and
+  `mediaio`'s `ffmpeg` feature. The build script refuses an FFmpeg older
+  than 9 by name, before any of the family's code is compiled against it:
+  it reads the linked release from `ffmpeg-sys-next`'s `links` metadata
+  (`DEP_FFMPEG_FFMPEG_9_0`, which `ffmpeg-sys-next` sets from libavcodec
+  63.1, FFmpeg 9.0's), names the release it found instead, and says where
+  to point the build. This crate now depends on `ffmpeg-sys-next` directly
+  for that metadata alone, enabling no feature of it.
+
+### Added
+
+- **`DemuxerName`: a demuxer the linked FFmpeg registers, by its whole
+  name** — an `AVInputFormat.name` exactly as libavformat spells it, the
+  comma list where FFmpeg registers one demuxer for a family
+  (`mov,mp4,m4a,3gp,3g2,mj2`), never a word of it. It is made only from
+  a name the linked libavformat registers (`DemuxerName::registered`, and
+  `FromStr`), found with `av_demuxer_iterate`, and borrows libavformat's
+  own static text. Any other name is refused by name with
+  `UnregisteredDemuxer`, which gives the whole name to use where the
+  refused one is a word of it. `ContainerFormat::is` tells whether a
+  session's format is that demuxer.
 
 ## [0.19.0] - 2026-10-16
 

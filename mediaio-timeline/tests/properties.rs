@@ -5,9 +5,10 @@
 mod common;
 
 use mediaio_timeline::{
-  ChangeKind, Clip, ClipId, Duration, Fade, FadeShape, Fades, Gain, Item, MediaRef, Rate,
-  TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind, Transition, diff, layout,
-  otio::{OtioTarget, Refused, Spot, to_otio, validate_json},
+  ChangeKind, Clip, ClipId, Duration, Fade, FadeShape, Fades, Gain, Item, Marker, MarkerColor,
+  MediaRef, Metadata, Rate, ReaderMetadata, TimeRange, Timebase, Timeline, Timestamp, Track,
+  TrackKind, Transition, diff, layout,
+  otio::{OtioTarget, Refused, Spot, from_otio, to_otio, validate_json},
   validate,
 };
 use mediatime::Rounding;
@@ -78,13 +79,43 @@ struct Planned {
 }
 
 /// A valid timeline, built from `seed`.
+///
+/// The words markers brought — markers on tracks and clips, notes, disabled
+/// tracks, transitions kept out of their cuts' order — are drawn from a
+/// second stream, `extra`, so the first draws every timeline before them
+/// exactly as it did, and the seeds the laws below name are the same
+/// timelines.
+/// Now and then other readers' metadata: a note where DaVinci Resolve reads
+/// one, a namespace holding no entry, or both.
+fn readers(rng: &mut Seeded, note: &str) -> ReaderMetadata {
+  let mut readers = ReaderMetadata::new();
+  if rng.one_in(3) {
+    readers.insert("Resolve_OTIO", Metadata::new().with("Note", note));
+  }
+  if rng.one_in(8) {
+    readers.insert("zeta", Metadata::new());
+  }
+  readers
+}
+
 fn timeline(seed: u64) -> Timeline {
   let mut rng = Seeded(seed);
+  let mut extra = Seeded(!seed);
+  // Other readers' metadata, from a stream of its own: every other word is
+  // drawn as before it existed; so are the timeline's own markers.
+  let mut other = Seeded(seed.rotate_left(32) ^ 0xA5A5_A5A5_A5A5_A5A5);
+  let mut stacked = Seeded(seed.rotate_left(16) ^ 0x5A5A_5A5A_5A5A_5A5A);
   let rate = rng.pick(&RATES);
   let edit = rate.checked_to_timebase().unwrap();
   let frames = |n: u64| Duration::new(n, edit);
   let mut timeline = Timeline::new(format_utf8bytes!("seed {seed}"), rate)
     .with_start(Timestamp::new(rng.within(0, 200_000) as i64, edit));
+  if extra.one_in(3) {
+    timeline
+      .metadata_mut()
+      .insert("project", format_utf8bytes!("seed {seed}"));
+  }
+  *timeline.readers_mut() = readers(&mut other, "the cut");
   for track_index in 0..rng.within(1, 3) {
     let kind = if rng.one_in(2) {
       TrackKind::Video
@@ -181,18 +212,36 @@ fn timeline(seed: u64) -> Timeline {
       let gain = rng
         .one_in(3)
         .then(|| Gain::from_db(-(rng.within(0, 240) as f32) / 10.0).unwrap());
-      track.clips_mut().push(
-        Clip::new(
-          ClipId::new(format_utf8bytes!("{track_index}.{index}")),
-          format_utf8bytes!("c{placed}"),
-          media,
-          TimeRange::new(source_start, source_end, ruler),
-          TimeRange::new(start as i64, cursor as i64, edit),
-        )
-        .with_gain(gain)
-        .with_fades(fades)
-        .with_enabled(!rng.one_in(8)),
-      );
+      let mut clip = Clip::new(
+        ClipId::new(format_utf8bytes!("{track_index}.{index}")),
+        format_utf8bytes!("c{placed}"),
+        media,
+        TimeRange::new(source_start, source_end, ruler),
+        TimeRange::new(start as i64, cursor as i64, edit),
+      )
+      .with_gain(gain)
+      .with_fades(fades)
+      .with_enabled(!rng.one_in(8));
+      // Markers in the medium's own ticks, anywhere about the source range.
+      for marker in 0..extra.within(0, 2) {
+        let at = source_start + extra.within(0, source_length) as i64;
+        let length = extra.within(0, source_length / 2) as i64;
+        clip.markers_mut().push(
+          Marker::new(
+            format_utf8bytes!("m{marker}"),
+            TimeRange::new(at, at + length, ruler),
+          )
+          .with_color(extra.pick(&MarkerColor::ALL))
+          .with_readers(readers(&mut other, "a clip's marker")),
+        );
+      }
+      if extra.one_in(4) {
+        clip
+          .metadata_mut()
+          .insert("take", format_utf8bytes!("{}", extra.within(1, 9)));
+      }
+      *clip.readers_mut() = readers(&mut other, "a clip");
+      track.clips_mut().push(clip);
       if let Some((into, out)) = planned.entering {
         track.transitions_mut().push(Transition::dissolve(
           Timestamp::new(start as i64, edit),
@@ -201,7 +250,61 @@ fn timeline(seed: u64) -> Timeline {
         ));
       }
     }
+    // A track's own markers, at the edit rate from zero, now and then past
+    // its last record; a disabled track; transitions kept the other way
+    // round, which the export says by each dissolve's place.
+    for marker in 0..extra.within(0, 2) {
+      let at = extra.within(0, cursor + 48) as i64;
+      // Now and then a point: a marker of no length.
+      let length = if extra.one_in(4) {
+        0
+      } else {
+        extra.within(1, 48) as i64
+      };
+      track.markers_mut().push(
+        Marker::new(
+          format_utf8bytes!("t{marker}"),
+          TimeRange::new(at, at + length, edit),
+        )
+        .with_color(extra.pick(&MarkerColor::ALL))
+        .with_comment(if extra.one_in(2) { "a note" } else { "" })
+        .with_readers(readers(&mut other, "a track's marker")),
+      );
+    }
+    if extra.one_in(6) {
+      track.set_enabled(false);
+    }
+    *track.readers_mut() = readers(&mut other, "a track");
+    if track.transitions().len() > 1 && extra.one_in(2) {
+      track.transitions_mut().reverse();
+    }
     timeline.tracks_mut().push(track);
+  }
+  // The timeline's own markers, at the edit rate from zero, anywhere about
+  // its tracks, now and then past their ends; now and then a point.
+  let end = timeline
+    .tracks()
+    .iter()
+    .filter_map(|track| track.clips().last())
+    .map(|clip| clip.record().end_pts())
+    .max()
+    .unwrap_or(0);
+  for marker in 0..stacked.within(0, 2) {
+    let at = stacked.within(0, end as u64 + 48) as i64;
+    let length = if stacked.one_in(4) {
+      0
+    } else {
+      stacked.within(1, 96) as i64
+    };
+    timeline.markers_mut().push(
+      Marker::new(
+        format_utf8bytes!("s{marker}"),
+        TimeRange::new(at, at + length, edit),
+      )
+      .with_color(stacked.pick(&MarkerColor::ALL))
+      .with_comment(if stacked.one_in(2) { "a scene" } else { "" })
+      .with_readers(readers(&mut other, "a timeline's marker")),
+    );
   }
   timeline
 }
@@ -331,6 +434,27 @@ fn exported(seed: u64, timeline: &Timeline, target: OtioTarget) -> Option<Utf8By
       None
     }
     other => panic!("seed {seed}: {other:?}"),
+  }
+}
+
+/// **What the export writes reads back exactly**, for both targets:
+/// `from_otio(to_otio(timeline))` is the timeline itself — every count,
+/// timebase and rate as the model held it, the markers, the notes and the
+/// transitions' order among them.
+#[test]
+fn every_generated_timeline_reads_back_from_its_opentimelineio() {
+  for seed in 0..SEEDS {
+    let timeline = timeline(seed);
+    for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+      let Some(text) = exported(seed, &timeline, target) else {
+        continue;
+      };
+      assert_eq!(
+        from_otio(&text),
+        Ok(timeline.clone()),
+        "seed {seed}, {target:?}"
+      );
+    }
   }
 }
 
@@ -522,18 +646,63 @@ fn the_generator_reaches_every_word() {
     cut_backs: usize,
     rulers: std::collections::BTreeSet<String>,
     rates: std::collections::BTreeSet<String>,
+    track_markers: usize,
+    clip_markers: usize,
+    marker_points: usize,
+    comments: usize,
+    colors: std::collections::BTreeSet<String>,
+    notes: usize,
+    disabled_tracks: usize,
+    reordered: usize,
+    namespaces: usize,
+    empty_namespaces: usize,
+    timeline_markers: usize,
   }
   let mut seen = Seen::default();
+  let namespaces = |seen: &mut Seen, readers: &ReaderMetadata| {
+    for (_, entries) in readers.iter() {
+      seen.namespaces += 1;
+      seen.empty_namespaces += usize::from(entries.is_empty());
+    }
+  };
   for seed in 0..SEEDS {
     let timeline = timeline(seed);
     seen.rates.insert(timeline.rate().to_string());
+    seen.notes += usize::from(!timeline.metadata().is_empty());
+    namespaces(&mut seen, timeline.readers());
+    seen.timeline_markers += timeline.markers().len();
+    for marker in timeline.markers() {
+      namespaces(&mut seen, marker.readers());
+      seen.colors.insert(marker.color().to_string());
+      seen.comments += usize::from(!marker.comment().is_empty());
+      seen.marker_points += usize::from(marker.range().start() == marker.range().end());
+    }
     for (track, laid) in timeline
       .tracks()
       .iter()
       .zip(layout(&timeline).unwrap().tracks())
     {
       seen.tracks[usize::from(track.kind() == TrackKind::Audio)] += 1;
+      namespaces(&mut seen, track.readers());
       seen.transitions += track.transitions().len();
+      seen.disabled_tracks += usize::from(!track.enabled());
+      seen.reordered += usize::from(
+        track
+          .transitions()
+          .windows(2)
+          .any(|pair| pair[1].at() < pair[0].at()),
+      );
+      let markers = track
+        .markers()
+        .iter()
+        .chain(track.clips().iter().flat_map(Clip::markers));
+      for marker in markers {
+        namespaces(&mut seen, marker.readers());
+        seen.colors.insert(marker.color().to_string());
+        seen.comments += usize::from(!marker.comment().is_empty());
+        seen.marker_points += usize::from(marker.range().start() == marker.range().end());
+      }
+      seen.track_markers += track.markers().len();
       seen.gaps += laid
         .items()
         .iter()
@@ -553,6 +722,7 @@ fn the_generator_reaches_every_word() {
         })
         .count();
       for clip in track.clips() {
+        namespaces(&mut seen, clip.readers());
         seen.clips += 1;
         seen.fades_in += usize::from(clip.fades().in_().is_some());
         seen.fades_out += usize::from(clip.fades().out().is_some());
@@ -561,6 +731,8 @@ fn the_generator_reaches_every_word() {
         seen.unknown_available += usize::from(clip.media().available_range().is_none());
         seen.media_rates += usize::from(clip.media().rate().is_some());
         seen.reels += usize::from(clip.media().reel().is_some());
+        seen.clip_markers += clip.markers().len();
+        seen.notes += usize::from(!clip.metadata().is_empty());
         seen
           .rulers
           .insert(clip.source_range().timebase().to_string());
@@ -585,6 +757,17 @@ fn the_generator_reaches_every_word() {
   enough(seen.media_rates, "media rates");
   enough(seen.reels, "reels");
   enough(seen.cut_backs, "cut-backs");
+  enough(seen.track_markers, "track markers");
+  enough(seen.clip_markers, "clip markers");
+  enough(seen.marker_points, "point markers");
+  enough(seen.comments, "marker comments");
+  enough(seen.notes, "notes");
+  enough(seen.disabled_tracks, "disabled tracks");
+  enough(seen.namespaces, "readers' namespaces");
+  enough(seen.empty_namespaces, "empty namespaces");
+  enough(seen.timeline_markers, "timeline markers");
+  assert!(seen.reordered >= 10, "reordered tracks: {seen:?}");
+  assert_eq!(seen.colors.len(), MarkerColor::ALL.len(), "{seen:?}");
   assert_eq!(seen.rulers.len(), media_rulers().len(), "{seen:?}");
   assert_eq!(seen.rates.len(), RATES.len(), "{seen:?}");
 }

@@ -62,7 +62,7 @@ The probe keeps every packet it consumes until the first picture comes
 out. When no backend takes the stream by then, `open` (that is,
 `DecodePath::Auto`) replays those packets into the software decoder, so
 nothing is lost; `DecodePath::AnyHardware` and a `DecodePath::Hardware`
-pin report `VideoDecodeError::Decode(Error::AllBackendsFailed(p))`
+pin report `VideoDecodeError::Decode(Error::ProbeExhausted(p))`
 instead, carrying them (`p.unconsumed_packets()` /
 `p.into_unconsumed_packets()`) — so non-seekable callers (live streams,
 pipes, network sources) can replay them through a software decoder of
@@ -343,13 +343,51 @@ for end-to-end demuxer-driven runs that cover all three streams.
   picture's own error; when to stop trusting a hardware session is the
   caller's policy. `is_hardware()` / `is_software()` stay the live
   reading of where a session is.
+- **Decoder options**: `DecoderOptions` — libavcodec's `skip_frame`,
+  `skip_loop_filter` and `skip_idct`, each a `Discard` (FFmpeg's
+  `AVDiscard`: `none` … `all`), written into every video codec context
+  a decoder opens. Each video decoder takes them in its open request:
+  the stream decoder through `FfmpegVideoStreamDecoder::open_from` and
+  `VideoStreamDecoderOpen`, which also names the `DecodePath`; the
+  standalone `VideoDecoder` through `VideoDecoder::open_from` and
+  `VideoDecoderOpen`, which also names the probe or a pinned backend,
+  the limits and the packet timebase. They are decode behaviour, not
+  limits: `DecoderLimits` stays what a decoder may spend. `skip_frame` is
+  not the road for a picture cadence — see the demuxer's `DISPOSABLE`
+  mark below — and on a temporally scalable HEVC stream `noref` also
+  skips pictures a higher sub-layer references.
 - **Demuxer**: `FfmpegDemuxer` — `mediadecode`'s `Demuxer` over
   `libavformat`, opened from a path (`open`) or from any
   `Read + Seek` byte source through a custom `AVIOContext`
-  (`open_reader`). Plus `DemuxError`, and `format()` → `ContainerFormat`
+  (`open_reader`), or with every optional of the open named in a
+  `DemuxerOpen` (`open_from`, `open_reader_from`). Plus `DemuxError`, and
+  `format()` → `ContainerFormat`
   — libavformat's own identification of the bytes (`"matroska,webm"`,
   `"mov,mp4,m4a,3gp,3g2,mj2"`), read from the container rather than
-  guessed from a path.
+  guessed from a path. A video packet of an H.264 or HEVC track is
+  marked `PacketFlags::DISPOSABLE` where its NAL units prove that
+  nothing references it (`mediadecode::nal`) — a non-reference picture,
+  or an HEVC sub-layer non-reference picture at the highest temporal
+  sub-layer, with nothing beside it a later picture needs — and only
+  there: where a track is read, its reading decides, the container's own
+  mark (MP4's `sdtp`) with it. **A container is read only where the
+  caller declares its demuxer's inputs plaintext**
+  (`DemuxerOpen::plaintext_demuxers`, each a `DemuxerName` the linked
+  FFmpeg registers, by its whole name: `"mov,mp4,m4a,3gp,3g2,mj2"`).
+  FFmpeg cannot prove a container's payload plaintext — an MP4 track
+  protected under OMA DRM 2's PDCF reaches the demuxer as ciphertext,
+  with nothing public to say so — so by default the raw `h264` and `hevc`
+  elementary streams alone are read, plaintext by construction, and every
+  other demuxer is container-only: its packets carry the container's mark
+  alone, as FFmpeg delivers it, which it sets in `mov` alone and never on
+  an H.264 track. **The declaration is the caller's assertion, and its
+  risk:** an encrypted input's ciphertext, read as a bitstream, can be
+  marked falsely. Inside a declared demuxer every encryption signal
+  FFmpeg gives — `ENCRYPTION_INFO` on a packet, `pssh`'s
+  `ENCRYPTION_INIT_INFO` or Matroska's `enc_key_id` on a stream — still
+  ends a reading. A Sony XAVC original, which carries no `sdtp`, has two
+  pictures in three marked where `mov` is declared; a consumer that keeps
+  only reference pictures drops them before they are decoded.
 - **Codec identity**: `CodecId` — the number FFmpeg keys on, with
   `name()` / `long_name()` reading libavcodec's own descriptor table
   for the word beside it (`"h264"`, `"aac"`), so a stored track row can
@@ -434,9 +472,11 @@ once `--ignored` has opted into them.
 
 ## Build requirements
 
-- A system FFmpeg ≥ **5.1** linkable via `pkg-config` (we reference
-  `AV_PIX_FMT_P212LE` / `AV_PIX_FMT_P412LE`, which were added in 5.1).
-  Tested against 9.0. Verify with `ffmpeg -hwaccels` that your build
+- A system **FFmpeg 9** or newer, linkable via `pkg-config`; no older
+  release is supported. The build refuses an older one by name:
+  `mediaio-ffmpeg`'s build script reads the linked release from
+  `ffmpeg-sys-next`'s `links` metadata (`DEP_FFMPEG_FFMPEG_9_0`). Tested
+  against 9.0.1. Verify with `ffmpeg -hwaccels` that your build
   has the backends you expect compiled in
   (e.g. `videotoolbox` on macOS, `vaapi` / `cuda` on Linux,
   `d3d11va` / `cuda` on Windows).

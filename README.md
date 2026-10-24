@@ -23,11 +23,16 @@ through, and adapters that implement them.
 | [`mediadecode-ffmpeg`](mediadecode-ffmpeg/README.md) | read adapter | the FFmpeg decoders and demuxer, with hardware-acceleration probing |
 | [`mediaencode-ffmpeg`](mediaencode-ffmpeg/README.md) | write adapter | the FFmpeg muxer, the encoder-by-name catalogue and its GPL gate; the encoders follow |
 | [`mediadecode-webcodecs`](mediadecode-webcodecs/README.md) | read adapter, `wasm32` | the WebCodecs decoders |
-| [`mediaio-timeline`](mediaio-timeline/README.md) | pure model | the editing timeline as data, with OpenTimelineIO export |
+| [`mediaio-timeline`](mediaio-timeline/README.md) | pure model | the editing timeline as data, with OpenTimelineIO export and its exact read-back |
 | [`mediaio`](mediaio/README.md) | umbrella | the family in one dependency, by feature; pure Rust by default |
 
-`mediaspine` and `mediaio-timeline` are versioned on their own; the
-rest of the family releases in lockstep.
+The FFmpeg-dependent crates — `mediaio-ffmpeg`, `mediadecode-ffmpeg`,
+`mediaencode-ffmpeg` and `mediaio` — release in lockstep; every other
+crate moves only when it changes.
+
+**FFmpeg 9 is the floor** of the FFmpeg crates — `mediaio-ffmpeg`,
+`mediadecode-ffmpeg`, `mediaencode-ffmpeg` and `mediaio`'s `ffmpeg`
+feature: no older release is supported, and the build refuses one by name.
 
 The pixel-format and color vocabulary (`PixelFormat`, the H.273 color
 enums, `BayerPattern`, the frame primitives) is sourced from

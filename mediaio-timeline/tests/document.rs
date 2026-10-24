@@ -5,8 +5,9 @@
 use core::num::NonZeroI32;
 
 use mediaio_timeline::{
-  Clip, ClipId, Duration, Fade, FadeShape, Fades, Gain, MediaRef, Metadata, Rate, Schema,
-  TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind, Transition,
+  Clip, ClipId, Duration, Fade, FadeShape, Fades, Gain, Marker, MarkerColor, MediaRef, Metadata,
+  Rate, ReaderMetadata, Schema, TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind,
+  Transition,
 };
 
 fn tb(num: i32, den: i32) -> Timebase {
@@ -25,8 +26,16 @@ fn read(text: &str) -> serde_json::Result<Timeline> {
   serde_json::from_reader(text.as_bytes())
 }
 
-/// Every word of the model, present once. The document need not validate:
-/// it pins the wire names, not an edit.
+/// A reader's namespace, as a writer puts a note where DaVinci Resolve
+/// reads it.
+fn resolve(note: &str) -> ReaderMetadata {
+  ReaderMetadata::new().with("Resolve_OTIO", Metadata::new().with("Note", note))
+}
+
+/// Every word of the model, present once — a marker on the timeline, one
+/// on a track and one on a clip among them, and readers' namespaces on the
+/// timeline, the track, the clip and the track's marker. The document need
+/// not validate: it pins the wire names, not an edit.
 fn sample() -> Timeline {
   let edit = tb(1001, 24_000);
   let media = tb(1, 24_000);
@@ -50,14 +59,25 @@ fn sample() -> Timeline {
           .with_fades(Fades::new().with_out(Some(Fade::new(
             Duration::new(24, edit),
             FadeShape::EqualPower,
-          )))),
+          ))))
+          .with_marker(Marker::new("slate", TimeRange::new(48_048, 72_072, media)))
+          .with_readers(resolve("take 3")),
         )
         .with_transition(Transition::dissolve(
           Timestamp::new(96, edit),
           Duration::new(12, edit),
           Duration::new(12, edit),
-        )),
+        ))
+        .with_marker(
+          Marker::new("act one", TimeRange::new(0, 48, edit))
+            .with_color(MarkerColor::Red)
+            .with_comment("the opening")
+            .with_readers(resolve("act one")),
+        )
+        .with_readers(resolve("picture")),
     )
+    .with_marker(Marker::new("scene 1", TimeRange::new(0, 96, edit)).with_color(MarkerColor::Blue))
+    .with_readers(resolve("the cut"))
 }
 
 /// Predicted by hand from the field declarations before the first run.
@@ -134,7 +154,27 @@ const SAMPLE_PRETTY: &str = r#"{
               "shape": "equal_power"
             }
           },
-          "metadata": {}
+          "metadata": {},
+          "markers": [
+            {
+              "name": "slate",
+              "range": {
+                "start": 48048,
+                "end": 72072,
+                "timebase": {
+                  "numerator": 1,
+                  "denominator": 24000
+                }
+              },
+              "color": "green",
+              "comment": ""
+            }
+          ],
+          "readers": {
+            "Resolve_OTIO": {
+              "Note": "take 3"
+            }
+          }
         }
       ],
       "transitions": [
@@ -162,9 +202,54 @@ const SAMPLE_PRETTY: &str = r#"{
             }
           }
         }
-      ]
+      ],
+      "markers": [
+        {
+          "name": "act one",
+          "range": {
+            "start": 0,
+            "end": 48,
+            "timebase": {
+              "numerator": 1001,
+              "denominator": 24000
+            }
+          },
+          "color": "red",
+          "comment": "the opening",
+          "readers": {
+            "Resolve_OTIO": {
+              "Note": "act one"
+            }
+          }
+        }
+      ],
+      "readers": {
+        "Resolve_OTIO": {
+          "Note": "picture"
+        }
+      }
     }
-  ]
+  ],
+  "markers": [
+    {
+      "name": "scene 1",
+      "range": {
+        "start": 0,
+        "end": 96,
+        "timebase": {
+          "numerator": 1001,
+          "denominator": 24000
+        }
+      },
+      "color": "blue",
+      "comment": ""
+    }
+  ],
+  "readers": {
+    "Resolve_OTIO": {
+      "Note": "the cut"
+    }
+  }
 }"#;
 
 #[test]
@@ -232,7 +317,7 @@ fn a_word_inside_a_record_this_reader_does_not_know_is_refused_by_name() {
 
 /// Every time value the sample carries, by JSON pointer, its timebase among
 /// them.
-const TIME_VALUES: [&str; 18] = [
+const TIME_VALUES: [&str; 22] = [
   "/rate",
   "/start",
   "/start/timebase",
@@ -251,6 +336,10 @@ const TIME_VALUES: [&str; 18] = [
   "/tracks/0/transitions/0/in_offset/timebase",
   "/tracks/0/transitions/0/out_offset",
   "/tracks/0/transitions/0/out_offset/timebase",
+  "/tracks/0/clips/0/markers/0/range",
+  "/tracks/0/clips/0/markers/0/range/timebase",
+  "/tracks/0/markers/0/range",
+  "/tracks/0/markers/0/range/timebase",
 ];
 
 #[test]
@@ -376,6 +465,8 @@ fn a_range_longer_than_i64_max_ticks_is_refused_by_the_reader() {
     ("record", "/tracks/0/clips/0/record"),
     ("source_range", "/tracks/0/clips/0/source_range"),
     ("available_range", "/tracks/0/clips/0/media/available_range"),
+    ("a clip's marker", "/tracks/0/clips/0/markers/0/range"),
+    ("a track's marker", "/tracks/0/markers/0/range"),
   ] {
     let mut doc = serde_json::to_value(sample()).unwrap();
     let end = doc.pointer(path).unwrap()["end"].clone();
@@ -424,4 +515,127 @@ fn a_new_timeline_counts_its_start_at_the_edit_rate() {
   let zero = Timeline::new("t", Rate::hz(0));
   assert_eq!(zero.edit_timebase(), None);
   assert_eq!(zero.start().timebase(), Timebase::default());
+}
+
+#[test]
+fn markers_left_out_read_as_none_and_a_marker_reads_strictly() {
+  // A document from before markers — none written — reads with none, and
+  // a timeline without markers writes no `markers` word at all.
+  let mut doc = serde_json::to_value(sample()).unwrap();
+  doc.as_object_mut().unwrap().remove("markers");
+  doc["tracks"][0].as_object_mut().unwrap().remove("markers");
+  doc["tracks"][0]["clips"][0]
+    .as_object_mut()
+    .unwrap()
+    .remove("markers");
+  let back: Timeline = serde_json::from_value(doc).unwrap();
+  assert!(back.markers().is_empty());
+  assert!(back.tracks()[0].markers().is_empty());
+  assert!(back.tracks()[0].clips()[0].markers().is_empty());
+  let text = serde_json::to_string(&back).unwrap();
+  assert!(!text.contains("markers"), "{text}");
+
+  // A word a marker does not know is refused by name, and so is a color
+  // outside OpenTimelineIO's eleven.
+  let mut doc = serde_json::to_value(sample()).unwrap();
+  doc["tracks"][0]["markers"][0]["speed"] = serde_json::json!(2.0);
+  let error = serde_json::from_value::<Timeline>(doc)
+    .unwrap_err()
+    .to_string();
+  assert!(error.contains("unknown field `speed`"), "{error}");
+  let mut doc = serde_json::to_value(sample()).unwrap();
+  doc["tracks"][0]["markers"][0]["color"] = serde_json::json!("lilac");
+  let error = serde_json::from_value::<Timeline>(doc)
+    .unwrap_err()
+    .to_string();
+  assert!(error.contains("unknown variant `lilac`"), "{error}");
+}
+
+#[test]
+fn readers_left_out_read_as_none_and_a_timeline_without_them_writes_no_word() {
+  // A document from before readers' namespaces — 0.3.0's — reads with
+  // none, and a timeline without them writes no `readers` word at all.
+  let mut doc = serde_json::to_value(sample()).unwrap();
+  for owner in ["", "/tracks/0", "/tracks/0/clips/0", "/tracks/0/markers/0"] {
+    doc
+      .pointer_mut(owner)
+      .unwrap()
+      .as_object_mut()
+      .unwrap()
+      .remove("readers")
+      .unwrap();
+  }
+  let back: Timeline = serde_json::from_value(doc).unwrap();
+  assert!(back.readers().is_empty());
+  assert!(back.tracks()[0].readers().is_empty());
+  assert!(back.tracks()[0].clips()[0].readers().is_empty());
+  assert!(back.tracks()[0].markers()[0].readers().is_empty());
+  let text = serde_json::to_string(&back).unwrap();
+  assert!(!text.contains("readers"), "{text}");
+  // A namespace holding no entry is a word, written and read back.
+  let timeline = sample().with_readers(ReaderMetadata::new().with("Avid", Metadata::new()));
+  let text = serde_json::to_string(&timeline).unwrap();
+  assert!(text.ends_with(r#","readers":{"Avid":{}}}"#), "{text}");
+  assert_eq!(read(&text).unwrap(), timeline);
+}
+
+#[test]
+fn a_namespace_named_twice_or_holding_anything_but_strings_is_refused_by_name() {
+  let text = serde_json::to_string(&sample()).unwrap().replacen(
+    r#""readers":{"Resolve_OTIO":{"Note":"the cut"}}"#,
+    r#""readers":{"Resolve_OTIO":{"Note":"the cut"},"Resolve_OTIO":{}}"#,
+    1,
+  );
+  let error = read(&text).unwrap_err().to_string();
+  assert!(
+    error.contains("duplicate reader namespace `Resolve_OTIO`"),
+    "{error}"
+  );
+  for value in ["3", "true", "null", "[]", "{}"] {
+    let text = serde_json::to_string(&sample()).unwrap().replacen(
+      r#""Note":"the cut""#,
+      &format!(r#""Note":{value}"#),
+      1,
+    );
+    let error = read(&text).unwrap_err().to_string();
+    assert!(error.contains("expected a string"), "{value}: {error}");
+  }
+  let text = serde_json::to_string(&sample()).unwrap().replacen(
+    r#""readers":{"Resolve_OTIO":{"Note":"the cut"}}"#,
+    r#""readers":{"Resolve_OTIO":"the cut"}"#,
+    1,
+  );
+  let error = read(&text).unwrap_err().to_string();
+  assert!(error.contains("an object of string values"), "{error}");
+}
+
+#[test]
+fn reader_metadata_iterates_in_key_order_whatever_the_insertion_order() {
+  let readers = ReaderMetadata::new()
+    .with("zeta", Metadata::new().with("b", "2").with("a", "1"))
+    .with("Resolve_OTIO", Metadata::new());
+  let namespaces: Vec<_> = readers.iter().map(|(namespace, _)| namespace).collect();
+  assert_eq!(namespaces, ["Resolve_OTIO", "zeta"]);
+  let entries: Vec<_> = readers.get("zeta").unwrap().iter().collect();
+  assert_eq!(entries, [("a", "1"), ("b", "2")]);
+  assert_eq!(
+    readers,
+    [
+      ("Resolve_OTIO", Metadata::new()),
+      ("zeta", Metadata::new().with("a", "1").with("b", "2")),
+    ]
+    .into_iter()
+    .collect()
+  );
+  assert_eq!((readers.len(), readers.is_empty()), (2, false));
+  let mut readers = readers;
+  readers.get_mut("Resolve_OTIO").unwrap().insert("Note", "n");
+  assert_eq!(readers.get("Resolve_OTIO").unwrap().get("Note"), Some("n"));
+  assert_eq!(
+    readers.insert("zeta", Metadata::new()),
+    Some(Metadata::new().with("a", "1").with("b", "2"))
+  );
+  assert_eq!(readers.remove("zeta"), Some(Metadata::new()));
+  assert_eq!(readers.get("zeta"), None);
+  assert!(ReaderMetadata::new().is_empty());
 }

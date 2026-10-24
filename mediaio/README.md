@@ -18,7 +18,9 @@ re-exported under a short name:
 | `render` | no | — | reserved for the renderer a later release adds |
 
 The default build is pure Rust: nothing links FFmpeg until `ffmpeg` is
-enabled. Enabling it links libavcodec and libavformat; GPL encoders stay
+enabled. Enabling it links libavcodec and libavformat, which must be
+**FFmpeg 9** or newer — the family's floor, refused by name below it; GPL
+encoders stay
 closed even then, behind `mediaencode-ffmpeg`'s own `gpl` feature (and
 linking a GPL FFmpeg makes the binary GPL in any case — see that
 crate's documentation).

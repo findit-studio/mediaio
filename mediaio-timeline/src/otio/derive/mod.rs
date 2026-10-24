@@ -65,7 +65,10 @@
 //! export writes are such ranges, held whole as they are planned; a clip's
 //! source range is planned with its start and its length within ±2^53, and
 //! its end and last tick are held by the walk ([`range`]), so the search can
-//! write the clip in a ruler that holds them.
+//! write the clip in a ruler that holds them. The reader holds what it reads
+//! to the same arithmetic: every range by both its ends ([`range_held`]),
+//! and each track and the stack by the walk the export makes of them
+//! ([`track`], [`stack`]).
 //!
 //! The lines cited are OpenTimelineIO's `main` at `00c22fa` (2026-10-09),
 //! and the tools' heads of the same day.
@@ -298,14 +301,20 @@ impl Time {
   /// OpenTimelineIO's double less than half a tick from it. Refused with
   /// the exact count to the nearest tick — or, past `i128`, the double.
   pub(super) fn hold(self, at: Spot) -> Result<(), NotRepresentable> {
-    if let Some((num, den)) = self.exact_count() {
+    if self.held() {
+      Ok(())
+    } else {
+      Err(self.refused(at))
+    }
+  }
+
+  /// Whether [`hold`](Self::hold) holds the value.
+  fn held(self) -> bool {
+    self.exact_count().is_some_and(|(num, den)| {
       let (whole, part) = (num.div_euclid(den), num.rem_euclid(den));
       let within = (-EXACT..EXACT).contains(&whole) || (whole == EXACT && part == 0);
-      if within && near(self.value, whole, part, den) {
-        return Ok(());
-      }
-    }
-    Err(self.refused(at))
+      within && near(self.value, whole, part, den)
+    })
   }
 
   /// The refusal of this value at `at`: its exact count to the nearest tick
@@ -328,6 +337,7 @@ impl Time {
       value,
       rate: self.ruler.exact,
       searched: None,
+      misread: None,
     }
   }
 }
@@ -354,7 +364,7 @@ fn near(value: f64, whole: i128, part: i128, den: i128) -> bool {
 /// `std::floor`, which `core` lacks: the greatest whole `f64` not above
 /// `value`. Past ±2^52 an `f64` is whole already, and an infinity or a NaN
 /// is its own floor, as `std::floor` answers them.
-fn floor(value: f64) -> f64 {
+pub(super) fn floor(value: f64) -> f64 {
   if !(value > -WHOLE && value < WHOLE) {
     return value;
   }
@@ -544,8 +554,24 @@ fn from_the_global_start(start: Time, duration: Time, spot: Spot) -> Result<(), 
 /// (`timeRange.h` 105–108), and its last tick (88–102). In one ruler each
 /// is the exact count wherever it lies within ±2^53.
 pub(super) fn range(start: Time, duration: Time, spot: Spot) -> Result<(), NotRepresentable> {
-  Time::end(start, duration).hold(spot)?;
-  Time::end_inclusive(start, duration).hold(spot)
+  ends(start, duration)
+    .into_iter()
+    .try_for_each(|end| end.hold(spot))
+}
+
+/// Whether [`range`] holds the range from `start` running `duration`: for
+/// the reader, which names a range by where the document writes it.
+pub(super) fn range_held(start: Time, duration: Time) -> bool {
+  ends(start, duration).into_iter().all(Time::held)
+}
+
+/// The two ends OpenTimelineIO derives from the range from `start` running
+/// `duration`: exclusive, then its last tick.
+fn ends(start: Time, duration: Time) -> [Time; 2] {
+  [
+    Time::end(start, duration),
+    Time::end_inclusive(start, duration),
+  ]
 }
 
 /// `Track::available_range` (`track.cpp` 117–148): from zero at rate 1,

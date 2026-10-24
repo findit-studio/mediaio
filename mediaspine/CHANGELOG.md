@@ -18,6 +18,97 @@ Its versions are its own: they do not move with the rest of the family's.
   re-exported from `mediaspine::demuxer`, whole — an unnamed bit
   included. `from_track_info` copies it, and `into_parts` returns it.
 
+## [0.1.1] - 2026-10-23
+
+### Added
+
+- **`nal`: what an H.264 or HEVC packet's NAL units say about its
+  picture.** `NalStream` reads each of a track's packets (`read`) and
+  answers `Verdict::Disposable` only where the bitstream proves that
+  nothing references the packet's picture and nothing beside it is needed
+  later:
+  - H.264: at least one slice, every slice of `nal_ref_idc` 0, none an
+    IDR, and nothing beside them but access unit delimiters, filler data
+    and SEI units of picture timing and filler payload alone — and only
+    while every sequence parameter set FFmpeg's decoder may read codes
+    frames only (`frame_mbs_only_flag` 1), since FFmpeg joins a frame's two
+    fields across packets, lets `frame_num` jump nowhere
+    (`gaps_in_frame_num_value_allowed_flag` 0) and fixes the reorder depth
+    (`bitstream_restriction_flag`, a `max_num_reorder_frames` of 15 at
+    most), in each of the three readings it may adopt of one: before one is
+    read, and from the first that does not, nothing is marked
+    (`frames_only` says whether fields are let in). Not a picture of intra
+    slices alone, at which FFmpeg's frame threads reset the film grain
+    seed's offset; and, since the opening or the last seek, only after a
+    reference picture the decoder decodes and, for a picture holding an
+    intra slice, a kept packet holding one;
+  - HEVC: every slice a sub-layer non-reference type FFmpeg decodes
+    (TRAIL_N, TSA_N, STSA_N, RADL_N, RASL_N) of layer 0 at the highest
+    temporal sub-layer, learned from every SPS and VPS FFmpeg's splitter
+    may read and from the record's `numTemporalLayers`, and nothing beside
+    them but delimiters, filler data and SEI units of filler payload alone;
+    not in the first packet after the opening, a seek or an end of
+    sequence, which takes up FFmpeg's `eos`, while a recovery point (of
+    any layer) may be pending, or while SEI state or a Dolby Vision RPU
+    may be pending for the next picture decoded — left by an earlier
+    packet, or by a configuration record: the one the decoder opens with,
+    which a decoder opened afresh at a seek reads again, and one a packet
+    carries, read before it. A packet that follows an HEVC record leaves
+    pending whatever was pending before it, since a record that fails
+    returns before the decoder reads its packet.
+    Unlike FFmpeg's own `AVDISCARD_NONREF`, which skips sub-layer
+    non-reference pictures at every sub-layer, it never marks one a higher
+    sub-layer may reference.
+
+  Parameter sets are learned from every packet a decoder reads, one the
+  reading cannot frame included: that one in every framing a decoder may
+  read it in. It reads plaintext only: a caller feeds it no encrypted
+  payload, and none of the track's packets after one.
+
+  The framing is FFmpeg's decoder's own state — whether lengths are read,
+  and their size, kept apart — moved where FFmpeg moves it: by the
+  configuration record at the opening (`new`) and mid-stream
+  (`reconfigure`, and `read_with_record`, which takes a packet's record
+  as the decoder takes it), by an H.264 packet that is an `avcC`, and by
+  H.264's four-byte probe; a packet that moves it is kept. A seek after the
+  framing moved (`seeked`), an `avcC` whose reading turns on whether a
+  parameter set decodes, and a mid-stream `hvcC` of other than two-byte
+  lengths leave the framing unknown, and nothing is marked. `LengthSize`
+  is one to four bytes, as FFmpeg reads them.
+
+  Anything else keeps the packet, with the reason (`KeptReason`): a
+  reference or random-access picture, a parameter set, an SEI unit of any
+  other message, or an end, an extension's NAL unit, a picture below the
+  highest sub-layer or before any SPS, an H.264 picture that may be a
+  field, where `frame_num` may jump or the reorder depth is not fixed, of
+  intra slices alone, or before the reference picture or the intra slice
+  it awaits; an HEVC packet a sequence may start at, or a picture while a
+  recovery point or what an earlier packet left may be pending; a packet
+  that does not parse — a length-framed unit holding a start code among
+  them — a configuration record, a switch of framing, and a framing
+  unknown or unset. `NalCodec` names the two codecs read; every other
+  codec is unclassified.
+
+### Changed
+
+- **`PacketFlags::DISPOSABLE` is the container's mark or the
+  bitstream's**: nothing references this picture. Its contract is
+  unchanged — absent means unknown — and a demuxer that reads the
+  bitstream sets it on more H.264 and HEVC packets than the container
+  marks. Where a demuxer reads a track, the bitstream's verdict decides:
+  the container's mark is cleared on every other verdict. Its promise is pixels: dropping a marked packet changes no later
+  picture's pixels, and promises nothing of a later frame's best-effort
+  timestamp, which a decoder may guess from every frame before; a frame's
+  own pts is the exact one. A container's bitstream is read for it only
+  where the caller declares its demuxer's inputs plaintext: by default the
+  raw `h264` and `hevc` streams alone are read, since FFmpeg cannot prove a
+  container's payload plaintext — an MP4 track under OMA DRM 2's PDCF
+  reaches the demuxer as ciphertext with nothing to say so. The
+  declaration is the caller's assertion, and its risk; inside a declared
+  demuxer every encryption signal FFmpeg gives still ends a reading. The
+  container's own mark reaches a packet only on a track libavformat does
+  not parse as it reads: never on an H.264 track of MP4.
+
 ## [0.1.0] - 2026-10-16
 
 ### Added

@@ -5,8 +5,8 @@ use smol_bytes::{Utf8Bytes, Utf8BytesMut, format_utf8bytes};
 
 use super::{json::Value, *};
 use crate::{
-  Clip, ClipId, Duration, Fade, FadeShape, Fades, MediaRef, Rate, TimeRange, Timebase, Timestamp,
-  Track, TrackKind, Transition,
+  Clip, ClipId, Duration, Fade, FadeShape, Fades, Marker, MarkerAt, MarkerColor, MediaRef, Rate,
+  TimeRange, Timebase, Timestamp, Track, TrackKind, Transition,
 };
 
 fn tb(num: i32, den: i32) -> Timebase {
@@ -382,10 +382,276 @@ fn a_count_past_2_53_is_refused_rather_than_read_rounded() {
   // The start, at the edit rate.
   let early = at_one_fps(0, 1).with_start(Timestamp::new(-TWO_53 - 1, tb(1, 1)));
   assert_eq!(not_representable(&early), (Spot::Start, -past));
-  // Up to 2^53 itself is written, and reads back whole.
+  // Within 2^53 every count is written, in a spelling OpenTimelineIO 0.17's
+  // reader reads back exactly (below), and reads back whole: 2^53 - 1.
   assert_eq!(
     children(&at_one_fps(TWO_53 - 1, TWO_53)),
     ["Gap(9007199254740991)", "a"]
+  );
+}
+
+/// Where `to_otio` refuses `timeline` because OpenTimelineIO 0.17's reader
+/// reads a number it would write as another value, and the refusal.
+fn misread(timeline: &Timeline) -> (NotRepresentable, Misread) {
+  match to_otio(timeline, OtioTarget::V0_15Plus) {
+    Err(Refused::NotRepresentable(refusal)) => match refusal.misread() {
+      Some(misread) => (refusal, misread),
+      None => panic!("{refusal}"),
+    },
+    other => panic!("{other:?}"),
+  }
+}
+
+/// Whether OpenTimelineIO 0.17's reader reads `text` as `meant`, bit for
+/// bit, in a build that rounds RapidJSON's multiply-adds twice and in one
+/// that fuses them.
+fn reads_back(text: &str, meant: f64) -> bool {
+  json::readings(text)
+    .iter()
+    .all(|reading| reading.is_ok_and(|number| number.double().to_bits() == meant.to_bits()))
+}
+
+/// The spellings of every `RationalTime.1`'s two numbers in `text`: its
+/// value, then its rate.
+fn times(text: &str) -> Vec<(String, String)> {
+  let root = json::parse(text).unwrap();
+  let mut found = Vec::new();
+  named(&root, "RationalTime.1", &mut found);
+  found
+    .into_iter()
+    .map(|time| {
+      (
+        String::from(spelled(time, "value")),
+        String::from(spelled(time, "rate")),
+      )
+    })
+    .collect()
+}
+
+#[test]
+fn a_count_past_the_last_one_its_point_zero_spells_exactly_is_written_as_its_integer() {
+  // OpenTimelineIO 0.17's reader takes `<digits>.0`'s zero into the
+  // significand, which converts to a double rounded past 2^53 before it is
+  // divided by ten: every count up to 1 801 439 850 948 198, ⌊2^54 / 10⌋,
+  // reads back exactly so, and the next as 1 801 439 850 948 199.25.
+  const LAST: i64 = 1_801_439_850_948_198;
+  let past = (LAST + 1) as f64;
+  assert!(reads_back("1801439850948198.0", LAST as f64));
+  assert!(!reads_back("1801439850948199.0", past));
+  // Its integer it hands over whole, which a `double` member takes exactly.
+  assert!(reads_back("1801439850948199", past));
+  for (gap, spelling) in [
+    (LAST, "1801439850948198.0"),
+    (LAST + 1, "1801439850948199"),
+    (TWO_53 - 1, "9007199254740991"),
+  ] {
+    let timeline = at_one_fps(gap, gap + 1);
+    let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+    // The gap's length is the document's first count past the start.
+    let written = times(&text);
+    assert!(
+      written.iter().any(|(value, _)| value == spelling),
+      "{gap}: {written:?}"
+    );
+    for (value, _) in &written {
+      let count: i128 = value.strip_suffix(".0").unwrap_or(value).parse().unwrap();
+      assert!(reads_back(value, count as f64), "{gap}: {value}");
+    }
+    validate_json(&text, OtioTarget::V0_15Plus).unwrap();
+    assert_eq!(from_otio(&text), Ok(timeline), "{gap}");
+  }
+  // Negative counts alike: a start at the edit rate, before the zero.
+  let early = at_one_fps(0, 1).with_start(Timestamp::new(-LAST - 1, tb(1, 1)));
+  let text = to_otio(&early, OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(times(&text)[0].0, "-1801439850948199");
+  assert_eq!(from_otio(&text), Ok(early));
+}
+
+/// One clip of 24 frames at the edit rate `num/1001`, on a medium at it.
+fn at_1001(num: i32) -> Timeline {
+  let rate = Rate::fps(num, NonZeroI32::new(1001).unwrap());
+  let frame = rate.checked_to_timebase().unwrap();
+  one_track_at(
+    rate,
+    Clip::new(
+      ClipId::new("a"),
+      "a",
+      MediaRef::new("file:///a.mov"),
+      TimeRange::new(0, 24, frame),
+      TimeRange::new(0, 24, frame),
+    ),
+  )
+}
+
+#[test]
+fn a_rate_whose_shortest_spelling_reads_as_another_is_written_in_one_that_reads_exactly() {
+  // 96000/1001's f64 is shortest `95.90409590409591`, which OpenTimelineIO
+  // 0.17's reader reads as the next f64 up; 11000/1001's `10.989010989010989`
+  // as the next down. Each is written as an integer an f64 holds over a
+  // power of ten: one exact conversion, one division, rounded once.
+  // 28863/1001 has no such spelling, and is written with zeros, which the
+  // reader multiplies in, each rounded once with nothing added, before it
+  // divides. Every common rate keeps its shortest.
+  for (num, shortest, spelling) in [
+    (96_000, "95.90409590409591", "95904095904095904e-15"),
+    (11_000, "10.989010989010989", "109890109890109888e-16"),
+    (
+      28_863,
+      "28.834165834165834",
+      "2883416583416583600000000000000000e-32",
+    ),
+    (24_000, "23.976023976023978", "23.976023976023978"),
+    (30_000, "29.97002997002997", "29.97002997002997"),
+    (48_000, "47.952047952047955", "47.952047952047955"),
+  ] {
+    let meant = f64::from(num) / 1001.0;
+    assert_eq!(format!("{meant:?}"), shortest);
+    assert_eq!(reads_back(shortest, meant), shortest == spelling, "{num}");
+    assert!(reads_back(spelling, meant), "{num}");
+    let timeline = at_1001(num);
+    let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+    for (_, rate) in times(&text) {
+      assert_eq!(rate, spelling, "{num}");
+    }
+    validate_json(&text, OtioTarget::V0_15Plus).unwrap();
+    assert_eq!(from_otio(&text), Ok(timeline), "{num}");
+  }
+}
+
+#[test]
+fn a_rate_no_spelling_of_which_reads_back_exactly_is_refused_by_name() {
+  // Of the rates num/1001 up to 200000/1001, three read as another f64 in
+  // every spelling the export tries — and in each of the 15 626 tried
+  // around them, against RapidJSON 06d58b9e compiled either way. Each is
+  // refused where it is first written, at the start, with no search.
+  for (num, read) in [
+    (29_195, 0x403D_2A74_1B9E_D134_u64),
+    (31_264, 0x403F_3B96_A224_50D0),
+    (31_799, 0x403F_C469_5DDB_AF30),
+  ] {
+    let (refusal, misread) = misread(&at_1001(num));
+    assert_eq!(
+      (refusal.at(), refusal.value(), refusal.searched()),
+      (Spot::Start, 0, None),
+      "{num}"
+    );
+    assert_eq!(misread.number(), MisreadNumber::Rate);
+    assert_eq!(misread.meant(), f64::from(num) / 1001.0);
+    assert_eq!(misread.read().map(f64::to_bits), [read; 2], "{num}");
+  }
+  let (refusal, _) = misread(&at_1001(29_195));
+  assert_eq!(
+    std::string::ToString::to_string(&refusal),
+    "the start counts 0 ticks of 1001/29195 s, its rate written 29.165834165834166: \
+     OpenTimelineIO 0.17 reads this spelling as another value, and every other the export \
+     tries, 29.16583416583417"
+  );
+}
+
+/// SplitMix64: a fixed seed gives a fixed sequence, on every platform.
+struct Seeded(u64);
+
+impl Seeded {
+  fn next(&mut self) -> u64 {
+    self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = self.0;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+  }
+
+  /// A number in `low..=high`.
+  fn within(&mut self, low: u64, high: u64) -> u64 {
+    low + self.next() % (high - low + 1)
+  }
+}
+
+#[test]
+fn every_number_an_accepted_export_writes_reads_back_exactly_in_either_build() {
+  // Rates common and exotic, and gaps from a few frames to 2^53, from fixed
+  // seeds. Whatever `to_otio` writes, OpenTimelineIO 0.17's reader reads
+  // back as the value meant — each count as its whole number, each rate as
+  // the f64 nearest the exact rate — in a build that rounds RapidJSON's
+  // multiply-adds twice and in one that fuses them; a rate it refuses as
+  // misread, either build does read otherwise in its shortest spelling.
+  const COMMON: [(i32, i32); 12] = [
+    (24, 1),
+    (25, 1),
+    (30, 1),
+    (48, 1),
+    (50, 1),
+    (60, 1),
+    (24_000, 1001),
+    (30_000, 1001),
+    (48_000, 1001),
+    (60_000, 1001),
+    (96_000, 1001),
+    (25, 2),
+  ];
+  // Fewer under Miri, which interprets slowly: the first eight seeds, which
+  // between them draw every kind of rate and of gap.
+  let (seeds, many) = if cfg!(miri) { (8, 0) } else { (256, 128) };
+  let (mut written, mut respelled) = (0, 0);
+  for seed in 0..seeds {
+    let mut draw = Seeded(seed);
+    let (num, den) = match draw.within(0, 2) {
+      0 => COMMON[draw.within(0, COMMON.len() as u64 - 1) as usize],
+      1 => (draw.within(1, 240_000) as i32, 1001),
+      _ => (draw.within(1, 240_000) as i32, draw.within(1, 1001) as i32),
+    };
+    let rate = Rate::fps(num, core::num::NonZeroI32::new(den).unwrap());
+    let Some(frame) = rate.checked_to_timebase() else {
+      continue;
+    };
+    let gap = match draw.within(0, 3) {
+      0 => draw.within(0, 1000),
+      1 => 1 << draw.within(0, 53),
+      2 => draw.within(1_801_439_850_948_190, 1_801_439_850_948_210),
+      _ => draw.within((1 << 53) - 30, 1 << 53),
+    } as i64;
+    let length = draw.within(1, 48) as i64;
+    let timeline = one_track_at(
+      rate,
+      Clip::new(
+        ClipId::new("a"),
+        "a",
+        MediaRef::new("file:///a.mov"),
+        TimeRange::new(0, length, frame),
+        TimeRange::new(gap, gap + length, frame),
+      ),
+    );
+    let meant = rate.as_f64();
+    match to_otio(&timeline, OtioTarget::V0_15Plus) {
+      Ok(text) => {
+        written += 1;
+        for (value, spelling) in times(&text) {
+          let count: i128 = value.strip_suffix(".0").unwrap_or(&value).parse().unwrap();
+          assert!(reads_back(&value, count as f64), "seed {seed}: {value}");
+          // Every rate the document carries is the edit rate's.
+          assert!(reads_back(&spelling, meant), "seed {seed}: {spelling}");
+          if spelling != format!("{meant:?}") {
+            respelled += 1;
+          }
+        }
+      }
+      // A count past 2^53, or a rate none of whose spellings reads back.
+      Err(Refused::NotRepresentable(refusal)) => {
+        if let Some(read) = refusal.misread() {
+          assert_eq!(read.number(), MisreadNumber::Rate, "seed {seed}");
+          assert!(
+            !reads_back(&format!("{meant:?}"), meant),
+            "seed {seed}: {refusal}"
+          );
+        }
+      }
+      Err(other) => panic!("seed {seed}: {other}"),
+    }
+  }
+  // Most drawn are written, some in a spelling other than their shortest;
+  // under Miri, at least one.
+  assert!(
+    written > many && (cfg!(miri) || respelled > 0),
+    "{written} written, {respelled} respelled"
   );
 }
 
@@ -566,26 +832,34 @@ fn every_count_in_the_goldens_is_one_an_f64_holds_exactly() {
     let mut times = Vec::new();
     named(&root, "RationalTime.1", &mut times);
     // The start; per clip its source and available ranges; per gap its range;
-    // per transition its two offsets.
-    assert_eq!(times.len(), 1 + 3 * 4 + 2 * 2 + 3 * 2);
+    // per transition its two offsets; per marker — the timeline's, a
+    // track's and a clip's — its range.
+    assert_eq!(times.len(), 1 + 3 * 4 + 2 * 2 + 3 * 2 + 3 * 2);
     for time in &times {
       // A whole count within ±2^53, written as `<digits>.0`, which an f64
-      // reads back as exactly that count.
+      // reads back as exactly that count — and OpenTimelineIO 0.17's reader
+      // too, in either build.
       let value = spelled(time, "value");
       let digits = value.strip_suffix(".0").unwrap();
       let count: i128 = digits.parse().unwrap();
       assert!(count.unsigned_abs() <= 1 << 53, "{value}");
       assert_eq!(value.parse::<f64>().unwrap() as i128, count, "{value}");
+      let both = |text: &str, meant: f64| {
+        json::readings(text).map(|reading| reading.map(|number| number.double().to_bits()))
+          == [Ok(meant.to_bits()); 2]
+      };
+      assert!(both(value, count as f64), "{value}");
       // The rate spelled as the shortest text of one f64, which reads back as
-      // that very f64.
+      // that very f64, in either build of OpenTimelineIO 0.17's reader too.
       let rate = spelled(time, "rate");
       let read = rate.parse::<f64>().unwrap();
       assert!(read.is_finite() && read > 0.0, "{rate}");
       assert_eq!(format!("{read:?}"), rate);
+      assert!(both(rate, read), "{rate}");
     }
     let mut ranges = Vec::new();
     named(&root, "TimeRange.1", &mut ranges);
-    assert_eq!(ranges.len(), 3 * 2 + 2);
+    assert_eq!(ranges.len(), 3 * 2 + 2 + 3);
     for range in ranges {
       let time = |key: &str| match range.iter().find(|(k, _)| k == key) {
         Some((_, Value::Object(members))) => members.as_slice(),
@@ -617,6 +891,7 @@ fn a_refusal_to_export_says_why() {
       value: 9_007_199_254_740_993,
       rate: Rate::hz(1),
       searched: None,
+      misread: None,
     })),
     "the gap before track 0, clip 0 counts 9007199254740993 ticks of 1/1 s, which \
      OpenTimelineIO's f64 does not hold exactly"
@@ -629,6 +904,7 @@ fn a_refusal_to_export_says_why() {
       value: 27_021_597_764_222_973,
       rate: Rate::hz(3),
       searched: Some(RulerSearch { walks: 3 }),
+      misread: None,
     })),
     "the place of track 0, child 1 counts 27021597764222973 ticks of 1/3 s, which \
      OpenTimelineIO's f64 does not hold exactly, in the last of 3 plans the bounded search \
@@ -651,6 +927,7 @@ fn a_refusal_to_export_says_why() {
       value: 9_007_199_254_740_994,
       rate: Rate::hz(1),
       searched: Some(RulerSearch { walks: 0 }),
+      misread: None,
     })),
     "the source range of track 0, clip 0 counts 9007199254740994 ticks of 1/1 s, which \
      OpenTimelineIO's f64 does not hold exactly, in any of the range's own rulers or of the \
@@ -662,6 +939,7 @@ fn a_refusal_to_export_says_why() {
       value: 9_007_199_254_740_993,
       rate: Rate::hz(1),
       searched: Some(RulerSearch { walks: 0 }),
+      misread: None,
     })),
     "the available range of track 0, clip 0 counts 9007199254740993 ticks of 1/1 s, which \
      OpenTimelineIO's f64 does not hold exactly, in any of the range's own rulers or of the \
@@ -847,6 +1125,7 @@ fn required_by_readers(schema: &str, target: OtioTarget) -> &'static [&'static s
     ("Clip.1" | "Gap.1", _) => &[],
     ("Transition.1", _) => &["in_offset", "out_offset", "transition_type"],
     ("ExternalReference.1", _) => &["target_url"],
+    ("Marker.2", _) => &["marked_range"],
     ("RationalTime.1", _) => &["rate", "value"],
     ("TimeRange.1", _) => &["start_time", "duration"],
     _ => panic!("no audit for {schema}"),
@@ -1048,4 +1327,321 @@ fn a_document_that_is_not_json_is_refused_as_syntax() {
   );
 }
 
+/// The words under `metadata.mediaio` of `value`, as `(word, value)` text
+/// pairs, a nested object written as JSON.
+fn words(value: &Value) -> Vec<(String, String)> {
+  let ours = member(&member(value, "metadata"), "mediaio");
+  ours
+    .as_object()
+    .unwrap()
+    .iter()
+    .map(|(key, word)| {
+      let mut text = Utf8BytesMut::new();
+      json::write_pretty(word, &mut text);
+      (
+        String::from(key.as_str()),
+        String::from(text.freeze_shared().as_str()),
+      )
+    })
+    .collect()
+}
+
+/// A clip `m` at [0, 24) of a 24 fps timeline, playing a second of a
+/// 48 kHz medium, with a marker on the clip and one on its track.
+fn marked() -> Timeline {
+  let sound = tb(1, 48_000);
+  let mut m = clip("m", 0, 24);
+  m.set_source_range(TimeRange::new(48_000, 96_000, sound));
+  m.markers_mut().push(
+    Marker::new("breath", TimeRange::new(60_000, 72_000, sound))
+      .with_color(MarkerColor::Cyan)
+      .with_comment("a \"quoted\" note"),
+  );
+  one_track(
+    Track::new(TrackKind::Audio, "A")
+      .with_clip(m)
+      .with_marker(Marker::new("act one", TimeRange::new(6, 18, edit()))),
+  )
+}
+
+#[test]
+fn markers_are_written_as_marker_2_where_their_owners_count_time() {
+  let timeline = marked();
+  assert_eq!(validate(&timeline), Ok(()));
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let text = to_otio(&timeline, target).unwrap();
+    assert_eq!(validate_json(&text, target), Ok(()), "{target:?}");
+  }
+  let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+  let root = json::parse(&text).unwrap();
+  let track = member(&member(&root, "tracks"), "children")
+    .as_array()
+    .unwrap()[0]
+    .clone();
+
+  // The track's: at the edit rate, from the timeline's zero, with no words.
+  let on_track = member(&track, "markers").as_array().unwrap()[0].clone();
+  assert_eq!(member(&on_track, "OTIO_SCHEMA").as_str(), Some("Marker.2"));
+  assert_eq!(member(&on_track, "metadata"), Value::Object(Vec::new()));
+  assert_eq!(member(&on_track, "name").as_str(), Some("act one"));
+  assert_eq!(member(&on_track, "color").as_str(), Some("GREEN"));
+  assert_eq!(member(&on_track, "comment").as_str(), Some(""));
+  assert_eq!(
+    rate_start_duration(&member(&on_track, "marked_range")),
+    (24.0, 6.0, 12.0)
+  );
+
+  // The clip's: in its medium's ticks, the exact ruler and timebase beside.
+  let clip = member(&track, "children").as_array().unwrap()[0].clone();
+  let on_clip = member(&clip, "markers").as_array().unwrap()[0].clone();
+  assert_eq!(member(&on_clip, "name").as_str(), Some("breath"));
+  assert_eq!(member(&on_clip, "color").as_str(), Some("CYAN"));
+  assert_eq!(
+    member(&on_clip, "comment").as_str(),
+    Some("a \"quoted\" note")
+  );
+  assert_eq!(
+    rate_start_duration(&member(&on_clip, "marked_range")),
+    (48_000.0, 60_000.0, 12_000.0)
+  );
+  let range = "{\n    \"ruler\": \"48000/1\",\n    \"timebase\": \"1/48000\"\n}";
+  assert_eq!(
+    words(&on_clip),
+    [(String::from("range"), String::from(range))]
+  );
+}
+
+#[test]
+fn the_exact_words_name_the_edit_rate_and_each_ranges_rulers() {
+  // At 30000/1001 the edit rate's f64 names many rationals: the timeline
+  // says which. A source range in 1/90 000 s ticks of a 29.97 fps medium is
+  // written in its frames: the clip says which ruler, and which timebase
+  // the model counts it in; so does its reference, for its available range.
+  let edit = Rate::FPS_29_97;
+  let ticks = tb(1, 90_000);
+  let mut timeline = one_source(
+    edit,
+    30,
+    TimeRange::new(3003, 3003 * 31, ticks),
+    Some(Rate::FPS_29_97),
+  );
+  timeline.tracks_mut()[0].clips_mut()[0]
+    .media_mut()
+    .set_available_range(Some(TimeRange::new(0, 3003 * 100, ticks)));
+  let text = to_otio(&timeline, OtioTarget::Legacy).unwrap();
+  let root = json::parse(&text).unwrap();
+  assert_eq!(
+    words(&root),
+    [(String::from("rate"), String::from("\"30000/1001\""))]
+  );
+  let exact = "{\n    \"ruler\": \"30000/1001\",\n    \"timebase\": \"1/90000\"\n}";
+  let clip = first_clip(&timeline);
+  assert_eq!(
+    words(&clip),
+    [
+      (String::from("id"), String::from("\"a\"")),
+      (String::from("source"), String::from(exact)),
+    ]
+  );
+  assert_eq!(
+    words(&member(&clip, "media_reference")),
+    [
+      (String::from("rate"), String::from("\"30000/1001\"")),
+      (String::from("available"), String::from(exact)),
+    ]
+  );
+  assert_eq!(
+    source_range(&timeline),
+    (Rate::FPS_29_97.as_f64(), 1.0, 30.0)
+  );
+}
+
+/// Three abutting clips with a dissolve at each of their two cuts, kept in
+/// `order`.
+fn two_dissolves(order: [i64; 2]) -> Timeline {
+  let mut track = Track::new(TrackKind::Video, "V");
+  for (name, start) in [("a", 0), ("b", 24), ("c", 48)] {
+    let mut placed = clip(name, start, start + 24);
+    placed.set_source_range(TimeRange::new(10, 34, edit()));
+    placed
+      .media_mut()
+      .set_available_range(Some(TimeRange::new(0, 100, edit())));
+    track.clips_mut().push(placed);
+  }
+  for cut in order {
+    track.transitions_mut().push(Transition::dissolve(
+      crate::Timestamp::new(cut, edit()),
+      Duration::new(2, edit()),
+      Duration::new(2, edit()),
+    ));
+  }
+  one_track(track)
+}
+
+/// The `order` word of each dissolve the first track writes, in the order
+/// they are written.
+fn orders(timeline: &Timeline) -> Vec<Option<String>> {
+  let text = to_otio(timeline, OtioTarget::V0_15Plus).unwrap();
+  let root = json::parse(&text).unwrap();
+  let track = member(&member(&root, "tracks"), "children")
+    .as_array()
+    .unwrap()[0]
+    .clone();
+  member(&track, "children")
+    .as_array()
+    .unwrap()
+    .iter()
+    .filter(|child| member(child, "OTIO_SCHEMA").as_str() == Some("Transition.1"))
+    .map(|dissolve| {
+      words_or_none(dissolve)
+        .into_iter()
+        .find(|(word, _)| word == "order")
+        .map(|(_, value)| value)
+    })
+    .collect()
+}
+
+/// [`words`], or none where the object's metadata holds no `mediaio`.
+fn words_or_none(value: &Value) -> Vec<(String, String)> {
+  let metadata = member(value, "metadata");
+  if metadata.as_object().unwrap().is_empty() {
+    Vec::new()
+  } else {
+    words(value)
+  }
+}
+
+#[test]
+fn a_dissolve_says_its_place_only_where_its_track_keeps_transitions_out_of_order() {
+  // Written in their cuts' order, the dissolves need no word…
+  let ordered = two_dissolves([24, 48]);
+  assert_eq!(validate(&ordered), Ok(()));
+  assert_eq!(orders(&ordered), [None, None]);
+  // …kept the other way round, each says its place among the track's.
+  let reversed = two_dissolves([48, 24]);
+  assert_eq!(validate(&reversed), Ok(()));
+  assert_eq!(
+    orders(&reversed),
+    [Some(String::from("1")), Some(String::from("0"))]
+  );
+  assert_eq!(
+    to_otio(&reversed, OtioTarget::Legacy).map(drop),
+    Ok(()),
+    "the same dissolves, in the same places"
+  );
+}
+
+#[test]
+fn the_timelines_markers_are_written_on_the_stack_at_the_edit_rate() {
+  // Q813. DaVinci Resolve 21.1 imports the stack's markers alone as its
+  // timeline's — it drops a track's, and attaches a clip's to its item
+  // (findit-studio/application#265) — so the timeline's own are written
+  // there, at the edit rate from the stack's zero, as a track's are on the
+  // track.
+  let timeline = marked()
+    .with_marker(
+      Marker::new("scene 1", TimeRange::new(0, 12, edit()))
+        .with_color(MarkerColor::Blue)
+        .with_comment("the opening"),
+    )
+    .with_marker(Marker::new("cut", TimeRange::new(12, 12, tb(2, 48))));
+  assert_eq!(validate(&timeline), Ok(()));
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let text = to_otio(&timeline, target).unwrap();
+    assert_eq!(validate_json(&text, target), Ok(()), "{target:?}");
+    assert_eq!(from_otio(&text), Ok(timeline.clone()), "{target:?}");
+  }
+  let root = json::parse(&to_otio(&timeline, OtioTarget::V0_15Plus).unwrap()).unwrap();
+  let stack = member(&root, "tracks");
+  let markers = member(&stack, "markers").as_array().unwrap().to_vec();
+  let [scene, cut] = &markers[..] else {
+    panic!("two markers on the stack: {markers:?}")
+  };
+  assert_eq!(member(scene, "OTIO_SCHEMA").as_str(), Some("Marker.2"));
+  assert_eq!(member(scene, "metadata"), Value::Object(Vec::new()));
+  assert_eq!(member(scene, "name").as_str(), Some("scene 1"));
+  assert_eq!(member(scene, "color").as_str(), Some("BLUE"));
+  assert_eq!(member(scene, "comment").as_str(), Some("the opening"));
+  assert_eq!(
+    rate_start_duration(&member(scene, "marked_range")),
+    (24.0, 0.0, 12.0)
+  );
+  // A point, its timebase spelled otherwise than the edit rate's
+  // reciprocal: that spelling, as a track's marker says it.
+  assert_eq!(member(cut, "color").as_str(), Some("GREEN"));
+  assert_eq!(
+    rate_start_duration(&member(cut, "marked_range")),
+    (24.0, 12.0, 0.0)
+  );
+  assert_eq!(
+    words(cut),
+    [(String::from("timebase"), String::from("\"2/48\""))]
+  );
+  // The track's own stays on the track.
+  let track = member(&stack, "children").as_array().unwrap()[0].clone();
+  assert_eq!(member(&track, "markers").as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_marker_no_ruler_holds_whole_is_refused_by_name() {
+  // The timeline's marker and a track's are counted at the edit rate: past
+  // 2^53 there, refused with no search — the timeline's before any
+  // track's.
+  let mut timeline =
+    marked().with_marker(Marker::new("scene", TimeRange::new(0, TWO_53 + 1, edit())));
+  timeline.tracks_mut()[0].markers_mut()[0].set_range(TimeRange::new(0, TWO_53 + 1, edit()));
+  assert_eq!(
+    not_representable(&timeline),
+    (
+      Spot::Marker(MarkerAt::Timeline { marker: 0 }),
+      i128::from(TWO_53 + 1)
+    )
+  );
+  let mut timeline = marked();
+  timeline.tracks_mut()[0].markers_mut()[0].set_range(TimeRange::new(0, TWO_53 + 1, edit()));
+  assert_eq!(
+    not_representable(&timeline),
+    (
+      Spot::Marker(MarkerAt::Track {
+        track: 0,
+        marker: 0
+      }),
+      i128::from(TWO_53 + 1)
+    )
+  );
+  // A clip's marker of 2^62 thirds of a second: its own ticks, and the
+  // coarsest whole ruler that lands on it — the same thirds — count past
+  // 2^53, and no operand's ruler holds it either.
+  let mut timeline = marked();
+  timeline.tracks_mut()[0].clips_mut()[0].markers_mut()[0].set_range(TimeRange::new(
+    0,
+    1 << 62,
+    tb(1, 3),
+  ));
+  assert_eq!(validate(&timeline), Ok(()));
+  let refused = match to_otio(&timeline, OtioTarget::V0_15Plus) {
+    Err(Refused::NotRepresentable(count)) => count,
+    other => panic!("{other:?}"),
+  };
+  assert_eq!(
+    (refused.at(), refused.value(), refused.rate()),
+    (
+      Spot::Marker(MarkerAt::Clip {
+        clip: crate::ClipAt::new(0, 0),
+        marker: 0
+      }),
+      1_i128 << 62,
+      Rate::hz(3)
+    )
+  );
+  assert_eq!(refused.searched().map(|search| search.walks()), Some(0));
+  assert!(
+    std::string::ToString::to_string(&refused).starts_with(
+      "the marked range of track 0, clip 0, marker 0 counts 4611686018427387904 ticks"
+    ),
+    "{refused}"
+  );
+}
+
 mod derived;
+mod import;

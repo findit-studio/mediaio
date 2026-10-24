@@ -18,6 +18,363 @@ The backend-agnostic core it adapts has its own log at
   keeps — cover art arrives marked `ATTACHED_PIC`, which is what a muxer
   needs to write it back as cover art.
 
+## [0.21.0] - 2026-10-24
+
+The hardware probe's redesign and the video decoders' options. The FFmpeg
+crates release in lockstep, so `mediaio-ffmpeg`, `mediaencode-ffmpeg` and
+`mediaio` are 0.21.0 as well.
+
+### Changed
+
+- **BREAKING: `Error::AllBackendsFailed` is `Error::ProbeExhausted`, and
+  its payload `AllBackendsFailed` is `ProbeExhausted`.** A probe can now
+  run out of backends without any of them failing, since a backend may be
+  unfit for the stream (below), so the name no longer claims a failure.
+  The payload's methods are as they were. Each of its `attempts()` is a
+  backend's failure, as the error it answered, or its unfitness,
+  `Error::DownloadFormatUnsupported` naming the layout.
+- **BREAKING: a hardware probe's replay holds back no frame, and
+  `VideoDecoder::with_max_probe_pending_bytes` is removed.** A backend
+  tried after another fails is sent the probe's own packets, by reference
+  and with no copy made, as far as it takes them before it has output for
+  the caller; the rest it is fed as the caller drains, before anything
+  new. No frame is queued while a backend is on trial, so the budget the
+  method set has nothing left to bound. The packets go back with
+  `ProbeExhausted` only once every decoder has let them go.
+- **BREAKING: a failure of this crate's own while a probe opens or
+  advances is reported as it is, never as `ProbeExhausted`.** A copy of
+  the stream's parameters, or a codec context, that cannot be made is the
+  same for every backend. It used to be recorded against the backend being
+  opened, so it could answer `AllBackendsFailed`, the stream decoder's cue
+  for software, which the same failure meets. It is now the error itself,
+  with the backends still to try kept in the order and the history whole.
+  **And the advance is owed**: the backend the probe was leaving was torn
+  down when it was left, so no decoder lives while the advance is owed,
+  and the next send, end or receive resumes the advance before anything
+  else, its attempt recorded where it was tried. A send meanwhile answers
+  `Sent::MustDrain`, the packet the caller's with no decoder to hold it. A
+  `flush` keeps it owed.
+- **BREAKING: a decoder that answers `ProbeExhausted` at run time, or
+  `AmbiguousSend`, is spent, and every entry after it answers the new
+  `Error::Spent`.** No decoder lives after either: every send, end and
+  receive is refused by name, `Spent::ProbeExhausted` or
+  `Spent::AmbiguousSend`, and a `flush` does not revive it — going on
+  means a new decoder, from the packets the error handed back. An
+  exhausted probe used to flush its last backend to hand the history back
+  and leave it behind as a committed decoder, its end forgotten, so a
+  packet sent after the end was taken; an ended decoder took input again
+  after a `flush`. The stream decoder alike: a path that excludes software
+  and meets its probe's exhaustion, an `Auto` fallback that fails
+  (`FallbackFailed`, `Spent::FallbackFailed`), and an ambiguous send each
+  leave no decoder installed. `is_hardware()` and `is_software()` are both
+  `false` then, `hardware_inner()` is `None`, and every entry answers
+  `Error::Spent`. A failed fallback used to leave the exhausted hardware
+  decoder in place, and the next end drove a second fallback.
+- **BREAKING: a picture whose download would choose a CPU layout a
+  `Frame` cannot carry, or for which the backend lists no layout at all, is
+  no delivery, and on trial its backend is unfit for the stream.** The
+  layout is the first the backend lists for a download, as libavutil's own
+  allocating road picks it, and this crate keeps that choice — a driver's
+  conversion to another layout can lose samples — and reads it before any
+  transfer. A backend that lists none (VAAPI with no device format,
+  D3D11VA on an opaque surface) offers nothing to download into, and is
+  unfit the same way, `DownloadFormatUnsupported` naming `AV_PIX_FMT_NONE`.
+  Such a layout used to be read as the backend failing, with a synthesized
+  `AVERROR(EINVAL)`. Now
+  the probe records the unfitness, naming the layout and never an errno,
+  and leaves the backend as it leaves a failed one, the history replayed
+  whole into the next. With no backend left the probe ends in
+  `ProbeExhausted`, every attempt and every packet with it, on the
+  standalone probe and `DecodePath::AnyHardware` alike: a caller keeps
+  the lossless replay for a software decoder of its own. `DecodePath::Auto`
+  takes the stream to software as before. That includes VAAPI's packed
+  4:2:2 and 4:4:4 downloads (`YUYV422`, `Y210`, `VUYX`, `XV30`) and
+  D3D11VA's (`YUY2`, `Y210`, `AYUV`, `Y410`). **A named limit:** a
+  committed decoder's picture in such a layout is that decoder's
+  `Error::DownloadFormatUnsupported`, for that picture; it used to be
+  `Error::Ffmpeg(EINVAL)`. That covers a mid-stream reconfiguration, a
+  backend committed on a packet the probe could not keep, and a backend
+  pinned alone. Nothing falls back after the commit. A `Frame` that
+  carries the packed layouts hardware downloads is a later change.
+
+### Fixed
+
+- **A hardware probe judges a backend by its own answers alone.** A
+  delivered picture commits a backend on trial and its own error fails
+  it, as before. A clean end — the end taken, then libavcodec's
+  `AVERROR_EOF` with no refusal latched — is now a successful empty
+  completion that commits it too, at every `skip_frame` level and for
+  every codec. A packet past the probe's ceiling (256 packets or 64 MiB)
+  is sent to the candidate with the history whole: taken, it commits the
+  candidate; refused, it fails it, and the next backend is tried with the
+  whole history. So is every packet the probe cannot keep for a replay —
+  one of more than 64 side-data entries, or one whose copy cannot be made
+  — since the probe's own limits are never a backend's answer. They no
+  longer answer `AllBackendsFailed` before the packet is sent, and `Auto`
+  never takes one as its cue for software. After such a commit a failure
+  is the decoder's own error, with no history to replay. No skip level,
+  codec, packet flag or payload is read to guess what a backend should
+  have given. Before, the standalone probe and `DecodePath::AnyHardware`
+  answered `AllBackendsFailed` at either, and `DecodePath::Auto` left for
+  software a hardware decoder that had failed nothing: on a stream of VP9
+  or AV1 hidden frames, an edit list's pre-roll (`AV_PKT_FLAG_DISCARD`),
+  or a run longer than the ceiling with no picture yet.
+- **A backend on trial is charged with its own answers alone, by type.**
+  The probe's replay recorded against the next backend a packet copy that
+  could not be made, for a packet that backend never saw, and the caps of
+  its frame queue against a backend that had produced a picture. Either
+  could answer `AllBackendsFailed`, so `DecodePath::Auto` left for
+  software, and `DecodePath::AnyHardware` failed, with a hardware decoder
+  that worked. The probe now records and advances on a candidate's own
+  calls alone — its open, a send, a receive, a download, and a surface
+  pool its `get_format` declined — and on its unfitness for the stream.
+- **A backend commits at its first delivered picture**: downloaded in a
+  layout a `Frame` carries, its properties copied. A picture over the
+  caller's frame limit is no delivery, as before: `HwTransferTooLarge`,
+  the backend still on trial and charged nothing. A picture whose
+  properties this crate cannot copy is no delivery either, and **no
+  longer the backend's failure**: it is this crate's own error, the
+  backend still on trial and charged nothing, where it used to advance the
+  probe as the backend failing. A backend that this crate's own reason
+  refuses again and again meets the probe's ceiling, which commits it with
+  no failure claimed.
+- **A packet a backend on trial took is kept when this crate refuses it.**
+  libavcodec queues a packet before it decodes it, so the frame budget,
+  refused while a sent packet was decoded, answers a packet the backend
+  took. The probe now keeps it in its history as an accepted packet, or
+  commits the backend where the history cannot keep it, so a later replay
+  holds everything the backend consumed, and the caller does not send it
+  again. Before, its copy was dropped: a backend tried after a later
+  failure was replayed a history without it, and `AllBackendsFailed`
+  handed back packets that did not hold it.
+- **No packet is lost or fed twice where `avcodec_send_packet` leaves in
+  doubt whether it took one.** It answers `AVERROR(ENOMEM)` both when it
+  cannot reference a packet, which it then has not taken, and when the
+  decode it runs after taking one fails for memory (`libavcodec/decode.c`
+  748–757 in FFmpeg 9.0.1). Every road that sends now goes through one
+  door that reads the answer by source: taken, not taken, taken with the
+  decoder's error, or `ENOMEM`, in doubt. A packet the probe's replay had
+  not reached when its backend committed was dropped on any error but
+  `EAGAIN`, so under memory pressure the stream went on past a packet the
+  decoder never took. Now a decoder whose send of such a packet answers
+  `ENOMEM` ends, and hands that packet and every one behind it back
+  (`Error::AmbiguousSend`, below). On trial, a backend's `ENOMEM` leaves it
+  as its own answer, the history replayed whole into the next; where a
+  refusal of this crate's own is latched beside it, the backend can be
+  neither kept nor charged, and the decoder ends the same way. A packet
+  is kept as taken on this crate's own refusal only where the answer says
+  the backend took it.
+- **A send's answer is about its own packet.** `Sent::MustDrain` means the
+  packet was not taken, and an error that it was taken or is refused for
+  good. Three answers broke that. A decoder owed packets — the rest of a
+  replay, or a backlog after the commit — was fed them by the caller's
+  send, which then answered an owed packet's error for a packet it never
+  sent; the sends now answer `Sent::MustDrain` while anything is owed, and
+  the receive road feeds it and reports what it answers. An advance a send
+  starts or resumes that stops at a failure of this crate's own answered
+  that failure for a packet no backend that goes on had seen; it now
+  answers `Sent::MustDrain`, and the drain resumes the advance and reports
+  the failure if it stands. And `EAGAIN` with a refusal latched before the
+  send answered the refusal for a packet the decoder had not taken; it is
+  `Sent::MustDrain` now, and the drain reports the refusal.
+- **A packet of a shape libavcodec refuses charges no backend.** Data with
+  no size is refused with `AVERROR(EINVAL)` before libavcodec references
+  it (`decode.c` 742–743), as is a packet with no buffer of a size it will
+  not allocate. The probe took that `EINVAL` for a backend's answer, so a
+  malformed packet failed every backend in turn; it is the packet's own
+  error now, the backend still on trial. The `EINVAL` a decode answers is
+  told apart by the packet's shape.
+- **A packet with neither payload nor side data is the end**, as
+  libavcodec takes it (`avcodec.h` 2341–2347): `VideoDecoder::send_av_packet`
+  sends it as `send_eof` does. The probe used to record it in its history
+  as a packet while libavcodec started draining.
+- **A backend the probe leaves is torn down at once.** A backend that
+  failed, was unfit, or answered a send `ENOMEM` was kept, with the
+  picture its scratch frame held, while an advance stopped by a failure of
+  this crate's own was owed; a send then answered `Sent::MustDrain` for a
+  packet the decoder it left might still hold a reference to. It is
+  dropped the moment it is left now, before anything is answered, and
+  every reference it held to a packet, the caller's or the history's, goes
+  with it.
+- **A memory failure of the download's own allocations charges no
+  backend.** `av_hwframe_transfer_data` into an empty destination
+  allocates it first (`libavutil/hwcontext.c` 398–446 in FFmpeg 9.0.1), so
+  an `ENOMEM` it answered could be the CPU's as well as the backend's, and
+  a healthy backend under memory pressure was recorded as failing — enough
+  to exhaust the probe and send `Auto` to software. The download is split
+  now: this crate reads the format the backend lists first, checks that a
+  `Frame` carries it, prices it, and allocates the destination itself
+  (`av_frame_get_buffer`); a failure there, or the format list's own
+  `ENOMEM`, is this crate's error, the backend still on trial and charged
+  nothing. `av_hwframe_transfer_data` is then called on a destination with
+  buffers, which libavutil hands straight to the backend's own transfer
+  callback (488–492), and only that answer, its `ENOMEM` included, is the
+  backend's.
+- **The download's ceiling prices the destination it allocates**: the
+  format the download is made in, at the frames context's extent, where it
+  priced the costliest format the backend lists, which over-refused a
+  picture whose first format was cheaper.
+- **A picture whose download runs out of memory is held, not lost.** The
+  download-format list's, the destination's or the properties' copy's
+  `ENOMEM` returned this crate's own error with the decoded picture left in
+  the scratch frame, and the next receive unreferenced it
+  (`avcodec_receive_frame` clears its frame first), so the picture was
+  gone. It is held now, and the next receive downloads it again before it
+  asks the decoder for another: delivered, in order, once. A flush, a
+  rejected candidate or a terminal state drops it. On trial, a picture the
+  backend failed to download while a refusal of this crate's own (the frame
+  budget) was latched beside it is held too: the refusal is answered, and a
+  backend failing again is charged at the next download. A picture over the
+  frame limit is dropped by name, its pts in the refusal.
+- **The scaled-output road charges the backend's own transfer failure to
+  the backend.** A fitted surface whose download failed was taken for the
+  stage's failure whatever the cause: the stage stood down and the
+  full-size frame was downloaded, so a backend's transfer error on trial
+  was never recorded. The fitted download now keeps every failure's class,
+  as the full-size one does, and the stage stands down for reasons of its
+  own alone, all decided before a fitted download.
+
+### Added
+
+- **`Error::AmbiguousSend`**, its payload `AmbiguousSend` with
+  `backend()`, `reason()`, `residual()`, `end_follows()`,
+  `into_residual()` and `into_parts()`: a hardware decoder that ended
+  because libavcodec's `ENOMEM` left unknown whether it took a packet only
+  the decoder held. `residual()` is every packet it may not have taken, in
+  order — after the commit the backlog from that packet on, on trial the
+  whole history — each referenced by its packet alone, and `end_follows()`
+  whether the caller's end comes after them. A packet the caller was
+  sending when the decoder ended is not in it. The decoder is spent after
+  it: every entry answers `Error::Spent`, a `flush` included. No
+  `DecodePath` takes it as the cue for software.
+
+- **`Error::Spent`**, its payload `Spent` (`ProbeExhausted`,
+  `AmbiguousSend`, `FallbackFailed`): what every send, end and receive of a
+  spent decoder answers, naming the error that spent it.
+
+- **`HwTransferTooLarge::pts` and `with_pts`**: the refusal names the
+  picture it drops, by its presentation timestamp, and says that it is
+  dropped.
+
+- **`Error::DownloadFormatUnsupported`**, its payload
+  `DownloadFormatUnsupported` with `format()`, the raw `AVPixelFormat` the
+  download would choose: a backend's unfitness in `ProbeExhausted::attempts`,
+  and a committed decoder's error for a picture in a layout a `Frame`
+  cannot carry.
+
+- **`DecoderOptions`, how a video decoder decodes**: libavcodec's
+  `skip_frame`, `skip_loop_filter` and `skip_idct`, each a `Discard`
+  (both re-exported from `mediaio-ffmpeg` 0.21.0, with
+  `ParseDiscardError`). They are written into every video codec context
+  a decoder opens — each hardware candidate, a probe advance, the
+  software decoder and a fallback's — and read back by `options()`. On a
+  temporally scalable HEVC stream `Discard::NonReference` also skips
+  pictures a higher sub-layer references, which the bitstream's
+  `DISPOSABLE` never marks. Which levels a decoder reads is the decoder's
+  — FFmpeg 9.0.1's VP9 decoder reads none, its native AV1 decoder
+  `NonIntra`, `NonKey` and `All` alone, and `libdav1d` decodes key frames
+  under `All` — so the hardware probe runs under every level, `All` among
+  them, and weighs a backend by its answers alone.
+- **One open road per video decoder, through an open request.** Each
+  request holds every optional of its decoder's construction, with a
+  getter, a consuming `with_*` and an in-place `set_*`, and is
+  `#[non_exhaustive]`: a later optional joins the request, not the
+  constructor list.
+  - The stream decoder: `VideoStreamDecoderOpen` (the `DecodePath`, and
+    the `DecoderOptions`) and
+    `FfmpegVideoStreamDecoder::open_from(request, parameters, time_base,
+    limits)`. `open` and `open_as` keep their signatures and behaviour,
+    each opening the request its arguments spell.
+  - The standalone decoder: `VideoDecoderOpen` (the probe or one pinned
+    backend, the limits, the packet timebase, and the `DecoderOptions`)
+    and `VideoDecoder::open_from(request, parameters)`. The eight `open*`
+    constructors keep their signatures and behaviour, each opening the
+    request its arguments spell.
+
+## [0.20.0] - 2026-10-23
+
+### Changed
+
+- **The demuxer marks `PacketFlags::DISPOSABLE` from the bitstream.**
+  A video packet of an H.264 or HEVC track is marked where its NAL units
+  prove that nothing references its picture (`mediadecode::nal`): a
+  non-reference H.264 picture, or an HEVC sub-layer non-reference picture
+  at the highest temporal sub-layer, with nothing beside it a later
+  picture needs, read with the `AV_PKT_DATA_NEW_EXTRADATA` it carries as
+  the decoder takes the two, and told of every seek. **Where a track is
+  read, its reading decides: the container's own mark (MP4's `sdtp`) is
+  cleared on every other verdict**, since a picture nothing references
+  may still take up SEI state an earlier packet left — film grain a
+  skipped RASL picture's SEI left, for one. A track not read keeps the
+  container's mark, as FFmpeg delivers it, which on an H.264 track of MP4
+  is none: libavformat parses its headers as it reads, and rebuilds each
+  packet's flags without the mark. Every packet is read, a corrupt one
+  too, as the decoder reads it; a corrupt one is never marked. **A packet
+  carrying side data that persists past it — a new configuration, a
+  parameter change, a palette, captions, and any type this build does not
+  name — is never `DISPOSABLE`: the container's mark is cleared there
+  too.** **A container is read only where the caller declares its
+  demuxer's inputs plaintext** (`DemuxerOpen::plaintext_demuxers`).
+  FFmpeg cannot prove a container's payload plaintext — an MP4 track
+  protected under OMA DRM 2's PDCF reaches the demuxer as ciphertext,
+  `frma` having replaced its `encv` four-cc, with nothing public to say
+  so — so by default the raw `h264` and `hevc` elementary streams alone
+  are read, plaintext by construction, and every other demuxer, `mov`
+  among them, is container-only. **The declaration is the caller's
+  assertion, and its risk the caller's:** that no input it opens through
+  a declared demuxer is encrypted content to be decrypted downstream; an
+  encrypted input's ciphertext, read as a bitstream, can be marked
+  falsely. **Inside a declared demuxer an encrypted payload is never
+  read:** a packet carrying `AV_PKT_DATA_ENCRYPTION_INFO` or
+  `AV_PKT_DATA_ENCRYPTION_INIT_INFO` gets no bitstream mark, and its
+  track's reading stops there for the rest of the stream, a seek
+  included, latched as the packet is read, whatever becomes of it
+  (delivered, refused by a limit, parked, or discarded by a seek); and a
+  track FFmpeg names encrypted at the open — a stream's
+  `ENCRYPTION_INIT_INFO` from `pssh`, its `enc_key_id`, or a `codec_tag`
+  of `encv` — is never read at all. What no signal answers is named, by
+  demuxer, with the option: in `mov`, a protection scheme with no CENC
+  index and no `pssh`, such as PDCF, and a protected sample description
+  that is not the track's first; in Matroska and WebM, encryption without
+  a key id; in ASF, WTV, MXF and MPEG-TS, every encryption; through
+  `concat`, `hls` and `dash`, every input they open. **More packets are
+  marked DISPOSABLE on the raw H.264 and HEVC streams, and on the H.264
+  and HEVC tracks of a declared container, so a consumer that drops them
+  decodes fewer pictures**: two in three of a Sony XAVC original, which
+  carries no `sdtp` and was marked nowhere before, where `mov` is
+  declared. An H.264 stream whose sequence parameter set codes
+  fields, lets `frame_num` jump, or leaves the reorder depth to FFmpeg's
+  guess (no `bitstream_restriction_flag`) is marked nowhere. The flag's
+  contract is unchanged — absent means unknown — and its promise is
+  pixels: dropping a marked packet changes no later picture's pixels, but
+  may move a later frame's best-effort timestamp
+  (`VideoFrameExtra::best_effort_timestamp`, FFmpeg's guess from every
+  frame decoded before), as dropping a packet `sdtp` marks may. A
+  consumer reads the frame's `pts`, its packet's, for the exact one.
+- **BREAKING: FFmpeg 9 is the floor.** This crate builds against FFmpeg
+  9 or newer and no older release: the build script of `mediaio-ffmpeg`
+  0.20.0, the base it is built on, reads the linked release from
+  `ffmpeg-sys-next`'s `links` metadata (`DEP_FFMPEG_FFMPEG_9_0`, set from
+  libavcodec 63.1, FFmpeg 9.0's) and refuses an older FFmpeg by name. Every
+  FFmpeg 9 packet side-data kind is named as its headers name it: no
+  version gates, and a kind a later FFmpeg adds persists, so its packet is
+  never `DISPOSABLE`.
+
+### Added
+
+- **`DemuxerOpen`, one open road for the demuxer**, holding every
+  optional of its construction — the session's `DemuxLimits`, and the
+  demuxers whose inputs the caller declares plaintext — each with a
+  getter, a consuming `with_*` and an in-place `set_*`, and
+  `#[non_exhaustive]`, so a later optional joins the request, not the
+  constructor list. `CarrierDemuxer::open_from(path, request)` and
+  `open_reader_from(reader, url, request)` open it; `open`, `open_with`,
+  `open_reader` and `open_reader_with` keep their signatures, each opening
+  the request its arguments spell, which declares no demuxer.
+- `DemuxerName` and `UnregisteredDemuxer`, re-exported from
+  `mediaio-ffmpeg` 0.20.0: a demuxer the linked FFmpeg registers, by its
+  whole name, and the refusal, by name, of a name it does not register.
+
 ## [0.19.0] - 2026-10-16
 
 The FFmpeg crossings move to the new base crate,

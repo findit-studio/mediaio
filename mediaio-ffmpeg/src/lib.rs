@@ -36,6 +36,7 @@ pub mod frame;
 pub mod limits;
 #[doc(hidden)]
 pub mod measured;
+pub mod options;
 // The muxing context: public because the write adapter
 // (`mediaencode-ffmpeg`) drives it, hidden because nothing else should.
 // It takes no pointer from a caller, so nothing in it is an `unsafe fn`.
@@ -83,7 +84,7 @@ pub use channel_layout::{
   channel_order_from_ffmpeg,
 };
 pub use codec_id::CodecId;
-pub use container::ContainerFormat;
+pub use container::{ContainerFormat, DemuxerName, UnregisteredDemuxer};
 pub use error::{
   CrossingError, ParametersAlloc, ParametersChannelMap, ParametersCopy, ParametersError,
   ParametersLayoutShape, ParametersMissing, ParametersOpaque, ParametersTooLarge,
@@ -97,6 +98,7 @@ pub use limits::{
   DEFAULT_MAX_TOTAL_CODEC_PARAMETER_BYTES, DEFAULT_MAX_TOTAL_STREAM_METADATA_BYTES, DecoderLimits,
   DemuxLimits, FrameLimits, PacketLimits,
 };
+pub use options::{DecoderOptions, Discard, ParseDiscardError};
 #[cfg(feature = "resample")]
 #[cfg_attr(docsrs, doc(cfg(feature = "resample")))]
 pub use resampler::{
