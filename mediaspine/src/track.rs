@@ -314,8 +314,10 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
   }
 
   /// Splits the description into its timebase, parameters, extradata,
-  /// side data, language, disposition and — for an attachment track —
-  /// its file.
+  /// side data, language and — for an attachment track — its file.
+  ///
+  /// The disposition is `Copy`, and is not among the parts: read it with
+  /// [`disposition`](Self::disposition) before the split.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn into_parts(
     self,
@@ -325,7 +327,6 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
     Option<D>,
     S,
     Option<E::Text>,
-    TrackDisposition,
     Option<AttachedFile<E, D>>,
   ) {
     (
@@ -334,7 +335,6 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
       self.extradata,
       self.side_data,
       self.language,
-      self.disposition,
       self.file,
     )
   }
@@ -660,8 +660,8 @@ mod tests {
     description.side_data_mut()[1] = 8;
     assert_eq!(description.side_data(), &[7, 8]);
 
-    let (timebase, params, extradata, side_data, language, disposition, file) =
-      description.into_parts();
+    let disposition = description.disposition();
+    let (timebase, params, extradata, side_data, language, file) = description.into_parts();
     assert_eq!(timebase, ms_tb());
     assert_eq!(params.kind(), TrackKind::Video);
     assert_eq!(extradata, Some(AVCC));

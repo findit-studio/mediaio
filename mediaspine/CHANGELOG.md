@@ -7,7 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with the rest of the family's.
 
-## [Unreleased]
+## [0.1.2] - unreleased
 
 ### Added
 
@@ -16,7 +16,8 @@ Its versions are its own: they do not move with the rest of the family's.
   their `with_` and `set_` builders) carry the container's
   `AV_DISPOSITION_*` bits as `mediaframe`'s `TrackDisposition`,
   re-exported from `mediaspine::demuxer`, whole — an unnamed bit
-  included. `from_track_info` copies it, and `into_parts` returns it.
+  included. `from_track_info` copies it. `into_parts` keeps its shape: the
+  disposition, `Copy`, is read with `disposition()` before the split.
 
 ## [0.1.1] - 2026-10-23
 

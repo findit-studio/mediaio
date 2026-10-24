@@ -9,7 +9,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
-## [Unreleased]
+## [0.21.1] - unreleased
 
 ### Added
 
