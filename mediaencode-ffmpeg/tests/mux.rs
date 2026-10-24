@@ -1194,12 +1194,29 @@ fn written_text(corpus: &Corpus, name: &str, text: &str) -> PathBuf {
   out
 }
 
-/// AV1 video, made by SVT-AV1, in Matroska.
+/// A 64 × 64 AV1 temporal unit — a temporal delimiter, a sequence header
+/// and one shown key frame — as SVT-AV1 4.2 encodes a grey picture at its
+/// lowest quality (`ffmpeg -f lavfi -i color=c=gray:s=64x64 -frames:v 1
+/// -c:v libsvtav1 -crf 63 -preset 12`).
+const AV1_TEMPORAL_UNIT: [u8; 29] = [
+  0x12, 0x00, 0x0A, 0x0B, 0x02, 0x00, 0x00, 0x05, 0x15, 0x7F, 0xFC, 0x4A, 0xF9, 0x00, 0x40, 0x32,
+  0x0C, 0x10, 0x00, 0xF3, 0x82, 0x3F, 0xFE, 0x69, 0x83, 0x00, 0x00, 0x05, 0x80,
+];
+
+/// AV1 video in Matroska, made with no AV1 encoder: ten
+/// [`AV1_TEMPORAL_UNIT`]s, read as a low-overhead bitstream (the `obu`
+/// demuxer, at its default 25 frames a second) and copied. An `ffmpeg` CLI
+/// need not be built with an AV1 encoder, and CI's is not; every build has
+/// the `obu` demuxer and the Matroska muxer, and the copy carries the
+/// sequence header as the track's configuration (`av1C`).
 #[rustfmt::skip]
 fn av1_mkv(corpus: &Corpus) -> PathBuf {
+  let units = output(corpus, "av1.obu");
+  if !units.exists() {
+    std::fs::write(&units, AV1_TEMPORAL_UNIT.repeat(10)).expect("write");
+  }
   generated(corpus, "av1.mkv", &[
-    "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25:duration=0.4",
-    "-c:v", "libsvtav1", "-preset", "12", "-pix_fmt", "yuv420p",
+    "-f", "obu", "-i", units.to_str().expect("utf-8 path"), "-c:v", "copy",
   ])
 }
 
