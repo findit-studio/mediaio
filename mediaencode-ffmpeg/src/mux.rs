@@ -278,8 +278,8 @@
 //! | VC-1's and TrueHD's sync read from the bitstream | 7344–7348 | reported ([`Rewrite::SyncFromBitstream`]) |
 //! | an empty packet, dropped | 7431–7441 | [`PayloadRule::Empty`] |
 //! | a cover's one picture, a second ignored | 7606–7618 | the cover road writes one |
-//! | `mov_text`'s cue ends | 7625–7656 | [`FfmpegMuxRefusal::CueOrder`]; reported ([`Rewrite::CueEnds`]) |
-//! | libavcodec's TTML paragraphs, held for one document | 7658–7684 | reported ([`Rewrite::ParagraphsJoined`]); its size, table B |
+//! | `mov_text`'s cue ends | 7625–7656 | [`FfmpegMuxRefusal::CueOrder`]; the samples MP4 makes around the cues, table C′; reported ([`Rewrite::CueEnds`]) |
+//! | libavcodec's TTML paragraphs, held for one document | 7658–7684 | the one sample MP4 joins them into, table C′; its size, table B; reported ([`Rewrite::ParagraphsJoined`]) |
 //! | IAMF's packets; MOV's raw video and palette | 7594–7603; 7688–7720 | not reached: no stream group; MOV's mode alone |
 //!
 //! **MP4, the trailer** — the `moov`, written at the end (`mov_write_trailer`, 9013–9140):
@@ -298,7 +298,29 @@
 //! | TTML's codec tag | 2259–2280 | not reached: the header refuses `dfxp` outside ISMV first (8603–8609), a fault at open |
 //! | libavcodec's TTML joined into one document: its header strings, its size | `movenc_ttml.c` 236–317; `ttmlenc.c` 82–122 | [`MuxOpenError::ConfigurationInvalid`]; [`PayloadRule::DocumentSize`] |
 //! | the cover: an empty picture skipped | 4823 | table E |
-//! | the chapters: a text track and a Nero list | 7727–7815; 5040–5064 | table E |
+//! | the chapters: a text track and a Nero list | 7727–7815; 5040–5064 | the track's samples, table C′; the report, table E |
+//!
+//! **MP4, the packets it makes itself** (table C′) — every place MP4's
+//! writer makes or hands on a packet of its own, by grep (#82's R5 lists
+//! each `ff_mov_write_packet`, `mov_write_single_packet` and
+//! `mov_write_subtitle_end_packet` call, every `av_new_packet`,
+//! `av_packet_alloc` and `av_packet_ref` in `movenc.c` and `movenc_ttml.c`,
+//! by the function it is in). Each meets `check_pkt` as a caller's packet
+//! does (6897–6930), and is held here to it, or reported:
+//!
+//! | packet | made by, and when | its times, and the rules it meets | here |
+//! |---|---|---|---|
+//! | a chapter's sample | `mov_create_chapter_track`, at the header (7727–7815, from 8851–8853) | each titled chapter's start and end counted in the movie timescale — `av_gcd_q` of the streams' time bases, at least 1000 (8427–8446) — its duration their distance; the first counted from zero, the track's start being 0 (8448–8474), each later one from the last; `ff_mov_write_packet`'s answer ignored (7807): a duration past `INT_MAX` loses the sample, a start before the last or `INT_MAX` or more after it is moved | refused at open ([`MuxOpenError::ChapterSample`]), the movie timescale mirrored |
+//! | an empty `mov_text` sample | `mov_write_subtitle_end_packet` (7479–7497), from `mov_write_packet` before any packet past a cue's end (7625–7656), at zero before the first cue, and from the trailer after the last (9025–9031) | the end of the last cue, its decode time; `check_pkt` counts its gap from that cue's decode time, and the next cue's from it | a cue's duration below `INT_MAX` ([`FfmpegMuxRefusal::DurationTooLong`]); the next cue's gap counted from the last one's end, the first's from zero ([`FfmpegMuxRefusal::DtsGap`]); reported ([`Rewrite::CueEnds`]) |
+//! | TTML's joined sample | `mov_write_squashed_packet` at the trailer (6579–6615, from 9036–9037), its bytes `ff_mov_generate_squashed_ttml_packet`'s document (`movenc_ttml.c` 236–317) | from zero to the latest paragraph's end (108–110, 178, 212–213, 305–306); no paragraph meets `check_pkt` itself; refused past `INT_MAX` ticks, failing the trailer and the file | a paragraph ending past `INT_MAX` refused ([`FfmpegMuxRefusal::DocumentSpan`]); its bytes, table B; reported ([`Rewrite::ParagraphsJoined`]) |
+//! | a timecode track's sample | `mov_create_timecode_track` (7827–7870), at the header, for a video stream with `timecode` metadata, or the context's (8339–8369, 8865–8885) | — | never made: the context and its streams carry no `timecode` ([`Output`] writes a stream's language, filename and MIME type alone) |
+//! | E-AC-3's joined samples | `handle_eac3` (464–610) | table C's packet path | table C |
+//! | the cover's picture | held by `mov_write_packet` (7606–7618), written by `mov_write_covr` at the trailer (4815–4839) | — | the cover road writes one |
+//! | an RTP hint packet | `ff_mov_add_hinted_packet` (`movenchint.c` 405–429), with `-movflags rtphint` alone | — | never made: no flag is set |
+//!
+//! Matroska makes no packet of its own: the audio packet it holds back
+//! (3255–3271, 3300–3306) is the caller's, under the rules its own write
+//! met.
 //!
 //! **MP4, the header** (`mov_init`, 8129–8700; `mov_write_header`): refused
 //! by name first — TrueHD's experiment (8580–8587); libavformat's own
@@ -372,7 +394,7 @@
 //! | Matroska's default flag | written as declared: its `default_mode` is `passthrough` (`matroskaenc.c` 3684) | — |
 //! | an attachment of no bytes | Matroska's reader drops it as incomplete (`matroskadec.c` 3510–3512); MP4 skips the cover (`movenc.c` 4823) | not written, and reported at open ([`Uncarried::Attachment`]) |
 //! | a chapter's id | MP4 keeps none: its reader numbers chapters by position (`mov.c`'s `chpl` and chapter track); Matroska renumbers every chapter from 1 where one's id is 0 or repeats (`matroskaenc.c` 2399–2442) | reported at open ([`Uncarried::ChapterId`]) |
-//! | a chapter's span | MP4 counts it in its movie's milliseconds and its reader ends each chapter where the next starts (`movenc.c` 7727–7815); Matroska counts it in nanoseconds (2439–2440), each rounded to the nearest | reported at open where an instant moves ([`Uncarried::ChapterSpan`]) |
+//! | a chapter's span | MP4 counts it in its movie timescale (table C′) and its reader ends each chapter where the next starts (`movenc.c` 7727–7815); Matroska counts it in nanoseconds (2439–2440), each rounded to the nearest | reported at open where an instant moves ([`Uncarried::ChapterSpan`]) |
 //! | a chapter without a title, a title past 65535 bytes | MP4 writes every chapter into its Nero list but a titled one alone into its chapter track, which its reader lays over the list by position; a title with a 16-bit length (`movenc.c` 7791–7807) | refused at open ([`MuxOpenError::ChapterWithoutTitle`], [`ChapterTitleTooLong`](MuxOpenError::ChapterTitleTooLong)) |
 //! | VP9's hidden frames, still held at the stream's end | dropped by the filter, which no later frame shows (`vp9_superframe.c` 198–207) | stated with the filter ([`AutomaticFilter::Vp9Superframe`]): the muxer cannot know at a held frame that none will follow, and does not refuse the file at `finish` for it |
 //! | PGS segments, still held at the stream's end | written as one packet marked corrupt (`pgs_frame_merge.c` 79–84) | stated with the filter ([`AutomaticFilter::PgsFrameMerge`]) |
@@ -824,7 +846,8 @@ pub enum Uncarried {
   },
   /// A chapter's start or end the container does not keep: it reads back
   /// at another instant — table E of the census. MP4 counts a chapter's
-  /// times in its movie's milliseconds, and its reader ends each chapter
+  /// times in its movie timescale, which its streams' time bases make
+  /// (`mov_init`, `movenc.c` 8427–8446), and its reader ends each chapter
   /// where the next starts (`mov_create_chapter_track`, `movenc.c`
   /// 7727–7815); Matroska counts them in nanoseconds (2439–2440). Each
   /// rescale rounds to the nearest (`av_rescale_q`).
@@ -1105,6 +1128,20 @@ pub enum FfmpegMuxRefusal {
     track: TrackIndex,
     /// The decode time offered.
     dts: Timestamp,
+  },
+  /// MP4 TTML from libavcodec's TTML encoder: a paragraph ending more than
+  /// `i32::MAX` ticks after zero. MP4 joins the track's paragraphs at the
+  /// trailer into one sample from zero to the latest end, and refuses a
+  /// sample longer than `i32::MAX` ticks there, failing its trailer and the
+  /// whole file (`movenc_ttml.c` 108–110, 212–213, 305–306; `check_pkt`,
+  /// `movenc.c` 6925–6928; 9036–9037). Refused at the paragraph that would
+  /// pass it.
+  #[error("track {}: the paragraph at {} ends too far after zero for MP4's joined TTML", .track.get(), .pts.pts())]
+  DocumentSpan {
+    /// The track.
+    track: TrackIndex,
+    /// The paragraph's presentation time.
+    pts: Timestamp,
   },
   /// MP4: a presentation more than `i32::MAX` ticks after its decode,
   /// beyond MP4's 32-bit composition offset (`movenc.c` 6955–6959; the
@@ -1574,6 +1611,20 @@ pub enum MuxOpenError {
   /// `matroskaenc.c` 2445–2451) — or one its own time base cannot count.
   #[error("chapter {chapter}'s span runs backwards or before zero")]
   ChapterSpan {
+    /// The chapter's position in the table.
+    chapter: usize,
+  },
+  /// MP4: a chapter whose sample in the chapter track MP4 makes at its
+  /// header MP4 would refuse or rewrite — table C′ of the census (see [the
+  /// module](self)). MP4 counts each chapter in its movie timescale, which
+  /// its streams' time bases make, and hands each sample to its packet
+  /// writer, ignoring its answer (`mov_create_chapter_track`, `movenc.c`
+  /// 7727–7815): a chapter longer than `i32::MAX` ticks loses its sample and
+  /// lays every later title over another chapter; one starting before the
+  /// last chapter, or `i32::MAX` ticks or more after it, is moved to one tick
+  /// after (`check_pkt`, 6897–6930).
+  #[error("chapter {chapter}'s sample in MP4's chapter track would be refused or moved")]
+  ChapterSample {
     /// The chapter's position in the table.
     chapter: usize,
   },
@@ -3287,6 +3338,21 @@ where
         }
       }
     }
+    // MP4's chapter track, whose samples MP4 makes at its header from the
+    // chapters, counted in the movie timescale its streams' time bases make
+    // (table C′ of the census).
+    let movie_timescale = mp4_movie_timescale(
+      tracks
+        .iter()
+        .zip(&roads)
+        .filter(|(_, road)| !matches!(road, Road::NotWritten))
+        .map(|(description, _)| description),
+    );
+    if family == Family::Mp4
+      && let Some(chapter) = mp4_chapter_sample_refused(chapters, &spans, movie_timescale)
+    {
+      return Err(MuxOpenError::ChapterSample { chapter });
+    }
     // MP4's default selection, which needs the whole table (table E).
     let defaults_added = mp4_defaults_added(family, &tracks, &roads);
 
@@ -3358,7 +3424,7 @@ where
     }
     report
       .uncarried
-      .extend(chapter_losses(family, chapters, &spans));
+      .extend(chapter_losses(family, chapters, &spans, movie_timescale));
     for (index, (chapter, (start, end))) in chapters.iter().zip(spans).enumerate() {
       output
         .add_chapter(
@@ -3740,9 +3806,12 @@ struct Timed {
 
 /// Holds a packet's times to the rows of the packet-rule table that judge
 /// them, in the table's order: a negative duration; MP4's 32-bit fields,
-/// against `last`, the decode time of the last packet whose times reached
-/// it; a missing presentation time on a stream that reorders; a time before
-/// the earliest the container writes.
+/// against `last`, the decode time of the last sample MP4 wrote on the track
+/// — the last packet whose times reached it, or for `mov_text` the empty
+/// sample MP4 marks the last cue's end with, at zero before the first — or,
+/// for TTML's paragraphs, the one sample MP4 joins them into; a missing
+/// presentation time on a stream that reorders; a time before the earliest
+/// the container writes.
 fn check_times(
   rules: &PacketRules,
   last: Option<i64>,
@@ -3763,9 +3832,30 @@ fn check_times(
   {
     return Err(FfmpegMuxRefusal::NegativeDuration { track, duration });
   }
-  if rules.mp4 {
+  if rules.mp4 && rules.ttml_document.is_some() {
+    // MP4 holds libavcodec's TTML paragraphs back, and joins them at the
+    // trailer into one sample from zero to the latest end (`movenc.c`
+    // 7658–7684; `movenc_ttml.c` 108–110, 178, 212–213, 305–306): no
+    // paragraph meets `check_pkt`, and the joined sample meets it with that
+    // end for its duration, refused past `INT_MAX` with the trailer — the
+    // whole file (6925–6928, 9036–9037).
+    if i128::from(pts_ticks.unwrap_or(dts_ticks)) + i128::from(duration_ticks) > limit {
+      return Err(FfmpegMuxRefusal::DocumentSpan {
+        track,
+        pts: pts.unwrap_or(dts),
+      });
+    }
+  } else if rules.mp4 {
+    // `mov_text`: an empty sample follows each cue at its end (7625–7656,
+    // 9025–9031), its decode time the cue's own and the cue's duration
+    // after, which `check_pkt` moves where it is `INT_MAX` or more.
+    let longest = if rules.cues_in_order {
+      limit - 1
+    } else {
+      limit
+    };
     if let Some(duration) = duration
-      && i128::from(duration_ticks) > limit
+      && i128::from(duration_ticks) > longest
     {
       return Err(FfmpegMuxRefusal::DurationTooLong { track, duration });
     }
@@ -3824,7 +3914,19 @@ fn check_packet_rules(
   // holds does not meet: its times never reach libavformat's timing or the
   // container.
   if reaches {
-    check_times(rules, state.last_ticks, timed)?;
+    // The last sample MP4 wrote on a `mov_text` track is the empty one at the
+    // last cue's end, or the one at zero before the first (`movenc.c`
+    // 7625–7656); `check_pkt` counts the next cue's gap from it.
+    let last = if rules.cues_in_order {
+      Some(
+        state
+          .cue_end
+          .map_or(0, |end| i64::try_from(end).unwrap_or(i64::MAX)),
+      )
+    } else {
+      state.last_ticks
+    };
+    check_times(rules, last, timed)?;
   }
   let cue_end = if rules.cues_in_order {
     if dts_ticks < 0 || state.cue_end.is_some_and(|end| i128::from(dts_ticks) < end) {
@@ -4934,20 +5036,20 @@ fn same_instant(a: i64, a_base: Timebase, b: i64, b_base: Timebase) -> bool {
 
 /// What `family` does not keep of `chapters`, each counted as `spans` in
 /// its own time base — table E of the census: MP4 numbers chapters by
-/// position and counts them in its movie's milliseconds, each ending where
-/// the next starts; Matroska renumbers them all from 1 where an id is 0 or
-/// repeats, and counts them in nanoseconds. Another container's chapters
-/// are its own.
+/// position and counts them in its movie timescale, `movie_timescale`
+/// ([`mp4_movie_timescale`]), each ending where the next starts; Matroska
+/// renumbers them all from 1 where an id is 0 or repeats, and counts them in
+/// nanoseconds. Another container's chapters are its own.
 fn chapter_losses(
   family: Family,
   chapters: &[Chapter<Ffmpeg>],
   spans: &[(i64, i64)],
+  movie_timescale: i64,
 ) -> Vec<Uncarried> {
   let mut lost = Vec::new();
   match family {
     Family::Mp4 => {
-      // `movie_timescale`, MP4's default (`movenc.c`'s options).
-      const MOVIE_UNITS: i64 = 1000;
+      let movie_units = movie_timescale;
       for (index, (chapter, &(start, end))) in chapters.iter().zip(spans).enumerate() {
         if chapter.id() != index as i64 {
           lost.push(Uncarried::ChapterId {
@@ -4960,9 +5062,9 @@ fn chapter_losses(
           (Some(next), Some(&(next_start, _))) => {
             same_instant(end, base, next_start, next.timebase())
           }
-          _ => counts_exactly(end, base, MOVIE_UNITS),
+          _ => counts_exactly(end, base, movie_units),
         };
-        if !counts_exactly(start, base, MOVIE_UNITS) || !ends_where_the_next_starts {
+        if !counts_exactly(start, base, movie_units) || !ends_where_the_next_starts {
           lost.push(Uncarried::ChapterSpan { chapter: index });
         }
       }
@@ -4991,6 +5093,110 @@ fn chapter_losses(
     Family::Other => {}
   }
   lost
+}
+
+/// `AV_CODEC_ID_TIMED_ID3`, whose stream MP4 makes no track of (`mov_init`,
+/// `movenc.c` 8309–8313).
+const TIMED_ID3: CodecId =
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_TIMED_ID3 as i32);
+
+/// MP4's movie timescale for the streams `written` describes, as `mov_init`
+/// makes it from their time bases before any track's own is chosen
+/// (`movenc.c` 8427–8446 in FFmpeg 9.0.1): `av_gcd_q` over every stream but
+/// a timed ID3 one — the least common multiple of their denominators while
+/// it stays below `INT_MAX`, else none, for good (`libavutil/rational.c`
+/// 188–195) — and at least 1000, `MOV_TIMESCALE`. A time base of numerator
+/// 0 is libavformat's to give first: an audio stream's its sample rate's,
+/// another's 90 kHz (`init_muxer`, `mux.c` 228–234). The chapter track's
+/// samples, and the chapters MP4 reads back, are counted in it (7758,
+/// 7788–7789).
+fn mp4_movie_timescale<'a, D: AsRef<[u8]> + 'a>(
+  written: impl Iterator<Item = &'a TrackDescription<Ffmpeg, D, CodecTicket>>,
+) -> i64 {
+  use ffmpeg_next::ffi::AVMediaType as M;
+  movie_timescale(
+    written
+      .filter(|description| description.codec() != TIMED_ID3)
+      .map(|description| {
+        let ticket = description.side_data();
+        let time_base = description.timebase();
+        let rate = ticket.sample_rate();
+        if time_base.num() != 0 {
+          i64::from(time_base.den().get())
+        } else if ticket.codec_type() == M::AVMEDIA_TYPE_AUDIO as i32 && rate > 0 {
+          i64::from(rate)
+        } else if ticket.codec_type() == M::AVMEDIA_TYPE_AUDIO as i32 && rate < 0 {
+          // `avpriv_set_pts_info` ignores a rate that is not positive.
+          i64::from(time_base.den().get())
+        } else {
+          90_000
+        }
+      }),
+  )
+}
+
+/// `mov_init`'s fold of `av_gcd_q` over the time bases' denominators
+/// `dens`, from `{0, 1}` (`movenc.c` 8427–8446): their least common
+/// multiple while it stays below `INT_MAX`, else none for good
+/// (`libavutil/rational.c` 188–195), and at least 1000.
+fn movie_timescale(dens: impl Iterator<Item = i64>) -> i64 {
+  // `av_gcd`: the positive greatest common divisor, a zero argument
+  // answering the other (`libavutil/mathematics.c` 37–55).
+  fn gcd(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.unsigned_abs(), b.unsigned_abs());
+    while b != 0 {
+      (a, b) = (b, a % b);
+    }
+    a as i64
+  }
+  let mut den: i64 = 1;
+  for stream_den in dens {
+    if den == 0 {
+      break;
+    }
+    let lcm = (den / gcd(den, stream_den)) * stream_den;
+    den = if lcm < i64::from(i32::MAX) { lcm } else { 0 };
+  }
+  if den == 0 {
+    den = 1000;
+  }
+  den.max(1000)
+}
+
+/// The first of `chapters`, counted as `spans` in their own time bases,
+/// whose sample in MP4's chapter track MP4 would refuse or rewrite. MP4
+/// makes one sample a titled chapter at its header — its start and end each
+/// counted in the movie timescale `movie_timescale`, rounded to the nearest
+/// (`av_rescale_q`), its duration their distance — and hands each to
+/// `ff_mov_write_packet`, ignoring its answer (`mov_create_chapter_track`,
+/// `movenc.c` 7727–7815): `check_pkt` refuses a duration past `INT_MAX`,
+/// which loses the sample and lays every later title over another chapter,
+/// and moves a start before the last, or `INT_MAX` or more after it, to one
+/// tick after (6897–6930) — the first's counted from zero, as no track past
+/// the streams is given `AV_NOPTS_VALUE` for its start (8448–8474).
+fn mp4_chapter_sample_refused(
+  chapters: &[Chapter<Ffmpeg>],
+  spans: &[(i64, i64)],
+  movie_timescale: i64,
+) -> Option<usize> {
+  let limit = i128::from(i32::MAX);
+  let mut last = 0i128;
+  for (index, (chapter, &(start, end))) in chapters.iter().zip(spans).enumerate() {
+    let base = chapter.timebase();
+    let count = |ticks: i64| {
+      i128::from(rescale_nearest(
+        i128::from(ticks),
+        i128::from(base.num()) * i128::from(movie_timescale),
+        i128::from(base.den().get()),
+      ))
+    };
+    let (start, end) = (count(start), count(end));
+    if start < last || start - last >= limit || end - start > limit || end < start {
+      return Some(index);
+    }
+    last = start;
+  }
+  None
 }
 
 /// A chapter's span in its own time base, or a refusal naming it.

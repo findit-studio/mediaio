@@ -1832,3 +1832,69 @@ fn pcm_rechunkings_sample_size_is_counted_in_an_int() {
     "no fixed width: no filter takes it"
   );
 }
+
+/// **MP4's movie timescale is `mov_init`'s fold of `av_gcd_q`**: the least
+/// common multiple of the streams' denominators below `INT_MAX`, at least
+/// 1000, none for good once it passes.
+#[test]
+fn mp4s_movie_timescale_is_mov_inits_fold() {
+  let of = |dens: &[i64]| movie_timescale(dens.iter().copied());
+  assert_eq!(of(&[]), 1000, "no stream: MOV_TIMESCALE");
+  assert_eq!(of(&[1000]), 1000);
+  assert_eq!(of(&[25]), 1000, "at least 1000");
+  assert_eq!(of(&[90_000, 48_000]), 720_000);
+  assert_eq!(of(&[90_000, 44_100]), 4_410_000);
+  assert_eq!(of(&[1_000_000, 48_000, 30_000]), 6_000_000);
+  // Past `INT_MAX` the fold keeps `{1, 0}`: 1000, whatever follows.
+  assert_eq!(of(&[2_147_483_629, 2]), 1000);
+  assert_eq!(of(&[2_147_483_629, 2, 90_000]), 1000);
+}
+
+/// **MP4's chapter track refuses or moves the samples `check_pkt` would**:
+/// counted in the movie timescale, a duration past `INT_MAX`, a start
+/// `INT_MAX` or more after the last — the first's after zero — or before it.
+#[test]
+fn mp4s_chapter_samples_are_held_to_check_pkt() {
+  let chapter = |start: i64, end: i64| {
+    Chapter::<Ffmpeg>::new(
+      0,
+      millis(),
+      Timestamp::new(start, millis()),
+      Timestamp::new(end, millis()),
+    )
+  };
+  let refused = |spans: &[(i64, i64)], timescale: i64| {
+    let chapters: Vec<_> = spans
+      .iter()
+      .map(|&(start, end)| chapter(start, end))
+      .collect();
+    mp4_chapter_sample_refused(&chapters, spans, timescale)
+  };
+  let edge = i64::from(i32::MAX);
+  assert_eq!(refused(&[(0, edge)], 1000), None, "INT_MAX ticks long");
+  assert_eq!(refused(&[(0, edge + 1)], 1000), Some(0));
+  assert_eq!(refused(&[(edge - 1, edge)], 1000), None);
+  assert_eq!(
+    refused(&[(edge, edge)], 1000),
+    Some(0),
+    "INT_MAX after zero"
+  );
+  assert_eq!(
+    refused(&[(0, 10), (edge, edge)], 1000),
+    Some(1),
+    "INT_MAX after the last's start"
+  );
+  assert_eq!(
+    refused(&[(5, 10), (3, 20)], 1000),
+    Some(1),
+    "before the last"
+  );
+  assert_eq!(
+    refused(&[(5, 10), (5, 20)], 1000),
+    None,
+    "at the last's start"
+  );
+  // At 90 kHz, INT_MAX ticks are 23 860.93 s.
+  assert_eq!(refused(&[(0, 23_860_000)], 90_000), None);
+  assert_eq!(refused(&[(0, 23_861_000)], 90_000), Some(0));
+}

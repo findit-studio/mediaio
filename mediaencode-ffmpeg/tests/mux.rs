@@ -4406,3 +4406,183 @@ fn l51_hdr10_plus_reaches_matroska_where_libavutil_round_trips_it() {
     "the two windows read back as themselves"
   );
 }
+
+/// `chapters` in seconds: each `(start, end)`, titled.
+fn chapters_s(spans: &[(i64, i64)]) -> Vec<Chapter<Ffmpeg>> {
+  spans
+    .iter()
+    .enumerate()
+    .map(|(index, &(start, end))| {
+      chapter_of(index as i64, start * 1000, end * 1000, Some("chapter"))
+    })
+    .collect()
+}
+
+/// **L52 — MP4's chapter track's samples are counted in the movie
+/// timescale its streams make, and a sample MP4 would refuse or move is
+/// refused at open** (table C′ of the census; Codex R4's finding 6). MP4
+/// counts its chapters in `av_gcd_q` of its streams' time bases — the
+/// transport stream's 90 kHz here (`mov_init`, `movenc.c` 8427–8446) — and
+/// `check_pkt` refuses a chapter sample past `INT_MAX` ticks, an answer
+/// `mov_create_chapter_track` ignores (7807): a chapter of 23 861 s is
+/// refused, one of 23 860 s opens and reads back counted in 1/90000; a
+/// chapter starting `INT_MAX` ticks or more after the last is refused.
+///
+/// PLANT: the movie timescale taken as 1000, as before, opens the chapter
+/// of 23 861 s.
+#[test]
+fn l52_mp4s_chapter_samples_are_counted_in_its_movie_timescale() {
+  let Some(corpus) = Corpus::new() else { return };
+  let ts = corpus.transport_stream();
+  let (_, frames) = first_track(&ts, TrackKind::Audio, 1);
+  let open = |name: &str, chapters: &[Chapter<Ffmpeg>]| {
+    FfmpegOwnedMuxer::open(
+      File::create(output(&corpus, name)).expect("create"),
+      ContainerName::MP4,
+      table_of(&ts, TrackKind::Audio),
+      chapters,
+      PacketLimits::default(),
+    )
+  };
+  assert!(matches!(
+    open("l52-long.mp4", &chapters_s(&[(0, 23_861)])),
+    Err(MuxOpenError::ChapterSample { chapter: 0 })
+  ));
+  assert!(matches!(
+    open("l52-gap.mp4", &chapters_s(&[(0, 10), (23_861, 23_862)])),
+    Err(MuxOpenError::ChapterSample { chapter: 1 })
+  ));
+  let (mut muxer, _) = open("l52.mp4", &chapters_s(&[(0, 23_860)])).expect("open");
+  muxer
+    .write_audio(audio_at(&audio_of(&frames[0]), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  muxer.finish().expect("finished");
+  let read = self::chapters(&output(&corpus, "l52.mp4"));
+  assert_eq!(read.len(), 1);
+  assert_eq!(
+    read[0].timebase().den().get(),
+    90_000,
+    "the movie timescale"
+  );
+  assert_eq!(span_ms(&read[0]).0, 0);
+}
+
+/// A subtitle packet of `packet`'s at `at` ticks of `base`, lasting
+/// `duration` of them.
+fn subtitle_ticks(
+  packet: &Subtitle,
+  base: Timebase,
+  at: i64,
+  duration: i64,
+) -> SubtitleTrackPacket<Ffmpeg, FfmpegBytes> {
+  SubtitleTrackPacket::new(
+    TrackIndex::new(0),
+    packet
+      .clone()
+      .with_pts(Some(Timestamp::new(at, base)))
+      .with_duration(Some(Timestamp::new(duration, base))),
+  )
+}
+
+/// **L53 — MP4's `mov_text` cues are judged from the samples MP4 writes
+/// around them** (table C′): an empty sample at zero before the first cue
+/// and at each cue's end (`movenc.c` 7625–7656), from which `check_pkt`
+/// counts the next one's gap, in the track's own ticks. A first cue 2^31
+/// ticks after zero is refused — MP4 would move it; a cue of `INT_MAX`
+/// ticks is refused — its end sample would be moved; a cue `INT_MAX` − 1
+/// ticks after the last one ends is admitted, as MP4 writes it, and reads
+/// back at its time.
+///
+/// PLANT: the gap counted from the last cue's decode time, as before,
+/// admits the first cue 2^31 ticks after zero.
+#[test]
+fn l53_mov_text_cues_are_judged_from_the_samples_mp4_writes_around_them() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = mov_text_mp4(&corpus);
+  let (table, cues) = first_track(&source, TrackKind::Subtitle, 1);
+  let base = table[0].timebase();
+  let cue = subtitle_of(&cues[0]);
+  let track = TrackIndex::new(0);
+  let at = |ticks: i64| Timestamp::new(ticks, base);
+  let (far, edge) = (1i64 << 31, i64::from(i32::MAX));
+  let mut muxer = muxer_into(
+    &output(&corpus, "l53-far.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Subtitle),
+  );
+  let first = subtitle_ticks(&cue, base, far, 1000);
+  let (refusal, back) = by_container(muxer.write_subtitle(first.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::DtsGap {
+      track,
+      dts: at(far)
+    }
+  );
+  untouched!(first, back);
+  let (refusal, _) = by_container(muxer.write_subtitle(subtitle_ticks(&cue, base, 0, edge)));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::DurationTooLong {
+      track,
+      duration: at(edge)
+    }
+  );
+  muxer.finish().expect("finished");
+
+  let target = output(&corpus, "l53.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  let late = 1000 + edge - 1;
+  for (start, duration) in [(0, 1000), (late, 10)] {
+    muxer
+      .write_subtitle(subtitle_ticks(&cue, base, start, duration))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a cue MP4 writes as it is");
+  }
+  muxer.finish().expect("finished");
+  assert!(
+    packets(&target)[0]
+      .iter()
+      .any(|seen| seen.pts == Some(at(late))),
+    "the late cue reads back at its time"
+  );
+}
+
+/// **L54 — MP4's TTML paragraphs are judged by the one sample MP4 joins
+/// them into** (table C′): from zero to the latest end, at the trailer
+/// (`movenc_ttml.c` 236–317), which `check_pkt` refuses past `INT_MAX`
+/// ticks, failing the trailer and the file. Over a track configured as
+/// libavcodec's TTML encoder configures its own — whose paragraphs MP4
+/// joins: a paragraph ending at `INT_MAX` ticks is admitted, and the file
+/// finishes; one at `INT_MAX` + 1 is refused by name, the packet untouched.
+///
+/// PLANT: without the joined sample's rule, the paragraph past it is
+/// admitted, and `finish` fails the file.
+#[test]
+fn l54_mp4s_ttml_is_judged_by_the_sample_it_joins() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = ttml_mp4(&corpus);
+  let (mut table, paragraphs) = first_track(&source, TrackKind::Subtitle, 1);
+  table[0].set_extradata(Some(bytes_of(b"lavc-ttmlenc")));
+  let base = table[0].timebase();
+  let paragraph = subtitle_holding(&subtitle_of(&paragraphs[0]), b"hello");
+  let track = TrackIndex::new(0);
+  let edge = i64::from(i32::MAX);
+  let mut muxer = muxer_into(&output(&corpus, "l54.mp4"), ContainerName::MP4, table);
+  let past = subtitle_ticks(&paragraph, base, edge + 1, 0);
+  let (refusal, back) = by_container(muxer.write_subtitle(past.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::DocumentSpan {
+      track,
+      pts: Timestamp::new(edge + 1, base)
+    }
+  );
+  untouched!(past, back);
+  muxer
+    .write_subtitle(subtitle_ticks(&paragraph, base, edge, 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a paragraph ending at INT_MAX");
+  muxer.finish().expect("the joined sample, INT_MAX long");
+}
