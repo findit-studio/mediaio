@@ -60,7 +60,7 @@ pub mod writer_guard;
 
 pub use adapter::Ffmpeg;
 pub use boundary::{
-  MediaKind, PacketBuildError, SendPayloadTooLarge, SendSideDataTooLarge,
+  MediaKind, PacketBuildError, PacketRefusal, SendPayloadTooLarge, SendSideDataTooLarge,
   attachment_packet_from_ffmpeg, audio_packet_from_ffmpeg, audio_packet_from_ffmpeg_in,
   data_packet_from_ffmpeg_in, empty_audio_frame, empty_owned_audio_frame,
   empty_owned_subtitle_frame, empty_owned_video_frame, empty_subtitle_frame, empty_video_frame,

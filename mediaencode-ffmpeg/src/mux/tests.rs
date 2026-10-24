@@ -1898,3 +1898,39 @@ fn mp4s_chapter_samples_are_held_to_check_pkt() {
   assert_eq!(refused(&[(0, 23_860_000)], 90_000), None);
   assert_eq!(refused(&[(0, 23_861_000)], 90_000), Some(0));
 }
+
+/// **What a filter holds at the end is reported by its count**: VP9's
+/// hidden frames, PGS's packets of an open display set; nothing for a filter
+/// that holds nothing.
+#[test]
+fn what_a_filter_holds_at_the_end_is_counted() {
+  assert_eq!(
+    held_at_end(Filter::Vp9 {
+      held: 3,
+      bytes: 30,
+      largest: 10
+    }),
+    Some((AutomaticFilter::Vp9Superframe, 3))
+  );
+  assert_eq!(
+    held_at_end(Filter::Vp9 {
+      held: 0,
+      bytes: 0,
+      largest: 0
+    }),
+    None
+  );
+  let holding = PgsState {
+    holding: true,
+    presentation: true,
+    bytes: 40,
+    side: 0,
+    packets: 2,
+  };
+  assert_eq!(
+    held_at_end(Filter::Pgs(holding)),
+    Some((AutomaticFilter::PgsFrameMerge, 2))
+  );
+  assert_eq!(held_at_end(Filter::Pgs(PgsState::default())), None);
+  assert_eq!(held_at_end(Filter::None), None);
+}

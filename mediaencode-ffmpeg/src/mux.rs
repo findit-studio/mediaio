@@ -242,7 +242,7 @@
 //! | Matroska's cluster | written into a dynamic buffer of at most `INT_MAX`, refused past it and the cluster written cut; a new one once the last passes 5 MiB, two blocks at most written after that check (`matroskaenc.c` 2746–2749, 3213–3271) | each block — the packet as written, or each one its filter puts out, VP9's superframe and PGS's display set with the side data they take, and what the filter holds at the least it can come to — its payload and side data at most half of what is left beside 5 MiB and 64 KiB, less its own elements (`MATROSKA_BLOCK_BYTES_MAX`, [`PayloadRule::ClusterSize`]) |
 //! | WebVTT's lines | Matroska and WebM: the cue, its identifier and its settings summed, refused past `INT_MAX` (`matroskaenc.c` 2828–2853) | within the cluster's bound |
 //! | MP4's joined TTML | libavcodec's TTML encoder's paragraphs, joined at the trailer into one document in a dynamic buffer and then one packet (`movenc_ttml.c` 236–317) | the document's bytes counted — each paragraph and its element, and the header its configuration and language make — and refused at the paragraph that would pass the bound ([`PayloadRule::DocumentSize`]) |
-//! | the payload and side data copied in | `av_new_packet` and `av_packet_new_side_data` refuse past the bound (`libavcodec/packet.c` 83–95, 231–250), after the muxer's own budget ([`PacketLimits`]) | a fault before libavformat is reached ([`OutputError::Build`]), the packet not handed back |
+//! | the payload and side data copied in | the copy road's builder refuses a packet marked trusted, side data past 64 entries or 256 KiB, a payload past the muxer's budget ([`PacketLimits`]), and a side-data kind libavcodec does not name — the base's one judgment of what a packet alone decides (`mediaio_ffmpeg::boundary::check_packet_build`) — and `av_new_packet` and `av_packet_new_side_data` refuse past the bound (`libavcodec/packet.c` 83–95, 231–250) | each refused by name with the packet in hand ([`PayloadRule::Trusted`], [`PayloadRule::SideDataBudget`], [`PayloadRule::PayloadTooLarge`], [`PayloadRule::SideDataUnnamed`]); MP4's cover, built after the header, at open ([`MuxOpenError::Cover`]); what is left — an allocation's failure — a fault ([`OutputError::Build`]) |
 //!
 //! ## C. Each container's checks of each codec
 //!
@@ -396,8 +396,8 @@
 //! | a chapter's id | MP4 keeps none: its reader numbers chapters by position (`mov.c`'s `chpl` and chapter track); Matroska renumbers every chapter from 1 where one's id is 0 or repeats (`matroskaenc.c` 2399–2442) | reported at open ([`Uncarried::ChapterId`]) |
 //! | a chapter's span | MP4 counts it in its movie timescale (table C′) and its reader ends each chapter where the next starts (`movenc.c` 7727–7815); Matroska counts it in nanoseconds (2439–2440), each rounded to the nearest | reported at open where an instant moves ([`Uncarried::ChapterSpan`]) |
 //! | a chapter without a title, a title past 65535 bytes | MP4 writes every chapter into its Nero list but a titled one alone into its chapter track, which its reader lays over the list by position; a title with a 16-bit length (`movenc.c` 7791–7807) | refused at open ([`MuxOpenError::ChapterWithoutTitle`], [`ChapterTitleTooLong`](MuxOpenError::ChapterTitleTooLong)) |
-//! | VP9's hidden frames, still held at the stream's end | dropped by the filter, which no later frame shows (`vp9_superframe.c` 198–207) | stated with the filter ([`AutomaticFilter::Vp9Superframe`]): the muxer cannot know at a held frame that none will follow, and does not refuse the file at `finish` for it |
-//! | PGS segments, still held at the stream's end | written as one packet marked corrupt (`pgs_frame_merge.c` 79–84) | stated with the filter ([`AutomaticFilter::PgsFrameMerge`]) |
+//! | VP9's hidden frames, still held at the stream's end | dropped by the filter, which no later frame shows (`vp9_superframe.c` 198–207) | reported at `finish` ([`Uncarried::Held`], with the report [`CarrierMuxer::finish_into_sink`] hands back): the muxer cannot know at a held frame that none will follow, and does not refuse the file for it |
+//! | PGS segments, still held at the stream's end | written as one packet marked corrupt (`pgs_frame_merge.c` 77–83) | reported at `finish` ([`Uncarried::Held`]) |
 //! | MP4's durations, where packets do not abut | kept only as the distance to the next decode time (`movenc.c` 1241–1259) | reported as learned ([`Rewrite::Durations`]) |
 //!
 //! The report covers these fields and those of the tables above; a codec's
@@ -441,7 +441,8 @@ use mediaencode::{
 };
 use mediaio_ffmpeg::{
   CarrierOps, ChannelLayoutTicket, CodecId, CodecTicket, CustomChannel, Ffmpeg, FfmpegCarrier,
-  Owned, PacketLimits, View,
+  Owned, PacketLimits, PacketRefusal, View,
+  boundary::check_packet_build,
   extras::{SideDataEntry, packet_side_data_name},
   hdr_metadata::{check_hdr10_plus, check_smpte2094_app5},
   output::{
@@ -855,6 +856,21 @@ pub enum Uncarried {
     /// The chapter's position in the table.
     chapter: usize,
   },
+  /// Packets an automatic filter still held when the muxer finished,
+  /// which the stream's end decides: VP9's hidden frames, which no later
+  /// frame shows, dropped (`vp9_superframe.c` 198–207, its flush), and
+  /// PGS's segments, put out as one packet marked corrupt
+  /// (`pgs_frame_merge.c` 77–83) — table E of the census (see [the
+  /// module](self)). Reported by [`CarrierMuxer::finish_into_sink`], with
+  /// the report it hands back.
+  Held {
+    /// The track.
+    track: TrackIndex,
+    /// The filter.
+    filter: AutomaticFilter,
+    /// How many packets it held.
+    packets: u64,
+  },
   /// Packet side data of a kind the container has no place for on the
   /// track, or keeps in part — the side-data table (see [the
   /// module](self)). Reported once per track, kind and fate, when the
@@ -946,7 +962,8 @@ impl MuxReport {
   /// rewrites; then the chapters, in table order, each its id and its
   /// span. What is learned while writing follows, in the order it was
   /// learned: a track's durations, the side data of each kind a container
-  /// drops.
+  /// drops; then, from [`CarrierMuxer::finish_into_sink`], the packets an
+  /// automatic filter still held at the end, track by track.
   pub fn uncarried(&self) -> &[Uncarried] {
     &self.uncarried
   }
@@ -1440,6 +1457,26 @@ pub enum PayloadRule {
   /// container.
   #[error("the packet carries two side-data entries of one kind")]
   SideDataRepeated,
+  /// A packet marked `AV_PKT_FLAG_TRUSTED`, whose payload libavcodec may
+  /// follow pointers out of: no packet so marked is built into FFmpeg
+  /// ([`mediaio_ffmpeg::TrustedPayload`]; the base's one judgment of what
+  /// a packet alone decides, `mediaio_ffmpeg::boundary::check_packet_build`).
+  #[error("the packet is marked trusted, which no packet into FFmpeg may be")]
+  Trusted,
+  /// A payload past the muxer's [`PacketLimits`], or past the largest
+  /// packet libavcodec allocates (`packet_alloc`, `libavcodec/packet.c`
+  /// 83–95 in FFmpeg 9.0.1), which the packet's builder refuses.
+  #[error("the packet's payload is larger than the muxer's limits or than a packet holds")]
+  PayloadTooLarge,
+  /// Side data past the caps the read side keeps — 64 entries, 256 KiB in
+  /// all — which the packet's builder refuses.
+  #[error("the packet's side data passes the 64 entries or 256 KiB a packet carries")]
+  SideDataBudget,
+  /// A side-data kind the linked libavcodec does not name, which the
+  /// packet's builder refuses rather than hand C a kind nothing downstream
+  /// reads.
+  #[error("the packet carries side data of a kind the linked libavcodec does not name")]
+  SideDataUnnamed,
 }
 
 /// Why a muxer did not open. Nothing was written.
@@ -1517,6 +1554,16 @@ pub enum MuxOpenError {
   SampleSize {
     /// The track.
     track: TrackIndex,
+  },
+  /// MP4's cover, whose one packet its builder would refuse after the
+  /// header is written ([`PayloadRule::Trusted`],
+  /// [`PayloadRule::PayloadTooLarge`]): refused here, nothing written.
+  #[error("cover track {}'s picture is one its packet's builder refuses: {rule}", .track.get())]
+  Cover {
+    /// The track.
+    track: TrackIndex,
+    /// What its packet breaks.
+    rule: PayloadRule,
   },
   /// An attachment with no filename, which Matroska requires
   /// (`matroskaenc.c` 2538–2543 in FFmpeg 9.0.1).
@@ -1889,6 +1936,7 @@ fn mp4_frame_bytes(kind: TrackKind, codec: &StreamCodec) -> Option<u32> {
 struct Payload<'a> {
   bytes: &'a [u8],
   key: bool,
+  flags: PacketFlags,
   side_data: &'a [SideDataEntry],
 }
 
@@ -3321,7 +3369,7 @@ where
     let mut lost = Vec::with_capacity(tracks.len());
     for (index, description) in tracks.iter().enumerate() {
       let track = TrackIndex::new(index);
-      let (road, losses) = judge(&output, family, sites, track, description, filters)?;
+      let (road, losses) = judge(&output, family, sites, track, description, filters, limits)?;
       roads.push(road);
       lost.push(losses);
     }
@@ -3518,7 +3566,9 @@ where
   /// What the container could not carry: what the open answered, then what
   /// the muxer learned writing — a track's durations MP4 does not keep, the
   /// packet side data its container drops — in the order learned. What it
-  /// learns comes from packets written, so it is whole once the last is.
+  /// learns comes from packets written, so it is whole once the last is,
+  /// but for what only the end decides, which
+  /// [`Self::finish_into_sink`] adds ([`Uncarried::Held`]).
   pub const fn report(&self) -> &MuxReport {
     &self.report
   }
@@ -3528,9 +3578,11 @@ where
     &self.container
   }
 
-  /// Completes the container and hands the sink back — [`Muxer::finish`],
-  /// keeping the sink.
-  pub fn finish_into_sink(mut self) -> Result<W, MuxFault> {
+  /// Completes the container and hands the sink back, with the whole
+  /// report — [`Muxer::finish`], keeping both. The report gains what only
+  /// the stream's end decides: the packets an automatic filter still held
+  /// ([`Uncarried::Held`]).
+  pub fn finish_into_sink(mut self) -> Result<(W, MuxReport), MuxFault> {
     // A trailer the container would fail for want of a frame no packet was
     // left to decide: refused by name before it runs, and the context
     // dropped as it stands (table C of the census).
@@ -3546,14 +3598,24 @@ where
         },
       ));
     }
+    for (index, state) in self.tracks.iter().enumerate() {
+      if let Some((filter, packets)) = held_at_end(state.filter) {
+        self.report.uncarried.push(Uncarried::Held {
+          track: TrackIndex::new(index),
+          filter,
+          packets,
+        });
+      }
+    }
     self
       .output
       .write_trailer()
       .map_err(|error| MuxFault::new(MuxStage::Trailer, error))?;
-    self
-      .output
+    let Self { output, report, .. } = self;
+    let sink = output
       .into_sink()
-      .map_err(|error| MuxFault::new(MuxStage::Finish, error))
+      .map_err(|error| MuxFault::new(MuxStage::Finish, error))?;
+    Ok((sink, report))
   }
 
   /// Judges a timed packet: the face's rules — the presentation rule on
@@ -3635,6 +3697,21 @@ where
       return Err(Refusal::Container(FfmpegMuxRefusal::Payload {
         track,
         rule: PayloadRule::SideDataRepeated,
+      }));
+    }
+    // What the packet's builder refuses that the packet alone decides, and
+    // the largest packet the copy road allocates (table B): refused with
+    // the packet in hand, where the builder would fail the write after it
+    // was taken.
+    if let Some(rule) = build_refusal(
+      payload.flags,
+      payload.bytes.len(),
+      payload.side_data,
+      self.limits,
+    ) {
+      return Err(Refusal::Container(FfmpegMuxRefusal::Payload {
+        track,
+        rule,
       }));
     }
     // The track's automatic filter takes the packet before libavformat's
@@ -4083,6 +4160,28 @@ fn hdr_metadata_rule(entry: &SideDataEntry) -> Option<PayloadRule> {
   }
 }
 
+/// What the copy road's packet builder would refuse of a packet with
+/// `flags`, a payload of `len` bytes and `side_data`, under `limits` — the
+/// base's one judgment of what the packet alone decides
+/// ([`check_packet_build`]) — and the payload past the largest packet
+/// `av_new_packet` allocates ([`PACKET_BYTES_MAX`]), which the copy road
+/// fails on (`libavcodec/packet.c` 83–95 in FFmpeg 9.0.1).
+fn build_refusal(
+  flags: PacketFlags,
+  len: usize,
+  side_data: &[SideDataEntry],
+  limits: PacketLimits,
+) -> Option<PayloadRule> {
+  match check_packet_build(flags, len, side_data, limits) {
+    Ok(()) if len as u64 > PACKET_BYTES_MAX => Some(PayloadRule::PayloadTooLarge),
+    Ok(()) => None,
+    Err(PacketRefusal::TrustedPayload(_)) => Some(PayloadRule::Trusted),
+    Err(PacketRefusal::SendPayloadTooLarge(_)) => Some(PayloadRule::PayloadTooLarge),
+    Err(PacketRefusal::SendSideDataTooLarge(_)) => Some(PayloadRule::SideDataBudget),
+    Err(PacketRefusal::UnknownSideData(_)) => Some(PayloadRule::SideDataUnnamed),
+  }
+}
+
 /// Whether two of `side_data`'s entries are of one kind, which libavcodec
 /// would fold into one (`av_packet_add_side_data`, `libavcodec/packet.c`
 /// 197–227 in FFmpeg 9.0.1).
@@ -4112,6 +4211,7 @@ where
     let payload = Payload {
       bytes: p.data().as_ref(),
       key: p.flags().contains(PacketFlags::KEY),
+      flags: p.flags(),
       side_data: p.extra().side_data(),
     };
     let plan = match self.admit(
@@ -4140,6 +4240,7 @@ where
     let payload = Payload {
       bytes: p.data().as_ref(),
       key: p.flags().contains(PacketFlags::KEY),
+      flags: p.flags(),
       side_data: p.extra().side_data(),
     };
     let plan = match self.admit(
@@ -4169,6 +4270,7 @@ where
     let payload = Payload {
       bytes: p.data().as_ref(),
       key: p.flags().contains(PacketFlags::KEY),
+      flags: p.flags(),
       side_data: p.extra().side_data(),
     };
     let plan = match self.admit(
@@ -4199,6 +4301,7 @@ where
     let payload = Payload {
       bytes: p.data().as_ref(),
       key: p.flags().contains(PacketFlags::KEY),
+      flags: p.flags(),
       side_data: p.extra().side_data(),
     };
     let plan = match self.admit(
@@ -4224,6 +4327,16 @@ where
   }
 }
 
+/// What `filter` still holds when the stream ends, which the end decides
+/// ([`Uncarried::Held`]): the filter, and how many packets it holds.
+fn held_at_end(filter: Filter) -> Option<(AutomaticFilter, u64)> {
+  match filter {
+    Filter::Vp9 { held, .. } if held > 0 => Some((AutomaticFilter::Vp9Superframe, u64::from(held))),
+    Filter::Pgs(state) if state.holding => Some((AutomaticFilter::PgsFrameMerge, state.packets)),
+    _ => None,
+  }
+}
+
 impl<W, C> fmt::Debug for CarrierMuxer<W, C> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("CarrierMuxer")
@@ -4244,6 +4357,7 @@ fn judge<W, D: AsRef<[u8]>>(
   track: TrackIndex,
   description: &TrackDescription<Ffmpeg, D, CodecTicket>,
   filters: bool,
+  limits: PacketLimits,
 ) -> Result<(Road, Vec<Uncarried>), MuxOpenError> {
   let codec = description.codec();
   if codec.raw() != description.side_data().codec_id() {
@@ -4293,7 +4407,21 @@ fn judge<W, D: AsRef<[u8]>>(
         }
         Road::Attachment
       }
-      Family::Mp4 if is_cover_codec(codec) => Road::Cover,
+      Family::Mp4 if is_cover_codec(codec) => {
+        // Its one packet is built after the header is written; what its
+        // builder would refuse is refused here, nothing written.
+        if let Some(file) = description.file()
+          && let Some(rule) = build_refusal(
+            file.payload().flags(),
+            file.payload().data().as_ref().len(),
+            &[],
+            limits,
+          )
+        {
+          return Err(MuxOpenError::Cover { track, rule });
+        }
+        Road::Cover
+      }
       _ => Road::NotWritten,
     },
     _ => {

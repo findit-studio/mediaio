@@ -4586,3 +4586,171 @@ fn l54_mp4s_ttml_is_judged_by_the_sample_it_joins() {
     .expect("a paragraph ending at INT_MAX");
   muxer.finish().expect("the joined sample, INT_MAX long");
 }
+
+/// `path`'s every track, each attachment with its file.
+fn table_with_files(path: &Path) -> Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>> {
+  let mut demuxer = FfmpegOwnedDemuxer::open(path).expect("open the source");
+  let mut files: Vec<Option<_>> = demuxer.tracks().iter().map(|_| None).collect();
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    if let DemuxedPacket::Attachment(attachment) = packet {
+      let (track, payload) = attachment.into_parts();
+      files[track.get()] = Some(payload);
+    }
+  }
+  demuxer
+    .tracks()
+    .iter()
+    .zip(files)
+    .map(|(row, file)| {
+      TrackDescription::from_track_info(&**row, file, ticket(row)).expect("a description")
+    })
+    .collect()
+}
+
+/// **L55 — what a packet's builder would refuse is refused by name, the
+/// packet handed back** (Q858 R1): the base's one judgment of what a packet
+/// alone decides (`check_packet_build`), which the copy road's builder
+/// makes only after the muxer took the packet. Into Matroska: 300 KiB of
+/// side data, past the 256 KiB a packet carries; a side-data kind libavcodec
+/// does not name; a packet marked trusted; and, under limits of 16 bytes, a
+/// 40-byte payload. MP4's cover, whose packet is built after the header,
+/// is refused at open, nothing written.
+///
+/// PLANT: without the judgment in `admit`, the side data reaches the
+/// builder, and the write is a fault, the packet lost.
+#[test]
+fn l55_what_a_packets_builder_refuses_is_refused_with_the_packet_back() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, video) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&video[0]);
+  let with = |packet: Video| VideoTrackPacket::new(TrackIndex::new(0), packet);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l55.mkv"),
+    ContainerName::MATROSKA,
+    table_of(&source, TrackKind::Video),
+  );
+  let mut bulky = frame.clone().with_pts(Some(ms(0))).with_dts(Some(ms(0)));
+  bulky
+    .extra_mut()
+    .set_side_data(vec![side(T::AV_PKT_DATA_A53_CC, &vec![0; 300 * 1024])]);
+  let mut unnamed = frame.clone().with_pts(Some(ms(0))).with_dts(Some(ms(0)));
+  unnamed
+    .extra_mut()
+    .set_side_data(vec![SideDataEntry::new(9999, bytes_of(&[1]))]);
+  let trusted = frame
+    .clone()
+    .with_pts(Some(ms(0)))
+    .with_dts(Some(ms(0)))
+    .with_flags(PacketFlags::from_bits_retain(
+      mediaio_ffmpeg::buffer::TRUSTED_BIT,
+    ));
+  for (packet, rule) in [
+    (bulky, PayloadRule::SideDataBudget),
+    (unnamed, PayloadRule::SideDataUnnamed),
+    (trusted, PayloadRule::Trusted),
+  ] {
+    let offered = with(packet);
+    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    assert_eq!(refusal, payload(rule));
+    untouched!(offered, back);
+  }
+  muxer.finish().expect("finished");
+
+  let small = PacketLimits::default().with_max_packet_bytes(16);
+  let mut muxer = muxer_with(
+    &output(&corpus, "l55-small.mkv"),
+    ContainerName::MATROSKA,
+    table_of(&source, TrackKind::Video),
+    MuxOptions::new().with_limits(small),
+  );
+  let large = with(
+    video_holding(&frame, &[0x42; 40])
+      .with_pts(Some(ms(0)))
+      .with_dts(Some(ms(0))),
+  );
+  let (refusal, back) = by_container(muxer.write_video(large.clone()));
+  assert_eq!(refusal, payload(PayloadRule::PayloadTooLarge));
+  untouched!(large, back);
+
+  let cover = corpus.cover_art_mp3();
+  let target = output(&corpus, "l55-cover.mp4");
+  let opened = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table_with_files(&cover),
+    &[],
+    small,
+  );
+  assert!(matches!(
+    opened,
+    Err(MuxOpenError::Cover {
+      rule: PayloadRule::PayloadTooLarge,
+      ..
+    })
+  ));
+  assert_eq!(
+    std::fs::metadata(&target).expect("the file").len(),
+    0,
+    "nothing written"
+  );
+}
+
+/// **L56 — the packets an automatic filter still holds at the end are
+/// reported, with the report `finish_into_sink` hands back** (Q858 R2):
+/// VP9's two hidden frames, which no later frame shows, are dropped by the
+/// filter's flush (`vp9_superframe.c` 198–207); a stream ending on a frame
+/// shown leaves none.
+///
+/// PLANT: without the held lines, the report is silent on the two frames.
+#[test]
+fn l56_what_a_filter_still_holds_at_the_end_is_reported() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = vp9_webm(&corpus);
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  let track = TrackIndex::new(0);
+  for (name, ends_shown) in [("l56-held.mkv", false), ("l56-shown.mkv", true)] {
+    let mut muxer = muxer_into(
+      &output(&corpus, name),
+      ContainerName::MATROSKA,
+      table_of(&source, TrackKind::Video),
+    );
+    let mut frames = vec![
+      vp9_frame(4, true, 1),
+      vp9_frame(4, false, 2),
+      vp9_frame(4, false, 3),
+    ];
+    if ends_shown {
+      frames.push(vp9_frame(4, true, 4));
+    }
+    for (index, bytes) in frames.iter().enumerate() {
+      let at = 40 * index as i64;
+      muxer
+        .write_video(video_at(&video_holding(&frame, bytes), Some(at), at))
+        .map_err(|error| error.map_packet(drop))
+        .expect("a frame the filter takes");
+    }
+    let (_, report) = muxer.finish_into_sink().expect("finished");
+    let held: Vec<_> = report
+      .uncarried()
+      .iter()
+      .filter(|line| matches!(line, Uncarried::Held { .. }))
+      .cloned()
+      .collect();
+    if ends_shown {
+      assert_eq!(held, vec![], "{name}");
+    } else {
+      assert_eq!(
+        held,
+        vec![Uncarried::Held {
+          track,
+          filter: AutomaticFilter::Vp9Superframe,
+          packets: 2
+        }],
+        "{name}"
+      );
+    }
+  }
+}
