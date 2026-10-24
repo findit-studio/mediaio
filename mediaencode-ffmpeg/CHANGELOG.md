@@ -87,6 +87,39 @@ crate moves only when it changes.
   packed code does not unpack to itself, reported; no flag the report
   names as dropped handed to libavformat, so MP4 makes no cover of a
   timed track.
+- **Each container's checks of each codec are made first** (table C of
+  the census). Into MP4: an AC-3 track's first frame — the one MP4 writes
+  `dac3` from at the trailer — of a bit stream id past 8, refused at that
+  frame (`PayloadRule::Ac3BitStreamId`); an AC-3 or E-AC-3 track that took
+  no frame, refused by `finish` before the trailer would fail the file
+  (`FfmpegMuxRefusal::NoFrame`, carried by the fault's new
+  `MuxFault::refusal`; `MuxFault::error` now answers an `Option`); AV1,
+  FLAC, Opus, ALAC and MPEG-4 ALS with no configuration, which MP4 writes
+  empty or refuses at the trailer (`MuxOpenError::ConfigurationMissing`);
+  FLAC's configuration not one 34-byte STREAMINFO, Opus's not an OpusHead
+  `dOps` takes, and the header strings of libavcodec's TTML encoder cut
+  short (`MuxOpenError::ConfigurationInvalid`); frame cropping that leaves
+  no picture (`MuxOpenError::Cropping`); new extradata MP4 would write as a
+  sample description its trailer refuses, or of another form than the
+  track's — Annex B or not — which turns the rewrite on or off
+  (`PayloadRule::NewExtradata`; FLAC's of another length,
+  `PayloadRule::FlacStreamInfo`); an E-AC-3 first packet of more than 15
+  dependent frames. Into Matroska: AAC's new extradata that libavcodec
+  does not parse, or larger than the space its header reserved
+  (`PayloadRule::NewExtradata`).
+- **What a container adds, reinterprets or drops of the table is
+  reported** (table E). The flags a track reads back with that it did not
+  declare (`Uncarried::DispositionAdded`): the default MP4 sets on the
+  first video, audio and subtitle track of each type where none declares
+  it; the partner of each DASH role pair MP4 writes as one — hearing
+  impaired and captions, visual impaired and descriptions; the attached
+  picture an MP4 cover, and a Matroska attachment of an image MIME type,
+  reads back as. A chapter's id a container does not keep
+  (`Uncarried::ChapterId`) and its span where an instant moves
+  (`Uncarried::ChapterSpan`); an MP4 chapter without a title, or with one
+  past its 16-bit length, refused at open (`MuxOpenError::ChapterWithoutTitle`,
+  `ChapterTitleTooLong`). An attachment of no bytes, which Matroska's
+  reader drops and MP4 skips, is not written, and reported.
 - **The sizes libavformat counts in 32 bits are counted first, wide.**
   VP9's superframe — the hidden frames the automatic filter holds and the
   frame shown that joins them, which it sums in 32 bits and allocates by

@@ -1294,20 +1294,12 @@ fn a_tracks_kind_agrees_with_its_media_type_as_table_d_says() {
       }
     }
   }
-  // An attachment: an attachment stream's or an attached picture's
-  // parameters, whatever the codec.
-  assert!(media_type_agrees(
-    TrackKind::Attachment,
-    attachment,
-    Some(attachment)
-  ));
-  assert!(media_type_agrees(TrackKind::Attachment, video, Some(video)));
-  assert!(media_type_agrees(TrackKind::Attachment, attachment, None));
-  assert!(!media_type_agrees(
-    TrackKind::Attachment,
-    audio,
-    Some(audio)
-  ));
+  // An attachment: its road makes its stream's media type, whatever its
+  // ticket's and its codec's.
+  for media in [attachment, video, audio, -1] {
+    assert!(media_type_agrees(TrackKind::Attachment, media, Some(media)));
+    assert!(media_type_agrees(TrackKind::Attachment, media, None));
+  }
   assert!(!media_type_agrees(TrackKind::Unknown, video, Some(video)));
 }
 
@@ -1391,4 +1383,124 @@ fn the_annex_b_rewrite_is_bounded_by_its_start_codes() {
   assert_eq!(length_prefixed_bytes(&[0, 0, 1, 9, 9, 0, 0, 1, 8]), 9 + 2);
   assert_eq!(length_prefixed_bytes(&[0, 0, 0, 1, 9]), 5 + 1);
   assert_eq!(length_prefixed_bytes(&[1, 2, 3]), 3);
+}
+
+/// **The configurations MP4's trailer refuses are known at open**: FLAC's
+/// one 34-byte STREAMINFO, Opus's OpusHead and its mapping table, the
+/// header strings of libavcodec's TTML encoder; and a frame cropping that
+/// leaves no picture.
+#[test]
+fn the_configurations_mp4s_trailer_refuses_are_known_at_open() {
+  let flac = [0u8; 34];
+  assert!(!configuration_invalid(Family::Mp4, CodecId::FLAC, &flac));
+  assert!(configuration_invalid(
+    Family::Mp4,
+    CodecId::FLAC,
+    &flac[..33]
+  ));
+  assert!(configuration_invalid(
+    Family::Mp4,
+    CodecId::FLAC,
+    &[flac.as_slice(), &[0; 4]].concat()
+  ));
+  assert!(
+    !configuration_invalid(Family::Matroska, CodecId::FLAC, &flac[..33]),
+    "Matroska's header writes it"
+  );
+  // An OpusHead of 19 bytes, mapping family 0; of family 1, two bytes and
+  // one a channel after them.
+  let mut head = b"OpusHead".to_vec();
+  head.extend([1, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0]);
+  assert_eq!(head.len(), 19);
+  assert!(opus_head_written(&head));
+  assert!(!opus_head_written(&head[..18]));
+  head[18] = 1;
+  assert!(!opus_head_written(&head), "family 1 with no table");
+  head.extend([1, 0, 0, 1]);
+  assert!(opus_head_written(&head));
+  assert!(configuration_invalid(
+    Family::Mp4,
+    CodecId::OPUS,
+    &head[..10]
+  ));
+  // TTML's header strings: none, or a terminated string and another.
+  assert!(ttml_header_strings(b""));
+  assert!(ttml_header_strings(b"a\0b\0"));
+  assert!(ttml_header_strings(b"\0\0"));
+  assert!(!ttml_header_strings(b"a"));
+  assert!(!ttml_header_strings(b"a\0"));
+  assert!(!ttml_header_strings(b"a\0b"));
+  assert!(configuration_invalid(
+    Family::Mp4,
+    CodecId::TTML,
+    b"lavc-ttmlenca\0"
+  ));
+  assert!(!configuration_invalid(Family::Mp4, CodecId::TTML, b"<tt/>"));
+  // Frame cropping: 16 bytes of top, bottom, left and right.
+  let crop = |top: u32, bottom: u32, left: u32, right: u32| {
+    [top, bottom, left, right]
+      .iter()
+      .flat_map(|count| count.to_le_bytes())
+      .collect::<Vec<_>>()
+  };
+  assert!(!crop_leaves_no_picture(Some(&crop(1, 1, 2, 2)), 64, 48));
+  assert!(crop_leaves_no_picture(Some(&crop(0, 0, 32, 32)), 64, 48));
+  assert!(crop_leaves_no_picture(Some(&crop(24, 24, 0, 0)), 64, 48));
+  assert!(
+    crop_leaves_no_picture(Some(&crop(0, 0, 0, 0)), 0, 48),
+    "no width"
+  );
+  assert!(!crop_leaves_no_picture(
+    Some(&crop(0, 0, 32, 32)[..15]),
+    64,
+    48
+  ));
+  assert!(!crop_leaves_no_picture(None, 0, 0));
+  // No configuration where MP4 needs one.
+  for codec in [CodecId::AV1, CodecId::FLAC, CodecId::OPUS, CodecId::ALAC] {
+    assert!(
+      configuration_missing(Family::Mp4, codec, &[], true),
+      "{codec:?}"
+    );
+  }
+}
+
+/// **An AudioSpecificConfig parses as libavcodec parses it**: it fails on
+/// no bytes, a channel configuration past 14, and an ALS configuration
+/// short of its header.
+#[test]
+fn an_audio_specific_config_parses_as_libavcodec_parses_it() {
+  // AAC LC, 48 kHz, stereo: 00010 0011 0010 000.
+  assert!(audio_specific_config_parses(&[0x11, 0x90]));
+  // Channel configuration 15.
+  assert!(!audio_specific_config_parses(&[0x11, 0xF8]));
+  assert!(!audio_specific_config_parses(&[]));
+  // An escaped object type, 32 + 4 = 36, ALS: 11111 000100, rate index 3,
+  // channels 2, then nothing of its 112 bits.
+  assert!(!audio_specific_config_parses(&[0xF8, 0x86, 0x40, 0x00]));
+}
+
+/// **MP4's AC-3 takes no first frame its `dac3` does not define**: a bit
+/// stream id of 9 or 10 on the frame MP4 writes `dac3` from is refused; on
+/// a later frame it is not asked.
+#[test]
+fn mp4s_ac3_refuses_a_first_frame_dac3_does_not_define() {
+  // AC-3 at 48 kHz, frame size code 0 (64 words), bit stream id `id`.
+  let frame = |id: u8| {
+    let mut bytes = vec![0x0B, 0x77, 0, 0, 0x00, id << 3, 0, 0];
+    bytes.resize(128, 0);
+    bytes
+  };
+  assert!(ac3_packet(Ac3State::default(), false, &frame(8)).is_ok());
+  for id in [9, 10] {
+    assert_eq!(
+      ac3_packet(Ac3State::default(), false, &frame(id)),
+      Err(PayloadRule::Ac3BitStreamId),
+      "{id}"
+    );
+  }
+  let after = ac3_packet(Ac3State::default(), false, &frame(8)).expect("the first");
+  assert!(ac3_packet(after, false, &frame(9)).is_ok(), "a later frame");
+  // E-AC-3's dec3 carries no such bound.
+  assert!(ac3_packet(Ac3State::default(), true, &frame(9)).is_ok());
 }
