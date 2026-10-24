@@ -164,6 +164,32 @@
 //! census, each row from the source; `movenc.c` and `matroskaenc.c` are
 //! `libavformat/`'s, the filters `libavcodec/bsf/`'s.
 //!
+//! ## A. Packet side data, and what each writer assumes of it
+//!
+//! Every reader of packet side data in libavformat's writers, by kind; what
+//! each assumes of the entry's bytes; and what is held to it here. Every
+//! entry reaches libavformat as libavcodec allocates it, its size and 64
+//! zeroed bytes of padding behind it (`av_packet_new_side_data`,
+//! `libavcodec/packet.c` 231–250), one entry a kind (197–227). The report
+//! of what each container keeps is the side-data table above.
+//!
+//! | kind | read by, and what it assumes | here |
+//! |---|---|---|
+//! | HDR10+ | Matroska and WebM, a video block's: cast to `AVDynamicHDRPlus` without asking the size (`matroskaenc.c` 2947–2969), then serialized by a function that trusts every count, divides by every denominator, multiplies in `int` and asserts its size (`hdr_dynamic_metadata.c` 237–395); the reader fails the packet over a payload it cannot parse (`matroskadec.c` 4057–4077) | checked exactly — the linked libavutil's size, every count, divisor, product, bit width, unit, flag and the two syntaxes' agreement ([`mediaio_ffmpeg::hdr_metadata`]); refused by name, the packet untouched ([`PayloadRule::DynamicHdrPlus`]) |
+//! | SMPTE 2094 APP5 | Matroska and WebM, a video block's: cast to `AVDynamicHDRSmpte2094App5` (2970–2990), serialized into an 855-byte buffer by a function that bounds one image's curve count of four (`hdr_dynamic_metadata.c` 563–706) | checked exactly, each image's count among it ([`PayloadRule::DynamicHdrApp5`]) |
+//! | LCEVC | Matroska and WebM, a video block's: its size, plus four bytes, copied (2991–3006) | bytes, any size |
+//! | Matroska block additional | Matroska and WebM: read at a size of 8 or more (2936–2946) | bytes |
+//! | skip samples | Matroska: at 10 or more (2922–2934); MP4: at 10 or more, where the codec fixes a frame's samples (`movenc.c` 7311–7320), refused there below nothing after the packet is taken | bytes; MP4's refusal made first ([`PayloadRule::SkipSamples`]) |
+//! | WebVTT identifier, settings | Matroska and WebM, a WebVTT block's: copied by size, their sum with the cue's against `INT_MAX` (2828–2853) | bytes; the cue rule ([`PayloadRule::WebVttCue`]); the sum within the cluster's bound (table B) |
+//! | new extradata | MP4: a sample description from the packet on, written by the codec's writer at the trailer (`movenc.c` 7044–7074, 7406–7420); Matroska: AAC's parsed and fitted to the space its header reserved, FLAC's of the track's length (3065–3097) | table C |
+//! | producer reference time | MP4: copied only at its struct's exact size (7365–7369) | bytes |
+//! | palette | MOV's raw video alone (7695–7700; `rawutils.c` 82–92, its size checked) — not MP4's | bytes |
+//! | IAMF parameters | cast to `AVIAMFParamDefinition` (`iamf_writer.c` 1176–1184), reached only for a stream group's track (`movenc.c` 7594–7603); the muxing context adds no stream group | never reached |
+//! | any other | read by no writer of these three containers | bytes |
+//! | any, in another container | every reader in libavformat's byte-stream writers bounds its read by the entry's size, or reads inside its zeroed padding: `adtsenc.c` 182, `apngenc.c` 120, `flacenc.c` 291, `flvenc.c` 1256, `framecrcenc.c` 77–161 (each struct only at its exact size), `hashenc.c` 296–309, `latmenc.c` 186, `mp3enc.c` 366, `mpegtsenc.c` 1883 (one byte, inside the padding) and 2087, `nutenc.c` 866–915, `oggenc.c` 665–691, `rawutils.c` 82, `rtpenc.c` 629, `srtenc.c` 63, `webvttenc.c` 68–82; the muxers that write no byte stream of their own (DASH, HLS, segment, tee, FIFO, WHIP) are refused at open; HDR10+ and APP5 are read by none | forwarded as given |
+//! | two entries of one kind | libavcodec keeps one: the later's bytes in the earlier's place (`packet.c` 197–227), the earlier dropped unsaid | refused in every container ([`PayloadRule::SideDataRepeated`]) |
+//! | the stream's own, coded side data | the ticket's, mirrored from a demuxer's parameters ([`CodecTicket::mirror`] is its only constructor): libavformat's and libavcodec's structs at their own sizes; MP4 casts Dolby Vision's only under the strict compliance "unofficial" (`movenc.c` 2999–3006), which the context never sets; MP4's frame cropping is table C's | — |
+//!
 //! ## D. A track's kind and its media type
 //!
 //! Judged before any stream is added ([`MuxOpenError::MediaTypeMismatch`]):
@@ -218,6 +244,7 @@ use mediaio_ffmpeg::{
   CarrierOps, ChannelLayoutTicket, CodecId, CodecTicket, CustomChannel, Ffmpeg, FfmpegCarrier,
   Owned, PacketLimits, View,
   extras::{SideDataEntry, packet_side_data_name},
+  hdr_metadata::{check_hdr10_plus, check_smpte2094_app5},
   output::{
     CodecQuery, Output, OutputError, OutputPacket, OutputText, PacketTimes, StreamCodec,
     StreamMedia, StreamSpec,
@@ -901,6 +928,36 @@ pub enum PayloadRule {
   /// (`pgs_frame_merge.c` 59–68, 93–130).
   #[error("the PGS segments do not make a display set the automatic filter writes whole")]
   PgsSegments,
+  /// Matroska and WebM video: HDR10+ side data
+  /// (`AV_PKT_DATA_DYNAMIC_HDR10_PLUS`) that is not an `AVDynamicHDRPlus`
+  /// the writer serializes whole and the reader reads back as itself. The
+  /// writer casts the entry's bytes to the struct without asking their
+  /// size, and libavutil's serializer trusts every count and divides by
+  /// every denominator (`matroskaenc.c` 2947–2969;
+  /// `hdr_dynamic_metadata.c` 237–395): an entry of another size than the
+  /// linked libavutil's struct, a count past its array, a zero
+  /// denominator, a value its bits cannot hold — each rule in
+  /// [`mediaio_ffmpeg::hdr_metadata::check_hdr10_plus`], table A of the
+  /// census (see [the module](self)).
+  #[error("the packet's HDR10+ side data is not a struct Matroska writes whole and reads back")]
+  DynamicHdrPlus,
+  /// Matroska and WebM video: SMPTE ST 2094 application 5 side data
+  /// (`AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5`) that is not an
+  /// `AVDynamicHDRSmpte2094App5` the writer serializes whole and the reader
+  /// reads back as itself (`matroskaenc.c` 2970–2990;
+  /// `hdr_dynamic_metadata.c` 563–706) — each rule in
+  /// [`mediaio_ffmpeg::hdr_metadata::check_smpte2094_app5`].
+  #[error(
+    "the packet's SMPTE 2094 APP5 side data is not a struct Matroska writes whole and reads back"
+  )]
+  DynamicHdrApp5,
+  /// Two side-data entries of one kind. libavcodec keeps one entry a kind:
+  /// a later one's bytes replace the earlier one's in its place
+  /// (`av_packet_add_side_data`, `libavcodec/packet.c` 197–227 in FFmpeg
+  /// 9.0.1), so the earlier would be dropped unsaid. Refused in every
+  /// container.
+  #[error("the packet carries two side-data entries of one kind")]
+  SideDataRepeated,
 }
 
 /// Why a muxer did not open. Nothing was written.
@@ -1103,6 +1160,9 @@ struct PacketRules {
   /// MP4 AC-3 (`Some(false)`) and E-AC-3 (`Some(true)`): each packet is one
   /// MP4's AC-3 handling writes.
   ac3: Option<bool>,
+  /// Matroska and WebM video: HDR10+ and APP5 side data is a struct the
+  /// writer serializes whole (table A of the census).
+  hdr_metadata: bool,
 }
 
 /// The earliest time a container writes without moving every stream, in
@@ -1166,6 +1226,7 @@ impl PacketRules {
       prores: matroska && id == CodecId::PRORES,
       webvtt: either_matroska && id == CodecId::WEBVTT,
       ac3: (mp4 && (id == CodecId::AC3 || id == CodecId::EAC3)).then_some(id == CodecId::EAC3),
+      hdr_metadata: either_matroska && kind == TrackKind::Video,
     }
   }
 }
@@ -2506,6 +2567,13 @@ where
       }
     }
     let duration_ticks = duration.map(count).transpose()?.unwrap_or(0);
+    // The packet as libavcodec builds it holds one entry a kind.
+    if side_data_repeated(payload.side_data) {
+      return Err(Refusal::Container(FfmpegMuxRefusal::Payload {
+        track,
+        rule: PayloadRule::SideDataRepeated,
+      }));
+    }
     // The track's automatic filter takes the packet before libavformat's
     // timing does (`write_packets_common`, `mux.c` 1151–1174): its own
     // refusals come first, and a packet it holds — its times, flags and
@@ -2802,7 +2870,44 @@ fn check_packet_rules(
     },
     None => None,
   };
+  // The side data the container's writer casts to libavutil's structs, on
+  // a packet whose side data reaches it.
+  if rules.hdr_metadata && reaches {
+    for entry in payload.side_data {
+      if let Some(rule) = hdr_metadata_rule(entry) {
+        return refused(rule);
+      }
+    }
+  }
   Ok(Learned { cue_end, ac3 })
+}
+
+/// The rule an HDR metadata entry Matroska's writer would cast breaks, if
+/// it breaks one (table A of the census, see [the module](self)).
+fn hdr_metadata_rule(entry: &SideDataEntry) -> Option<PayloadRule> {
+  use AVPacketSideDataType as T;
+  if entry.kind() == T::AV_PKT_DATA_DYNAMIC_HDR10_PLUS as i32 {
+    check_hdr10_plus(entry.data())
+      .is_err()
+      .then_some(PayloadRule::DynamicHdrPlus)
+  } else if entry.kind() == T::AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5 as i32 {
+    check_smpte2094_app5(entry.data())
+      .is_err()
+      .then_some(PayloadRule::DynamicHdrApp5)
+  } else {
+    None
+  }
+}
+
+/// Whether two of `side_data`'s entries are of one kind, which libavcodec
+/// would fold into one (`av_packet_add_side_data`, `libavcodec/packet.c`
+/// 197–227 in FFmpeg 9.0.1).
+fn side_data_repeated(side_data: &[SideDataEntry]) -> bool {
+  side_data.iter().enumerate().any(|(at, entry)| {
+    side_data[..at]
+      .iter()
+      .any(|earlier| earlier.kind() == entry.kind())
+  })
 }
 
 impl<W, C> Muxer for CarrierMuxer<W, C>

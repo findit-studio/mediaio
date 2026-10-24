@@ -974,6 +974,38 @@ pub(crate) mod c_shims {
     /// (`libavcodec/packet.c` 269–317 in FFmpeg 9.0.1). Each name is a
     /// string literal of libavcodec's, live and unwritten for the process.
     pub(crate) fn av_packet_side_data_name(kind: c_int) -> *const libc::c_char;
+
+    /// `libavutil/hdr_dynamic_metadata.h`, which ffmpeg-sys-next 9.0.1
+    /// binds no part of: a zeroed `AVDynamicHDRPlus` of the linked
+    /// libavutil's own size, which it writes to `size` — 0 with a failed
+    /// allocation, answered as null (`hdr_dynamic_metadata.c` 36–44 in
+    /// FFmpeg 9.0.1). The struct stays opaque here: the pointer is read as
+    /// bytes and freed with `av_free`, never formed into a Rust type.
+    pub(crate) fn av_dynamic_hdr_plus_alloc(size: *mut usize) -> *mut libc::c_void;
+
+    /// As [`av_dynamic_hdr_plus_alloc`], for `AVDynamicHDRSmpte2094App5`
+    /// (`hdr_dynamic_metadata.c` 397–405).
+    pub(crate) fn av_dynamic_hdr_smpte2094_app5_alloc(size: *mut usize) -> *mut libc::c_void;
+
+    /// Parses an ITU-T T.35 HDR10+ payload of `size` bytes into the struct
+    /// `s` points at, answering 0 or a negative code
+    /// (`hdr_dynamic_metadata.c` 59–235): it refuses a payload past
+    /// `AV_HDR_PLUS_MAX_PAYLOAD_SIZE` bytes, copies the rest into a padded
+    /// buffer of its own, and writes only the struct's fields.
+    pub(crate) fn av_dynamic_hdr_plus_from_t35(
+      s: *mut libc::c_void,
+      data: *const u8,
+      size: usize,
+    ) -> c_int;
+
+    /// As [`av_dynamic_hdr_plus_from_t35`], for SMPTE ST 2094 application
+    /// 5 (`hdr_dynamic_metadata.c` 429–561), which copies the payload into
+    /// a padded buffer of its own first.
+    pub(crate) fn av_dynamic_hdr_smpte2094_app5_from_t35(
+      s: *mut libc::c_void,
+      data: *const u8,
+      size: usize,
+    ) -> c_int;
   }
 }
 

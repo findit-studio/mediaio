@@ -13,6 +13,19 @@ crate moves only when it changes.
 
 ### Added
 
+- **`hdr_metadata`** (hidden, for the muxer): `check_hdr10_plus` and
+  `check_smpte2094_app5` hold an HDR10+ or SMPTE ST 2094 APP5 side-data
+  entry — libavutil's struct, not bytes — to everything Matroska's writer
+  and libavutil's serializer assume of it, and to what the reader takes:
+  the linked libavutil's struct size, asked of its allocator once and
+  required to be the `repr(C)` mirror's (ffmpeg-sys-next 9.0.1 binds no
+  part of `libavutil/hdr_dynamic_metadata.h`), every count within its
+  array, every denominator nonzero, no overflow in C's `int`, every value
+  within its bits and a whole number of its unit, every flag 0 or 1, and
+  the writer's and the reader's syntaxes in agreement
+  (`HdrMetadataError`). `hdr10_plus_from_t35` and
+  `smpte2094_app5_from_t35` answer the struct libavutil parses from a
+  T.35 payload, as a demuxer delivers it.
 - `CodecId::media_type`: the media type libavcodec's descriptor gives a
   codec, as the integer it stores, or `None` where the build has no
   descriptor for the id.

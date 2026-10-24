@@ -3296,3 +3296,132 @@ fn l39_a_truncated_program_config_element_is_refused() {
     muxer.finish().expect("finished");
   }
 }
+
+/// An HDR10+ ITU-T T.35 payload — the bytes after the T.35 header — of one
+/// window, every field the syntax carries set: application version 1, the
+/// targeted display at 400, maxscl 1000, 2000, 3000 and an average of 500,
+/// two percentiles, the bright pixels at 10, a knee at (100, 200), three
+/// anchors and a saturation weight of 5 (the base's laws build it field by
+/// field, `mediaio-ffmpeg/src/hdr_metadata/tests.rs`).
+const HDR10_PLUS_T35: [u8; 30] = [
+  0x01, 0x40, 0x00, 0x0C, 0x80, 0x07, 0xD0, 0x07, 0xD0, 0x05, 0xDC, 0x00, 0x7D, 0x08, 0x08, 0x01,
+  0x91, 0x90, 0x4E, 0x20, 0x0A, 0x41, 0x90, 0x32, 0x0C, 0x0A, 0x05, 0x01, 0xE8, 0xA0,
+];
+
+/// An SMPTE ST 2094 application 5 payload: a custom reference white of
+/// 203, a baseline of 1000, one alternate image at 2000 with a curve of two
+/// points (built field by field in the base's laws).
+const APP5_T35: [u8; 19] = [
+  0x00, 0xC0, 0x00, 0xCB, 0x03, 0xE8, 0x10, 0x07, 0xD0, 0x00, 0x0C, 0x00, 0x64, 0x00, 0xC8, 0x01,
+  0x2C, 0x01, 0x90,
+];
+
+/// **L40 — HDR metadata side data reaches Matroska only as a struct its
+/// writer serializes whole, and then reads back as itself** (table A of
+/// the census). Matroska casts an HDR10+ or APP5 entry to libavutil's
+/// struct without asking its size (`matroskaenc.c` 2947–2990 in FFmpeg
+/// 9.0.1): an entry of sixteen bytes, and an HDR10+ struct naming four
+/// windows, are refused by name, each packet handed back untouched; the
+/// struct libavutil parses from a T.35 payload is written, and the packet
+/// reads back carrying the very bytes. Two entries of one kind are refused
+/// in every container, MP4's too.
+///
+/// PLANT: without the check in `check_packet_rules`, the sixteen bytes
+/// reach the writer, which reads the struct past them.
+#[test]
+fn l40_hdr_metadata_reaches_matroska_only_whole() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  use mediaio_ffmpeg::hdr_metadata::{hdr10_plus_from_t35, smpte2094_app5_from_t35};
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, video) = first_track(&source, TrackKind::Video, 3);
+  let with = |index: usize, entries: Vec<SideDataEntry>| {
+    let at = 40 * index as i64;
+    let mut packet = video_of(&video[index])
+      .with_pts(Some(ms(at)))
+      .with_dts(Some(ms(at)));
+    packet.extra_mut().set_side_data(entries);
+    VideoTrackPacket::new(TrackIndex::new(0), packet)
+  };
+  let plus = hdr10_plus_from_t35(&HDR10_PLUS_T35).expect("libavutil parses the payload");
+  let app5 = smpte2094_app5_from_t35(&APP5_T35).expect("libavutil parses the payload");
+  let (hdr10_plus, smpte_app5) = (
+    T::AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
+    T::AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5,
+  );
+
+  let target = output(&corpus, "l40.mkv");
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::MATROSKA,
+    table_of(&source, TrackKind::Video),
+  );
+  let mut four_windows = plus.clone();
+  four_windows[2] = 4;
+  for (entries, rule) in [
+    (
+      vec![side(hdr10_plus, &[0; 16])],
+      PayloadRule::DynamicHdrPlus,
+    ),
+    (
+      vec![side(hdr10_plus, &four_windows)],
+      PayloadRule::DynamicHdrPlus,
+    ),
+    (
+      vec![side(smpte_app5, &[0; 16])],
+      PayloadRule::DynamicHdrApp5,
+    ),
+    (
+      vec![side(hdr10_plus, &plus), side(hdr10_plus, &plus)],
+      PayloadRule::SideDataRepeated,
+    ),
+  ] {
+    let offered = with(0, entries);
+    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    assert_eq!(refusal, payload(rule));
+    untouched!(offered, back);
+  }
+  muxer
+    .write_video(with(0, vec![side(hdr10_plus, &plus)]))
+    .map_err(|error| error.map_packet(drop))
+    .expect("an HDR10+ struct Matroska writes whole");
+  muxer
+    .write_video(with(1, vec![side(smpte_app5, &app5)]))
+    .map_err(|error| error.map_packet(drop))
+    .expect("an APP5 struct Matroska writes whole");
+  muxer
+    .write_video(with(2, Vec::new()))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a packet");
+  assert!(muxer.report().is_empty(), "{:?}", muxer.report());
+  muxer.finish().expect("finished");
+  let read = side_data_of(&target);
+  assert!(
+    read[0].contains(&(hdr10_plus as i32, plus.clone())),
+    "the HDR10+ struct reads back as itself: {:?}",
+    read[0]
+      .iter()
+      .map(|(kind, bytes)| (kind, bytes.len()))
+      .collect::<Vec<_>>()
+  );
+  assert!(
+    read[1].contains(&(smpte_app5 as i32, app5.clone())),
+    "the APP5 struct reads back as itself"
+  );
+
+  let mut muxer = muxer_into(
+    &output(&corpus, "l40.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Video),
+  );
+  let offered = with(
+    0,
+    vec![
+      side(T::AV_PKT_DATA_A53_CC, &[1]),
+      side(T::AV_PKT_DATA_A53_CC, &[2]),
+    ],
+  );
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(refusal, payload(PayloadRule::SideDataRepeated));
+  untouched!(offered, back);
+}

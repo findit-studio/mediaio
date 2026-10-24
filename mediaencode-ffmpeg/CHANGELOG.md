@@ -87,6 +87,15 @@ crate moves only when it changes.
   packed code does not unpack to itself, reported; no flag the report
   names as dropped handed to libavformat, so MP4 makes no cover of a
   timed track.
+- **HDR metadata side data is checked exactly before Matroska casts it.**
+  On a Matroska or WebM video track, an HDR10+ or SMPTE ST 2094 APP5
+  entry is admitted only as the linked libavutil's struct, whole, that its
+  serializer writes and its reader reads back as itself
+  (`mediaio_ffmpeg::hdr_metadata`); any other is refused by name, the
+  packet handed back (`PayloadRule::DynamicHdrPlus`, `DynamicHdrApp5`).
+  The writer cast an undersized entry to the struct and read past it.
+  Two side-data entries of one kind, which libavcodec folds into one, are
+  refused in every container (`PayloadRule::SideDataRepeated`).
 - **AAC's program config element is bound-parsed.** On MP4's and
   Matroska's AAC with no configuration, the first ADTS frame whose
   channels are its program config element's is admitted only where the

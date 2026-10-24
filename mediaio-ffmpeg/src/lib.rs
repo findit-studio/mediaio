@@ -33,6 +33,8 @@ pub mod ffi;
 pub mod footprint;
 #[doc(hidden)]
 pub mod frame;
+#[doc(hidden)]
+pub mod hdr_metadata;
 pub mod limits;
 #[doc(hidden)]
 pub mod measured;
