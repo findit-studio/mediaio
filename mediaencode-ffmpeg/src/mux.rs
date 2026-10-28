@@ -134,10 +134,16 @@
 //! filter would refuse after taking it is refused first, by name
 //! ([`PayloadRule::Superframe`], [`PayloadRule::PgsSegments`],
 //! [`PayloadRule::AdtsFrame`]), every packet it puts out is sized before any
-//! of it is handed over (table B), and a packet a filter holds, its times,
-//! flags and side data dropped — a hidden VP9 frame, a PGS packet without
-//! its display set's presentation segment — meets none of the rules of its
-//! times.
+//! of it is handed over (table B), and every mirror of libavformat's timing
+//! and the container's moves on what a filter puts out now, in the times
+//! each packet it puts out carries — never on what it takes ([`Emits`];
+//! the mirrors, table B): a packet a filter holds meets none of the rules
+//! of its times until a packet put out carries them — PGS's display set, at
+//! its end segment's packet, in its presentation segment's packet's times
+//! — and a hidden VP9 frame's are dropped. PGS's open display sets this
+//! muxer holds itself, and hands to libavformat whole at the packet that
+//! completes them, so that nothing reaches FFmpeg's filter that a later
+//! refusal would leave there ([`CarrierMuxer::take_held`]).
 //!
 //! A caller turns them off ([`MuxOptions::set_automatic_filters`]), and no
 //! filter is then inserted at a first packet: AAC with no configuration is
@@ -169,8 +175,9 @@
 //! | HDR10+, SMPTE 2094 APP5, LCEVC | dropped | a video track's: kept, as ITU-T T.35 block additions (2947–3006) the trailer maps (3418–3443), which the reader turns back into their kinds (`matroskadec.c` 4038–4130); else dropped |
 //! | any other | dropped | dropped |
 //!
-//! A packet an automatic filter holds has all its side data dropped
-//! (`vp9_superframe.c` 169; `pgs_frame_merge.c` 132–136), and the first
+//! A packet whose own side data an automatic filter drops — a hidden VP9
+//! frame's, a PGS packet's that holds no presentation segment — has all of
+//! it dropped (`vp9_superframe.c` 169; `pgs_frame_merge.c` 132–136), and the first
 //! frame AAC's filter converts has its new extradata replaced by the
 //! configuration the filter makes (`aac_adtstoasc.c` 98–103).
 //!
@@ -236,12 +243,43 @@
 //! | `vp9_superframe` | IVF (`ivf_init`, `ivfenc.c` 42) | its start, whatever the option; VP9 | a superframe of the frames it holds — at most six hidden and the one shown — and its index of their sizes, summed in `unsigned` and allocated by the sum (`vp9_superframe.c` 34–98, 151–155): past 4 GiB the sum wraps and the copy runs past the allocation, below it `av_new_packet` refuses after taking the frames | mirrored with the filters on or off: the run counted wide, a hidden frame refused where no frame shown after it could join the run within the bound, a frame shown where its superframe passes it ([`PayloadRule::SuperframeSize`]); the filter's own refusals ([`PayloadRule::Superframe`]); reported ([`AutomaticFilter::Vp9Superframe`]) |
 //! | `vp9_superframe` | Matroska, WebM, the MOV family — MOV, 3GP, MP4, PSP, 3G2, iPod, ISMV, F4V, every muxer whose `check_bitstream` is MOV's (`mkv_check_bitstream`, `matroskaenc.c` 3639; `mov_check_bitstream`, `movenc.c` 9147) | the first packet, `AUTO_BSF`; VP9 | as above | as above, with the filters on |
 //! | `aac_adtstoasc` | Matroska's video muxer, the MOV family, FLV, LATM (`matroskaenc.c` 3634–3637; `movenc.c` 9144–9145; `flvenc.c` 1491–1493; `latmenc.c` 255–257) | the first packet, `AUTO_BSF`, where it opens with an ADTS header of more than two bytes; AAC | each frame less its header and CRC; the first converted, of channel configuration 0, less the program config element opening its payload too, consumed with no check that it fits, so that a packet the element runs past is put out at a negative size (`aac_adtstoasc.c` 54–96); raw packets passed on a configured track (51–52); its start refuses a configuration libavcodec does not parse (130–144) | MP4 and Matroska: ADTS frames alone, whole, on a track with no configuration (table F), named at open; on a configured one the first packet decides, the frames converted whole, and Matroska's configuration the filter makes within the space its header reserved ([`PayloadRule::NewExtradata`]); another container: the first packet decides; each filter named at its write, its refusals and its output's size held to ([`PayloadRule::AdtsFrame`]) |
-//! | `pgs_frame_merge` | Matroska's video muxer (`matroskaenc.c` 3640–3642) | the first packet, `AUTO_BSF`; PGS | display sets — the segments it holds and the packet's, several from one packet — grown by `av_grow_packet`, which refuses past the bound after taking them (`pgs_frame_merge.c` 93–157) | mirrored: each set counted, with room for its end segment, refused at the packet past which none fits ([`PayloadRule::DisplaySetSize`]) |
+//! | `pgs_frame_merge` | Matroska's video muxer (`matroskaenc.c` 3640–3642) | the first packet, `AUTO_BSF`; PGS | display sets — the segments it holds and the packet's, several from one packet — grown by `av_grow_packet`, which refuses past the bound after taking them; each put out at the packet that ends it, in the times of the packet that held its presentation segment; what it holds at the end, written marked corrupt (`pgs_frame_merge.c` 77–83, 93–157) | mirrored: each set counted, with room for its end segment, refused at the packet past which none fits ([`PayloadRule::DisplaySetSize`]); an open set held by this muxer, not FFmpeg's filter, and handed to libavformat whole at the packet that completes it, judged then in the times it is put out in; one no packet completes, handed back on asking ([`CarrierMuxer::take_held`]), else not written, reported ([`Uncarried::Held`]) |
 //! | `pcm_rechunk` | DAUD (`daud_init`, `daudenc.c` 44), GXF (`gxf_write_header`, `gxfenc.c` 724), MXF, MXF D-10, MXF OP-Atom (`mxf_init`, `mxfenc.c` 3081) | the start; an audio track — of PCM alone, which libavcodec admits to it (`av_bsf_init`, `libavcodec/bsf.c` 154–170) | packets of a fixed count of samples (`pcm_rechunk.c` 123–186); its start multiplies the channels by the bits per sample in `int`, and refuses a size past `INT_MAX` over it (49–58) | the product held at open ([`MuxOpenError::SampleSize`]); its packets are its options'; named at open ([`AutomaticFilter::PcmRechunk`]) |
 //! | `av1_metadata`, `td=insert` | IVF (`ivfenc.c` 46); OBU (`rawenc.c` 572) | IVF's start, whatever the option; OBU's first packet, `AUTO_BSF`; AV1 | the OBUs read and written back by CBS, each unit's write buffer at most `INT_MAX / 8` (`cbs.c` 342–372), the fragment summed in `size_t` (`cbs_av1.c` 1245–1265) and handed on as an `int` (`cbs.c` 472–474), which only shrinks it | nothing to hold; its refusals are the container's own; named at open ([`AutomaticFilter::Av1Metadata`]) |
 //! | `eia608_to_smpte436m` | MCC (`mcc_init`, `mccenc.c` 434), MXF (`mxf_init`, `mxfenc.c` 3104) | the start; EIA-608 | one ANC packet of at most 255 bytes, of at most 80 triples (`eia608_to_smpte436m.c` 168–209, 227) | nothing to hold; named at open ([`AutomaticFilter::Eia608ToSmpte436m`]) |
 //! | `extract_extradata` | FLV (`flvenc.c` 1501) | the first packet, `AUTO_BSF`, no configuration; H.264, HEVC, VVC, AV1, MPEG-4 | the packet less its parameter sets, each sum within the packet's or against `INT_MAX` (`extract_extradata.c` 102–116, 412–419) | nothing to hold; named at open, which its configuration decides ([`AutomaticFilter::ExtractExtradata`]) |
 //! | `h264_mp4toannexb`, `hevc_mp4toannexb`, `vvc_mp4toannexb` | MPEG-TS (`mpegtsenc.c` 2331) and RTP MPEG-TS's MPEG-TS, nested in a context of its own whose option stays on (`rtpenc_mpegts.c` 67); MXF and MXF OP-Atom, not MXF D-10 (`mxfenc.c` 3636, 3707–3758); the raw H.264, VVC and HEVC muxers (`rawenc.c` 391, 416, 441) | the first packet, `AUTO_BSF` — the nested context's own — of five bytes or more opening on no start code, MPEG-TS's on a 3-byte one where the configuration is length-prefixed; H.264, HEVC, VVC — MXF's H.264 alone | start codes for lengths, parameter sets before an IDR, counted in 64 bits against `INT_MAX` (`h264_mp4toannexb.c` 291, 420–424; `hevc_mp4toannexb.c` 199–206; `vvc_mp4toannexb.c` 287–294) | nothing to hold; named at the write of the packet that inserts it ([`AutomaticFilter::H264Mp4ToAnnexB`], [`HevcMp4ToAnnexB`](AutomaticFilter::HevcMp4ToAnnexB), [`VvcMp4ToAnnexB`](AutomaticFilter::VvcMp4ToAnnexB)) |
+//!
+//! **What moves each mirror** (grep G20 of #82): every mirror this muxer
+//! keeps of libavformat's timing and of the container's moves on what the
+//! track's filter puts out now, in the times each packet put out carries
+//! ([`Emits`]) — what `write_packets_from_bsfs` hands on from the filter to
+//! `write_packet_common` (`mux.c` 1094–1149) — and never on a packet the
+//! filter takes and holds.
+//!
+//! | mirror | moved by | why |
+//! |---|---|---|
+//! | libavformat's equal-decode-time rule ([`FfmpegMuxRefusal::RepeatedDts`]) | each packet put out, its decode time | `compute_muxer_pkt_fields` runs on each packet a filter puts out (`mux.c` 557–566, 1094–1149) |
+//! | the move of early times and the interleaving's first write ([`Shift`]) | each packet put out, in its times | `handle_avoid_negative_ts` and the interleaving see only what the filter puts out (636–717, 939–1003) |
+//! | MP4's `check_pkt` reference (the last sample written, table C″) | the last packet put out, or the joined E-AC-3 sample | `check_pkt` judges each packet MP4 is handed (`movenc.c` 6897–6930) |
+//! | the latest decode time handed beside a `mov_text` cue ([`Neighbours`]) | each packet put out | the interleaving's (`mux.c` 939–1003) |
+//! | the container's first packet of a track | the first put out | Matroska's start skip (`matroskaenc.c` 2089–2104); MP4's AC-3 configuration (`movenc.c` 424–429) |
+//! | the rules of a packet's times — MP4's 32-bit fields, a missing presentation time, a negative duration, a time before the earliest | each packet put out, in its times | the container judges what it is handed |
+//! | Matroska's block bound (table B) | each packet put out, and what the filter holds at the least it can come to | the cluster's |
+//! | a packet's flags' and side data's fates (the side-data table) | the packet whose own they are, put out now or later | the filter carries or drops them (`vp9_superframe.c` 169; `pgs_frame_merge.c` 132–136) |
+//! | the face's decode order | every packet offered, held or not | the face's own rule, not libavformat's |
+//!
+//! A filter that holds packets inside FFmpeg can lose none to a later
+//! refusal: VP9's superframe takes the times of the frame that completes it
+//! (`vp9_superframe.c` 163–175), so no rule judged then depends on a held
+//! frame's, each held frame's size is judged at its own packet against the
+//! least a completion comes to, and the filter drops, never writes, what it
+//! holds at the end (198–207, reported); MP4's E-AC-3 join is MP4's own,
+//! judged at the run's first packet against a reference no other packet
+//! moves (table C″), and freed at the trailer, reported at open. PGS's
+//! filter writes what it holds at the end marked corrupt, in the times of a
+//! packet a later refusal may leave before the earliest: so this muxer
+//! holds PGS's open sets itself.
 //!
 //! **The sizes libavformat counts**, every size the packet path computes in
 //! 32 bits, with the bound held here — libavcodec's largest packet
@@ -436,7 +474,7 @@
 //! | a chapter's span | MP4 counts it in its movie timescale (table C′) and its reader ends each chapter where the next starts (`movenc.c` 7727–7815); Matroska counts it in nanoseconds (2439–2440), each rounded to the nearest | reported at open where an instant moves ([`Uncarried::ChapterSpan`]) |
 //! | a chapter without a title, a title past 65535 bytes | MP4 writes every chapter into its Nero list but a titled one alone into its chapter track, which its reader lays over the list by position; a title with a 16-bit length (`movenc.c` 7791–7807) | refused at open ([`MuxOpenError::ChapterWithoutTitle`], [`ChapterTitleTooLong`](MuxOpenError::ChapterTitleTooLong)) |
 //! | VP9's hidden frames, still held at the stream's end | dropped by the filter, which no later frame shows (`vp9_superframe.c` 198–207) | reported at `finish` ([`Uncarried::Held`], with the report [`CarrierMuxer::finish_into_sink`] hands back): the muxer cannot know at a held frame that none will follow, and does not refuse the file for it |
-//! | PGS segments, still held at the stream's end | written as one packet marked corrupt (`pgs_frame_merge.c` 77–83) | reported at `finish` ([`Uncarried::Held`]) |
+//! | PGS segments, still held at the stream's end | written as one packet marked corrupt (`pgs_frame_merge.c` 77–83) | held by this muxer, not FFmpeg's filter: handed back on asking ([`CarrierMuxer::take_held`]), else not written, reported at `finish` ([`Uncarried::Held`]) |
 //! | MP4's durations, where packets do not abut | kept only as the distance to the next decode time (`movenc.c` 1241–1259), counted between the samples MP4 writes (table C″) | reported as learned ([`Rewrite::Durations`]) |
 //! | an E-AC-3 track's last sample, joined | the edit list ends it at its last packet's duration (`movenc.c` 6940, 7329–7342), short of the frames it joins | reported at `finish` ([`Rewrite::Durations`]) |
 //!
@@ -491,7 +529,7 @@
 //! | [`FfmpegMuxRefusal::CueOrder`] | an overlapping or replacing cue is written as it is, the last cue shortened (`movenc.c` 7646–7653) — taken and reported (round 6) — unless another track's packet makes MP4 mark the end first and then move the cue (6917–6923), as the `ffmpeg` CLI does beside video: "Packet duration: -1000 / dts: 2000 in stream 1 is out of range". A first cue before zero MP4's writer takes, and its reader drops: its edit list starts the track at zero (4133–4239), and `mov_fix_index` marks a sample before an edit's start discarded and counts every later one from it (`mov.c` 4374–4682) — `ffprobe` reads the CLI's cues at −30 and 20 (`-itsoffset -0.03`) back at −40, marked discarded, and 10. Judged by the round trip, not the writer alone (ruled) | corrupts, or loses, where it is refused |
 //! | [`FfmpegMuxRefusal::NegativeDuration`], a subtitle's outside Matroska and WebM | libavformat hands a subtitle's on as it is (`guess_pkt_duration`, `mux.c` 605–611): MP4 refuses it after taking the packet (`check_pkt`, `movenc.c` 6925–6928), or joins a TTML paragraph into its document ending before it starts (`ttmlenc.c` 172); SRT drops the cue (`srtenc.c` 71–75); WebVTT and ASS write it ending before it starts (`webvttenc.c` 80, `assenc.c` 160). Any other track's libavformat writes as zero, or its own guess (605–633), and Matroska and WebM a subtitle's as zero (`matroskaenc.c` 3134): taken, reported ([`Rewrite::Durations`]) — L11; PLANT: refused on every track, L11's video packet refused; on none, MP4 refuses L11's cue after taking it | refuses after taking, loses, or corrupts, where it is refused |
 //! | [`FfmpegMuxRefusal::KeyFrameUnmarked`] | libavformat marks every packet of a codec its descriptor counts of key frames alone a key frame (`mux.c` 820–821), overriding the packet's own word that it is no seek point: a frame can lean on the one before — an MP3 frame whose bit reservoir starts there decodes, where decoding starts at it, to silence (`mpegaudiodec_template.c` 1316–1322) — so the mark would make a seek point that does not decode. Kept: a caller that knows the packet is a key frame marks it — L16; PLANT: dropped, L16's unmarked frame taken | writes it false |
-//! | [`FfmpegMuxRefusal::BeforeZero`] | libavformat moves every stream's times later at its first write, by the earliest distance before its stream's earliest of the packet it writes or of one its interleaving holds then (`handle_avoid_negative_ts`, `mux.c` 636–717): mirrored ([`Shift`]), taken, reported ([`Uncarried::TimesShifted`]). A packet after that write the move leaves before the earliest it hands the container as it is, warning it "failed to avoid negative timestamp" (692–715): FLV refuses it after taking it (`flvenc.c` 1267–1274); Matroska writes it with no cue, its block time a 16-bit count from its cluster's, which starts no earlier than zero, so that one more than 32768 ticks before zero wraps (`matroskaenc.c` 969–970, 3146–3163, 2888) — refused. Where the move is not mirrored — GXF's and MXF's own interleaving, Matroska's times uncertain beside a video track of no native id — every time before the earliest is refused, as round 2 refused it — L14, L46; PLANT: the move unmirrored, L14's early packets refused; after the first write unjudged, L14's late packets taken | refuses after taking, or corrupts, where it is refused |
+//! | [`FfmpegMuxRefusal::BeforeZero`] | libavformat moves every stream's times later at its first write, by the earliest distance before its stream's earliest of the packet it writes or of one its interleaving holds then (`handle_avoid_negative_ts`, `mux.c` 636–717): mirrored ([`Shift`]), taken, reported ([`Uncarried::TimesShifted`]). A packet after that write the move leaves before the earliest it hands the container as it is, warning it "failed to avoid negative timestamp" (692–715): FLV refuses it after taking it (`flvenc.c` 1267–1274); Matroska writes it with no cue, its block time a 16-bit count from its cluster's, which starts no earlier than zero, so that one more than 32768 ticks before zero wraps (`matroskaenc.c` 969–970, 3146–3163, 2888) — refused. Where the move is not mirrored — GXF's and MXF's own interleaving, Matroska's times uncertain beside a video track of no native id — every time before the earliest is refused, as round 2 refused it — L14, L46; PLANT: the move unmirrored, L14's early packets refused; after the first write unjudged, L14's late packets taken. Each packet is judged in the times of what its track's filter puts out, when it puts it out (table B's mirrors; Codex R6 [high]): a PGS display set at the packet that ends it, in its presentation segment's packet's times — L69; PLANT: the mirrors moved on what the filter takes, L69's held presentation segment moving every stream | refuses after taking, or corrupts, where it is refused |
 //! | [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Cropping`] | MP4's trailer refuses the box (`movenc.c` 1299–1340, 857–910, 3024–3036; `movenc_ttml.c` 236–317) | refuses after taking: the file |
 //! | [`MuxOpenError::SampleSize`], [`MuxOpenError::Cover`] | `pcm_rechunk`'s start fails the header (`pcm_rechunk.c` 49–58); the cover's builder fails after the header (`packet.c` 83–95) | refuses: the file |
 //! | [`MuxOpenError::MediaTypeMismatch`] | a stream of one media type whose packets this muxer would judge as another's | corrupts |
@@ -977,11 +1015,13 @@ pub enum Uncarried {
     /// The chapter's position in the table.
     chapter: usize,
   },
-  /// Packets an automatic filter still held when the muxer finished,
-  /// which the stream's end decides: VP9's hidden frames, which no later
-  /// frame shows, dropped (`vp9_superframe.c` 198–207, its flush), and
-  /// PGS's segments, put out as one packet marked corrupt
-  /// (`pgs_frame_merge.c` 77–83) — table E of the census (see [the
+  /// Packets held when the muxer finished, which the stream's end decides:
+  /// VP9's hidden frames, which no later frame shows, dropped by its filter
+  /// (`vp9_superframe.c` 198–207, its flush), and the packets of a PGS
+  /// display set no packet completed, which this muxer held and does not
+  /// write — FFmpeg's filter, holding them, would write them marked corrupt
+  /// (`pgs_frame_merge.c` 77–83) — unless handed back first
+  /// ([`CarrierMuxer::take_held`]): table E of the census (see [the
   /// module](self)). Reported by [`CarrierMuxer::finish_into_sink`], with
   /// the report it hands back.
   Held {
@@ -1911,9 +1951,14 @@ struct TrackState {
   /// The last decode time written, as an instant.
   last: Option<Timestamp>,
   /// The decode time, counted in the stream's time base, of the last
-  /// packet whose own times reached libavformat's timing: one an automatic
-  /// filter holds, whose times it drops, does not count ([`Filter`]).
+  /// packet libavformat was handed on the track: the last its automatic
+  /// filter put out ([`Emits`]).
   last_ticks: Option<i64>,
+  /// The decode time of that packet, as an instant.
+  handed: Option<Timestamp>,
+  /// PGS: what the packets this muxer holds of the track put out, once
+  /// handed ([`Plan::pending`]).
+  pending: Vec<Timed>,
   /// MP4: the last sample MP4 wrote on the track, which `check_pkt`
   /// counts the next packet's gap from — moved only where MP4 writes one,
   /// not by a packet it holds (table C″ of the census).
@@ -1926,7 +1971,8 @@ struct TrackState {
   filter: Filter,
   /// Which side data the container writes on the track.
   sides: SideRules,
-  /// Whether a packet's own times have reached the container yet.
+  /// Whether the track's filter has put out a packet yet: the container's
+  /// first.
   written: bool,
   /// MP4 `mov_text`: the samples MP4 has written of the track.
   cues: Cues,
@@ -3316,9 +3362,14 @@ enum Filter {
 /// What a track's filter does with a packet ([`Filter::step`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Step {
-  /// Whether the packet's own times, flags and side data reach the
-  /// container: not where the filter holds the packet.
-  reaches: bool,
+  /// Whether the packet's own flags and side data reach the container, in a
+  /// packet the filter puts out now or later: not where the filter drops
+  /// them, with the packet's times.
+  owns: bool,
+  /// What the filter puts out now, by whose times each packet carries: what
+  /// libavformat's interleaving and the container are handed at the
+  /// packet's write, which every mirror of their timing moves on alone.
+  emits: Emits,
   /// The largest packet the filter puts out with this one — its payload's
   /// bytes and its side data's — or `None` where it puts out none.
   largest: Option<u64>,
@@ -3329,6 +3380,39 @@ struct Step {
   /// The filter this packet inserts, where the track's first packet decides
   /// it: reported for the track at its write (table B).
   inserted: Option<AutomaticFilter>,
+}
+
+/// The packets a track's filter puts out with a packet, now, by whose times
+/// each carries ([`Step::emits`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Emits {
+  /// The display set the packet completes, held before it: it takes the
+  /// times of the packet that held its presentation segment
+  /// (`pgs_frame_merge.c` 132–136).
+  held: Option<Timed>,
+  /// Whether it puts out a packet with the packet's own times — one or
+  /// more: the display sets one PGS packet holds whole share them.
+  own: bool,
+}
+
+impl Emits {
+  /// Nothing put out.
+  const NONE: Self = Self {
+    held: None,
+    own: false,
+  };
+
+  /// The packet, as its own.
+  const OWN: Self = Self {
+    held: None,
+    own: true,
+  };
+
+  /// The times of what is put out, in the order put out, the packet's own
+  /// being `own`.
+  fn times(self, own: Timed) -> impl Iterator<Item = Timed> {
+    self.held.into_iter().chain(self.own.then_some(own))
+  }
 }
 
 impl Filter {
@@ -3419,14 +3503,22 @@ impl Filter {
     }
   }
 
-  /// Holds a packet of `bytes`, carrying `side` bytes of side data, to the
-  /// filter, every packet it puts out held to `limit` — libavcodec's
-  /// largest packet, which the laws lower: answers what the filter holds
-  /// after it and what it puts out ([`Step`]), or the rule it breaks.
-  fn step(self, bytes: &[u8], side: u64, limit: u64) -> Result<(Self, Step), PayloadRule> {
+  /// Holds a packet timed `timed`, of `bytes`, carrying `side` bytes of
+  /// side data, to the filter, every packet it puts out held to `limit` —
+  /// libavcodec's largest packet, which the laws lower: answers what the
+  /// filter holds after it and what it puts out ([`Step`]), or the rule it
+  /// breaks.
+  fn step(
+    self,
+    timed: Timed,
+    bytes: &[u8],
+    side: u64,
+    limit: u64,
+  ) -> Result<(Self, Step), PayloadRule> {
     let len = bytes.len() as u64;
     let passed = Step {
-      reaches: true,
+      owns: true,
+      emits: Emits::OWN,
       largest: Some(len + side),
       held: None,
       inserted: None,
@@ -3449,7 +3541,7 @@ impl Filter {
             configured,
             whole,
           }
-          .step(bytes, side, limit)?;
+          .step(timed, bytes, side, limit)?;
           Ok((
             filter,
             Step {
@@ -3517,14 +3609,16 @@ impl Filter {
             superframe_bytes(sum + len, largest.max(len), u64::from(held) + 1)
           };
           Step {
-            reaches: true,
+            owns: true,
+            emits: Emits::OWN,
             largest: Some(out + side),
             held: None,
             inserted: None,
           }
         } else {
           Step {
-            reaches: false,
+            owns: false,
+            emits: Emits::NONE,
             largest: None,
             held: Some(superframe_bytes(
               run.0 + 1,
@@ -3543,9 +3637,8 @@ impl Filter {
           step,
         ))
       }
-      Self::Pgs(state) => {
-        pgs_frame_merge(state, bytes, side, limit).map(|(state, step)| (Self::Pgs(state), step))
-      }
+      Self::Pgs(state) => pgs_frame_merge(state, timed, bytes, side, limit)
+        .map(|(state, step)| (Self::Pgs(state), step)),
     }
   }
 }
@@ -3818,15 +3911,17 @@ fn superframe_bytes(sum: u64, largest: u64, frames: u64) -> u64 {
 
 /// What the PGS filter holds of a display set: whether it holds any of its
 /// segments, whether one was its presentation segment, their bytes, the
-/// side data's bytes of the packet that held the presentation segment —
-/// the set is put out with that packet's side data (`pgs_frame_merge.c`
-/// 132–136) — and how many packets' segments it holds.
+/// side data's bytes and the times of the packet that held the
+/// presentation segment — the set is put out with that packet's times and
+/// side data (`pgs_frame_merge.c` 132–136) — and how many packets'
+/// segments it holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PgsState {
   holding: bool,
   presentation: bool,
   bytes: u64,
   side: u64,
+  times: Option<Timed>,
   packets: u64,
 }
 
@@ -3851,6 +3946,7 @@ const PGS_END_SEGMENT_BYTES: u64 = 3;
 /// the set. The limit is [`PACKET_BYTES_MAX`]; the laws lower it.
 fn pgs_frame_merge(
   state: PgsState,
+  timed: Timed,
   bytes: &[u8],
   side: u64,
   limit: u64,
@@ -3860,6 +3956,10 @@ fn pgs_frame_merge(
   }
   let mut state = state;
   let mut own = false;
+  // What the filter puts out of the packet, now: the set held before it,
+  // which takes the times of the packet that held its presentation segment,
+  // and the sets whose presentation segment it holds, which take its own.
+  let mut emits = Emits::NONE;
   let mut largest: Option<u64> = None;
   let mut rest = bytes;
   // The filter takes a packet's display sets one at a time, the rest of
@@ -3900,7 +4000,8 @@ fn pgs_frame_merge(
         return Ok((
           PgsState::default(),
           Step {
-            reaches: true,
+            owns: true,
+            emits: Emits { own: true, ..emits },
             largest,
             held: None,
             inserted: None,
@@ -3926,6 +4027,11 @@ fn pgs_frame_merge(
         if !state.presentation {
           return Err(PayloadRule::PgsSegments);
         }
+        if presentation {
+          emits.own = true;
+        } else {
+          emits.held = state.times;
+        }
         largest = Some(largest.map_or(held + set_side, |most| most.max(held + set_side)));
         state = PgsState::default();
         rest = &rest[size..];
@@ -3941,6 +4047,11 @@ fn pgs_frame_merge(
           presentation: state.presentation,
           bytes: held,
           side: set_side,
+          times: if presentation {
+            Some(timed)
+          } else {
+            state.times
+          },
           packets: state.packets + 1,
         };
         rest = &[];
@@ -3953,7 +4064,8 @@ fn pgs_frame_merge(
   Ok((
     state,
     Step {
-      reaches: own,
+      owns: own,
+      emits,
       largest,
       held,
       inserted: None,
@@ -4246,10 +4358,14 @@ struct Plan {
   shift: Option<Shift>,
   dts: Timestamp,
   times: PacketTimes,
-  dts_ticks: i64,
-  /// Whether the packet's own times, flags and side data reach the
-  /// container: not where its track's automatic filter holds it.
-  reaches: bool,
+  /// What libavformat's interleaving is handed at the packet's write, by
+  /// the times each carries: what the track's filter puts out ([`Emits`]).
+  outputs: Vec<Timed>,
+  /// Whether this muxer holds the packet, with its display set, handing
+  /// libavformat nothing.
+  holds: bool,
+  /// What the packets this muxer holds of the track put out, once handed.
+  pending: Vec<Timed>,
   /// What the track's automatic filter holds after the packet.
   filter: Filter,
   /// What the container learns of the track from the packet.
@@ -4285,7 +4401,7 @@ struct Learned {
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
-pub struct CarrierMuxer<W, C> {
+pub struct CarrierMuxer<W, C: FfmpegCarrier> {
   output: Output<W>,
   container: ContainerName,
   tracks: Vec<TrackState>,
@@ -4296,6 +4412,9 @@ pub struct CarrierMuxer<W, C> {
   /// libavformat's shift of every stream's times, where it makes one and
   /// this muxer mirrors it.
   shift: Option<Shift>,
+  /// PGS: the packets of each display set left open, in the order offered,
+  /// which no packet has completed ([`Self::take_held`]).
+  held: Vec<HeldPacket<C::Buffer>>,
   _carrier: PhantomData<fn() -> C>,
 }
 
@@ -4559,6 +4678,8 @@ where
         strict: strict && !matches!(kind, TrackKind::Subtitle | TrackKind::Data),
         last: None,
         last_ticks: None,
+        handed: None,
+        pending: Vec::new(),
         sample: None,
         rules,
         filter,
@@ -4607,6 +4728,7 @@ where
         bounds,
         report: report.clone(),
         shift,
+        held: Vec::new(),
         _carrier: PhantomData,
       },
       report,
@@ -4621,6 +4743,29 @@ where
   /// [`Self::finish_into_sink`] adds ([`Uncarried::Held`]).
   pub const fn report(&self) -> &MuxReport {
     &self.report
+  }
+
+  /// The packets of every display set this muxer holds open, handed back in
+  /// the order offered, each on its track. A PGS packet that leaves its
+  /// display set without its end segment is held here, with the packets of
+  /// the set before it, and not handed to libavformat — whose filter would
+  /// hold it out of reach, and write it at the end marked corrupt
+  /// (`pgs_frame_merge.c` 77–83, 132–151 in FFmpeg 9.0.1) — until a packet
+  /// completes the set: a set whose completing packet is refused stays held,
+  /// and this hands it back. Each track handed back starts a new display
+  /// set, its last decode time what it was before the set. What
+  /// [`Self::finish_into_sink`] still finds held is not written, and is
+  /// reported ([`Uncarried::Held`]).
+  pub fn take_held(&mut self) -> Vec<SubtitleTrackPacket<Ffmpeg, C::Buffer>> {
+    let held = core::mem::take(&mut self.held);
+    // Newest first, so that each track ends at its first held packet's.
+    for entry in held.iter().rev() {
+      let state = &mut self.tracks[entry.packet.track().get()];
+      state.last = entry.last;
+      state.filter = Filter::Pgs(PgsState::default());
+      state.pending.clear();
+    }
+    held.into_iter().map(|entry| entry.packet).collect()
   }
 
   /// The container this muxer writes.
@@ -4665,6 +4810,20 @@ where
           track,
           filter,
           packets,
+        });
+      }
+      // PGS: a display set no packet completed, which this muxer held and
+      // does not write.
+      let held = self
+        .held
+        .iter()
+        .filter(|entry| entry.packet.track() == track)
+        .count() as u64;
+      if held > 0 {
+        self.report.uncarried.push(Uncarried::Held {
+          track,
+          filter: AutomaticFilter::PgsFrameMerge,
+          packets: held,
         });
       }
       // MP4 ends its edit list at the last sample's decode time and its last
@@ -4792,58 +4951,93 @@ where
     }
     // The track's automatic filter takes the packet before libavformat's
     // timing does (`write_packets_common`, `mux.c` 1151–1174): its own
-    // refusals come first, and a packet it holds — its times, flags and
-    // side data dropped — meets no rule libavformat and the container apply
-    // to the times of what the filter puts out.
+    // refusals come first, and what libavformat's timing and the container
+    // meet is what the filter puts out now ([`Emits`]) — a packet it holds
+    // meets nothing until a packet it puts out carries its times, and every
+    // mirror of their timing moves on what is put out alone.
     let side: u64 = payload
       .side_data
       .iter()
       .map(|entry| entry.data().len() as u64)
       .sum();
+    let own = Timed {
+      track,
+      pts,
+      dts,
+      duration,
+      pts_ticks,
+      dts_ticks,
+      duration_ticks,
+    };
     let (filter, step) = state
       .filter
-      .step(payload.bytes, side, self.bounds.packet)
+      .step(own, payload.bytes, side, self.bounds.packet)
       .map_err(|rule| Refusal::Container(FfmpegMuxRefusal::Payload { track, rule }))?;
-    let reaches = step.reaches;
-    // libavformat's rule, exactly: nothing is checked while the last
-    // decode time is zero — its counter starts there — and a repeat is
-    // refused after any other.
-    if reaches
-      && state.strict
-      && matches!(state.last_ticks, Some(last) if last != 0 && last >= dts_ticks)
-    {
-      return Err(Refusal::Container(FfmpegMuxRefusal::RepeatedDts {
-        track,
-        dts,
-      }));
+    // PGS: a packet that leaves its display set open is held by this muxer,
+    // with every packet of the set before it, and nothing of them reaches
+    // libavformat until a packet completes the set — inside FFmpeg the
+    // filter would hold them out of reach of a later refusal, and write
+    // them at the end marked corrupt (`pgs_frame_merge.c` 77–83, 132–151;
+    // [`Self::take_held`]). What they put out is put out when the packet
+    // that completes the set hands them over.
+    let holds =
+      offered == TrackKind::Subtitle && matches!(filter, Filter::Pgs(next) if next.holding);
+    let emitted = state.pending.iter().copied().chain(step.emits.times(own));
+    let (outputs, pending): (Vec<Timed>, Vec<Timed>) = if holds {
+      (Vec::new(), emitted.collect())
+    } else {
+      (emitted.collect(), Vec::new())
+    };
+    // libavformat's rule, exactly, on every packet it is handed: nothing is
+    // checked while the last decode time is zero — its counter starts there
+    // — and a repeat is refused after any other.
+    let mut last_ticks = state.last_ticks;
+    for output in &outputs {
+      if state.strict && matches!(last_ticks, Some(last) if last != 0 && last >= output.dts_ticks) {
+        return Err(Refusal::Container(FfmpegMuxRefusal::RepeatedDts {
+          track,
+          dts: output.dts,
+        }));
+      }
+      last_ticks = Some(output.dts_ticks);
     }
     // libavformat's shift of early times, which its first write settles
-    // (table G): a packet before it is lifted with every stream; one after
-    // it the shift leaves before the earliest is written there.
+    // (table G), met by every packet its interleaving is handed: one before
+    // that write is lifted with every stream; one after it the shift leaves
+    // before the earliest is written there.
     let shift = match &self.shift {
-      // A reordering stream's packet without the presentation time judged
-      // is refused below ([`FfmpegMuxRefusal::MissingPts`]), and would move
-      // nothing: libavformat judges no packet without its time (`mux.c`
-      // 650–651).
-      Some(shift) if reaches && !(shift.by_pts && pts.is_none() && state.rules.needs_pts) => {
+      Some(current) => {
         let lowest = match state.rules.earliest {
           Some(Earliest::Presentation(lowest) | Earliest::Decode(lowest)) => lowest,
           None => 0,
         };
-        let (at, timestamp) = if shift.by_pts {
-          (pts_ticks.unwrap_or(dts_ticks), pts.unwrap_or(dts))
-        } else {
-          (dts_ticks, dts)
-        };
-        let next = shift
-          .take(track.get(), (at, dts_ticks, lowest), time_base)
-          .ok_or(Refusal::Container(FfmpegMuxRefusal::BeforeZero {
-            track,
-            timestamp,
-          }))?;
+        let mut next = current.clone();
+        for output in &outputs {
+          // A reordering stream's packet without the presentation time
+          // judged is refused below ([`FfmpegMuxRefusal::MissingPts`]), and
+          // would move nothing: libavformat judges no packet without its
+          // time (`mux.c` 650–651).
+          if next.by_pts && output.pts.is_none() && state.rules.needs_pts {
+            continue;
+          }
+          let (at, timestamp) = if next.by_pts {
+            (
+              output.pts_ticks.unwrap_or(output.dts_ticks),
+              output.pts.unwrap_or(output.dts),
+            )
+          } else {
+            (output.dts_ticks, output.dts)
+          };
+          next = next
+            .take(track.get(), (at, output.dts_ticks, lowest), time_base)
+            .ok_or(Refusal::Container(FfmpegMuxRefusal::BeforeZero {
+              track,
+              timestamp,
+            }))?;
+        }
         Some(next)
       }
-      _ => None,
+      None => None,
     };
     let neighbours = if state.rules.mov_text {
       self.neighbours(track, time_base)
@@ -4854,15 +5048,7 @@ where
       state,
       time_base,
       neighbours,
-      Timed {
-        track,
-        pts,
-        dts,
-        duration,
-        pts_ticks,
-        dts_ticks,
-        duration_ticks,
-      },
+      (own, &outputs),
       payload,
       step,
       self.bounds,
@@ -4874,7 +5060,7 @@ where
       &self.report.uncarried,
       payload,
       &learned,
-      reaches,
+      step.owns,
     );
     // The filter this packet's write inserts, where the first packet
     // decides it: named for the track then, once (table B).
@@ -4899,8 +5085,9 @@ where
       shift,
       dts,
       times: PacketTimes::new(pts_ticks, Some(dts_ticks), duration_ticks),
-      dts_ticks,
-      reaches,
+      outputs,
+      holds,
+      pending,
       filter,
       learned,
       uncarried,
@@ -4924,7 +5111,7 @@ where
       {
         neighbours.finer = true;
       }
-      neighbours.latest = neighbours.latest.max(other.last);
+      neighbours.latest = neighbours.latest.max(other.handed);
     }
     neighbours
   }
@@ -4944,8 +5131,12 @@ where
     let state = &mut self.tracks[plan.track.get()];
     state.last = Some(plan.dts);
     state.filter = plan.filter;
-    if plan.reaches {
-      state.last_ticks = Some(plan.dts_ticks);
+    state.pending = plan.pending;
+    // What libavformat was handed moves every mirror of its timing and the
+    // container's: the last packet the filter put out.
+    if let Some(last) = plan.outputs.last() {
+      state.last_ticks = Some(last.dts_ticks);
+      state.handed = Some(last.dts);
       state.written = true;
     }
     if let Some(sample) = plan.learned.sample {
@@ -4960,9 +5151,43 @@ where
     if let Some(document) = plan.learned.document {
       state.document = document;
     }
-    self.report.uncarried.extend(plan.uncarried);
+    for line in plan.uncarried {
+      if !self.report.uncarried.contains(&line) {
+        self.report.uncarried.push(line);
+      }
+    }
     Ok(())
   }
+
+  /// Holds a PGS packet `plan` admitted, with the display set it leaves
+  /// open: nothing of it reaches libavformat, and its report waits for the
+  /// write that hands it over ([`Self::take_held`]).
+  fn hold(&mut self, plan: Plan, packet: SubtitleTrackPacket<Ffmpeg, C::Buffer>) {
+    let state = &mut self.tracks[plan.track.get()];
+    let last = state.last;
+    state.last = Some(plan.dts);
+    state.filter = plan.filter;
+    state.pending = plan.pending;
+    self.held.push(HeldPacket {
+      packet,
+      times: plan.times,
+      uncarried: plan.uncarried,
+      last,
+    });
+  }
+}
+
+/// A PGS packet this muxer holds, with the display set it leaves open,
+/// until a packet completes the set ([`CarrierMuxer::take_held`]).
+struct HeldPacket<B> {
+  packet: SubtitleTrackPacket<Ffmpeg, B>,
+  /// What libavformat is told of it, once handed.
+  times: PacketTimes,
+  /// What the report learns from it, once written.
+  uncarried: Vec<Uncarried>,
+  /// Its track's last decode time before it, which handing it back
+  /// restores.
+  last: Option<Timestamp>,
 }
 
 /// What the report learns from a packet of `track` once it is written —
@@ -4974,8 +5199,8 @@ where
 ///   the last one it wrote loses that one's offered duration — counted
 ///   between the samples MP4 writes, not the packets it holds (table C″);
 /// - the packet's side data the container drops, by the side-data table
-///   ([`SideRules::fate`]) — all of it, where the automatic filter holds
-///   the packet, or where MP4 joins it to a sample of E-AC-3 frames, which
+///   ([`SideRules::fate`]) — all of it, where the automatic filter drops it
+///   with the packet's times, or where MP4 joins it to a sample of E-AC-3 frames, which
 ///   takes the run's first packet's (all but its new extradata, which MP4
 ///   reads first), and its new extradata, on the first frame AAC's filter
 ///   converts, which the filter replaces with the configuration it makes
@@ -4986,7 +5211,7 @@ fn learned_losses(
   reported: &[Uncarried],
   payload: Payload<'_>,
   learned: &Learned,
-  reaches: bool,
+  owns: bool,
 ) -> Vec<Uncarried> {
   let (payload_bytes, side_data) = (payload.bytes, payload.side_data);
   let mut lines = Vec::new();
@@ -5007,7 +5232,7 @@ fn learned_losses(
   for entry in side_data {
     let new_extradata = entry.kind() == AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
     let replaced = first_conversion(state.filter, payload_bytes) && new_extradata;
-    let fate = if !reaches || replaced || (learned.joined && !new_extradata) {
+    let fate = if !owns || replaced || (learned.joined && !new_extradata) {
       Some(SideDataFate::Dropped)
     } else {
       state.sides.fate(entry, !state.written)
@@ -5026,7 +5251,7 @@ fn learned_losses(
 
 /// A timed packet's times, as offered and as counted in its stream's time
 /// base.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Timed {
   track: TrackIndex,
   pts: Option<Timestamp>,
@@ -5145,12 +5370,12 @@ fn check_packet_rules(
   state: &TrackState,
   time_base: Timebase,
   neighbours: Neighbours,
-  timed: Timed,
+  (own, outputs): (Timed, &[Timed]),
   payload: Payload<'_>,
   step: Step,
   bounds: Bounds,
 ) -> Result<Learned, FfmpegMuxRefusal> {
-  let reaches = step.reaches;
+  let owns = step.owns;
   let rules = &state.rules;
   let Timed {
     track,
@@ -5158,16 +5383,18 @@ fn check_packet_rules(
     dts_ticks,
     duration_ticks,
     ..
-  } = timed;
+  } = own;
   let limit = i128::from(i32::MAX);
   // MP4 `mov_text`: the samples MP4 writes around the cue (table C″).
   let cues = rules
     .mov_text
     .then(|| state.cues.take(dts_ticks, duration_ticks));
-  // The rules of a packet's times, which a packet the automatic filter
-  // holds does not meet: its times never reach libavformat's timing or the
-  // container.
-  if reaches {
+  // The rules of a packet's times, met by each packet the track's filter
+  // puts out with it, in that packet's times ([`Emits`]): a packet the
+  // filter holds meets none, its times reaching libavformat's timing and
+  // the container only with what the filter puts out.
+  let mut last_sample = state.sample.map(|sample| i128::from(sample.dts));
+  for output in outputs {
     // `check_pkt` counts a packet's gap from the last sample MP4 wrote on the
     // track — not from a packet MP4 holds — and a `mov_text` cue's from the
     // empty sample where MP4 writes it first (table C″).
@@ -5179,11 +5406,12 @@ fn check_packet_rules(
         longest: limit - 1 + i128::from(cue.next.start.unwrap_or(0)),
       },
       None => Mp4Times {
-        last: state.sample.map(|sample| i128::from(sample.dts)),
+        last: last_sample,
         longest: limit,
       },
     };
-    check_times(rules, mp4, timed)?;
+    check_times(rules, mp4, *output)?;
+    last_sample = Some(i128::from(output.dts_ticks));
   }
   // A cue before the end MP4 marks the last one with, which MP4 takes as
   // it is — the last cue shortened to it — unless another track's packet
@@ -5268,7 +5496,7 @@ fn check_packet_rules(
   {
     return refused(PayloadRule::FlacStreamInfo);
   }
-  if reaches
+  if owns
     && let Some(new) = side_data(
       payload.side_data,
       AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
@@ -5310,7 +5538,7 @@ fn check_packet_rules(
   }
   // The side data the container's writer casts to libavutil's structs, on
   // a packet whose side data reaches it.
-  if rules.hdr_metadata && reaches {
+  if rules.hdr_metadata && owns {
     for entry in payload.side_data {
       if let Some(rule) = hdr_metadata_rule(entry) {
         return refused(rule);
@@ -5361,11 +5589,13 @@ fn check_packet_rules(
     }
     None => None,
   };
-  // The sample MP4 writes with the packet, where it writes one: not where it
-  // holds the packet — a frame of fewer than six E-AC-3 blocks — and a
-  // joined sample at the packet that completes it, with its first packet's
-  // decode time (table C″). `mov_text`'s and TTML's samples are their own.
-  let sample = if !rules.mp4 || rules.mov_text || rules.ttml_document.is_some() || !reaches {
+  // The sample MP4 writes with the packet, where it writes one: the last
+  // packet the track's filter puts out with it, and none where the filter
+  // puts out none; not where MP4 holds the packet — a frame of fewer than
+  // six E-AC-3 blocks — and a joined sample at the packet that completes
+  // it, with its first packet's decode time (table C″). `mov_text`'s and
+  // TTML's samples are their own.
+  let sample = if !rules.mp4 || rules.mov_text || rules.ttml_document.is_some() {
     None
   } else {
     match ac3 {
@@ -5374,16 +5604,17 @@ fn check_packet_rules(
         dts: run.dts,
         offered: run.offered,
       }),
-      _ => Some(Sample {
-        dts: dts_ticks,
-        offered: (duration_ticks > 0).then(|| i128::from(duration_ticks)),
+      _ => outputs.last().map(|output| Sample {
+        dts: output.dts_ticks,
+        offered: (output.duration_ticks > 0).then(|| i128::from(output.duration_ticks)),
       }),
     }
   };
-  // `mov_text`: MP4 keeps a cue's duration as the distance to the next
-  // sample — the empty one at its end, or a cue before that end (table C″):
-  // a cue before the end shortens the last one.
-  let durations = duration_ticks < 0
+  // A negative duration libavformat or the container writes as zero, on a
+  // packet put out; and `mov_text`: MP4 keeps a cue's duration as the
+  // distance to the next sample — the empty one at its end, or a cue before
+  // that end (table C″): a cue before the end shortens the last one.
+  let durations = outputs.iter().any(|output| output.duration_ticks < 0)
     || cues.is_some_and(|cue| {
       cue.early
         && state.cues.cue.is_some_and(|(at, offered)| {
@@ -5541,6 +5772,33 @@ where
       Ok(plan) => plan,
       Err(refusal) => return Err(refusal.with_packet(packet)),
     };
+    if plan.holds {
+      self.hold(plan, packet);
+      return Ok(());
+    }
+    // The packets held of the display set this one completes go first, in
+    // the order offered: the filter puts the set out at this one.
+    let track = plan.track;
+    let (held, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.held)
+      .into_iter()
+      .partition(|entry| entry.packet.track() == track);
+    self.held = kept;
+    let mut plan = plan;
+    let mut lines = Vec::new();
+    for entry in held {
+      self
+        .output
+        .write_packet::<C>(
+          plan.stream,
+          OutputPacket::Subtitle(entry.packet.packet()),
+          entry.times,
+          self.limits,
+        )
+        .map_err(|error| MuxError::Fault(MuxFault::new(MuxStage::Write { track }, error)))?;
+      lines.extend(entry.uncarried);
+    }
+    lines.append(&mut plan.uncarried);
+    plan.uncarried = lines;
     let written = self.output.write_packet::<C>(
       plan.stream,
       OutputPacket::Subtitle(p),
@@ -5584,17 +5842,18 @@ where
   }
 }
 
-/// What `filter` still holds when the stream ends, which the end decides
-/// ([`Uncarried::Held`]): the filter, and how many packets it holds.
+/// What `filter` still holds inside FFmpeg when the stream ends, which the
+/// end decides ([`Uncarried::Held`]): the filter, and how many packets it
+/// holds. PGS's display sets this muxer holds itself
+/// ([`CarrierMuxer::take_held`]).
 fn held_at_end(filter: Filter) -> Option<(AutomaticFilter, u64)> {
   match filter {
     Filter::Vp9 { held, .. } if held > 0 => Some((AutomaticFilter::Vp9Superframe, u64::from(held))),
-    Filter::Pgs(state) if state.holding => Some((AutomaticFilter::PgsFrameMerge, state.packets)),
     _ => None,
   }
 }
 
-impl<W, C> fmt::Debug for CarrierMuxer<W, C> {
+impl<W, C: FfmpegCarrier> fmt::Debug for CarrierMuxer<W, C> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("CarrierMuxer")
       .field("container", &self.container)

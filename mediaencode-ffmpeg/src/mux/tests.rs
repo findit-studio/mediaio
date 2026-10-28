@@ -8,6 +8,31 @@ fn millis() -> Timebase {
   Timebase::new(1, NonZeroI32::new(1000).expect("non-zero"))
 }
 
+/// A packet's times on track 0 at `ms` milliseconds, as a filter's step is
+/// handed them.
+fn timed_at(ms: i64) -> Timed {
+  let at = Timestamp::new(ms, millis());
+  Timed {
+    track: TrackIndex::new(0),
+    pts: Some(at),
+    dts: at,
+    duration: None,
+    pts_ticks: Some(ms),
+    dts_ticks: ms,
+    duration_ticks: 0,
+  }
+}
+
+/// PGS's filter mirror over a packet at zero.
+fn merge(
+  state: PgsState,
+  bytes: &[u8],
+  side: u64,
+  limit: u64,
+) -> Result<(PgsState, Step), PayloadRule> {
+  pgs_frame_merge(state, timed_at(0), bytes, side, limit)
+}
+
 /// The report table's language rule for a timed track of `family`.
 fn language(family: Family, tag: &str) -> bool {
   kept(
@@ -916,13 +941,17 @@ fn a_first_packet_filter_is_named_at_the_packet_that_inserts_it() {
     whole: false,
   };
   let (after, step) = undecided
-    .step(&adts, 0, PACKET_BYTES_MAX)
+    .step(timed_at(0), &adts, 0, PACKET_BYTES_MAX)
     .expect("converted");
   assert_eq!(step.inserted, Some(A::AacAdtsToAsc));
   assert_eq!(after.named(), Some(A::AacAdtsToAsc));
-  let (_, step) = after.step(&adts, 0, PACKET_BYTES_MAX).expect("converted");
+  let (_, step) = after
+    .step(timed_at(0), &adts, 0, PACKET_BYTES_MAX)
+    .expect("converted");
   assert_eq!(step.inserted, None, "once");
-  let (after, step) = undecided.step(&raw, 0, PACKET_BYTES_MAX).expect("passed");
+  let (after, step) = undecided
+    .step(timed_at(0), &raw, 0, PACKET_BYTES_MAX)
+    .expect("passed");
   assert_eq!((after, step.inserted), (Filter::None, None));
   let annexb = |configured| Filter::AnnexBUndecided {
     filter: A::H264Mp4ToAnnexB,
@@ -937,7 +966,7 @@ fn a_first_packet_filter_is_named_at_the_packet_that_inserts_it() {
     (&[0, 0, 0, 2][..], false, false),
   ] {
     let (after, step) = annexb(configured)
-      .step(bytes, 0, PACKET_BYTES_MAX)
+      .step(timed_at(0), bytes, 0, PACKET_BYTES_MAX)
       .expect("passed");
     assert_eq!(
       step.inserted,
@@ -952,13 +981,13 @@ fn a_first_packet_filter_is_named_at_the_packet_that_inserts_it() {
         Filter::None
       }
     );
-    assert!(step.reaches, "the filter holds nothing");
+    assert!(step.owns, "the filter holds nothing");
   }
   let (after, _) = annexb(false)
-    .step(&length_prefixed, 0, PACKET_BYTES_MAX)
+    .step(timed_at(0), &length_prefixed, 0, PACKET_BYTES_MAX)
     .expect("inserted");
   let (_, step) = after
-    .step(&length_prefixed, 0, PACKET_BYTES_MAX)
+    .step(timed_at(0), &length_prefixed, 0, PACKET_BYTES_MAX)
     .expect("passed");
   assert_eq!(step.inserted, None, "once");
 }
@@ -1047,6 +1076,8 @@ fn eac3_track(frame_size: i32) -> TrackState {
     strict: true,
     last: None,
     last_ticks: None,
+    handed: None,
+    pending: Vec::new(),
     sample: None,
     rules: PacketRules {
       mp4: true,
@@ -1118,7 +1149,8 @@ fn admit_eac3(
     duration_ticks: duration,
   };
   let step = Step {
-    reaches: true,
+    owns: true,
+    emits: Emits::OWN,
     largest: Some(bytes.len() as u64),
     held: None,
     inserted: None,
@@ -1127,7 +1159,7 @@ fn admit_eac3(
     state,
     time_base,
     Neighbours::default(),
-    timed,
+    (timed, &[timed]),
     payload,
     step,
     Bounds::REAL,
@@ -1494,52 +1526,90 @@ fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
   let start = PgsState::default();
   let (pcs, end, ods) = (segment(0x16, 8), segment(0x80, 0), segment(0x15, 4));
   let whole = [pcs.clone(), ods.clone(), end.clone()].concat();
-  let out = |reaches, largest: Option<usize>, held: Option<usize>| Step {
-    reaches,
+  let out = |owns, emits, largest: Option<usize>, held: Option<usize>| Step {
+    owns,
+    emits,
     largest: largest.map(|bytes| bytes as u64),
     held: held.map(|bytes| bytes as u64),
     inserted: None,
   };
   assert_eq!(
-    pgs_frame_merge(start, &whole, 0, PACKET_BYTES_MAX),
-    Ok((start, out(true, Some(whole.len()), None)))
+    merge(start, &whole, 0, PACKET_BYTES_MAX),
+    Ok((start, out(true, Emits::OWN, Some(whole.len()), None)))
   );
-  // The presentation segment's packet carries 100 bytes of side data, which
-  // the set is put out with.
+  // The presentation segment's packet, at 100, carries 100 bytes of side
+  // data: the set is put out at its end segment's packet, at 200, timed at
+  // 100 and with that side data.
   let held = PgsState {
     holding: true,
     presentation: true,
     bytes: pcs.len() as u64,
     side: 100,
+    times: Some(timed_at(100)),
     packets: 1,
   };
   assert_eq!(
-    pgs_frame_merge(start, &pcs, 100, PACKET_BYTES_MAX),
-    Ok((held, out(true, None, Some(pcs.len() + 3 + 100))))
+    pgs_frame_merge(start, timed_at(100), &pcs, 100, PACKET_BYTES_MAX),
+    Ok((
+      held,
+      out(true, Emits::NONE, None, Some(pcs.len() + 3 + 100))
+    )),
+    "held: nothing put out"
   );
   assert_eq!(
     pgs_frame_merge(
       held,
+      timed_at(200),
       &[ods.clone(), end.clone()].concat(),
       7,
       PACKET_BYTES_MAX
     ),
-    Ok((start, out(false, Some(whole.len() + 100), None))),
-    "the set is timed by its presentation segment's packet, and takes its side data"
+    Ok((
+      start,
+      out(
+        false,
+        Emits {
+          held: Some(timed_at(100)),
+          own: false
+        },
+        Some(whole.len() + 100),
+        None
+      )
+    )),
+    "the set is put out now, timed by its presentation segment's packet"
+  );
+  assert_eq!(
+    pgs_frame_merge(
+      held,
+      timed_at(200),
+      &[ods.clone(), end.clone(), whole.clone()].concat(),
+      7,
+      PACKET_BYTES_MAX
+    )
+    .map(|(_, step)| step.emits),
+    Ok(Emits {
+      held: Some(timed_at(100)),
+      own: true
+    }),
+    "the held set first, then a whole one at the packet's own times"
   );
   let unpresented = PgsState {
     holding: true,
     presentation: false,
     bytes: ods.len() as u64,
     side: 0,
+    times: None,
     packets: 1,
   };
   assert_eq!(
-    pgs_frame_merge(start, &ods, 9, PACKET_BYTES_MAX),
-    Ok((unpresented, out(false, None, Some(ods.len() + 3))))
+    merge(start, &ods, 9, PACKET_BYTES_MAX),
+    Ok((
+      unpresented,
+      out(false, Emits::NONE, None, Some(ods.len() + 3))
+    ))
   );
   assert_eq!(
-    pgs_frame_merge(
+    merge(
       PgsState {
         packets: 2,
         bytes: 2 * ods.len() as u64,
@@ -1555,18 +1625,24 @@ fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
         presentation: true,
         bytes: (2 * ods.len() + pcs.len()) as u64,
         side: 5,
+        times: Some(timed_at(0)),
         packets: 3,
       },
-      out(true, None, Some(2 * ods.len() + pcs.len() + 3 + 5))
+      out(
+        true,
+        Emits::NONE,
+        None,
+        Some(2 * ods.len() + pcs.len() + 3 + 5)
+      )
     )),
     "a third packet joins the set, its presentation segment with it"
   );
   assert_eq!(
-    pgs_frame_merge(unpresented, &end, 0, PACKET_BYTES_MAX),
+    merge(unpresented, &end, 0, PACKET_BYTES_MAX),
     Err(PayloadRule::PgsSegments)
   );
   assert_eq!(
-    pgs_frame_merge(
+    merge(
       start,
       &[ods.clone(), end.clone()].concat(),
       0,
@@ -1576,12 +1652,12 @@ fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
     "a whole set with no presentation segment"
   );
   assert_eq!(
-    pgs_frame_merge(start, &pcs[..6], 0, PACKET_BYTES_MAX),
+    merge(start, &pcs[..6], 0, PACKET_BYTES_MAX),
     Err(PayloadRule::PgsSegments),
     "a segment past the packet"
   );
   assert_eq!(
-    pgs_frame_merge(
+    merge(
       start,
       &[pcs.clone(), pcs.clone(), end.clone()].concat(),
       0,
@@ -1591,7 +1667,7 @@ fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
     "two presentation segments in a set"
   );
   assert_eq!(
-    pgs_frame_merge(
+    merge(
       start,
       &[segment(0x16, 2), end.clone()].concat(),
       0,
@@ -1601,30 +1677,43 @@ fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
     "a presentation segment shorter than 11 bytes"
   );
   assert_eq!(
-    pgs_frame_merge(
+    merge(
       start,
       &[whole.clone(), whole.clone()].concat(),
       4,
       PACKET_BYTES_MAX
     ),
-    Ok((start, out(true, Some(whole.len() + 4), None))),
+    Ok((start, out(true, Emits::OWN, Some(whole.len() + 4), None))),
     "two sets in one packet, each put out with its side data"
   );
   // A set completed, and the start of the next held, from one packet.
   assert_eq!(
-    pgs_frame_merge(
+    merge(
       held,
       &[ods.clone(), end.clone(), pcs.clone()].concat(),
       2,
       PACKET_BYTES_MAX
     ),
     Ok((
-      PgsState { side: 2, ..held },
-      out(true, Some(whole.len() + 100), Some(pcs.len() + 3 + 2))
-    ))
+      PgsState {
+        side: 2,
+        times: Some(timed_at(0)),
+        ..held
+      },
+      out(
+        true,
+        Emits {
+          held: Some(timed_at(100)),
+          own: false
+        },
+        Some(whole.len() + 100),
+        Some(pcs.len() + 3 + 2)
+      )
+    )),
+    "the held set put out at its presentation's times; the next opened at this packet's"
   );
   assert_eq!(
-    pgs_frame_merge(start, &[], 0, PACKET_BYTES_MAX),
+    merge(start, &[], 0, PACKET_BYTES_MAX),
     Err(PayloadRule::Empty)
   );
 }
@@ -2038,7 +2127,7 @@ fn aacs_filter_is_mirrored_as_it_converts() {
     "a program config element a byte past its payload"
   );
   let ends = with(&element);
-  let some = |filter: Filter, bytes: &[u8]| filter.step(bytes, 0, PACKET_BYTES_MAX);
+  let some = |filter: Filter, bytes: &[u8]| filter.step(timed_at(0), bytes, 0, PACKET_BYTES_MAX);
   let elsewhere = Filter::AdtsUndecided {
     configured: false,
     parses: false,
@@ -2065,7 +2154,7 @@ fn aacs_filter_is_mirrored_as_it_converts() {
   // Elsewhere, a first packet that opens with no ADTS header inserts no
   // filter, for good; one that does inserts it, converted.
   let (next, step) = some(elsewhere, &[0x21, 0x10, 0x05]).expect("raw");
-  assert_eq!((next, step.reaches), (Filter::None, true));
+  assert_eq!((next, step.owns), (Filter::None, true));
   let (next, _) = some(elsewhere, &frame).expect("a frame");
   assert_eq!(
     next,
@@ -2211,21 +2300,18 @@ fn a_pgs_display_set_past_the_limit_is_refused() {
   let (pcs, end, ods) = (segment(0x16, 8), segment(0x80, 0), segment(0x15, 4));
   let start = PgsState::default();
   // 11 bytes held, then 7 more and the end's 3: 21.
-  let (held, _) = pgs_frame_merge(start, &pcs, 0, 20).expect("the presentation segment, held");
+  let (held, _) = merge(start, &pcs, 0, 20).expect("the presentation segment, held");
   assert_eq!(
-    pgs_frame_merge(held, &[ods.clone(), end.clone()].concat(), 0, 20),
+    merge(held, &[ods.clone(), end.clone()].concat(), 0, 20),
     Err(PayloadRule::DisplaySetSize)
   );
-  assert!(pgs_frame_merge(held, &[ods.clone(), end.clone()].concat(), 0, 21).is_ok());
+  assert!(merge(held, &[ods.clone(), end.clone()].concat(), 0, 21).is_ok());
   // 11 and 7 held leave 2 bytes, where no end segment fits.
-  assert_eq!(
-    pgs_frame_merge(held, &ods, 0, 20),
-    Err(PayloadRule::DisplaySetSize)
-  );
-  assert!(pgs_frame_merge(held, &ods, 0, 21).is_ok());
+  assert_eq!(merge(held, &ods, 0, 20), Err(PayloadRule::DisplaySetSize));
+  assert!(merge(held, &ods, 0, 21).is_ok());
   // A whole set passes as it is, held by nothing.
   let whole = [pcs, ods, end].concat();
-  assert!(pgs_frame_merge(start, &whole, 0, 20).is_ok());
+  assert!(merge(start, &whole, 0, 20).is_ok());
 }
 
 /// **VP9's filter puts out each superframe sized with the hidden frames it
@@ -2241,29 +2327,37 @@ fn vp9s_filter_puts_out_superframes_sized_with_what_it_holds() {
   };
   let hidden = [0x80, 1, 1, 1];
   let shown = [0x82, 2, 2];
-  let (vp9, step) = vp9.step(&hidden, 50, PACKET_BYTES_MAX).expect("held");
+  let (vp9, step) = vp9
+    .step(timed_at(0), &hidden, 50, PACKET_BYTES_MAX)
+    .expect("held");
   assert_eq!(
     step,
     Step {
-      reaches: false,
+      owns: false,
+      emits: Emits::NONE,
       largest: None,
       held: Some(4 + 1 + 2 + 2),
       inserted: None,
     },
     "four bytes held and a byte shown, their index of two sizes"
   );
-  let (vp9, step) = vp9.step(&shown, 30, PACKET_BYTES_MAX).expect("joined");
+  let (vp9, step) = vp9
+    .step(timed_at(0), &shown, 30, PACKET_BYTES_MAX)
+    .expect("joined");
   assert_eq!(
     step,
     Step {
-      reaches: true,
+      owns: true,
+      emits: Emits::OWN,
       largest: Some(4 + 3 + 2 + 2 + 30),
       held: None,
       inserted: None,
     },
     "the superframe, with the shown frame's side data"
   );
-  let (_, step) = vp9.step(&shown, 30, PACKET_BYTES_MAX).expect("alone");
+  let (_, step) = vp9
+    .step(timed_at(0), &shown, 30, PACKET_BYTES_MAX)
+    .expect("alone");
   assert_eq!(
     step.largest,
     Some(3 + 30),
@@ -2479,8 +2573,8 @@ fn mp4s_chapter_samples_are_held_to_check_pkt() {
 }
 
 /// **What a filter holds at the end is reported by its count**: VP9's
-/// hidden frames, PGS's packets of an open display set; nothing for a filter
-/// that holds nothing.
+/// hidden frames; nothing for a filter that holds nothing, nor for PGS,
+/// whose open display sets this muxer holds itself and counts at the end.
 #[test]
 fn what_a_filter_holds_at_the_end_is_counted() {
   assert_eq!(
@@ -2504,12 +2598,10 @@ fn what_a_filter_holds_at_the_end_is_counted() {
     presentation: true,
     bytes: 40,
     side: 0,
+    times: Some(timed_at(0)),
     packets: 2,
   };
-  assert_eq!(
-    held_at_end(Filter::Pgs(holding)),
-    Some((AutomaticFilter::PgsFrameMerge, 2))
-  );
+  assert_eq!(held_at_end(Filter::Pgs(holding)), None, "the muxer's own");
   assert_eq!(held_at_end(Filter::Pgs(PgsState::default())), None);
   assert_eq!(held_at_end(Filter::None), None);
 }

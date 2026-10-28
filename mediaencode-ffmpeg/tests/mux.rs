@@ -5817,3 +5817,152 @@ fn l68_mp4_reports_ac3s_new_extradata_dropped() {
     );
   }
 }
+
+/// One PGS display set as FFmpeg's SUP demuxer reads it: a presentation
+/// segment of no objects, then an end segment, a packet each, at zero
+/// (`supdec.c` 39–68).
+fn pgs_sup(corpus: &Corpus) -> PathBuf {
+  let out = output(corpus, "one-set.sup");
+  if !out.exists() {
+    let segment = |kind: u8, payload: &[u8]| {
+      let mut bytes = b"PG".to_vec();
+      bytes.extend(0u32.to_be_bytes());
+      bytes.extend(0u32.to_be_bytes());
+      bytes.push(kind);
+      bytes.extend(u16::try_from(payload.len()).expect("small").to_be_bytes());
+      bytes.extend(payload);
+      bytes
+    };
+    // 1920 × 1080, composition 0, an epoch start, no palette update, no
+    // objects.
+    let presentation = [0x07, 0x80, 0x04, 0x38, 0x10, 0, 0, 0x80, 0, 0, 0];
+    let set = [segment(0x16, &presentation), segment(0x80, &[])].concat();
+    std::fs::write(&out, set).expect("write");
+  }
+  out
+}
+
+/// **L69 — every mirror of libavformat's timing moves on what an automatic
+/// filter puts out, not on what it takes** (Codex R6 [high]; table G).
+/// PGS's filter puts a display set out at its end segment's packet, with
+/// the times of the packet that held its presentation segment
+/// (`pgs_frame_merge.c` 132–151): this muxer holds the set itself until
+/// then, and hands it to libavformat whole. Beside video and audio in
+/// Matroska, a presentation segment at −40 s is held; video at 0 and audio
+/// 10 s after make libavformat's first write without it (`mux.c` 939–1003);
+/// its end segment would then put the set out at −40 s, which that write's
+/// move no longer lifts — Matroska would wrap its 16-bit block time
+/// (`matroskaenc.c` 2888, 3146–3163) — so it is refused by name, untouched,
+/// no move reported, and the held packet handed back whole, nothing of the
+/// set written. Ended before the other streams' packets, the same set is
+/// put out first, and its −40 s moves every stream: read back at 0, the
+/// video at 40 s.
+///
+/// PLANT: the mirrors moved on what the filter takes (`Step::owns`), the
+/// muxer holding nothing: the held presentation segment moves every stream,
+/// and the end segment is taken.
+#[test]
+fn l69_every_mirror_moves_on_what_a_filter_puts_out() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let (_, audio) = first_track(&source, TrackKind::Audio, 1);
+  let sup = pgs_sup(&corpus);
+  let (_, segments) = first_track(&sup, TrackKind::Subtitle, 2);
+  let table = || {
+    let mut table = table_of(&source, TrackKind::Video);
+    table.extend(table_of(&source, TrackKind::Audio));
+    table.extend(table_of(&sup, TrackKind::Subtitle));
+    table
+  };
+  let segment = |index: usize, at: i64| {
+    SubtitleTrackPacket::new(
+      TrackIndex::new(2),
+      subtitle_of(&segments[index]).with_pts(Some(ms(at))),
+    )
+  };
+  let video = |at: i64| {
+    VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_of(&frames[0])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at))),
+    )
+  };
+  let sound = |at: i64| {
+    AudioTrackPacket::new(
+      TrackIndex::new(1),
+      audio_of(&audio[0])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at))),
+    )
+  };
+  let shifted = |muxer: &FfmpegOwnedMuxer<File>| {
+    muxer
+      .report()
+      .uncarried()
+      .contains(&Uncarried::TimesShifted)
+  };
+
+  let target = output(&corpus, "l69.mkv");
+  let mut muxer = muxer_into(&target, ContainerName::MATROSKA, table());
+  let presentation = segment(0, -40_000);
+  muxer
+    .write_subtitle(presentation.clone())
+    .map_err(|error| error.map_packet(drop))
+    .expect("held by the muxer");
+  muxer
+    .write_video(video(0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("video");
+  muxer
+    .write_audio(sound(10_001))
+    .map_err(|error| error.map_packet(drop))
+    .expect("audio 10 s on: libavformat's first write");
+  assert!(!shifted(&muxer), "nothing early reached libavformat");
+  let end = segment(1, -39_999);
+  let (refusal, back) = by_container(muxer.write_subtitle(end.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::BeforeZero {
+      track: TrackIndex::new(2),
+      timestamp: ms(-40_000),
+    },
+    "the set's times, its presentation segment's"
+  );
+  untouched!(end, back);
+  let held = muxer.take_held();
+  assert_eq!(held.len(), 1, "the presentation segment's packet");
+  untouched!(presentation, held[0]);
+  assert!(!shifted(&muxer));
+  muxer.finish().expect("finished");
+  let seen = packets(&target);
+  assert_eq!(seen[2].len(), 0, "nothing of the set written");
+  assert_eq!(seen[0][0].pts, Some(ms(0)), "the video not moved");
+
+  let target = output(&corpus, "l69-first.mkv");
+  let mut muxer = muxer_into(&target, ContainerName::MATROSKA, table());
+  for (index, at) in [(0, -40_000), (1, -39_999)] {
+    muxer
+      .write_subtitle(segment(index, at))
+      .map_err(|error| error.map_packet(drop))
+      .expect("the set, put out at its end");
+  }
+  muxer
+    .write_video(video(0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("video");
+  assert!(shifted(&muxer), "the set before zero moves every stream");
+  muxer
+    .write_audio(sound(10_001))
+    .map_err(|error| error.map_packet(drop))
+    .expect("audio");
+  muxer.finish().expect("finished");
+  let seen = packets(&target);
+  assert_eq!(
+    seen[2].iter().map(|seen| seen.pts).collect::<Vec<_>>(),
+    vec![Some(ms(0))],
+    "the set, one block, moved by 40 s"
+  );
+  assert_eq!(seen[0][0].pts, Some(ms(40_000)), "the video moved with it");
+}

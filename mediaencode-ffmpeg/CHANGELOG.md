@@ -83,9 +83,16 @@ crate moves only when it changes.
   first packet decides: libavformat inserts a track's filter at its first
   packet, and the muxer admits on an AAC track with no configuration only
   what the filter converts, refusing by name what it would refuse after
-  taking it (`PayloadRule::AdtsFrame`, `Superframe`, `PgsSegments`). A packet the filter holds meets no rule of its times. A
-  caller turns them off with `MuxOptions::set_automatic_filters`, and the
-  refusals by name apply instead.
+  taking it (`PayloadRule::AdtsFrame`, `Superframe`, `PgsSegments`).
+  Every mirror of libavformat's timing and the container's moves on what
+  a filter puts out now, in its times, never on what it takes: a packet
+  the filter holds meets no rule of its times until a packet put out
+  carries them. PGS's open display sets the muxer holds itself and hands
+  to libavformat whole at the packet that completes them; one whose
+  completion is refused stays held, and `CarrierMuxer::take_held` hands
+  it back. A caller turns the filters off with
+  `MuxOptions::set_automatic_filters`, and the refusals by name apply
+  instead.
 - **MP4 is judged by the samples it writes.** `check_pkt` counts a
   packet's gap from the last sample MP4 wrote on the track, which an
   E-AC-3 frame MP4 holds to join into a sample of six blocks does not
