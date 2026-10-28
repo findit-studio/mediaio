@@ -60,6 +60,10 @@ parameters are rebuilt from, an attachment track with its one file.
   write of the packet that inserts it. libavformat inserts a filter at a
   track's first packet, so the first packet decides, and on an AAC track
   with no configuration the muxer admits only what the filter converts.
+  Every rule of a packet's times meets what a filter puts out, when it
+  puts it out; PGS's open display sets the muxer holds itself, handing
+  them to libavformat whole, and `take_held` hands back one whose
+  completion is refused.
   `MuxOptions::set_automatic_filters(false)` turns them off, and the
   refusals by name apply instead.
 - **Packet side data a container has no place for is reported**, by
