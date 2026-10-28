@@ -1985,54 +1985,51 @@ fn l15_mp4_refuses_a_cue_out_of_order() {
   untouched!(before, back);
 }
 
-/// **L16 — a packet of a codec of key frames alone, not marked one, is
-/// refused by name** (table G), which libavformat would mark (`mux.c`
-/// 820–821) over the packet's word that it is no seek point: MP3 and PCM
-/// into MP4 and into Matroska. An MP3 frame whose bit reservoir starts in
-/// the frame before decodes, where decoding starts at it, to silence
-/// (`mpegaudiodec_template.c` 1316–1322): the mark would make a seek point
-/// that does not decode. Matroska writes every subtitle block as a key
-/// frame, so there a subtitle's flag is not kept either way, and the cue is
-/// admitted.
+/// **L16 — a packet libavformat marks a key frame is written as one, and
+/// reported** (table G): libavformat marks every packet of a codec whose
+/// descriptor counts every frame a key frame — libavcodec's
+/// `AV_CODEC_PROP_INTRA_ONLY`, PCM's and MP3's among them (`codec_desc.c`
+/// 1998–2002, 2792–2796) — or of any subtitle codec (`ff_is_intra_only`,
+/// `avformat.c` 903–912; `mux.c` 820–821): the library's own claim. An
+/// unmarked such packet is taken into MP4 and Matroska, reads back a key
+/// frame, and the report says so; Matroska writes every subtitle block as
+/// one, so an unmarked cue is reported too. A codec without the property
+/// is L71's.
 ///
-/// PLANT: the refusal dropped takes the unmarked frames.
+/// PLANT: the mark unreported leaves the line out.
 #[test]
-fn l16_an_unmarked_key_frame_is_refused_by_name() {
+fn l16_a_key_frame_libavformat_marks_is_written_and_reported() {
   let Some(corpus) = Corpus::new() else { return };
-  for (source, at, name) in [
+  for (source, at, codec) in [
     (pcm_mov(&corpus), 10, "pcm"),
     (audio_file(&corpus, "l16.mp3", "libmp3lame"), 24, "mp3"),
   ] {
-    let (_, packets) = first_track(&source, TrackKind::Audio, 2);
+    let (_, frames) = first_track(&source, TrackKind::Audio, 2);
     for (container, name) in [
-      (ContainerName::MP4, format!("l16-{name}.mp4")),
-      (ContainerName::MATROSKA, format!("l16-{name}.mkv")),
+      (ContainerName::MP4, format!("l16-{codec}.mp4")),
+      (ContainerName::MATROSKA, format!("l16-{codec}.mkv")),
     ] {
-      let mut muxer = muxer_into(
-        &output(&corpus, &name),
-        container,
-        table_of(&source, TrackKind::Audio),
-      );
+      let target = output(&corpus, &name);
+      let mut muxer = muxer_into(&target, container, table_of(&source, TrackKind::Audio));
       muxer
-        .write_audio(audio_at(&audio_of(&packets[0]), 0))
+        .write_audio(audio_at(&audio_of(&frames[0]), 0))
+        .map_err(|error| error.map_packet(drop))
         .expect("a key frame");
-      let unmarked = AudioTrackPacket::new(
-        TrackIndex::new(0),
-        audio_of(&packets[1])
-          .with_pts(Some(ms(at)))
-          .with_dts(Some(ms(at)))
-          .with_flags(PacketFlags::empty()),
-      );
-      let (refusal, back) = by_container(muxer.write_audio(unmarked.clone()));
-      assert_eq!(
-        refusal,
-        FfmpegMuxRefusal::KeyFrameUnmarked {
-          track: TrackIndex::new(0)
-        },
-        "{name}"
-      );
-      untouched!(unmarked, back);
+      assert_eq!(marked_of(muxer.report()), 0, "{name}: the premise");
+      muxer
+        .write_audio(AudioTrackPacket::new(
+          TrackIndex::new(0),
+          audio_of(&frames[1])
+            .with_pts(Some(ms(at)))
+            .with_dts(Some(ms(at)))
+            .with_flags(PacketFlags::empty()),
+        ))
+        .map_err(|error| error.map_packet(drop))
+        .expect("marked by libavformat");
+      assert_eq!(marked_of(muxer.report()), 1, "{name}: reported");
       muxer.finish().expect("finished");
+      let keys: Vec<_> = packets(&target)[0].iter().map(|seen| seen.key).collect();
+      assert_eq!(keys, vec![true, true], "{name}: read back a key frame");
     }
   }
   let (table, cues) = first_track(&corpus.multi_track_mkv(), TrackKind::Subtitle, 1);
@@ -2048,7 +2045,9 @@ fn l16_an_unmarked_key_frame_is_refused_by_name() {
         .with_pts(Some(ms(0)))
         .with_flags(PacketFlags::empty()),
     ))
+    .map_err(|error| error.map_packet(drop))
     .expect("Matroska writes a subtitle as a key frame regardless");
+  assert_eq!(marked_of(muxer.report()), 1, "reported");
   muxer.finish().expect("finished");
 }
 
@@ -6028,4 +6027,125 @@ fn l70_flv_refuses_a_packet_before_the_first_it_wrote() {
     vec![Some(ms(5_000))],
     "what was admitted"
   );
+}
+
+/// The `Rewrite::KeyFramesMarked` lines of `report`.
+fn marked_of(report: &mediaencode_ffmpeg::MuxReport) -> usize {
+  lines(report, |line| {
+    matches!(
+      line,
+      Uncarried::Rewritten {
+        rewrite: Rewrite::KeyFramesMarked,
+        ..
+      }
+    )
+  })
+  .len()
+}
+
+/// **L71 — MP4 refuses by name an audio packet not marked a key frame
+/// whose codec's frames are not all key frames, and reports a video track
+/// none of whose packets is one** (table G): MP4 writes no sync-sample
+/// table for an audio track but TrueHD's, MPEG-H 3D Audio's and USAC
+/// AAC's, nor for a track none of whose samples is a key frame, and every
+/// sample of such a track reads back as one (`movenc.c` 3412–3418). AAC's
+/// descriptor counts no frame a key frame (`codec_desc.c` 2799–2803), so
+/// libavformat leaves an unmarked AAC packet as it is, and MP4 would make
+/// it a seek point: refused, untouched. Matroska keeps the flag: taken,
+/// read back unmarked, nothing reported. A video track none of whose
+/// packets is marked gets no sync-sample table, every sample a key frame
+/// by the file: reported at `finish`; one with a key frame gets its table.
+///
+/// PLANT: the refusal dropped takes the AAC packet, read back marked.
+#[test]
+fn l71_mp4_refuses_a_seek_point_its_codec_does_not_promise() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, audio) = first_track(&source, TrackKind::Audio, 2);
+  let unmarked = |at: i64| {
+    AudioTrackPacket::new(
+      TrackIndex::new(0),
+      audio_of(&audio[1])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at)))
+        .with_flags(PacketFlags::empty()),
+    )
+  };
+  let mut muxer = muxer_into(
+    &output(&corpus, "l71.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Audio),
+  );
+  muxer
+    .write_audio(audio_at(&audio_of(&audio[0]), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a key frame");
+  let offered = unmarked(21);
+  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::KeyFrameUnmarked {
+      track: TrackIndex::new(0)
+    }
+  );
+  untouched!(offered, back);
+  muxer.finish().expect("finished");
+
+  let target = output(&corpus, "l71.mkv");
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::MATROSKA,
+    table_of(&source, TrackKind::Audio),
+  );
+  muxer
+    .write_audio(audio_at(&audio_of(&audio[0]), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a key frame");
+  muxer
+    .write_audio(unmarked(21))
+    .map_err(|error| error.map_packet(drop))
+    .expect("Matroska keeps the flag");
+  assert_eq!(marked_of(muxer.report()), 0, "nothing marked");
+  muxer.finish().expect("finished");
+  let keys: Vec<_> = packets(&target)[0].iter().map(|seen| seen.key).collect();
+  assert_eq!(keys, vec![true, false], "read back as offered");
+
+  let (_, frames) = first_track(&source, TrackKind::Video, 2);
+  for (name, first_key, reported) in [("l71-none.mp4", false, 1), ("l71-mixed.mp4", true, 0)] {
+    let target = output(&corpus, name);
+    let mut muxer = muxer_into(
+      &target,
+      ContainerName::MP4,
+      table_of(&source, TrackKind::Video),
+    );
+    for (index, frame) in frames.iter().enumerate() {
+      let at = 40 * index as i64;
+      let flags = if index == 0 && first_key {
+        PacketFlags::KEY
+      } else {
+        PacketFlags::empty()
+      };
+      muxer
+        .write_video(VideoTrackPacket::new(
+          TrackIndex::new(0),
+          video_of(frame)
+            .with_pts(Some(ms(at)))
+            .with_dts(Some(ms(at)))
+            .with_flags(flags),
+        ))
+        .map_err(|error| error.map_packet(drop))
+        .expect("video");
+    }
+    let (_, report) = muxer.finish_into_sink().expect("finished");
+    assert_eq!(marked_of(&report), reported, "{name}");
+    // The sync-sample table: none, where no sample is a key frame — every
+    // sample one by the file, though FFmpeg's reader parses H.264's own
+    // from the bitstream (`mov.c` 3159–3160).
+    let written = std::fs::read(&target).expect("the file");
+    assert_eq!(
+      written.windows(4).any(|box_type| box_type == b"stss"),
+      first_key,
+      "{name}: the sync-sample table"
+    );
+  }
 }

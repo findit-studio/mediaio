@@ -548,7 +548,7 @@
 //! | [`FfmpegMuxRefusal::DurationTooLong`], a `mov_text` cue's | `check_pkt` moves the empty sample marking its end where that lies `INT_MAX` or more after it, its duration and the track's start before zero, so that the cue shows one tick (`movenc.c` 6917–6923, 7321, 7652): at the next cue past it, or at the trailer, which the cue alone decides | loses |
 //! | [`FfmpegMuxRefusal::CueOrder`] | an overlapping or replacing cue is written as it is, the last cue shortened (`movenc.c` 7646–7653) — taken and reported (round 6) — unless another track's packet makes MP4 mark the end first and then move the cue (6917–6923), as the `ffmpeg` CLI does beside video: "Packet duration: -1000 / dts: 2000 in stream 1 is out of range". A first cue before zero MP4's writer takes, and its reader drops: its edit list starts the track at zero (4133–4239), and `mov_fix_index` marks a sample before an edit's start discarded and counts every later one from it (`mov.c` 4374–4682) — `ffprobe` reads the CLI's cues at −30 and 20 (`-itsoffset -0.03`) back at −40, marked discarded, and 10. Judged by the round trip, not the writer alone (ruled) | corrupts, or loses, where it is refused |
 //! | [`FfmpegMuxRefusal::NegativeDuration`], a subtitle's outside Matroska and WebM | libavformat hands a subtitle's on as it is (`guess_pkt_duration`, `mux.c` 605–611): MP4 refuses it after taking the packet (`check_pkt`, `movenc.c` 6925–6928), or joins a TTML paragraph into its document ending before it starts (`ttmlenc.c` 172); SRT drops the cue (`srtenc.c` 71–75); WebVTT and ASS write it ending before it starts (`webvttenc.c` 80, `assenc.c` 160). Any other track's libavformat writes as zero, or its own guess (605–633), and Matroska and WebM a subtitle's as zero (`matroskaenc.c` 3134): taken, reported ([`Rewrite::Durations`]) — L11; PLANT: refused on every track, L11's video packet refused; on none, MP4 refuses L11's cue after taking it | refuses after taking, loses, or corrupts, where it is refused |
-//! | [`FfmpegMuxRefusal::KeyFrameUnmarked`] | libavformat marks every packet of a codec its descriptor counts of key frames alone a key frame (`mux.c` 820–821), overriding the packet's own word that it is no seek point: a frame can lean on the one before — an MP3 frame whose bit reservoir starts there decodes, where decoding starts at it, to silence (`mpegaudiodec_template.c` 1316–1322) — so the mark would make a seek point that does not decode. Kept: a caller that knows the packet is a key frame marks it — L16; PLANT: dropped, L16's unmarked frame taken | writes it false |
+//! | [`FfmpegMuxRefusal::KeyFrameUnmarked`], an MP4 audio packet's of a codec without `AV_CODEC_PROP_INTRA_ONLY` | the library's own question, its codec descriptor (`avcodec_descriptor_get`; `ff_is_intra_only`, `avformat.c` 903–912): libavformat marks a packet a key frame only where the descriptor counts every frame one, or for any subtitle or data codec (`mux.c` 820–821) — the library's claim, PCM's and MP3's among them (`codec_desc.c` 1998–2002, 2792–2796): taken, the mark reported ([`Rewrite::KeyFramesMarked`]) — L16; PLANT: unreported, L16's line missing. A codec without the property, AAC's (2799–2803), libavformat leaves as it is; but MP4 writes no sync-sample table for an audio track but TrueHD's, MPEG-H 3D Audio's and USAC AAC's (`movenc.c` 3412–3418), so the packet would read back a key frame, a seek point its codec does not promise — refused; Matroska keeps the flag, taken; a video track none of whose packets is marked reads back as key frames, reported at `finish` — L71; PLANT: dropped, L71's AAC packet taken and read back a key frame | writes it false, where it is refused |
 //! | [`FfmpegMuxRefusal::BeforeZero`] | libavformat moves every stream's times later at its first write, by the earliest distance before its stream's earliest of the packet it writes or of one its interleaving holds then (`handle_avoid_negative_ts`, `mux.c` 636–717): mirrored ([`Shift`]), taken, reported ([`Uncarried::TimesShifted`]). A packet after that write the move leaves before the earliest it hands the container as it is, warning it "failed to avoid negative timestamp" (692–715): FLV refuses it after taking it (`flvenc.c` 1267–1274); Matroska writes it with no cue, its block time a 16-bit count from its cluster's, which starts no earlier than zero, so that one more than 32768 ticks before zero wraps (`matroskaenc.c` 969–970, 3146–3163, 2888) — refused. Where the move is not mirrored — GXF's and MXF's own interleaving, Matroska's times uncertain beside a video track of no native id — every time before the earliest is refused, as round 2 refused it — L14, L46; PLANT: the move unmirrored, L14's early packets refused; after the first write unjudged, L14's late packets taken. Each packet is judged in the times of what its track's filter puts out, when it puts it out (table B's mirrors; Codex R6 [high]): a PGS display set at the packet that ends it, in its presentation segment's packet's times — L69; PLANT: the mirrors moved on what the filter takes, L69's held presentation segment moving every stream | refuses after taking, or corrupts, where it is refused |
 //! | [`FfmpegMuxRefusal::BeforeFirstDts`] | FLV keeps the first packet it writes as its reference and refuses every later packet decoded before it after taking it — "Packets are not in the proper order with respect to DTS" (`flvenc.c` 1267–1274): a packet of a stream the interleaving's 10 s delay wrote ahead of (`mux.c` 939–1003) — L70; PLANT: unmirrored, L70's audio at 2 s taken, FLV refusing it after taking it (`Invalid argument`) | refuses after taking |
 //! | [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Cropping`] | MP4's trailer refuses the box (`movenc.c` 1299–1340, 857–910, 3024–3036; `movenc_ttml.c` 236–317) | refuses after taking: the file |
@@ -1134,6 +1134,22 @@ pub enum Rewrite {
   /// MP4 VC-1 and TrueHD: a sample's sync flag is read from its bitstream,
   /// not from the packet's key flag (`movenc.c` 7344–7348).
   SyncFromBitstream,
+  /// A packet not marked a key frame, written as one. libavformat marks
+  /// every packet of a codec whose descriptor counts every frame a key
+  /// frame — `AV_CODEC_PROP_INTRA_ONLY`, or any subtitle or data codec
+  /// (`ff_is_intra_only`, `avformat.c` 903–912; `mux.c` 820–821 in FFmpeg
+  /// 9.0.1; [`CodecId::intra_only`]) — the library's own claim, which the
+  /// file keeps; Matroska and WebM write every subtitle block as one
+  /// (`matroskaenc.c` 3132–3133). Reported at the first such packet. And
+  /// MP4 writes its sync-sample table only for a track some but not all of
+  /// whose samples are key frames (`movenc.c` 3412–3418): a video track
+  /// none of whose packets is marked one gets none, every sample a key
+  /// frame by the file — though a reader that parses the codec's own, as
+  /// FFmpeg's does H.264's (`mov.c` 3159–3160), may find otherwise —
+  /// reported at `finish` ([`CarrierMuxer::finish_into_sink`]). Where MP4
+  /// would mark an audio packet libavformat does not, the packet is refused
+  /// ([`FfmpegMuxRefusal::KeyFrameUnmarked`]).
+  KeyFramesMarked,
   /// A packet's duration is not kept as given. MP4 keeps every sample's
   /// duration as the distance to the next one's decode time, the last
   /// one's from its packet (`get_cluster_duration`, `movenc.c` 1241–1259;
@@ -1489,17 +1505,19 @@ pub enum FfmpegMuxRefusal {
     /// The cue's time.
     pts: Timestamp,
   },
-  /// A packet of a codec every frame of which libavformat counts a key
-  /// frame, not marked one: libavformat would mark it (`mux.c` 820–821;
-  /// [`CodecId::intra_only`]), overriding the packet's word that it is no
-  /// seek point. A frame of such a codec can lean on the one before: an MP3
-  /// frame whose bit reservoir starts there decodes, where decoding starts
-  /// at it, to silence (`mpegaudiodec_template.c` 1316–1322 in FFmpeg
-  /// 9.0.1), so the mark would make a seek point that does not decode.
-  /// Refused, untouched: a caller that knows the packet is one marks it.
-  /// Not in Matroska or WebM for a subtitle track, whose every block they
-  /// write as a key frame regardless (`matroskaenc.c` 3132–3133).
-  #[error("track {}: a packet of a codec of key frames alone is not marked one", .track.get())]
+  /// MP4: an audio packet not marked a key frame, of a codec whose
+  /// descriptor does not count every frame one — libavcodec's
+  /// `AV_CODEC_PROP_INTRA_ONLY` absent, AAC's among them
+  /// ([`CodecId::intra_only`]). libavformat leaves its flag as it is, but MP4
+  /// writes no sync-sample table for an audio track but TrueHD's, MPEG-H 3D
+  /// Audio's and USAC AAC's (`movenc.c` 3412–3418 in FFmpeg 9.0.1), so the
+  /// packet would read back a key frame: a seek point its codec does not
+  /// promise. Refused, untouched: a caller that knows the packet is one
+  /// marks it. Where libavformat marks the packet itself — its codec's
+  /// descriptor counting every frame a key frame, PCM's and MP3's among
+  /// them — the mark is the library's own: written, and reported
+  /// ([`Rewrite::KeyFramesMarked`]).
+  #[error("track {}: MP4 would write a packet its codec's frames do not all promise as a key frame", .track.get())]
   KeyFrameUnmarked {
     /// The track.
     track: TrackIndex,
@@ -2024,6 +2042,8 @@ struct TrackState {
   /// Whether the track's filter has put out a packet yet: the container's
   /// first.
   written: bool,
+  /// Whether a packet marked a key frame has reached the container.
+  keyed: bool,
   /// MP4 `mov_text`: the samples MP4 has written of the track.
   cues: Cues,
   /// MP4 AC-3 and E-AC-3: what MP4 has learned of the track's frames.
@@ -2470,8 +2490,18 @@ struct PacketRules {
   needs_pts: bool,
   /// AAC whose configuration is stated must be raw: no ADTS header.
   raw_aac: bool,
-  /// Every packet of the codec is a key frame.
-  intra_only: bool,
+  /// libavformat marks every packet of the codec a key frame: its
+  /// descriptor counts every frame one ([`CodecId::intra_only`]).
+  marks_key: bool,
+  /// The container writes every sample of the track as a key frame: MP4's
+  /// audio track but TrueHD's, MPEG-H 3D Audio's and USAC AAC's, which has
+  /// no sync-sample table, and its subtitle and data tracks (`movenc.c`
+  /// 3412–3418); a Matroska or WebM subtitle track (`matroskaenc.c`
+  /// 3132–3133).
+  all_sync: bool,
+  /// MP4: the track has a sync-sample table where some but not all of its
+  /// samples are key frames, and none where none is (`movenc.c` 3417).
+  syncs: bool,
   /// MP4 PCM: the bytes of one frame.
   frame_bytes: Option<u32>,
   /// AV1: the OBUs are parsed.
@@ -2541,6 +2571,37 @@ fn mp4_entry_reads_extradata(codec: CodecId) -> bool {
     BIN_DATA,
   ]
   .contains(&codec)
+}
+
+/// Whether MP4 writes a sync-sample table for a track of `kind` whose
+/// stream holds `codec` — its video, TrueHD, MPEG-H 3D Audio and USAC AAC
+/// tracks (`movenc.c` 3412–3418), where some but not all samples are key
+/// frames. USAC is AAC's profile `AV_PROFILE_AAC_USAC`, the object type
+/// less one (`aacdec.c` 2531–2533) of the configuration's: its first five
+/// bits, or at 31 the six after plus 32 (`get_object_type`, `mpeg4audio.c`
+/// 77–83), 42.
+fn mp4_syncs(kind: TrackKind, codec: &StreamCodec) -> bool {
+  const MPEGH_3D_AUDIO: CodecId =
+    CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MPEGH_3D_AUDIO as i32);
+  let id = codec.codec();
+  let usac = || {
+    let config = codec.extradata();
+    let bits = |from: usize, count: usize| {
+      (from..from + count).try_fold(0u32, |value, at| {
+        config
+          .get(at / 8)
+          .map(|byte| (value << 1) | u32::from((byte >> (7 - at % 8)) & 1))
+      })
+    };
+    match bits(0, 5) {
+      Some(31) => bits(5, 6).is_some_and(|rest| rest + 32 == 42),
+      _ => false,
+    }
+  };
+  kind == TrackKind::Video
+    || id == CodecId::TRUEHD
+    || id == MPEGH_3D_AUDIO
+    || (id == CodecId::AAC && usac())
 }
 
 /// What a container takes of new extradata on a track, beside what the
@@ -2670,10 +2731,10 @@ impl PacketRules {
       no_empty: mp4 || (either_matroska && kind == TrackKind::Audio),
       needs_pts: family != Family::Other && codec.video_delay() > 0,
       raw_aac: (mp4 || matroska) && id == CodecId::AAC && !codec.extradata().is_empty(),
-      // Matroska and WebM write every subtitle block as a key frame
-      // (`matroskaenc.c` 3132–3133): the flag a subtitle packet offers is
-      // not kept there either way.
-      intra_only: id.intra_only() && !(either_matroska && kind == TrackKind::Subtitle),
+      marks_key: id.intra_only(),
+      all_sync: (mp4 && kind != TrackKind::Video && !mp4_syncs(kind, codec))
+        || (either_matroska && kind == TrackKind::Subtitle),
+      syncs: mp4 && mp4_syncs(kind, codec),
       frame_bytes: if mp4 {
         mp4_frame_bytes(kind, codec)
       } else {
@@ -4495,6 +4556,8 @@ struct Plan {
   holds: bool,
   /// What the packets this muxer holds of the track put out, once handed.
   pending: Vec<Timed>,
+  /// Whether the packet reaches the container marked a key frame.
+  key: bool,
   /// What the track's automatic filter holds after the packet.
   filter: Filter,
   /// What the container learns of the track from the packet.
@@ -4809,6 +4872,7 @@ where
         last_ticks: None,
         handed: None,
         pending: Vec::new(),
+        keyed: false,
         sample: None,
         rules,
         filter,
@@ -4954,6 +5018,20 @@ where
           filter: AutomaticFilter::PgsFrameMerge,
           packets: held,
         });
+      }
+      // MP4 writes no sync-sample table for a track none of whose samples
+      // is a key frame, which then reads back as all key frames (`movenc.c`
+      // 3417).
+      let marked = Uncarried::Rewritten {
+        track,
+        rewrite: Rewrite::KeyFramesMarked,
+      };
+      if state.rules.syncs
+        && state.written
+        && !state.keyed
+        && !self.report.uncarried.contains(&marked)
+      {
+        self.report.uncarried.push(marked);
       }
       // MP4 ends its edit list at the last sample's decode time and its last
       // packet's own duration (`movenc.c` 6940, 7329–7342): a joined E-AC-3
@@ -5222,6 +5300,7 @@ where
       outputs,
       holds,
       pending,
+      key: step.owns && payload.key,
       filter,
       learned,
       uncarried,
@@ -5272,6 +5351,7 @@ where
       state.last_ticks = Some(last.dts_ticks);
       state.handed = Some(last.dts);
       state.written = true;
+      state.keyed |= plan.key;
     }
     if let Some(sample) = plan.learned.sample {
       state.sample = Some(sample);
@@ -5354,6 +5434,12 @@ fn learned_losses(
       lines.push(line);
     }
   };
+  if owns && !learned.joined && !payload.key && (state.rules.marks_key || state.rules.all_sync) {
+    push(Uncarried::Rewritten {
+      track,
+      rewrite: Rewrite::KeyFramesMarked,
+    });
+  }
   if learned.durations
     || matches!((learned.sample, state.sample), (Some(sample), Some(last))
       if last.offered.is_some_and(|duration| i128::from(sample.dts) - i128::from(last.dts) != duration))
@@ -5557,9 +5643,6 @@ fn check_packet_rules(
   {
     return Err(FfmpegMuxRefusal::CueOrder { track, pts: dts });
   }
-  if rules.intra_only && !payload.key {
-    return Err(FfmpegMuxRefusal::KeyFrameUnmarked { track });
-  }
   let refused = |rule| Err(FfmpegMuxRefusal::Payload { track, rule });
   if rules.no_empty && payload.bytes.is_empty() {
     return refused(PayloadRule::Empty);
@@ -5603,6 +5686,16 @@ fn check_packet_rules(
     }
     None => None,
   };
+  // A packet whose own flags reach the container, not marked a key frame —
+  // not one MP4 joins to an E-AC-3 sample, which takes its first packet's
+  // (588): where libavformat marks it one, the library's own claim, it is
+  // written so and reported; where it does not, a container that writes
+  // every sample as a key frame would claim a seek point the codec does
+  // not promise (`movenc.c` 3412–3418).
+  let joined = matches!(ac3, Some((_, Ac3Step::Joins | Ac3Step::Completes(_), _)));
+  if owns && !joined && !payload.key && rules.all_sync && !rules.marks_key {
+    return Err(FfmpegMuxRefusal::KeyFrameUnmarked { track });
+  }
   if let Some(skip) = rules.skip_samples {
     let below = match ac3 {
       // A joined sample carries its first packet's skip samples, judged at

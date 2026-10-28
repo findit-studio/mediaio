@@ -1078,6 +1078,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     last_ticks: None,
     handed: None,
     pending: Vec::new(),
+    keyed: false,
     sample: None,
     rules: PacketRules {
       mp4: true,

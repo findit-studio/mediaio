@@ -45,8 +45,9 @@ crate moves only when it changes.
   write's move of every stream's times; an FLV packet decoded before the
   first one FLV wrote (`FfmpegMuxRefusal::BeforeFirstDts`); an MP4 `mov_text` cue before zero, or before the
   last cue's end where another track's packet can make MP4 mark that end
-  first; an unmarked key
-  frame of a codec of key frames alone (`FfmpegMuxRefusal`); and a
+  first; an MP4 audio packet not marked a key frame, of a codec whose
+  descriptor does not count every frame one, which MP4 would write as one
+  (`FfmpegMuxRefusal::KeyFrameUnmarked`); and a
   packet's bytes or side data the container would refuse or write
   otherwise — an empty packet it drops, AAC in an ADTS header on a
   configured track no filter converts, partial PCM,
@@ -68,7 +69,10 @@ crate moves only when it changes.
   headers. Reported while writing (`CarrierMuxer::report`): MP4's
   durations, where the samples it writes do not abut, and where a
   `mov_text` cue starting before the last one's end shortens it; a
-  negative duration libavformat or the container writes as zero; and
+  negative duration libavformat or the container writes as zero; a
+  packet not marked a key frame that libavformat or the container writes
+  as one (`Rewrite::KeyFramesMarked`) — libavformat for a codec whose
+  descriptor counts every frame one, by the library's own question — and
   libavformat's move of every stream's times at its first write, where a
   packet lies before the earliest the container writes
   (`Uncarried::TimesShifted`).
