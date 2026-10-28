@@ -913,6 +913,7 @@ fn a_first_packet_filter_is_named_at_the_packet_that_inserts_it() {
   let undecided = Filter::AdtsUndecided {
     configured: false,
     parses: false,
+    whole: false,
   };
   let (after, step) = undecided
     .step(&adts, 0, PACKET_BYTES_MAX)
@@ -1122,7 +1123,15 @@ fn admit_eac3(
     held: None,
     inserted: None,
   };
-  let learned = check_packet_rules(state, time_base, timed, payload, step, Bounds::REAL)?;
+  let learned = check_packet_rules(
+    state,
+    time_base,
+    Neighbours::default(),
+    timed,
+    payload,
+    step,
+    Bounds::REAL,
+  )?;
   let lines = learned_losses(state, track, &[], payload, &learned, true);
   if let Some(sample) = learned.sample {
     state.sample = Some(sample);
@@ -1218,6 +1227,7 @@ fn mp4_marks_a_cues_end_only_where_the_next_starts_past_it() {
       end: 150,
       last: Some(50),
       ended: false,
+      cue: Some((50, 100)),
     }
   );
   let past = first.next.take(200, 10);
@@ -1251,6 +1261,7 @@ fn mp4_marks_a_cues_end_only_where_the_next_starts_past_it() {
       end: 10,
       last: Some(-30),
       ended: false,
+      cue: Some((-30, 10)),
     }
   );
   // The end is counted from the track's first sample, and read as a
@@ -1864,8 +1875,17 @@ fn the_filters_are_those_each_muxer_inserts() {
     assert_eq!(filter.named(), Some(A::AacAdtsToAsc), "{muxer}");
     assert_eq!(
       settle(muxer, None, CodecId::AAC, &[0x11, 0x90], true),
+      Filter::AdtsUndecided {
+        configured: true,
+        parses: true,
+        whole: true,
+      },
+      "{muxer}: a configured track's first packet decides"
+    );
+    assert_eq!(
+      settle(muxer, None, CodecId::AAC, &[0x11, 0x90], false),
       Filter::None,
-      "{muxer}: a configured track takes raw AAC alone"
+      "{muxer}: no filter with them off"
     );
   }
   for muxer in ["flv", "latm", "mov", "ipod"] {
@@ -1873,7 +1893,8 @@ fn the_filters_are_those_each_muxer_inserts() {
       settle(muxer, None, CodecId::AAC, &[0x11, 0x90], true),
       Filter::AdtsUndecided {
         configured: true,
-        parses: true
+        parses: true,
+        whole: false,
       },
       "{muxer}"
     );
@@ -2007,6 +2028,7 @@ fn aacs_filter_is_mirrored_as_it_converts() {
   let elsewhere = Filter::AdtsUndecided {
     configured: false,
     parses: false,
+    whole: false,
   };
   let known = Filter::Adts {
     converted: false,
@@ -2045,7 +2067,8 @@ fn aacs_filter_is_mirrored_as_it_converts() {
     some(
       Filter::AdtsUndecided {
         configured: true,
-        parses: false
+        parses: false,
+        whole: false,
       },
       &frame
     )
@@ -2056,7 +2079,8 @@ fn aacs_filter_is_mirrored_as_it_converts() {
     some(
       Filter::AdtsUndecided {
         configured: true,
-        parses: false
+        parses: false,
+        whole: false,
       },
       &[0x21, 0x10, 0x05]
     )

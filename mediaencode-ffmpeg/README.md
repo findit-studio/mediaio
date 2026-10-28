@@ -48,15 +48,18 @@ parameters are rebuilt from, an attachment track with its one file.
   where the container writes a track's packets in a form of its own
   (`Uncarried::Rewritten`, `Rewrite`), or written and read back as handed
   over. MP4's durations, which it keeps only as the distances between
-  packets, are reported as they are lost, in the muxer's own `report`.
+  the samples it writes, are reported as they are lost, in the muxer's
+  own `report`.
 - **libavformat's automatic bitstream filters run, each reported.** As
-  `ffmpeg -c copy` runs them: AAC's ADTS headers stripped where the track
-  states no configuration, VP9's hidden frames joined into superframes,
-  PGS segments joined into display sets — each named for its track at
-  open (`Uncarried::Filtered`). libavformat inserts a filter at a track's
-  first packet, so the first packet decides, and the muxer admits only
-  what the filter converts. `MuxOptions::set_automatic_filters(false)`
-  turns them off, and the refusals by name apply instead.
+  `ffmpeg -c copy` runs them: AAC's ADTS headers stripped, VP9's hidden
+  frames joined into superframes, PGS segments joined into display sets,
+  and every other filter a muxer inserts — each named for its track
+  (`Uncarried::Filtered`), at open where open decides it, else at the
+  write of the packet that inserts it. libavformat inserts a filter at a
+  track's first packet, so the first packet decides, and on an AAC track
+  with no configuration the muxer admits only what the filter converts.
+  `MuxOptions::set_automatic_filters(false)` turns them off, and the
+  refusals by name apply instead.
 - **Packet side data a container has no place for is reported**, by
   name, for its track (`Uncarried::SideData`), from a table of what each
   container writes; where the source does not settle a kind's fate, it is

@@ -1721,22 +1721,37 @@ fn l14_a_time_before_the_earliest_written_is_refused_by_name() {
   untouched!(early, back);
 }
 
-/// **L15 — MP4 refuses by name a `mov_text` cue before zero, or before
-/// the last cue ends**, which it would rewrite after the empty sample it
-/// marks the last cue's end with. A cue after the last one ends is
-/// written.
+/// **L15 — beside video counted in finer ticks, MP4 refuses by name a
+/// `mov_text` cue before zero, or before the last cue ends** (table C″):
+/// a video packet whose decode time, in its own ticks, passes the cue
+/// track's end makes MP4 mark that end first, and MP4 then moves the cue
+/// past the mark (`movenc.c` 7646–7653, 6917–6923). A cue where the last
+/// one ends is written. Alone, MP4 writes both (L65).
 #[test]
 fn l15_mp4_refuses_a_cue_out_of_order() {
   let Some(corpus) = Corpus::new() else { return };
-  let source = mov_text_mp4(&corpus);
-  let (table, cues) = first_track(&source, TrackKind::Subtitle, 1);
+  let video_source = corpus.multi_track_mkv();
+  let (_, frames) = first_track(&video_source, TrackKind::Video, 1);
+  let source = mov_text_ms_mp4(&corpus);
+  let (_, cues) = first_track(&source, TrackKind::Subtitle, 1);
   let cue = subtitle_of(&cues[0]);
-  let track = TrackIndex::new(0);
-  let mut muxer = muxer_into(&output(&corpus, "l15.mp4"), ContainerName::MP4, table);
+  let track = TrackIndex::new(1);
+  let base = millis();
+  let table = || {
+    let mut table = table_of(&video_source, TrackKind::Video);
+    table.extend(table_of(&source, TrackKind::Subtitle));
+    table
+  };
+  let mut muxer = muxer_into(&output(&corpus, "l15.mp4"), ContainerName::MP4, table());
   muxer
-    .write_subtitle(subtitle_at(&cue, 0, 1000))
+    .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("video");
+  muxer
+    .write_subtitle(cue_on(1, &cue, base, (0, 1000)))
+    .map_err(|error| error.map_packet(drop))
     .expect("the first cue");
-  let early = subtitle_at(&cue, 500, 100);
+  let early = cue_on(1, &cue, base, (500, 100));
   let (refusal, back) = by_container(muxer.write_subtitle(early.clone()));
   assert_eq!(
     refusal,
@@ -1747,16 +1762,17 @@ fn l15_mp4_refuses_a_cue_out_of_order() {
   );
   untouched!(early, back);
   muxer
-    .write_subtitle(subtitle_at(&cue, 1000, 500))
+    .write_subtitle(cue_on(1, &cue, base, (1000, 500)))
+    .map_err(|error| error.map_packet(drop))
     .expect("a cue where the last one ends");
   muxer.finish().expect("finished");
 
   let mut muxer = muxer_into(
     &output(&corpus, "l15-early.mp4"),
     ContainerName::MP4,
-    table_of(&source, TrackKind::Subtitle),
+    table(),
   );
-  let before = subtitle_at(&cue, -10, 100);
+  let before = cue_on(1, &cue, base, (-10, 100));
   let (refusal, back) = by_container(muxer.write_subtitle(before.clone()));
   assert_eq!(
     refusal,
@@ -1875,11 +1891,13 @@ fn l17_an_empty_packet_a_container_drops_is_refused() {
 }
 
 /// **L18 — AAC in an ADTS header is refused by name on a track whose
-/// configuration is stated**, into MP4, which would refuse the first such
-/// packet after taking it, and into Matroska, which would write it into a
-/// track that declares raw AAC — the automatic filters on or off, as the
-/// filter would convert it only were it the track's first packet, and then
-/// make a configuration beside the track's.
+/// configuration is stated where no filter converts it**, into MP4, which
+/// would refuse the first such packet after taking it and write the rest
+/// with their headers inside (`movenc.c` 7076–7086), and into Matroska,
+/// which would write them into a track that declares raw AAC: with the
+/// automatic filters off, and with them on after a raw first packet, which
+/// inserts none (`check_bitstream`, `mux.c` 1063–1068). An ADTS first
+/// packet inserts the filter (L67).
 #[test]
 fn l18_aac_in_an_adts_header_is_refused_on_a_configured_track() {
   let Some(corpus) = Corpus::new() else { return };
@@ -1899,7 +1917,13 @@ fn l18_aac_in_an_adts_header_is_refused_on_a_configured_track() {
         table_of(&source, TrackKind::Audio),
         filters(on),
       );
-      let offered = audio_at(&audio_holding(&raw, &framed), 0);
+      if on {
+        muxer
+          .write_audio(audio_at(&raw, 0))
+          .map_err(|error| error.map_packet(drop))
+          .expect("a raw first packet, which inserts no filter");
+      }
+      let offered = audio_at(&audio_holding(&raw, &framed), 21);
       let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
       assert_eq!(
         refusal,
@@ -5217,5 +5241,306 @@ fn l64_the_filters_open_decides_are_named_at_open() {
       },
       "OBU, the filters on {on}"
     );
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  The refusals check: refused only where FFmpeg refuses, loses or corrupts.
+// ---------------------------------------------------------------------------
+
+/// Two `mov_text` cues in MP4, the track counted in milliseconds — as the
+/// `ffmpeg` CLI writes it with `-time_base:s 1/1000`.
+#[rustfmt::skip]
+fn mov_text_ms_mp4(corpus: &Corpus) -> PathBuf {
+  let srt = written_text(
+    corpus,
+    "two.srt",
+    "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n2\n00:00:01,000 --> 00:00:02,000\nworld\n\n",
+  );
+  generated(corpus, "movtext-ms.mp4", &[
+    "-i", srt.to_str().expect("utf-8 path"), "-c:s", "mov_text", "-time_base:s", "1/1000",
+  ])
+}
+
+/// `packet` on `track`, presented at `at` and lasting `duration` ticks of
+/// `base`.
+fn cue_on(
+  track: usize,
+  packet: &Subtitle,
+  base: Timebase,
+  (at, duration): (i64, i64),
+) -> SubtitleTrackPacket<Ffmpeg, FfmpegBytes> {
+  SubtitleTrackPacket::new(
+    TrackIndex::new(track),
+    packet
+      .clone()
+      .with_pts(Some(Timestamp::new(at, base)))
+      .with_duration(Some(Timestamp::new(duration, base))),
+  )
+}
+
+/// The `Rewrite::Durations` lines of `report`.
+fn durations_of(report: &mediaencode_ffmpeg::MuxReport) -> usize {
+  lines(report, |line| {
+    matches!(
+      line,
+      Uncarried::Rewritten {
+        rewrite: Rewrite::Durations,
+        ..
+      }
+    )
+  })
+  .len()
+}
+
+/// **L65 — MP4 takes a `mov_text` cue that starts before the last one
+/// ends as it is, and the report says what it keeps of the last one's
+/// duration; a first cue before zero it does not keep** (table C″; the
+/// refusals check). MP4 writes an empty sample at the last cue's end only
+/// where the next cue starts past it (`movenc.c` 7646–7653), so a cue at 50
+/// after one at 0 of 100 ticks shortens that one to 50, reported at its
+/// write; a cue past the end gets its empty sample. Alone in the file, no
+/// other track can make MP4 write an end first. Read back: each sample
+/// where MP4 put it. A first cue at −30 MP4 writes, but its reader drops a
+/// sample that starts before the edit list's start, and counts the samples
+/// after it from there (`mov_fix_index`, `mov.c` 4374–4682): refused, by
+/// name, untouched.
+///
+/// PLANT: `mov_text` strict again — a cue before the end refused in every
+/// file — refuses the cue at 50.
+#[test]
+fn l65_mp4_takes_cues_before_the_last_ones_end_as_it_writes_them() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = mov_text_ms_mp4(&corpus);
+  let (table, cues) = first_track(&source, TrackKind::Subtitle, 1);
+  let base = table[0].timebase();
+  assert_eq!(base, millis(), "the premise: milliseconds");
+  let cue = subtitle_of(&cues[0]);
+  let target = output(&corpus, "l65.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  muxer
+    .write_subtitle(cue_on(0, &cue, base, (0, 100)))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a cue");
+  assert_eq!(durations_of(muxer.report()), 0, "nothing shortened yet");
+  muxer
+    .write_subtitle(cue_on(0, &cue, base, (50, 100)))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a cue before the last one ends, which MP4 takes");
+  assert_eq!(durations_of(muxer.report()), 1, "the first one shortened");
+  muxer
+    .write_subtitle(cue_on(0, &cue, base, (200, 10)))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a cue past the end");
+  muxer.finish().expect("finished");
+  let at = |ticks| Some(Timestamp::new(ticks, base));
+  // The trailer's empty sample, at 210, lies at the end of the edit list
+  // MP4 writes for the track, where FFmpeg's reader presents none.
+  let seen: Vec<_> = packets(&target)[0].iter().map(|seen| seen.pts).collect();
+  assert_eq!(
+    seen,
+    vec![at(0), at(50), at(150), at(200)],
+    "the cues, and the empty sample at the end MP4 marks before the third"
+  );
+
+  let mut muxer = muxer_into(
+    &output(&corpus, "l65-before-zero.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Subtitle),
+  );
+  let before = cue_on(0, &cue, base, (-30, 10));
+  let (refusal, back) = by_container(muxer.write_subtitle(before.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::CueOrder {
+      track: TrackIndex::new(0),
+      pts: Timestamp::new(-30, base),
+    }
+  );
+  untouched!(before, back);
+}
+
+/// **L66 — beside another track, MP4 takes a cue before the last one's end
+/// only where no packet of that track can make it write the end first**
+/// (table C″): MP4 marks the last cue's end before any packet whose decode
+/// time, in its own track's ticks, passes the end counted in the cue
+/// track's (`movenc.c` 7646–7653), and then moves the cue past it, its
+/// presentation time dropped (6917–6923) — as the `ffmpeg` CLI does to such
+/// a cue beside video, logging "Packet duration: -1000 / dts: 2000 ... is
+/// out of range". Beside video MP4 counts in sixteenths of a millisecond,
+/// finer than a cue track's milliseconds: refused, by name, untouched.
+/// Beside it, a cue track counted in microseconds, every video packet
+/// handed within the end and libavformat's 10 s of interleaving: taken;
+/// with a video packet handed 11 s ahead, which libavformat may hand on
+/// first: refused.
+///
+/// PLANT: without the neighbours' check, the cue beside finer video is
+/// taken, and MP4 moves it.
+#[test]
+fn l66_beside_another_track_an_early_cue_is_taken_only_where_none_can_end_it_first() {
+  let Some(corpus) = Corpus::new() else { return };
+  let video_source = corpus.multi_track_mkv();
+  let (_, frames) = first_track(&video_source, TrackKind::Video, 3);
+  for (name, cues_source, beside_finer) in [
+    ("l66.mp4", mov_text_ms_mp4(&corpus), true),
+    ("l66-coarse.mp4", mov_text_mp4(&corpus), false),
+  ] {
+    let (cue_table, cues) = first_track(&cues_source, TrackKind::Subtitle, 1);
+    let base = cue_table[0].timebase();
+    let per_ms = i64::from(base.den().get()) / 1000;
+    let cue = subtitle_of(&cues[0]);
+    let mut table = table_of(&video_source, TrackKind::Video);
+    table.extend(cue_table);
+    let mut muxer = muxer_into(&output(&corpus, name), ContainerName::MP4, table);
+    muxer
+      .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
+      .map_err(|error| error.map_packet(drop))
+      .expect("video");
+    muxer
+      .write_subtitle(cue_on(1, &cue, base, (0, 100 * per_ms)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a cue");
+    muxer
+      .write_video(video_at(&video_of(&frames[1]), Some(40), 40))
+      .map_err(|error| error.map_packet(drop))
+      .expect("video");
+    let early = cue_on(1, &cue, base, (50 * per_ms, 100 * per_ms));
+    if beside_finer {
+      let (refusal, back) = by_container(muxer.write_subtitle(early.clone()));
+      assert_eq!(
+        refusal,
+        FfmpegMuxRefusal::CueOrder {
+          track: TrackIndex::new(1),
+          pts: Timestamp::new(50 * per_ms, base),
+        },
+        "{name}"
+      );
+      untouched!(early, back);
+    } else {
+      muxer
+        .write_subtitle(early)
+        .map_err(|error| error.map_packet(drop))
+        .expect("beside coarser video, handed in time");
+      muxer
+        .write_video(video_at(&video_of(&frames[2]), Some(11_000), 11_000))
+        .map_err(|error| error.map_packet(drop))
+        .expect("video 11 s ahead");
+      let late = cue_on(1, &cue, base, (60 * per_ms, 10 * per_ms));
+      let (refusal, back) = by_container(muxer.write_subtitle(late.clone()));
+      assert_eq!(
+        refusal,
+        FfmpegMuxRefusal::CueOrder {
+          track: TrackIndex::new(1),
+          pts: Timestamp::new(60 * per_ms, base),
+        },
+        "{name}: a packet handed past the end and the delay"
+      );
+      untouched!(late, back);
+    }
+    muxer.finish().expect("finished");
+  }
+}
+
+/// One ADTS frame of AAC LC at 48 kHz, its channel configuration
+/// `channels`, no CRC, `payload` after its header.
+fn adts_frame_of(payload: &[u8], channels: u64) -> Vec<u8> {
+  let mut frame = adts_with(payload);
+  // The channel configuration's three bits straddle the third and fourth
+  // bytes (`adts_header.c` 47–52).
+  frame[2] = (frame[2] & !1) | u8::from(channels & 4 != 0);
+  frame[3] = (frame[3] & 0x3F) | (((channels & 3) as u8) << 6);
+  frame
+}
+
+/// **L67 — a configured AAC track's first packet decides AAC's filter in
+/// MP4 and Matroska, as libavformat decides it** (the refusals check):
+/// `mov_check_bitstream` and `mkv_check_bitstream` insert `aac_adtstoasc` at
+/// a first packet that opens with an ADTS header, whatever the
+/// configuration (`movenc.c` 9143–9145; `matroskaenc.c` 3635–3637), which
+/// then converts each ADTS frame and passes raw AAC (`aac_adtstoasc.c`
+/// 51–52). An ADTS first frame is taken, the filter named at its write, and
+/// reads back as its raw payload; raw and ADTS packets after it are taken.
+/// Matroska rewrites the track's configuration with the one the filter
+/// makes of the first frame, within the space its header reserved — the
+/// stated configuration's length — and refuses one past it after taking
+/// the packet (`matroskaenc.c` 3065–3082, 1334–1365): a first frame whose
+/// channels its program config element gives makes one of eight bytes,
+/// refused, by name, untouched; MP4 makes it a sample description, and
+/// takes it.
+///
+/// PLANT: a configured track taking raw AAC alone, as before: the ADTS
+/// first frame is refused.
+#[test]
+fn l67_a_configured_aac_tracks_first_packet_decides_its_filter() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (table, frames) = first_track(&source, TrackKind::Audio, 1);
+  let stated = table[0].side_data().extradata().len();
+  assert!(
+    (2..8).contains(&stated),
+    "the premise: a configuration shorter than eight bytes, {stated}"
+  );
+  let raw = audio_of(&frames[0]);
+  let framed = adts_frame_of(raw.data().as_ref(), 2);
+  for (container, name) in [
+    (ContainerName::MP4, "l67.mp4"),
+    (ContainerName::MATROSKA, "l67.mkv"),
+  ] {
+    let target = output(&corpus, name);
+    let mut muxer = muxer_into(
+      &target,
+      container.clone(),
+      table_of(&source, TrackKind::Audio),
+    );
+    assert_eq!(
+      filtered(muxer.report()),
+      vec![],
+      "{name}: undecided at open"
+    );
+    for (index, bytes) in [&framed, raw.data().as_ref(), &framed]
+      .into_iter()
+      .enumerate()
+    {
+      muxer
+        .write_audio(audio_at(&audio_holding(&raw, bytes), 21 * index as i64))
+        .map_err(|error| error.map_packet(drop))
+        .expect("an ADTS first frame inserts the filter, which takes what follows");
+    }
+    assert_eq!(
+      filtered(muxer.report()),
+      vec![Uncarried::Filtered {
+        track: TrackIndex::new(0),
+        filter: AutomaticFilter::AacAdtsToAsc,
+      }],
+      "{name}"
+    );
+    muxer.finish().expect("finished");
+    let seen = &packets(&target)[0];
+    assert_eq!(seen.len(), 3, "{name}");
+    assert!(
+      seen
+        .iter()
+        .all(|packet| packet.bytes == raw.data().as_ref()),
+      "{name}: each reads back as the raw payload"
+    );
+
+    let element = [&BARE_PCE[..], raw.data().as_ref()].concat();
+    let offered = audio_at(&audio_holding(&raw, &adts_frame_of(&element, 0)), 0);
+    let mut muxer = muxer_into(
+      &output(&corpus, &format!("pce-{name}")),
+      container.clone(),
+      table_of(&source, TrackKind::Audio),
+    );
+    if container == ContainerName::MATROSKA {
+      let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+      assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{name}");
+      untouched!(offered, back);
+    } else {
+      muxer
+        .write_audio(offered)
+        .map_err(|error| error.map_packet(drop))
+        .expect("MP4: a sample description of the configuration made");
+      muxer.finish().expect("finished");
+    }
   }
 }

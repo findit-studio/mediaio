@@ -39,11 +39,13 @@ crate moves only when it changes.
   duration; MP4's duration, decode gap and composition offset past
   `i32::MAX` ticks, the gap judged in `i128`; a reordering stream's
   packet without a presentation time; a time before the earliest the
-  container writes; an MP4 `mov_text` cue out of order; an unmarked key
+  container writes; an MP4 `mov_text` cue before zero, or before the
+  last cue's end where another track's packet can make MP4 mark that end
+  first; an unmarked key
   frame of a codec of key frames alone (`FfmpegMuxRefusal`); and a
   packet's bytes or side data the container would refuse or write
-  otherwise — an empty packet it drops, AAC in an ADTS header on a track
-  whose configuration is stated, partial PCM,
+  otherwise — an empty packet it drops, AAC in an ADTS header on a
+  configured track no filter converts, partial PCM,
   AV1 OBUs or WavPack blocks that do not parse, MP4 skip-samples below
   nothing, Matroska's new FLAC STREAMINFO of another length, a ProRes
   packet off its atom, a WebVTT cue that would not read back, an AC-3
@@ -60,19 +62,31 @@ crate moves only when it changes.
   joined TTML paragraphs, sync from the bitstream, Matroska's and WebM's
   durations without a default duration, Matroska's stripped WavPack
   headers. Reported while writing (`CarrierMuxer::report`): MP4's
-  durations, where a track's packets do not abut.
+  durations, where the samples it writes do not abut, and where a
+  `mov_text` cue starting before the last one's end shortens it.
 - **The automatic filters, on by default, each reported.** libavformat's
   automatic bitstream filters run as `ffmpeg -c copy` runs them —
-  `aac_adtstoasc` for MP4's and Matroska's AAC framed in ADTS with no
-  configuration, `vp9_superframe` for VP9 in MP4, Matroska and WebM,
-  `pgs_frame_merge` for Matroska's PGS — each named for its track at open
-  (`Uncarried::Filtered`, `AutomaticFilter`). The first packet decides:
-  libavformat inserts a track's filter at its first packet, and the muxer
-  admits there only what the filter converts, refusing by name what it
-  would refuse after taking it (`PayloadRule::AdtsFrame`, `Superframe`,
-  `PgsSegments`). A packet the filter holds meets no rule of its times. A
+  `aac_adtstoasc` for MP4's and Matroska's AAC framed in ADTS,
+  `vp9_superframe` for VP9 in MP4, Matroska and WebM, `pgs_frame_merge`
+  for Matroska's PGS, and every other filter a muxer inserts —
+  `pcm_rechunk`, `av1_metadata`, `eia608_to_smpte436m`,
+  `extract_extradata` and the Annex B conversions — each named for its
+  track (`Uncarried::Filtered`, `AutomaticFilter`): at open where open
+  decides it, else at the write of the first packet, which inserts it. The
+  first packet decides: libavformat inserts a track's filter at its first
+  packet, and the muxer admits on an AAC track with no configuration only
+  what the filter converts, refusing by name what it would refuse after
+  taking it (`PayloadRule::AdtsFrame`, `Superframe`, `PgsSegments`). A packet the filter holds meets no rule of its times. A
   caller turns them off with `MuxOptions::set_automatic_filters`, and the
   refusals by name apply instead.
+- **MP4 is judged by the samples it writes.** `check_pkt` counts a
+  packet's gap from the last sample MP4 wrote on the track, which an
+  E-AC-3 frame MP4 holds to join into a sample of six blocks does not
+  move; the joined sample's bytes are held within `av_grow_packet`'s bound
+  (`PayloadRule::Ac3SampleSize`), and a last joined sample past `i32::MAX`
+  ticks, which MP4's trailer asserts on, is refused by `finish`
+  (`FfmpegMuxRefusal::LastSampleTooLong`). A `mov_text` cue starting
+  before the last one's end is written as MP4 writes it.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
