@@ -1500,14 +1500,23 @@ fn packet_count(path: &Path) -> usize {
 /// tick a second or finer.
 const PAST_I32_SECONDS: i64 = 1 << 31;
 
-/// **L11 — a negative duration is refused by name** in MP4, which refuses
-/// a subtitle's after taking it, and in Matroska, which writes zero; the
-/// packet is handed back and the file holds only what was admitted.
+/// **L11 — a negative duration is written as libavformat makes it, and
+/// reported; a subtitle's, which libavformat hands the container as it is,
+/// is refused by name outside Matroska and WebM** (table G). libavformat
+/// writes zero, or its own guess, in place of a video or audio packet's
+/// (`guess_pkt_duration`, `mux.c` 605–633), and Matroska zero for a
+/// subtitle's (`matroskaenc.c` 3134), the cue read back with none: taken,
+/// the durations reported. MP4 refuses a subtitle's after taking the packet
+/// (`movenc.c` 6925–6928), and SRT drops the cue (`srtenc.c` 71–75):
+/// refused, untouched, the file holding only what was admitted.
+///
+/// PLANT: the refusal on every track refuses the video packet; on none, MP4
+/// refuses the cue after taking it.
 #[test]
-fn l11_a_negative_duration_is_refused_by_name() {
+fn l11_a_negative_duration_is_written_as_libavformat_makes_it() {
   let Some(corpus) = Corpus::new() else { return };
   let source = corpus.multi_track_mkv();
-  let (_, packets) = first_track(&source, TrackKind::Video, 2);
+  let (_, frames) = first_track(&source, TrackKind::Video, 2);
   for (container, name) in [
     (ContainerName::MP4, "l11.mp4"),
     (ContainerName::MATROSKA, "l11.mkv"),
@@ -1515,25 +1524,88 @@ fn l11_a_negative_duration_is_refused_by_name() {
     let target = output(&corpus, name);
     let mut muxer = muxer_into(&target, container, table_of(&source, TrackKind::Video));
     muxer
-      .write_video(video_at(&video_of(&packets[0]), Some(0), 0))
+      .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
       .expect("the first packet");
-    let offered = video_at(
-      &video_of(&packets[1]).with_duration(Some(ms(-40))),
-      Some(40),
-      40,
+    assert_eq!(
+      durations_of(muxer.report()),
+      0,
+      "{name}: the premise, nothing rewritten"
     );
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    muxer
+      .write_video(video_at(
+        &video_of(&frames[1]).with_duration(Some(ms(-40))),
+        Some(40),
+        40,
+      ))
+      .map_err(|error| error.map_packet(drop))
+      .expect("written with libavformat's duration");
+    assert_eq!(durations_of(muxer.report()), 1, "{name}: reported");
+    muxer.finish().expect("finished");
+    assert_eq!(packet_count(&target), 2, "{name}");
+  }
+
+  let (cue_table, cues) = first_track(&source, TrackKind::Subtitle, 1);
+  let cue = subtitle_of(&cues[0]);
+  let target = output(&corpus, "l11-cue.mkv");
+  let mut muxer = muxer_into(&target, ContainerName::MATROSKA, cue_table);
+  assert_eq!(durations_of(muxer.report()), 0, "the premise");
+  muxer
+    .write_subtitle(subtitle_at(&cue, 0, -40))
+    .map_err(|error| error.map_packet(drop))
+    .expect("Matroska writes zero");
+  assert_eq!(durations_of(muxer.report()), 1, "reported");
+  muxer.finish().expect("finished");
+  let seen = &packets(&target)[0];
+  assert_eq!(seen.len(), 1);
+  assert_eq!(seen[0].pts, Some(ms(0)));
+  assert_eq!(
+    seen[0].duration, None,
+    "written as zero, which Matroska writes no duration for (`matroskaenc.c` 2896)"
+  );
+
+  let mov_text = mov_text_mp4(&corpus);
+  let (mov_table, mov_cues) = first_track(&mov_text, TrackKind::Subtitle, 1);
+  let base = mov_table[0].timebase();
+  for (name, container, table, cue) in [
+    (
+      "l11-cue.mp4",
+      ContainerName::MP4,
+      mov_table,
+      cue_on(0, &subtitle_of(&mov_cues[0]), base, (0, -1)),
+    ),
+    (
+      "l11-cue.srt",
+      ContainerName::new("srt"),
+      table_of(&source, TrackKind::Subtitle),
+      subtitle_at(&cue, 0, -40),
+    ),
+  ] {
+    let target = output(&corpus, name);
+    let mut muxer = muxer_into(&target, container, table);
+    let duration = cue.packet().duration().expect("a duration");
+    let (refusal, back) = by_container(muxer.write_subtitle(cue.clone()));
     assert_eq!(
       refusal,
       FfmpegMuxRefusal::NegativeDuration {
         track: TrackIndex::new(0),
-        duration: ms(-40),
+        duration,
       },
       "{name}"
     );
-    untouched!(offered, back);
+    untouched!(cue, back);
     muxer.finish().expect("finished");
-    assert_eq!(packet_count(&target), 1, "{name}: only what was admitted");
+    // SRT writes nothing of its own; MP4's trailer writes the empty sample
+    // of a `mov_text` track that took no cue (`movenc.c` 9025–9031). The
+    // cue's bytes are nowhere.
+    let empty = std::fs::metadata(&target).expect("the file").len() == 0;
+    assert!(
+      empty
+        || packets(&target)
+          .iter()
+          .flatten()
+          .all(|seen| seen.bytes != cue.packet().data().as_ref()),
+      "{name}: only what was admitted"
+    );
   }
 }
 
@@ -1617,8 +1689,10 @@ fn l12_mp4_refuses_times_past_its_32_bit_fields() {
 /// **L13 — a stream that reorders has no presentation time made up for
 /// it: a packet without one is refused by name** in Matroska, which
 /// refuses it after taking it, and in MP4, which presents it at its
-/// decode time. A stream that does not reorder is presented at its decode
-/// time by libavformat, and admitted.
+/// decode time. In Matroska its decode time before zero changes nothing:
+/// libavformat's move of early times judges the presentation time, and
+/// judges no packet without one (`mux.c` 650–651). A stream that does not
+/// reorder is presented at its decode time by libavformat, and admitted.
 #[test]
 fn l13_a_reordering_stream_needs_a_presentation_time() {
   let Some(corpus) = Corpus::new() else { return };
@@ -1645,6 +1719,25 @@ fn l13_a_reordering_stream_needs_a_presentation_time() {
     untouched!(offered, back);
     muxer.finish().expect("finished");
   }
+  let mut muxer = muxer_into(
+    &output(&corpus, "l13-early.mkv"),
+    ContainerName::MATROSKA,
+    table_of(&reordering, TrackKind::Video),
+  );
+  muxer
+    .write_video(video_at(&video_of(&packets[0]), Some(0), -80))
+    .expect("the first packet");
+  let offered = video_at(&video_of(&packets[1]), None, -60);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::MissingPts {
+      track: TrackIndex::new(0)
+    },
+    "a decode time before zero"
+  );
+  untouched!(offered, back);
+  muxer.finish().expect("finished");
   let (table, packets) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 1);
   let mut muxer = muxer_into(
     &output(&corpus, "l13-plain.mkv"),
@@ -1657,68 +1750,176 @@ fn l13_a_reordering_stream_needs_a_presentation_time() {
   muxer.finish().expect("finished");
 }
 
-/// **L14 — a time before the earliest the container writes is refused by
-/// name**: in Matroska a presentation time below zero, or below an audio
-/// track's codec delay before zero; in another container that shifts
-/// early times, a decode time below zero. Either would move every
-/// stream's times.
+/// **L14 — a time before the earliest the container writes is written as
+/// libavformat moves it, every stream's times with it, and reported; one
+/// that libavformat's first write leaves before the earliest is refused by
+/// name** (table G). At its first write libavformat moves every stream's
+/// times later by the earliest distance before its stream's earliest of the
+/// packet it writes or of one its interleaving holds then
+/// (`handle_avoid_negative_ts`, `mux.c` 636–717): in Matroska a
+/// presentation time below zero, or below an audio track's codec delay
+/// before it; in FLV a decode time below zero. Alone, a track's first
+/// packet is that write, and a reordering stream's later packet the move
+/// leaves before zero is refused, untouched. Beside another stream, the
+/// write waits until both hold a packet, so an early packet of the second
+/// moves the first's times too; or until one's packets span more than
+/// libavformat's 10 s of interleaving, after which the other's early packet
+/// is refused. Read back: every time moved, each stream's distance rounded
+/// up to its own tick.
+///
+/// PLANT: the move unmirrored — every time before the earliest refused, as
+/// round 2 refused it — refuses the early first packets; the packets after
+/// the first write unjudged takes the late ones.
 #[test]
-fn l14_a_time_before_the_earliest_written_is_refused_by_name() {
+fn l14_a_time_before_the_earliest_written_is_moved_as_libavformat_moves_it() {
   let Some(corpus) = Corpus::new() else { return };
-  let track = TrackIndex::new(0);
+  let shifted = |muxer: &FfmpegOwnedMuxer<File>| {
+    muxer
+      .report()
+      .uncarried()
+      .contains(&Uncarried::TimesShifted)
+  };
   let source = corpus.multi_track_mkv();
-  let (table, packets) = first_track(&source, TrackKind::Video, 1);
-  let mut muxer = muxer_into(&output(&corpus, "l14.mkv"), ContainerName::MATROSKA, table);
-  let early = video_at(&video_of(&packets[0]), Some(-40), -40);
-  let (refusal, back) = by_container(muxer.write_video(early.clone()));
+  let (_, frames) = first_track(&source, TrackKind::Video, 2);
+  let (_, audio) = first_track(&source, TrackKind::Audio, 2);
+  let audio_on = |track: usize, packet: &Audio, at: i64| {
+    AudioTrackPacket::new(
+      TrackIndex::new(track),
+      packet.clone().with_pts(Some(ms(at))).with_dts(Some(ms(at))),
+    )
+  };
+  let presented = |path: &Path, track: usize| -> Vec<Option<Timestamp>> {
+    packets(path)[track].iter().map(|seen| seen.pts).collect()
+  };
+
+  // Alone, the first packet is libavformat's first write.
+  for (container, name) in [
+    (ContainerName::MATROSKA, "l14.mkv"),
+    (ContainerName::new("flv"), "l14.flv"),
+  ] {
+    let target = output(&corpus, name);
+    let mut muxer = muxer_into(&target, container, table_of(&source, TrackKind::Video));
+    muxer
+      .write_video(video_at(&video_of(&frames[0]), Some(-40), -40))
+      .map_err(|error| error.map_packet(drop))
+      .expect("before zero: every stream moved");
+    assert!(shifted(&muxer), "{name}");
+    muxer
+      .write_video(video_at(&video_of(&frames[1]), Some(0), 0))
+      .map_err(|error| error.map_packet(drop))
+      .expect("the next");
+    muxer.finish().expect("finished");
+    assert_eq!(
+      presented(&target, 0),
+      vec![Some(ms(0)), Some(ms(40))],
+      "{name}: moved by 40 ms"
+    );
+  }
+
+  // AAC's encoder delay of 1024 samples at 48 kHz: 21 ms before zero, the
+  // earliest Matroska writes; a packet at −22 moves the track by a tick.
+  let target = output(&corpus, "l14-audio.mkv");
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::MATROSKA,
+    table_of(&source, TrackKind::Audio),
+  );
+  muxer
+    .write_audio(audio_at(&audio_of(&audio[0]), -22))
+    .map_err(|error| error.map_packet(drop))
+    .expect("below the codec delay: moved");
+  assert!(shifted(&muxer));
+  muxer
+    .write_audio(audio_at(&audio_of(&audio[1]), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the next");
+  muxer.finish().expect("finished");
+  assert_eq!(presented(&target, 0), vec![Some(ms(-21)), Some(ms(1))]);
+
+  // A reordering stream alone: its first packet settles the move, and a
+  // later presentation time it leaves before zero is refused.
+  let reordering = reordering_mkv(&corpus);
+  let (_, bframes) = first_track(&reordering, TrackKind::Video, 2);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l14-reordering.mkv"),
+    ContainerName::MATROSKA,
+    table_of(&reordering, TrackKind::Video),
+  );
+  muxer
+    .write_video(video_at(&video_of(&bframes[0]), Some(-40), -80))
+    .map_err(|error| error.map_packet(drop))
+    .expect("moved by 40 ms");
+  let late = video_at(&video_of(&bframes[1]), Some(-50), -60);
+  let (refusal, back) = by_container(muxer.write_video(late.clone()));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::BeforeZero {
-      track,
-      timestamp: ms(-40)
+      track: TrackIndex::new(0),
+      timestamp: ms(-50)
     }
   );
-  untouched!(early, back);
+  untouched!(late, back);
+  muxer
+    .write_video(video_at(&video_of(&bframes[1]), Some(0), -40))
+    .map_err(|error| error.map_packet(drop))
+    .expect("moved past zero");
+  muxer.finish().expect("finished");
 
-  // AAC's encoder delay of 1024 samples at 48 kHz: 21 ms before zero.
-  let (audio_table, audio) = first_track(&source, TrackKind::Audio, 2);
-  let mut muxer = muxer_into(
-    &output(&corpus, "l14-audio.mkv"),
-    ContainerName::MATROSKA,
-    audio_table,
+  // Beside audio: the write waits until both hold a packet, so the early
+  // audio packet moves the video too, by 9 ms.
+  let mut table = table_of(&source, TrackKind::Video);
+  table.extend(table_of(&source, TrackKind::Audio));
+  let target = output(&corpus, "l14-both.mkv");
+  let mut muxer = muxer_into(&target, ContainerName::MATROSKA, table);
+  muxer
+    .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("video");
+  assert!(!shifted(&muxer), "nothing early yet");
+  muxer
+    .write_audio(audio_on(1, &audio_of(&audio[0]), -30))
+    .map_err(|error| error.map_packet(drop))
+    .expect("9 ms below the codec delay, before the first write");
+  assert!(shifted(&muxer));
+  muxer.finish().expect("finished");
+  assert_eq!(presented(&target, 0), vec![Some(ms(9))], "the video moved");
+  assert_eq!(
+    presented(&target, 1),
+    vec![Some(ms(-21))],
+    "the audio moved"
   );
-  let below = audio_at(&audio_of(&audio[0]), -22);
-  let (refusal, back) = by_container(muxer.write_audio(below.clone()));
+
+  // Beside audio that holds none, the write comes once the video spans more
+  // than 10 s; the audio's early packet after it is refused.
+  let mut table = table_of(&source, TrackKind::Video);
+  table.extend(table_of(&source, TrackKind::Audio));
+  let mut muxer = muxer_into(
+    &output(&corpus, "l14-late.mkv"),
+    ContainerName::MATROSKA,
+    table,
+  );
+  for (frame, at) in frames.iter().zip([0, 10_001]) {
+    muxer
+      .write_video(video_at(&video_of(frame), Some(at), at))
+      .map_err(|error| error.map_packet(drop))
+      .expect("video");
+  }
+  let late = audio_on(1, &audio_of(&audio[0]), -22);
+  let (refusal, back) = by_container(muxer.write_audio(late.clone()));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::BeforeZero {
-      track,
+      track: TrackIndex::new(1),
       timestamp: ms(-22)
     }
   );
-  untouched!(below, back);
+  untouched!(late, back);
   muxer
-    .write_audio(audio_at(&audio_of(&audio[0]), -21))
+    .write_audio(audio_on(1, &audio_of(&audio[0]), -21))
+    .map_err(|error| error.map_packet(drop))
     .expect("within the codec delay");
+  assert!(!shifted(&muxer), "nothing moved");
   muxer.finish().expect("finished");
-
-  // FLV has no `AVFMT_TS_NEGATIVE`: libavformat would shift every stream
-  // by the first decode time below zero.
-  let mut muxer = muxer_into(
-    &output(&corpus, "l14.flv"),
-    ContainerName::new("flv"),
-    table_of(&source, TrackKind::Video),
-  );
-  let early = video_at(&video_of(&packets[0]), Some(-40), -40);
-  let (refusal, back) = by_container(muxer.write_video(early.clone()));
-  assert_eq!(
-    refusal,
-    FfmpegMuxRefusal::BeforeZero {
-      track,
-      timestamp: ms(-40)
-    }
-  );
-  untouched!(early, back);
 }
 
 /// **L15 — beside video counted in finer ticks, MP4 refuses by name a
@@ -1785,44 +1986,54 @@ fn l15_mp4_refuses_a_cue_out_of_order() {
 }
 
 /// **L16 — a packet of a codec of key frames alone, not marked one, is
-/// refused by name**, which libavformat would mark: PCM into MP4 and into
-/// Matroska. Matroska writes every subtitle block as a key frame, so
-/// there a subtitle's flag is not kept either way, and the cue is
+/// refused by name** (table G), which libavformat would mark (`mux.c`
+/// 820–821) over the packet's word that it is no seek point: MP3 and PCM
+/// into MP4 and into Matroska. An MP3 frame whose bit reservoir starts in
+/// the frame before decodes, where decoding starts at it, to silence
+/// (`mpegaudiodec_template.c` 1316–1322): the mark would make a seek point
+/// that does not decode. Matroska writes every subtitle block as a key
+/// frame, so there a subtitle's flag is not kept either way, and the cue is
 /// admitted.
+///
+/// PLANT: the refusal dropped takes the unmarked frames.
 #[test]
 fn l16_an_unmarked_key_frame_is_refused_by_name() {
   let Some(corpus) = Corpus::new() else { return };
-  let pcm = pcm_mov(&corpus);
-  let (_, packets) = first_track(&pcm, TrackKind::Audio, 2);
-  for (container, name) in [
-    (ContainerName::MP4, "l16.mp4"),
-    (ContainerName::MATROSKA, "l16.mkv"),
+  for (source, at, name) in [
+    (pcm_mov(&corpus), 10, "pcm"),
+    (audio_file(&corpus, "l16.mp3", "libmp3lame"), 24, "mp3"),
   ] {
-    let mut muxer = muxer_into(
-      &output(&corpus, name),
-      container,
-      table_of(&pcm, TrackKind::Audio),
-    );
-    muxer
-      .write_audio(audio_at(&audio_of(&packets[0]), 0))
-      .expect("a key frame");
-    let unmarked = AudioTrackPacket::new(
-      TrackIndex::new(0),
-      audio_of(&packets[1])
-        .with_pts(Some(ms(10)))
-        .with_dts(Some(ms(10)))
-        .with_flags(PacketFlags::empty()),
-    );
-    let (refusal, back) = by_container(muxer.write_audio(unmarked.clone()));
-    assert_eq!(
-      refusal,
-      FfmpegMuxRefusal::KeyFrameUnmarked {
-        track: TrackIndex::new(0)
-      },
-      "{name}"
-    );
-    untouched!(unmarked, back);
-    muxer.finish().expect("finished");
+    let (_, packets) = first_track(&source, TrackKind::Audio, 2);
+    for (container, name) in [
+      (ContainerName::MP4, format!("l16-{name}.mp4")),
+      (ContainerName::MATROSKA, format!("l16-{name}.mkv")),
+    ] {
+      let mut muxer = muxer_into(
+        &output(&corpus, &name),
+        container,
+        table_of(&source, TrackKind::Audio),
+      );
+      muxer
+        .write_audio(audio_at(&audio_of(&packets[0]), 0))
+        .expect("a key frame");
+      let unmarked = AudioTrackPacket::new(
+        TrackIndex::new(0),
+        audio_of(&packets[1])
+          .with_pts(Some(ms(at)))
+          .with_dts(Some(ms(at)))
+          .with_flags(PacketFlags::empty()),
+      );
+      let (refusal, back) = by_container(muxer.write_audio(unmarked.clone()));
+      assert_eq!(
+        refusal,
+        FfmpegMuxRefusal::KeyFrameUnmarked {
+          track: TrackIndex::new(0)
+        },
+        "{name}"
+      );
+      untouched!(unmarked, back);
+      muxer.finish().expect("finished");
+    }
   }
   let (table, cues) = first_track(&corpus.multi_track_mkv(), TrackKind::Subtitle, 1);
   let mut muxer = muxer_into(
@@ -4067,40 +4278,42 @@ fn l45_mp4_spelled_in_any_case_meets_mp4s_rules() {
 
 /// **L46 — Matroska spelled in capitals is Matroska**: `MATROSKA` opens the
 /// muxer named `matroska`, and its presentation rule holds — an AAC packet
-/// inside the codec delay before zero admitted, one before it refused — and
-/// its report is the one under `matroska`.
+/// inside the codec delay before zero written as it is, one below it
+/// moving every stream, as libavformat moves it, reported — and its report
+/// is the one under `matroska`.
 #[test]
 fn l46_matroska_spelled_in_capitals_meets_matroskas_rules() {
   let Some(corpus) = Corpus::new() else { return };
   let source = corpus.multi_track_mkv();
   let (_, audio) = first_track(&source, TrackKind::Audio, 1);
-  let track = TrackIndex::new(0);
-  let (_, canonical) = opened(
-    &output(&corpus, "l46-canonical.mkv"),
-    ContainerName::MATROSKA,
-    table_of(&source, TrackKind::Audio),
-  );
-  let (mut muxer, report) = opened(
-    &output(&corpus, "l46.mkv"),
-    ContainerName::new("MATROSKA"),
-    table_of(&source, TrackKind::Audio),
-  );
-  assert_eq!(report, canonical, "the report at open");
-  let below = audio_at(&audio_of(&audio[0]), -22);
-  let (refusal, back) = by_container(muxer.write_audio(below.clone()));
-  assert_eq!(
-    refusal,
-    FfmpegMuxRefusal::BeforeZero {
-      track,
-      timestamp: ms(-22)
+  let mut reports = Vec::new();
+  for (spelling, container) in [
+    ("canonical", ContainerName::MATROSKA),
+    ("capitals", ContainerName::new("MATROSKA")),
+  ] {
+    for (at, moved) in [(-21, false), (-22, true)] {
+      let (mut muxer, report) = opened(
+        &output(&corpus, &format!("l46-{spelling}{at}.mkv")),
+        container.clone(),
+        table_of(&source, TrackKind::Audio),
+      );
+      muxer
+        .write_audio(audio_at(&audio_of(&audio[0]), at))
+        .map_err(|error| error.map_packet(drop))
+        .expect("as Matroska writes it");
+      assert_eq!(
+        muxer
+          .report()
+          .uncarried()
+          .contains(&Uncarried::TimesShifted),
+        moved,
+        "{spelling}: at {at}"
+      );
+      reports.push((report, muxer.report().clone()));
+      muxer.finish().expect("finished");
     }
-  );
-  untouched!(below, back);
-  muxer
-    .write_audio(audio_at(&audio_of(&audio[0]), -21))
-    .map_err(|error| error.map_packet(drop))
-    .expect("within the codec delay, as Matroska writes it");
-  muxer.finish().expect("finished");
+  }
+  assert_eq!(reports[..2], reports[2..], "the reports at open and after");
 }
 
 /// **L47 — WebM spelled in capitals is WebM**: `WEBM` opens the muxer named
@@ -5542,5 +5755,65 @@ fn l67_a_configured_aac_tracks_first_packet_decides_its_filter() {
         .expect("MP4: a sample description of the configuration made");
       muxer.finish().expect("finished");
     }
+  }
+}
+
+/// **L68 — MP4 reports an AC-3 or E-AC-3 track's new extradata dropped**
+/// (the side-data table): MP4 writes their sample entry's configuration,
+/// `dac3` or `dec3`, from its own parse of the frames (`movenc.c` 418–462,
+/// 612–666; 1084–1087, 1507–1510), so the sample description a packet's new
+/// extradata opens (7044–7074) holds none of its bytes. Reported for the
+/// track, by name, at the first packet carrying it; nothing reads back with
+/// them.
+///
+/// PLANT: MP4's new extradata kept for every codec again leaves the line
+/// out.
+#[test]
+fn l68_mp4_reports_ac3s_new_extradata_dropped() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let added = [1, 2, 3, 4];
+  for codec in ["ac3", "eac3"] {
+    let source = audio_file(&corpus, &format!("{codec}.mkv"), codec);
+    let (table, frames) = first_track(&source, TrackKind::Audio, 2);
+    let target = output(&corpus, &format!("l68-{codec}.mp4"));
+    let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+    let mut first = audio_of(&frames[0])
+      .with_pts(Some(ms(0)))
+      .with_dts(Some(ms(0)));
+    first
+      .extra_mut()
+      .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &added)]);
+    muxer
+      .write_audio(AudioTrackPacket::new(TrackIndex::new(0), first))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame with new extradata");
+    assert_eq!(
+      lines(muxer.report(), |line| matches!(
+        line,
+        Uncarried::SideData { .. }
+      )),
+      vec![Uncarried::SideData {
+        track: TrackIndex::new(0),
+        kind: T::AV_PKT_DATA_NEW_EXTRADATA as i32,
+        name: Some("New Extradata"),
+        fate: SideDataFate::Dropped,
+      }],
+      "{codec}"
+    );
+    muxer
+      .write_audio(audio_at(&audio_of(&frames[1]), 32))
+      .map_err(|error| error.map_packet(drop))
+      .expect("the next frame");
+    muxer.finish().expect("finished");
+    let (written, _) = first_track(&target, TrackKind::Audio, 0);
+    assert_ne!(written[0].side_data().extradata(), &added[..], "{codec}");
+    assert!(
+      side_data_of(&target)
+        .iter()
+        .flatten()
+        .all(|(_, bytes)| bytes.as_slice() != &added[..]),
+      "{codec}: no packet reads back with them"
+    );
   }
 }

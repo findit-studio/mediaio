@@ -1704,8 +1704,9 @@ fn mp4_pcm_takes_the_layouts_its_chnl_box_writes() {
 }
 
 /// **Each container keeps the packet side data it has a place for**, by
-/// the side-data table: MP4 its new extradata, and its skip samples
-/// possibly; Matroska and WebM an audio block's end skip and its first
+/// the side-data table: MP4 its new extradata — but an AC-3 or E-AC-3
+/// track's, whose sample entry MP4 writes from its parse of the frames —
+/// and its skip samples possibly; Matroska and WebM an audio block's end skip and its first
 /// start skip, a WebVTT cue's lines, a block addition of id 1, a video
 /// block's T.35 additions; neither anything else; another container
 /// nothing claimed.
@@ -1740,6 +1741,19 @@ fn each_container_keeps_the_side_data_it_has_a_place_for() {
     mp4.fate(&entry(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x12, 0x10]), false),
     None
   );
+  for codec in [CodecId::AC3, CodecId::EAC3] {
+    let parsed = rules(Family::Mp4, TrackKind::Audio, codec);
+    assert_eq!(
+      parsed.fate(&entry(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x12, 0x10]), false),
+      Some(Dropped),
+      "{codec:?}: its sample entry is MP4's parse"
+    );
+    assert_eq!(
+      parsed.fate(&entry(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x11, 0x90]), false),
+      None,
+      "{codec:?}: the track's own says nothing new"
+    );
+  }
   assert_eq!(mp4.fate(&skipping, false), Some(PossiblyDropped));
   assert_eq!(
     mp4.fate(&entry(T::AV_PKT_DATA_SKIP_SAMPLES, &skip(0, 0)), false),
@@ -2498,4 +2512,156 @@ fn what_a_filter_holds_at_the_end_is_counted() {
   );
   assert_eq!(held_at_end(Filter::Pgs(PgsState::default())), None);
   assert_eq!(held_at_end(Filter::None), None);
+}
+
+/// **libavformat's move of every stream's times is mirrored where its
+/// first write settles it** (`handle_avoid_negative_ts`, `mux.c` 636–717;
+/// table G): MP4 makes none; GXF, MXF, and Matroska beside a video track of
+/// no native id are not mirrored; Matroska judges presentation times, but
+/// decode times beside JPEG 2000, and another container decode times. With
+/// one stream interleaved — SMPTE 2038 data not counted — the first packet
+/// is written as it comes. With two: once as many hold a packet as are
+/// interleaved, SMPTE 2038 data's counted among those holding; or once the
+/// packets held span more than 10 s, every stream that holds none one that
+/// may be lacked — not VP8 — the subtitles' span left aside. Each stream's
+/// distance is rounded up to its own tick, and after the write a packet the
+/// move leaves before the earliest is refused.
+#[test]
+fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
+  let ms = millis();
+  let ninety = Timebase::new(1, NonZeroI32::new(90_000).expect("non-zero"));
+  let video = (TrackKind::Video, CodecId::H264, true);
+  let audio = (TrackKind::Audio, CodecId::AAC, true);
+  let subtitle = (TrackKind::Subtitle, CodecId::SUBRIP, true);
+  let data = (TrackKind::Data, SMPTE_2038, true);
+  let of = |family, muxer: &str, tracks: &[(TrackKind, CodecId, bool)]| {
+    Shift::of(family, muxer, true, tracks)
+  };
+
+  assert_eq!(Shift::of(Family::Mp4, "mp4", false, &[video]), None);
+  for muxer in ["gxf", "mxf", "mxf_d10", "mxf_opatom"] {
+    assert_eq!(of(Family::Other, muxer, &[video]), None, "{muxer}");
+  }
+  assert_eq!(
+    Shift::of(Family::Other, "ogg", false, &[audio]),
+    None,
+    "a container that takes negative times"
+  );
+  assert!(
+    of(Family::Matroska, "matroska", &[video, audio])
+      .expect("mirrored")
+      .by_pts
+  );
+  assert!(
+    !of(
+      Family::Matroska,
+      "matroska",
+      &[(TrackKind::Video, CodecId::JPEG2000, true), audio]
+    )
+    .expect("mirrored")
+    .by_pts,
+    "VFW mode"
+  );
+  assert_eq!(
+    of(
+      Family::Matroska,
+      "matroska",
+      &[
+        (
+          TrackKind::Video,
+          CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H263 as i32),
+          true,
+        ),
+        audio
+      ]
+    ),
+    None,
+    "VFW or QuickTime mode, by tables not mirrored"
+  );
+  assert!(!of(Family::Other, "flv", &[video]).expect("mirrored").by_pts);
+
+  // One stream interleaved, beside SMPTE 2038 data: the first packet is
+  // the first write, and settles the move.
+  let alone = of(Family::Other, "mpegts", &[video, data]).expect("mirrored");
+  assert!(alone.passthrough);
+  let moved = alone.take(0, (-40, -40, 0), ms).expect("before the write");
+  assert!(moved.written);
+  assert_eq!(moved.earliest, Some(Timestamp::new(-40, ms)));
+  assert!(moved.take(1, (-40, -40, 0), ms).is_some(), "lifted to zero");
+  assert_eq!(moved.take(1, (-41, -41, 0), ms), None, "left before it");
+
+  // Two: written once both hold a packet, the early one moving the other.
+  let both = of(Family::Matroska, "matroska", &[video, audio]).expect("mirrored");
+  assert!(!both.passthrough);
+  let held = both.take(0, (0, 0, 0), ms).expect("video");
+  assert!(!held.written, "the audio may still come earlier");
+  let moved = held.take(1, (-30, -30, -21), ms).expect("before the write");
+  assert!(moved.written);
+  assert_eq!(moved.earliest, Some(Timestamp::new(-9, ms)));
+  assert!(moved.take(0, (-9, -9, 0), ms).is_some());
+  assert_eq!(moved.take(0, (-10, -10, 0), ms), None);
+
+  // Each stream's distance rounded up to its own tick.
+  let mixed = of(Family::Other, "mpegts", &[video, audio]).expect("mirrored");
+  let fine = mixed
+    .take(0, (-1, -1, 0), ninety)
+    .and_then(|shift| shift.take(1, (0, 0, 0), ms))
+    .expect("both held");
+  assert!(fine.written);
+  assert!(
+    fine.take(1, (-1, -1, 0), ms).is_some(),
+    "a tick of 90 kHz lifts a millisecond"
+  );
+  assert_eq!(fine.take(1, (-2, -2, 0), ms), None);
+  let coarse = mixed
+    .take(1, (-1, -1, 0), ms)
+    .and_then(|shift| shift.take(0, (0, 0, 0), ninety))
+    .expect("both held");
+  assert!(
+    coarse.take(0, (-90, -90, 0), ninety).is_some(),
+    "a millisecond is 90 ticks"
+  );
+  assert_eq!(coarse.take(0, (-91, -91, 0), ninety), None);
+
+  // The delay: written once the packets held span more than 10 s.
+  let spanned = both
+    .take(0, (0, 0, 0), ms)
+    .and_then(|shift| shift.take(0, (10_000, 10_000, 0), ms))
+    .expect("video");
+  assert!(!spanned.written, "10 s is not past the delay");
+  let late = spanned.take(0, (10_001, 10_001, 0), ms).expect("video");
+  assert!(late.written);
+  assert_eq!(
+    late.take(1, (-22, -22, -21), ms),
+    None,
+    "the audio's, after it"
+  );
+  // ... but not where the stream that holds none may not be lacked.
+  let vp8 = of(
+    Family::WebM,
+    "webm",
+    &[(TrackKind::Video, CodecId::VP8, true), audio],
+  )
+  .expect("mirrored");
+  let waiting = vp8
+    .take(1, (0, 0, -21), ms)
+    .and_then(|shift| shift.take(1, (20_000, 20_000, -21), ms))
+    .expect("audio");
+  assert!(!waiting.written, "the interleaving waits on VP8");
+  // ... and not by a subtitle's span.
+  let cues = of(Family::Matroska, "matroska", &[video, audio, subtitle]).expect("mirrored");
+  let waiting = cues
+    .take(0, (0, 0, 0), ms)
+    .and_then(|shift| shift.take(2, (20_000, 20_000, 0), ms))
+    .expect("video and a cue");
+  assert!(!waiting.written, "a subtitle's span is left aside");
+
+  // SMPTE 2038 data, not interleaved, still counts among those holding.
+  let counted = of(Family::Other, "mpegts", &[video, audio, data]).expect("mirrored");
+  assert!(!counted.passthrough);
+  let written = counted
+    .take(0, (0, 0, 0), ms)
+    .and_then(|shift| shift.take(2, (0, 0, 0), ms))
+    .expect("video and data");
+  assert!(written.written, "two hold a packet, as two are interleaved");
 }

@@ -161,7 +161,7 @@
 //!
 //! | kind | MP4 (`movenc.c`) | Matroska, WebM (`matroskaenc.c`) |
 //! |---|---|---|
-//! | new extradata | kept: a sample description from the packet on, or the configuration of a track that had none (7044–7074, 7412–7429) | AAC, FLAC (Matroska): possibly dropped — it rewrites the track's one configuration, which a later packet's replaces (3065–3097); any other: dropped, unless it is the track's own (3098–3115) |
+//! | new extradata | kept: a sample description from the packet on, or the configuration of a track that had none (7044–7074, 7412–7429); AC-3's and E-AC-3's dropped: their sample entry's configuration is MP4's own parse of the frames, the bytes never written (`mov_write_ac3_tag`, `mov_write_eac3_tag`, 418–462, 612–666; 1084–1087, 1507–1510) | AAC, FLAC (Matroska): possibly dropped — it rewrites the track's one configuration, which a later packet's replaces (3065–3097); any other: dropped, unless it is the track's own (3098–3115) |
 //! | skip samples | possibly dropped: the end skip trims the track's end in the edit list from the last packet alone, the start skip and the reasons are not read; dropped where the codec fixes no frame's samples (7311–7319, 7333–7342) | an audio track's end skip, as the block's discard padding (2922–2934), and its first packet's start skip where it is the stream's initial padding, written as the codec delay (2089–2104), which the reader puts back (`matroskadec.c` 2896–2901): kept; else dropped |
 //! | producer reference time | dropped: written only into fragments, with `write_prft` set (6034–6102, 7365–7369) | dropped |
 //! | WebVTT identifier, settings | dropped | a WebVTT cue's: kept, on lines of their own (2828–2855, 3591–3593); else dropped |
@@ -204,7 +204,7 @@
 //! | Matroska block additional | Matroska and WebM: read at a size of 8 or more (2936–2946) | bytes |
 //! | skip samples | Matroska: at 10 or more (2922–2934); MP4: at 10 or more, where the codec fixes a frame's samples (`movenc.c` 7311–7320), refused there below nothing after the packet is taken | bytes; MP4's refusal made first ([`PayloadRule::SkipSamples`]) |
 //! | WebVTT identifier, settings | Matroska and WebM, a WebVTT block's: copied by size, their sum with the cue's against `INT_MAX` (2828–2853) | bytes; the cue rule ([`PayloadRule::WebVttCue`]); the sum within the cluster's bound (table B) |
-//! | new extradata | MP4: a sample description from the packet on, written by the codec's writer at the trailer (`movenc.c` 7044–7074, 7406–7420); Matroska: AAC's parsed and fitted to the space its header reserved, FLAC's of the track's length (3065–3097) | table C |
+//! | new extradata | MP4: a sample description from the packet on, written by the codec's writer at the trailer (`movenc.c` 7044–7074, 7406–7420), AC-3's and E-AC-3's of none of its bytes (418–462, 612–666); Matroska: AAC's parsed and fitted to the space its header reserved, FLAC's of the track's length (3065–3097) | table C |
 //! | producer reference time | MP4: copied only at its struct's exact size (7365–7369) | bytes |
 //! | palette | MOV's raw video alone (7695–7700; `rawutils.c` 82–92, its size checked) — not MP4's | bytes |
 //! | IAMF parameters | cast to `AVIAMFParamDefinition` (`iamf_writer.c` 1176–1184), reached only for a stream group's track (`movenc.c` 7594–7603); the muxing context adds no stream group | never reached |
@@ -276,11 +276,11 @@
 //!
 //! | check | source | here |
 //! |---|---|---|
-//! | a duration or a decode gap past `i32::MAX` ticks — the gap from the last sample MP4 wrote on the track, none before the first; a subtitle's negative duration; a composition offset past `i32` | `check_pkt` 6897–6928; 6955–6959 | [`FfmpegMuxRefusal::DurationTooLong`], [`DtsGap`](FfmpegMuxRefusal::DtsGap), [`NegativeDuration`](FfmpegMuxRefusal::NegativeDuration), [`PresentationOffset`](FfmpegMuxRefusal::PresentationOffset); the last sample written, table C″ |
+//! | a duration or a decode gap past `i32::MAX` ticks — the gap from the last sample MP4 wrote on the track, none before the first; a subtitle's negative duration, which libavformat hands on as it is — another track's it writes as zero, or its own guess (`mux.c` 605–633), reported ([`Rewrite::Durations`]); a composition offset past `i32` | `check_pkt` 6897–6928; 6955–6959 | [`FfmpegMuxRefusal::DurationTooLong`], [`DtsGap`](FfmpegMuxRefusal::DtsGap), [`NegativeDuration`](FfmpegMuxRefusal::NegativeDuration), [`PresentationOffset`](FfmpegMuxRefusal::PresentationOffset); the last sample written, table C″ |
 //! | AMR-NB: one frame a packet; ADPCM MS and IMA WAV: a frame size | 6983–7002 | not reached: MP4's tag table holds neither (`codec_mp4_tags`, 9230–9290), refused at open ([`MuxOpenError::CodecNotCarried`]); MOV's other modes reach it |
 //! | no samples: less than a frame of a sized codec | 7006–7010 | [`PayloadRule::PartialSample`], [`PayloadRule::Empty`] |
 //! | the first packet taken as the configuration of H.264, HEVC, VVC, EVC, LCEVC, VP9, TrueHD or DNxHD where none is stated | 7024–7041 | H.264, HEVC, VVC, LCEVC and EVC refused at open ([`MuxOpenError::ConfigurationMissing`]); TrueHD refused at open; VP9's and DNxHD's boxes made from it, written |
-//! | new extradata: a sample description from the packet on, each written by its codec's writer at the trailer; MPEG-4 ALS, AAC, AV1 and FLAC's overwriting a configuration stated as none | 7044–7074, 7406–7420 | FLAC's of 34 bytes ([`PayloadRule::FlacStreamInfo`]); Opus's an OpusHead `dOps` takes, H.264's, HEVC's, VVC's and LCEVC's of the track's form — Annex B or not — as the rewrite reads it ([`PayloadRule::NewExtradata`]); a configuration stated as none refused at open, so none is overwritten |
+//! | new extradata: a sample description from the packet on, each written by its codec's writer at the trailer — AC-3's and E-AC-3's, `dac3` and `dec3`, from MP4's parse of the frames, of none of its bytes; MPEG-4 ALS, AAC, AV1 and FLAC's overwriting a configuration stated as none | 7044–7074, 7406–7420; 418–462, 612–666 | AC-3's and E-AC-3's reported dropped (the side-data table); FLAC's of 34 bytes ([`PayloadRule::FlacStreamInfo`]); Opus's an OpusHead `dOps` takes, H.264's, HEVC's, VVC's and LCEVC's of the track's form — Annex B or not — as the rewrite reads it ([`PayloadRule::NewExtradata`]); a configuration stated as none refused at open, so none is overwritten |
 //! | AAC framed in ADTS | 7076–7086 | [`PayloadRule::AdtsHeader`], [`PayloadRule::AdtsFrame`] |
 //! | the Annex B rewrite | 7087–7158 | reported ([`Rewrite::LengthPrefixed`]); its size, table B |
 //! | AV1's OBUs | 7159–7174 | [`PayloadRule::Obus`]; reported ([`Rewrite::ObusFiltered`]) |
@@ -347,7 +347,7 @@
 //!
 //! | road | the mechanism | what is written | here | law |
 //! |---|---|---|---|---|
-//! | E-AC-3's frames of fewer than six blocks | `handle_eac3` (577–606): held in `info->pkt`, joined by `av_grow_packet` until six, then written as one sample; nothing written before | one sample: the first packet's decode and presentation times, flags and side data (588); the bytes joined (593–595); the durations summed (597); the last packet's own duration for its skip samples and the edit list's end (6940, 7311–7342) | each packet's gap counted from the last sample written, none before the first ([`FfmpegMuxRefusal::DtsGap`]); libavformat's own rules on every packet as taken, which meet it before the hold ([`FfmpegMuxRefusal::RepeatedDts`]); the joined bytes within `av_grow_packet`'s bound ([`PayloadRule::Ac3SampleSize`]); the run's skip samples judged at its last packet, against that packet's duration, a held packet's never ([`PayloadRule::SkipSamples`]) — where a frame size is stated, which no demuxer's AC-3 or E-AC-3 ticket states (`demux.c` 2076–2087); a joined packet's side data reported dropped, but its new extradata, which MP4 reads before holding it (7044–7074); the durations counted between the samples written ([`Rewrite::Durations`]) | L57, L58; the unit laws |
+//! | E-AC-3's frames of fewer than six blocks | `handle_eac3` (577–606): held in `info->pkt`, joined by `av_grow_packet` until six, then written as one sample; nothing written before | one sample: the first packet's decode and presentation times, flags and side data (588); the bytes joined (593–595); the durations summed (597); the last packet's own duration for its skip samples and the edit list's end (6940, 7311–7342) | each packet's gap counted from the last sample written, none before the first ([`FfmpegMuxRefusal::DtsGap`]); libavformat's own rules on every packet as taken, which meet it before the hold ([`FfmpegMuxRefusal::RepeatedDts`]); the joined bytes within `av_grow_packet`'s bound ([`PayloadRule::Ac3SampleSize`]); the run's skip samples judged at its last packet, against that packet's duration, a held packet's never ([`PayloadRule::SkipSamples`]) — where a frame size is stated, which no demuxer's AC-3 or E-AC-3 ticket states (`demux.c` 2076–2087); a joined packet's side data reported dropped, and its new extradata, which MP4 reads before holding it (7044–7074) into a sample entry made from its parse (612–666); the durations counted between the samples written ([`Rewrite::Durations`]) | L57, L58; the unit laws |
 //! | the last sample, joined | the trailer reads its duration from the sum and asserts it within `INT_MAX` (`get_cluster_duration`, 1248–1256: `av_assert0` ends the process), and ends the edit list at its last packet's duration (7329–7342) | — | refused at `finish` past `INT_MAX` ([`FfmpegMuxRefusal::LastSampleTooLong`]); its end reported at `finish` ([`Rewrite::Durations`]) | L59, L60 |
 //! | E-AC-3's blocks short of six at the end | `mov_free` frees the run (7951–7955) | dropped | reported at open ([`Rewrite::Ac3Parsed`]) | L61 |
 //! | an AC-3 frame that does not parse | `handle_eac3` (481–493): dropped before the track's first sample, refused after | — | refused ([`PayloadRule::Ac3Header`]) | L25 |
@@ -382,14 +382,14 @@
 //! | new extradata: FLAC's of the configuration's length | 3084–3097 | [`PayloadRule::FlacStreamInfo`] |
 //! | AV1 or AAC with no configuration: every packet refused | 3080–3083, 3098–3109 | refused at open ([`MuxOpenError::ConfigurationMissing`]), AAC's only with the filters off |
 //! | a packet with no timestamp | 3140–3143 | a reordering stream's refused ([`FfmpegMuxRefusal::MissingPts`]); libavformat fills it otherwise |
-//! | a time before the earliest written | 3538–3541 | [`FfmpegMuxRefusal::BeforeZero`] |
+//! | a time before the earliest written, which libavformat's first write moves every stream's times past (`mux.c` 636–717) | 2089–2104, 3538–3541 | mirrored, reported ([`Uncarried::TimesShifted`]); a packet after that write the move leaves before it refused ([`FfmpegMuxRefusal::BeforeZero`]) — every one where a video track of no native id makes the times judged uncertain (2025–2081) |
 //! | the Annex B rewrite | 3574–3582 | reported ([`Rewrite::LengthPrefixed`]); its size, table B |
 //! | WavPack's blocks | 2775–2816 | [`PayloadRule::WavPackBlocks`]; reported ([`Rewrite::WavPackHeaders`]) |
 //! | ProRes's atom | 3584–3587 | [`PayloadRule::ProResAtom`] |
 //! | AV1's OBUs | 3589–3590 | [`PayloadRule::Obus`] |
 //! | WebVTT's lines | 2828–2853 | [`PayloadRule::WebVttCue`]; their size within the cluster's |
 //! | an empty audio packet, dropped | 3262–3268 | [`PayloadRule::Empty`] |
-//! | a subtitle's negative duration, written as zero | 3134 | [`FfmpegMuxRefusal::NegativeDuration`] |
+//! | a subtitle's negative duration, written as zero | 3134 | reported ([`Rewrite::Durations`]) |
 //! | the block's side data | 2864–3010 | table A |
 //! | the cluster's buffer | 2746–2749, 3213–3271 | table B |
 //!
@@ -468,7 +468,7 @@
 //! track, would refuse it after taking it, lose it, corrupt it, end the
 //! process, or change it in a way the report has no name for; a change the
 //! report names is written and reported. Every refusal rounds 3 to 6 of
-//! #82 added or changed, with its cause:
+//! #82 added or changed, and round 2's, judged again, with its cause:
 //!
 //! | refusal | without it, FFmpeg | so |
 //! |---|---|---|
@@ -488,17 +488,14 @@
 //! | [`FfmpegMuxRefusal::LastSampleTooLong`] | the trailer's `av_assert0` on the last joined E-AC-3 sample's duration (`movenc.c` 1248–1256) | ends the process (round 6) |
 //! | [`FfmpegMuxRefusal::DtsGap`], as rounds 5 and 6 count it | `check_pkt` moves the packet one tick past the last sample written and drops its presentation time (`movenc.c` 6897–6923) — a `mov_text` cue's from the empty sample before it, an E-AC-3 packet's from the last sample, not a held packet | corrupts |
 //! | [`FfmpegMuxRefusal::DurationTooLong`], a `mov_text` cue's | `check_pkt` moves the empty sample marking its end where that lies `INT_MAX` or more after it, its duration and the track's start before zero, so that the cue shows one tick (`movenc.c` 6917–6923, 7321, 7652): at the next cue past it, or at the trailer, which the cue alone decides | loses |
-//! | [`FfmpegMuxRefusal::CueOrder`] | an overlapping or replacing cue is written as it is, the last cue shortened (`movenc.c` 7646–7653) — taken and reported (round 6) — unless another track's packet makes MP4 mark the end first and then move the cue (6917–6923), as the `ffmpeg` CLI does beside video: "Packet duration: -1000 / dts: 2000 in stream 1 is out of range". A first cue before zero is written, and MP4's reader drops it and moves every later one (`mov.c` 4374–4682): `ffprobe` reads the CLI's cues at −30 and 20 back at −40, marked discarded, and 10 | corrupts, or loses, where it is refused |
+//! | [`FfmpegMuxRefusal::CueOrder`] | an overlapping or replacing cue is written as it is, the last cue shortened (`movenc.c` 7646–7653) — taken and reported (round 6) — unless another track's packet makes MP4 mark the end first and then move the cue (6917–6923), as the `ffmpeg` CLI does beside video: "Packet duration: -1000 / dts: 2000 in stream 1 is out of range". A first cue before zero MP4's writer takes, and its reader drops: its edit list starts the track at zero (4133–4239), and `mov_fix_index` marks a sample before an edit's start discarded and counts every later one from it (`mov.c` 4374–4682) — `ffprobe` reads the CLI's cues at −30 and 20 (`-itsoffset -0.03`) back at −40, marked discarded, and 10. Judged by the round trip, not the writer alone (ruled) | corrupts, or loses, where it is refused |
+//! | [`FfmpegMuxRefusal::NegativeDuration`], a subtitle's outside Matroska and WebM | libavformat hands a subtitle's on as it is (`guess_pkt_duration`, `mux.c` 605–611): MP4 refuses it after taking the packet (`check_pkt`, `movenc.c` 6925–6928), or joins a TTML paragraph into its document ending before it starts (`ttmlenc.c` 172); SRT drops the cue (`srtenc.c` 71–75); WebVTT and ASS write it ending before it starts (`webvttenc.c` 80, `assenc.c` 160). Any other track's libavformat writes as zero, or its own guess (605–633), and Matroska and WebM a subtitle's as zero (`matroskaenc.c` 3134): taken, reported ([`Rewrite::Durations`]) — L11; PLANT: refused on every track, L11's video packet refused; on none, MP4 refuses L11's cue after taking it | refuses after taking, loses, or corrupts, where it is refused |
+//! | [`FfmpegMuxRefusal::KeyFrameUnmarked`] | libavformat marks every packet of a codec its descriptor counts of key frames alone a key frame (`mux.c` 820–821), overriding the packet's own word that it is no seek point: a frame can lean on the one before — an MP3 frame whose bit reservoir starts there decodes, where decoding starts at it, to silence (`mpegaudiodec_template.c` 1316–1322) — so the mark would make a seek point that does not decode. Kept: a caller that knows the packet is a key frame marks it — L16; PLANT: dropped, L16's unmarked frame taken | writes it false |
+//! | [`FfmpegMuxRefusal::BeforeZero`] | libavformat moves every stream's times later at its first write, by the earliest distance before its stream's earliest of the packet it writes or of one its interleaving holds then (`handle_avoid_negative_ts`, `mux.c` 636–717): mirrored ([`Shift`]), taken, reported ([`Uncarried::TimesShifted`]). A packet after that write the move leaves before the earliest it hands the container as it is, warning it "failed to avoid negative timestamp" (692–715): FLV refuses it after taking it (`flvenc.c` 1267–1274); Matroska writes it with no cue, its block time a 16-bit count from its cluster's, which starts no earlier than zero, so that one more than 32768 ticks before zero wraps (`matroskaenc.c` 969–970, 3146–3163, 2888) — refused. Where the move is not mirrored — GXF's and MXF's own interleaving, Matroska's times uncertain beside a video track of no native id — every time before the earliest is refused, as round 2 refused it — L14, L46; PLANT: the move unmirrored, L14's early packets refused; after the first write unjudged, L14's late packets taken | refuses after taking, or corrupts, where it is refused |
 //! | [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Cropping`] | MP4's trailer refuses the box (`movenc.c` 1299–1340, 857–910, 3024–3036; `movenc_ttml.c` 236–317) | refuses after taking: the file |
 //! | [`MuxOpenError::SampleSize`], [`MuxOpenError::Cover`] | `pcm_rechunk`'s start fails the header (`pcm_rechunk.c` 49–58); the cover's builder fails after the header (`packet.c` 83–95) | refuses: the file |
 //! | [`MuxOpenError::MediaTypeMismatch`] | a stream of one media type whose packets this muxer would judge as another's | corrupts |
 //! | [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSample`] | MP4 writes every chapter into its Nero list but a titled one alone into its chapter track, which its reader lays over the list by position, with a 16-bit title length (`movenc.c` 7791–7807); `ff_mov_write_packet`'s answer for a chapter's sample ignored, a sample past `INT_MAX` lost, one out of range moved (7807) | corrupts, or loses |
-//!
-//! Round 2's [`FfmpegMuxRefusal::NegativeDuration`] — libavformat writes
-//! zero for a video or audio packet's (`mux.c` 607–611) —
-//! [`FfmpegMuxRefusal::KeyFrameUnmarked`] — libavformat marks the packet
-//! (820–821) — and [`FfmpegMuxRefusal::BeforeZero`] — libavformat moves
-//! every stream (636–717) — stand as round 2 ruled them.
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -995,6 +992,19 @@ pub enum Uncarried {
     /// How many packets it held.
     packets: u64,
   },
+  /// Every stream's times written later than offered — the chapters' not.
+  /// libavformat moves them all where the first packet it writes — or one
+  /// its interleaving holds then — lies before the earliest its stream's
+  /// container writes, by that packet's distance before it, each stream's
+  /// rounded up to its own tick (`handle_avoid_negative_ts`, `mux.c`
+  /// 636–717 in FFmpeg 9.0.1): Matroska and WebM judge presentation times —
+  /// decode times beside a video track written in VFW mode — below zero or
+  /// below an audio track's codec delay before it; another container
+  /// without `AVFMT_TS_NEGATIVE` decode times below zero. Reported once, at
+  /// the first packet that makes it certain ([`CarrierMuxer::report`]); a
+  /// packet after the first write that the move leaves before the earliest
+  /// is refused ([`FfmpegMuxRefusal::BeforeZero`]).
+  TimesShifted,
   /// Packet side data of a kind the container has no place for on the
   /// track, or keeps in part — the side-data table (see [the
   /// module](self)). Reported once per track, kind and fate, when the
@@ -1062,12 +1072,17 @@ pub enum Rewrite {
   /// ends an E-AC-3 track's edit list at its last sample's last packet's
   /// duration (6940, 7329–7342): a last sample joined of several is
   /// presented short of its frames, reported at `finish`
-  /// ([`CarrierMuxer::finish_into_sink`]). Matroska and WebM keep a video
-  /// or audio packet's only where it differs from the
-  /// track's default duration (`mkv_write_block`, `matroskaenc.c`
-  /// 2895–2911), and a video track without a frame rate, or an audio track
-  /// whose codec fixes no frame's samples, has none (1933–1940, 2058–2065,
-  /// 2119–2124): reported at open.
+  /// ([`CarrierMuxer::finish_into_sink`]). A negative duration libavformat
+  /// writes as zero, or as its own guess (`guess_pkt_duration`, `mux.c`
+  /// 605–633 in FFmpeg 9.0.1), and Matroska and WebM a subtitle's as zero
+  /// (`matroskaenc.c` 3134): reported at the packet — a subtitle's another
+  /// container is handed as it is, refused
+  /// ([`FfmpegMuxRefusal::NegativeDuration`]). Matroska and WebM keep a
+  /// video or audio packet's only where it differs from the track's default
+  /// duration (`mkv_write_block`, `matroskaenc.c` 2895–2911), and a video
+  /// track without a frame rate, or an audio track whose codec fixes no
+  /// frame's samples, has none (1933–1940, 2058–2065, 2119–2124): reported
+  /// at open.
   Durations,
   /// Matroska WavPack: each block's header is stripped to the fields
   /// Matroska keeps (`matroskaenc.c` 2775–2816, 3571–3572).
@@ -1247,11 +1262,17 @@ pub enum FfmpegMuxRefusal {
     /// The timestamp.
     timestamp: Timestamp,
   },
-  /// A negative duration: libavformat writes zero in its place
-  /// (`mux.c` 607–611 in FFmpeg 9.0.1), Matroska does for a subtitle too
-  /// (`matroskaenc.c` 3134), and MP4 refuses a subtitle's after taking the
-  /// packet (`movenc.c` 6925–6928).
-  #[error("track {}: the duration {} is negative", .track.get(), .duration.pts())]
+  /// A subtitle's negative duration, outside Matroska and WebM.
+  /// libavformat hands a subtitle's on as it is (`guess_pkt_duration`,
+  /// `mux.c` 605–611 in FFmpeg 9.0.1): MP4 refuses it after taking the
+  /// packet (`check_pkt`, `movenc.c` 6925–6928), or joins a TTML paragraph
+  /// into its document ending before it starts (`ttmlenc.c` 172); SRT drops
+  /// the cue (`srtenc.c` 71–75); WebVTT and ASS write it ending before it
+  /// starts (`webvttenc.c` 80, `assenc.c` 160). Any other track's
+  /// libavformat writes as zero, or as its own guess (605–633), and
+  /// Matroska and WebM a subtitle's as zero (`matroskaenc.c` 3134): taken,
+  /// and reported ([`Rewrite::Durations`]).
+  #[error("track {}: the subtitle's duration {} is negative", .track.get(), .duration.pts())]
   NegativeDuration {
     /// The track.
     track: TrackIndex,
@@ -1320,13 +1341,29 @@ pub enum FfmpegMuxRefusal {
     /// The track.
     track: TrackIndex,
   },
-  /// A time before the earliest the container writes without moving
-  /// every stream: libavformat shifts every stream's times by the first
-  /// packet's distance below its stream's earliest (`mux.c` 636–717). In
-  /// Matroska and WebM that is a presentation time below zero, or below an
-  /// audio track's codec delay before zero (`matroskaenc.c` 2089–2104,
-  /// 3538–3541); in another container without `AVFMT_TS_NEGATIVE` a decode
-  /// time below zero. MP4 takes negative times as they are.
+  /// A time libavformat would hand the container before the earliest it
+  /// writes. At its first write libavformat moves every stream's times
+  /// later, by the earliest distance before its stream's earliest of the
+  /// packet it writes or of one its interleaving holds then
+  /// (`handle_avoid_negative_ts`, `mux.c` 636–717 in FFmpeg 9.0.1): taken,
+  /// and reported ([`Uncarried::TimesShifted`]). A packet after that write
+  /// that the move leaves before the earliest it hands the container as it
+  /// is, warning it "failed to avoid negative timestamp" (692–715): FLV
+  /// refuses it after taking it (`flvenc.c` 1267–1274), and Matroska writes
+  /// it with no cue (`matroskaenc.c` 969–970), its block time a 16-bit count
+  /// from its cluster's, which starts no earlier than zero, so that one more
+  /// than 32768 ticks before zero wraps (2888, 3146–3163) — refused.
+  ///
+  /// In Matroska and WebM the earliest is zero, or an audio track's codec
+  /// delay before it (2089–2104), and the time judged a presentation time
+  /// (3538–3541) — a decode time where a video track is written in VFW
+  /// mode, as JPEG 2000 is (2025–2081); in another container without
+  /// `AVFMT_TS_NEGATIVE`, zero, and a decode time. MP4 takes negative times
+  /// as they are. Where this muxer does not mirror the move — GXF's and
+  /// MXF's own interleaving (`gxfenc.c` 1030; `mxfenc.c` 3721–3756), and
+  /// Matroska beside a video track of no native id, which libavformat may
+  /// write in either mode — every time before the earliest is refused: in
+  /// Matroska both the presentation and the decode time.
   #[error("track {}: {} lies before the earliest time the container writes", .track.get(), .timestamp.pts())]
   BeforeZero {
     /// The track.
@@ -1362,11 +1399,16 @@ pub enum FfmpegMuxRefusal {
     /// The cue's time.
     pts: Timestamp,
   },
-  /// A packet of a codec every frame of which is a key frame, not marked
-  /// one: libavformat would mark it (`mux.c` 820–821;
-  /// [`CodecId::intra_only`]). Not in Matroska or WebM for a subtitle
-  /// track, whose every block they write as a key frame regardless
-  /// (`matroskaenc.c` 3132–3133).
+  /// A packet of a codec every frame of which libavformat counts a key
+  /// frame, not marked one: libavformat would mark it (`mux.c` 820–821;
+  /// [`CodecId::intra_only`]), overriding the packet's word that it is no
+  /// seek point. A frame of such a codec can lean on the one before: an MP3
+  /// frame whose bit reservoir starts there decodes, where decoding starts
+  /// at it, to silence (`mpegaudiodec_template.c` 1316–1322 in FFmpeg
+  /// 9.0.1), so the mark would make a seek point that does not decode.
+  /// Refused, untouched: a caller that knows the packet is one marks it.
+  /// Not in Matroska or WebM for a subtitle track, whose every block they
+  /// write as a key frame regardless (`matroskaenc.c` 3132–3133).
   #[error("track {}: a packet of a codec of key frames alone is not marked one", .track.get())]
   KeyFrameUnmarked {
     /// The track.
@@ -2028,6 +2070,238 @@ impl Neighbours {
   }
 }
 
+/// libavformat's shift of every stream's times (`handle_avoid_negative_ts`,
+/// `mux.c` 636–717; table G of the census): at the first packet it writes,
+/// where that packet, or one its interleaving holds then, lies before the
+/// earliest its stream's container writes, it moves every stream's times
+/// later by the earliest one's distance before it, each stream's distance
+/// rounded up to its own tick. A packet after that write that the shift
+/// leaves before the earliest is written there ("failed to avoid negative
+/// timestamp", 692–715).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Shift {
+  /// The times judged: presentation times in Matroska and WebM (3538–3541),
+  /// decode times in another container and where Matroska writes a video
+  /// track in VFW mode (`matroskaenc.c` 2077–2081).
+  by_pts: bool,
+  /// Whether libavformat's interleaving hands every packet on as it comes:
+  /// fewer than two streams it interleaves (`mux.c` 327–335).
+  passthrough: bool,
+  /// The earliest time handed before the first write, less its stream's
+  /// earliest, where it lies before it: what the shift moves every stream
+  /// by.
+  earliest: Option<Timestamp>,
+  /// Whether libavformat has made its first write, which settles the shift.
+  written: bool,
+  /// What the interleaving holds before its first write, by track — none
+  /// for a track whose stream takes no packet.
+  held: Vec<Option<Held>>,
+  /// The earliest decode time it holds, in microseconds: its queue's head.
+  head_us: Option<i128>,
+}
+
+/// What libavformat's interleaving holds of a stream before its first
+/// write ([`Shift`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Held {
+  /// Whether libavformat counts the stream among those it interleaves:
+  /// any but SMPTE 2038 data (`mux.c` 327–329). A stream it does not count
+  /// still counts among those that hold a packet (957–958).
+  interleaved: bool,
+  /// Whether it writes before every stream holds a packet, without one of
+  /// this — any stream's but VP8's, VP9's and SMPTE 2038 data's (959–963).
+  may_lack: bool,
+  /// A subtitle stream, which the interleaving's delay leaves aside (988).
+  subtitle: bool,
+  /// The decode time of the last packet of it held, in microseconds.
+  last_us: Option<i128>,
+}
+
+/// `ticks` of `time_base` in microseconds, as `av_rescale_q` rounds: to
+/// the nearest, half away from zero.
+fn micros(ticks: i64, time_base: Timebase) -> i128 {
+  let numerator = i128::from(ticks) * i128::from(time_base.num()) * 1_000_000;
+  let den = i128::from(time_base.den().get());
+  let away = if numerator < 0 { -(den / 2) } else { den / 2 };
+  (numerator + away) / den
+}
+
+impl Shift {
+  /// The shift `family`'s muxer, named `muxer`, makes over `tracks` — each
+  /// track's kind, codec, and whether it has a stream — where this muxer
+  /// mirrors it; `None` where libavformat makes none (MP4's
+  /// `AVFMT_TS_NEGATIVE`), or where this muxer does not mirror it: a muxer
+  /// that interleaves its own way (GXF, the MXF muxers: `gxfenc.c` 1030,
+  /// `mxfenc.c` 3721–3756), and Matroska with a video track of no native
+  /// Matroska id that is not certainly in VFW mode, which may make
+  /// libavformat judge decode times or presentation times (`matroskaenc.c`
+  /// 2025–2081). There the times before the earliest stay refused.
+  fn of(
+    family: Family,
+    muxer: &str,
+    shifts: bool,
+    tracks: &[(TrackKind, CodecId, bool)],
+  ) -> Option<Self> {
+    let by_pts = match family {
+      Family::Mp4 => return None,
+      Family::Matroska | Family::WebM => {
+        let mut by_pts = true;
+        for &(kind, codec, _) in tracks {
+          if kind != TrackKind::Video || MATROSKA_NATIVE_VIDEO.contains(&codec) {
+            continue;
+          }
+          // JPEG 2000 is written in VFW mode whatever the table says
+          // (2027–2030); any other codec of no native id in VFW or in
+          // QuickTime mode, by tables this muxer does not mirror.
+          if codec == CodecId::JPEG2000 {
+            by_pts = false;
+          } else {
+            return None;
+          }
+        }
+        by_pts
+      }
+      Family::Other if shifts && !matches!(muxer, "gxf" | "mxf" | "mxf_d10" | "mxf_opatom") => {
+        false
+      }
+      Family::Other => return None,
+    };
+    let held: Vec<_> = tracks
+      .iter()
+      .map(|&(kind, codec, stream)| {
+        stream.then_some(Held {
+          interleaved: codec != SMPTE_2038,
+          may_lack: codec != CodecId::VP8 && codec != CodecId::VP9 && codec != SMPTE_2038,
+          subtitle: kind == TrackKind::Subtitle,
+          last_us: None,
+        })
+      })
+      .collect();
+    let interleaved = held
+      .iter()
+      .flatten()
+      .filter(|held| held.interleaved)
+      .count();
+    Some(Self {
+      by_pts,
+      passthrough: interleaved <= 1,
+      earliest: None,
+      written: false,
+      held,
+      head_us: None,
+    })
+  }
+
+  /// What libavformat makes of a packet of `track` — its time judged `at`,
+  /// its decode time `dts`, its stream's earliest `lowest`, each in ticks of
+  /// `time_base`: the shift after it, or `None` where libavformat writes it
+  /// before the earliest, which only a packet after the first write can
+  /// be: one before it the shift lifts.
+  fn take(
+    &self,
+    track: usize,
+    (at, dts, lowest): (i64, i64, i64),
+    time_base: Timebase,
+  ) -> Option<Self> {
+    let below = i128::from(at) - i128::from(lowest);
+    if self.written {
+      // Each stream's distance, rounded up to its own tick (`mux.c`
+      // 676–680).
+      let lift = self.earliest.map_or(0, |earliest| {
+        let from = earliest.timebase();
+        let numerator =
+          -i128::from(earliest.pts()) * i128::from(from.num()) * i128::from(time_base.den().get());
+        let den = i128::from(from.den().get()) * i128::from(time_base.num());
+        if den <= 0 {
+          0
+        } else {
+          (numerator + den - 1).div_euclid(den)
+        }
+      });
+      return (below + lift >= 0).then(|| self.clone());
+    }
+    let mut next = self.clone();
+    if below < 0 {
+      let instant = Timestamp::new(i64::try_from(below).unwrap_or(i64::MIN), time_base);
+      next.earliest = Some(
+        next
+          .earliest
+          .map_or(instant, |earliest| earliest.min(instant)),
+      );
+    }
+    let us = micros(dts, time_base);
+    if let Some(Some(held)) = next.held.get_mut(track) {
+      held.last_us = Some(us);
+    }
+    next.head_us = Some(next.head_us.map_or(us, |head| head.min(us)));
+    next.written = next.passthrough || next.flushes();
+    Some(next)
+  }
+
+  /// Whether the interleaving, holding what it holds, writes its first
+  /// packet (`ff_interleave_packet_per_dts`, `mux.c` 939–1003): as many
+  /// streams hold one as it interleaves; or each that holds none may be
+  /// lacked, and the packets held span more than `max_interleave_delta` —
+  /// its default, the context keeping it — the subtitles' left aside.
+  fn flushes(&self) -> bool {
+    let streams = self.held.iter().flatten();
+    let holding = streams
+      .clone()
+      .filter(|held| held.last_us.is_some())
+      .count();
+    let interleaved = streams.clone().filter(|held| held.interleaved).count();
+    if holding == interleaved {
+      return true;
+    }
+    let lacking = streams
+      .clone()
+      .filter(|held| held.last_us.is_none() && held.may_lack)
+      .count();
+    let Some(head) = self.head_us else {
+      return false;
+    };
+    interleaved == holding + lacking
+      && streams
+        .filter(|held| !held.subtitle)
+        .filter_map(|held| held.last_us)
+        .any(|last| last - head > INTERLEAVE_DELTA_MICROSECONDS)
+  }
+}
+
+/// The video codecs Matroska writes with ids of its own
+/// (`ff_mkv_codec_tags`, `matroska.c` 80–105), JPEG 2000 but written in VFW
+/// mode (`matroskaenc.c` 2027–2030); RealVideo 1.0 to 3.0 are refused at open.
+const MATROSKA_NATIVE_VIDEO: [CodecId; 23] = [
+  CodecId::AV1,
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_AVS2 as i32),
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_AVS3 as i32),
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_DIRAC as i32),
+  CodecId::FFV1,
+  CodecId::MJPEG,
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO as i32),
+  CodecId::MPEG2VIDEO,
+  CodecId::MPEG4,
+  CodecId::H264,
+  CodecId::HEVC,
+  CodecId::VVC,
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MSMPEG4V3 as i32),
+  CodecId::PRORES,
+  CodecId::RV10,
+  CodecId::RV20,
+  CodecId::RV30,
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_RV40 as i32),
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_SNOW as i32),
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_THEORA as i32),
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_RAWVIDEO as i32),
+  CodecId::VP8,
+  CodecId::VP9,
+];
+
+/// `AV_CODEC_ID_SMPTE_2038`, data libavformat's interleaving neither counts
+/// nor waits on (`mux.c` 327–329, 959–963).
+const SMPTE_2038: CodecId =
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_SMPTE_2038 as i32);
+
 /// The rows of the packet-rule table one track's packets meet in its
 /// container, settled at open from the container and the stream's own
 /// parameters ([`PacketRules::settle`]); each is refused by name, the
@@ -2040,6 +2314,15 @@ struct PacketRules {
   mp4: bool,
   /// The earliest time the container writes without moving every stream.
   earliest: Option<Earliest>,
+  /// Whether a time before it is refused here, where this muxer does not
+  /// mirror libavformat's shift ([`Shift`]) — and whether a decode time is
+  /// judged too, where the shift may judge either.
+  before_zero: Option<BeforeZero>,
+  /// A negative duration is refused: a subtitle's outside Matroska and
+  /// WebM, which libavformat hands the container as it is
+  /// ([`FfmpegMuxRefusal::NegativeDuration`]); any other libavformat or
+  /// the container writes as zero, or as libavformat's guess: reported.
+  negative_duration: bool,
   /// An empty packet is dropped.
   no_empty: bool,
   /// The stream reorders, and the container makes up or refuses a
@@ -2158,6 +2441,15 @@ impl Ac3Rules {
   }
 }
 
+/// A time before the earliest a container writes, where this muxer does
+/// not mirror libavformat's shift ([`Shift`]): refused, as the time judged,
+/// or both times where the shift may judge either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeforeZero {
+  Refused,
+  RefusedEither,
+}
+
 /// The earliest time a container writes without moving every stream, in
 /// the stream's ticks, and which of a packet's times it judges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2198,6 +2490,8 @@ impl PacketRules {
     Self {
       mp4,
       earliest,
+      before_zero: None,
+      negative_duration: kind == TrackKind::Subtitle && !either_matroska,
       no_empty: mp4 || (either_matroska && kind == TrackKind::Audio),
       needs_pts: family != Family::Other && codec.video_delay() > 0,
       raw_aac: (mp4 || matroska) && id == CodecId::AAC && !codec.extradata().is_empty(),
@@ -3856,8 +4150,14 @@ impl SideRules {
       // 7044–7074, 7412–7429); Matroska rewrites an AAC or FLAC track's
       // configuration with it, which a later packet's replaces in turn
       // (`matroskaenc.c` 3065–3097), and ignores any other (3098–3115).
-      if data.is_empty() || self.family == Family::Mp4 || data == self.extradata {
+      if data.is_empty() || data == self.extradata {
         None
+      } else if self.family == Family::Mp4 {
+        // MP4 writes an AC-3 or E-AC-3 sample entry's configuration, `dac3`
+        // or `dec3`, from its own parse of the frames, not from the
+        // extradata, whose bytes it never writes (`mov_write_ac3_tag`,
+        // `mov_write_eac3_tag`, `movenc.c` 418–462, 612–666).
+        (self.codec == CodecId::AC3 || self.codec == CodecId::EAC3).then_some(Dropped)
       } else if self.family == Family::Matroska
         && (self.codec == CodecId::AAC || self.codec == CodecId::FLAC)
       {
@@ -3942,6 +4242,8 @@ impl Refusal {
 struct Plan {
   track: TrackIndex,
   stream: usize,
+  /// libavformat's shift after the packet, where this muxer mirrors it.
+  shift: Option<Shift>,
   dts: Timestamp,
   times: PacketTimes,
   dts_ticks: i64,
@@ -3975,7 +4277,9 @@ struct Learned {
   joined: bool,
   /// MP4 TTML from libavcodec's TTML encoder: the joined document's bytes.
   document: Option<u64>,
-  /// MP4 `mov_text`: the cue shortens the duration MP4 keeps of the last
+  /// The packet's duration as offered is not kept — a negative one, which
+  /// libavformat or the container writes as zero, or as libavformat's
+  /// guess; or a `mov_text` cue shortens the duration MP4 keeps of the last
   /// one (table C″).
   durations: bool,
 }
@@ -3989,6 +4293,9 @@ pub struct CarrierMuxer<W, C> {
   bounds: Bounds,
   /// What the open answered, then what writing has learned.
   report: MuxReport,
+  /// libavformat's shift of every stream's times, where it makes one and
+  /// this muxer mirrors it.
+  shift: Option<Shift>,
   _carrier: PhantomData<fn() -> C>,
 }
 
@@ -4263,6 +4570,34 @@ where
       });
     }
 
+    // libavformat's shift of early times, mirrored where it can be; where
+    // not, a time before the earliest stays refused (table G).
+    let shift = Shift::of(
+      family,
+      output.container(),
+      shifts,
+      &track_states
+        .iter()
+        .map(|state| (state.kind, state.sides.codec, state.stream.is_some()))
+        .collect::<Vec<_>>(),
+    );
+    let either = family != Family::Other
+      && track_states.iter().any(|state| {
+        state.kind == TrackKind::Video
+          && state.stream.is_some()
+          && !MATROSKA_NATIVE_VIDEO.contains(&state.sides.codec)
+          && state.sides.codec != CodecId::JPEG2000
+      });
+    for state in &mut track_states {
+      if state.rules.earliest.is_some() && shift.is_none() {
+        state.rules.before_zero = Some(if either {
+          BeforeZero::RefusedEither
+        } else {
+          BeforeZero::Refused
+        });
+      }
+    }
+
     Ok((
       Self {
         output,
@@ -4271,6 +4606,7 @@ where
         limits,
         bounds,
         report: report.clone(),
+        shift,
         _carrier: PhantomData,
       },
       report,
@@ -4481,6 +4817,34 @@ where
         dts,
       }));
     }
+    // libavformat's shift of early times, which its first write settles
+    // (table G): a packet before it is lifted with every stream; one after
+    // it the shift leaves before the earliest is written there.
+    let shift = match &self.shift {
+      // A reordering stream's packet without the presentation time judged
+      // is refused below ([`FfmpegMuxRefusal::MissingPts`]), and would move
+      // nothing: libavformat judges no packet without its time (`mux.c`
+      // 650–651).
+      Some(shift) if reaches && !(shift.by_pts && pts.is_none() && state.rules.needs_pts) => {
+        let lowest = match state.rules.earliest {
+          Some(Earliest::Presentation(lowest) | Earliest::Decode(lowest)) => lowest,
+          None => 0,
+        };
+        let (at, timestamp) = if shift.by_pts {
+          (pts_ticks.unwrap_or(dts_ticks), pts.unwrap_or(dts))
+        } else {
+          (dts_ticks, dts)
+        };
+        let next = shift
+          .take(track.get(), (at, dts_ticks, lowest), time_base)
+          .ok_or(Refusal::Container(FfmpegMuxRefusal::BeforeZero {
+            track,
+            timestamp,
+          }))?;
+        Some(next)
+      }
+      _ => None,
+    };
     let neighbours = if state.rules.mov_text {
       self.neighbours(track, time_base)
     } else {
@@ -4520,9 +4884,19 @@ where
         uncarried.insert(0, line);
       }
     }
+    // The shift, once a packet before the earliest makes it certain.
+    if shift.as_ref().is_some_and(|shift| shift.earliest.is_some())
+      && self
+        .shift
+        .as_ref()
+        .is_some_and(|shift| shift.earliest.is_none())
+    {
+      uncarried.push(Uncarried::TimesShifted);
+    }
     Ok(Plan {
       track,
       stream,
+      shift,
       dts,
       times: PacketTimes::new(pts_ticks, Some(dts_ticks), duration_ticks),
       dts_ticks,
@@ -4564,6 +4938,9 @@ where
     written.map_err(|error| {
       MuxError::Fault(MuxFault::new(MuxStage::Write { track: plan.track }, error))
     })?;
+    if let Some(shift) = plan.shift {
+      self.shift = Some(shift);
+    }
     let state = &mut self.tracks[plan.track.get()];
     state.last = Some(plan.dts);
     state.filter = plan.filter;
@@ -4676,11 +5053,13 @@ struct Mp4Times {
 }
 
 /// Holds a packet's times to the rows of the packet-rule table that judge
-/// them, in the table's order: a negative duration; MP4's 32-bit fields,
-/// against `mp4`, what `check_pkt` judges them by — or, for TTML's
-/// paragraphs, against the one sample MP4 joins them into; a missing
-/// presentation time on a stream that reorders; a time before the earliest
-/// the container writes.
+/// them, in the table's order: a subtitle's negative duration, where the
+/// container is handed it as it is; MP4's 32-bit fields, against `mp4`,
+/// what `check_pkt` judges them by — or, for TTML's paragraphs, against
+/// the one sample MP4 joins them into; a missing presentation time on a
+/// stream that reorders; a time before the earliest the container writes,
+/// where this muxer does not mirror libavformat's move of every stream's
+/// times ([`Shift`]), which judges it where it does.
 fn check_times(rules: &PacketRules, mp4: Mp4Times, timed: Timed) -> Result<(), FfmpegMuxRefusal> {
   let Timed {
     track,
@@ -4694,6 +5073,7 @@ fn check_times(rules: &PacketRules, mp4: Mp4Times, timed: Timed) -> Result<(), F
   let limit = i128::from(i32::MAX);
   if let Some(duration) = duration
     && duration_ticks < 0
+    && rules.negative_duration
   {
     return Err(FfmpegMuxRefusal::NegativeDuration { track, duration });
   }
@@ -4730,11 +5110,22 @@ fn check_times(rules: &PacketRules, mp4: Mp4Times, timed: Timed) -> Result<(), F
   if rules.needs_pts && pts.is_none() {
     return Err(FfmpegMuxRefusal::MissingPts { track });
   }
+  let Some(before_zero) = rules.before_zero else {
+    return Ok(());
+  };
   match rules.earliest {
     Some(Earliest::Presentation(earliest)) if pts_ticks.unwrap_or(dts_ticks) < earliest => {
       Err(FfmpegMuxRefusal::BeforeZero {
         track,
         timestamp: pts.unwrap_or(dts),
+      })
+    }
+    Some(Earliest::Presentation(earliest))
+      if before_zero == BeforeZero::RefusedEither && dts_ticks < earliest =>
+    {
+      Err(FfmpegMuxRefusal::BeforeZero {
+        track,
+        timestamp: dts,
       })
     }
     Some(Earliest::Decode(earliest)) if dts_ticks < earliest => Err(FfmpegMuxRefusal::BeforeZero {
@@ -4992,13 +5383,13 @@ fn check_packet_rules(
   // `mov_text`: MP4 keeps a cue's duration as the distance to the next
   // sample — the empty one at its end, or a cue before that end (table C″):
   // a cue before the end shortens the last one.
-  let durations = cues.is_some_and(|cue| {
-    cue.early
-      && state
-        .cues
-        .cue
-        .is_some_and(|(at, offered)| i128::from(dts_ticks) - i128::from(at) != i128::from(offered))
-  });
+  let durations = duration_ticks < 0
+    || cues.is_some_and(|cue| {
+      cue.early
+        && state.cues.cue.is_some_and(|(at, offered)| {
+          i128::from(dts_ticks) - i128::from(at) != i128::from(offered)
+        })
+    });
   Ok(Learned {
     sample,
     cues: cues.map(|cue| cue.next),

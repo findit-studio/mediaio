@@ -49,7 +49,9 @@ parameters are rebuilt from, an attachment track with its one file.
   (`Uncarried::Rewritten`, `Rewrite`), or written and read back as handed
   over. MP4's durations, which it keeps only as the distances between
   the samples it writes, are reported as they are lost, in the muxer's
-  own `report`.
+  own `report`; so are libavformat's move of every stream's times, where
+  a packet lies before the earliest the container writes
+  (`Uncarried::TimesShifted`), and a negative duration it writes as zero.
 - **libavformat's automatic bitstream filters run, each reported.** As
   `ffmpeg -c copy` runs them: AAC's ADTS headers stripped, VP9's hidden
   frames joined into superframes, PGS segments joined into display sets,

@@ -35,11 +35,14 @@ crate moves only when it changes.
 - **The packet-rule table.** Every rule libavformat applies on the
   packet path in Matroska, WebM and MP4, at FFmpeg 9.0.1, is refused by
   name before libavformat is handed the packet, reported at open, or
-  passed through. Refused, the packet handed back untouched: a negative
-  duration; MP4's duration, decode gap and composition offset past
-  `i32::MAX` ticks, the gap judged in `i128`; a reordering stream's
-  packet without a presentation time; a time before the earliest the
-  container writes; an MP4 `mov_text` cue before zero, or before the
+  passed through. Refused, the packet handed back untouched: a
+  subtitle's negative duration outside Matroska and WebM, which
+  libavformat hands the container as it is; MP4's duration, decode gap
+  and composition offset past `i32::MAX` ticks, the gap judged in
+  `i128`; a reordering stream's packet without a presentation time; a
+  time libavformat's first write leaves before the earliest the container
+  writes, and every such time where the muxer does not mirror that
+  write's move of every stream's times; an MP4 `mov_text` cue before zero, or before the
   last cue's end where another track's packet can make MP4 mark that end
   first; an unmarked key
   frame of a codec of key frames alone (`FfmpegMuxRefusal`); and a
@@ -63,7 +66,11 @@ crate moves only when it changes.
   durations without a default duration, Matroska's stripped WavPack
   headers. Reported while writing (`CarrierMuxer::report`): MP4's
   durations, where the samples it writes do not abut, and where a
-  `mov_text` cue starting before the last one's end shortens it.
+  `mov_text` cue starting before the last one's end shortens it; a
+  negative duration libavformat or the container writes as zero; and
+  libavformat's move of every stream's times at its first write, where a
+  packet lies before the earliest the container writes
+  (`Uncarried::TimesShifted`).
 - **The automatic filters, on by default, each reported.** libavformat's
   automatic bitstream filters run as `ffmpeg -c copy` runs them —
   `aac_adtstoasc` for MP4's and Matroska's AAC framed in ADTS,
@@ -91,8 +98,10 @@ crate moves only when it changes.
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
   time a packet carrying it is written (`Uncarried::SideData`,
-  `SideDataFate::Dropped`), and a kind whose fate the source does not
-  settle as possibly dropped (`SideDataFate::PossiblyDropped`).
+  `SideDataFate::Dropped`) — MP4's new extradata on an AC-3 or E-AC-3
+  track among them, whose sample entry MP4 writes from its own parse of
+  the frames — and a kind whose fate the source does not settle as
+  possibly dropped (`SideDataFate::PossiblyDropped`).
 - **The report table.** What a road keeps of a track's filename, MIME
   type, language and each disposition flag, per container, is one
   table the report and the stream's disposition both read: Matroska's
