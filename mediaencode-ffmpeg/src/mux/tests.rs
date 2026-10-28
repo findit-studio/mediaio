@@ -1793,9 +1793,9 @@ fn mp4_pcm_takes_the_layouts_its_chnl_box_writes() {
 }
 
 /// **Each container keeps the packet side data it has a place for**, by
-/// the side-data table: MP4 its new extradata — but an AC-3 or E-AC-3
-/// track's, whose sample entry MP4 writes from its parse of the frames —
-/// and its skip samples possibly; Matroska and WebM an audio block's end skip and its first
+/// the side-data table: MP4 its new extradata — but where the codec's
+/// sample entry reads none of it, AC-3's, E-AC-3's, APV's, PCM's and
+/// TTML's (grep G19) — and its skip samples possibly; Matroska and WebM an audio block's end skip and its first
 /// start skip, a WebVTT cue's lines, a block addition of id 1, a video
 /// block's T.35 additions; neither anything else; another container
 /// nothing claimed.
@@ -1830,12 +1830,30 @@ fn each_container_keeps_the_side_data_it_has_a_place_for() {
     mp4.fate(&entry(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x12, 0x10]), false),
     None
   );
-  for codec in [CodecId::AC3, CodecId::EAC3] {
-    let parsed = rules(Family::Mp4, TrackKind::Audio, codec);
+  for (kind, codec) in [
+    (TrackKind::Video, CodecId::H264),
+    (TrackKind::Audio, CodecId::OPUS),
+    (TrackKind::Subtitle, CodecId::MOV_TEXT),
+  ] {
+    assert_eq!(
+      rules(Family::Mp4, kind, codec).fate(&entry(T::AV_PKT_DATA_NEW_EXTRADATA, &[1, 2]), false),
+      None,
+      "{codec:?}: its sample entry is written from it"
+    );
+  }
+  for (kind, codec) in [
+    (TrackKind::Audio, CodecId::AC3),
+    (TrackKind::Audio, CodecId::EAC3),
+    (TrackKind::Audio, CodecId::PCM_S16LE),
+    (TrackKind::Audio, CodecId::PCM_F64BE),
+    (TrackKind::Video, CodecId::APV),
+    (TrackKind::Subtitle, CodecId::TTML),
+  ] {
+    let parsed = rules(Family::Mp4, kind, codec);
     assert_eq!(
       parsed.fate(&entry(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x12, 0x10]), false),
       Some(Dropped),
-      "{codec:?}: its sample entry is MP4's parse"
+      "{codec:?}: its sample entry reads none of it"
     );
     assert_eq!(
       parsed.fate(&entry(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x11, 0x90]), false),

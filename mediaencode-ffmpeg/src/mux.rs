@@ -167,13 +167,33 @@
 //!
 //! | kind | MP4 (`movenc.c`) | Matroska, WebM (`matroskaenc.c`) |
 //! |---|---|---|
-//! | new extradata | kept: a sample description from the packet on, or the configuration of a track that had none (7044–7074, 7412–7429); AC-3's and E-AC-3's dropped: their sample entry's configuration is MP4's own parse of the frames, the bytes never written (`mov_write_ac3_tag`, `mov_write_eac3_tag`, 418–462, 612–666; 1084–1087, 1507–1510) | AAC, FLAC (Matroska): possibly dropped — it rewrites the track's one configuration, which a later packet's replaces (3065–3097); any other: dropped, unless it is the track's own (3098–3115) |
+//! | new extradata | kept: a sample description from the packet on, or the configuration of a track that had none (7044–7074, 7412–7429); dropped where the codec's sample entry reads none of it (grep G19): AC-3's and E-AC-3's, whose configuration is MP4's own parse of the frames (418–462, 612–666), APV's, its parse of the packets (1725–1738), PCM's, TTML's and GoPro metadata's, whose entries hold no configuration (1520–1528, 2259–2278, 3153–3163) | AAC, FLAC (Matroska): possibly dropped — it rewrites the track's one configuration, which a later packet's replaces (3065–3097); any other: dropped, unless it is the track's own (3098–3115) |
 //! | skip samples | possibly dropped: the end skip trims the track's end in the edit list from the last packet alone, the start skip and the reasons are not read; dropped where the codec fixes no frame's samples (7311–7319, 7333–7342) | an audio track's end skip, as the block's discard padding (2922–2934), and its first packet's start skip where it is the stream's initial padding, written as the codec delay (2089–2104), which the reader puts back (`matroskadec.c` 2896–2901): kept; else dropped |
 //! | producer reference time | dropped: written only into fragments, with `write_prft` set (6034–6102, 7365–7369) | dropped |
 //! | WebVTT identifier, settings | dropped | a WebVTT cue's: kept, on lines of their own (2828–2855, 3591–3593); else dropped |
 //! | Matroska block additional | dropped | kept where its id — its first eight bytes, big-endian — is 1 (2936–2946); else dropped |
 //! | HDR10+, SMPTE 2094 APP5, LCEVC | dropped | a video track's: kept, as ITU-T T.35 block additions (2947–3006) the trailer maps (3418–3443), which the reader turns back into their kinds (`matroskadec.c` 4038–4130); else dropped |
 //! | any other | dropped | dropped |
+//!
+//! **MP4's sample entries and new extradata** (grep G19 of #82): for every
+//! codec MP4's tag table holds (`movenc.c` 9230–9290), the writer of its
+//! sample entry's configuration and what it reads of the sample
+//! description's extradata, which new extradata opens a new description
+//! with from its packet on (7044–7074):
+//!
+//! | codecs | writer | reads the extradata | new extradata |
+//! |---|---|---|---|
+//! | MPEG-4 Part 2, MPEG-1 and MPEG-2 video, MJPEG, PNG, JPEG 2000, TSCC2 (`mp4v`); AAC, MPEG-4 ALS, MP3, MP2, DTS, Vorbis, QCELP, EVRC (`mp4a`); DVD subtitles (`mp4s`) | `esds` (765–816) | as its decoder-specific information | kept |
+//! | H.264, HEVC, VVC, EVC, LCEVC, AVS3 | `avcC`, `hvcC` and `lhvC`, `vvcC`, `evcC`, `lvcC`, `av3c` (1584–1593, 1639–1674, 1706–1723, 1676–1704, 1618–1626) | whole | kept |
+//! | VP9, AV1, VC-1 | `vpcC`, `av1C`, `dvc1` (1628–1637, 1573–1582, 1186–1201) | parsed, or whole | kept |
+//! | ALAC, FLAC, Opus, TrueHD | `alac`, `dfLa`, `dOps`, `dmlp` (672–676, 857–938) | whole, or parsed | kept |
+//! | Dirac, FFV1, MPEG-H 3D Audio | `glbl` (1203–1210) | whole | kept |
+//! | `mov_text` | the entry itself (2281–2282) | whole | kept |
+//! | AC-3, E-AC-3 | `dac3`, `dec3` (418–462, 612–666) | none: MP4's parse of the frames | dropped |
+//! | APV | `apvC` (1725–1738) | none: its parse of the packets | dropped |
+//! | PCM | `ipcm` and `fpcm`: `pcmC`, `chnl`, `srat` (1299–1377, 1520–1528) | none | dropped |
+//! | TTML | its namespace alone (2259–2278) | none | dropped |
+//! | GoPro metadata | `gpmd` (3153–3163) | none | dropped |
 //!
 //! A packet whose own side data an automatic filter drops — a hidden VP9
 //! frame's, a PGS packet's that holds no presentation segment — has all of
@@ -211,7 +231,7 @@
 //! | Matroska block additional | Matroska and WebM: read at a size of 8 or more (2936–2946) | bytes |
 //! | skip samples | Matroska: at 10 or more (2922–2934); MP4: at 10 or more, where the codec fixes a frame's samples (`movenc.c` 7311–7320), refused there below nothing after the packet is taken | bytes; MP4's refusal made first ([`PayloadRule::SkipSamples`]) |
 //! | WebVTT identifier, settings | Matroska and WebM, a WebVTT block's: copied by size, their sum with the cue's against `INT_MAX` (2828–2853) | bytes; the cue rule ([`PayloadRule::WebVttCue`]); the sum within the cluster's bound (table B) |
-//! | new extradata | MP4: a sample description from the packet on, written by the codec's writer at the trailer (`movenc.c` 7044–7074, 7406–7420), AC-3's and E-AC-3's of none of its bytes (418–462, 612–666); Matroska: AAC's parsed and fitted to the space its header reserved, FLAC's of the track's length (3065–3097) | table C |
+//! | new extradata | MP4: a sample description from the packet on, written by the codec's writer at the trailer (`movenc.c` 7044–7074, 7406–7420), AC-3's, E-AC-3's, APV's, PCM's, TTML's and GoPro metadata's of none of its bytes (grep G19); Matroska: AAC's parsed and fitted to the space its header reserved, FLAC's of the track's length (3065–3097) | table C |
 //! | producer reference time | MP4: copied only at its struct's exact size (7365–7369) | bytes |
 //! | palette | MOV's raw video alone (7695–7700; `rawutils.c` 82–92, its size checked) — not MP4's | bytes |
 //! | IAMF parameters | cast to `AVIAMFParamDefinition` (`iamf_writer.c` 1176–1184), reached only for a stream group's track (`movenc.c` 7594–7603); the muxing context adds no stream group | never reached |
@@ -318,7 +338,7 @@
 //! | AMR-NB: one frame a packet; ADPCM MS and IMA WAV: a frame size | 6983–7002 | not reached: MP4's tag table holds neither (`codec_mp4_tags`, 9230–9290), refused at open ([`MuxOpenError::CodecNotCarried`]); MOV's other modes reach it |
 //! | no samples: less than a frame of a sized codec | 7006–7010 | [`PayloadRule::PartialSample`], [`PayloadRule::Empty`] |
 //! | the first packet taken as the configuration of H.264, HEVC, VVC, EVC, LCEVC, VP9, TrueHD or DNxHD where none is stated | 7024–7041 | H.264, HEVC, VVC, LCEVC and EVC refused at open ([`MuxOpenError::ConfigurationMissing`]); TrueHD refused at open; VP9's and DNxHD's boxes made from it, written |
-//! | new extradata: a sample description from the packet on, each written by its codec's writer at the trailer — AC-3's and E-AC-3's, `dac3` and `dec3`, from MP4's parse of the frames, of none of its bytes; MPEG-4 ALS, AAC, AV1 and FLAC's overwriting a configuration stated as none | 7044–7074, 7406–7420; 418–462, 612–666 | AC-3's and E-AC-3's reported dropped (the side-data table); FLAC's of 34 bytes ([`PayloadRule::FlacStreamInfo`]); Opus's an OpusHead `dOps` takes, H.264's, HEVC's, VVC's and LCEVC's of the track's form — Annex B or not — as the rewrite reads it ([`PayloadRule::NewExtradata`]); a configuration stated as none refused at open, so none is overwritten |
+//! | new extradata: a sample description from the packet on, each written by its codec's writer at the trailer — AC-3's and E-AC-3's, `dac3` and `dec3`, from MP4's parse of the frames, APV's `apvC` from its packets', PCM's, TTML's and GoPro metadata's entries of no configuration, none of its bytes; MPEG-4 ALS, AAC, AV1 and FLAC's overwriting a configuration stated as none | 7044–7074, 7406–7420; grep G19 | where none of its bytes is written, reported dropped (the side-data table); FLAC's of 34 bytes ([`PayloadRule::FlacStreamInfo`]); Opus's an OpusHead `dOps` takes, H.264's, HEVC's, VVC's and LCEVC's of the track's form — Annex B or not — as the rewrite reads it ([`PayloadRule::NewExtradata`]); a configuration stated as none refused at open, so none is overwritten |
 //! | AAC framed in ADTS | 7076–7086 | [`PayloadRule::AdtsHeader`], [`PayloadRule::AdtsFrame`] |
 //! | the Annex B rewrite | 7087–7158 | reported ([`Rewrite::LengthPrefixed`]); its size, table B |
 //! | AV1's OBUs | 7159–7174 | [`PayloadRule::Obus`]; reported ([`Rewrite::ObusFiltered`]) |
@@ -2488,6 +2508,41 @@ struct PacketRules {
   new_extradata: ExtradataRule,
 }
 
+/// Whether MP4's sample entry for a track of `codec` is written from the
+/// track's extradata — the sample description's, which new extradata opens
+/// a new one with from its packet on (`movenc.c` 7044–7074) — by the
+/// dispatch of `mov_write_audio_tag`, `mov_write_video_tag` and
+/// `mov_write_subtitle_tag` (1486–1530, 2880–2927, 2257–2283; grep G19 of
+/// #82). Every codec MP4's tag table holds (9230–9290) does but AC-3 and
+/// E-AC-3, whose `dac3` and `dec3` are MP4's own parse of the frames
+/// (418–462, 612–666); APV, whose `apvC` is its parse of the packets
+/// (1725–1738); PCM, whose `ipcm` and `fpcm` hold no configuration
+/// (1520–1528: `pcmC`, `chnl`, `srat`, 1299–1377); TTML, whose entry holds
+/// none (2259–2278); and GoPro metadata, whose `gpmd` holds none
+/// (3153–3163).
+fn mp4_entry_reads_extradata(codec: CodecId) -> bool {
+  const BIN_DATA: CodecId =
+    CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_BIN_DATA as i32);
+  ![
+    CodecId::AC3,
+    CodecId::EAC3,
+    CodecId::APV,
+    CodecId::PCM_S16BE,
+    CodecId::PCM_S16LE,
+    CodecId::PCM_S24BE,
+    CodecId::PCM_S24LE,
+    CodecId::PCM_S32BE,
+    CodecId::PCM_S32LE,
+    CodecId::PCM_F32BE,
+    CodecId::PCM_F32LE,
+    CodecId::PCM_F64BE,
+    CodecId::PCM_F64LE,
+    CodecId::TTML,
+    BIN_DATA,
+  ]
+  .contains(&codec)
+}
+
 /// What a container takes of new extradata on a track, beside what the
 /// side-data table reports of it (table C of the census, see [the
 /// module](self)).
@@ -4339,11 +4394,11 @@ impl SideRules {
       if data.is_empty() || data == self.extradata {
         None
       } else if self.family == Family::Mp4 {
-        // MP4 writes an AC-3 or E-AC-3 sample entry's configuration, `dac3`
-        // or `dec3`, from its own parse of the frames, not from the
-        // extradata, whose bytes it never writes (`mov_write_ac3_tag`,
-        // `mov_write_eac3_tag`, `movenc.c` 418–462, 612–666).
-        (self.codec == CodecId::AC3 || self.codec == CodecId::EAC3).then_some(Dropped)
+        // MP4 writes its sample entry's configuration box from the sample
+        // description's extradata, which new extradata replaces from the
+        // packet on — but where the codec's writer reads none of it
+        // ([`mp4_entry_reads_extradata`]).
+        (!mp4_entry_reads_extradata(self.codec)).then_some(Dropped)
       } else if self.family == Family::Matroska
         && (self.codec == CodecId::AAC || self.codec == CodecId::FLAC)
       {

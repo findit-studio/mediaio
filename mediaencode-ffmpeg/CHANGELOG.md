@@ -106,10 +106,10 @@ crate moves only when it changes.
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
   time a packet carrying it is written (`Uncarried::SideData`,
-  `SideDataFate::Dropped`) — MP4's new extradata on an AC-3 or E-AC-3
-  track among them, whose sample entry MP4 writes from its own parse of
-  the frames — and a kind whose fate the source does not settle as
-  possibly dropped (`SideDataFate::PossiblyDropped`).
+  `SideDataFate::Dropped`) — MP4's new extradata among them where the
+  codec's sample entry reads none of it: AC-3's, E-AC-3's, APV's, PCM's,
+  TTML's and GoPro metadata's — and a kind whose fate the source does not
+  settle as possibly dropped (`SideDataFate::PossiblyDropped`).
 - **The report table.** What a road keeps of a track's filename, MIME
   type, language and each disposition flag, per container, is one
   table the report and the stream's disposition both read: Matroska's

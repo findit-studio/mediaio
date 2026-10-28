@@ -5758,23 +5758,29 @@ fn l67_a_configured_aac_tracks_first_packet_decides_its_filter() {
   }
 }
 
-/// **L68 — MP4 reports an AC-3 or E-AC-3 track's new extradata dropped**
-/// (the side-data table): MP4 writes their sample entry's configuration,
-/// `dac3` or `dec3`, from its own parse of the frames (`movenc.c` 418–462,
-/// 612–666; 1084–1087, 1507–1510), so the sample description a packet's new
-/// extradata opens (7044–7074) holds none of its bytes. Reported for the
-/// track, by name, at the first packet carrying it; nothing reads back with
-/// them.
+/// **L68 — MP4 reports new extradata dropped where the track's sample entry
+/// reads none of it** (the side-data table; grep G19 of #82): the sample
+/// description a packet's new extradata opens (`movenc.c` 7044–7074) is
+/// written by the codec's writer, and AC-3's and E-AC-3's `dac3` and `dec3`
+/// are MP4's own parse of the frames (418–462, 612–666; 1084–1087,
+/// 1507–1510), PCM's `ipcm` holds no configuration (1520–1528): none of its
+/// bytes is written. Reported for the track, by name, at the first packet
+/// carrying it; nothing reads back with them.
 ///
 /// PLANT: MP4's new extradata kept for every codec again leaves the line
-/// out.
+/// out; kept for every codec but AC-3 and E-AC-3, as before the sweep,
+/// leaves PCM's out.
 #[test]
 fn l68_mp4_reports_ac3s_new_extradata_dropped() {
   use ffmpeg_next::ffi::AVPacketSideDataType as T;
   let Some(corpus) = Corpus::new() else { return };
   let added = [1, 2, 3, 4];
-  for codec in ["ac3", "eac3"] {
-    let source = audio_file(&corpus, &format!("{codec}.mkv"), codec);
+  for codec in ["ac3", "eac3", "pcm"] {
+    let source = if codec == "pcm" {
+      pcm_mov(&corpus)
+    } else {
+      audio_file(&corpus, &format!("{codec}.mkv"), codec)
+    };
     let (table, frames) = first_track(&source, TrackKind::Audio, 2);
     let target = output(&corpus, &format!("l68-{codec}.mp4"));
     let mut muxer = muxer_into(&target, ContainerName::MP4, table);
