@@ -743,6 +743,225 @@ fn mp4s_ac3_handling_is_mirrored() {
   assert_eq!(take(held, true, &independent), Err(PayloadRule::Ac3Blocks));
 }
 
+/// The kind of a track of `codec`, as the laws' tracks are: audio for AAC
+/// and PCM, a subtitle for PGS and EIA-608, else video.
+fn kind_of(codec: CodecId) -> TrackKind {
+  if codec == CodecId::AAC || codec == CodecId::PCM_S16LE {
+    TrackKind::Audio
+  } else if codec == CodecId::HDMV_PGS_SUBTITLE || codec == EIA_608 {
+    TrackKind::Subtitle
+  } else {
+    TrackKind::Video
+  }
+}
+
+/// **Every filter table B names is settled where its muxer inserts it, and
+/// named for the track where open decides it** (E″ of the census): every
+/// `check_bitstream` answers 1 or the insertion's answer, so libavformat
+/// decides a muxer's filters at a track's first packet, never later
+/// (`mux.c` 1063–1068); a muxer's start inserts the rest whatever the
+/// option says. `pcm_rechunk` in DAUD, GXF and the three MXF muxers;
+/// `av1_metadata` in IVF at its start and in OBU at the first packet;
+/// `eia608_to_smpte436m` in MCC and the MXF muxers; `extract_extradata` in
+/// FLV where the track states no configuration; the Annex B conversions,
+/// undecided until the first packet, in MPEG-TS — and RTP MPEG-TS's nested
+/// one, the option aside — in MXF and MXF OP-Atom for H.264, and in each
+/// raw muxer for its codec.
+#[test]
+fn every_filter_table_b_names_is_settled_where_its_muxer_inserts_it() {
+  use AutomaticFilter as A;
+  let settle = |muxer: &str, codec, extradata: &[u8], on| {
+    Filter::settle(
+      Sites::of(muxer, None),
+      Family::of(muxer),
+      (kind_of(codec), codec),
+      extradata,
+      on,
+    )
+  };
+  let named =
+    |muxer: &str, codec, extradata: &[u8], on| settle(muxer, codec, extradata, on).named();
+  for on in [true, false] {
+    for muxer in ["daud", "gxf", "mxf", "mxf_d10", "mxf_opatom"] {
+      assert_eq!(
+        named(muxer, CodecId::PCM_S16LE, &[], on),
+        Some(A::PcmRechunk),
+        "{muxer}"
+      );
+    }
+    for muxer in ["mcc", "mxf", "mxf_d10", "mxf_opatom"] {
+      assert_eq!(
+        named(muxer, EIA_608, &[], on),
+        Some(A::Eia608ToSmpte436m),
+        "{muxer}"
+      );
+    }
+    assert_eq!(named("ivf", CodecId::AV1, &[], on), Some(A::Av1Metadata));
+  }
+  assert_eq!(named("wav", CodecId::PCM_S16LE, &[], true), None);
+  assert_eq!(named("mov", EIA_608, &[], true), None);
+  assert_eq!(named("obu", CodecId::AV1, &[], true), Some(A::Av1Metadata));
+  assert_eq!(named("obu", CodecId::AV1, &[], false), None);
+  assert_eq!(named("mp4", CodecId::AV1, &[1], true), None);
+  for codec in [
+    CodecId::H264,
+    CodecId::HEVC,
+    CodecId::VVC,
+    CodecId::AV1,
+    CodecId::MPEG4,
+  ] {
+    assert_eq!(
+      named("flv", codec, &[], true),
+      Some(A::ExtractExtradata),
+      "{codec:?}"
+    );
+    assert_eq!(
+      named("flv", codec, &[1, 2], true),
+      None,
+      "{codec:?}: configured"
+    );
+    assert_eq!(named("flv", codec, &[], false), None, "{codec:?}: off");
+  }
+  let undecided = |filter, configured| Filter::AnnexBUndecided { filter, configured };
+  for (codec, filter) in [
+    (CodecId::H264, A::H264Mp4ToAnnexB),
+    (CodecId::HEVC, A::HevcMp4ToAnnexB),
+    (CodecId::VVC, A::VvcMp4ToAnnexB),
+  ] {
+    assert_eq!(settle("mpegts", codec, &[], true), undecided(filter, false));
+    assert_eq!(settle("mpegts", codec, &[], false), Filter::None);
+    assert_eq!(
+      settle("rtp_mpegts", codec, &[], false),
+      undecided(filter, false),
+      "nested"
+    );
+    let raw = match codec {
+      CodecId::H264 => "h264",
+      CodecId::HEVC => "hevc",
+      _ => "vvc",
+    };
+    assert_eq!(
+      settle(raw, codec, &[1], true),
+      undecided(filter, false),
+      "{raw}"
+    );
+    assert_eq!(
+      settle(raw, codec, &[], true).named(),
+      None,
+      "{raw}: undecided at open"
+    );
+  }
+  // MPEG-TS asks the configuration's first byte: `configurationVersion` 1,
+  // or VVC's reserved `11111`.
+  assert_eq!(
+    settle("mpegts", CodecId::H264, &[1, 0x64], true),
+    undecided(A::H264Mp4ToAnnexB, true)
+  );
+  assert_eq!(
+    settle("mpegts", CodecId::H264, &[0, 0, 0, 1], true),
+    undecided(A::H264Mp4ToAnnexB, false)
+  );
+  assert_eq!(
+    settle("mpegts", CodecId::VVC, &[0xFF], true),
+    undecided(A::VvcMp4ToAnnexB, true)
+  );
+  assert_eq!(
+    settle("mpegts", CodecId::VVC, &[0x01], true),
+    undecided(A::VvcMp4ToAnnexB, false)
+  );
+  for muxer in ["mxf", "mxf_opatom"] {
+    assert_eq!(
+      settle(muxer, CodecId::H264, &[1], true),
+      undecided(A::H264Mp4ToAnnexB, false),
+      "{muxer}"
+    );
+    assert_eq!(
+      settle(muxer, CodecId::HEVC, &[], true),
+      Filter::None,
+      "{muxer}"
+    );
+  }
+  assert_eq!(
+    settle("mxf_d10", CodecId::H264, &[], true),
+    Filter::None,
+    "no check_bitstream"
+  );
+  assert_eq!(A::PcmRechunk.name(), "pcm_rechunk");
+  assert_eq!(A::Av1Metadata.name(), "av1_metadata");
+  assert_eq!(A::Eia608ToSmpte436m.name(), "eia608_to_smpte436m");
+  assert_eq!(A::ExtractExtradata.name(), "extract_extradata");
+  assert_eq!(A::H264Mp4ToAnnexB.name(), "h264_mp4toannexb");
+  assert_eq!(A::HevcMp4ToAnnexB.name(), "hevc_mp4toannexb");
+  assert_eq!(A::VvcMp4ToAnnexB.name(), "vvc_mp4toannexb");
+}
+
+/// **A filter the first packet decides is inserted, and named, at the
+/// packet that decides it, and never after** (E″ of the census): AAC's at
+/// an ADTS header of more than two bytes (`flvenc.c` 1491–1493;
+/// `latmenc.c` 255–257); the Annex B conversions at a packet of five bytes
+/// or more opening on no 4-byte start code, nor on a 3-byte one but where
+/// MPEG-TS finds the configuration length-prefixed (`mpegtsenc.c`
+/// 2326–2331). A packet that inserts none leaves none to insert.
+///
+/// PLANT: without `Step::inserted`, the write that inserts the filter
+/// names none.
+#[test]
+fn a_first_packet_filter_is_named_at_the_packet_that_inserts_it() {
+  use AutomaticFilter as A;
+  let adts = adts(16, false, 3, 2, 0, 0x11);
+  let raw = [0x21, 0x10, 0x05];
+  let undecided = Filter::AdtsUndecided {
+    configured: false,
+    parses: false,
+  };
+  let (after, step) = undecided
+    .step(&adts, 0, PACKET_BYTES_MAX)
+    .expect("converted");
+  assert_eq!(step.inserted, Some(A::AacAdtsToAsc));
+  assert_eq!(after.named(), Some(A::AacAdtsToAsc));
+  let (_, step) = after.step(&adts, 0, PACKET_BYTES_MAX).expect("converted");
+  assert_eq!(step.inserted, None, "once");
+  let (after, step) = undecided.step(&raw, 0, PACKET_BYTES_MAX).expect("passed");
+  assert_eq!((after, step.inserted), (Filter::None, None));
+  let annexb = |configured| Filter::AnnexBUndecided {
+    filter: A::H264Mp4ToAnnexB,
+    configured,
+  };
+  let length_prefixed = [0, 0, 0, 2, 0x65, 0x88];
+  for (bytes, configured, inserted) in [
+    (&length_prefixed[..], false, true),
+    (&[0, 0, 0, 1, 0x65, 0x88][..], false, false),
+    (&[0, 0, 1, 0x65, 0x88][..], false, false),
+    (&[0, 0, 1, 0x65, 0x88][..], true, true),
+    (&[0, 0, 0, 2][..], false, false),
+  ] {
+    let (after, step) = annexb(configured)
+      .step(bytes, 0, PACKET_BYTES_MAX)
+      .expect("passed");
+    assert_eq!(
+      step.inserted,
+      inserted.then_some(A::H264Mp4ToAnnexB),
+      "{bytes:?}, configured {configured}"
+    );
+    assert_eq!(
+      after,
+      if inserted {
+        Filter::Unmirrored(A::H264Mp4ToAnnexB)
+      } else {
+        Filter::None
+      }
+    );
+    assert!(step.reaches, "the filter holds nothing");
+  }
+  let (after, _) = annexb(false)
+    .step(&length_prefixed, 0, PACKET_BYTES_MAX)
+    .expect("inserted");
+  let (_, step) = after
+    .step(&length_prefixed, 0, PACKET_BYTES_MAX)
+    .expect("passed");
+  assert_eq!(step.inserted, None, "once");
+}
+
 /// **MP4 joins E-AC-3 frames of fewer than six blocks into the sample it
 /// writes when they make six, and writes nothing before** (`handle_eac3`,
 /// `movenc.c` 577–606; table C″ of the census): the sample takes its first
@@ -901,6 +1120,7 @@ fn admit_eac3(
     reaches: true,
     largest: Some(bytes.len() as u64),
     held: None,
+    inserted: None,
   };
   let learned = check_packet_rules(state, time_base, timed, payload, step, Bounds::REAL)?;
   let lines = learned_losses(state, track, &[], payload, &learned, true);
@@ -1267,6 +1487,7 @@ fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
     reaches,
     largest: largest.map(|bytes| bytes as u64),
     held: held.map(|bytes| bytes as u64),
+    inserted: None,
   };
   assert_eq!(
     pgs_frame_merge(start, &whole, 0, PACKET_BYTES_MAX),
@@ -1604,7 +1825,7 @@ fn the_filters_are_those_each_muxer_inserts() {
     Filter::settle(
       Sites::of(muxer, mime),
       Family::of(muxer),
-      codec,
+      (kind_of(codec), codec),
       extradata,
       on,
     )
@@ -1989,6 +2210,7 @@ fn vp9s_filter_puts_out_superframes_sized_with_what_it_holds() {
       reaches: false,
       largest: None,
       held: Some(4 + 1 + 2 + 2),
+      inserted: None,
     },
     "four bytes held and a byte shown, their index of two sizes"
   );
@@ -1999,6 +2221,7 @@ fn vp9s_filter_puts_out_superframes_sized_with_what_it_holds() {
       reaches: true,
       largest: Some(4 + 3 + 2 + 2 + 30),
       held: None,
+      inserted: None,
     },
     "the superframe, with the shown frame's side data"
   );

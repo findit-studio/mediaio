@@ -44,8 +44,9 @@
 //! `MP4` opens MP4's muxer and meets every rule MP4's does. Any other
 //! muxer opens the same way and libavformat decides what it writes; an
 //! attachment is not handed to it (and is reported), and nothing else is
-//! claimed about what it keeps but what a bitstream filter it inserts,
-//! which this muxer mirrors, converts or drops (table B).
+//! claimed about what it keeps but the bitstream filters it inserts, each
+//! named for its track, and what those this muxer mirrors convert or drop
+//! (table B).
 //!
 //! # Writing: the face's refusals, then the container's
 //!
@@ -99,25 +100,36 @@
 //! libavformat's automatic bitstream filters are on, as libavformat and
 //! `ffmpeg -c copy` have them (`AVFMT_FLAG_AUTO_BSF`,
 //! `libavformat/options_table.h` 42): container-level conversions that lose
-//! nothing of what a decoder reads, each named for its track at open
-//! ([`Uncarried::Filtered`], [`AutomaticFilter`]) —
+//! nothing of what a decoder reads, each named for its track
+//! ([`Uncarried::Filtered`], [`AutomaticFilter`]) — at open, where open
+//! decides it, else at the write of the packet that inserts it —
 //!
 //! - MP4 and Matroska strip AAC's ADTS headers where the track states no
-//!   configuration, making it from the first frame's header;
+//!   configuration, making it from the first frame's header, and FLV and
+//!   LATM where the track's first packet is ADTS;
 //! - MP4, Matroska, WebM, MOV's other modes and IVF join VP9's hidden
 //!   frames, with the next frame the stream shows, into superframes;
-//! - Matroska joins PGS segments into display sets.
+//! - Matroska joins PGS segments into display sets;
+//! - DAUD, GXF and MXF cut PCM into packets of their counts of samples;
+//!   IVF and OBU put temporal delimiters before AV1's temporal units; MCC
+//!   and MXF rewrite EIA-608 as SMPTE 436M; FLV makes a configuration from
+//!   the parameter sets of H.264, HEVC, VVC, AV1 or MPEG-4 that states
+//!   none; MPEG-TS, MXF and the raw muxers rewrite length-prefixed H.264,
+//!   HEVC or VVC as Annex B.
 //!
 //! **The first packet decides.** libavformat inserts most filters when it
-//! writes a track's first packet (`check_bitstream`, `mux.c` 1056–1073):
-//! VP9's and PGS's always, AAC's only where that packet opens with an ADTS
-//! header (`movenc.c` 9138–9151; `matroskaenc.c` 3630–3646). This muxer
-//! admits on such a track in MP4 and Matroska only what the filter
-//! converts, so the report at open stays true: an AAC track with no
-//! configuration takes one ADTS frame a packet ([`PayloadRule::AdtsFrame`]),
-//! and one whose configuration is stated takes raw AAC alone
-//! ([`PayloadRule::AdtsHeader`]); in another container that inserts AAC's
-//! filter, the first packet decides as it does for libavformat. What a
+//! writes a track's first packet, and never later: every muxer's
+//! `check_bitstream` answers 1 or the insertion's answer, which settles the
+//! track (`check_bitstream`, `mux.c` 1056–1073; table B's greps): VP9's and
+//! PGS's always, AAC's only where that packet opens with an ADTS header
+//! (`movenc.c` 9138–9151; `matroskaenc.c` 3630–3646), the Annex B
+//! conversions only where it is length-prefixed. This muxer admits on such
+//! a track in MP4 and Matroska only what the filter converts, so the report
+//! at open stays true: an AAC track with no configuration takes one ADTS
+//! frame a packet ([`PayloadRule::AdtsFrame`]), and one whose configuration
+//! is stated takes raw AAC alone ([`PayloadRule::AdtsHeader`]); in another
+//! container the first packet decides as it does for libavformat, and the
+//! filter it inserts is named at its write, once. What a
 //! filter would refuse after taking it is refused first, by name
 //! ([`PayloadRule::Superframe`], [`PayloadRule::PgsSegments`],
 //! [`PayloadRule::AdtsFrame`]), every packet it puts out is sized before any
@@ -222,13 +234,13 @@
 //! |---|---|---|---|---|
 //! | `vp9_superframe` | IVF (`ivf_init`, `ivfenc.c` 42) | its start, whatever the option; VP9 | a superframe of the frames it holds — at most six hidden and the one shown — and its index of their sizes, summed in `unsigned` and allocated by the sum (`vp9_superframe.c` 34–98, 151–155): past 4 GiB the sum wraps and the copy runs past the allocation, below it `av_new_packet` refuses after taking the frames | mirrored with the filters on or off: the run counted wide, a hidden frame refused where no frame shown after it could join the run within the bound, a frame shown where its superframe passes it ([`PayloadRule::SuperframeSize`]); the filter's own refusals ([`PayloadRule::Superframe`]); reported ([`AutomaticFilter::Vp9Superframe`]) |
 //! | `vp9_superframe` | Matroska, WebM, the MOV family — MOV, 3GP, MP4, PSP, 3G2, iPod, ISMV, F4V, every muxer whose `check_bitstream` is MOV's (`mkv_check_bitstream`, `matroskaenc.c` 3639; `mov_check_bitstream`, `movenc.c` 9147) | the first packet, `AUTO_BSF`; VP9 | as above | as above, with the filters on |
-//! | `aac_adtstoasc` | Matroska's video muxer, the MOV family, FLV, LATM (`matroskaenc.c` 3634–3637; `movenc.c` 9144–9145; `flvenc.c` 1491–1493; `latmenc.c` 255–257) | the first packet, `AUTO_BSF`, where it opens with an ADTS header of more than two bytes; AAC | each frame less its header and CRC; the first converted, of channel configuration 0, less the program config element opening its payload too, consumed with no check that it fits, so that a packet the element runs past is put out at a negative size (`aac_adtstoasc.c` 54–96); raw packets passed on a configured track (51–52); its start refuses a configuration libavcodec does not parse (130–144) | MP4 and Matroska: ADTS frames alone, whole, on a track with no configuration, raw AAC alone on one with it (table F); another container: the first packet decides, and the filter's refusals and its output's size are held to ([`PayloadRule::AdtsFrame`]) |
+//! | `aac_adtstoasc` | Matroska's video muxer, the MOV family, FLV, LATM (`matroskaenc.c` 3634–3637; `movenc.c` 9144–9145; `flvenc.c` 1491–1493; `latmenc.c` 255–257) | the first packet, `AUTO_BSF`, where it opens with an ADTS header of more than two bytes; AAC | each frame less its header and CRC; the first converted, of channel configuration 0, less the program config element opening its payload too, consumed with no check that it fits, so that a packet the element runs past is put out at a negative size (`aac_adtstoasc.c` 54–96); raw packets passed on a configured track (51–52); its start refuses a configuration libavcodec does not parse (130–144) | MP4 and Matroska: ADTS frames alone, whole, on a track with no configuration, raw AAC alone on one with it (table F), named at open; another container: the first packet decides, the filter named at its write, and the filter's refusals and its output's size are held to ([`PayloadRule::AdtsFrame`]) |
 //! | `pgs_frame_merge` | Matroska's video muxer (`matroskaenc.c` 3640–3642) | the first packet, `AUTO_BSF`; PGS | display sets — the segments it holds and the packet's, several from one packet — grown by `av_grow_packet`, which refuses past the bound after taking them (`pgs_frame_merge.c` 93–157) | mirrored: each set counted, with room for its end segment, refused at the packet past which none fits ([`PayloadRule::DisplaySetSize`]) |
-//! | `pcm_rechunk` | DAUD (`daud_init`, `daudenc.c` 44), GXF (`gxf_write_header`, `gxfenc.c` 724), MXF, MXF D-10, MXF OP-Atom (`mxf_init`, `mxfenc.c` 3081) | the start; an audio track — of PCM alone, which libavcodec admits to it (`av_bsf_init`, `libavcodec/bsf.c` 154–170) | packets of a fixed count of samples (`pcm_rechunk.c` 123–186); its start multiplies the channels by the bits per sample in `int`, and refuses a size past `INT_MAX` over it (49–58) | the product held at open ([`MuxOpenError::SampleSize`]); its packets are its options' |
-//! | `av1_metadata`, `td=insert` | IVF (`ivfenc.c` 46); OBU (`rawenc.c` 572) | IVF's start, whatever the option; OBU's first packet, `AUTO_BSF`; AV1 | the OBUs read and written back by CBS, each unit's write buffer at most `INT_MAX / 8` (`cbs.c` 342–372), the fragment summed in `size_t` (`cbs_av1.c` 1245–1265) and handed on as an `int` (`cbs.c` 472–474), which only shrinks it | nothing to hold; its refusals are the container's own |
-//! | `eia608_to_smpte436m` | MCC (`mcc_init`, `mccenc.c` 434), MXF (`mxf_init`, `mxfenc.c` 3104) | the start; EIA-608 | one ANC packet of at most 255 bytes, of at most 80 triples (`eia608_to_smpte436m.c` 168–209, 227) | nothing to hold |
-//! | `extract_extradata` | FLV (`flvenc.c` 1501) | the first packet, `AUTO_BSF`, no configuration; H.264, HEVC, VVC, AV1, MPEG-4 | the packet less its parameter sets, each sum within the packet's or against `INT_MAX` (`extract_extradata.c` 102–116, 412–419) | nothing to hold |
-//! | `h264_mp4toannexb`, `hevc_mp4toannexb`, `vvc_mp4toannexb` | MPEG-TS (`mpegtsenc.c` 2331), MXF (`mxfenc.c` 3636), the raw H.264, VVC and HEVC muxers (`rawenc.c` 391, 416, 441) | the first packet, `AUTO_BSF`, of length prefixes; H.264, HEVC, VVC | start codes for lengths, parameter sets before an IDR, counted in 64 bits against `INT_MAX` (`h264_mp4toannexb.c` 291, 420–424; `hevc_mp4toannexb.c` 199–206; `vvc_mp4toannexb.c` 287–294) | nothing to hold |
+//! | `pcm_rechunk` | DAUD (`daud_init`, `daudenc.c` 44), GXF (`gxf_write_header`, `gxfenc.c` 724), MXF, MXF D-10, MXF OP-Atom (`mxf_init`, `mxfenc.c` 3081) | the start; an audio track — of PCM alone, which libavcodec admits to it (`av_bsf_init`, `libavcodec/bsf.c` 154–170) | packets of a fixed count of samples (`pcm_rechunk.c` 123–186); its start multiplies the channels by the bits per sample in `int`, and refuses a size past `INT_MAX` over it (49–58) | the product held at open ([`MuxOpenError::SampleSize`]); its packets are its options'; named at open ([`AutomaticFilter::PcmRechunk`]) |
+//! | `av1_metadata`, `td=insert` | IVF (`ivfenc.c` 46); OBU (`rawenc.c` 572) | IVF's start, whatever the option; OBU's first packet, `AUTO_BSF`; AV1 | the OBUs read and written back by CBS, each unit's write buffer at most `INT_MAX / 8` (`cbs.c` 342–372), the fragment summed in `size_t` (`cbs_av1.c` 1245–1265) and handed on as an `int` (`cbs.c` 472–474), which only shrinks it | nothing to hold; its refusals are the container's own; named at open ([`AutomaticFilter::Av1Metadata`]) |
+//! | `eia608_to_smpte436m` | MCC (`mcc_init`, `mccenc.c` 434), MXF (`mxf_init`, `mxfenc.c` 3104) | the start; EIA-608 | one ANC packet of at most 255 bytes, of at most 80 triples (`eia608_to_smpte436m.c` 168–209, 227) | nothing to hold; named at open ([`AutomaticFilter::Eia608ToSmpte436m`]) |
+//! | `extract_extradata` | FLV (`flvenc.c` 1501) | the first packet, `AUTO_BSF`, no configuration; H.264, HEVC, VVC, AV1, MPEG-4 | the packet less its parameter sets, each sum within the packet's or against `INT_MAX` (`extract_extradata.c` 102–116, 412–419) | nothing to hold; named at open, which its configuration decides ([`AutomaticFilter::ExtractExtradata`]) |
+//! | `h264_mp4toannexb`, `hevc_mp4toannexb`, `vvc_mp4toannexb` | MPEG-TS (`mpegtsenc.c` 2331) and RTP MPEG-TS's MPEG-TS, nested in a context of its own whose option stays on (`rtpenc_mpegts.c` 67); MXF and MXF OP-Atom, not MXF D-10 (`mxfenc.c` 3636, 3707–3758); the raw H.264, VVC and HEVC muxers (`rawenc.c` 391, 416, 441) | the first packet, `AUTO_BSF` — the nested context's own — of five bytes or more opening on no start code, MPEG-TS's on a 3-byte one where the configuration is length-prefixed; H.264, HEVC, VVC — MXF's H.264 alone | start codes for lengths, parameter sets before an IDR, counted in 64 bits against `INT_MAX` (`h264_mp4toannexb.c` 291, 420–424; `hevc_mp4toannexb.c` 199–206; `vvc_mp4toannexb.c` 287–294) | nothing to hold; named at the write of the packet that inserts it ([`AutomaticFilter::H264Mp4ToAnnexB`], [`HevcMp4ToAnnexB`](AutomaticFilter::HevcMp4ToAnnexB), [`VvcMp4ToAnnexB`](AutomaticFilter::VvcMp4ToAnnexB)) |
 //!
 //! **The sizes libavformat counts**, every size the packet path computes in
 //! 32 bits, with the bound held here — libavcodec's largest packet
@@ -733,6 +745,43 @@ pub enum AutomaticFilter {
   /// still held when the stream ends are written as one packet, marked
   /// corrupt (`pgs_frame_merge.c` 59–157).
   PgsFrameMerge,
+  /// `pcm_rechunk`, for PCM audio in DAUD, GXF and the MXF muxers, which
+  /// insert it at their start whatever the automatic filters say
+  /// (`daudenc.c` 44; `gxfenc.c` 724; `mxfenc.c` 3081): the track's
+  /// samples are cut into packets of the count the muxer names, their
+  /// times counted from the first (`pcm_rechunk.c` 123–186).
+  PcmRechunk,
+  /// `av1_metadata`, inserting a temporal delimiter before each temporal
+  /// unit that opens without one — IVF's AV1 at its start, whatever the
+  /// automatic filters say, and the low-overhead OBU muxer's at a track's
+  /// first packet (`ivfenc.c` 46; `rawenc.c` 572): each packet's OBUs read
+  /// and written back.
+  Av1Metadata,
+  /// `eia608_to_smpte436m`, for EIA-608 captions in MCC and the MXF
+  /// muxers, at their start (`mccenc.c` 434; `mxfenc.c` 3104): each
+  /// packet's byte pairs rewritten as one SMPTE 436M ANC packet
+  /// (`eia608_to_smpte436m.c` 168–227).
+  Eia608ToSmpte436m,
+  /// `extract_extradata`, for H.264, HEVC, VVC, AV1 and MPEG-4 video with
+  /// no configuration in FLV, at a track's first packet (`flvenc.c`
+  /// 1495–1501): the track's configuration made from the parameter sets
+  /// its packets carry, handed to FLV as new extradata, the packets kept
+  /// (`extract_extradata.c` 412–419).
+  ExtractExtradata,
+  /// `h264_mp4toannexb`, for H.264 whose first packet is length-prefixed,
+  /// in MPEG-TS, MXF, MXF OP-Atom and the raw H.264 muxer, at that packet
+  /// (`mpegtsenc.c` 2310–2334; `mxfenc.c` 3631–3639; `rawenc.c` 386–393):
+  /// each length rewritten as a start code, the parameter sets put before
+  /// each IDR frame.
+  H264Mp4ToAnnexB,
+  /// `hevc_mp4toannexb`, for HEVC whose first packet is length-prefixed,
+  /// in MPEG-TS and the raw HEVC muxer (`mpegtsenc.c` 2310–2334;
+  /// `rawenc.c` 436–443), as for H.264.
+  HevcMp4ToAnnexB,
+  /// `vvc_mp4toannexb`, for VVC whose first packet is length-prefixed, in
+  /// MPEG-TS and the raw VVC muxer (`mpegtsenc.c` 2310–2334; `rawenc.c`
+  /// 411–418), as for H.264.
+  VvcMp4ToAnnexB,
 }
 
 impl AutomaticFilter {
@@ -742,6 +791,13 @@ impl AutomaticFilter {
       Self::AacAdtsToAsc => "aac_adtstoasc",
       Self::Vp9Superframe => "vp9_superframe",
       Self::PgsFrameMerge => "pgs_frame_merge",
+      Self::PcmRechunk => "pcm_rechunk",
+      Self::Av1Metadata => "av1_metadata",
+      Self::Eia608ToSmpte436m => "eia608_to_smpte436m",
+      Self::ExtractExtradata => "extract_extradata",
+      Self::H264Mp4ToAnnexB => "h264_mp4toannexb",
+      Self::HevcMp4ToAnnexB => "hevc_mp4toannexb",
+      Self::VvcMp4ToAnnexB => "vvc_mp4toannexb",
     }
   }
 }
@@ -834,10 +890,12 @@ pub enum Uncarried {
   },
   /// Packets one of libavformat's bitstream filters converts before the
   /// container sees them — the filter, named ([`AutomaticFilter`]).
-  /// Reported at open, where the filter is known there: a muxer inserts it
-  /// at its start, or libavformat at the track's first packet where this
-  /// muxer admits on the track only the packets that filter converts (see
-  /// [the module](self), table B).
+  /// Reported at open, where open decides it: a muxer inserts it at its
+  /// start, or libavformat at the track's first packet where the codec and
+  /// the configuration settle it, or this muxer admits on the track only the
+  /// packets that filter converts; else at the write of the first packet,
+  /// which inserts it — AAC's in FLV and LATM, the Annex B conversions —
+  /// once ([`CarrierMuxer::report`]; see [the module](self), table B).
   Filtered {
     /// The track.
     track: TrackIndex,
@@ -2664,6 +2722,25 @@ fn ac3_packet(
 enum Insertion {
   Start,
   FirstPacket,
+  /// At the first packet, by a context the muxer opens of its own, which
+  /// keeps libavformat's default — the filters on — whatever the caller's
+  /// option says: RTP MPEG-TS's MPEG-TS (`rtp_mpegts_write_header`,
+  /// `rtpenc_mpegts.c` 67).
+  Nested,
+}
+
+/// Where a muxer inserts a length-prefix-to-Annex-B filter, and how its
+/// `check_bitstream` decides it at a track's first packet (table B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnnexBSite {
+  /// The codecs it inserts one for: MPEG-TS's H.264, HEVC and VVC; MXF's
+  /// H.264; a raw muxer's own codec.
+  codecs: &'static [CodecId],
+  /// MPEG-TS's rule: a packet opening on a 3-byte start code still inserts
+  /// the filter where the track's configuration is of the length-prefixed
+  /// form (`mpegtsenc.c` 2319–2330).
+  configuration: bool,
+  insertion: Insertion,
 }
 
 /// The filters the muxer libavformat resolved inserts that this muxer
@@ -2688,6 +2765,20 @@ struct Sites {
   /// `pcm_rechunk`, at the start, for an audio track: DAUD's, GXF's and
   /// the MXF muxers' (`daudenc.c` 44; `gxfenc.c` 724; `mxfenc.c` 3081).
   rechunk: bool,
+  /// `av1_metadata`, `td=insert`: IVF's at its start (`ivfenc.c` 46); the
+  /// OBU muxer's at the first packet (`rawenc.c` 572).
+  av1: Option<Insertion>,
+  /// `eia608_to_smpte436m`, at the start, for EIA-608: MCC's and the MXF
+  /// muxers' (`mccenc.c` 434; `mxfenc.c` 3104).
+  eia608: bool,
+  /// `extract_extradata`, at the first packet of a track with no
+  /// configuration: FLV's (`flvenc.c` 1495–1501).
+  extract: bool,
+  /// `h264_mp4toannexb` and its HEVC and VVC kin, at a length-prefixed
+  /// first packet: MPEG-TS's, MXF's and MXF OP-Atom's, the raw muxers', and
+  /// RTP MPEG-TS's nested MPEG-TS (`mpegtsenc.c` 2310–2334; `mxfenc.c`
+  /// 3631–3639; `rawenc.c` 386–443).
+  annexb: Option<AnnexBSite>,
 }
 
 impl Sites {
@@ -2715,6 +2806,37 @@ impl Sites {
       aac: matroska_video || mov || muxer == "flv" || muxer == "latm",
       pgs: matroska_video,
       rechunk: matches!(muxer, "daud" | "gxf" | "mxf" | "mxf_d10" | "mxf_opatom"),
+      av1: match muxer {
+        "ivf" => Some(Insertion::Start),
+        "obu" => Some(Insertion::FirstPacket),
+        _ => None,
+      },
+      eia608: matches!(muxer, "mcc" | "mxf" | "mxf_d10" | "mxf_opatom"),
+      extract: muxer == "flv",
+      annexb: Self::annexb(muxer),
+    }
+  }
+
+  /// The muxer's length-prefix-to-Annex-B site: MPEG-TS's and RTP
+  /// MPEG-TS's nested one for H.264, HEVC and VVC, the configuration asked;
+  /// MXF's and MXF OP-Atom's for H.264 — MXF D-10 asks no `check_bitstream`
+  /// (`mxfenc.c` 3726–3740) — and each raw muxer's for its codec.
+  fn annexb(muxer: &str) -> Option<AnnexBSite> {
+    const TS: &[CodecId] = &[CodecId::H264, CodecId::HEVC, CodecId::VVC];
+    let site = |codecs, configuration, insertion| {
+      Some(AnnexBSite {
+        codecs,
+        configuration,
+        insertion,
+      })
+    };
+    match muxer {
+      "mpegts" => site(TS, true, Insertion::FirstPacket),
+      "rtp_mpegts" => site(TS, true, Insertion::Nested),
+      "mxf" | "mxf_opatom" | "h264" => site(&[CodecId::H264], false, Insertion::FirstPacket),
+      "hevc" => site(&[CodecId::HEVC], false, Insertion::FirstPacket),
+      "vvc" => site(&[CodecId::VVC], false, Insertion::FirstPacket),
+      _ => None,
     }
   }
 
@@ -2722,7 +2844,7 @@ impl Sites {
   /// or off.
   const fn inserts(insertion: Option<Insertion>, on: bool) -> bool {
     match insertion {
-      Some(Insertion::Start) => true,
+      Some(Insertion::Start | Insertion::Nested) => true,
       Some(Insertion::FirstPacket) => on,
       None => false,
     }
@@ -2761,6 +2883,21 @@ enum Filter {
   Vp9 { held: u8, bytes: u64, largest: u64 },
   /// `pgs_frame_merge`, and what it holds of a display set.
   Pgs(PgsState),
+  /// A filter of another container that this muxer names and does not
+  /// mirror: its packets reach it as handed over, and nothing is claimed
+  /// of what it does with them but its name (table B).
+  Unmirrored(AutomaticFilter),
+  /// A length-prefix-to-Annex-B filter not yet inserted: the track's first
+  /// packet decides — the filter is inserted where it holds five bytes or
+  /// more and opens on no 4-byte start code, nor on a 3-byte one unless
+  /// `configured` — the track's configuration of the length-prefixed form,
+  /// asked by MPEG-TS alone — and never otherwise (`check_bitstream`,
+  /// `mux.c` 1063–1068; `mpegtsenc.c` 2326–2331; `mxfenc.c` 3633–3636;
+  /// `rawenc.c` 389–391).
+  AnnexBUndecided {
+    filter: AutomaticFilter,
+    configured: bool,
+  },
 }
 
 /// What a track's filter does with a packet ([`Filter::step`]).
@@ -2776,17 +2913,30 @@ struct Step {
   /// least, once put out — VP9's superframe of them and a frame of a byte,
   /// PGS's display set and its end segment — or `None` where it holds none.
   held: Option<u64>,
+  /// The filter this packet inserts, where the track's first packet decides
+  /// it: reported for the track at its write (table B).
+  inserted: Option<AutomaticFilter>,
 }
 
 impl Filter {
   /// The filter the muxer libavformat resolved inserts for a timed track
-  /// of `codec` whose stream holds `extradata`, the automatic filters `on`,
-  /// by `sites`, the muxer's (table B of the census). MP4 and Matroska take
-  /// ADTS frames alone on an AAC track with no configuration, one a packet,
-  /// so its filter is inserted at its first ([`PayloadRule::AdtsFrame`]),
-  /// and raw AAC alone on one with it ([`PayloadRule::AdtsHeader`]), so it
-  /// never is; another container's first packet decides.
-  fn settle(sites: Sites, family: Family, codec: CodecId, extradata: &[u8], on: bool) -> Self {
+  /// of `kind` and `codec` whose stream holds `extradata`, the automatic
+  /// filters `on`, by `sites`, the muxer's (table B of the census). MP4 and
+  /// Matroska take ADTS frames alone on an AAC track with no configuration,
+  /// one a packet, so its filter is inserted at its first
+  /// ([`PayloadRule::AdtsFrame`]), and raw AAC alone on one with it
+  /// ([`PayloadRule::AdtsHeader`]), so it never is; another container's
+  /// first packet decides.
+  fn settle(
+    sites: Sites,
+    family: Family,
+    (kind, codec): (TrackKind, CodecId),
+    extradata: &[u8],
+    on: bool,
+  ) -> Self {
+    let annexb = sites
+      .annexb
+      .filter(|site| site.codecs.contains(&codec) && Sites::inserts(Some(site.insertion), on));
     if codec == CodecId::VP9 && Sites::inserts(sites.vp9, on) {
       Self::Vp9 {
         held: 0,
@@ -2808,6 +2958,38 @@ impl Filter {
       }
     } else if codec == CodecId::HDMV_PGS_SUBTITLE && sites.pgs && on {
       Self::Pgs(PgsState::default())
+    } else if kind == TrackKind::Audio && sites.rechunk {
+      Self::Unmirrored(AutomaticFilter::PcmRechunk)
+    } else if codec == CodecId::AV1 && Sites::inserts(sites.av1, on) {
+      Self::Unmirrored(AutomaticFilter::Av1Metadata)
+    } else if codec == EIA_608 && sites.eia608 {
+      Self::Unmirrored(AutomaticFilter::Eia608ToSmpte436m)
+    } else if sites.extract
+      && on
+      && extradata.is_empty()
+      && [
+        CodecId::H264,
+        CodecId::HEVC,
+        CodecId::VVC,
+        CodecId::AV1,
+        CodecId::MPEG4,
+      ]
+      .contains(&codec)
+    {
+      Self::Unmirrored(AutomaticFilter::ExtractExtradata)
+    } else if let Some(site) = annexb {
+      // The configuration's first byte, `configurationVersion` 1 for H.264
+      // and HEVC, VVC's reserved `11111` (`mpegtsenc.c` 2319–2321).
+      let (filter, mask, value) = match codec {
+        CodecId::H264 => (AutomaticFilter::H264Mp4ToAnnexB, 0xff, 0x01),
+        CodecId::HEVC => (AutomaticFilter::HevcMp4ToAnnexB, 0xff, 0x01),
+        _ => (AutomaticFilter::VvcMp4ToAnnexB, 0xf8, 0xf8),
+      };
+      Self::AnnexBUndecided {
+        filter,
+        configured: site.configuration
+          && extradata.first().is_some_and(|first| first & mask == value),
+      }
     } else {
       Self::None
     }
@@ -2816,10 +2998,11 @@ impl Filter {
   /// The filter, named, where it is known at open.
   const fn named(self) -> Option<AutomaticFilter> {
     match self {
-      Self::None | Self::AdtsUndecided { .. } => None,
+      Self::None | Self::AdtsUndecided { .. } | Self::AnnexBUndecided { .. } => None,
       Self::Adts { .. } => Some(AutomaticFilter::AacAdtsToAsc),
       Self::Vp9 { .. } => Some(AutomaticFilter::Vp9Superframe),
       Self::Pgs(_) => Some(AutomaticFilter::PgsFrameMerge),
+      Self::Unmirrored(filter) => Some(filter),
     }
   }
 
@@ -2833,9 +3016,10 @@ impl Filter {
       reaches: true,
       largest: Some(len + side),
       held: None,
+      inserted: None,
     };
     match self {
-      Self::None => Ok((self, passed)),
+      Self::None | Self::Unmirrored(_) => Ok((self, passed)),
       // An ADTS header of more than two bytes inserts the filter, which
       // takes the packet (`mux.c` 1063–1068); anything else, never.
       Self::AdtsUndecided { configured, parses } => {
@@ -2843,15 +3027,41 @@ impl Filter {
           if configured && !parses {
             return Err(PayloadRule::AdtsFrame);
           }
-          Self::Adts {
+          let (filter, step) = Self::Adts {
             converted: false,
             configured,
             whole: false,
           }
-          .step(bytes, side, limit)
+          .step(bytes, side, limit)?;
+          Ok((
+            filter,
+            Step {
+              inserted: Some(AutomaticFilter::AacAdtsToAsc),
+              ..step
+            },
+          ))
         } else {
           Ok((Self::None, passed))
         }
+      }
+      Self::AnnexBUndecided { filter, configured } => {
+        let start_code = |at: usize| {
+          bytes
+            .get(..at)
+            .is_some_and(|code| code[..at - 1].iter().all(|&byte| byte == 0) && code[at - 1] == 1)
+        };
+        let inserts = bytes.len() >= 5 && !start_code(4) && (!start_code(3) || configured);
+        Ok(if inserts {
+          (
+            Self::Unmirrored(filter),
+            Step {
+              inserted: Some(filter),
+              ..passed
+            },
+          )
+        } else {
+          (Self::None, passed)
+        })
       }
       Self::Adts {
         converted,
@@ -2893,6 +3103,7 @@ impl Filter {
             reaches: true,
             largest: Some(out + side),
             held: None,
+            inserted: None,
           }
         } else {
           Step {
@@ -2903,6 +3114,7 @@ impl Filter {
               run.1.max(1),
               u64::from(next) + 1,
             )),
+            inserted: None,
           }
         };
         Ok((
@@ -3242,6 +3454,7 @@ fn pgs_frame_merge(
             reaches: true,
             largest,
             held: None,
+            inserted: None,
           },
         ));
       }
@@ -3294,6 +3507,7 @@ fn pgs_frame_merge(
       reaches: own,
       largest,
       held,
+      inserted: None,
     },
   ))
 }
@@ -3784,7 +3998,13 @@ where
       report.uncarried.append(&mut lost[index]);
       let mut filter = Filter::None;
       if let (Road::Timed, Some((_, codec))) = (road, &stream) {
-        filter = Filter::settle(sites, family, codec.codec(), codec.extradata(), filters);
+        filter = Filter::settle(
+          sites,
+          family,
+          (kind, codec.codec()),
+          codec.extradata(),
+          filters,
+        );
         report.uncarried.extend(
           filter
             .named()
@@ -4120,7 +4340,7 @@ where
       self.bounds,
     )
     .map_err(Refusal::Container)?;
-    let uncarried = learned_losses(
+    let mut uncarried = learned_losses(
       state,
       track,
       &self.report.uncarried,
@@ -4128,6 +4348,14 @@ where
       &learned,
       reaches,
     );
+    // The filter this packet's write inserts, where the first packet
+    // decides it: named for the track then, once (table B).
+    if let Some(filter) = step.inserted {
+      let line = Uncarried::Filtered { track, filter };
+      if !self.report.uncarried.contains(&line) {
+        uncarried.insert(0, line);
+      }
+    }
     Ok(Plan {
       track,
       stream,
@@ -5639,6 +5867,10 @@ fn chapter_losses(
   }
   lost
 }
+
+/// `AV_CODEC_ID_EIA_608`, the captions MCC and the MXF muxers convert at
+/// their start (table B).
+const EIA_608: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_EIA_608 as i32);
 
 /// `AV_CODEC_ID_TIMED_ID3`, whose stream MP4 makes no track of (`mov_init`,
 /// `movenc.c` 8309–8313).

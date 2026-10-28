@@ -5042,3 +5042,180 @@ fn l61_e_ac3_blocks_short_of_a_sample_at_the_end_are_dropped() {
   muxer.finish().expect("finished");
   assert_eq!(packets(&target)[0].len(), 2, "the two six-block frames");
 }
+
+// ---------------------------------------------------------------------------
+//  E″: the filters FFmpeg decides, named where it decides them.
+// ---------------------------------------------------------------------------
+
+/// The filter lines of `report`.
+fn filtered(report: &mediaencode_ffmpeg::MuxReport) -> Vec<Uncarried> {
+  lines(report, |line| matches!(line, Uncarried::Filtered { .. }))
+}
+
+/// **L62 — FLV's and LATM's AAC filter is named for its track at the
+/// packet that inserts it, once, and never where none is** (E″ of the
+/// census): their `check_bitstream` inserts `aac_adtstoasc` at a track's
+/// first packet where it opens with an ADTS header (`flvenc.c` 1491–1493;
+/// `latmenc.c` 255–257; `mux.c` 1063–1068). A transport stream's ADTS
+/// frames: nothing is named at open, one line at the first frame's write,
+/// none more at the second. A configured track's raw AAC: none.
+///
+/// PLANT: without the transition's line, the report names no filter for
+/// the frames it converts.
+#[test]
+fn l62_flv_and_latm_name_aacs_filter_at_the_packet_that_inserts_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let ts = corpus.transport_stream();
+  let (_, frames) = first_track(&ts, TrackKind::Audio, 2);
+  let mkv = audio_file(&corpus, "aac.mkv", "aac");
+  let (_, raw) = first_track(&mkv, TrackKind::Audio, 1);
+  let named = vec![Uncarried::Filtered {
+    track: TrackIndex::new(0),
+    filter: AutomaticFilter::AacAdtsToAsc,
+  }];
+  for container in ["flv", "latm"] {
+    let mut muxer = muxer_into(
+      &output(&corpus, &format!("l62.{container}")),
+      ContainerName::new(container),
+      table_of(&ts, TrackKind::Audio),
+    );
+    assert_eq!(
+      filtered(muxer.report()),
+      vec![],
+      "{container}: undecided at open"
+    );
+    for (index, frame) in frames.iter().enumerate() {
+      muxer
+        .write_audio(audio_at(&audio_of(frame), 21 * index as i64))
+        .map_err(|error| error.map_packet(drop))
+        .expect("an ADTS frame the filter converts");
+      assert_eq!(filtered(muxer.report()), named, "{container}: once");
+    }
+    muxer.finish().expect("finished");
+
+    let mut muxer = muxer_into(
+      &output(&corpus, &format!("l62-raw.{container}")),
+      ContainerName::new(container),
+      table_of(&mkv, TrackKind::Audio),
+    );
+    muxer
+      .write_audio(audio_at(&audio_of(&raw[0]), 0))
+      .map_err(|error| error.map_packet(drop))
+      .expect("raw AAC");
+    assert_eq!(filtered(muxer.report()), vec![], "{container}: no filter");
+    muxer.finish().expect("finished");
+  }
+}
+
+/// **L63 — MPEG-TS's Annex B conversion is named at the length-prefixed
+/// first packet that inserts it, and not for an Annex B one** (E″): its
+/// `check_bitstream` inserts `h264_mp4toannexb` at a first packet of five
+/// bytes or more opening on no start code (`mpegtsenc.c` 2310–2334).
+///
+/// PLANT: without the transition's line, the conversion goes unnamed.
+#[test]
+fn l63_mpeg_ts_names_its_annex_b_conversion_at_the_packet_that_inserts_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mkv = corpus.multi_track_mkv();
+  let (_, prefixed) = first_track(&mkv, TrackKind::Video, 2);
+  let ts = corpus.transport_stream();
+  let (_, annex_b) = first_track(&ts, TrackKind::Video, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l63.ts"),
+    ContainerName::new("mpegts"),
+    table_of(&mkv, TrackKind::Video),
+  );
+  assert_eq!(filtered(muxer.report()), vec![], "undecided at open");
+  for (index, frame) in prefixed.iter().enumerate() {
+    let at = 40 * index as i64;
+    muxer
+      .write_video(video_at(&video_of(frame), Some(at), at))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a length-prefixed frame the filter converts");
+    assert_eq!(
+      filtered(muxer.report()),
+      vec![Uncarried::Filtered {
+        track: TrackIndex::new(0),
+        filter: AutomaticFilter::H264Mp4ToAnnexB,
+      }],
+      "once"
+    );
+  }
+  muxer.finish().expect("finished");
+
+  let mut muxer = muxer_into(
+    &output(&corpus, "l63-annex-b.ts"),
+    ContainerName::new("mpegts"),
+    table_of(&ts, TrackKind::Video),
+  );
+  muxer
+    .write_video(video_at(&video_of(&annex_b[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("an Annex B frame");
+  assert_eq!(filtered(muxer.report()), vec![], "no filter");
+  muxer.finish().expect("finished");
+}
+
+/// **L64 — the filters open decides are named at open** (E″): FLV's
+/// `extract_extradata` for H.264 with no configuration (`flvenc.c`
+/// 1495–1501), none with one; IVF's `av1_metadata`, inserted at its start
+/// whatever the option says (`ivfenc.c` 46); the OBU muxer's, at the first
+/// packet, with the filters on alone (`rawenc.c` 572).
+///
+/// PLANT: an unmirrored filter left unnamed: none of these is named.
+#[test]
+fn l64_the_filters_open_decides_are_named_at_open() {
+  let Some(corpus) = Corpus::new() else { return };
+  let named = |name: &str, container: &str, table, on: bool| {
+    let muxer = muxer_with(
+      &output(&corpus, name),
+      ContainerName::new(container),
+      table,
+      filters(on),
+    );
+    lines(muxer.report(), |line| {
+      matches!(line, Uncarried::Filtered { .. })
+    })
+    .into_iter()
+    .map(|line| match line {
+      Uncarried::Filtered { filter, .. } => filter,
+      other => panic!("{other:?}"),
+    })
+    .collect::<Vec<_>>()
+  };
+  let mkv = corpus.multi_track_mkv();
+  let bare = table_of(&mkv, TrackKind::Video)
+    .into_iter()
+    .map(|row| row.with_extradata(Some(bytes_of(&[]))))
+    .collect();
+  assert_eq!(
+    named("l64.flv", "flv", bare, true),
+    vec![AutomaticFilter::ExtractExtradata]
+  );
+  assert_eq!(
+    named(
+      "l64-configured.flv",
+      "flv",
+      table_of(&mkv, TrackKind::Video),
+      true
+    ),
+    vec![]
+  );
+  let av1 = av1_mkv(&corpus);
+  for on in [true, false] {
+    assert_eq!(
+      named("l64.ivf", "ivf", table_of(&av1, TrackKind::Video), on),
+      vec![AutomaticFilter::Av1Metadata],
+      "IVF, the filters on {on}"
+    );
+    assert_eq!(
+      named("l64.obu", "obu", table_of(&av1, TrackKind::Video), on),
+      if on {
+        vec![AutomaticFilter::Av1Metadata]
+      } else {
+        vec![]
+      },
+      "OBU, the filters on {on}"
+    );
+  }
+}
