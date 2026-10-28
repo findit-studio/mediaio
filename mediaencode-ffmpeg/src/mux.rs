@@ -263,7 +263,7 @@
 //!
 //! | check | source | here |
 //! |---|---|---|
-//! | a duration or a decode gap past `i32::MAX` ticks; a subtitle's negative duration; a composition offset past `i32` | `check_pkt` 6902–6928; 6955–6959 | [`FfmpegMuxRefusal::DurationTooLong`], [`DtsGap`](FfmpegMuxRefusal::DtsGap), [`NegativeDuration`](FfmpegMuxRefusal::NegativeDuration), [`PresentationOffset`](FfmpegMuxRefusal::PresentationOffset) |
+//! | a duration or a decode gap past `i32::MAX` ticks — the gap from the last sample MP4 wrote on the track, none before the first; a subtitle's negative duration; a composition offset past `i32` | `check_pkt` 6897–6928; 6955–6959 | [`FfmpegMuxRefusal::DurationTooLong`], [`DtsGap`](FfmpegMuxRefusal::DtsGap), [`NegativeDuration`](FfmpegMuxRefusal::NegativeDuration), [`PresentationOffset`](FfmpegMuxRefusal::PresentationOffset); the last sample written, table C″ |
 //! | AMR-NB: one frame a packet; ADPCM MS and IMA WAV: a frame size | 6983–7002 | not reached: MP4's tag table holds neither (`codec_mp4_tags`, 9230–9290), refused at open ([`MuxOpenError::CodecNotCarried`]); MOV's other modes reach it |
 //! | no samples: less than a frame of a sized codec | 7006–7010 | [`PayloadRule::PartialSample`], [`PayloadRule::Empty`] |
 //! | the first packet taken as the configuration of H.264, HEVC, VVC, EVC, LCEVC, VP9, TrueHD or DNxHD where none is stated | 7024–7041 | H.264, HEVC, VVC, LCEVC and EVC refused at open ([`MuxOpenError::ConfigurationMissing`]); TrueHD refused at open; VP9's and DNxHD's boxes made from it, written |
@@ -271,14 +271,14 @@
 //! | AAC framed in ADTS | 7076–7086 | [`PayloadRule::AdtsHeader`], [`PayloadRule::AdtsFrame`] |
 //! | the Annex B rewrite | 7087–7158 | reported ([`Rewrite::LengthPrefixed`]); its size, table B |
 //! | AV1's OBUs | 7159–7174 | [`PayloadRule::Obus`]; reported ([`Rewrite::ObusFiltered`]) |
-//! | AC-3 and E-AC-3: a frame header that parses, dependent frames that tile a first packet, blocks joined into samples of six | 7175–7181; `handle_eac3` 464–610 | [`PayloadRule::Ac3Header`], [`Ac3Substreams`](PayloadRule::Ac3Substreams) (at most 15, `dec3`'s four bits), [`Ac3Blocks`](PayloadRule::Ac3Blocks); reported ([`Rewrite::Ac3Parsed`]) |
+//! | AC-3 and E-AC-3: a frame header that parses, dependent frames that tile a first packet, blocks joined into samples of six | 7175–7181; `handle_eac3` 464–610 | [`PayloadRule::Ac3Header`], [`Ac3Substreams`](PayloadRule::Ac3Substreams) (at most 15, `dec3`'s four bits), [`Ac3Blocks`](PayloadRule::Ac3Blocks), [`Ac3SampleSize`](PayloadRule::Ac3SampleSize); the joined samples, table C″; reported ([`Rewrite::Ac3Parsed`]) |
 //! | EIA-608's pairs into `cdat` | 7182–7197 | not reached: not in MP4's tag table |
 //! | APV's packets read for `apvC` | 7198–7203 | written as given |
-//! | skip samples that leave less than nothing | 7311–7320 | [`PayloadRule::SkipSamples`] |
+//! | skip samples that leave less than nothing | 7311–7320 | [`PayloadRule::SkipSamples`] — a joined E-AC-3 sample's at its last packet, table C″ |
 //! | VC-1's and TrueHD's sync read from the bitstream | 7344–7348 | reported ([`Rewrite::SyncFromBitstream`]) |
 //! | an empty packet, dropped | 7431–7441 | [`PayloadRule::Empty`] |
 //! | a cover's one picture, a second ignored | 7606–7618 | the cover road writes one |
-//! | `mov_text`'s cue ends | 7625–7656 | [`FfmpegMuxRefusal::CueOrder`]; the samples MP4 makes around the cues, table C′; reported ([`Rewrite::CueEnds`]) |
+//! | `mov_text`'s cue ends | 7625–7656 | [`FfmpegMuxRefusal::CueOrder`]; the samples MP4 makes around the cues, tables C′ and C″; reported ([`Rewrite::CueEnds`]) |
 //! | libavcodec's TTML paragraphs, held for one document | 7658–7684 | the one sample MP4 joins them into, table C′; its size, table B; reported ([`Rewrite::ParagraphsJoined`]) |
 //! | IAMF's packets; MOV's raw video and palette | 7594–7603; 7688–7720 | not reached: no stream group; MOV's mode alone |
 //!
@@ -311,16 +311,42 @@
 //! | packet | made by, and when | its times, and the rules it meets | here |
 //! |---|---|---|---|
 //! | a chapter's sample | `mov_create_chapter_track`, at the header (7727–7815, from 8851–8853) | each titled chapter's start and end counted in the movie timescale — `av_gcd_q` of the streams' time bases, at least 1000 (8427–8446) — its duration their distance; the first counted from zero, the track's start being 0 (8448–8474), each later one from the last; `ff_mov_write_packet`'s answer ignored (7807): a duration past `INT_MAX` loses the sample, a start before the last or `INT_MAX` or more after it is moved | refused at open ([`MuxOpenError::ChapterSample`]), the movie timescale mirrored |
-//! | an empty `mov_text` sample | `mov_write_subtitle_end_packet` (7479–7497), from `mov_write_packet` before any packet past a cue's end (7625–7656), at zero before the first cue, and from the trailer after the last (9025–9031) | the end of the last cue, its decode time; `check_pkt` counts its gap from that cue's decode time, and the next cue's from it | a cue's duration below `INT_MAX` ([`FfmpegMuxRefusal::DurationTooLong`]); the next cue's gap counted from the last one's end, the first's from zero ([`FfmpegMuxRefusal::DtsGap`]); reported ([`Rewrite::CueEnds`]) |
+//! | an empty `mov_text` sample | `mov_write_subtitle_end_packet` (7479–7497), from `mov_write_packet` before a packet past the track's end (7646–7653) — at zero before the first cue — and from the trailer after the last (9025–9031) | `track_duration`, the last cue's end counted from the track's first sample, its decode time; `check_pkt` counts its gap from that cue's decode time, and the next cue's from it | table C″; reported ([`Rewrite::CueEnds`]) |
 //! | TTML's joined sample | `mov_write_squashed_packet` at the trailer (6579–6615, from 9036–9037), its bytes `ff_mov_generate_squashed_ttml_packet`'s document (`movenc_ttml.c` 236–317) | from zero to the latest paragraph's end (108–110, 178, 212–213, 305–306); no paragraph meets `check_pkt` itself; refused past `INT_MAX` ticks, failing the trailer and the file | a paragraph ending past `INT_MAX` refused ([`FfmpegMuxRefusal::DocumentSpan`]); its bytes, table B; reported ([`Rewrite::ParagraphsJoined`]) |
 //! | a timecode track's sample | `mov_create_timecode_track` (7827–7870), at the header, for a video stream with `timecode` metadata, or the context's (8339–8369, 8865–8885) | — | never made: the context and its streams carry no `timecode` ([`Output`] writes a stream's language, filename and MIME type alone) |
-//! | E-AC-3's joined samples | `handle_eac3` (464–610) | table C's packet path | table C |
+//! | E-AC-3's joined samples | `handle_eac3` (577–606) | table C″ | table C″ |
 //! | the cover's picture | held by `mov_write_packet` (7606–7618), written by `mov_write_covr` at the trailer (4815–4839) | — | the cover road writes one |
 //! | an RTP hint packet | `ff_mov_add_hinted_packet` (`movenchint.c` 405–429), with `-movflags rtphint` alone | — | never made: no flag is set |
 //!
-//! Matroska makes no packet of its own: the audio packet it holds back
-//! (3255–3271, 3300–3306) is the caller's, under the rules its own write
-//! met.
+//! Matroska makes no packet of its own.
+//!
+//! **MP4 and Matroska, what they write of what they take** (table C″) —
+//! every road on which a writer takes a packet without writing it at once
+//! as a sample of its own, by grep (#82's R6 lists every `goto end`,
+//! `return 0`, `av_packet_ref`, `av_grow_packet`, `av_packet_move_ref`,
+//! `ff_packet_list_put` and `mov_write_subtitle_end_packet` on MP4's packet
+//! path, and every `cur_audio_pkt` on Matroska's, by the function it is
+//! in). The writer's own checks run against what it has written:
+//! `check_pkt` counts a packet's gap from the last sample MP4 wrote on the
+//! track, none before the first (6897–6930), and that sample moves only
+//! where MP4 writes one. Each check here is made against the same, and
+//! moves only there.
+//!
+//! | road | the mechanism | what is written | here | law |
+//! |---|---|---|---|---|
+//! | E-AC-3's frames of fewer than six blocks | `handle_eac3` (577–606): held in `info->pkt`, joined by `av_grow_packet` until six, then written as one sample; nothing written before | one sample: the first packet's decode and presentation times, flags and side data (588); the bytes joined (593–595); the durations summed (597); the last packet's own duration for its skip samples and the edit list's end (6940, 7311–7342) | each packet's gap counted from the last sample written, none before the first ([`FfmpegMuxRefusal::DtsGap`]); libavformat's own rules on every packet as taken, which meet it before the hold ([`FfmpegMuxRefusal::RepeatedDts`]); the joined bytes within `av_grow_packet`'s bound ([`PayloadRule::Ac3SampleSize`]); the run's skip samples judged at its last packet, against that packet's duration, a held packet's never ([`PayloadRule::SkipSamples`]) — where a frame size is stated, which no demuxer's AC-3 or E-AC-3 ticket states (`demux.c` 2076–2087); a joined packet's side data reported dropped, but its new extradata, which MP4 reads before holding it (7044–7074); the durations counted between the samples written ([`Rewrite::Durations`]) | L57, L58; the unit laws |
+//! | the last sample, joined | the trailer reads its duration from the sum and asserts it within `INT_MAX` (`get_cluster_duration`, 1248–1256: `av_assert0` ends the process), and ends the edit list at its last packet's duration (7329–7342) | — | refused at `finish` past `INT_MAX` ([`FfmpegMuxRefusal::LastSampleTooLong`]); its end reported at `finish` ([`Rewrite::Durations`]) | L59, L60 |
+//! | E-AC-3's blocks short of six at the end | `mov_free` frees the run (7951–7955) | dropped | reported at open ([`Rewrite::Ac3Parsed`]) | L61 |
+//! | an AC-3 frame that does not parse | `handle_eac3` (481–493): dropped before the track's first sample, refused after | — | refused ([`PayloadRule::Ac3Header`]) | L25 |
+//! | `mov_text`'s empty samples | `mov_write_packet` (7646–7653): before a packet of any track whose decode time, in its own ticks, passes the cue track's `track_duration`, where the track's last sample is a cue or it has none; the trailer's after the last (9025–9031) | an empty sample at `track_duration` — the last cue's end counted from the track's first sample, read as a decode time — the one at zero first; none before a cue at or before it, so that the last cue is shortened to it ([`Cues::take`]) | each cue's gap counted from the sample before it, the empty one where MP4 writes it first ([`FfmpegMuxRefusal::DtsGap`]); a cue's duration within `INT_MAX` of its empty sample's ([`FfmpegMuxRefusal::DurationTooLong`]); a cue before the end MP4 marks refused ([`FfmpegMuxRefusal::CueOrder`]) | L15, L53; the unit law |
+//! | TTML's paragraphs | `mov_write_packet` (7658–7684): queued by `ff_packet_list_put`, joined at the trailer | table C′ | table C′ | L54 |
+//! | the cover's picture | `mov_write_packet` (7606–7619): held by `av_packet_ref`, a second ignored | its one picture, at the trailer (4815–4839) | the cover road writes one | L10 |
+//! | an empty packet | `mov_write_single_packet` (7431–7441) | dropped | refused ([`PayloadRule::Empty`]) | L17 |
+//! | a timed ID3 packet | `mov_write_packet` (7586–7589) | an `emsg` box, no sample | not reached: MP4's tag tables hold no timed ID3, refused at open ([`MuxOpenError::CodecNotCarried`]) | — |
+//! | IAMF's packets; a fragment's | `mov_build_iamf_packet` (7594–7603); `mov_flush_fragment` | — | not reached: no stream group, no fragmenting flag | — |
+//! | Matroska's audio packet | `mkv_write_packet` (3254–3271): held by `av_packet_ref` until the next packet, or the trailer (3300–3306) | the packet as taken, one packet later, its cluster's checks made then (3122–3200) | the rules its own write met, its block's bound counting the block before it (table B) | L1, L49 |
+//! | libavformat's interleaving | `ff_interleave_packet_per_dts` (`mux.c` 940–1003): every packet queued, written in decode-time order across the streams, each stream's own in its order | every packet as taken | a track's rules are its own; across tracks, MP4's `mov_text` empty samples, above | L15 |
+//! | the automatic filters | table B | table B | table B | table B's |
 //!
 //! **MP4, the header** (`mov_init`, 8129–8700; `mov_write_header`): refused
 //! by name first — TrueHD's experiment (8580–8587); libavformat's own
@@ -398,7 +424,8 @@
 //! | a chapter without a title, a title past 65535 bytes | MP4 writes every chapter into its Nero list but a titled one alone into its chapter track, which its reader lays over the list by position; a title with a 16-bit length (`movenc.c` 7791–7807) | refused at open ([`MuxOpenError::ChapterWithoutTitle`], [`ChapterTitleTooLong`](MuxOpenError::ChapterTitleTooLong)) |
 //! | VP9's hidden frames, still held at the stream's end | dropped by the filter, which no later frame shows (`vp9_superframe.c` 198–207) | reported at `finish` ([`Uncarried::Held`], with the report [`CarrierMuxer::finish_into_sink`] hands back): the muxer cannot know at a held frame that none will follow, and does not refuse the file for it |
 //! | PGS segments, still held at the stream's end | written as one packet marked corrupt (`pgs_frame_merge.c` 77–83) | reported at `finish` ([`Uncarried::Held`]) |
-//! | MP4's durations, where packets do not abut | kept only as the distance to the next decode time (`movenc.c` 1241–1259) | reported as learned ([`Rewrite::Durations`]) |
+//! | MP4's durations, where packets do not abut | kept only as the distance to the next decode time (`movenc.c` 1241–1259), counted between the samples MP4 writes (table C″) | reported as learned ([`Rewrite::Durations`]) |
+//! | an E-AC-3 track's last sample, joined | the edit list ends it at its last packet's duration (`movenc.c` 6940, 7329–7342), short of the frames it joins | reported at `finish` ([`Rewrite::Durations`]) |
 //!
 //! The report covers these fields and those of the tables above; a codec's
 //! parameters beyond its configuration — its color properties, its field
@@ -907,10 +934,12 @@ pub enum Rewrite {
   /// 7159–7174; `matroskaenc.c` 3589–3590).
   ObusFiltered,
   /// MP4 AC-3 and E-AC-3: E-AC-3 frames of fewer than six blocks are
-  /// joined into samples of six, and the blocks of a set the stream leaves
+  /// joined into samples of six, each taking its first packet's times,
+  /// flags and side data, and the blocks of a set the stream leaves
   /// incomplete at its end are dropped (`handle_eac3`, `movenc.c` 577–606;
-  /// `mov_free`, 7951–7955). A packet MP4 would refuse or drop is refused
-  /// by name ([`PayloadRule::Ac3Header`] and its neighbours).
+  /// `mov_free`, 7951–7955; table C″ of the census). A packet MP4 would
+  /// refuse or drop is refused by name ([`PayloadRule::Ac3Header`] and its
+  /// neighbours).
   Ac3Parsed,
   /// MP4 `mov_text`: an empty sample is written at the end of each cue a
   /// later packet passes, and at zero before the first, each read back as
@@ -922,14 +951,19 @@ pub enum Rewrite {
   /// MP4 VC-1 and TrueHD: a sample's sync flag is read from its bitstream,
   /// not from the packet's key flag (`movenc.c` 7344–7348).
   SyncFromBitstream,
-  /// A packet's duration is not kept as given. MP4 keeps every packet's
+  /// A packet's duration is not kept as given. MP4 keeps every sample's
   /// duration as the distance to the next one's decode time, the last
   /// one's from its packet (`get_cluster_duration`, `movenc.c` 1241–1259;
-  /// 7321), so a track whose packets do not abut — a gap, or an overlap —
-  /// loses the durations it offered there. Reported for such a track when
-  /// the first packet showing it is written ([`CarrierMuxer::report`]);
-  /// packets that abut lose nothing and report nothing, and `mov_text`
-  /// marks each cue's end instead ([`Rewrite::CueEnds`]). Matroska and
+  /// 7321), so a track whose samples do not abut — a gap, or an overlap —
+  /// loses the durations it offered there, counted between the samples MP4
+  /// writes: a joined E-AC-3 sample's is its packets' sum (table C″ of the
+  /// census). Reported for such a track when the first packet showing it is
+  /// written ([`CarrierMuxer::report`]); samples that abut lose nothing and
+  /// report nothing, and `mov_text` marks each cue's end instead
+  /// ([`Rewrite::CueEnds`]). And MP4 ends an E-AC-3 track's edit list at
+  /// its last sample's last packet's duration (6940, 7329–7342): a last
+  /// sample joined of several is presented short of its frames, reported
+  /// at `finish` ([`CarrierMuxer::finish_into_sink`]). Matroska and
   /// WebM keep a video or audio packet's only where it differs from the
   /// track's default duration (`mkv_write_block`, `matroskaenc.c`
   /// 2895–2911), and a video track without a frame rate, or an audio track
@@ -1135,10 +1169,12 @@ pub enum FfmpegMuxRefusal {
     /// The duration offered.
     duration: Timestamp,
   },
-  /// MP4: a decode time `i32::MAX` ticks or more after the track's last:
-  /// MP4 would rewrite it to one tick after the last and drop the
-  /// presentation time, and write the packet so (`check_pkt`, `movenc.c`
-  /// 6902–6923).
+  /// MP4: a decode time `i32::MAX` ticks or more after the last sample
+  /// MP4 wrote on the track — a packet MP4 holds back writes none, and an
+  /// empty `mov_text` sample is one (table C″ of the census): MP4 would
+  /// rewrite it to one tick after that sample and drop the presentation
+  /// time, and write the packet so (`check_pkt`, `movenc.c` 6897–6923).
+  /// Before the track's first sample, nothing is judged.
   #[error("track {}: the decode time {} lies too far after the last for MP4", .track.get(), .dts.pts())]
   DtsGap {
     /// The track.
@@ -1242,6 +1278,21 @@ pub enum FfmpegMuxRefusal {
     /// The track.
     track: TrackIndex,
   },
+  /// MP4 E-AC-3: the track's last sample, joined from frames of fewer than
+  /// six blocks, lasting more than `i32::MAX` ticks of the stream's time
+  /// base. MP4 joins such frames into one sample whose duration is the sum
+  /// of its packets' (`handle_eac3`, `movenc.c` 597), each of which
+  /// `check_pkt` held within `INT_MAX` alone, and its trailer reads the last
+  /// sample's duration from that sum and asserts it fits `INT_MAX`
+  /// (`get_cluster_duration`, 1248–1256): `av_assert0` ends the process.
+  /// A later sample would take the duration from its own decode time, so
+  /// no packet decides it: `finish` refuses it, before the trailer, and
+  /// names it in its fault ([`MuxFault::refusal`]).
+  #[error("track {}'s last sample lasts longer than MP4's trailer reads", .track.get())]
+  LastSampleTooLong {
+    /// The track.
+    track: TrackIndex,
+  },
 }
 
 /// What about a packet's bytes [`FfmpegMuxRefusal::Payload`] refuses — each
@@ -1306,7 +1357,9 @@ pub enum PayloadRule {
   #[error("the packet's WavPack blocks do not parse whole")]
   WavPackBlocks,
   /// MP4: skip-samples side data that would shorten the packet below
-  /// nothing, which MP4 refuses after taking it (`movenc.c` 7311–7320).
+  /// nothing, which MP4 refuses after taking it (`movenc.c` 7311–7320) —
+  /// a joined E-AC-3 sample's, its first packet's, against the duration of
+  /// the packet that completes it, refused there (table C″ of the census).
   #[error("the packet's skip-samples side data leaves less than nothing")]
   SkipSamples,
   /// Matroska FLAC: new STREAMINFO side data of another length than the
@@ -1346,6 +1399,13 @@ pub enum PayloadRule {
   /// taking it (`movenc.c` 577–585).
   #[error("the packet's E-AC-3 blocks run past a sample of six")]
   Ac3Blocks,
+  /// MP4 E-AC-3: a frame of fewer than six blocks whose bytes would take
+  /// the sample MP4 joins such frames into past the largest packet
+  /// `av_grow_packet` grows — `INT_MAX` less the padding — which refuses it
+  /// after taking the frame (`handle_eac3`, `movenc.c` 592–595;
+  /// `libavcodec/packet.c` 121–127; table C″ of the census).
+  #[error("the E-AC-3 frames MP4 would join into one sample are larger than a packet holds")]
+  Ac3SampleSize,
   /// MP4 AC-3: the track's first frame — the one MP4 writes the track's
   /// `dac3` from — of a bit stream id past 8, which `dac3` does not define
   /// and MP4's trailer refuses, failing the whole file (`mov_write_ac3_tag`,
@@ -1692,12 +1752,13 @@ struct TrackState {
   /// The last decode time written, as an instant.
   last: Option<Timestamp>,
   /// The decode time, counted in the stream's time base, of the last
-  /// packet whose own times reached the container: one an automatic
+  /// packet whose own times reached libavformat's timing: one an automatic
   /// filter holds, whose times it drops, does not count ([`Filter`]).
   last_ticks: Option<i64>,
-  /// That packet's duration as offered, in ticks, where it offered one
-  /// above zero: what MP4 keeps only as the distance to the next.
-  last_duration: Option<i64>,
+  /// MP4: the last sample MP4 wrote on the track, which `check_pkt`
+  /// counts the next packet's gap from — moved only where MP4 writes one,
+  /// not by a packet it holds (table C″ of the census).
+  sample: Option<Sample>,
   /// The rules the container's packet path holds this track's packets
   /// to (see [the module](self)).
   rules: PacketRules,
@@ -1708,13 +1769,93 @@ struct TrackState {
   sides: SideRules,
   /// Whether a packet's own times have reached the container yet.
   written: bool,
-  /// MP4 `mov_text`: where the last cue written ends, in ticks.
-  cue_end: Option<i128>,
+  /// MP4 `mov_text`: the samples MP4 has written of the track.
+  cues: Cues,
   /// MP4 AC-3 and E-AC-3: what MP4 has learned of the track's frames.
   ac3: Ac3State,
   /// MP4 TTML from libavcodec's TTML encoder: the bytes of the document
   /// MP4 joins its paragraphs into, so far.
   document: u64,
+}
+
+/// A sample MP4 wrote ([`TrackState::sample`]): its decode time, and its
+/// duration as offered — a joined E-AC-3 sample's, the sum of its
+/// packets', where each offered one — where above zero, in ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sample {
+  dts: i64,
+  offered: Option<i128>,
+}
+
+/// MP4 `mov_text`: what MP4 has written of a track — the samples
+/// `check_pkt` counts a cue's gap from, and the end it marks the last cue
+/// with (`movenc.c` 7246–7322, 7646–7656; table C″ of the census).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Cues {
+  /// The decode time of the track's first sample — zero, where MP4 wrote
+  /// the empty one there before the first cue: `start_dts` (7288–7290).
+  start: Option<i64>,
+  /// `track_duration`: the last sample's decode time and duration,
+  /// counted from `start` (7321) — zero before the first. MP4 writes the
+  /// empty sample marking the last cue's end at this count, read as a
+  /// decode time (7652, 9029).
+  end: i128,
+  /// The decode time of the last sample written — a cue, or the empty
+  /// one after it (7252).
+  last: Option<i128>,
+  /// Whether the last sample is the empty one at a cue's end
+  /// (`last_sample_is_subtitle_end`, 7322, 7653).
+  ended: bool,
+}
+
+/// What MP4 does with a `mov_text` cue ([`Cues::take`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CueStep {
+  /// The decode time `check_pkt` counts the cue's gap from: the last
+  /// sample written, the empty one where MP4 writes it first — none
+  /// before the track's first (6900–6909).
+  reference: Option<i128>,
+  /// Whether the cue starts before the end MP4 marks the last one with —
+  /// zero, before the first (`end`): MP4 writes no empty sample before it,
+  /// so the last cue is shortened to it; and a packet of another track
+  /// whose decode time, counted in its own ticks, passes that end, which
+  /// MP4 may take first (`mux.c` 957–1003), makes MP4 write the empty
+  /// sample there first, and the cue's decode time is then moved past it
+  /// and its presentation time dropped (6917–6923).
+  early: bool,
+  /// The track after the cue.
+  next: Cues,
+}
+
+impl Cues {
+  /// What MP4 does with the track's next cue, at `dts` of `duration` ticks,
+  /// where no packet of another track wrote the empty sample first: the
+  /// empty sample at `end` first, where the cue starts past it and the last
+  /// sample is not already one (7649–7653); then the cue.
+  fn take(self, dts: i64, duration: i64) -> CueStep {
+    let at = i128::from(dts);
+    let mut track = self;
+    if track.end < at && (track.start.is_none() || !track.ended) {
+      // `mov_write_subtitle_end_packet` (7479–7497): a sample of its own at
+      // `end`, its duration zero, which the cue follows at once. Before any,
+      // `end` is zero, and the track starts there.
+      track.start.get_or_insert(0);
+      track.last = Some(track.end);
+    }
+    let reference = track.last;
+    let start = *track.start.get_or_insert(dts);
+    let next = Self {
+      start: Some(start),
+      end: at - i128::from(start) + i128::from(duration),
+      last: Some(at),
+      ended: false,
+    };
+    CueStep {
+      reference,
+      early: at < self.end,
+      next,
+    }
+  }
 }
 
 /// The rows of the packet-rule table one track's packets meet in its
@@ -1755,9 +1896,9 @@ struct PacketRules {
   prores: bool,
   /// Matroska and WebM WebVTT: each cue reads back from its lines.
   webvtt: bool,
-  /// MP4 AC-3 (`Some(false)`) and E-AC-3 (`Some(true)`): each packet is one
-  /// MP4's AC-3 handling writes.
-  ac3: Option<bool>,
+  /// MP4 AC-3 and E-AC-3: each packet is one MP4's AC-3 handling writes,
+  /// and how it takes them.
+  ac3: Option<Ac3Rules>,
   /// Matroska and WebM video: HDR10+ and APP5 side data is a struct the
   /// writer serializes whole (table A of the census).
   hdr_metadata: bool,
@@ -1789,6 +1930,61 @@ enum ExtradataRule {
   /// Matroska AAC: an AudioSpecificConfig libavcodec parses, within the
   /// space Matroska's header reserved.
   AudioSpecificConfig { reserved: usize },
+}
+
+/// MP4 AC-3 and E-AC-3: how MP4's handling takes a track's packets
+/// ([`ac3_packet`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ac3Rules {
+  /// E-AC-3, whose frames of fewer than six blocks MP4 joins; else AC-3.
+  eac3: bool,
+  /// The duration, in ticks, libavformat gives a packet that states none
+  /// before MP4 is handed it (`guess_pkt_duration`, `mux.c` 604–633):
+  /// AC-3's 1536 samples, or an E-AC-3 track's frame size where above one
+  /// (`get_audio_frame_duration`, `libavcodec/utils.c` 578–800), counted at
+  /// its sample rate as `av_rescale_q` rounds; else none.
+  guessed: i64,
+  /// Whether MP4's trailer reads each sample's duration from its sample
+  /// table: a frame size other than one makes the track's audio of
+  /// variable rate (`mov_init`, `movenc.c` 8539–8553), whose every sample's
+  /// duration `mov_write_stts_tag` reads (3247–3270) — the last one's from
+  /// the sum `handle_eac3` made, asserted within `INT_MAX` (1248–1256).
+  durations_read: bool,
+}
+
+impl Ac3Rules {
+  /// The rules of an MP4 AC-3 or E-AC-3 track whose stream holds `codec`,
+  /// counted in `time_base`.
+  fn of(codec: &StreamCodec, time_base: Timebase) -> Self {
+    let eac3 = codec.codec() == CodecId::EAC3;
+    let frame_size = codec.frame_size();
+    let samples = if eac3 {
+      if frame_size > 1 { frame_size } else { 0 }
+    } else {
+      1536
+    };
+    let sample_rate = codec.sample_rate();
+    let guessed = if samples != 0 && sample_rate != 0 {
+      rescale_nearest(
+        i128::from(samples),
+        i128::from(time_base.den().get()),
+        i128::from(sample_rate) * i128::from(time_base.num()),
+      )
+    } else {
+      0
+    };
+    Self {
+      eac3,
+      guessed,
+      durations_read: frame_size != 1,
+    }
+  }
+
+  /// A packet's duration as MP4 is handed it: as offered where above zero,
+  /// else libavformat's guess.
+  const fn handed(self, offered: i64) -> i64 {
+    if offered > 0 { offered } else { self.guessed }
+  }
 }
 
 /// The earliest time a container writes without moving every stream, in
@@ -1851,7 +2047,8 @@ impl PacketRules {
       streaminfo_len: ((matroska || mp4) && id == CodecId::FLAC).then(|| codec.extradata().len()),
       prores: matroska && id == CodecId::PRORES,
       webvtt: either_matroska && id == CodecId::WEBVTT,
-      ac3: (mp4 && (id == CodecId::AC3 || id == CodecId::EAC3)).then_some(id == CodecId::EAC3),
+      ac3: (mp4 && (id == CodecId::AC3 || id == CodecId::EAC3))
+        .then(|| Ac3Rules::of(codec, time_base)),
       hdr_metadata: either_matroska && kind == TrackKind::Video,
       length_prefixed: length_prefixed(family, id, codec.extradata()),
       matroska_block: either_matroska,
@@ -2036,6 +2233,14 @@ fn side_data(side_data: &[SideDataEntry], kind: AVPacketSideDataType) -> Option<
     .map(SideDataEntry::data)
 }
 
+/// The samples MP4 drops from a packet's end by its skip-samples side
+/// data, where the entry is one MP4 reads — of 10 bytes or more
+/// (`movenc.c` 7311–7312): its second 32-bit field.
+fn skip_end(side: &[SideDataEntry]) -> Option<u32> {
+  let skip = side_data(side, AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES)?;
+  (skip.len() >= 10).then(|| u32::from_le_bytes([skip[4], skip[5], skip[6], skip[7]]))
+}
+
 /// Whether MP4 would shorten the packet below nothing by its
 /// skip-samples side data (`movenc.c` 7311–7320): its duration, at least
 /// a frame of `frame_size` samples, less the samples to drop from its end,
@@ -2044,15 +2249,23 @@ fn side_data(side_data: &[SideDataEntry], kind: AVPacketSideDataType) -> Option<
 fn skips_below_nothing(
   side: &[SideDataEntry],
   duration: i64,
+  skip: (i32, i32),
+  time_base: Timebase,
+) -> bool {
+  skip_end(side).is_some_and(|end| end_below_nothing(end, duration, skip, time_base))
+}
+
+/// Whether MP4 would shorten a sample below nothing by skip samples that
+/// drop `end` samples from its end, its end counted with `duration` — the
+/// packet's own, or a joined E-AC-3 sample's last packet's (6940) — at
+/// least a frame of `frame_size` samples, each counted in `time_base` from
+/// `sample_rate` as `av_rescale_q` rounds (7311–7320).
+fn end_below_nothing(
+  end: u32,
+  duration: i64,
   (frame_size, sample_rate): (i32, i32),
   time_base: Timebase,
 ) -> bool {
-  let Some(skip) = side_data(side, AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES) else {
-    return false;
-  };
-  if skip.len() < 10 {
-    return false;
-  }
   let ticks = |samples: i128| {
     rescale_nearest(
       samples,
@@ -2060,7 +2273,6 @@ fn skips_below_nothing(
       i128::from(sample_rate) * i128::from(time_base.num()),
     )
   };
-  let end = u32::from_le_bytes([skip[4], skip[5], skip[6], skip[7]]);
   let longest = ticks(i128::from(frame_size)).max(duration);
   i128::from(longest) - i128::from(ticks(i128::from(end))) < 0
 }
@@ -2264,20 +2476,92 @@ fn ac3_header(bytes: &[u8]) -> Option<Ac3Header> {
 
 /// What MP4's AC-3 handling has learned of a track (`handle_eac3`,
 /// `movenc.c` 464–610): whether it has read the stream's first frame set,
-/// the bit stream id of its first frame, and the blocks of E-AC-3 frames
-/// it holds back to make up a sample of six.
+/// the bit stream id of its first frame, the run of E-AC-3 frames of fewer
+/// than six blocks it holds back to make up a sample of six, and the last
+/// sample it wrote, which the trailer reads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Ac3State {
   done: bool,
   bsid: u8,
-  pending: u8,
+  run: Option<Ac3Run>,
+  last: Option<Ac3Sample>,
+}
+
+/// The sample MP4 is joining E-AC-3 frames of fewer than six blocks into,
+/// while it holds any (`handle_eac3`, `movenc.c` 586–603): it takes its
+/// first packet's decode time, presentation time, flags and side data
+/// (`av_packet_ref`, 588), the packets' bytes joined (`av_grow_packet`,
+/// 593–595) and their durations summed (597).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ac3Run {
+  /// Its blocks so far, below six.
+  blocks: u8,
+  /// The first packet's decode time, in ticks: the sample's.
+  dts: i64,
+  /// The packets' durations as MP4 is handed them — libavformat's for a
+  /// packet that states none ([`Ac3Rules::guessed`]) — summed: the
+  /// sample's.
+  duration: i128,
+  /// The packets' durations as offered, summed, where each offered one
+  /// above zero.
+  offered: Option<i128>,
+  /// The joined bytes.
+  bytes: u64,
+  /// The first packet's skip samples, which the sample carries: the samples
+  /// to drop from its end, where the entry is one MP4 reads (7311–7312).
+  skip_end: Option<u32>,
+}
+
+/// The last sample MP4 wrote of an AC-3 or E-AC-3 track, as its trailer
+/// reads it: the sample's duration as MP4 was handed it — a joined
+/// sample's, its packets' sum — and the duration its edit list's end is
+/// counted with, the last packet's own (`movenc.c` 6940, 7329–7342).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ac3Sample {
+  duration: i128,
+  closing: i128,
+}
+
+/// What MP4 does with an AC-3 or E-AC-3 packet ([`ac3_packet`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ac3Step {
+  /// It writes the packet as a sample of its own: a frame of six blocks,
+  /// with none held (577–580).
+  Alone,
+  /// It holds the packet, opening a run of frames of fewer than six blocks
+  /// (587–591).
+  Opens,
+  /// It holds the packet, joined to the run (592–599).
+  Joins,
+  /// It writes the run the packet completes as one sample (600–603): the
+  /// run as completed.
+  Completes(Ac3Run),
+}
+
+/// An AC-3 or E-AC-3 packet as MP4's handling reads it: its bytes, its
+/// decode time and its duration as MP4 is handed them, in ticks, and its
+/// skip samples' end ([`skip_end`]).
+#[derive(Debug, Clone, Copy)]
+struct Ac3Packet<'a> {
+  bytes: &'a [u8],
+  dts: i64,
+  duration: i64,
+  offered: Option<i64>,
+  skip_end: Option<u32>,
 }
 
 /// Holds an MP4 AC-3 (`eac3` false) or E-AC-3 packet to MP4's handling of
 /// it, from what MP4 has learned of the track (`handle_eac3`, `movenc.c`
-/// 464–610): answers what MP4 learns of this packet, or the rule it
-/// breaks.
-fn ac3_packet(state: Ac3State, eac3: bool, bytes: &[u8]) -> Result<Ac3State, PayloadRule> {
+/// 464–610), the sample it joins held to `limit`, libavcodec's largest
+/// packet, which the laws lower: answers what MP4 learns of the track and
+/// what it does with the packet ([`Ac3Step`]), or the rule it breaks.
+fn ac3_packet(
+  state: Ac3State,
+  eac3: bool,
+  packet: Ac3Packet<'_>,
+  limit: u64,
+) -> Result<(Ac3State, Ac3Step), PayloadRule> {
+  let bytes = packet.bytes;
   let first = ac3_header(bytes).ok_or(PayloadRule::Ac3Header)?;
   let mut next = state;
   // 509–575: until the first set is read, a second independent frame ends
@@ -2316,14 +2600,59 @@ fn ac3_packet(state: Ac3State, eac3: bool, bytes: &[u8]) -> Result<Ac3State, Pay
     }
   }
   // 577–606: a frame of six blocks is a sample of its own; fewer are held
-  // back until six.
-  next.pending = match (state.pending, first.blocks) {
-    (0, 6) => 0,
-    (pending, blocks) if pending + blocks > 6 => return Err(PayloadRule::Ac3Blocks),
-    (pending, blocks) if pending + blocks == 6 => 0,
-    (pending, blocks) => pending + blocks,
+  // back until six, joined into one sample.
+  let len = bytes.len() as u64;
+  let (run, step) = match state.run {
+    None if first.blocks == 6 => (None, Ac3Step::Alone),
+    None => (
+      Some(Ac3Run {
+        blocks: first.blocks,
+        dts: packet.dts,
+        duration: i128::from(packet.duration),
+        offered: packet.offered.map(i128::from),
+        bytes: len,
+        skip_end: packet.skip_end,
+      }),
+      Ac3Step::Opens,
+    ),
+    Some(run) if run.blocks + first.blocks > 6 => return Err(PayloadRule::Ac3Blocks),
+    Some(run) => {
+      // `av_grow_packet` grows a packet to `INT_MAX` less the padding at
+      // most, a byte past libavcodec's largest (`libavcodec/packet.c`
+      // 121–127), and refuses after the frame was taken.
+      if run.bytes + len > limit + 1 {
+        return Err(PayloadRule::Ac3SampleSize);
+      }
+      let joined = Ac3Run {
+        blocks: run.blocks + first.blocks,
+        duration: run.duration + i128::from(packet.duration),
+        offered: run
+          .offered
+          .zip(packet.offered)
+          .map(|(sum, own)| sum + i128::from(own)),
+        bytes: run.bytes + len,
+        ..run
+      };
+      if joined.blocks == 6 {
+        (None, Ac3Step::Completes(joined))
+      } else {
+        (Some(joined), Ac3Step::Joins)
+      }
+    }
   };
-  Ok(next)
+  next.run = run;
+  next.last = match step {
+    Ac3Step::Alone => Some(Ac3Sample {
+      duration: i128::from(packet.duration),
+      closing: i128::from(packet.duration),
+    }),
+    Ac3Step::Completes(run) => Some(Ac3Sample {
+      duration: run.duration,
+      closing: i128::from(packet.duration),
+    }),
+    Ac3Step::Opens | Ac3Step::Joins => state.last,
+  };
+  Ok((next, step))
 }
 
 /// When libavformat inserts a filter for a track (table B of the census,
@@ -3247,8 +3576,6 @@ struct Plan {
   dts: Timestamp,
   times: PacketTimes,
   dts_ticks: i64,
-  /// The packet's duration as offered, in ticks, where above zero.
-  duration_ticks: Option<i64>,
   /// Whether the packet's own times, flags and side data reach the
   /// container: not where its track's automatic filter holds it.
   reaches: bool,
@@ -3264,10 +3591,19 @@ struct Plan {
 /// next one's judgment.
 #[derive(Debug, Clone, Copy, Default)]
 struct Learned {
-  /// MP4 `mov_text`: where the cue ends, in ticks.
-  cue_end: Option<i128>,
+  /// MP4: the sample MP4 writes with the packet, where it writes one —
+  /// not where it holds the packet (table C″ of the census).
+  sample: Option<Sample>,
+  /// MP4 `mov_text`: the samples MP4 has written of the track after the
+  /// cue.
+  cues: Option<Cues>,
   /// MP4 AC-3 and E-AC-3: what MP4 has learned of the frames.
   ac3: Option<Ac3State>,
+  /// MP4 E-AC-3: a packet joined to the sample MP4 makes of the frames it
+  /// holds, which takes the run's first packet's side data: the packet's
+  /// own is never written, but its new extradata, which MP4 reads before
+  /// holding it (`movenc.c` 7044–7074, 7175–7181).
+  joined: bool,
   /// MP4 TTML from libavcodec's TTML encoder: the joined document's bytes.
   document: Option<u64>,
 }
@@ -3538,12 +3874,12 @@ where
         strict: strict && !matches!(kind, TrackKind::Subtitle | TrackKind::Data),
         last: None,
         last_ticks: None,
-        last_duration: None,
+        sample: None,
         rules,
         filter,
         sides,
         written: false,
-        cue_end: None,
+        cues: Cues::default(),
         ac3: Ac3State::default(),
         document: rules.ttml_document.unwrap_or(0),
       });
@@ -3581,30 +3917,56 @@ where
   /// Completes the container and hands the sink back, with the whole
   /// report — [`Muxer::finish`], keeping both. The report gains what only
   /// the stream's end decides: the packets an automatic filter still held
-  /// ([`Uncarried::Held`]).
+  /// ([`Uncarried::Held`]), and where MP4 ends an E-AC-3 track's last
+  /// joined sample short of its packets ([`Rewrite::Durations`]).
   pub fn finish_into_sink(mut self) -> Result<(W, MuxReport), MuxFault> {
     // A trailer the container would fail for want of a frame no packet was
-    // left to decide: refused by name before it runs, and the context
-    // dropped as it stands (table C of the census).
-    if let Some(index) = self
-      .tracks
-      .iter()
-      .position(|state| state.rules.ac3.is_some() && !state.written)
-    {
-      return Err(MuxFault::refused(
-        MuxStage::Trailer,
-        FfmpegMuxRefusal::NoFrame {
-          track: TrackIndex::new(index),
-        },
-      ));
+    // left to decide, or would end the process over the last sample's
+    // duration, which only the stream's end decides: refused by name before
+    // it runs, and the context dropped as it stands (tables C and C″ of the
+    // census).
+    let limit = i128::from(i32::MAX);
+    for (index, state) in self.tracks.iter().enumerate() {
+      let Some(rules) = state.rules.ac3 else {
+        continue;
+      };
+      let track = TrackIndex::new(index);
+      if !state.written {
+        return Err(MuxFault::refused(
+          MuxStage::Trailer,
+          FfmpegMuxRefusal::NoFrame { track },
+        ));
+      }
+      if rules.durations_read && state.ac3.last.is_some_and(|sample| sample.duration > limit) {
+        return Err(MuxFault::refused(
+          MuxStage::Trailer,
+          FfmpegMuxRefusal::LastSampleTooLong { track },
+        ));
+      }
     }
     for (index, state) in self.tracks.iter().enumerate() {
+      let track = TrackIndex::new(index);
       if let Some((filter, packets)) = held_at_end(state.filter) {
         self.report.uncarried.push(Uncarried::Held {
-          track: TrackIndex::new(index),
+          track,
           filter,
           packets,
         });
+      }
+      // MP4 ends its edit list at the last sample's decode time and its last
+      // packet's own duration (`movenc.c` 6940, 7329–7342): a joined E-AC-3
+      // sample is presented short of the frames it joins.
+      let ended_short = Uncarried::Rewritten {
+        track,
+        rewrite: Rewrite::Durations,
+      };
+      if state
+        .ac3
+        .last
+        .is_some_and(|sample| sample.closing < sample.duration)
+        && !self.report.uncarried.contains(&ended_short)
+      {
+        self.report.uncarried.push(ended_short);
       }
     }
     self
@@ -3763,7 +4125,7 @@ where
       track,
       &self.report.uncarried,
       payload,
-      dts_ticks,
+      &learned,
       reaches,
     );
     Ok(Plan {
@@ -3772,7 +4134,6 @@ where
       dts,
       times: PacketTimes::new(pts_ticks, Some(dts_ticks), duration_ticks),
       dts_ticks,
-      duration_ticks: (duration_ticks > 0).then_some(duration_ticks),
       reaches,
       filter,
       learned,
@@ -3794,11 +4155,13 @@ where
     state.filter = plan.filter;
     if plan.reaches {
       state.last_ticks = Some(plan.dts_ticks);
-      state.last_duration = plan.duration_ticks;
       state.written = true;
     }
-    if let Some(cue_end) = plan.learned.cue_end {
-      state.cue_end = Some(cue_end);
+    if let Some(sample) = plan.learned.sample {
+      state.sample = Some(sample);
+    }
+    if let Some(cues) = plan.learned.cues {
+      state.cues = cues;
     }
     if let Some(ac3) = plan.learned.ac3 {
       state.ac3 = ac3;
@@ -3812,14 +4175,18 @@ where
 }
 
 /// What the report learns from a packet of `track` once it is written —
-/// each line once ([`Uncarried`]), `reported` the report so far:
+/// each line once ([`Uncarried`]), `reported` the report so far, `learned`
+/// what the container learns of the track from it:
 ///
 /// - MP4 keeps a duration only as the distance to the next decode time
-///   ([`Rewrite::Durations`]), so a packet that does not abut the last one
-///   whose times reached it loses that one's offered duration;
+///   ([`Rewrite::Durations`]), so a sample MP4 writes that does not abut
+///   the last one it wrote loses that one's offered duration — counted
+///   between the samples MP4 writes, not the packets it holds (table C″);
 /// - the packet's side data the container drops, by the side-data table
 ///   ([`SideRules::fate`]) — all of it, where the automatic filter holds
-///   the packet, and its new extradata, on the first frame AAC's filter
+///   the packet, or where MP4 joins it to a sample of E-AC-3 frames, which
+///   takes the run's first packet's (all but its new extradata, which MP4
+///   reads first), and its new extradata, on the first frame AAC's filter
 ///   converts, which the filter replaces with the configuration it makes
 ///   (`aac_adtstoasc.c` 98–103).
 fn learned_losses(
@@ -3827,7 +4194,7 @@ fn learned_losses(
   track: TrackIndex,
   reported: &[Uncarried],
   payload: Payload<'_>,
-  dts_ticks: i64,
+  learned: &Learned,
   reaches: bool,
 ) -> Vec<Uncarried> {
   let (payload_bytes, side_data) = (payload.bytes, payload.side_data);
@@ -3837,11 +4204,9 @@ fn learned_losses(
       lines.push(line);
     }
   };
-  if reaches
-    && state.sides.family == Family::Mp4
-    && state.sides.codec != CodecId::MOV_TEXT
-    && let (Some(last), Some(duration)) = (state.last_ticks, state.last_duration)
-    && i128::from(dts_ticks) - i128::from(last) != i128::from(duration)
+  if let (Some(sample), Some(last)) = (learned.sample, state.sample)
+    && let Some(duration) = last.offered
+    && i128::from(sample.dts) - i128::from(last.dts) != duration
   {
     push(Uncarried::Rewritten {
       track,
@@ -3849,9 +4214,9 @@ fn learned_losses(
     });
   }
   for entry in side_data {
-    let replaced = first_conversion(state.filter, payload_bytes)
-      && entry.kind() == AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
-    let fate = if !reaches || replaced {
+    let new_extradata = entry.kind() == AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
+    let replaced = first_conversion(state.filter, payload_bytes) && new_extradata;
+    let fate = if !reaches || replaced || (learned.joined && !new_extradata) {
       Some(SideDataFate::Dropped)
     } else {
       state.sides.fate(entry, !state.written)
@@ -3881,19 +4246,28 @@ struct Timed {
   duration_ticks: i64,
 }
 
+/// What MP4's `check_pkt` judges a packet's times against (`movenc.c`
+/// 6897–6930; table C″ of the census): the decode time of the last sample
+/// MP4 wrote on the track — a sample, not a packet MP4 holds; for a
+/// `mov_text` cue, the empty sample where MP4 writes it first — none before
+/// the first; and the longest duration the packet may offer: `INT_MAX`
+/// ticks, or a `mov_text` cue's, whose end MP4 marks with an empty sample
+/// that `check_pkt` moves where it lies `INT_MAX` or more after it — the
+/// cue's duration after it, and the track's first sample's distance before
+/// zero (7321, 7652, 9029).
+#[derive(Clone, Copy)]
+struct Mp4Times {
+  last: Option<i128>,
+  longest: i128,
+}
+
 /// Holds a packet's times to the rows of the packet-rule table that judge
 /// them, in the table's order: a negative duration; MP4's 32-bit fields,
-/// against `last`, the decode time of the last sample MP4 wrote on the track
-/// — the last packet whose times reached it, or for `mov_text` the empty
-/// sample MP4 marks the last cue's end with, at zero before the first — or,
-/// for TTML's paragraphs, the one sample MP4 joins them into; a missing
+/// against `mp4`, what `check_pkt` judges them by — or, for TTML's
+/// paragraphs, against the one sample MP4 joins them into; a missing
 /// presentation time on a stream that reorders; a time before the earliest
 /// the container writes.
-fn check_times(
-  rules: &PacketRules,
-  last: Option<i64>,
-  timed: Timed,
-) -> Result<(), FfmpegMuxRefusal> {
+fn check_times(rules: &PacketRules, mp4: Mp4Times, timed: Timed) -> Result<(), FfmpegMuxRefusal> {
   let Timed {
     track,
     pts,
@@ -3923,21 +4297,13 @@ fn check_times(
       });
     }
   } else if rules.mp4 {
-    // `mov_text`: an empty sample follows each cue at its end (7625–7656,
-    // 9025–9031), its decode time the cue's own and the cue's duration
-    // after, which `check_pkt` moves where it is `INT_MAX` or more.
-    let longest = if rules.cues_in_order {
-      limit - 1
-    } else {
-      limit
-    };
     if let Some(duration) = duration
-      && i128::from(duration_ticks) > longest
+      && i128::from(duration_ticks) > mp4.longest
     {
       return Err(FfmpegMuxRefusal::DurationTooLong { track, duration });
     }
-    if let Some(last) = last
-      && i128::from(dts_ticks) - i128::from(last) >= limit
+    if let Some(last) = mp4.last
+      && i128::from(dts_ticks) - last >= limit
     {
       return Err(FfmpegMuxRefusal::DtsGap { track, dts });
     }
@@ -3987,32 +4353,35 @@ fn check_packet_rules(
     duration_ticks,
     ..
   } = timed;
+  let limit = i128::from(i32::MAX);
+  // MP4 `mov_text`: the samples MP4 writes around the cue (table C″).
+  let cues = rules
+    .cues_in_order
+    .then(|| state.cues.take(dts_ticks, duration_ticks));
   // The rules of a packet's times, which a packet the automatic filter
   // holds does not meet: its times never reach libavformat's timing or the
   // container.
   if reaches {
-    // The last sample MP4 wrote on a `mov_text` track is the empty one at the
-    // last cue's end, or the one at zero before the first (`movenc.c`
-    // 7625–7656); `check_pkt` counts the next cue's gap from it.
-    let last = if rules.cues_in_order {
-      Some(
-        state
-          .cue_end
-          .map_or(0, |end| i64::try_from(end).unwrap_or(i64::MAX)),
-      )
-    } else {
-      state.last_ticks
+    // `check_pkt` counts a packet's gap from the last sample MP4 wrote on the
+    // track — not from a packet MP4 holds — and a `mov_text` cue's from the
+    // empty sample where MP4 writes it first (table C″).
+    let mp4 = match cues {
+      Some(cue) => Mp4Times {
+        last: cue.reference,
+        // The empty sample after the cue lies its duration after it, and the
+        // track's first sample's distance before zero (7321, 7652, 9029).
+        longest: limit - 1 + i128::from(cue.next.start.unwrap_or(0)),
+      },
+      None => Mp4Times {
+        last: state.sample.map(|sample| i128::from(sample.dts)),
+        longest: limit,
+      },
     };
-    check_times(rules, last, timed)?;
+    check_times(rules, mp4, timed)?;
   }
-  let cue_end = if rules.cues_in_order {
-    if dts_ticks < 0 || state.cue_end.is_some_and(|end| i128::from(dts_ticks) < end) {
-      return Err(FfmpegMuxRefusal::CueOrder { track, pts: dts });
-    }
-    Some(i128::from(dts_ticks) + i128::from(duration_ticks))
-  } else {
-    None
-  };
+  if cues.is_some_and(|cue| cue.early) {
+    return Err(FfmpegMuxRefusal::CueOrder { track, pts: dts });
+  }
   if rules.intra_only && !payload.key {
     return Err(FfmpegMuxRefusal::KeyFrameUnmarked { track });
   }
@@ -4034,10 +4403,44 @@ fn check_packet_rules(
   if rules.wavpack && !wavpack_parse(payload.bytes) {
     return refused(PayloadRule::WavPackBlocks);
   }
-  if let Some(skip) = rules.skip_samples
-    && skips_below_nothing(payload.side_data, duration_ticks, skip, time_base)
-  {
-    return refused(PayloadRule::SkipSamples);
+  // MP4's AC-3 handling, which runs before the skip samples are read
+  // (`movenc.c` 7175–7181, 7311–7320): the duration MP4 is handed, and what
+  // it does with the packet — a sample of its own, held, or the joined
+  // sample it completes.
+  let ac3 = match rules.ac3 {
+    Some(ac3_rules) => {
+      let duration = ac3_rules.handed(duration_ticks);
+      let packet = Ac3Packet {
+        bytes: payload.bytes,
+        dts: dts_ticks,
+        duration,
+        offered: (duration_ticks > 0).then_some(duration_ticks),
+        skip_end: skip_end(payload.side_data),
+      };
+      match ac3_packet(state.ac3, ac3_rules.eac3, packet, bounds.packet) {
+        Ok((learned, ac3_step)) => Some((learned, ac3_step, duration)),
+        Err(rule) => return refused(rule),
+      }
+    }
+    None => None,
+  };
+  if let Some(skip) = rules.skip_samples {
+    let below = match ac3 {
+      // A joined sample carries its first packet's skip samples, judged at
+      // the packet that completes it against that packet's own duration
+      // (6940, 7311–7320); a packet MP4 holds meets no such check.
+      Some((_, Ac3Step::Opens | Ac3Step::Joins, _)) => false,
+      Some((_, Ac3Step::Completes(run), duration)) => run
+        .skip_end
+        .is_some_and(|end| end_below_nothing(end, duration, skip, time_base)),
+      Some((_, Ac3Step::Alone, duration)) => {
+        skips_below_nothing(payload.side_data, duration, skip, time_base)
+      }
+      None => skips_below_nothing(payload.side_data, duration_ticks, skip, time_base),
+    };
+    if below {
+      return refused(PayloadRule::SkipSamples);
+    }
   }
   if let Some(len) = rules.streaminfo_len
     && side_data(
@@ -4076,13 +4479,6 @@ fn check_packet_rules(
   if rules.webvtt && !webvtt_cue(payload.bytes, payload.side_data) {
     return refused(PayloadRule::WebVttCue);
   }
-  let ac3 = match rules.ac3 {
-    Some(eac3) => match ac3_packet(state.ac3, eac3, payload.bytes) {
-      Ok(learned) => Some(learned),
-      Err(rule) => return refused(rule),
-    },
-    None => None,
-  };
   // The side data the container's writer casts to libavutil's structs, on
   // a packet whose side data reaches it.
   if rules.hdr_metadata && reaches {
@@ -4136,9 +4532,30 @@ fn check_packet_rules(
     }
     None => None,
   };
+  // The sample MP4 writes with the packet, where it writes one: not where it
+  // holds the packet — a frame of fewer than six E-AC-3 blocks — and a
+  // joined sample at the packet that completes it, with its first packet's
+  // decode time (table C″). `mov_text`'s and TTML's samples are their own.
+  let sample = if !rules.mp4 || rules.cues_in_order || rules.ttml_document.is_some() || !reaches {
+    None
+  } else {
+    match ac3 {
+      Some((_, Ac3Step::Opens | Ac3Step::Joins, _)) => None,
+      Some((_, Ac3Step::Completes(run), _)) => Some(Sample {
+        dts: run.dts,
+        offered: run.offered,
+      }),
+      _ => Some(Sample {
+        dts: dts_ticks,
+        offered: (duration_ticks > 0).then(|| i128::from(duration_ticks)),
+      }),
+    }
+  };
   Ok(Learned {
-    cue_end,
-    ac3,
+    sample,
+    cues: cues.map(|cue| cue.next),
+    ac3: ac3.map(|(learned, _, _)| learned),
+    joined: matches!(ac3, Some((_, Ac3Step::Joins | Ac3Step::Completes(_), _))),
     document,
   })
 }

@@ -653,6 +653,24 @@ fn ac3_headers_parse_as_libavcodec_parses_them() {
   assert_eq!(ac3_header(&pair).map(|header| header.frame_type), Some(1));
 }
 
+/// An AC-3 or E-AC-3 packet of `bytes` at decode time `dts`, of `duration`
+/// ticks as offered and handed to MP4, without skip samples.
+fn ac3_at(bytes: &[u8], dts: i64, duration: i64) -> Ac3Packet<'_> {
+  Ac3Packet {
+    bytes,
+    dts,
+    duration,
+    offered: (duration > 0).then_some(duration),
+    skip_end: None,
+  }
+}
+
+/// What MP4 learns of the track from `bytes`, at zero, of no duration, the
+/// sample it joins unbounded.
+fn take(state: Ac3State, eac3: bool, bytes: &[u8]) -> Result<Ac3State, PayloadRule> {
+  ac3_packet(state, eac3, ac3_at(bytes, 0, 0), u64::MAX >> 1).map(|(state, _)| state)
+}
+
 /// **MP4's AC-3 handling is held as MP4 holds it**: a header that does not
 /// parse; an E-AC-3 track's first packet tiled by dependent frames; a
 /// second independent frame ending the first set; frames of fewer than six
@@ -660,66 +678,366 @@ fn ac3_headers_parse_as_libavcodec_parses_them() {
 #[test]
 fn mp4s_ac3_handling_is_mirrored() {
   let start = Ac3State::default();
+  let alone = Some(Ac3Sample {
+    duration: 0,
+    closing: 0,
+  });
   let ac3 = frame(&AC3, 448);
-  let learned = ac3_packet(start, false, &ac3).expect("an AC-3 frame");
+  let learned = take(start, false, &ac3).expect("an AC-3 frame");
   assert_eq!(
     learned,
     Ac3State {
       done: true,
       bsid: 8,
-      pending: 0
+      run: None,
+      last: alone,
     }
   );
   assert_eq!(
-    ac3_packet(learned, false, &[1, 2, 3]),
+    take(learned, false, &[1, 2, 3]),
     Err(PayloadRule::Ac3Header)
   );
   // E-AC-3: the first packet, alone or with a dependent frame after it.
   let independent = frame(&eac3(0, 3), 768);
-  let first = ac3_packet(start, true, &independent).expect("one frame");
+  let first = take(start, true, &independent).expect("one frame");
   assert_eq!(
     first,
     Ac3State {
       done: false,
       bsid: 16,
-      pending: 0
+      run: None,
+      last: alone,
     }
   );
   let mut with_dependent = independent.clone();
   with_dependent.extend(frame(&eac3(1, 3), 768));
-  assert!(ac3_packet(start, true, &with_dependent).is_ok());
+  assert!(take(start, true, &with_dependent).is_ok());
   let mut with_independent = independent.clone();
   with_independent.extend(frame(&eac3(0, 3), 768));
   assert_eq!(
-    ac3_packet(start, true, &with_independent),
+    take(start, true, &with_independent),
     Err(PayloadRule::Ac3Substreams)
   );
   let mut left_over = independent.clone();
   left_over.extend([1, 2, 3]);
   assert_eq!(
-    ac3_packet(start, true, &left_over),
+    take(start, true, &left_over),
     Err(PayloadRule::Ac3Substreams)
   );
   // The second independent frame ends the first set: no tiling is asked
   // of it.
-  let second = ac3_packet(first, true, &left_over).expect("the second packet");
+  let second = take(first, true, &left_over).expect("the second packet");
   assert!(second.done);
   // Two-block frames join into sixes; a three-block frame after four
   // blocks, or a six-block frame after two, runs past.
   let two = frame(&eac3(0, 1), 768);
   let three = frame(&eac3(0, 2), 768);
   let mut state = second;
-  for pending in [2, 4, 0] {
-    state = ac3_packet(state, true, &two).expect("two blocks");
-    assert_eq!(state.pending, pending);
+  for held in [2, 4, 0] {
+    state = take(state, true, &two).expect("two blocks");
+    assert_eq!(state.run.map_or(0, |run| run.blocks), held);
   }
-  let four = ac3_packet(ac3_packet(state, true, &two).expect("two"), true, &two).expect("four");
-  assert_eq!(ac3_packet(four, true, &three), Err(PayloadRule::Ac3Blocks));
-  let held = ac3_packet(state, true, &two).expect("two");
+  let four = take(take(state, true, &two).expect("two"), true, &two).expect("four");
+  assert_eq!(take(four, true, &three), Err(PayloadRule::Ac3Blocks));
+  let held = take(state, true, &two).expect("two");
+  assert_eq!(take(held, true, &independent), Err(PayloadRule::Ac3Blocks));
+}
+
+/// **MP4 joins E-AC-3 frames of fewer than six blocks into the sample it
+/// writes when they make six, and writes nothing before** (`handle_eac3`,
+/// `movenc.c` 577–606; table C″ of the census): the sample takes its first
+/// packet's decode time and skip samples, its packets' durations summed and
+/// their bytes joined — within `av_grow_packet`'s bound, a byte past the
+/// largest packet — and its last packet's own duration ends the track's
+/// edit list where it is the last. A frame of six blocks is a sample of its
+/// own.
+#[test]
+fn mp4_joins_e_ac3s_short_frames_into_the_sample_it_writes() {
+  let one = frame(&eac3(0, 0), 768);
+  let six = frame(&eac3(0, 3), 768);
+  let mut state = take(Ac3State::default(), true, &six).expect("the first set");
+  let (alone, step) = ac3_packet(state, true, ac3_at(&six, 10, 6), 1 << 20).expect("six");
+  assert_eq!(step, Ac3Step::Alone);
   assert_eq!(
-    ac3_packet(held, true, &independent),
-    Err(PayloadRule::Ac3Blocks)
+    alone.last,
+    Some(Ac3Sample {
+      duration: 6,
+      closing: 6,
+    })
   );
+  state = alone;
+  let mut skipped = ac3_at(&one, 100, 1);
+  skipped.skip_end = Some(2000);
+  let (opened, step) = ac3_packet(state, true, skipped, 1 << 20).expect("one block");
+  assert_eq!(step, Ac3Step::Opens);
+  assert_eq!(opened.last, alone.last, "nothing written");
+  state = opened;
+  for at in 101..105 {
+    let (joined, step) = ac3_packet(state, true, ac3_at(&one, at, 2), 1 << 20).expect("one");
+    assert_eq!(step, Ac3Step::Joins);
+    assert_eq!(joined.last, alone.last, "nothing written");
+    state = joined;
+  }
+  let (completed, step) = ac3_packet(state, true, ac3_at(&one, 105, 3), 1 << 20).expect("six");
+  let run = Ac3Run {
+    blocks: 6,
+    dts: 100,
+    duration: 1 + 4 * 2 + 3,
+    offered: Some(12),
+    bytes: 6 * 768,
+    skip_end: Some(2000),
+  };
+  assert_eq!(step, Ac3Step::Completes(run));
+  assert_eq!(completed.run, None);
+  assert_eq!(
+    completed.last,
+    Some(Ac3Sample {
+      duration: 12,
+      closing: 3,
+    })
+  );
+  // A packet offering no duration leaves the sum's offer unknown.
+  let (opened, _) = ac3_packet(completed, true, ac3_at(&one, 200, 0), 1 << 20).expect("one");
+  assert_eq!(opened.run.and_then(|run| run.offered), None);
+  // The bytes: five frames of 768 joined, a sixth taking them to the bound
+  // and a byte past it, then a byte more.
+  let mut state = completed;
+  for at in 300..305 {
+    state = ac3_packet(state, true, ac3_at(&one, at, 1), 6 * 768 - 1)
+      .expect("within the bound")
+      .0;
+  }
+  assert!(ac3_packet(state, true, ac3_at(&one, 305, 1), 6 * 768 - 1).is_ok());
+  assert_eq!(
+    ac3_packet(state, true, ac3_at(&one, 305, 1), 6 * 768 - 2).map(|(_, step)| step),
+    Err(PayloadRule::Ac3SampleSize)
+  );
+}
+
+/// An MP4 E-AC-3 track at 48 kHz, counted in its samples, with a frame of
+/// `frame_size` samples stated — which MP4 reads skip samples by (`movenc.c`
+/// 7311–7312), and which no demuxer's ticket of AC-3 or E-AC-3 states:
+/// libavcodec's parser and decoder set none, and `avformat_find_stream_info`
+/// asks it of MPEG audio and Codec 2 alone (`demux.c` 2076–2087).
+fn eac3_track(frame_size: i32) -> TrackState {
+  let time_base = Timebase::new(1, NonZeroI32::new(48_000).expect("non-zero"));
+  TrackState {
+    kind: TrackKind::Audio,
+    stream: Some((0, time_base)),
+    strict: true,
+    last: None,
+    last_ticks: None,
+    sample: None,
+    rules: PacketRules {
+      mp4: true,
+      no_empty: true,
+      skip_samples: (frame_size != 0).then_some((frame_size, 48_000)),
+      ac3: Some(Ac3Rules {
+        eac3: true,
+        guessed: if frame_size > 1 {
+          i64::from(frame_size)
+        } else {
+          0
+        },
+        durations_read: frame_size != 1,
+      }),
+      ..PacketRules::default()
+    },
+    filter: Filter::None,
+    sides: SideRules {
+      family: Family::Mp4,
+      kind: TrackKind::Audio,
+      codec: CodecId::EAC3,
+      sample_rate: 48_000,
+      frame_size,
+      initial_padding: 0,
+      extradata: Vec::new(),
+    },
+    written: false,
+    cues: Cues::default(),
+    ac3: Ac3State::default(),
+    document: 0,
+  }
+}
+
+/// Skip samples dropping `end` samples from a packet's end.
+fn skipping(end: u32) -> Vec<SideDataEntry> {
+  let mut bytes = [0u8; 10];
+  bytes[4..8].copy_from_slice(&end.to_le_bytes());
+  vec![SideDataEntry::new(
+    AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES as i32,
+    FfmpegBytes::try_copy_from_slice(&bytes).expect("a copy"),
+  )]
+}
+
+/// Holds an E-AC-3 packet of `bytes` and `side`, at `dts` of `duration`
+/// ticks, to `state`'s rules, and settles what MP4 learns from it as the
+/// muxer does: the rules' answer, and the report's lines.
+fn admit_eac3(
+  state: &mut TrackState,
+  bytes: &[u8],
+  side: &[SideDataEntry],
+  (dts, duration): (i64, i64),
+) -> Result<Vec<Uncarried>, FfmpegMuxRefusal> {
+  let (_, time_base) = state.stream.expect("a stream");
+  let track = TrackIndex::new(0);
+  let at = |ticks: i64| Timestamp::new(ticks, time_base);
+  let payload = Payload {
+    bytes,
+    key: true,
+    flags: PacketFlags::KEY,
+    side_data: side,
+  };
+  let timed = Timed {
+    track,
+    pts: Some(at(dts)),
+    dts: at(dts),
+    duration: Some(at(duration)),
+    pts_ticks: Some(dts),
+    dts_ticks: dts,
+    duration_ticks: duration,
+  };
+  let step = Step {
+    reaches: true,
+    largest: Some(bytes.len() as u64),
+    held: None,
+  };
+  let learned = check_packet_rules(state, time_base, timed, payload, step, Bounds::REAL)?;
+  let lines = learned_losses(state, track, &[], payload, &learned, true);
+  if let Some(sample) = learned.sample {
+    state.sample = Some(sample);
+  }
+  if let Some(ac3) = learned.ac3 {
+    state.ac3 = ac3;
+  }
+  state.written = true;
+  Ok(lines)
+}
+
+/// **MP4 judges a joined E-AC-3 sample's skip samples at the packet that
+/// completes it, against that packet's own duration, and drops a joined
+/// packet's own** (table C″ of the census): the sample takes its first
+/// packet's side data (`handle_eac3`, `movenc.c` 586–603), and MP4 reads
+/// its skip samples once it writes it, its end counted with the duration of
+/// the packet it was handed last (6940, 7311–7320). With a frame of 1536
+/// samples stated, a first packet dropping 2000 — past its duration and
+/// its frame — is taken, its skip samples reported as possibly dropped, as
+/// on any sample; a joined packet's skip samples are reported dropped; a
+/// completing packet of one tick is refused, one of 2000 taken.
+///
+/// PLANT: the skip samples judged at every packet with its own, as before:
+/// the first packet is refused.
+#[test]
+fn a_joined_samples_skip_samples_are_judged_at_its_last_packet() {
+  use SideDataFate::{Dropped, PossiblyDropped};
+  let one = frame(&eac3(0, 0), 768);
+  let mut state = eac3_track(1536);
+  let line = |fate| Uncarried::SideData {
+    track: TrackIndex::new(0),
+    kind: AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES as i32,
+    name: packet_side_data_name(AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES as i32),
+    fate,
+  };
+  assert_eq!(
+    admit_eac3(&mut state, &one, &skipping(2000), (0, 1)),
+    Ok(vec![line(PossiblyDropped)]),
+    "held: its skip samples ride on the sample"
+  );
+  assert_eq!(
+    admit_eac3(&mut state, &one, &skipping(10), (1, 1)),
+    Ok(vec![line(Dropped)]),
+    "joined: never read"
+  );
+  for dts in 2..5 {
+    assert_eq!(admit_eac3(&mut state, &one, &[], (dts, 1)), Ok(vec![]));
+  }
+  let before = state.clone();
+  assert_eq!(
+    admit_eac3(&mut state, &one, &[], (5, 1)),
+    Err(FfmpegMuxRefusal::Payload {
+      track: TrackIndex::new(0),
+      rule: PayloadRule::SkipSamples
+    })
+  );
+  assert_eq!(state.ac3, before.ac3, "nothing learned of a refused packet");
+  assert_eq!(admit_eac3(&mut state, &one, &[], (5, 2000)), Ok(vec![]));
+  assert_eq!(
+    state.sample,
+    Some(Sample {
+      dts: 0,
+      offered: Some(1 + 4 + 2000),
+    }),
+    "the sample, at its first packet's decode time"
+  );
+  // Without a frame size, as every demuxer's ticket has it, MP4 reads no
+  // skip samples, and drops them.
+  let mut state = eac3_track(0);
+  assert_eq!(
+    admit_eac3(&mut state, &one, &skipping(2000), (0, 1)),
+    Ok(vec![line(Dropped)])
+  );
+}
+
+/// **MP4 marks a `mov_text` cue's end with an empty sample only where the
+/// next cue starts past it** (`movenc.c` 7646–7653; table C″ of the
+/// census): at zero before a first cue past zero; at the last cue's end,
+/// counted from the track's first sample, before a cue past it; none before
+/// a cue at or before it, whose gap `check_pkt` counts from the last cue. A
+/// first cue before zero starts the track, and every end after it is
+/// counted from there.
+#[test]
+fn mp4_marks_a_cues_end_only_where_the_next_starts_past_it() {
+  let start = Cues::default();
+  let first = start.take(50, 100);
+  assert_eq!(first.reference, Some(0), "the empty sample at zero first");
+  assert!(!first.early);
+  assert_eq!(
+    first.next,
+    Cues {
+      start: Some(0),
+      end: 150,
+      last: Some(50),
+      ended: false,
+    }
+  );
+  let past = first.next.take(200, 10);
+  assert_eq!(
+    past.reference,
+    Some(150),
+    "the empty sample at the end first"
+  );
+  assert!(!past.early);
+  let at = first.next.take(150, 10);
+  assert_eq!(
+    at.reference,
+    Some(50),
+    "no empty sample: the gap from the cue"
+  );
+  assert!(!at.early);
+  let before = first.next.take(100, 10);
+  assert_eq!(before.reference, Some(50));
+  assert!(before.early, "before the end MP4 marks");
+  assert_eq!(before.next.end, 110);
+  let zero = start.take(0, 10);
+  assert_eq!(zero.reference, None, "the track's first sample");
+  assert!(!zero.early);
+  let negative = start.take(-30, 10);
+  assert_eq!(negative.reference, None);
+  assert!(negative.early, "before zero");
+  assert_eq!(
+    negative.next,
+    Cues {
+      start: Some(-30),
+      end: 10,
+      last: Some(-30),
+      ended: false,
+    }
+  );
+  // The end is counted from the track's first sample, and read as a
+  // decode time: the empty sample at 10, not at the cue's end, -20.
+  let after = negative.next.take(20, 5);
+  assert_eq!(after.reference, Some(10));
+  assert_eq!(after.next.end, 20 + 30 + 5);
 }
 
 /// An ADTS frame `len` bytes long: its header — a CRC after it where `crc`,
@@ -1806,18 +2124,18 @@ fn mp4s_ac3_refuses_a_first_frame_dac3_does_not_define() {
     bytes.resize(128, 0);
     bytes
   };
-  assert!(ac3_packet(Ac3State::default(), false, &frame(8)).is_ok());
+  assert!(take(Ac3State::default(), false, &frame(8)).is_ok());
   for id in [9, 10] {
     assert_eq!(
-      ac3_packet(Ac3State::default(), false, &frame(id)),
+      take(Ac3State::default(), false, &frame(id)),
       Err(PayloadRule::Ac3BitStreamId),
       "{id}"
     );
   }
-  let after = ac3_packet(Ac3State::default(), false, &frame(8)).expect("the first");
-  assert!(ac3_packet(after, false, &frame(9)).is_ok(), "a later frame");
+  let after = take(Ac3State::default(), false, &frame(8)).expect("the first");
+  assert!(take(after, false, &frame(9)).is_ok(), "a later frame");
   // E-AC-3's dec3 carries no such bound.
-  assert!(ac3_packet(Ac3State::default(), true, &frame(9)).is_ok());
+  assert!(take(Ac3State::default(), true, &frame(9)).is_ok());
 }
 
 /// **PCM rechunking's sample size is counted as its start counts it**, in

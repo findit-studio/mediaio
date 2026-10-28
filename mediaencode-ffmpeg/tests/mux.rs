@@ -4754,3 +4754,291 @@ fn l56_what_a_filter_still_holds_at_the_end_is_reported() {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+//  Table C″: what MP4 writes, not what it is handed.
+// ---------------------------------------------------------------------------
+
+/// The time base MP4 counts a 48 kHz audio track in: its sample rate's
+/// (`mov_init`, `movenc.c` 8539).
+fn at_48k() -> Timebase {
+  Timebase::new(1, NonZeroI32::new(48_000).expect("non-zero"))
+}
+
+/// `frame`'s bytes, its `numblkscod` — bits 4–5 of its fifth byte, at
+/// 48 kHz — recoded as one block.
+fn one_block(frame: &Audio) -> Vec<u8> {
+  let mut bytes = frame.data().as_ref().to_vec();
+  assert_eq!(bytes[4] >> 6, 0, "the premise: 48 kHz");
+  bytes[4] &= !0x30;
+  bytes
+}
+
+/// `packet` on track 0, decoded and presented at `dts` and lasting
+/// `duration` ticks of 48 kHz.
+fn audio_ticks(packet: &Audio, dts: i64, duration: i64) -> AudioTrackPacket<Ffmpeg, FfmpegBytes> {
+  let at = |ticks: i64| Timestamp::new(ticks, at_48k());
+  AudioTrackPacket::new(
+    TrackIndex::new(0),
+    packet
+      .clone()
+      .with_pts(Some(at(dts)))
+      .with_dts(Some(at(dts)))
+      .with_duration(Some(at(duration))),
+  )
+}
+
+/// The first E-AC-3 frame of the corpus's E-AC-3 file — six blocks, 48 kHz
+/// — and its one-block recoding, with the file's path.
+fn eac3_frames(corpus: &Corpus) -> (PathBuf, Audio, Audio) {
+  let source = audio_file(corpus, "eac3.mkv", "eac3");
+  let (_, packets) = first_track(&source, TrackKind::Audio, 1);
+  let six = audio_of(&packets[0]);
+  let one = audio_holding(&six, &one_block(&six));
+  (source, six, one)
+}
+
+/// **L57 — MP4 judges an E-AC-3 packet's decode time from the last sample
+/// it wrote, which a packet it holds does not move** (table C″ of the
+/// census). `check_pkt` counts each packet's gap from the last sample MP4
+/// wrote on the track, and none before the first (`movenc.c` 6897–6930);
+/// MP4 holds a frame of fewer than six blocks, writing nothing, until six
+/// make one sample at the first one's decode time (`handle_eac3`,
+/// 577–606). Six one-block packets 0.5 × 10⁹ ticks apart are taken — none
+/// is judged before the first sample — and make the sample at 0; a packet
+/// at 3 × 10⁹ is refused, 3 × 10⁹ after that sample though 0.5 × 10⁹ after
+/// the packet before it. A run opened at 2.0 × 10⁹ moves nothing until it
+/// is written: a packet at 2.2 × 10⁹ is refused, that far after the sample
+/// at 0; once the run is written at 2.0 × 10⁹, a packet at 4.0 × 10⁹ is
+/// taken, 2.0 × 10⁹ after it.
+///
+/// PLANT: the reference advanced on a held packet, as before: the packet at
+/// 3 × 10⁹ is taken, and MP4 would write it one tick after the sample at 0,
+/// its presentation time dropped.
+#[test]
+fn l57_mp4_judges_e_ac3_from_the_last_sample_it_wrote() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (source, _, one) = eac3_frames(&corpus);
+  let track = TrackIndex::new(0);
+  let taken = |muxer: &mut FfmpegOwnedMuxer<File>, dts: i64, what: &str| {
+    muxer
+      .write_audio(audio_ticks(&one, dts, 256))
+      .map_err(|error| error.map_packet(drop))
+      .expect(what);
+  };
+  let gap = |muxer: &mut FfmpegOwnedMuxer<File>, dts: i64| {
+    let offered = audio_ticks(&one, dts, 256);
+    let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+    assert_eq!(
+      refusal,
+      FfmpegMuxRefusal::DtsGap {
+        track,
+        dts: Timestamp::new(dts, at_48k())
+      }
+    );
+    untouched!(offered, back);
+  };
+  let step = 500_000_000;
+  let mut muxer = muxer_into(
+    &output(&corpus, "l57.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Audio),
+  );
+  for index in 0..6 {
+    taken(&mut muxer, index * step, "held, then joined at 0");
+  }
+  gap(&mut muxer, 6 * step);
+  muxer.finish().expect("finished");
+
+  let mut muxer = muxer_into(
+    &output(&corpus, "l57-run.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Audio),
+  );
+  for dts in 0..6 {
+    taken(&mut muxer, dts, "the sample at 0");
+  }
+  let run = 2_000_000_000;
+  taken(&mut muxer, run, "a run opened 2.0e9 after the sample at 0");
+  gap(&mut muxer, 2_200_000_000);
+  for dts in 2_100_000_000..2_100_000_005 {
+    taken(&mut muxer, dts, "the run, written at 2.0e9");
+  }
+  for dts in 4_000_000_000..4_000_000_006 {
+    taken(&mut muxer, dts, "2.0e9 after the run's sample");
+  }
+  muxer.finish().expect("finished");
+}
+
+/// **L58 — MP4 joins E-AC-3 frames only within the largest packet
+/// `av_grow_packet` grows** (table C″): it grows the sample it joins by
+/// each frame, and refuses one that would take it past `INT_MAX` less the
+/// padding after taking it (`handle_eac3`, `movenc.c` 592–595;
+/// `libavcodec/packet.c` 121–127). The bound lowered, six one-block frames
+/// that come to it are joined; one byte less, the sixth is refused, by
+/// name, untouched.
+///
+/// PLANT: without the bound, the sixth frame is taken.
+#[test]
+fn l58_mp4_joins_e_ac3_within_the_largest_packet() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (source, _, one) = eac3_frames(&corpus);
+  let sum = 6 * one.data().as_ref().len() as u64;
+  for (name, bound, sixth_taken) in [("l58.mp4", sum - 1, true), ("l58-past.mp4", sum - 2, false)] {
+    let mut muxer = muxer_with(
+      &output(&corpus, name),
+      ContainerName::MP4,
+      table_of(&source, TrackKind::Audio),
+      MuxOptions::new().with_lowered_bounds(bound, u64::MAX),
+    );
+    for dts in 0..5 {
+      muxer
+        .write_audio(audio_ticks(&one, dts * 256, 256))
+        .map_err(|error| error.map_packet(drop))
+        .expect("held");
+    }
+    let sixth = audio_ticks(&one, 5 * 256, 256);
+    if sixth_taken {
+      muxer
+        .write_audio(sixth)
+        .map_err(|error| error.map_packet(drop))
+        .expect("the sample at the bound");
+      muxer.finish().expect("finished");
+    } else {
+      let (refusal, back) = by_container(muxer.write_audio(sixth.clone()));
+      assert_eq!(refusal, payload(PayloadRule::Ac3SampleSize), "{name}");
+      untouched!(sixth, back);
+    }
+  }
+}
+
+/// **L59 — MP4 refuses at `finish` an E-AC-3 track whose last sample, a
+/// joined one, lasts past `INT_MAX` ticks** (table C″): the joined
+/// sample's duration is its packets' sum (`handle_eac3`, `movenc.c` 597),
+/// and the trailer reads the last sample's from it and asserts it fits
+/// (`get_cluster_duration`, 1248–1256), ending the process. Six one-block
+/// packets of 400 × 10⁶ ticks each, 2.4 × 10⁹ in all: as the last sample,
+/// `finish` refuses by name before the trailer runs; with a six-block
+/// frame after them, the file finishes.
+///
+/// PLANT: without the check, FFmpeg's assertion ends the test process.
+#[test]
+fn l59_mp4_refuses_a_last_joined_sample_past_int_max() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (source, six, one) = eac3_frames(&corpus);
+  let long = 400_000_000;
+  for (name, followed) in [("l59.mp4", false), ("l59-followed.mp4", true)] {
+    let mut muxer = muxer_into(
+      &output(&corpus, name),
+      ContainerName::MP4,
+      table_of(&source, TrackKind::Audio),
+    );
+    for index in 0..6 {
+      muxer
+        .write_audio(audio_ticks(&one, index * long, long))
+        .map_err(|error| error.map_packet(drop))
+        .expect("held, each within INT_MAX");
+    }
+    if followed {
+      muxer
+        .write_audio(audio_ticks(&six, 2_100_000_000, 1536))
+        .map_err(|error| error.map_packet(drop))
+        .expect("a sample of its own after the joined one");
+      muxer.finish().expect("finished");
+    } else {
+      let fault = muxer.finish().expect_err("the last sample past INT_MAX");
+      assert_eq!(fault.stage(), MuxStage::Trailer);
+      assert_eq!(
+        fault.refusal(),
+        Some(FfmpegMuxRefusal::LastSampleTooLong {
+          track: TrackIndex::new(0)
+        })
+      );
+      assert!(fault.error().is_none(), "no account of the context's");
+    }
+  }
+}
+
+/// **L60 — an E-AC-3 track whose last sample MP4 joins ends where its last
+/// packet's duration ends it, and the report says so at `finish`** (table
+/// C″): MP4 ends the track's edit list at its last sample's decode time and
+/// the duration of the packet it was handed last (`movenc.c` 6940,
+/// 7329–7342), so a joined sample is presented short of its frames. Twelve
+/// abutting one-block packets: their durations are reported, by the report
+/// `finish_into_sink` hands back; two abutting six-block frames: nothing.
+///
+/// PLANT: without the end's line, the report is silent.
+#[test]
+fn l60_a_last_joined_sample_is_reported_cut_short() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (source, six, one) = eac3_frames(&corpus);
+  let durations = |report: &mediaencode_ffmpeg::MuxReport| {
+    report
+      .uncarried()
+      .iter()
+      .filter(|line| {
+        matches!(
+          line,
+          Uncarried::Rewritten {
+            rewrite: Rewrite::Durations,
+            ..
+          }
+        )
+      })
+      .count()
+  };
+  for (name, frame, blocks, count, reported) in [
+    ("l60.mp4", &one, 256, 12, 1),
+    ("l60-six.mp4", &six, 1536, 2, 0),
+  ] {
+    let mut muxer = muxer_into(
+      &output(&corpus, name),
+      ContainerName::MP4,
+      table_of(&source, TrackKind::Audio),
+    );
+    for index in 0..count {
+      muxer
+        .write_audio(audio_ticks(frame, index * blocks, blocks))
+        .map_err(|error| error.map_packet(drop))
+        .expect("an abutting packet");
+    }
+    assert_eq!(durations(muxer.report()), 0, "{name}: samples that abut");
+    let (_, report) = muxer.finish_into_sink().expect("finished");
+    assert_eq!(durations(&report), reported, "{name}");
+  }
+}
+
+/// **L61 — the blocks an E-AC-3 track leaves short of a sample at its end
+/// are dropped, as the report says at open** (table C″; [`Rewrite::Ac3Parsed`]):
+/// MP4 frees the run it holds without writing it (`mov_free`, `movenc.c`
+/// 7951–7955). Two six-block frames and three one-block ones read back as
+/// the two.
+#[test]
+fn l61_e_ac3_blocks_short_of_a_sample_at_the_end_are_dropped() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (source, six, one) = eac3_frames(&corpus);
+  let target = output(&corpus, "l61.mp4");
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Audio),
+  );
+  assert!(muxer.report().uncarried().contains(&Uncarried::Rewritten {
+    track: TrackIndex::new(0),
+    rewrite: Rewrite::Ac3Parsed,
+  }));
+  for (frame, dts) in [
+    (&six, 0),
+    (&six, 1536),
+    (&one, 3072),
+    (&one, 3328),
+    (&one, 3584),
+  ] {
+    muxer
+      .write_audio(audio_ticks(frame, dts, 256))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  muxer.finish().expect("finished");
+  assert_eq!(packets(&target)[0].len(), 2, "the two six-block frames");
+}
