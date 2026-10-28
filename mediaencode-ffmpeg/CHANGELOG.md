@@ -42,7 +42,8 @@ crate moves only when it changes.
   `i128`; a reordering stream's packet without a presentation time; a
   time libavformat's first write leaves before the earliest the container
   writes, and every such time where the muxer does not mirror that
-  write's move of every stream's times; an MP4 `mov_text` cue before zero, or before the
+  write's move of every stream's times; an FLV packet decoded before the
+  first one FLV wrote (`FfmpegMuxRefusal::BeforeFirstDts`); an MP4 `mov_text` cue before zero, or before the
   last cue's end where another track's packet can make MP4 mark that end
   first; an unmarked key
   frame of a codec of key frames alone (`FfmpegMuxRefusal`); and a

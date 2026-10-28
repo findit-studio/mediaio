@@ -530,10 +530,26 @@
 //! | [`FfmpegMuxRefusal::NegativeDuration`], a subtitle's outside Matroska and WebM | libavformat hands a subtitle's on as it is (`guess_pkt_duration`, `mux.c` 605–611): MP4 refuses it after taking the packet (`check_pkt`, `movenc.c` 6925–6928), or joins a TTML paragraph into its document ending before it starts (`ttmlenc.c` 172); SRT drops the cue (`srtenc.c` 71–75); WebVTT and ASS write it ending before it starts (`webvttenc.c` 80, `assenc.c` 160). Any other track's libavformat writes as zero, or its own guess (605–633), and Matroska and WebM a subtitle's as zero (`matroskaenc.c` 3134): taken, reported ([`Rewrite::Durations`]) — L11; PLANT: refused on every track, L11's video packet refused; on none, MP4 refuses L11's cue after taking it | refuses after taking, loses, or corrupts, where it is refused |
 //! | [`FfmpegMuxRefusal::KeyFrameUnmarked`] | libavformat marks every packet of a codec its descriptor counts of key frames alone a key frame (`mux.c` 820–821), overriding the packet's own word that it is no seek point: a frame can lean on the one before — an MP3 frame whose bit reservoir starts there decodes, where decoding starts at it, to silence (`mpegaudiodec_template.c` 1316–1322) — so the mark would make a seek point that does not decode. Kept: a caller that knows the packet is a key frame marks it — L16; PLANT: dropped, L16's unmarked frame taken | writes it false |
 //! | [`FfmpegMuxRefusal::BeforeZero`] | libavformat moves every stream's times later at its first write, by the earliest distance before its stream's earliest of the packet it writes or of one its interleaving holds then (`handle_avoid_negative_ts`, `mux.c` 636–717): mirrored ([`Shift`]), taken, reported ([`Uncarried::TimesShifted`]). A packet after that write the move leaves before the earliest it hands the container as it is, warning it "failed to avoid negative timestamp" (692–715): FLV refuses it after taking it (`flvenc.c` 1267–1274); Matroska writes it with no cue, its block time a 16-bit count from its cluster's, which starts no earlier than zero, so that one more than 32768 ticks before zero wraps (`matroskaenc.c` 969–970, 3146–3163, 2888) — refused. Where the move is not mirrored — GXF's and MXF's own interleaving, Matroska's times uncertain beside a video track of no native id — every time before the earliest is refused, as round 2 refused it — L14, L46; PLANT: the move unmirrored, L14's early packets refused; after the first write unjudged, L14's late packets taken. Each packet is judged in the times of what its track's filter puts out, when it puts it out (table B's mirrors; Codex R6 [high]): a PGS display set at the packet that ends it, in its presentation segment's packet's times — L69; PLANT: the mirrors moved on what the filter takes, L69's held presentation segment moving every stream | refuses after taking, or corrupts, where it is refused |
+//! | [`FfmpegMuxRefusal::BeforeFirstDts`] | FLV keeps the first packet it writes as its reference and refuses every later packet decoded before it after taking it — "Packets are not in the proper order with respect to DTS" (`flvenc.c` 1267–1274): a packet of a stream the interleaving's 10 s delay wrote ahead of (`mux.c` 939–1003) — L70; PLANT: unmirrored, L70's audio at 2 s taken, FLV refusing it after taking it (`Invalid argument`) | refuses after taking |
 //! | [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Cropping`] | MP4's trailer refuses the box (`movenc.c` 1299–1340, 857–910, 3024–3036; `movenc_ttml.c` 236–317) | refuses after taking: the file |
 //! | [`MuxOpenError::SampleSize`], [`MuxOpenError::Cover`] | `pcm_rechunk`'s start fails the header (`pcm_rechunk.c` 49–58); the cover's builder fails after the header (`packet.c` 83–95) | refuses: the file |
 //! | [`MuxOpenError::MediaTypeMismatch`] | a stream of one media type whose packets this muxer would judge as another's | corrupts |
 //! | [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSample`] | MP4 writes every chapter into its Nero list but a titled one alone into its chapter track, which its reader lays over the list by position, with a 16-bit title length (`movenc.c` 7791–7807); `ff_mov_write_packet`'s answer for a chapter's sample ignored, a sample past `INT_MAX` lost, one out of range moved (7807) | corrupts, or loses |
+//!
+//! **Below a time a muxer keeps** (grep G18 of #82): every time a muxer
+//! keeps from a packet, and every comparison that holds a later packet's
+//! time below a kept or a fixed one, with what each does:
+//!
+//! | muxer | the rule | here |
+//! |---|---|---|
+//! | FLV | the first packet it wrote is its reference; a packet decoded before it, refused after taking it (`flvenc.c` 1267–1274) | mirrored ([`FfmpegMuxRefusal::BeforeFirstDts`]) |
+//! | ASF | a presentation time below −3.1 s, refused after taking it (`asfenc.c` 1025–1029) | libavformat's move makes every decode time, and so every presentation time, zero or more; one after its first write that the move leaves below, refused ([`FfmpegMuxRefusal::BeforeZero`]) |
+//! | NUT | a presentation time below zero, refused after taking it (`nutenc.c` 979–985) | as ASF's |
+//! | Matroska | a block below zero written with no cue (`matroskaenc.c` 969–970) | [`FfmpegMuxRefusal::BeforeZero`] |
+//! | MP4 | `check_pkt`'s reference, the last sample written (`movenc.c` 6897–6930) | table C″ |
+//! | MPEG-PS | the first packet's decode time, below the preload, raises the preload (`mpegenc.c` 1188–1199) | nothing refused after; the move first ([`FfmpegMuxRefusal::BeforeZero`]) |
+//! | MPEG-TS | a decode time below the clock reference: a warning (`mpegtsenc.c` 1606–1607) | nothing refused |
+//! | every other time G18 finds kept | a duration, a page's, a cue's or an index's start, a maximum, a base for RTP's clock — or a muxer refused at open (DASH, HDS, HLS, segment, smooth streaming) | nothing held below it |
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -1411,6 +1427,20 @@ pub enum FfmpegMuxRefusal {
     /// The time offered — a presentation time, or a decode time.
     timestamp: Timestamp,
   },
+  /// FLV: a decode time before that of the first packet FLV wrote, which FLV
+  /// keeps as its reference and refuses every later packet before after
+  /// taking it (`flvenc.c` 1267–1274 in FFmpeg 9.0.1): a packet of a stream
+  /// that held nothing when libavformat's interleaving made its first write
+  /// past its 10 s delay (`mux.c` 939–1003). Judged after libavformat's move
+  /// of early times, as FLV judges it, the decode times compared in ticks,
+  /// every FLV stream's milliseconds (1074).
+  #[error("track {}: decoded at {}, before the first packet FLV wrote", .track.get(), .dts.pts())]
+  BeforeFirstDts {
+    /// The track.
+    track: TrackIndex,
+    /// The decode time offered.
+    dts: Timestamp,
+  },
   /// MP4 `mov_text`: a first cue before zero, or, beside another timed
   /// track, a cue that starts before the end MP4 marks the last one with,
   /// where a packet of that track can make MP4 mark the end first (table C″
@@ -2142,8 +2172,28 @@ struct Shift {
   /// What the interleaving holds before its first write, by track — none
   /// for a track whose stream takes no packet.
   held: Vec<Option<Held>>,
-  /// The earliest decode time it holds, in microseconds: its queue's head.
-  head_us: Option<i128>,
+  /// The earliest decode time it holds: its queue's head, which its first
+  /// write writes (`mux.c` 1006–1016).
+  head: Option<Timestamp>,
+  /// FLV: whether the container refuses, after taking it, a packet whose
+  /// decode time lies before that of the first packet it wrote, its
+  /// reference (`flvenc.c` 1267–1274).
+  first_floor: bool,
+  /// The decode time of the first packet the container wrote, moved, in its
+  /// own stream's ticks: FLV's reference, as FLV keeps it.
+  first: Option<i128>,
+}
+
+/// Why libavformat's container would write a packet before where it may
+/// ([`Shift::take`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Early {
+  /// Before its stream's earliest, after the first write's move
+  /// ([`FfmpegMuxRefusal::BeforeZero`]).
+  BeforeEarliest,
+  /// FLV: before the first packet FLV wrote
+  /// ([`FfmpegMuxRefusal::BeforeFirstDts`]).
+  BeforeFirst,
 }
 
 /// What libavformat's interleaving holds of a stream before its first
@@ -2234,37 +2284,55 @@ impl Shift {
       earliest: None,
       written: false,
       held,
-      head_us: None,
+      head: None,
+      first_floor: muxer == "flv",
+      first: None,
+    })
+  }
+
+  /// Each stream's distance, rounded up to its own tick, `time_base`'s
+  /// (`mux.c` 676–680): none before a time below the earliest is held.
+  fn lift(&self, time_base: Timebase) -> i128 {
+    self.earliest.map_or(0, |earliest| {
+      let from = earliest.timebase();
+      let numerator =
+        -i128::from(earliest.pts()) * i128::from(from.num()) * i128::from(time_base.den().get());
+      let den = i128::from(from.den().get()) * i128::from(time_base.num());
+      if den <= 0 {
+        0
+      } else {
+        (numerator + den - 1).div_euclid(den)
+      }
     })
   }
 
   /// What libavformat makes of a packet of `track` — its time judged `at`,
   /// its decode time `dts`, its stream's earliest `lowest`, each in ticks of
-  /// `time_base`: the shift after it, or `None` where libavformat writes it
-  /// before the earliest, which only a packet after the first write can
-  /// be: one before it the shift lifts.
+  /// `time_base`: the shift after it, or why the container would write it
+  /// where it may not, which only a packet after the first write can be —
+  /// one before it the shift lifts: before the earliest, or FLV's before
+  /// the first packet FLV wrote, compared in ticks as FLV compares them
+  /// (`flvenc.c` 1270), every FLV stream's milliseconds (1074).
   fn take(
     &self,
     track: usize,
     (at, dts, lowest): (i64, i64, i64),
     time_base: Timebase,
-  ) -> Option<Self> {
+  ) -> Result<Self, Early> {
     let below = i128::from(at) - i128::from(lowest);
     if self.written {
-      // Each stream's distance, rounded up to its own tick (`mux.c`
-      // 676–680).
-      let lift = self.earliest.map_or(0, |earliest| {
-        let from = earliest.timebase();
-        let numerator =
-          -i128::from(earliest.pts()) * i128::from(from.num()) * i128::from(time_base.den().get());
-        let den = i128::from(from.den().get()) * i128::from(time_base.num());
-        if den <= 0 {
-          0
-        } else {
-          (numerator + den - 1).div_euclid(den)
-        }
-      });
-      return (below + lift >= 0).then(|| self.clone());
+      let lift = self.lift(time_base);
+      if below + lift < 0 {
+        return Err(Early::BeforeEarliest);
+      }
+      if self.first_floor
+        && self
+          .first
+          .is_some_and(|first| i128::from(dts) + lift < first)
+      {
+        return Err(Early::BeforeFirst);
+      }
+      return Ok(self.clone());
     }
     let mut next = self.clone();
     if below < 0 {
@@ -2275,13 +2343,19 @@ impl Shift {
           .map_or(instant, |earliest| earliest.min(instant)),
       );
     }
-    let us = micros(dts, time_base);
     if let Some(Some(held)) = next.held.get_mut(track) {
-      held.last_us = Some(us);
+      held.last_us = Some(micros(dts, time_base));
     }
-    next.head_us = Some(next.head_us.map_or(us, |head| head.min(us)));
+    let decoded = Timestamp::new(dts, time_base);
+    next.head = Some(next.head.map_or(decoded, |head| head.min(decoded)));
     next.written = next.passthrough || next.flushes();
-    Some(next)
+    if next.written {
+      // The first packet the container writes: the head, moved.
+      next.first = next
+        .head
+        .map(|head| i128::from(head.pts()) + next.lift(head.timebase()));
+    }
+    Ok(next)
   }
 
   /// Whether the interleaving, holding what it holds, writes its first
@@ -2303,7 +2377,7 @@ impl Shift {
       .clone()
       .filter(|held| held.last_us.is_none() && held.may_lack)
       .count();
-    let Some(head) = self.head_us else {
+    let Some(head) = self.head.map(|head| micros(head.pts(), head.timebase())) else {
       return false;
     };
     interleaved == holding + lacking
@@ -5030,10 +5104,15 @@ where
           };
           next = next
             .take(track.get(), (at, output.dts_ticks, lowest), time_base)
-            .ok_or(Refusal::Container(FfmpegMuxRefusal::BeforeZero {
-              track,
-              timestamp,
-            }))?;
+            .map_err(|early| {
+              Refusal::Container(match early {
+                Early::BeforeEarliest => FfmpegMuxRefusal::BeforeZero { track, timestamp },
+                Early::BeforeFirst => FfmpegMuxRefusal::BeforeFirstDts {
+                  track,
+                  dts: output.dts,
+                },
+              })
+            })?;
         }
         Some(next)
       }

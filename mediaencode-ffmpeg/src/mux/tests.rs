@@ -2679,8 +2679,12 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   let moved = alone.take(0, (-40, -40, 0), ms).expect("before the write");
   assert!(moved.written);
   assert_eq!(moved.earliest, Some(Timestamp::new(-40, ms)));
-  assert!(moved.take(1, (-40, -40, 0), ms).is_some(), "lifted to zero");
-  assert_eq!(moved.take(1, (-41, -41, 0), ms), None, "left before it");
+  assert!(moved.take(1, (-40, -40, 0), ms).is_ok(), "lifted to zero");
+  assert_eq!(
+    moved.take(1, (-41, -41, 0), ms),
+    Err(Early::BeforeEarliest),
+    "left before it"
+  );
 
   // Two: written once both hold a packet, the early one moving the other.
   let both = of(Family::Matroska, "matroska", &[video, audio]).expect("mirrored");
@@ -2690,8 +2694,8 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   let moved = held.take(1, (-30, -30, -21), ms).expect("before the write");
   assert!(moved.written);
   assert_eq!(moved.earliest, Some(Timestamp::new(-9, ms)));
-  assert!(moved.take(0, (-9, -9, 0), ms).is_some());
-  assert_eq!(moved.take(0, (-10, -10, 0), ms), None);
+  assert!(moved.take(0, (-9, -9, 0), ms).is_ok());
+  assert_eq!(moved.take(0, (-10, -10, 0), ms), Err(Early::BeforeEarliest));
 
   // Each stream's distance rounded up to its own tick.
   let mixed = of(Family::Other, "mpegts", &[video, audio]).expect("mirrored");
@@ -2701,19 +2705,22 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
     .expect("both held");
   assert!(fine.written);
   assert!(
-    fine.take(1, (-1, -1, 0), ms).is_some(),
+    fine.take(1, (-1, -1, 0), ms).is_ok(),
     "a tick of 90 kHz lifts a millisecond"
   );
-  assert_eq!(fine.take(1, (-2, -2, 0), ms), None);
+  assert_eq!(fine.take(1, (-2, -2, 0), ms), Err(Early::BeforeEarliest));
   let coarse = mixed
     .take(1, (-1, -1, 0), ms)
     .and_then(|shift| shift.take(0, (0, 0, 0), ninety))
     .expect("both held");
   assert!(
-    coarse.take(0, (-90, -90, 0), ninety).is_some(),
+    coarse.take(0, (-90, -90, 0), ninety).is_ok(),
     "a millisecond is 90 ticks"
   );
-  assert_eq!(coarse.take(0, (-91, -91, 0), ninety), None);
+  assert_eq!(
+    coarse.take(0, (-91, -91, 0), ninety),
+    Err(Early::BeforeEarliest)
+  );
 
   // The delay: written once the packets held span more than 10 s.
   let spanned = both
@@ -2725,7 +2732,7 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   assert!(late.written);
   assert_eq!(
     late.take(1, (-22, -22, -21), ms),
-    None,
+    Err(Early::BeforeEarliest),
     "the audio's, after it"
   );
   // ... but not where the stream that holds none may not be lacked.
@@ -2756,4 +2763,36 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
     .and_then(|shift| shift.take(2, (0, 0, 0), ms))
     .expect("video and data");
   assert!(written.written, "two hold a packet, as two are interleaved");
+
+  // FLV keeps the first packet it wrote as its reference, moved: a packet
+  // of the stream the delay left behind, before it, it refuses; another
+  // container takes it.
+  for (muxer, refused) in [("flv", true), ("mpegts", false)] {
+    let first = of(Family::Other, muxer, &[video, audio])
+      .expect("mirrored")
+      .take(0, (5_000, 5_000, 0), ms)
+      .and_then(|shift| shift.take(0, (15_001, 15_001, 0), ms))
+      .expect("video, past the delay");
+    assert!(first.written);
+    assert_eq!(
+      first.take(1, (2_000, 2_000, 0), ms).err(),
+      refused.then_some(Early::BeforeFirst),
+      "{muxer}"
+    );
+    assert!(first.take(1, (5_000, 5_000, 0), ms).is_ok(), "{muxer}");
+  }
+  let moved = of(Family::Other, "flv", &[video, audio])
+    .expect("mirrored")
+    .take(0, (-100, -100, 0), ms)
+    .and_then(|shift| shift.take(0, (9_901, 9_901, 0), ms))
+    .expect("video, past the delay");
+  assert!(
+    moved.take(1, (-50, -50, 0), ms).is_ok(),
+    "moved past zero, the first"
+  );
+  assert_eq!(
+    moved.take(1, (-150, -150, 0), ms),
+    Err(Early::BeforeEarliest),
+    "before zero, moved"
+  );
 }

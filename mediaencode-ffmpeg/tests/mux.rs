@@ -5966,3 +5966,60 @@ fn l69_every_mirror_moves_on_what_a_filter_puts_out() {
   );
   assert_eq!(seen[0][0].pts, Some(ms(40_000)), "the video moved with it");
 }
+
+/// **L70 — FLV refuses by name a packet decoded before the first one FLV
+/// wrote** (grep G18 of #82; table G): FLV keeps the first packet it writes
+/// as its reference, and refuses every later packet before it after taking
+/// it — "Packets are not in the proper order with respect to DTS"
+/// (`flvenc.c` 1267–1274). Beside audio that holds nothing, libavformat
+/// writes the video at 5 s once a packet 10 s on arrives (`mux.c`
+/// 939–1003): audio at 2 s after that is refused, untouched; at 5 s, taken.
+///
+/// PLANT: FLV's reference unmirrored takes the audio at 2 s, which FLV then
+/// refuses after taking it.
+#[test]
+fn l70_flv_refuses_a_packet_before_the_first_it_wrote() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, frames) = first_track(&source, TrackKind::Video, 2);
+  let (_, audio) = first_track(&source, TrackKind::Audio, 1);
+  let mut table = table_of(&source, TrackKind::Video);
+  table.extend(table_of(&source, TrackKind::Audio));
+  let target = output(&corpus, "l70.flv");
+  let mut muxer = muxer_into(&target, ContainerName::new("flv"), table);
+  for (frame, at) in frames.iter().zip([5_000, 15_001]) {
+    muxer
+      .write_video(video_at(&video_of(frame), Some(at), at))
+      .map_err(|error| error.map_packet(drop))
+      .expect("video");
+  }
+  let sound = |at: i64| {
+    AudioTrackPacket::new(
+      TrackIndex::new(1),
+      audio_of(&audio[0])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at))),
+    )
+  };
+  let early = sound(2_000);
+  let (refusal, back) = by_container(muxer.write_audio(early.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::BeforeFirstDts {
+      track: TrackIndex::new(1),
+      dts: ms(2_000),
+    }
+  );
+  untouched!(early, back);
+  muxer
+    .write_audio(sound(5_000))
+    .map_err(|error| error.map_packet(drop))
+    .expect("at the first packet FLV wrote");
+  muxer.finish().expect("finished");
+  let seen = packets(&target);
+  assert_eq!(
+    seen[1].iter().map(|seen| seen.dts).collect::<Vec<_>>(),
+    vec![Some(ms(5_000))],
+    "what was admitted"
+  );
+}
