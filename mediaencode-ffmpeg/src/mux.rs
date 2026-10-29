@@ -4452,15 +4452,19 @@ fn mono_or_stereo(layout: LayoutView<'_>) -> bool {
 /// size past one is compressed audio, of varying size; every other codec
 /// its bits a sample, in whole bytes, by its channels — PCM's — and IMA QT
 /// ADPCM is of varying size whatever its size. A size of zero — fewer than
-/// eight bits a sample — counts a packet one sample (7002–7005).
+/// eight bits a sample — counts a packet one sample (7002–7005). MS and
+/// IMA WAV ADPCM, whose packet MP4 counts as its frame size instead
+/// (6999–7001), reach no packet: MP4's tag table holds neither, and MOV's
+/// mode books them at open (table H).
 fn mp4_sample_size(codec: &StreamCodec) -> Option<u64> {
   use ffmpeg_next::ffi::AVCodecID as Id;
   let id = codec.codec();
   let is = |of: Id| id == CodecId::from_raw(of as i32);
   let bits = id.bits_per_sample();
-  if is(Id::AV_CODEC_ID_ILBC) || is(Id::AV_CODEC_ID_ADPCM_IMA_QT) {
-    None
-  } else if codec.frame_size() == 0 && bits == 0 {
+  if is(Id::AV_CODEC_ID_ILBC)
+    || is(Id::AV_CODEC_ID_ADPCM_IMA_QT)
+    || (codec.frame_size() == 0 && bits == 0)
+  {
     None
   } else if is(Id::AV_CODEC_ID_ADPCM_MS) || is(Id::AV_CODEC_ID_ADPCM_IMA_WAV) {
     Some(u64::try_from(codec.block_align()).unwrap_or(0))
@@ -9694,11 +9698,7 @@ fn check_packet_rules(
   // ([`Mp4Place`]). A configuration's packet writes no sample.
   let mp4_place = match rules.mp4_constant {
     Some(size) if !config_only => {
-      let samples = if size > 0 {
-        payload.bytes.len() as u64 / size
-      } else {
-        1
-      };
+      let samples = (payload.bytes.len() as u64).checked_div(size).unwrap_or(1);
       let counted = state.mp4_samples.saturating_add(samples);
       if counted > bounds.samples {
         return refused(PayloadRule::SampleCount);
