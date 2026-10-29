@@ -2391,8 +2391,9 @@ fn l25_mp4_refuses_ac3_it_would_drop_or_refuse() {
 
 /// **L26 — a configuration the container needs and the track does not
 /// carry is refused at open, by name, and nothing is written**: H.264
-/// without one into MP4, AV1 without one into WebM. AAC's is refused only
-/// with the automatic filters off (L29).
+/// without one into MP4, Opus without one into MP4, whose `dOps` refuses
+/// its absence at the trailer. AAC's is refused only with the automatic
+/// filters off (L29); WebM's AV1 takes its first packet's (L124).
 #[test]
 fn l26_a_missing_configuration_is_refused_at_open() {
   let Some(corpus) = Corpus::new() else { return };
@@ -2422,14 +2423,14 @@ fn l26_a_missing_configuration_is_refused_at_open() {
     open("l26.mp4", ContainerName::MP4, h264),
     Err(MuxOpenError::ConfigurationMissing { codec, .. }) if codec == CodecId::H264
   ));
-  let (av1, _) = first_track(&av1_mkv(&corpus), TrackKind::Video, 1);
-  let av1 = av1
+  let (opus, _) = first_track(&opus_mkv(&corpus), TrackKind::Audio, 1);
+  let opus = opus
     .into_iter()
     .map(|row| row.with_extradata(none()))
     .collect();
   assert!(matches!(
-    open("l26.webm", ContainerName::WEBM, av1),
-    Err(MuxOpenError::ConfigurationMissing { codec, .. }) if codec == CodecId::AV1
+    open("l26-opus.mp4", ContainerName::MP4, opus),
+    Err(MuxOpenError::ConfigurationMissing { codec, .. }) if codec == CodecId::OPUS
   ));
 }
 
@@ -15099,5 +15100,179 @@ fn l123b_ismv_takes_the_gap_short_of_it_and_before_a_key_frame() {
         .pts()
     };
     assert_eq!(ticks(at) - ticks(at - 1), gap, "{name}: the gap kept");
+  }
+}
+
+/// A metadata OBU of `len` bytes in all, of a type for private use (6),
+/// its payload zeros to its trailing bits — two bytes of size, for a
+/// payload of 128 to 16 383 bytes.
+fn av1_metadata_obu(len: usize) -> Vec<u8> {
+  let size = len - 3;
+  assert!((128..16_384).contains(&size), "a two-byte size: {size}");
+  let mut obu = vec![0x2A, (size & 0x7F) as u8 | 0x80, (size >> 7) as u8, 0x06];
+  obu.resize(len - 1, 0);
+  obu.push(0x80);
+  obu
+}
+
+/// The AV1 fixture's table with no configuration, its frames, and its
+/// `av1C`: the record's four bytes and the sequence header OBU.
+fn unconfigured_av1(corpus: &Corpus) -> (PathBuf, Vec<Video>, Vec<u8>) {
+  let av1 = av1_mkv(corpus);
+  let (table, frames) = whole_track(&av1, TrackKind::Video);
+  let av1c = stream_extradata_of(&table[0]);
+  assert_eq!(
+    av1c.len(),
+    4 + 13,
+    "the premise: the record and its sequence header"
+  );
+  (av1, frames.iter().map(video_of).collect(), av1c)
+}
+
+/// The Matroska and WebM AV1 laws' muxer: the fixture's track of no
+/// configuration, into `target`.
+fn unconfigured_av1_muxer(av1: &Path, target: &Path, container: &str) -> FfmpegOwnedMuxer<File> {
+  let table = table_of(av1, TrackKind::Video)
+    .into_iter()
+    .map(|row| row.with_extradata(Some(bytes_of(&[]))))
+    .collect();
+  muxer_into(target, ContainerName::new(container), table)
+}
+
+/// `frame` on track 0, carrying `config` as new extradata.
+fn configuring(frame: &Video, config: &[u8]) -> VideoTrackPacket<Ffmpeg, FfmpegBytes> {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let mut packet = frame.clone();
+  packet
+    .extra_mut()
+    .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, config)]);
+  VideoTrackPacket::new(TrackIndex::new(0), packet)
+}
+
+/// **L124a — Matroska and WebM take an AV1 track's first packet's
+/// configuration where the track states none** (R10, L4: ruling 4a;
+/// `matroskaenc.c` 1160–1165, 3098–3115, 1334–1369): the header reserves
+/// the track's CodecPrivate room, `(AV1_SANE_SEQUENCE_HEADER_MAX_BITS + 7)
+/// / 8 + 100` bytes, and the first packet's new extradata is written into
+/// it as `ff_isom_write_av1c` writes it — a record as it is, OBUs behind
+/// the record's four bytes — and becomes the stream's, every later one
+/// ignored. Taken, at the room's last byte: a record, and OBUs — a sequence
+/// header and a metadata OBU — each read back as written; a later packet's
+/// new extradata, past the room, taken and reported dropped, the first's
+/// not reported.
+///
+/// PLANT: Matroska's and WebM's AV1 left refused at open; the room a byte
+/// short, the 493-byte configurations refused; every new extradata judged
+/// against the room, the later one refused; the first's reported dropped.
+#[test]
+fn l124a_matroskas_av1_takes_its_first_packets_configuration() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let (av1, frames, av1c) = unconfigured_av1(&corpus);
+  let new_extradata = |line: &Uncarried| matches!(line, Uncarried::SideData { kind, .. } if *kind == T::AV_PKT_DATA_NEW_EXTRADATA as i32);
+  // The record, and the OBUs, each written into 493 bytes.
+  let record = [&av1c[..], &av1_metadata_obu(493 - av1c.len())].concat();
+  let obus = [&av1c[4..], &av1_metadata_obu(493 - av1c.len())].concat();
+  let written_obus = [&av1c[..4], &obus[..]].concat();
+  for container in ["mkv", "webm"] {
+    let name = if container == "mkv" {
+      "matroska"
+    } else {
+      "webm"
+    };
+    for (form, config, written) in [
+      ("a record", &record, &record),
+      ("OBUs", &obus, &written_obus),
+    ] {
+      let what = format!("{container}, {form}");
+      let target = output(&corpus, &format!("l124a-{}.{container}", form.len()));
+      let mut muxer = unconfigured_av1_muxer(&av1, &target, name);
+      muxer
+        .write_video(configuring(&frames[0], config))
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{what}: the first frame: {error:?}"));
+      assert!(
+        lines(muxer.report(), new_extradata).is_empty(),
+        "{what}: the configuration is not dropped"
+      );
+      muxer
+        .write_video(configuring(
+          &frames[1],
+          &[&av1c[..], &av1_metadata_obu(600)].concat(),
+        ))
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{what}: a later configuration: {error:?}"));
+      assert_eq!(
+        lines(muxer.report(), new_extradata),
+        vec![Uncarried::SideData {
+          track: TrackIndex::new(0),
+          kind: T::AV_PKT_DATA_NEW_EXTRADATA as i32,
+          name: Some("New Extradata"),
+          fate: SideDataFate::Dropped,
+        }],
+        "{what}: the later one ignored"
+      );
+      for frame in &frames[2..] {
+        muxer
+          .write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone()))
+          .map_err(|error| error.map_packet(drop))
+          .unwrap_or_else(|error| panic!("{what}: a frame: {error:?}"));
+      }
+      muxer
+        .finish()
+        .unwrap_or_else(|error| panic!("{what}: {error:?}"));
+      assert_eq!(
+        stream_extradata_of(&table_of(&target, TrackKind::Video)[0]),
+        *written,
+        "{what}: read back configured"
+      );
+      assert_eq!(packet_count(&target), frames.len(), "{what}: every frame");
+    }
+  }
+}
+
+/// **L124b — Matroska and WebM refuse an AV1 track's first configuration
+/// past the room their header reserved** (R10, L4; `matroskaenc.c`
+/// 1349–1358): past it, `mkv_update_codecprivate` writes the record's first
+/// four bytes alone, its OBUs — the sequence header among them — lost.
+/// Refused by name, the packet handed back, a byte past the room, as a
+/// record and as OBUs; and a first packet bringing no configuration, which
+/// Matroska refuses after taking it (3108–3109).
+///
+/// PLANT: the room unjudged, both taken; the OBUs counted without their
+/// metadata, the OBUs taken; a record counted as its four bytes, the
+/// record taken; the first packet's configuration not required, the
+/// frame of none taken.
+#[test]
+fn l124b_matroskas_av1_refuses_a_configuration_past_its_room() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (av1, frames, av1c) = unconfigured_av1(&corpus);
+  let record = [&av1c[..], &av1_metadata_obu(494 - av1c.len())].concat();
+  let obus = [&av1c[4..], &av1_metadata_obu(494 - av1c.len())].concat();
+  for container in ["mkv", "webm"] {
+    let name = if container == "mkv" {
+      "matroska"
+    } else {
+      "webm"
+    };
+    for (form, config) in [("a record", &record), ("OBUs", &obus)] {
+      let what = format!("{container}, {form}");
+      let target = output(&corpus, &format!("l124b-{}.{container}", form.len()));
+      let mut muxer = unconfigured_av1_muxer(&av1, &target, name);
+      let offered = configuring(&frames[0], config);
+      let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+      assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{what}");
+      untouched!(offered, back);
+    }
+    let target = output(&corpus, &format!("l124b-none.{container}"));
+    let mut muxer = unconfigured_av1_muxer(&av1, &target, name);
+    let offered = VideoTrackPacket::new(TrackIndex::new(0), frames[0].clone());
+    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    assert_eq!(
+      refusal,
+      payload(PayloadRule::ConfigurationAbsent),
+      "{container}: no configuration"
+    );
+    untouched!(offered, back);
   }
 }

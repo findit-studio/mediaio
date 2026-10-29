@@ -472,8 +472,8 @@ fn a_configuration_is_judged_and_its_rewrite_reported() {
       false,
     ),
     (Family::Matroska, Audited::Matroska, CodecId::AAC, true),
-    (Family::Matroska, Audited::Matroska, CodecId::AV1, false),
-    (Family::WebM, Audited::WebM, CodecId::AV1, false),
+    (Family::Matroska, Audited::Matroska, CodecId::AV1, true),
+    (Family::WebM, Audited::WebM, CodecId::AV1, true),
   ] {
     assert_eq!(
       first_packet_configures(family, audited, codec),

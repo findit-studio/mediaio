@@ -333,6 +333,12 @@ crate moves only when it changes.
   colours, the rest written unset, refused (`ConfigurationInvalid`); new
   extradata, which a new sample description holds unconverted, refused
   (`PayloadRule::NewExtradata`).
+  Matroska's and WebM's AV1 of no configuration opens, its first packet's
+  new extradata written as its CodecPrivate, as `ff_isom_write_av1c`
+  writes it, into the room the header reserved; one past that room, of
+  which Matroska would write the first four bytes alone, its OBUs lost,
+  refused (`PayloadRule::NewExtradata`), as is a first packet bringing none
+  (`PayloadRule::ConfigurationAbsent`).
   The configuration writers MP4 and FLV call and ignore the answer of —
   `avcC`, `hvcC`, `vvcC`, `evcC`, `lvcC`, `vpcC`, `av3c` and `dvc1` —
   mirrored from their source: a configuration a stream the standards

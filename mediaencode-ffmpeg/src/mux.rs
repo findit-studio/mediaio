@@ -535,7 +535,7 @@
 //! |---|---|---|
 //! | new extradata: AAC's an AudioSpecificConfig libavcodec parses, within the space reserved for it — the configuration's length, or `MAX_PCE_SIZE` where there was none — and none where the header reserved no output sampling frequency, which every update rewrites after the sampling frequency, the header writing it only where the stated configuration has an extension sample rate or none is stated | `mkv_check_new_extra_data` 3065–3082; `mkv_update_codecprivate` 1334–1365; `get_aac_sample_rates` 1116–1150; 2129–2135 | [`PayloadRule::NewExtradata`] — on the first frame AAC's filter converts, the configuration the filter makes in its place, held to the same space and the same reservation ([`aac_output_rate_reserved`]) |
 //! | new extradata: FLAC's of the configuration's length | 3084–3097 | [`PayloadRule::FlacStreamInfo`] |
-//! | AV1 or AAC with no configuration: every packet refused but one bringing new extradata, which configures the track (3065–3087, 3098–3115) | AV1's refused at open ([`MuxOpenError::ConfigurationMissing`]); AAC's taken where its first packet brings one, an ADTS frame or new extradata ([`PayloadRule::ConfigurationAbsent`] where it does not; R9: ruling 4a — L108) |
+//! | AV1 or AAC with no configuration: every packet refused but one bringing new extradata, which configures the track (3065–3087, 3098–3115); AV1's written into the CodecPrivate room the header reserved, `(AV1_SANE_SEQUENCE_HEADER_MAX_BITS + 7) / 8 + 100` bytes, as `ff_isom_write_av1c` writes it, past which only its first four bytes are written, its OBUs lost (1160–1165, 1334–1369), and every later one ignored | taken where the first packet brings one — AAC's an ADTS frame or new extradata, AV1's new extradata whose `av1C` fits the room ([`PayloadRule::ConfigurationAbsent`] where it brings none; [`PayloadRule::NewExtradata`] where it does not fit, or `ff_isom_write_av1c` fails on it; R9: ruling 4a — L108; R10, L4 — L124) |
 //! | a packet with no timestamp | 3140–3143 | a reordering stream's refused ([`FfmpegMuxRefusal::MissingPts`]); libavformat fills it otherwise |
 //! | a time before the earliest written, which libavformat's first write moves every stream's times past (`mux.c` 636–717) | 2089–2104, 3538–3541 | mirrored, reported ([`Uncarried::TimesShifted`]); a packet after that write the move leaves before it refused ([`FfmpegMuxRefusal::BeforeZero`]) — every one where a video track of no native id makes the times judged uncertain (2025–2081) |
 //! | the Annex B rewrite | 3574–3582 | reported ([`Rewrite::LengthPrefixed`]); its size, table B |
@@ -2644,12 +2644,13 @@ pub enum PayloadRule {
   /// 1252–1263); and the tracks MP4 and Matroska take their first packet's
   /// new extradata as the configuration of (R9: the coordinator's ruling
   /// 4a) — MP4's AAC, AV1, FLAC and MPEG-4 ALS, which MP4 writes its sample
-  /// description of at the trailer (`movenc.c` 7412–7428), Matroska's AAC,
-  /// whose CodecPrivate its header reserved room for (`matroskaenc.c`
-  /// 3065–3082) — whose first packet, of no such side data, nor an ADTS
-  /// header AAC's filter converts, leaves MP4 writing raw AAC of no
-  /// configuration and an empty `av1C`, `dfLa` or `esds`, and Matroska
-  /// refusing the packet after taking it (3083–3087).
+  /// description of at the trailer (`movenc.c` 7412–7428), Matroska's AAC
+  /// and Matroska's and WebM's AV1, whose CodecPrivate their header
+  /// reserved room for (`matroskaenc.c` 3065–3082, 3098–3115; R10, L4) —
+  /// whose first packet, of no such side data, nor an ADTS header AAC's
+  /// filter converts, leaves MP4 writing raw AAC of no configuration and an
+  /// empty `av1C`, `dfLa` or `esds`, and Matroska refusing the packet after
+  /// taking it (3083–3087, 3108–3109).
   #[error("the track states no configuration, and its first packet brings none")]
   ConfigurationAbsent,
   /// WAV: a packet after which the file would pass the 4 GiB its RIFF
@@ -4310,7 +4311,21 @@ enum ExtradataRule {
     reserved: usize,
     output_reserved: bool,
   },
+  /// Matroska and WebM AV1 of no configuration: the first packet's, which
+  /// `mkv_check_new_extra_data` writes as the track's CodecPrivate where
+  /// the stream holds none, every later one ignored (`matroskaenc.c`
+  /// 3098–3115) — an `av1C` `ff_isom_write_av1c` writes, into the room the
+  /// header reserved, past which Matroska writes the record's first four
+  /// bytes alone, its OBUs and their sequence header lost
+  /// (`mkv_update_codecprivate`, 1334–1369; [`MATROSKA_AV1_ROOM`]).
+  MatroskaAv1,
 }
+
+/// The CodecPrivate room Matroska's header reserves for an AV1 track of no
+/// configuration: `(AV1_SANE_SEQUENCE_HEADER_MAX_BITS + 7) / 8 + 100` bytes
+/// (`mkv_assemble_native_codecprivate`, `matroskaenc.c` 1160–1165;
+/// `libavcodec/av1.h` 190).
+const MATROSKA_AV1_ROOM: usize = 3138_usize.div_ceil(8) + 100;
 
 /// MP4 AC-3 and E-AC-3: how MP4's handling takes a track's packets
 /// ([`ac3_packet`]).
@@ -4556,6 +4571,8 @@ impl PacketRules {
           },
           output_reserved: aac_output_rate_reserved(codec.extradata()),
         }
+      } else if either_matroska && id == CodecId::AV1 && codec.extradata().is_empty() {
+        ExtradataRule::MatroskaAv1
       } else {
         ExtradataRule::Any
       },
@@ -4840,6 +4857,25 @@ fn av1c_written(config: &[u8]) -> bool {
     rest = &rest[obu.len..];
   }
   sequences == 1
+}
+
+/// The bytes `ff_isom_write_av1c` writes of `config`, a configuration it
+/// takes ([`av1c_written`]): a record as it is; of OBUs, the record's four
+/// bytes, then the sequence header OBU and every metadata OBU, whole
+/// (`av1.c` 399–495).
+fn av1c_written_len(config: &[u8]) -> usize {
+  if config.first().is_some_and(|first| first & 0x80 != 0) {
+    return config.len();
+  }
+  let mut len = 4;
+  let mut rest = config;
+  while let Some(obu) = obu_header(rest) {
+    if matches!(obu.kind, AV1_OBU_SEQUENCE_HEADER | AV1_OBU_METADATA) {
+      len += obu.len;
+    }
+    rest = &rest[obu.len..];
+  }
+  len
 }
 
 /// Whether libavformat's `parse_sequence_header` reads the sequence header
@@ -6586,6 +6622,11 @@ impl SideRules {
         && (self.codec == CodecId::AAC || self.codec == CodecId::FLAC)
       {
         Some(PossiblyDropped)
+      } else if either_matroska && self.codec == CodecId::AV1 && self.extradata.is_empty() && first
+      {
+        // An AV1 track of no configuration takes its first packet's as its
+        // CodecPrivate (3098–3115).
+        None
       } else {
         Some(Dropped)
       }
@@ -8992,6 +9033,9 @@ fn check_packet_rules(
         output_reserved
           && (replaced || (new.len() <= reserved && audio_specific_config_parses(new)))
       }
+      ExtradataRule::MatroskaAv1 => {
+        state.configured || (av1c_written(new) && av1c_written_len(new) <= MATROSKA_AV1_ROOM)
+      }
     };
     if !taken {
       return refused(PayloadRule::NewExtradata);
@@ -10573,16 +10617,19 @@ fn configuration_missing(
 /// header, nor AVIF's, each as R8 left it (the owner's word, Q870) — and
 /// Matroska's AAC, whose CodecPrivate and sampling frequencies the first
 /// packet's new extradata rewrites in the room the header reserved
-/// (`mkv_check_new_extra_data`, `matroskaenc.c` 3065–3082). Matroska's and
-/// WebM's AV1 of no configuration stays refused at open.
+/// (`mkv_check_new_extra_data`, `matroskaenc.c` 3065–3082), and Matroska's
+/// and WebM's AV1, whose CodecPrivate the first packet's new extradata
+/// writes into the room the header reserved, the stream's extradata set
+/// from it (3098–3115, 1360–1364; R10, L4).
 fn first_packet_configures(family: Family, audited: Audited, codec: CodecId) -> bool {
   match family {
     Family::Mp4 => {
       !matches!(audited, Audited::Mov(MovMode::Ism | MovMode::Avif))
         && [CodecId::AAC, CodecId::AV1, CodecId::FLAC, MP4ALS].contains(&codec)
     }
-    Family::Matroska => codec == CodecId::AAC,
-    Family::WebM | Family::Other => false,
+    Family::Matroska => codec == CodecId::AAC || codec == CodecId::AV1,
+    Family::WebM => codec == CodecId::AV1,
+    Family::Other => false,
   }
 }
 
