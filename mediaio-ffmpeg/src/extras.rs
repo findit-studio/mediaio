@@ -523,8 +523,8 @@ impl SubtitlePacketExtra {
   /// Returns the raw side-data entries from `AVPacket.side_data`.
   ///
   /// A subtitle packet's side data is rare but not absent — and a
-  /// packet that carries *nothing else* is exactly the case this seat
-  /// exists for: with no seat, a side-data-only packet has nowhere to
+  /// packet that carries *nothing else* is exactly the case this slot
+  /// exists for: with no slot, a side-data-only packet has nowhere to
   /// put its only content.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn side_data(&self) -> &[SideDataEntry] {
@@ -772,7 +772,7 @@ impl ImageOrientation {
   /// `None` when `bytes` is not exactly
   /// [`Self::DISPLAY_MATRIX_BYTES`] long — a malformed entry is not an
   /// orientation, and guessing one from a truncated matrix would be
-  /// the invention this seat exists to avoid.
+  /// the invention this slot exists to avoid.
   ///
   /// The entries are `int32_t` in **native** byte order: the side data
   /// is a C array as it sits in memory, not a wire format.
@@ -919,20 +919,20 @@ impl ImageOrientation {
 /// Per-[`ImageFrame`](mediaspine::frame::ImageFrame) extras — cover
 /// art, an embedded thumbnail, a poster frame.
 ///
-/// **One seat, deliberately.** This household is minimal at birth
+/// **One slot, deliberately.** This household is minimal at birth
 /// because a still image's `AVFrame` carries almost nothing a motion
 /// frame's does: no picture type, no field order, no best-effort
-/// timestamp, no SAR worth a seat. What it does carry is side data,
+/// timestamp, no SAR worth a slot. What it does carry is side data,
 /// and that is what is here.
 ///
-/// **EXIF orientation takes a seat here**, read off the frame's
+/// **EXIF orientation takes a slot here**, read off the frame's
 /// `AV_FRAME_DATA_DISPLAYMATRIX` side data — see [`ImageOrientation`]
 /// for the measurement that establishes that road, and for why an
 /// earlier reading of libavcodec (which put orientation in
 /// `AVFrame.metadata`) was wrong about where it arrives.
 ///
 /// **An ICC profile** arrives as side data too
-/// (`AV_FRAME_DATA_ICC_PROFILE`) and does *not* get a seat: it is a
+/// (`AV_FRAME_DATA_ICC_PROFILE`) and does *not* get a slot: it is a
 /// payload, not a fact — kilobytes of colour transform this crate has
 /// no vocabulary for and no business parsing. [`Self::side_data`]
 /// carries it unparsed and whole for a consumer that does. That is the
@@ -1133,10 +1133,10 @@ pub use mediaspine::hdr::{ContentLightLevel, MasteringDisplay};
 
 /// Per-`DataPacket` extras — timecode, KLV, timed ID3.
 ///
-/// The same three seats as [`VideoPacketExtra`]. The side-data list was
+/// The same three slots as [`VideoPacketExtra`]. The side-data list was
 /// left off at first — data demuxers carry their whole payload in the
 /// packet body — and then earned its place: a packet with no body and
-/// only side data is a real packet, and without this seat its only
+/// only side data is a real packet, and without this slot its only
 /// content would have nowhere to go.
 #[derive(Clone, Debug, Default)]
 pub struct DataPacketExtra {
@@ -1370,12 +1370,12 @@ impl ParameterFootprint {
 /// [`CodecTicket`](crate::ticket::CodecTicket) raises the stake: it
 /// enumerates **every** field by hand, heap and scalar alike, so a new
 /// *scalar* — which the bounded clone's bytewise sweep would have
-/// carried for free — is now a seat the mirror would drop. A field
+/// carried for free — is now a slot the mirror would drop. A field
 /// that is removed fails the build on its own; a field that is added
 /// fails it here.
 ///
 /// A size assertion is a tripwire, not a proof: it catches a struct
-/// that grew or was reordered, which is how a new seat arrives in
+/// that grew or was reordered, which is how a new slot arrives in
 /// practice. Gated to 64-bit because the number is pointer-width
 /// dependent and every target this crate links FFmpeg on is 64-bit;
 /// elsewhere the hand-written clone still runs, it just loses the
@@ -1390,7 +1390,7 @@ const _: () = {
   );
 };
 
-/// Measures an `AVCodecParameters`' heap seats without allocating
+/// Measures an `AVCodecParameters`' heap slots without allocating
 /// anything.
 ///
 /// `None` when a declared size cannot be added up — a count or length
@@ -1525,14 +1525,14 @@ pub enum ExtradataPolicy {
   Omit,
 }
 
-/// The `ENOMEM` a heap seat's copy reports when its allocation fails.
+/// The `ENOMEM` a heap slot's copy reports when its allocation fails.
 ///
 /// [`ParametersError::Alloc`] names the *destination struct*
-/// failing to allocate; a seat that fails after that is the copy
+/// failing to allocate; a slot that fails after that is the copy
 /// failing part way, which is what
 /// [`ParametersError::Copy`] was minted for and what
 /// `avcodec_parameters_copy` itself would have returned here.
-fn seat_copy_failed(stream_index: usize) -> ParametersError {
+fn slot_copy_failed(stream_index: usize) -> ParametersError {
   ParametersError::Copy(ParametersCopy::new(
     stream_index,
     ffmpeg_next::Error::Other {
@@ -1560,7 +1560,7 @@ fn seat_copy_failed(stream_index: usize) -> ParametersError {
 /// wholesale copy is gone from every attacker-facing path and this
 /// function replaces it.
 ///
-/// The shape that makes the class unable to recur: the heap seats are
+/// The shape that makes the class unable to recur: the heap slots are
 /// enumerated **by hand**, each is measured before it is copied, and
 /// the whole footprint is admitted against a budget first. A field
 /// nobody enumerated is a field that is not copied — which loses data
@@ -1570,7 +1570,7 @@ fn seat_copy_failed(stream_index: usize) -> ParametersError {
 /// # What it copies
 ///
 /// Every scalar, by a bytewise copy of the struct — so a *scalar* field
-/// a future FFmpeg adds travels for free. Then the three heap seats are
+/// a future FFmpeg adds travels for free. Then the three heap slots are
 /// nulled on the destination (the bytewise copy left them aliasing the
 /// source) and rebuilt one at a time:
 ///
@@ -1666,7 +1666,7 @@ pub(crate) fn bounded_clone_parameters_with(
   // SAFETY: `src` and `dst` are both live, non-null, distinct
   // `AVCodecParameters` allocations. The bytewise copy carries every
   // scalar across — including any this crate has never heard of — and
-  // leaves the three pointer seats aliasing `src`, which the very next
+  // leaves the three pointer slots aliasing `src`, which the very next
   // statements overwrite before anything can observe or free them.
   unsafe {
     core::ptr::copy_nonoverlapping(src, dst, 1);
@@ -1693,10 +1693,10 @@ pub(crate) fn bounded_clone_parameters_with(
     unsafe {
       let buffer = ffmpeg_next::ffi::av_mallocz(padded) as *mut u8;
       if buffer.is_null() {
-        return Err(seat_copy_failed(stream_index));
+        return Err(slot_copy_failed(stream_index));
       }
       let payload =
-        usize::try_from((*src).extradata_size).map_err(|_| seat_copy_failed(stream_index))?;
+        usize::try_from((*src).extradata_size).map_err(|_| slot_copy_failed(stream_index))?;
       core::ptr::copy_nonoverlapping((*src).extradata, buffer, payload);
       (*dst).extradata = buffer;
       (*dst).extradata_size = (*src).extradata_size;
@@ -1714,10 +1714,10 @@ pub(crate) fn bounded_clone_parameters_with(
       let entries = usize::try_from(count)
         .ok()
         .and_then(|c| c.checked_mul(core::mem::size_of::<ffmpeg_next::ffi::AVPacketSideData>()))
-        .ok_or_else(|| seat_copy_failed(stream_index))?;
+        .ok_or_else(|| slot_copy_failed(stream_index))?;
       let array = ffmpeg_next::ffi::av_mallocz(entries) as *mut ffmpeg_next::ffi::AVPacketSideData;
       if array.is_null() {
-        return Err(seat_copy_failed(stream_index));
+        return Err(slot_copy_failed(stream_index));
       }
       // Attached before the payloads are filled in, so a failure part
       // way leaves `out`'s own destructor a well-formed array to walk:
@@ -1744,7 +1744,7 @@ pub(crate) fn bounded_clone_parameters_with(
         if size > 0 && !data.is_null() {
           let payload = ffmpeg_next::ffi::av_mallocz(size) as *mut u8;
           if payload.is_null() {
-            return Err(seat_copy_failed(stream_index));
+            return Err(slot_copy_failed(stream_index));
           }
           core::ptr::copy_nonoverlapping(data, payload, size);
           core::ptr::write_unaligned(core::ptr::addr_of_mut!((*into).data), payload);
@@ -1799,7 +1799,7 @@ pub(crate) fn bounded_clone_parameters_with(
 /// affinity at all.
 ///
 /// The answer is the mirror this crate already lives by rather than an
-/// `unsafe impl` over FFI: [`CodecTicket`] holds every seat as owned
+/// `unsafe impl` over FFI: [`CodecTicket`] holds every slot as owned
 /// bytes and plain integers, so `Send + Sync` are structural facts and
 /// there is no safety argument to get wrong. See
 /// `crate::ticket::tests::the_ticket_is_send_and_sync` for the pins,
@@ -1909,7 +1909,7 @@ impl TrackExtra {
   /// failure here is the difference between a decoder that is not
   /// opened and one opened on parameters that are not the file's.
   ///
-  /// Every seat the file declared is written back, so what a decoder
+  /// Every slot the file declared is written back, so what a decoder
   /// receives is what the demuxer read — proved field by field, per
   /// codec, by `tests/codec_ticket_parity.rs`.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -1938,7 +1938,7 @@ impl TrackExtra {
   pub const fn frame_count(&self) -> Option<i64> {
     self.frame_count
   }
-  /// Returns the stream's owned codec ticket — every seat of its
+  /// Returns the stream's owned codec ticket — every slot of its
   /// `AVCodecParameters`, and what [`Self::clone_parameters`] rebuilds
   /// a decoder's parameters from.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -2046,7 +2046,7 @@ mod tests {
     assert_eq!(PictureType::default(), PictureType::Unspecified);
   }
 
-  /// Builds an `AVCodecParameters` with the heap seats a file
+  /// Builds an `AVCodecParameters` with the heap slots a file
   /// controls, so the preflight and the bounded clone can be driven
   /// without a container.
   ///
@@ -2091,10 +2091,10 @@ mod tests {
   }
 
   #[test]
-  fn the_measurement_counts_every_heap_seat_and_allocates_nothing() {
+  fn the_measurement_counts_every_heap_slot_and_allocates_nothing() {
     // The inventory the bounded clone is written against: `extradata`,
     // `coded_side_data` (payload *and* descriptor array), and a custom
-    // channel map. A seat the measurement misses is a seat the budget
+    // channel map. A slot the measurement misses is a slot the budget
     // never sees, which is how this class kept coming back.
     const PAD: usize = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
     const DESCRIPTOR: usize = core::mem::size_of::<ffmpeg_next::ffi::AVPacketSideData>();
@@ -2301,7 +2301,7 @@ mod tests {
   #[test]
   fn the_four_mirrored_tags_are_the_ones_exif_says_they_are() {
     // 2, 4, 5, 7 — and this is exactly the half `av_display_rotation_get`
-    // cannot distinguish, which is why the seat is eight-valued.
+    // cannot distinguish, which is why the slot is eight-valued.
     for (tag, orientation, _) in MEASURED {
       assert_eq!(
         orientation.is_mirrored(),
@@ -2443,7 +2443,7 @@ mod tests {
   }
 
   #[test]
-  fn the_orientation_seat_rides_the_image_extras() {
+  fn the_orientation_slot_rides_the_image_extras() {
     let extra = ImageFrameExtra::default();
     assert_eq!(extra.orientation(), None, "absent until a file says");
 
@@ -2457,7 +2457,7 @@ mod tests {
   }
 
   #[test]
-  fn the_image_household_is_one_seat() {
+  fn the_image_household_is_one_slot() {
     let extra = ImageFrameExtra::default();
     assert!(extra.side_data().is_empty());
     let carried = ImageFrameExtra::new().with_side_data(vec![SideDataEntry::new(

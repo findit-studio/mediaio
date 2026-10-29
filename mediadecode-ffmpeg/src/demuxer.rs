@@ -351,7 +351,7 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// the **following** packet. Compressed data and subtitle cues went
   /// missing under memory pressure, quietly.
   ///
-  /// So the read and the conversion are one transaction with a seat
+  /// So the read and the conversion are one transaction with a slot
   /// between them: a transient refusal parks the packet here and the
   /// next pull re-attempts *this* packet before reading another. It is
   /// the same park-then-replay the decode household already runs —
@@ -410,7 +410,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     request: DemuxerOpen,
   ) -> Result<Self, DemuxError> {
     let limits = request.limits();
-    // **The probe knobs, set before libavformat reads a byte.** See
+    // **The probe options, set before libavformat reads a byte.** See
     // [`DemuxLimits::max_probe_bytes`]: `avformat_open_input` and
     // `avformat_find_stream_info` build the attachment, extradata and
     // coded-side-data buffers themselves, so every budget that measures
@@ -507,9 +507,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
         meter.budget(),
       )));
     }
-    // Open and analysed: the seat bounds *probing*, and reading the
+    // Open and analysed: the slot bounds *probing*, and reading the
     // media itself afterwards is the caller's business, packet by
-    // packet, already bounded by the packet seats.
+    // packet, already bounded by the packet slots.
     meter.release();
     // A panic libavformat tolerated (a failed probe it recovered from)
     // still poisoned the reader; the session must not open over it.
@@ -523,7 +523,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
 
   /// Borrows the wrapped `ffmpeg::format::context::Input` — for
   /// `av_dump_format`, container-level metadata, and anything else the
-  /// portable track and chapter tables have no seat for.
+  /// portable track and chapter tables have no slot for.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) const fn input_impl(&self) -> &Input {
     &self.input
@@ -947,7 +947,7 @@ fn duration_source(method: i32) -> DurationSource {
 ///
 /// # What this bounds
 ///
-/// This is the only seat in the crate that reaches *behind*
+/// This is the only slot in the crate that reaches *behind*
 /// libavformat: `avformat_open_input` and `avformat_find_stream_info`
 /// build the attached picture, the extradata and the coded side data
 /// out of the file themselves, so every budget measuring this crate's
@@ -1358,11 +1358,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       return Err(panicked);
     }
     sought?;
-    // **The seat is cleared by a seek that happened, not by one that
+    // **The slot is cleared by a seek that happened, not by one that
     // was attempted.** A parked packet belongs to the position the
     // session is leaving, so a successful seek discards it. A *failed*
     // one leaves the session where it was — and that packet is off the
-    // wire, so dropping it here would be the same silent loss the seat
+    // wire, so dropping it here would be the same silent loss the slot
     // exists to prevent, with no re-read able to recover it.
     //
     // FFmpeg does not specify where a container sits after a seek that
@@ -1966,8 +1966,8 @@ impl ChapterTitleBudgetExhausted {
 /// exceed what the caller allowed, and a caller answers it by raising
 /// [`DemuxLimits::max_total_chapter_title_bytes`](crate::DemuxLimits::max_total_chapter_title_bytes).
 /// This one means a single value runs past a structural cap this crate
-/// owns and no seat can move — folding the two together would offer a
-/// knob that cannot fix it.
+/// owns and no slot can move — folding the two together would offer an
+/// option that cannot fix it.
 ///
 /// Refused rather than truncated (a truncated title is a different
 /// title), and refused *visibly*: reporting it as an absent title, as
@@ -2793,7 +2793,7 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
 /// passes stay one rule.
 ///
 /// `nb_chapters` is file-controlled and libavformat has no
-/// `max_chapters` knob to bound it with, so this crate judges the count
+/// `max_chapters` option to bound it with, so this crate judges the count
 /// itself before reserving anything —
 /// [`DemuxLimits::max_chapters`](crate::DemuxLimits::max_chapters), the
 /// same posture [`admit_streams`] takes for the track table. Past the
@@ -4332,7 +4332,7 @@ fn admit_streams(input: &Input, limits: DemuxLimits) -> Result<(), DemuxError> {
       //
       // The budget passed here is deliberately `usize::MAX`: the size
       // question belongs to `charge_attachment` below, which answers it
-      // as `AttachmentTooLarge` against the attachment seats rather than
+      // as `AttachmentTooLarge` against the attachment slots rather than
       // as a packet's own ceiling. This call is asked only for the
       // structural answers.
       //
@@ -4438,7 +4438,7 @@ fn stream_timebase(index: usize, declared: Rational) -> Result<Timebase, DemuxEr
 /// stream has no timebase yet" default, which ordinary containers carry
 /// on untimed streams, and passing it through is reporting rather than
 /// guessing. See [`positive_rational_to_timebase`] for the stricter
-/// rule the seats that cannot mean *absent* take.
+/// rule the slots that cannot mean *absent* take.
 ///
 /// # Why this is fallible now
 ///
@@ -4459,9 +4459,9 @@ fn rational_to_timebase(value: Rational) -> Option<Timebase> {
 
 /// [`rational_to_timebase`], and the numerator must be positive too.
 ///
-/// The rule for a seat where a zero numerator cannot mean "absent".
+/// The rule for a slot where a zero numerator cannot mean "absent".
 ///
-/// A chapter's `time_base` is one such seat: `avpriv_new_chapter` takes
+/// A chapter's `time_base` is one such slot: `avpriv_new_chapter` takes
 /// it as an argument, so whatever wrote the chapter wrote its ruler
 /// too, and `0/den` there is not an unset default but a declaration
 /// that every boundary in the table is the same instant — which is the
@@ -5698,7 +5698,7 @@ mod tests {
         .map(|tb| (tb.num(), tb.den().get()))
         .ok(),
       Some((0, 1)),
-      "`0/1` is not malformed for a track seat — see the lane below",
+      "`0/1` is not malformed for a track slot — see the lane below",
     );
   }
 
@@ -5706,7 +5706,7 @@ mod tests {
   /// and the disagreement is the point.
   ///
   /// `0/1` is libavformat's own default for a stream whose demuxer
-  /// never set one, so a track seat reads it as the container declaring
+  /// never set one, so a track slot reads it as the container declaring
   /// nothing. A chapter's ruler is written by whatever wrote the
   /// chapter, so the same value there is a claim that every boundary in
   /// the table falls on one instant — malformed, and refused.

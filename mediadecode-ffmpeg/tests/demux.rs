@@ -161,7 +161,7 @@ fn a_track_row_carries_its_codec_parameters_and_attachment_identity() {
     Some("application/x-truetype-font"),
   );
 
-  // The ticket seat is what opens a decoder for the track. Its medium
+  // The ticket slot is what opens a decoder for the track. Its medium
   // is read as the raw `AVMediaType` it is on the wire — no bindgen
   // enum is materialised out of a value a container controls.
   assert_eq!(
@@ -308,7 +308,7 @@ fn a_track_row_carries_the_language_the_container_declares() {
 }
 
 /// **`und` is a declaration and `None` is the absence of one**, and the
-/// seat keeps them apart.
+/// slot keeps them apart.
 ///
 /// An ISOBMFF `mdhd` has a language field it must fill, so an untagged
 /// MP4 track is written `und` — *undetermined*, which the file really
@@ -1172,7 +1172,7 @@ fn a_malformed_chapter_timebase_is_refused_by_name() {
 /// **The chapter count is judged before the table is reserved.**
 ///
 /// `nb_chapters` is file-controlled and libavformat has no
-/// `max_chapters` knob, so a header can declare an enormous table for
+/// `max_chapters` option, so a header can declare an enormous table for
 /// a handful of bytes and this crate's mirror — which owns a title per
 /// row — is the larger of the two. The ceiling is this crate's own.
 #[test]
@@ -1606,7 +1606,7 @@ fn a_packets_side_data_arrives_with_it() {
   // least one packet with real side data — `AV_PKT_DATA_SKIP_SAMPLES`
   // (kind 11), the encoder-delay trim an MP3 or AAC stream needs to be
   // cut correctly. The extras have always documented a `side_data`
-  // seat; nothing ever filled it, so that trim was dropped at the
+  // slot; nothing ever filled it, so that trim was dropped at the
   // boundary on every packet of every file.
   const SKIP_SAMPLES: i32 = 11;
 
@@ -2183,7 +2183,7 @@ fn the_probe_budget_refuses_an_open_before_libavformat_builds_the_container() {
   use mediadecode_ffmpeg::{DemuxError, DemuxLimits};
   let Some(corpus) = Corpus::new() else { return };
 
-  // **The one seat that reaches behind libavformat.** Every other
+  // **The one slot that reaches behind libavformat.** Every other
   // budget here measures a copy *this crate* makes, and on the demux
   // road that is always after `avformat_open_input` and
   // `avformat_find_stream_info` have already built the attached
@@ -2225,10 +2225,10 @@ fn the_probe_budget_refuses_an_open_before_libavformat_builds_the_container() {
     Ok(_) => panic!("a 1 KiB probe budget opened a whole container"),
   }
 
-  // And the defaults open the same file, so the seat is a seat and not
+  // And the defaults open the same file, so the slot is a slot and not
   // a wall. The budget is released once the container is analysed:
   // reading the media afterwards is the caller's own business, packet
-  // by packet, already bounded by the packet seats.
+  // by packet, already bounded by the packet slots.
   let mut demuxer = FfmpegDemuxer::open_reader_with(
     std::io::Cursor::new(bytes),
     Some("x.mp3"),
@@ -2244,7 +2244,7 @@ fn the_probe_budget_refuses_an_open_before_libavformat_builds_the_container() {
 }
 
 #[test]
-fn the_path_entrypoint_carries_the_probe_knobs_too() {
+fn the_path_entrypoint_carries_the_probe_options_too() {
   use mediadecode_ffmpeg::DemuxLimits;
   let Some(corpus) = Corpus::new() else { return };
   let path = corpus.cover_art_mp3();
@@ -2255,7 +2255,7 @@ fn the_path_entrypoint_carries_the_probe_knobs_too() {
   // `formatprobesize` / `max_streams` reach it through the options
   // dictionary, and that is the residual stated in the accounting.
   //
-  // What this lane pins is that the knobs are actually set: a
+  // What this lane pins is that the options are actually set: a
   // `max_streams` of zero is a value libavformat itself refuses to
   // open under, so reaching it proves the dictionary arrived.
   assert!(

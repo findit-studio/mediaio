@@ -224,9 +224,9 @@ impl ReadMeter {
   }
   /// Lifts the ceiling once the container is open and analysed.
   ///
-  /// The seat bounds *probing*: reading the media itself afterwards is
+  /// The slot bounds *probing*: reading the media itself afterwards is
   /// the caller's own business, packet by packet, and already bounded
-  /// by the packet seats.
+  /// by the packet slots.
   pub fn release(&self) {
     self.budget.store(u64::MAX, Ordering::Relaxed);
   }

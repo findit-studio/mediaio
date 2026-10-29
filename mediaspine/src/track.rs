@@ -52,7 +52,7 @@ use crate::{
 /// a packet. **An attachment track carries exactly one file, by
 /// construction**: [`Self::attachment`] takes one, [`Self::new`] refuses
 /// an attachment's parameters by name ([`AttachmentWithoutFile`]), and
-/// a description holds no second seat for another.
+/// a description holds no second slot for another.
 ///
 /// No `Clone`, for the reason [`TrackInfo`] has none: the parameters
 /// are not cheap to duplicate, and a consumer that needs to share a
@@ -867,7 +867,7 @@ mod tests {
 
   /// **An attachment track has exactly one file.** Without one it is
   /// refused by name — by the conversion and by [`TrackDescription::new`]
-  /// alike — and everything given comes back; a second has no seat.
+  /// alike — and everything given comes back; a second has no slot.
   #[test]
   fn an_attachment_track_without_its_file_is_refused_by_name() {
     let row = font_row();

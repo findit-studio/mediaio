@@ -540,7 +540,7 @@ impl SideDataAlloc {
 /// Named for the direction: this is the send leg. Its outbound twin is
 /// [`PacketBufferError::PacketTooLarge`](crate::PacketBufferError),
 /// which judges the same quantity coming the other way, against the
-/// same seat.
+/// same slot.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("a {bytes}-byte packet payload exceeds the {limit}-byte budget on the way into FFmpeg")]
 pub struct SendPayloadTooLarge {
@@ -685,7 +685,7 @@ pub fn check_packet_build(
 /// Judges the **whole** side-data list before a byte of it is
 /// allocated.
 ///
-/// # One seat, both directions
+/// # One slot, both directions
 ///
 /// The read side has capped frame and packet side data at 64 entries
 /// and 256 KiB since it was written; the send side had no cap at all.
@@ -1680,7 +1680,7 @@ unsafe fn delivered_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
 // ---------------------------------------------------------------------------
 
 /// [`video_packet_from_ffmpeg`], with explicit carrier and
-/// provenance seats on top of the same timebase requirement.
+/// provenance slots on top of the same timebase requirement.
 ///
 /// # Safety
 ///
@@ -1774,7 +1774,7 @@ pub unsafe fn video_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrie
 }
 
 /// [`audio_packet_from_ffmpeg`], with explicit carrier and
-/// provenance seats on top of the same timebase requirement.
+/// provenance slots on top of the same timebase requirement.
 ///
 /// # Safety
 ///
@@ -1868,7 +1868,7 @@ pub unsafe fn audio_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrie
 }
 
 /// [`subtitle_packet_from_ffmpeg`], with explicit carrier and
-/// provenance seats on top of the same timebase requirement.
+/// provenance slots on top of the same timebase requirement.
 ///
 /// # Safety
 ///
@@ -1965,7 +1965,7 @@ pub unsafe fn subtitle_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Car
 /// stream's timebase stamped onto every timestamp.
 ///
 /// Data packets are never reordered, so the mediaspine model gives
-/// them no `dts` seat; everything else mirrors
+/// them no `dts` slot; everything else mirrors
 /// [`video_packet_from_ffmpeg_in`]. `byte_pos` is forwarded from
 /// `AVPacket.pos`, which data consumers use to correlate a payload with
 /// its position in the file.
@@ -2078,7 +2078,7 @@ pub unsafe fn data_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrier
 /// is not decoded and is not on a timeline: it *is* its bytes, so a
 /// packet carrying none carries no attachment, and this answers
 /// `Ok(None)`. `AttachmentPacketExtra` accordingly has no side-data
-/// seat — a deliberate absence, not an oversight.
+/// slot — a deliberate absence, not an oversight.
 ///
 /// # Safety
 ///
@@ -4604,7 +4604,7 @@ mod tests {
 
   #[test]
   fn side_data_rides_a_packet_that_has_a_body_too() {
-    // The seat's documented promise — "the raw side-data entries from
+    // The slot's documented promise — "the raw side-data entries from
     // `AVPacket.side_data`" — was never kept by the conversion before.
     use ffmpeg_next::{
       ffi::{AVPacketSideDataType, av_packet_new_side_data},
