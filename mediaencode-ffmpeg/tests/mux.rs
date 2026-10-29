@@ -7422,9 +7422,12 @@ fn l79_a_raw_stream_refuses_what_it_would_write_unreadable() {
 /// than its position reported ([`Uncarried::ChapterId`]), a span off the
 /// millisecond reported ([`Uncarried::ChapterSpan`]), each read back by
 /// its title; WAV's and the raw streams' none, each chapter reported
-/// ([`Uncarried::Chapter`]).
+/// ([`Uncarried::Chapter`]). MP3's table of contents counts its chapters
+/// in 8 bits (`id3v2enc.c` 274; R9, the class): 255 open, 256 refused by
+/// name ([`MuxOpenError::ChapterCount`]), nothing written.
 ///
-/// PLANT: the chapters a container does not write unreported.
+/// PLANT: the chapters a container does not write unreported; MP3's count
+/// unjudged opens the 256.
 #[test]
 fn l80_the_chapters_each_simple_muxer_writes() {
   let Some(corpus) = Corpus::new() else { return };
@@ -7482,6 +7485,39 @@ fn l80_the_chapters_each_simple_muxer_writes() {
     titles,
     [Some("first".to_owned()), Some("second".to_owned())]
   );
+  let many = |count: i64| -> Vec<Chapter<Ffmpeg>> {
+    (0..count)
+      .map(|at| chapter_of(at, at * 10, at * 10 + 10, Some("a chapter")))
+      .collect()
+  };
+  for (count, opens) in [(255, true), (256, false)] {
+    let target = output(&corpus, &format!("l80-{count}.mp3"));
+    let opened = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new("mp3"),
+      table_of(&mp3, TrackKind::Audio),
+      &many(count),
+      PacketLimits::default(),
+    );
+    match opened {
+      Ok((muxer, _)) => {
+        assert!(opens, "{count} opened");
+        muxer.finish().expect("finished");
+      }
+      Err(refusal) => {
+        assert!(!opens, "{count}: {refusal:?}");
+        assert!(
+          matches!(refusal, MuxOpenError::ChapterCount { count: 256 }),
+          "{refusal:?}"
+        );
+        assert_eq!(
+          std::fs::metadata(&target).expect("the file").len(),
+          0,
+          "nothing written"
+        );
+      }
+    }
+  }
 
   for (container, source) in [
     ("wav", pcm_mkv(&corpus)),
@@ -11687,4 +11723,308 @@ fn l103_the_mov_familys_held_samples_and_nero_chapters() {
       .contains(&Uncarried::ChapterSpan { chapter: 253 })
   );
   assert_eq!(chapter_rows(&target).len(), 255);
+}
+
+/// **L104 — WAV refuses the packet that would take its fact chunk's count
+/// of samples past its 32 bits** (R9, the class; table H; `wavenc.c`
+/// 347–352, 409–420, 448–462): WAV writes a fact chunk for every codec tag
+/// but integer PCM's, its count of samples the presentation span with the
+/// last packet's duration, cut past 32 bits at the trailer, which its
+/// reader takes as the stream's length. With the bound lowered to 20 000,
+/// IMA ADPCM — two samples a byte — is refused at the packet whose span,
+/// its duration counted, passes it ([`PayloadRule::FileSize`]), by name,
+/// untouched, its file not much more than half the bound (L78: integer
+/// PCM, of no fact chunk, refused only where its file passes it).
+///
+/// PLANT: the count unjudged takes the packets until the file passes.
+#[test]
+fn l104_wav_refuses_a_fact_count_past_its_32_bits() {
+  let Some(corpus) = Corpus::new() else { return };
+  #[rustfmt::skip]
+  let adpcm = generated(&corpus, "adpcm-ima.wav", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000:duration=6",
+    "-ac", "1", "-c:a", "adpcm_ima_wav",
+  ]);
+  let (table, frames) = whole_track(&adpcm, TrackKind::Audio);
+  const BOUND: i64 = 20_000;
+  // Each packet's samples, the source's packets abutting: its distance to
+  // the next, the last of its predecessor's length.
+  let ticks =
+    |frame: &DemuxedPacket<Ffmpeg, FfmpegBytes>| audio_of(frame).pts().expect("a time").pts();
+  let origin = ticks(&frames[0]);
+  let lengths: Vec<i64> = (0..frames.len())
+    .map(|index| match frames.get(index + 1) {
+      Some(next) => ticks(next) - ticks(&frames[index]),
+      None => ticks(&frames[index]) - ticks(&frames[index - 1]),
+    })
+    .collect();
+  let expected = (0..frames.len())
+    .find(|&index| ticks(&frames[index]) - origin + lengths[index] > BOUND)
+    .expect("a packet past the bound");
+  assert!(expected > 2, "the premise: a few packets within it");
+  let options = MuxOptions::new().with_lowered_file_bound(BOUND as u64);
+  let target = output(&corpus, "l104.wav");
+  let mut muxer = muxer_with(&target, ContainerName::new("wav"), table, options);
+  for (index, frame) in frames.iter().enumerate() {
+    let packet = audio_of(frame);
+    let time_base = packet.pts().expect("a time").timebase();
+    let offered =
+      audio_on_zero(packet.with_duration(Some(Timestamp::new(lengths[index], time_base))));
+    let result = muxer.write_audio(offered.clone());
+    if index < expected {
+      result
+        .map_err(|error| error.map_packet(drop))
+        .expect("within the count");
+      continue;
+    }
+    let (refusal, back) = by_container(result);
+    assert_eq!(refusal, payload(PayloadRule::FileSize), "at packet {index}");
+    untouched!(offered, back);
+    break;
+  }
+  muxer.finish().expect("finished");
+  let written = std::fs::metadata(&target).expect("the file").len();
+  assert!(
+    written < BOUND as u64 * 3 / 5,
+    "the file at {written} bytes: the count passed first"
+  );
+}
+
+/// `row` with its stream's channel layout libavutil's own for `channels`
+/// — a native layout, as `av_channel_layout_default` makes it — where its
+/// reader stated an unordered one.
+fn relaid(
+  row: TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>,
+  channels: i32,
+) -> TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket> {
+  reticketed(row, |par| {
+    // SAFETY: `par` is live, its layout its own; `av_channel_layout_uninit`
+    // frees any map and `av_channel_layout_default` writes a native one in
+    // place.
+    unsafe {
+      ffmpeg_next::ffi::av_channel_layout_uninit(&mut par.ch_layout);
+      ffmpeg_next::ffi::av_channel_layout_default(&mut par.ch_layout, channels);
+    }
+  })
+}
+
+/// **L105 — FLV refuses at open the legacy audio its flags would write
+/// otherwise, or its multichannel header would end the process with** (R9,
+/// the class; table H; `flvenc.c` 140–240, 910–913, 497–540; `flvdec.c`
+/// 314–360, 1657–1670): 16-bit PCM at 44.1 kHz in stereo, its layout
+/// libavutil's own, is taken and reads back so; the same PCM of the
+/// unordered layout Matroska's reader states, and of 5.1, refused
+/// ([`MuxOpenError::ChannelLayout`]) — FFmpeg would name its fourcc, of
+/// which PCM has none, and assert; big-endian PCM, which reads back
+/// little-endian ([`MuxOpenError::CodecNotCarried`]); PCM at 8 kHz, written
+/// as the 5.5 kHz code, and G.711 µ-law at 44.1 kHz, read back at 8 kHz
+/// ([`MuxOpenError::ConfigurationInvalid`]) — µ-law at 8 kHz taken. Each
+/// refusal at open writes nothing.
+///
+/// PLANT: each check removed opens — the layout's ending the process.
+#[test]
+fn l105_flv_refuses_the_legacy_audio_it_would_write_otherwise() {
+  let Some(corpus) = Corpus::new() else { return };
+  let flv = || ContainerName::new("flv");
+  #[rustfmt::skip]
+  let pcm_at = |name: &str, codec: &str, rate: &str, channels: &str| generated(&corpus, name, &[
+    "-f", "lavfi", "-i", &format!("sine=frequency=440:sample_rate={rate}:duration=0.3"),
+    "-ac", channels, "-c:a", codec,
+  ]);
+  let stereo = pcm_at("pcm-44k.mkv", "pcm_s16le", "44100", "2");
+  let target = output(&corpus, "l105.flv");
+  let (_, frames) = whole_track(&stereo, TrackKind::Audio);
+  let mut muxer = muxer_into(
+    &target,
+    flv(),
+    vec![relaid(table_of(&stereo, TrackKind::Audio).remove(0), 2)],
+  );
+  for frame in &frames {
+    muxer
+      .write_audio(audio_on_zero(audio_of(frame)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("stereo PCM");
+  }
+  muxer.finish().expect("finished");
+  let back = table_of(&target, TrackKind::Audio).remove(0);
+  assert_eq!(back.codec(), CodecId::PCM_S16LE);
+  assert_eq!(back.side_data().sample_rate(), 44_100);
+  assert_eq!(back.side_data().ch_layout().channels(), 2);
+  assert_eq!(
+    joined_bytes(&whole_track(&target, TrackKind::Audio).1),
+    joined_bytes(&frames),
+    "the samples"
+  );
+
+  let open = |name: &str, table| {
+    let target = output(&corpus, name);
+    let opened = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      flv(),
+      table,
+      &[],
+      PacketLimits::default(),
+    )
+    .map(drop);
+    assert_eq!(
+      std::fs::metadata(&target).expect("the file").len() == 0,
+      opened.is_err(),
+      "{name}: nothing written where refused"
+    );
+    opened
+  };
+  let surround = pcm_at("pcm-44k-6.mkv", "pcm_s16le", "44100", "6");
+  for (name, table) in [
+    ("l105-unordered.flv", table_of(&stereo, TrackKind::Audio)),
+    (
+      "l105-surround.flv",
+      vec![relaid(table_of(&surround, TrackKind::Audio).remove(0), 6)],
+    ),
+  ] {
+    assert!(
+      matches!(open(name, table), Err(MuxOpenError::ChannelLayout { track }) if track.get() == 0),
+      "{name}"
+    );
+  }
+  let big = pcm_at("pcm-be-44k.mkv", "pcm_s16be", "44100", "2");
+  assert!(matches!(
+    open("l105-be.flv", vec![relaid(table_of(&big, TrackKind::Audio).remove(0), 2)]),
+    Err(MuxOpenError::CodecNotCarried { codec, .. }) if codec == CodecId::PCM_S16BE
+  ));
+  let narrow = pcm_at("pcm-8k.mkv", "pcm_s16le", "8000", "1");
+  let mulaw = pcm_at("mulaw-44k.wav", "pcm_mulaw", "44100", "1");
+  for (name, source) in [("l105-8k.flv", &narrow), ("l105-mulaw.flv", &mulaw)] {
+    assert!(
+      matches!(
+        open(name, vec![relaid(table_of(source, TrackKind::Audio).remove(0), 1)]),
+        Err(MuxOpenError::ConfigurationInvalid { track, .. }) if track.get() == 0
+      ),
+      "{name}"
+    );
+  }
+  let telephone = pcm_at("mulaw-8k.wav", "pcm_mulaw", "8000", "1");
+  open(
+    "l105-mulaw-8k.flv",
+    vec![relaid(table_of(&telephone, TrackKind::Audio).remove(0), 1)],
+  )
+  .expect("µ-law at 8 kHz");
+}
+
+/// **L106 — FLV's Annex B rewrite is reported where the configuration as
+/// of the packet makes it** (R9, the class; table H; `flvenc.c` 1250–1263,
+/// 1315–1327, 1495–1501): H.264 of an Annex B configuration has its
+/// packets rewritten to length prefixes, reported at open
+/// ([`Rewrite::LengthPrefixed`]) and read back so; of an `avcC` one,
+/// nothing at open, and a packet whose new extradata is Annex B turns the
+/// rewrite on, reported there; of none, `extract_extradata` makes an
+/// Annex B one of the first packet's parameter sets, reported at that
+/// packet.
+///
+/// PLANT: the rewrite decided at open alone leaves the two later ones
+/// unreported.
+#[test]
+fn l106_flvs_annex_b_rewrite_is_reported_where_the_configuration_makes_it() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let flv = || ContainerName::new("flv");
+  #[rustfmt::skip]
+  let annexb = generated(&corpus, "annexb.h264", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=0.4",
+    "-c:v", "libx264", "-preset", "medium", "-bf", "0", "-g", "5", "-pix_fmt", "yuv420p",
+  ]);
+  let (table, frames) = whole_track(&annexb, TrackKind::Video);
+  let configuration = stream_extradata_of(&table[0]);
+  assert!(
+    configuration.first() == Some(&0),
+    "the premise: an Annex B configuration"
+  );
+  let rewritten = |report: &mediaencode_ffmpeg::MuxReport| {
+    report.uncarried().contains(&Uncarried::Rewritten {
+      track: TrackIndex::new(0),
+      rewrite: Rewrite::LengthPrefixed,
+    })
+  };
+  let target = output(&corpus, "l106.flv");
+  let (mut muxer, report) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    flv(),
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  assert!(rewritten(&report), "at open, of the configuration");
+  // The raw stream's packets carry no times: each frame's at 25 a second.
+  for (index, frame) in frames.iter().enumerate() {
+    let at = 40 * i64::try_from(index).expect("few");
+    muxer
+      .write_video(video_at(&video_of(frame), Some(at), at))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  muxer.finish().expect("finished");
+  // Every packet read back a run of NAL units behind 4-byte lengths that
+  // end at its end; every one offered opened on a start code.
+  let prefixed = |bytes: &[u8]| {
+    let mut at = 0;
+    while let Some(length) = bytes.get(at..at + 4) {
+      let length = u32::from_be_bytes([length[0], length[1], length[2], length[3]]);
+      at += 4 + usize::try_from(length).expect("a length");
+    }
+    at == bytes.len()
+  };
+  let back = whole_track(&target, TrackKind::Video).1;
+  assert_eq!(back.len(), frames.len(), "every frame");
+  for (seen, sent) in back.iter().zip(&frames) {
+    assert!(
+      video_of(sent).data().as_ref().starts_with(&[0, 0, 0, 1])
+        || video_of(sent).data().as_ref().starts_with(&[0, 0, 1]),
+      "offered Annex B"
+    );
+    assert!(
+      prefixed(video_of(seen).data().as_ref()),
+      "read back length-prefixed"
+    );
+  }
+
+  let avcc = stream_extradata_of(&table_of(&corpus.multi_track_mkv(), TrackKind::Video)[0]);
+  assert_eq!(avcc.first(), Some(&1), "the premise: an avcC");
+  for (name, stated, side) in [
+    ("l106-switch.flv", Some(avcc), Some(configuration.clone())),
+    ("l106-extracted.flv", Some(Vec::new()), None),
+  ] {
+    let row = table_of(&annexb, TrackKind::Video)
+      .remove(0)
+      .with_extradata(stated.map(|bytes| bytes_of(&bytes)));
+    let (mut muxer, report) = FfmpegOwnedMuxer::open(
+      File::create(output(&corpus, name)).expect("create"),
+      flv(),
+      vec![row],
+      &[],
+      PacketLimits::default(),
+    )
+    .expect("open");
+    assert!(!rewritten(&report), "{name}: nothing at open");
+    let mut packet = video_of(&frames[0]);
+    if let Some(side) = &side {
+      packet
+        .extra_mut()
+        .set_side_data(vec![self::side(T::AV_PKT_DATA_NEW_EXTRADATA, side)]);
+    }
+    muxer
+      .write_video(video_at(&packet, Some(0), 0))
+      .map_err(|error| error.map_packet(drop))
+      .expect("the first frame");
+    assert!(rewritten(muxer.report()), "{name}: at the first frame");
+    muxer.finish().expect("finished");
+  }
+}
+
+/// The extradata `row`'s stream will hold: the description's own, else
+/// its ticket's.
+fn stream_extradata_of(row: &TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>) -> Vec<u8> {
+  match row.extradata() {
+    Some(bytes) => bytes.as_ref().to_vec(),
+    None => row.side_data().extradata().to_vec(),
+  }
 }

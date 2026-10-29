@@ -255,6 +255,30 @@ crate moves only when it changes.
   trailer, refused past the buffer (`PayloadRule::FragmentSize`, new). A
   chapter's end is judged where the next chapter starts as written, in MP4
   and ASF too.
+- **Each mirrored rule carries FFmpeg's whole predicate, and each size
+  its loops' exact arithmetic (R9).** Every gate on a codec, a media
+  type, a codec tag, a flag, a disposition or the compliance level, every
+  loop and split of a text into a list, and every length or count written
+  in 8, 16 or 24 bits, in every audited container's writer and the
+  helpers it calls, is placed against the rules (greps R13–R15 of #82).
+  FLV: big-endian PCM, which its reader takes as little-endian on a
+  little-endian host, refused (`CodecNotCarried`); an audio codec of no
+  extended header — PCM, Swiff ADPCM, Nellymoser, G.711, Speex — of a
+  layout not exactly mono or stereo, whose multichannel header FFmpeg
+  writes with a fourcc it has none of, asserting, refused
+  (`MuxOpenError::ChannelLayout`, its message now any container's); PCM's
+  and Swiff ADPCM's 8 and 16 kHz, written as the 5.5 kHz code, and G.711
+  at another rate than 8 kHz, read back at 8 kHz, refused
+  (`ConfigurationInvalid`); the Annex B rewrite of H.264, HEVC and VVC to
+  length prefixes reported (`Rewrite::LengthPrefixed`) where the
+  configuration as of the packet makes it — at open, or at the packet
+  whose new extradata, the caller's or `extract_extradata`'s, turns it
+  on — and the tag's size judged by it. WAV: of every codec tag but
+  integer PCM's, a packet that would take its fact chunk's count past
+  2^32 samples refused (`PayloadRule::FileSize`, which now names this
+  too). MP3: a table of more than 255 chapters, which its table of
+  contents counts in 8 bits, refused (`MuxOpenError::ChapterCount`, new).
+  `MuxOpenError::ChapterWithoutTitle`'s message is now any container's.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
