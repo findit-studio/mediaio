@@ -116,7 +116,7 @@
 //! and a drain that answered the first forever was an ordinary,
 //! silent infinite loop.
 //!
-//! # The buffer seat
+//! # The buffer slot
 //!
 //! Every trait here carries a `Buffer` associated type bounded only by
 //! `AsRef<[u8]>`, and none of them names a concrete carrier. What a
@@ -430,7 +430,7 @@ pub trait SubtitleDecoder {
 /// FFmpeg's own subtitle API is push-shaped; nothing forces it here.
 ///
 /// **The frame has no timestamps**, because
-/// [`ImageFrame`] has no seats for them.
+/// [`ImageFrame`] has no fields for them.
 ///
 /// # Where the input comes from
 ///

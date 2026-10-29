@@ -1,7 +1,7 @@
 use super::*;
 
 /// The defaults' own coherence — that they are finite, that 8K passes
-/// and the bomb does not, that no seat is shadowed by a wider one — is
+/// and the bomb does not, that no limit is shadowed by a wider one — is
 /// asserted at **compile time**, in `limits.rs` beside the constants
 /// themselves. Nothing here re-checks it: a `const` block that failed
 /// would have stopped the build before this file was reached.
@@ -75,11 +75,11 @@ fn demux_limits_carry_all_three_tiers() {
   assert_eq!(mutated.max_total_attachment_bytes(), 6);
 }
 
-/// The chapter seats carry their defaults and take their overrides,
+/// The chapter limits carry their defaults and take their overrides,
 /// through both mutators the house shape asks for.
 ///
 /// The defaults themselves are the load-bearing half: both are
-/// **finite**, which is the whole point of the seat — a chapter table
+/// **finite**, which is the whole point of the limit — a chapter table
 /// is file-controlled and libavformat has no ceiling of its own for it.
 #[test]
 fn demux_limits_bound_the_chapter_table() {

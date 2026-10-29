@@ -75,7 +75,7 @@
 //!
 //! | site | reads | sizes what | verdict |
 //! |---|---|---|---|
-//! | `judge_buffer` | `AVFrame.width/height` at `get_buffer2` | the software allocation's **cost** | **correct**: measured, libavcodec hands this hook the frame at *coded* extent (1920x1088, aligned 1920x1090, 2,092,831 bytes), and the footprint prices those aligned dims against `max_frame_bytes`. Logical extent is not this seat's question — `max_pixels` is enforced by `ff_set_dimensions` against the **raw** dims, which is the semantics it has |
+//! | `judge_buffer` | `AVFrame.width/height` at `get_buffer2` | the software allocation's **cost** | **correct**: measured, libavcodec hands this hook the frame at *coded* extent (1920x1088, aligned 1920x1090, 2,092,831 bytes), and the footprint prices those aligned dims against `max_frame_bytes`. Logical extent is not this check's question — `max_pixels` is enforced by `ff_set_dimensions` against the **raw** dims, which is the semantics it has |
 //! | `get_hw_format` | `AVCodecContext.coded_width/height` | the hardware pool | **correct, and new**: the display dims `max_pixels` was checked against are blind to it |
 //! | `judge_hw_transfer` | the frames-context pool dims | the transfer's CPU destination | **was display — repriced** |
 //! | `VideoDecoder::width/height` | the decoder's display dims | nothing; a public accessor | correct — display is what a caller is asking for |
@@ -617,7 +617,7 @@ impl core::fmt::Display for UnsupportedSampleFormat {
 /// Payload for [`ConvertError::UnsupportedChannelCount`].
 ///
 /// A channel count this crate will not carry: more than
-/// [`u8::MAX`], which the portable `AudioFrame` seat cannot hold, or
+/// [`u8::MAX`], which the portable `AudioFrame` field cannot hold, or
 /// none at all on a frame that claims samples.
 ///
 /// **Refused, never clamped.** Clamping to 255 was silent truncation of
@@ -1319,7 +1319,7 @@ pub unsafe fn image_frame_from(
 /// plane-extraction rule, shared — and none of its timeline. There is
 /// no `time_base` parameter because there is nothing to label with it:
 /// a still is not on the timeline, so `ImageFrame` has no `pts` and no
-/// `duration` seats. Whatever `AVFrame.pts` a one-shot image decoder
+/// `duration` fields. Whatever `AVFrame.pts` a one-shot image decoder
 /// happens to leave behind is an artefact of the packet it was fed,
 /// not a fact about the picture, and it is deliberately dropped rather
 /// than carried into a field that would invite a consumer to sort by
@@ -1941,7 +1941,7 @@ unsafe fn build_video_frame_extra(
     out.set_best_effort_timestamp(Some(bet));
   }
   // Side data — passthrough as raw bytes, and the two statically-
-  // shaped HDR entries additionally parsed onto their own seats.
+  // shaped HDR entries additionally parsed onto their own fields.
   // Parsed from the already-copied `SideDataEntry` bytes rather than
   // re-walking `av_frame` a second time — one unsafe walk, two uses.
   let side_data = unsafe { collect_side_data(av_frame) }?;
@@ -1953,14 +1953,14 @@ unsafe fn build_video_frame_extra(
 
 /// Byte length of FFmpeg's in-process `AVMasteringDisplayMetadata`:
 /// ten `AVRational`s (six chromaticities, two white-point, min and max
-/// luminance) plus two `int` presence flags, each seat four bytes wide
+/// luminance) plus two `int` presence flags, each field four bytes wide
 /// and none of them padded — `10 * 8 + 2 * 4 = 88`. Not part of
 /// `AVMasteringDisplayMetadata`'s own ABI contract (its header says so
 /// explicitly), but true for every FFmpeg this crate has linked; a
 /// payload shorter than this is refused rather than partially read.
 const MASTERING_DISPLAY_METADATA_BYTES: usize = 88;
 /// Byte length of FFmpeg's in-process `AVContentLightMetadata`: two
-/// `unsigned` seats, `MaxCLL` then `MaxFALL`.
+/// `unsigned` fields, `MaxCLL` then `MaxFALL`.
 const CONTENT_LIGHT_METADATA_BYTES: usize = 8;
 /// SMPTE ST 2086 chromaticity fixed-point unit: `raw / 50000.0` is the
 /// CIE 1931 coordinate. Shared with [`mediaframe::color::ChromaCoord`].
@@ -1992,7 +1992,7 @@ fn rescale_chroma_coord(num: i32, den: i32) -> Option<u32> {
 /// A rational's `(num, den)`, verbatim as `(u32, u32)`. `None` when
 /// `num` reads negative — [`MasteringDisplay::max_luminance`] /
 /// [`MasteringDisplay::min_luminance`] are physical quantities and a
-/// negative seat marks the payload corrupt rather than a value to
+/// negative field marks the payload corrupt rather than a value to
 /// keep — or when `den` is not strictly positive: FFmpeg's own
 /// `AVRational` documents a non-positive denominator as an invalid
 /// value (`av_cmp_q`/`av_q2d` treat it as such), and `0` specifically
@@ -2031,7 +2031,7 @@ fn read_presence_flag(bytes: &[u8], offset: usize) -> Option<bool> {
 /// zeroed `AVRational`s with both flags `0` — indistinguishable, byte
 /// for byte, from "primaries and luminance all at the coordinate
 /// origin" unless the flags gate construction. [`MasteringDisplay`]
-/// has no seat for reporting one half present and the other absent, so
+/// has no field for reporting one half present and the other absent, so
 /// the honest answer to a record where either flag is unset is `None`
 /// for the whole struct, not a value with a fabricated half.
 fn parse_mastering_display(bytes: &[u8]) -> Option<MasteringDisplay> {

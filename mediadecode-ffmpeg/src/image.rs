@@ -210,7 +210,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
     // capped by nothing but `c_int::MAX`.
     //
     // When the payload arrives through the demuxer it was already
-    // charged against the attachment budget; this seat is what keeps
+    // charged against the attachment budget; this check is what keeps
     // the same ceiling in force on the road that skips the demux tier,
     // where a caller builds the packet itself. Without it the direct
     // road was a gigabyte more permissive than the demuxed one for the
@@ -347,7 +347,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
         CorruptSource::DecodedFrame,
       )));
     }
-    // **This road needs no parked-frame seat, and the reason is the
+    // **This road needs no parked-frame slot, and the reason is the
     // signature.** The timed decoders advance libavcodec and hand the
     // caller nothing to retry with, which is why they park a frame
     // whose conversion could not commit. Here the caller still holds
@@ -570,7 +570,7 @@ impl core::fmt::Display for CorruptSource {
 ///   produces no frame at all. That flag is therefore forwarded and
 ///   nothing is decided here.
 ///
-/// `ImageFrame` has no flag seat — deliberately, it is a picture and
+/// `ImageFrame` has no flag field — deliberately, it is a picture and
 /// not a packet — so a corruption signal that survives the decode has
 /// nowhere left to go. Returning the picture anyway would hand a caller
 /// a possibly-garbage image with the one warning about it deleted en

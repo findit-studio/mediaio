@@ -59,7 +59,7 @@
 //! `ImageBitmap` has no `copyTo`; the bytes come back through a canvas
 //! or through `VideoFrame::new(ImageBitmap)`). That is separate work
 //! with separate failure modes, and half of it would have shipped an
-//! [`ImageAdapter`](mediadecode::adapter::ImageAdapter) whose seats
+//! [`ImageAdapter`](mediadecode::adapter::ImageAdapter) whose fields
 //! nothing could fill.
 //!
 //! The seam this crate will implement when that work happens is

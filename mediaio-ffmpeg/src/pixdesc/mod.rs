@@ -308,7 +308,7 @@ fn geometry_from(
   if paletted {
     // The palette rides `data[1]` as a flat `AVPALETTE_SIZE` run: 256
     // entries of `AV_PIX_FMT_RGB32`, one row, never any other size.
-    // A format bound, not a budget seat — there is no number here a
+    // A format bound, not a budget limit — there is no number here a
     // file gets to choose.
     if count >= MAX_PLANES {
       return None;

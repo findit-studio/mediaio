@@ -173,7 +173,7 @@ is CI-only and was not run locally.
   0.8.0 is additive to the container / audio-container / image roster
   households, which this adapter never names, and 0.9.0 is the `lang`
   family — the retirement of the lossy `lang::Language` triple, its
-  `LanguageError` and `audio::Tags`'s language seat, none of which
+  `LanguageError` and `audio::Tags`'s language field, none of which
   appears anywhere in this crate.
 
   Verified on the real dependency graph (native builds this crate
@@ -256,7 +256,7 @@ not run locally.
 
 - Version bump to track `mediadecode` 0.9. **No adapter source
   changed**, and that is the finding rather than an absence of one:
-  0.9's [D-seat amputation contract](../mediadecode/CHANGELOG.md) is
+  0.9's [D-slot amputation contract](../mediadecode/CHANGELOG.md) is
   the rule that `WebCodecsBuffer` was already built to — an
   `Arc<Vec<u8>>` view over bytes `copyTo` has already handed to Rust,
   owned, `Send + Sync`, cloning by refcount, with nothing reaching back

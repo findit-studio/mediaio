@@ -622,7 +622,7 @@ mod tests {
   }
 
   #[test]
-  fn a_borrowed_table_binds_the_handle_seat_without_an_allocator() {
+  fn a_borrowed_table_binds_the_handle_slot_without_an_allocator() {
     let row = TrackInfo::<Loopback>::new(
       ms_tb(),
       TrackParams::Subtitle(SubtitleTrackParams::new(7)),

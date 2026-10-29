@@ -182,7 +182,7 @@ fn the_budgets_fire_identically_on_both_lanes() {
   // **A ceiling judges sizes, not copies.** A view costs no bytes to
   // take, but a budget bounds what a caller is handed and asked to
   // hold — and on the view lane it also bounds how long a pool slot
-  // stays out. So every seat fires the same on both.
+  // stays out. So every limit fires the same on both.
   let starved = DemuxLimits::new().with_max_attachment_bytes(16);
 
   let owned = FfmpegOwnedDemuxer::open_with(&path, starved);
@@ -1393,7 +1393,7 @@ fn a_refused_seek_keeps_the_parked_packet() {
     // libavformat refuses to seek a cue queue with no index, so the
     // session stays exactly where it was — and the parked packet is off
     // the wire, so dropping it here would be the same silent loss the
-    // seat exists to prevent, with no re-read able to recover it.
+    // guard exists to prevent, with no re-read able to recover it.
     let seek = demuxer.seek(mediadecode::Timestamp::new(
       0,
       mediadecode::Timebase::new(1, std::num::NonZeroI32::new(1_000_000).expect("nonzero")),
@@ -1496,7 +1496,7 @@ fn a_failed_frame_conversion_parks_the_frame_instead_of_losing_it() {
       }
       assert!(
         refused.is_some(),
-        "the ceiling must refuse a frame carrier to test the seat",
+        "the ceiling must refuse a frame carrier to test the check",
       );
 
       // The parked frame is delivered first — the same frame the
@@ -1598,7 +1598,7 @@ fn a_failed_video_frame_conversion_parks_the_frame_instead_of_losing_it() {
       }
       assert!(
         refused,
-        "the ceiling must refuse a frame carrier to test the seat",
+        "the ceiling must refuse a frame carrier to test the check",
       );
 
       assert_eq!(
@@ -1671,7 +1671,7 @@ fn a_failed_cue_conversion_parks_the_cue_instead_of_losing_it() {
       assert!(expected.contains("Text"), "the fixture must decode to text");
 
       // Again, with the ceiling down at the moment of conversion. The
-      // packet is sent uncapped — what is being tested is the seat
+      // packet is sent uncapped — what is being tested is the check
       // between the decode and the carrier, not the send.
       let (mut demuxer, mut decoder, track) = open(&path);
       let packet = first_cue(&mut demuxer, track);

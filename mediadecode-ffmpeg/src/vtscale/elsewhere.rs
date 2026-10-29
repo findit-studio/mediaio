@@ -1,4 +1,4 @@
-//! The stage's other body: the same seat, answering that it cannot
+//! The stage's other body: the same hook, answering that it cannot
 //! fill it.
 //!
 //! Reached on every target [`crate::vtscale`]'s gate turns away — a

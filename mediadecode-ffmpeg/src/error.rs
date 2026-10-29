@@ -49,7 +49,7 @@ pub enum Error {
   /// The decoder tier has no options object of its own for this, so it
   /// applies the default ceiling. A caller that needs a larger one
   /// opens the parameters through the demux tier, where
-  /// [`DemuxLimits`](crate::DemuxLimits) carries the seat.
+  /// [`DemuxLimits`](crate::DemuxLimits) carries the limit.
   #[error(transparent)]
   ParametersTooLarge(#[from] mediaio_ffmpeg::ParametersTooLarge),
 

@@ -396,7 +396,7 @@ fn over_budget_metadata_on_the_last_stream_costs_no_track_material() {
 /// codec for its description, allocated infallibly to duplicate a
 /// string the process already owns for its whole life.
 ///
-/// The reader borrows now and the seats store the borrow with
+/// The reader borrows now and the fields store the borrow with
 /// `Utf8Bytes::from_static`. This walks a wide span of codec ids so the
 /// long descriptions are certainly included, and asserts the whole scan
 /// costs nothing — plus that it really did meet a name past the inline

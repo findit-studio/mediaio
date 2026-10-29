@@ -517,7 +517,7 @@ fn a_refused_request_renews_nothing_and_returns_to_full_size() {
     !stage.promise_stands(),
     "a refused request must not renew a broken promise"
   );
-  // And it clears the standing request: `Unsupported` from this seat
+  // And it clears the standing request: `Unsupported` from this hook
   // means the session is back to full coded size, which is the only
   // reading a caller can act on without risking a second resample of
   // an already-fitted picture.

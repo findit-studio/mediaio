@@ -1,9 +1,9 @@
 //! Resource ceilings — the finite budgets every copy across the FFmpeg
 //! boundary is checked against **before** it allocates.
 //!
-//! These seats are tier one and tier two of the [resource governance
+//! These limits are tier one and tier two of the [resource governance
 //! contract][gov]: what this crate allocates itself, and the FFmpeg
-//! knobs it sets on the caller's behalf. The contract also states what
+//! options it sets on the caller's behalf. The contract also states what
 //! they do **not** bound, and what a deployment needing a hard memory
 //! bound puts underneath them — read it before sizing these for a
 //! hostile-input service.
@@ -19,7 +19,7 @@
 //! refcount; from 0.9 it costs memory, and the claim has to be judged
 //! before it is paid.
 //!
-//! Every seat here is a **finite default**, not an `Option`. There is no
+//! Every limit here is a **finite default**, not an `Option`. There is no
 //! "unlimited" spelling on purpose: the shape that lets a caller ask for
 //! no ceiling is the shape a caller reaches for once, in a hurry, and
 //! never revisits. A caller who needs more says how much more.
@@ -111,7 +111,7 @@ pub const DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Default ceiling on one stream's codec-parameter heap — 16 MiB.
 ///
-/// **What it bounds.** `AVCodecParameters` has three heap seats and all
+/// **What it bounds.** `AVCodecParameters` has three heap fields and all
 /// three come from the file: `extradata`, every entry of
 /// `coded_side_data`, and a custom `ch_layout` channel map. A track
 /// row's codec ticket mirrors all three, and rebuilding one for a
@@ -153,7 +153,7 @@ pub const DEFAULT_MAX_TOTAL_CODEC_PARAMETER_BYTES: usize = 64 * 1024 * 1024;
 /// - the 100000×100000 header does not;
 /// - a whole-file attachment budget below the per-attachment one, or a
 ///   per-packet ceiling below the per-attachment one, would be
-///   incoherent — the narrower seat could never fire;
+///   incoherent — the narrower limit could never fire;
 /// - a per-packet ceiling above `c_int::MAX` could never fire either,
 ///   since `AVPacket.size` cannot express it.
 const _: () = {
@@ -206,7 +206,7 @@ const _: () = {
 ///
 /// Carried by every session that decodes frames and handed to the
 /// conversion that copies them. See the [module docs](self) for why the
-/// seats are finite and how [`Self::max_pixels`] reaches libavcodec as
+/// limits are finite and how [`Self::max_pixels`] reaches libavcodec as
 /// well as this crate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FrameLimits {
@@ -300,7 +300,7 @@ impl FrameLimits {
 /// and analysing a container — 5 MiB, which is FFmpeg's own
 /// `probesize` default.
 ///
-/// **What this seat is for, and what it is not.** Every other budget in
+/// **What this limit is for, and what it is not.** Every other budget in
 /// this crate bounds a copy *this crate* makes. This one bounds work
 /// **libavformat does before this crate is handed anything**:
 /// `avformat_open_input` and `avformat_find_stream_info` build the
@@ -353,7 +353,7 @@ pub const DEFAULT_MAX_CHAPTERS: u32 = 4096;
 /// already exists one layer down: the metadata reader refuses any
 /// single dictionary value past 64 KiB rather than truncating it. On
 /// its own that leaves the table's total at the count times that cap —
-/// 256 MiB at the two defaults. This seat is what turns those two
+/// 256 MiB at the two defaults. This limit is what turns those two
 /// finite numbers into a small one.
 pub const DEFAULT_MAX_TOTAL_CHAPTER_TITLE_BYTES: usize = 1024 * 1024;
 
@@ -400,7 +400,7 @@ pub const DEFAULT_MAX_TOTAL_STREAM_METADATA_BYTES: usize = 4 * 1024 * 1024;
 /// profile ahead of it pushed out. A picture came back silently rotated
 /// wrong.
 ///
-/// So the still road gets a seat sized to what it actually carries, and
+/// So the still road gets a limit sized to what it actually carries, and
 /// over-budget is a **named refusal** rather than a quiet truncation:
 /// side data that cannot be carried whole is a fact about the picture,
 /// not a detail to drop.
@@ -414,7 +414,7 @@ pub const DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES: usize = DEFAULT_MAX_CODEC_PARAMETER
 /// attachment: a whole
 /// file a container handed over eagerly. When it arrives through the
 /// demuxer it has already been charged against
-/// [`DEFAULT_MAX_ATTACHMENT_BYTES`], and this seat is what keeps the
+/// [`DEFAULT_MAX_ATTACHMENT_BYTES`], and this limit is what keeps the
 /// same ceiling in force when a caller builds the packet itself — the
 /// one road that skips the demux tier entirely. A 1 GiB packet ceiling
 /// here would mean the direct road was a gigabyte more permissive than
@@ -530,13 +530,13 @@ impl DecoderLimits {
 
   /// [`Self::max_packet_bytes`] as the [`PacketLimits`] the boundary
   /// conversions take, so the send leg and the receive leg are handed
-  /// the same seat rather than two numbers that could drift.
+  /// the same limit rather than two numbers that could drift.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn packet_limits(&self) -> PacketLimits {
     PacketLimits::new().with_max_packet_bytes(self.max_packet_bytes)
   }
   /// Most compressed bytes one **image** decode may be handed. See
-  /// [`DEFAULT_MAX_IMAGE_INPUT_BYTES`] for why this is its own seat.
+  /// [`DEFAULT_MAX_IMAGE_INPUT_BYTES`] for why this is its own limit.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn max_image_input_bytes(&self) -> usize {
     self.max_image_input_bytes
@@ -663,10 +663,10 @@ impl DemuxLimits {
   /// **Not bounded:** allocation *amplification* inside a parser. A
   /// container can describe, in a handful of bytes, a structure whose
   /// in-memory form is much larger, and nothing outside libavformat can
-  /// see that happen. What this seat guarantees is that the input to
+  /// see that happen. What this limit guarantees is that the input to
   /// that amplification is finite and small; bounding its output is the
   /// substrate's own hardening territory, and FFmpeg has its own
-  /// `max_streams` / `max_index_size` / `max_picture_buffer` seats for
+  /// `max_streams` / `max_index_size` / `max_picture_buffer` settings for
   /// exactly that — [`Self::max_streams`] sets the first of them.
   ///
   /// **Not bounded on the path entrypoint:** the byte meter needs an
@@ -679,7 +679,7 @@ impl DemuxLimits {
     self.max_probe_bytes
   }
   /// The ceiling on streams a container may declare. See
-  /// [`Self::max_probe_bytes`] for why a seat inside libavformat is
+  /// [`Self::max_probe_bytes`] for why a limit inside libavformat is
   /// worth setting at all.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn max_streams(&self) -> u32 {
@@ -706,7 +706,7 @@ impl DemuxLimits {
   /// claiming an enormous table is refused rather than mirrored. Unlike
   /// [`Self::max_streams`], which is handed to libavformat and enforced
   /// inside it, this one is this crate's own: libavformat has no
-  /// `max_chapters` knob, and an `AVChapter` is cheap enough there that
+  /// `max_chapters` option, and an `AVChapter` is cheap enough there that
   /// the probe budget does not reach the count either.
   ///
   /// A file over the ceiling **fails to open**, with
