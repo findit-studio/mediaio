@@ -1030,6 +1030,7 @@ fn mp4_joins_e_ac3s_short_frames_into_the_sample_it_writes() {
   let (completed, step) = ac3_packet(state, true, ac3_at(&one, 105, 3), 1 << 20).expect("six");
   let run = Ac3Run {
     blocks: 6,
+    packets: 6,
     dts: 100,
     duration: 1 + 4 * 2 + 3,
     offered: Some(12),

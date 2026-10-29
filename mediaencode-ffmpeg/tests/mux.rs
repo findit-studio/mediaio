@@ -5267,10 +5267,13 @@ fn l60_a_last_joined_sample_is_reported_cut_short() {
 }
 
 /// **L61 — the blocks an E-AC-3 track leaves short of a sample at its end
-/// are dropped, as the report says at open** (table C″; [`Rewrite::Ac3Parsed`]):
-/// MP4 frees the run it holds without writing it (`mov_free`, `movenc.c`
+/// are dropped, the joining reported at open and the run at `finish`**
+/// (table C″; [`Rewrite::Ac3Parsed`], [`Uncarried::Unjoined`]): MP4 frees
+/// the run it holds without writing it (`mov_free`, `movenc.c`
 /// 7951–7955). Two six-block frames and three one-block ones read back as
-/// the two.
+/// the two, the three counted.
+///
+/// PLANT: the run unreported at `finish`: no line counts the three.
 #[test]
 fn l61_e_ac3_blocks_short_of_a_sample_at_the_end_are_dropped() {
   let Some(corpus) = Corpus::new() else { return };
@@ -5297,7 +5300,23 @@ fn l61_e_ac3_blocks_short_of_a_sample_at_the_end_are_dropped() {
       .map_err(|error| error.map_packet(drop))
       .expect("a frame");
   }
-  muxer.finish().expect("finished");
+  assert!(
+    !muxer
+      .report()
+      .uncarried()
+      .iter()
+      .any(|line| matches!(line, Uncarried::Unjoined { .. })),
+    "not before the end decides"
+  );
+  let (_, report) = muxer.finish_into_sink().expect("finished");
+  assert_eq!(
+    lines(&report, |line| matches!(line, Uncarried::Unjoined { .. })),
+    vec![Uncarried::Unjoined {
+      track: TrackIndex::new(0),
+      packets: 3,
+    }],
+    "the run MP4 frees, counted"
+  );
   assert_eq!(packets(&target)[0].len(), 2, "the two six-block frames");
 }
 

@@ -104,7 +104,9 @@ crate moves only when it changes.
   move; the joined sample's bytes are held within `av_grow_packet`'s bound
   (`PayloadRule::Ac3SampleSize`), and a last joined sample past `i32::MAX`
   ticks, which MP4's trailer asserts on, is refused by `finish`
-  (`FfmpegMuxRefusal::LastSampleTooLong`). A `mov_text` cue starting
+  (`FfmpegMuxRefusal::LastSampleTooLong`); the frames MP4 still joins at
+  the end, which it frees unwritten, are counted at `finish`
+  (`Uncarried::Unjoined`). A `mov_text` cue starting
   before the last one's end is written as MP4 writes it.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place

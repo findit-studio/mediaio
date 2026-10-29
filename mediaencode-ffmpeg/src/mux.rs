@@ -497,6 +497,7 @@
 //! | PGS segments, still held at the stream's end | written as one packet marked corrupt (`pgs_frame_merge.c` 77–83) | held by this muxer, not FFmpeg's filter: handed back on asking ([`CarrierMuxer::take_held`]), else not written, reported at `finish` ([`Uncarried::Held`]) |
 //! | MP4's durations, where packets do not abut | kept only as the distance to the next decode time (`movenc.c` 1241–1259), counted between the samples MP4 writes (table C″) | reported as learned ([`Rewrite::Durations`]) |
 //! | an E-AC-3 track's last sample, joined | the edit list ends it at its last packet's duration (`movenc.c` 6940, 7329–7342), short of the frames it joins | reported at `finish` ([`Rewrite::Durations`]) |
+//! | an E-AC-3 track's frames short of a sample at its end | freed unwritten, the run MP4 joins them in (`mov_free`, `movenc.c` 7951–7955) | reported at `finish` ([`Uncarried::Unjoined`]), the packets counted, as VP9's held frames are (the Fable delta gate's R3); the joining reported at open ([`Rewrite::Ac3Parsed`]) |
 //!
 //! The report covers these fields and those of the tables above; a codec's
 //! parameters beyond its configuration — its color properties, its field
@@ -550,7 +551,7 @@
 //! | [`FfmpegMuxRefusal::CueOrder`] | an overlapping or replacing cue is written as it is, the last cue shortened (`movenc.c` 7646–7653) — taken and reported (round 6) — unless another track's packet makes MP4 mark the end first and then move the cue (6917–6923), as the `ffmpeg` CLI does beside video: "Packet duration: -1000 / dts: 2000 in stream 1 is out of range". A first cue before zero MP4's writer takes, and its reader drops: its edit list starts the track at zero (4133–4239), and `mov_fix_index` marks a sample before an edit's start discarded and counts every later one from it (`mov.c` 4374–4682) — `ffprobe` reads the CLI's cues at −30 and 20 (`-itsoffset -0.03`) back at −40, marked discarded, and 10. Judged by the round trip, not the writer alone (ruled) | corrupts, or loses, where it is refused |
 //! | [`FfmpegMuxRefusal::NegativeDuration`], a subtitle's outside Matroska and WebM | libavformat hands a subtitle's on as it is (`guess_pkt_duration`, `mux.c` 605–611): MP4 refuses it after taking the packet (`check_pkt`, `movenc.c` 6925–6928), or joins a TTML paragraph into its document ending before it starts (`ttmlenc.c` 172); SRT drops the cue (`srtenc.c` 71–75); WebVTT and ASS write it ending before it starts (`webvttenc.c` 80, `assenc.c` 160). Any other track's libavformat writes as zero, or its own guess (605–633), and Matroska and WebM a subtitle's as zero (`matroskaenc.c` 3134): taken, reported ([`Rewrite::Durations`]) — L11; PLANT: refused on every track, L11's video packet refused; on none, MP4 refuses L11's cue after taking it | refuses after taking, loses, or corrupts, where it is refused |
 //! | round 2's `KeyFrameUnmarked`, removed (R8, the Fable delta gate's C1): taken and reported ([`Rewrite::KeyFramesMarked`]) | libavformat marks a packet a key frame only where its codec descriptor counts every frame one, or for any subtitle or data codec (`ff_is_intra_only`, `avformat.c` 903–912; `mux.c` 820–821) — the library's own claim, PCM's and MP3's among them (`codec_desc.c` 1998–2002, 2792–2796) — L16; PLANT: unreported, L16's line missing. A codec without the property, AAC's (2799–2803), libavformat leaves as it is, and MP4 writes no sync-sample table for an audio track but TrueHD's, MPEG-H 3D Audio's and USAC AAC's by the stream's profile (`movenc.c` 3412–3418), whatever the flags: the file is the same for the packet unmarked as marked, every sample a key frame, so nothing is refused, and the change is reported; Matroska keeps the flag; a video track none of whose packets is marked gets no table, reported at `finish` — L71; PLANT: the profile test made of the configuration again, L71's USAC-profiled track without its table's report | nothing refused |
-//! | [`FfmpegMuxRefusal::BeforeZero`] | libavformat moves every stream's times later at its first write, by the earliest distance before its stream's earliest of the packet it writes or of one its interleaving holds then (`handle_avoid_negative_ts`, `mux.c` 636–717): mirrored ([`Shift`]), taken, reported ([`Uncarried::TimesShifted`]). A packet after that write the move leaves before the earliest it hands the container as it is, warning it "failed to avoid negative timestamp" (692–715): FLV refuses it after taking it (`flvenc.c` 1267–1274); Matroska writes it with no cue, its block time a 16-bit count from its cluster's, which starts no earlier than zero, so that one more than 32768 ticks before zero wraps (`matroskaenc.c` 969–970, 3146–3163, 2888) — refused. Where the move is not mirrored — GXF's and MXF's own interleaving, Matroska's times uncertain beside a video track of no native id — every time before the earliest is refused, as round 2 refused it — L14, L46; PLANT: the move unmirrored, L14's early packets refused; after the first write unjudged, L14's late packets taken. Each packet is judged in the times of what its track's filter puts out, when it puts it out (table B's mirrors; Codex R6 [high]): a PGS display set at the packet that ends it, in its presentation segment's packet's times — L69; PLANT: the mirrors moved on what the filter takes, L69's held presentation segment moving every stream | refuses after taking, or corrupts, where it is refused |
+//! | [`FfmpegMuxRefusal::BeforeZero`] | libavformat moves every stream's times later at its first write, by the earliest distance before its stream's earliest of the packet it writes or of one its interleaving holds then (`handle_avoid_negative_ts`, `mux.c` 636–717): mirrored ([`Shift`]), taken, reported ([`Uncarried::TimesShifted`]). A packet after that write the move leaves before the earliest it hands the container as it is, warning it "failed to avoid negative timestamp" (692–715): FLV refuses it after taking it (`flvenc.c` 1267–1274); Matroska writes it with no cue, its block time a 16-bit count from its cluster's, which starts no earlier than zero, so that one more than 32768 ticks before zero wraps (`matroskaenc.c` 969–970, 3146–3163, 2888), and a block before zero at all reads back with no timestamp (`matroskadec.c` 4322–4323; the Fable delta gate's R2) — refused. Where the move is not mirrored — GXF's and MXF's own interleaving, Matroska's times uncertain beside a video track of no native id — every time before the earliest is refused, as round 2 refused it — L14, L46; PLANT: the move unmirrored, L14's early packets refused; after the first write unjudged, L14's late packets taken. Each packet is judged in the times of what its track's filter puts out, when it puts it out (table B's mirrors; Codex R6 [high]): a PGS display set at the packet that ends it, in its presentation segment's packet's times — L69; PLANT: the mirrors moved on what the filter takes, L69's held presentation segment moving every stream | refuses after taking, or corrupts, where it is refused |
 //! | [`FfmpegMuxRefusal::BeforeFirstDts`] | FLV keeps the first packet it writes as its reference and refuses every later packet decoded before it after taking it — "Packets are not in the proper order with respect to DTS" (`flvenc.c` 1267–1274): a packet of a stream the interleaving's 10 s delay wrote ahead of (`mux.c` 939–1003) — L70; PLANT: unmirrored, L70's audio at 2 s taken, FLV refusing it after taking it (`Invalid argument`) | refuses after taking |
 //! | [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Cropping`] | MP4's trailer refuses the box (`movenc.c` 1299–1340, 857–910, 3024–3036; `movenc_ttml.c` 236–317) | refuses after taking: the file |
 //! | [`MuxOpenError::SampleSize`], [`MuxOpenError::Cover`] | `pcm_rechunk`'s start fails the header (`pcm_rechunk.c` 49–58); the cover's builder fails after the header (`packet.c` 83–95) | refuses: the file |
@@ -1066,7 +1067,23 @@ pub enum Uncarried {
     track: TrackIndex,
     /// The filter.
     filter: AutomaticFilter,
-    /// How many packets it held.
+    /// How many packets it held — the packets as offered, whole: a PGS
+    /// packet among them may carry display sets it completed besides the
+    /// one it left open, which are not written either, and come back with
+    /// it from [`CarrierMuxer::take_held`].
+    packets: u64,
+  },
+  /// E-AC-3 packets MP4 was still joining into one sample when the muxer
+  /// finished: frames of fewer than six audio blocks, held back until six
+  /// make up a sample (`handle_eac3`, `movenc.c` 586–603 in FFmpeg 9.0.1),
+  /// which its end frees unwritten (`mov_free`, 7951–7955) — as
+  /// [`Self::Held`] counts what a filter holds at the end. Reported by
+  /// [`CarrierMuxer::finish_into_sink`], with the report it hands back;
+  /// the joining itself is reported at open ([`Rewrite::Ac3Parsed`]).
+  Unjoined {
+    /// The track.
+    track: TrackIndex,
+    /// How many packets MP4 held.
     packets: u64,
   },
   /// Every stream's times written later than offered — the chapters' not.
@@ -1448,7 +1465,9 @@ pub enum FfmpegMuxRefusal {
   /// refuses it after taking it (`flvenc.c` 1267–1274), and Matroska writes
   /// it with no cue (`matroskaenc.c` 969–970), its block time a 16-bit count
   /// from its cluster's, which starts no earlier than zero, so that one more
-  /// than 32768 ticks before zero wraps (2888, 3146–3163) — refused.
+  /// than 32768 ticks before zero wraps (2888, 3146–3163) — and a block
+  /// before zero at all FFmpeg's reader reads back with no timestamp
+  /// (`matroskadec.c` 4322–4323) — refused.
   ///
   /// In Matroska and WebM the earliest is zero, or an audio track's codec
   /// delay before it (2089–2104), and the time judged a presentation time
@@ -3192,6 +3211,8 @@ struct Ac3State {
 struct Ac3Run {
   /// Its blocks so far, below six.
   blocks: u8,
+  /// Its packets so far, one a block at most.
+  packets: u8,
   /// The first packet's decode time, in ticks: the sample's.
   dts: i64,
   /// The packets' durations as MP4 is handed them — libavformat's for a
@@ -3303,6 +3324,7 @@ fn ac3_packet(
     None => (
       Some(Ac3Run {
         blocks: first.blocks,
+        packets: 1,
         dts: packet.dts,
         duration: i128::from(packet.duration),
         offered: packet.offered.map(i128::from),
@@ -3321,6 +3343,7 @@ fn ac3_packet(
       }
       let joined = Ac3Run {
         blocks: run.blocks + first.blocks,
+        packets: run.packets + 1,
         duration: run.duration + i128::from(packet.duration),
         offered: run
           .offered
@@ -4931,7 +4954,8 @@ where
   /// packet side data its container drops — in the order learned. What it
   /// learns comes from packets written, so it is whole once the last is,
   /// but for what only the end decides, which
-  /// [`Self::finish_into_sink`] adds ([`Uncarried::Held`]).
+  /// [`Self::finish_into_sink`] adds ([`Uncarried::Held`],
+  /// [`Uncarried::Unjoined`]).
   pub const fn report(&self) -> &MuxReport {
     &self.report
   }
@@ -4967,7 +4991,8 @@ where
   /// Completes the container and hands the sink back, with the whole
   /// report — [`Muxer::finish`], keeping both. The report gains what only
   /// the stream's end decides: the packets an automatic filter still held
-  /// ([`Uncarried::Held`]), and where MP4 ends an E-AC-3 track's last
+  /// ([`Uncarried::Held`]), the E-AC-3 packets MP4 still joined
+  /// ([`Uncarried::Unjoined`]), and where MP4 ends an E-AC-3 track's last
   /// joined sample short of its packets ([`Rewrite::Durations`]).
   pub fn finish_into_sink(mut self) -> Result<(W, MuxReport), MuxFault> {
     // A trailer the container would fail for want of a frame no packet was
@@ -5015,6 +5040,14 @@ where
           track,
           filter: AutomaticFilter::PgsFrameMerge,
           packets: held,
+        });
+      }
+      // MP4: the E-AC-3 run it still joins, which its end frees unwritten
+      // (`mov_free`, `movenc.c` 7951–7955).
+      if let Some(run) = state.ac3.run {
+        self.report.uncarried.push(Uncarried::Unjoined {
+          track,
+          packets: u64::from(run.packets),
         });
       }
       // MP4 writes no sync-sample table for a track none of whose samples
