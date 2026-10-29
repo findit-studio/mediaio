@@ -2659,12 +2659,24 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
     // track, whose only purpose was to sever the tie to the format
     // context. The mirror severs it by being owned Rust, so that copy
     // is gone rather than moved.
+    // The stream's sample aspect ratio, where the parameters state none:
+    // MOV's `pasp` and Matroska's display size live on the stream when the
+    // codec's decoder states no ratio of its own — ProRes, DNxHD — and a
+    // muxer reads the parameters' alone (R11, Q869 L11).
+    //
+    // SAFETY: `stream` keeps the `AVStream` live for the read, a plain
+    // `AVRational`.
+    let stream_ratio = unsafe { (*stream.as_ptr()).sample_aspect_ratio };
     let ticket = crate::ticket::CodecTicket::mirror_with(
       &parameters,
       index,
       limits.max_codec_parameter_bytes(),
       extradata_policy,
-    )?;
+    )?
+    .with_stream_aspect_ratio(crate::ticket::Ratio::new(
+      stream_ratio.num,
+      stream_ratio.den,
+    ));
     let extra = TrackExtra::new(index as i32, ticket)
       .with_disposition(disposition)
       .with_start_time((raw_start != AV_NOPTS_VALUE).then_some(raw_start))

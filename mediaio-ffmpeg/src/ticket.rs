@@ -760,6 +760,23 @@ impl CodecTicket {
   pub const fn sample_aspect_ratio(&self) -> Ratio {
     self.sample_aspect_ratio
   }
+  /// The ticket, its sample aspect ratio `stream`'s where its parameters
+  /// state none — a zero numerator — and `stream` is a ratio, both its
+  /// terms positive: the ratio a demuxer keeps on the stream rather than
+  /// in the parameters, as MOV's does of `pasp` and Matroska's of the
+  /// display size where the codec's decoder states none — ProRes's,
+  /// DNxHD's — which libavformat's own guess takes first
+  /// (`av_guess_sample_aspect_ratio`, `libavformat/avformat.c` 784–805 in
+  /// FFmpeg 9.0.1), and FFmpeg's tool for a stream copy. A ratio the
+  /// parameters state is kept. Every other field stays the parameters'.
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_stream_aspect_ratio(mut self, stream: Ratio) -> Self {
+    if self.sample_aspect_ratio.num == 0 && stream.num > 0 && stream.den > 0 {
+      self.sample_aspect_ratio = stream;
+    }
+    self
+  }
   /// The codec-level frame rate. `0/1` when frames differ in duration
   /// or the value is not known.
   #[cfg_attr(not(tarpaulin), inline(always))]

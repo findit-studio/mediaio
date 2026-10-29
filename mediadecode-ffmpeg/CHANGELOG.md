@@ -17,6 +17,13 @@ The backend-agnostic core it adapts has its own log at
   is `AVStream.disposition`, the same raw set `TrackExtra::disposition`
   keeps — cover art arrives marked `ATTACHED_PIC`, which is what a muxer
   needs to write it back as cover art.
+- **The row's ticket carries the stream's aspect ratio where the codec
+  parameters state none.** MOV's `pasp` and Matroska's display size live
+  on `AVStream.sample_aspect_ratio` when the codec's decoder states no
+  ratio of its own — ProRes, DNxHD, VP9 — and the parameters' stays 0/1,
+  so that a remux wrote none; the ticket now takes the stream's there, as
+  libavformat's `av_guess_sample_aspect_ratio` does. A ratio the
+  parameters state is kept.
 
 ## [0.21.0] - 2026-10-24
 

@@ -16014,3 +16014,45 @@ fn l136_mov_refuses_a_video_whose_track_aperture_overflows() {
     opened_in(&corpus, name, container, table).unwrap_or_else(|error| panic!("{name}: {error:?}"));
   }
 }
+
+/// **L137 — a stream's aspect ratio its parameters state not reaches the
+/// ticket, and round-trips** (R11, Q869 L11; `mov.c`'s `pasp` and
+/// `matroskadec.c`'s display size, kept on the stream;
+/// `av_guess_sample_aspect_ratio`, `avformat.c` 784–805): ProRes's decoder
+/// states no ratio, so a MOV's `pasp` of 10/11 lives on the stream alone;
+/// the base's demuxer takes it into the ticket where the parameters state
+/// none, and the muxer writes it — into Matroska as the display size, read
+/// back 10/11. VP9, a codec MP4 admits, from WebM's display size, into
+/// MP4's `pasp`, the same.
+///
+/// PLANT: the stream's ratio not taken, each source's ticket of none.
+#[test]
+fn l137_a_streams_aspect_ratio_reaches_the_ticket_and_round_trips() {
+  let Some(corpus) = Corpus::new() else { return };
+  #[rustfmt::skip]
+  let prores = generated(&corpus, "prores-sar.mov", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25", "-frames:v", "3",
+    "-c:v", "prores_ks", "-vf", "setsar=10/11",
+  ]);
+  #[rustfmt::skip]
+  let vp9 = generated(&corpus, "vp9-sar.webm", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25", "-frames:v", "3",
+    "-c:v", "libvpx-vp9", "-aspect", "16:9",
+  ]);
+  let ratio = |path: &Path| {
+    let ratio = table_of(path, TrackKind::Video)
+      .remove(0)
+      .side_data()
+      .sample_aspect_ratio();
+    (ratio.num(), ratio.den())
+  };
+  for (source, container, name, stated) in [
+    (&prores, "matroska", "l137-prores.mkv", (10, 11)),
+    (&vp9, "mp4", "l137-vp9.mp4", (85, 64)),
+  ] {
+    assert_eq!(ratio(source), stated, "{name}: the source's ticket");
+    let target = output(&corpus, name);
+    remux_through_ffmpeg(source, ContainerName::new(container), &target);
+    assert_eq!(ratio(&target), stated, "{name}: read back");
+  }
+}
