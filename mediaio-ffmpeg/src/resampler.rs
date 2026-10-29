@@ -201,7 +201,7 @@ impl ResampleSpec {
   /// (`track.extra().ticket()`) — the "source from `TrackInfo`" path.
   ///
   /// Reads the ticket directly rather than rebuilding an
-  /// `AVCodecParameters` to read three fields out of: the seats are
+  /// `AVCodecParameters` to read three fields out of: the fields are
   /// already owned, and a rebuild here would allocate `extradata` a
   /// resampler has no use for.
   ///
@@ -433,7 +433,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
   ///
   /// `limits` bounds what one **converted** frame may cost.
   ///
-  /// [`FrameLimits`] rather than a seat of this seam's own: the
+  /// [`FrameLimits`] rather than a limit of this seam's own: the
   /// quantity is bytes of one produced audio frame, which is exactly
   /// what [`FrameLimits::max_frame_bytes`] means everywhere else in
   /// this crate, and one number for "what a frame may cost" is worth
@@ -1017,7 +1017,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
     Ok(Sent::Accepted)
   }
 
-  /// **No parked-frame seat here, and none is needed.** The queue holds
+  /// **No parked-frame slot here, and none is needed.** The queue holds
   /// frames that are already built: every fallible step of a
   /// conversion — the carrier's claim included — happens in
   /// [`Self::prepare_output`], before `swr` consumes anything, and
@@ -1025,7 +1025,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
   /// conversion left to fail after a frame has been taken out of the
   /// queue, so nothing can be lost between the two. That is the
   /// property the reserve-then-commit seam was built for, stated where
-  /// the sibling roads state their seats.
+  /// the sibling roads state their slots.
   pub(crate) fn receive_frame_impl(
     &mut self,
     dst: &mut Frame<C>,
@@ -1483,7 +1483,7 @@ impl TooManyPlanes {
 
 /// Payload for [`ResampleError::UnsupportedChannelCount`].
 ///
-/// A spec declaring more channels than a frame's channel seat can
+/// A spec declaring more channels than a frame's channel field can
 /// carry. `mediaspine`'s `AudioFrame` states its channel count in a
 /// `u8`, so 255 is the ceiling in both directions.
 ///
@@ -1566,7 +1566,7 @@ impl TimestampOutOfRange {
 /// fifteen of twenty-four channels and `cube` → stereo loses two of
 /// eight, so this is not a matter of channel count. Installing an
 /// explicit mix matrix is how such a conversion would be accepted
-/// deliberately; until this crate has a seat for one, the pair is
+/// deliberately; until this crate has a place for one, the pair is
 /// refused.
 #[derive(thiserror::Error, Debug, Clone)]
 #[error(
@@ -1765,7 +1765,7 @@ pub enum ResampleError {
   #[error(transparent)]
   TooManyPlanes(#[from] TooManyPlanes),
 
-  /// A spec with more channels than a frame's channel seat can state.
+  /// A spec with more channels than a frame's channel field can state.
   #[error(transparent)]
   UnsupportedChannelCount(#[from] UnsupportedChannelCount),
 
@@ -1828,7 +1828,7 @@ impl core::fmt::Display for SpecEnd {
 const MAX_AUDIO_PLANES: i32 = 8;
 
 /// Channels a `mediaspine::frame::AudioFrame` can state — its channel
-/// seat is a `u8`. A spec past this is refused rather than clipped.
+/// field is a `u8`. A spec past this is refused rather than clipped.
 const MAX_FRAME_CHANNELS: i32 = u8::MAX as i32;
 
 /// Refuses a spec `swr` cannot be driven with, or whose channel layout
@@ -2004,7 +2004,7 @@ const SWR_CH_MAX: usize = 64;
 /// exactly on every pair measured.
 ///
 /// A pair `swr` cannot matrix at all is refused too. Accepting these
-/// deliberately is a *mix matrix* seat on the spec — a real design, not
+/// deliberately is a *mix matrix* option on the spec — a real design, not
 /// something to mint in passing; until it exists, refusal is the honest
 /// answer.
 fn check_pair(source: &ChannelLayout, target: &ChannelLayout) -> Result<(), ResampleError> {

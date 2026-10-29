@@ -542,7 +542,7 @@ impl ScaledOutput {
   /// [`is_acceptable_request`] refused it. Never an error.
   ///
   /// **A refusal returns the session to full coded size**, which is
-  /// what the trait says an `Unsupported` answer from this seat means,
+  /// what the trait says an `Unsupported` answer from this hook means,
   /// and the only reading a caller can safely act on: told
   /// `Unsupported`, it resamples for itself, and a session that went on
   /// quietly fitting to an older request would have it resample an

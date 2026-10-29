@@ -308,7 +308,7 @@ fn mastering_display_bytes(
 }
 
 /// A zeroed `(0, 1)` rational — the filler this file's negative/short-
-/// payload tests use for every seat that is not the one under test.
+/// payload tests use for every field that is not the one under test.
 const ZERO_RATIONAL: (i32, i32) = (0, 1);
 
 /// The exact numbers a real HDR10 mastering-display SEI decodes to on
@@ -361,7 +361,7 @@ fn parse_mastering_display_reads_a_real_hdr10_payload() {
 #[test]
 fn parse_mastering_display_rescales_a_non_standard_chroma_denominator() {
   let bytes = mastering_display_bytes(
-    (17, 200), // red_x — the one non-standard seat under test
+    (17, 200), // red_x — the one non-standard field under test
     ZERO_RATIONAL,
     ZERO_RATIONAL,
     ZERO_RATIONAL,
@@ -403,9 +403,9 @@ fn parse_mastering_display_refuses_a_short_payload() {
 
 /// A negative chromaticity or luminance component is unrepresentable
 /// in the physical quantity it names — refused rather than silently
-/// cast into a huge `u32`. Every other seat is otherwise-valid (`ZERO_
+/// cast into a huge `u32`. Every other field is otherwise-valid (`ZERO_
 /// RATIONAL` or the real HDR10 numbers), so the refusal is provably
-/// about the one negative seat and not an incidental short payload.
+/// about the one negative field and not an incidental short payload.
 #[test]
 fn parse_mastering_display_refuses_a_negative_component() {
   let negative_primary = mastering_display_bytes(
@@ -558,7 +558,7 @@ fn parse_mastering_display_refuses_a_non_positive_luminance_denominator() {
   assert!(parse_mastering_display(&negative_max_den).is_none());
 }
 
-/// `AVContentLightMetadata` is two `unsigned` seats — `MaxCLL` then
+/// `AVContentLightMetadata` is two `unsigned` fields — `MaxCLL` then
 /// `MaxFALL` — read verbatim. `1000, 400` is what the same real
 /// `libx265 -x265-params max-cll=1000,400` clip decodes to.
 #[test]
@@ -580,9 +580,9 @@ fn parse_content_light_level_refuses_a_short_payload() {
 
 /// [`find_mastering_display`] / [`find_content_light_level`] answer
 /// `None` on an empty side-data list — the "absent metadata answers
-/// absent" contract, at the seat a caller actually reads.
+/// absent" contract, at the field a caller actually reads.
 #[test]
-fn absent_side_data_answers_none_for_both_hdr_seats() {
+fn absent_side_data_answers_none_for_both_hdr_fields() {
   let side_data: Vec<SideDataEntry> = Vec::new();
   assert!(find_mastering_display(&side_data).is_none());
   assert!(find_content_light_level(&side_data).is_none());
@@ -591,7 +591,7 @@ fn absent_side_data_answers_none_for_both_hdr_seats() {
 /// The two entries are found by kind among unrelated side data, not by
 /// position — an SEI/timecode entry ahead of them does not hide them.
 #[test]
-fn hdr_seats_are_found_by_kind_among_unrelated_side_data() {
+fn hdr_fields_are_found_by_kind_among_unrelated_side_data() {
   let cll_bytes = {
     let mut b = Vec::with_capacity(CONTENT_LIGHT_METADATA_BYTES);
     b.extend_from_slice(&500u32.to_ne_bytes());

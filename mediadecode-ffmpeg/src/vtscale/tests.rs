@@ -1,9 +1,9 @@
-//! The request seat's answer, on whichever target these run on.
+//! The request hook's answer, on whichever target these run on.
 //!
 //! Deliberately the *only* thing tested here: the stage's arithmetic
 //! moved into `videotoolbox/tests.rs` alongside the body that owns it,
 //! so a build without a stage carries neither the code nor a test for
-//! it. What every build does carry is this seat, and what it must
+//! it. What every build does carry is this hook, and what it must
 //! always do is answer honestly about itself.
 
 use mediadecode::decoder::ScaledOutputCapability;
@@ -11,7 +11,7 @@ use mediadecode::decoder::ScaledOutputCapability;
 use super::ScaledOutput;
 
 #[test]
-fn the_request_seat_answers_what_this_target_can_do() {
+fn the_request_hook_answers_what_this_target_can_do() {
   let mut stage = ScaledOutput::new();
   let accepted = stage.request((512, 288), (1920, 1080));
   if ScaledOutput::supported() {
@@ -36,7 +36,7 @@ fn a_refused_request_returns_the_session_to_full_size() {
     assert_eq!(first, ScaledOutputCapability::Supported);
   }
   // **And the refusal is not a no-op.** The trait says an `Unsupported`
-  // answer from this seat leaves the session decoding at full coded
+  // answer from this hook leaves the session decoding at full coded
   // size, and a caller acting on it resamples for itself — so a session
   // that went on fitting to the older request would have it resample an
   // already-fitted picture.

@@ -251,7 +251,7 @@ the one `mediaframe`'s frames carry.
 
   A chapter is a named stretch of the **file's** timeline the container
   itself declares — a DVD-style scene marker, a podcast segment, a
-  Matroska `ChapterAtom`. It belongs to no track, so it has no seat on
+  Matroska `ChapterAtom`. It belongs to no track, so it has no place on
   `TrackInfo`, and until now the only road to one was whatever escape
   hatch a backend happened to expose.
 
@@ -271,7 +271,7 @@ the one `mediaframe`'s frames carry.
     `Clone` off a track row is about cost — a row carries backend
     metadata down to codec parameters. A chapter is four scalars and a
     title, so there is no deep copy here for the law to forbid, and no
-    `TrackHandle`-style carrier seat worth minting to avoid one.
+    `TrackHandle`-style carrier slot worth minting to avoid one.
   - **Two instants, not one `TimeRange`.** `TimeRange`'s constructor
     refuses `end < start`, which is precisely the row a container can
     write and this tier has to be able to report. The span is
@@ -282,10 +282,10 @@ the one `mediaframe`'s frames carry.
 
   **`Demuxer::chapters(&self) -> &[Chapter<Self::Adapter>]` is
   provided**, answering an empty slice — so every implementor written
-  before the seat existed compiles unchanged *and* answers correctly:
+  before the method existed compiles unchanged *and* answers correctly:
   most files declare no chapters, and a format that cannot carry them
   has nothing to override. Rows come back by borrow rather than through
-  a handle seat, for the same reason `Chapter` is `Clone`. The table is
+  a handle slot, for the same reason `Chapter` is `Clone`. The table is
   read under the track table's rules: held for the session's whole
   life, non-destructive, no ordering rule at all.
 
@@ -347,7 +347,7 @@ the one `mediaframe`'s frames carry.
   changed shape.
 
   **`CursorValue` does not cross, and that is not an oversight.**
-  `ingraph`'s bare-seat citizenship deliberately withholds the
+  `ingraph`'s bare-slot citizenship deliberately withholds the
   keyset-cursor row: a flags column's cursor domain is the declared bit
   mask, which is a storage-tier precondition the read-side citizenship
   this feature (and its replacement) grants does not carry — the
@@ -371,7 +371,7 @@ the one `mediaframe`'s frames carry.
   pub enum ScaledOutputCapability { Unsupported, Supported }
 
   pub trait VideoStreamDecoder {
-    // ...existing seats...
+    // ...existing methods...
     fn scaled_output_capability(&self) -> ScaledOutputCapability { .. }
     fn request_scaled_output(&mut self, size: (u32, u32)) -> ScaledOutputCapability { .. }
   }
@@ -393,7 +393,7 @@ the one `mediaframe`'s frames carry.
   probe, for a caller that needs the same picture bytes run to run.
 
   `mediadecode-ffmpeg`'s `CarrierVideoStreamDecoder` implements both
-  seats and answers `Unsupported` on every path it opens today — see
+  methods and answers `Unsupported` on every path it opens today — see
   its own `CHANGELOG` entry and doc comments for the census, and the
   per-backend follow-ups: VideoToolbox ([#55]), NVDEC/CUVID ([#56]),
   VAAPI ([#57]), D3D11 Video Processor ([#58]).
@@ -415,7 +415,7 @@ the one `mediaframe`'s frames carry.
   }
   ```
 
-  The seat `filename` and `mime_type` already have, for the third piece
+  The slot `filename` and `mime_type` already have, for the third piece
   of identity a container writes about a track. Additive: a row built
   by an existing backend defaults it to `None`, as `new` does for the
   other two.
@@ -432,7 +432,7 @@ the one `mediaframe`'s frames carry.
   authority on the question, disagreeing with the first in exactly the
   cases the registries exist for.
 
-  A narrower seat was considered and refused for the same reason: a
+  A narrower field was considered and refused for the same reason: a
   three-letter code has nowhere to put `zh-Hans`, and dropping a tag
   because it does not fit is a guess wearing an absence's clothes.
 
@@ -467,7 +467,7 @@ the one `mediaframe`'s frames carry.
   added here reaches the framework with nothing to edit anywhere.
 
   What the feature does **not** carry, deliberately: the per-backend
-  storage bind (`sqlx`) and the two GraphQL wire seats. Both ride
+  storage bind (`sqlx`) and the two GraphQL wire bindings. Both ride
   features of `ingraph`'s that name a backend or a wire library, and a
   media decoder that pulled a SQL driver and a GraphQL runtime into its
   dependency graph to describe three bits would be paying for a build
@@ -491,7 +491,7 @@ the one `mediaframe`'s frames carry.
   heap-backed, thread-crossing session binds `Arc<TrackInfo<..>>`, a
   single-threaded one binds `Rc`, and one whose rows live in memory it
   already borrows binds `&TrackInfo<..>`. That last binding is why the
-  seat exists rather than an `Arc` written into the trait — **the demux
+  slot exists rather than an `Arc` written into the trait — **the demux
   tier stays `core`-only**, with no item in the module owning an
   allocation, which an `Arc` in the signature would have ended for
   every implementor including the ones that never allocate.
@@ -593,14 +593,14 @@ the one `mediaframe`'s frames carry.
     discarded every variant, extension and private-use subtag — and
     replaces it with a four-type `lang` family (`LanguageId`,
     `Language`, `ScriptSubtag`, `Region`) over a vendored BCP 47
-    registry, moving `audio::Tags`'s language seat and `LanguageError`
+    registry, moving `audio::Tags`'s language field and `LanguageError`
     with it. **Neither the retired type, nor its successors, nor
     `audio::Tags` is named anywhere in this workspace.** The language
     tag this crate does carry is its own and always was:
     `subtitle::SubtitlePayload::Text`'s
-    `Option<[u8; 3]>` ISO 639-2/T seat, a raw three-byte array minted
+    `Option<[u8; 3]>` ISO 639-2/T slot, a raw three-byte array minted
     here, which `mediaframe` never typed and 0.9 does not reach.
-    Whether that seat should become a `lang::LanguageId` is a design
+    Whether that slot should become a `lang::LanguageId` is a design
     question this bump does not force and does not answer.
 
   The consumed surface, swept item by item, is unchanged in 0.9:
@@ -794,28 +794,28 @@ own source.
   "how much can this cost?":
 
   - **Tier one — what the backend allocates itself.** Every byte a
-    backend copies or allocates is bounded, by a named seat or by a
+    backend copies or allocates is bounded, by a named slot or by a
     format; there is no third kind. Provable, and proved by enumeration
     rather than assertion — a backend keeps an accounting of its own
     allocation sites and what bounds each. Two rules folded in that this
     release paid for: *a judge must dominate the allocator's arithmetic,
     not the payload's*, and *everything a conversion can refuse is
     refused before anything it can allocate is allocated*.
-  - **Tier two — the substrate's own knobs.** A backend sets every
-    resource knob its substrate offers, at every interposition point the
+  - **Tier two — the substrate's own options.** A backend sets every
+    resource option its substrate offers, at every interposition point the
     substrate exposes. Explicitly **defense in depth, not a proof**: the
-    union of those knobs is whatever the substrate's authors chose to
+    union of those options is whatever the substrate's authors chose to
     make interruptible.
   - **Tier three — the boundary.** Allocations internal to a substrate,
-    past its knob surface, are the substrate's territory. A deployment
+    past its option surface, are the substrate's territory. A deployment
     needing a hard memory bound puts the decode behind an OS-level
     instrument — an rlimit, a cgroup, a memory-limited worker — and the
-    seats compose with it rather than replacing it. Stated without
+    slots compose with it rather than replacing it. Stated without
     hedging: **this crate does not promise to be a hypervisor for its
     substrates.**
 
   The principle is homed here because it binds every backend, not only
-  the FFmpeg one; the concrete knob enumeration belongs to whichever
+  the FFmpeg one; the concrete option enumeration belongs to whichever
   crate owns the substrate.
 
 
@@ -845,7 +845,7 @@ own source.
 
 ### Added (BREAKING)
 
-- **The D-seat amputation contract**, written into the `adapter`
+- **The D-slot amputation contract**, written into the `adapter`
   module's docs as the one law a backend's buffer type `B` must obey:
   *owned, `Send + Sync`, cheap to clone (a refcount bump), with its
   lifetime fully decoupled from the backend's internal buffers at the
@@ -868,7 +868,7 @@ own source.
   still: cover art, an embedded thumbnail, a poster frame. It carries
   `dimensions`, `visible_rect`, `pixel_format`, up to four `Plane<D>`,
   `ColorInfo` and backend `extra` — and **no `pts`, no `duration`**.
-  Not `None`-valued seats: absent ones. A still is not on the
+  Not `None`-valued fields: absent ones. A still is not on the
   timeline, which is the same fact `AttachmentPacket` has always
   stated on the packet side, and a field that can only ever be empty
   is an invitation to a consumer to sort by it.
@@ -889,7 +889,7 @@ own source.
   profile, an orientation — not a picture type, a field order or a
   best-effort timestamp. Its `PacketExtra` is the *attachment's*
   extras, so a backend that also implements `DemuxAdapter` normally
-  binds one type in both seats and a cover-art payload goes from
+  binds one type in both slots and a cover-art payload goes from
   `next_packet` into `decode` with nothing to convert.
 
 - **`ImageDecoder`** — a one-shot decoder seam. `decode(&packet)`
@@ -921,7 +921,7 @@ own source.
 ### Changed
 
 - `decoder`'s module docs now state what the trait names mean, what
-  may be bound in the `Buffer` seat, and why construction is off the
+  may be bound in the `Buffer` slot, and why construction is off the
   traits. `adapter`'s carry the contract itself.
 
 ## [0.8.0] - 2026-08-24
@@ -1043,7 +1043,7 @@ own source.
   - **`DataPacket<E, D>`** and **`AttachmentPacket<E, D>`** — the two
     packet kinds that had no type because they have no decoder. A data
     packet is timed and never reordered, so like `SubtitlePacket` it has
-    no DTS seat. An attachment carries **no timestamps at all**: a font
+    no DTS field. An attachment carries **no timestamps at all**: a font
     or a cover image is not on the timeline.
 
   - **`TrackKind`** — the closed roster `{ Video, Audio, Subtitle, Data,
@@ -1064,7 +1064,7 @@ own source.
   - **`DemuxAdapter`** — the demux tier's vocabulary, bundling the three
     existing adapter families and adding what only a demuxer needs:
     `DataExtra`, `AttachmentExtra`, `TrackExtra`, and a `Text` carrier
-    for identity metadata (a seat, not a fixed string type, so the core
+    for identity metadata (a type parameter, not a fixed string type, so the core
     stays allocator-free). The three families are bound to share the
     bundle's `CodecId`: a demuxer reads one container, and a container's
     track table has one codec-identifier column.

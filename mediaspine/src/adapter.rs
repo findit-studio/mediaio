@@ -280,7 +280,7 @@
 //! ## Tier one — what the backend allocates itself
 //!
 //! **Every byte a backend copies or allocates is bounded, by a named
-//! seat or by a format.** No exceptions and no third kind: a buffer
+//! limit or by a format.** No exceptions and no third kind: a buffer
 //! whose size comes from a file answers to a configured ceiling, and a
 //! buffer whose size is a property of a format answers to that format.
 //! A site that appears to be neither has not been thought about yet.
@@ -302,27 +302,27 @@
 //!   the expensive half of the work is a correct refusal that did not
 //!   help.
 //!
-//! ## Tier two — the substrate's own knobs
+//! ## Tier two — the substrate's own options
 //!
-//! **A backend sets every resource knob its substrate offers, at every
+//! **A backend sets every resource option its substrate offers, at every
 //! interposition point the substrate exposes.** These are not the
 //! backend's allocations; they are the substrate's, intercepted where
 //! the substrate agreed to be interrupted — a ceiling field, an
 //! allocation callback, a negotiation hook, a custom I/O layer.
 //!
-//! This tier is **defense in depth, and it is not a proof.** Each knob
-//! bounds what that knob was built to bound, and the union of them is
+//! This tier is **defense in depth, and it is not a proof.** Each option
+//! bounds what that option was built to bound, and the union of them is
 //! whatever the substrate's authors chose to make interruptible. A
 //! backend is obliged to use all of them and obliged not to claim that
 //! using them is the same as bounding the substrate.
 //!
-//! `mediadecode-ffmpeg` enumerates its knobs — what each one is, and
+//! `mediadecode-ffmpeg` enumerates its options — what each one is, and
 //! what each one bounds — in its `buffer` module, beside the tier-one
 //! table.
 //!
 //! ## Tier three — the boundary
 //!
-//! **Allocations internal to the substrate, past its knob surface, are
+//! **Allocations internal to the substrate, past its option surface, are
 //! the substrate's territory.** A parser can describe, in a handful of
 //! bytes, a structure whose in-memory form is far larger, and nothing
 //! outside that parser can observe it happen. A driver can size a pool
@@ -341,7 +341,7 @@
 //! a cgroup, or a memory-limited worker process it can restart. That is
 //! the industry answer for `libav*` and for every comparable substrate,
 //! and it is the only instrument that actually bounds a foreign
-//! allocator. The seats in tiers one and two **compose with** it — they
+//! allocator. The limits in tiers one and two **compose with** it — they
 //! turn most hostile inputs into a named error instead of a killed
 //! worker, and they make the worker's limit a backstop rather than a
 //! first line — but they do not replace it, and a caller who treats
@@ -406,8 +406,8 @@ pub trait SubtitleAdapter {
 /// to name: what rides the frame. A still's extras are EXIF, an ICC
 /// profile, an orientation — not a picture type, not a field order,
 /// not a best-effort timestamp. Bending [`VideoAdapter::FrameExtra`]
-/// over both would give every motion frame seats that only a still
-/// fills and every still seats that only motion fills.
+/// over both would give every motion frame field that only a still
+/// fills and every still field that only motion fills.
 ///
 /// The compressed side is an
 /// [`AttachmentPacket`](crate::demuxer::AttachmentPacket): a still
@@ -415,7 +415,7 @@ pub trait SubtitleAdapter {
 /// timeline. [`PacketExtra`](Self::PacketExtra) is therefore the
 /// attachment's extras, and a backend that also implements
 /// [`DemuxAdapter`](crate::demuxer::DemuxAdapter) will normally bind
-/// the same type in both seats — the packet a demuxer hands out is the
+/// the same type in both slots — the packet a demuxer hands out is the
 /// packet an image decoder is fed.
 pub trait ImageAdapter {
   /// Codec identifier — the still's own codec (MJPEG, PNG, BMP, …),

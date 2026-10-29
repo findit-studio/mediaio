@@ -58,7 +58,7 @@ pub struct CarrierAudioStreamDecoder<C: crate::FfmpegCarrier> {
   /// converts the scratch it already has instead of asking libavcodec
   /// for another.
   ///
-  /// The same seat the demux session keeps for a packet, and the same
+  /// The same flag the demux session keeps for a packet, and the same
   /// discipline `flush` clears.
   scratch_pending: bool,
   /// `true` once [`Self::send_eof_impl`] has been accepted, until

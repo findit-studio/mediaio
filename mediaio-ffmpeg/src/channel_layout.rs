@@ -810,7 +810,7 @@ unsafe fn custom_channels_raw(
 ///
 /// # What this replaced, and why the replacement is the point
 ///
-/// mediaframe's text seats took `SmolStr`, whose constructor is
+/// mediaframe's text fields took `SmolStr`, whose constructor is
 /// infallible and allocates past a twenty-three-byte inline window. On
 /// a road that runs once per channel of a file-declared count, that is
 /// an abort this crate could not report — so for several rounds a
@@ -818,7 +818,7 @@ unsafe fn custom_channels_raw(
 /// instead: a truthful refusal, but a lossy one, and a workaround
 /// rather than an answer.
 ///
-/// mediaframe 0.11 moves those seats to [`Utf8Bytes`], whose road can
+/// mediaframe 0.11 moves those fields to [`Utf8Bytes`], whose road can
 /// be made fallible end to end: measure the decoding without producing
 /// it, reserve exactly that much, build it, and **move** the buffer
 /// into the carrier. Nothing is truncated and nothing is silently
@@ -850,7 +850,7 @@ unsafe fn custom_channel_label_raw(
     .position(|byte| *byte == 0)
     .unwrap_or(bytes.len());
   if end == 0 {
-    // An empty name is "there is none", which is the seat's own
+    // An empty name is "there is none", which is the field's own
     // documented absent value — not a refusal and not a loss.
     return Ok(Utf8Bytes::default());
   }
@@ -916,7 +916,7 @@ fn describe_layout(layout: &AvChannelLayout) -> Result<Utf8Bytes, ChannelLayoutF
   // for a layout whose channel count came out of a file, so its size is
   // the container's business; what this crate owes is an honest
   // refusal rather than a truncation or an abort. See [`decode_text`]
-  // for the road, and for what the `SmolStr` seat used to force here.
+  // for the road, and for what the `SmolStr` field used to force here.
   decode_text(&bytes[..end])
 }
 
@@ -1658,16 +1658,16 @@ mod null_map_tests {
   }
 
   /// **Text is carried whole and built fallibly** — the workaround
-  /// that reported it *absent* is gone with the seat that forced it.
+  /// that reported it *absent* is gone with the field that forced it.
   ///
   /// Two lanes used to stand here, both asserting that a label or a
   /// rendering past `SmolStr`'s twenty-three-byte inline window came
   /// back empty. That was honest about what the crate did and dishonest
-  /// about what the container said: mediaframe's seats took `SmolStr`,
+  /// about what the container said: mediaframe's fields took `SmolStr`,
   /// whose constructor is infallible, so on a road that runs once per
   /// channel of a file-declared count the only alternative to an
   /// unreportable abort was dropping the text. mediaframe 0.11 moves
-  /// those seats to `Utf8Bytes`, and the road is fallible end to end.
+  /// those fields to `Utf8Bytes`, and the road is fallible end to end.
   #[test]
   fn text_is_decoded_whole_and_fallibly() {
     for raw in [

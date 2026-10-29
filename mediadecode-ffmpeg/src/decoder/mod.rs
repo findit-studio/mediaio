@@ -5011,7 +5011,7 @@ pub(crate) fn build_codec_context(
   //
   // The translation is gone because it is no longer needed: the byte
   // ceiling is enforced by `judge_buffer`, which is *also* a
-  // pre-allocation seat — `get_buffer2` is the allocator, so it runs
+  // pre-allocation check — `get_buffer2` is the allocator, so it runs
   // before the allocation and prices the frame's real format at its
   // real aligned dimensions. Nothing is lost on the software road by
   // stating the pixel limit as what it is.
@@ -5022,7 +5022,7 @@ pub(crate) fn build_codec_context(
     (*ctx_ptr).max_pixels = i64::try_from(limits.frame().max_pixels()).unwrap_or(i64::MAX);
   }
 
-  // **The byte ceiling's own seat, in the allocator itself.**
+  // **The byte ceiling's own check, in the allocator itself.**
   // `max_pixels` bounds an extent; what an extent costs depends on its
   // format and on how the allocator aligns it — a `gray8` frame of
   // 65536x1 is 64 KiB by `w * h` and 2 MiB once its single row is
@@ -5094,7 +5094,7 @@ pub(crate) fn build_codec_context(
   // allocator's own ruler. An exact judge at the allocation beats an
   // approximate one before it.
 
-  // **The judge's budget seat.** `judge_buffer` runs as a C callback
+  // **The judge's budget slot.** `judge_buffer` runs as a C callback
   // with nothing but the context to read, and the byte ceiling is not
   // recoverable from any field on it — see `CallbackState`'s
   // `max_frame_bytes` in `mediaio-ffmpeg`. So the state that already

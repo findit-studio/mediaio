@@ -180,7 +180,7 @@ mod tests {
       &mut self,
       frame: &AudioFrame<u32, u32, (), &'static [u8]>,
     ) -> Result<Sent, LoopError> {
-      // The terminal state outranks the seat: draining never makes a
+      // The terminal state outranks the slot: draining never makes a
       // post-end offer acceptable, so `MustDrain` would be a promise
       // this face cannot keep. Checked first for that reason.
       if self.eof {
@@ -189,7 +189,7 @@ mod tests {
       if frame.sample_rate() != 48_000 {
         return Err(LoopError::SourceChanged);
       }
-      // A one-frame seat: a second frame before the first is drained
+      // A one-frame slot: a second frame before the first is drained
       // is back pressure, not a failure — the loopback is the smallest
       // implementation that can show the arm meaning something.
       if self.pending {

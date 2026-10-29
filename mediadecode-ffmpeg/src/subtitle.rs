@@ -7,10 +7,10 @@
 //! [`mediadecode::SubtitleFrame`] inside [`SubtitleDecoder::send_packet`]
 //! and stashing it in `pending` for the next [`SubtitleDecoder::receive_frame`]
 //! call. This matches the trait's contract: `send_packet` enqueues
-//! work — answering [`Sent::MustDrain`] while the seat is still full,
+//! work — answering [`Sent::MustDrain`] while the slot is still full,
 //! since the inline API cannot queue a second cue — and `receive_frame`
 //! drains one decoded frame at a time, answering
-//! [`Received::NeedsInput`] when the seat is empty and
+//! [`Received::NeedsInput`] when the slot is empty and
 //! [`Received::Ended`] once [`SubtitleDecoder::send_eof`] has been
 //! signalled.
 //!
@@ -86,7 +86,7 @@ pub struct CarrierSubtitleStreamDecoder<C: crate::FfmpegCarrier> {
   /// re-offers it. Converting inside `send_packet` meant an allocation
   /// that failed took the cue with it — the scratch was freed, the
   /// error returned, and the caller's next packet decoded the *next*
-  /// cue. Deferring the conversion to `receive_frame` gives it a seat
+  /// cue. Deferring the conversion to `receive_frame` gives it a slot
   /// to fail into: the scratch is cleared when a carrier exists for it,
   /// not before.
   ///
@@ -204,10 +204,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
     // whatever it is handed — so this session's `eof` latch is the only
     // thing that knows, and a latch that gates only the receive side is
     // not a latch. Without this, a valid packet after `send_eof` decoded
-    // normally, set the seat, and made the *next* `receive_frame` answer
+    // normally, set the slot, and made the *next* `receive_frame` answer
     // `Frame`: a terminal `Ended` reversed with no `flush` anywhere.
     //
-    // **Before the held-cue check, not after.** A cue in the seat would
+    // **Before the held-cue check, not after.** A cue in the slot would
     // otherwise turn a usage fault into `Sent::MustDrain` — an
     // instruction to drain and re-offer, which is precisely the one
     // thing that must not happen: the drained retry would then be
@@ -320,7 +320,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
     // input the caller believes will be decoded and will not be, while
     // a second `send_eof` restates a fact that is already true and
     // costs nothing. The held cue is still delivered by the next
-    // `receive_frame`, and only then does the seat answer `Ended`;
+    // `receive_frame`, and only then does the slot answer `Ended`;
     // refusing here would be back pressure with nothing behind it.
     //
     // The `swresample` seam one tier along is idempotent for the same

@@ -292,7 +292,7 @@ fn an_empty_submodule_directory_does_not_read_as_a_present_corpus() {
 /// shape — and the audio road's difference is that it never answers
 /// [`Sent::MustDrain`] for a parked frame.
 ///
-/// That is deliberate and documented at the seat: the video decoder has
+/// That is deliberate and documented at the flag: the video decoder has
 /// two scratches and can change which is current mid-fallback, so a
 /// submission under a park would leave the retry reading the other one;
 /// this decoder has a single scratch, so a submission under a park
@@ -343,7 +343,7 @@ fn the_audio_face_answers_the_same_vocabulary_without_a_park_refusal() {
   };
 
   // Two packets, back to back, with **no drain between them**. The
-  // first fills the scratch seat; on the video or subtitle road the
+  // first fills the scratch slot; on the video or subtitle road the
   // second would be told to drain. Here it is simply taken.
   assert_eq!(
     decoder.send_packet(&take()).expect("no fault"),

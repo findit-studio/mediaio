@@ -245,7 +245,7 @@ fn a_subtitle_session_that_was_told_the_stream_ended_says_so() {
 
   assert_eq!(decoder.send_eof().expect("send_eof"), Sent::Accepted);
 
-  // And now the same empty seat means the opposite thing — which is the
+  // And now the same empty slot means the opposite thing — which is the
   // whole point. A drain loop stops here instead of asking forever.
   for _ in 0..4 {
     assert_eq!(
@@ -361,13 +361,13 @@ fn a_subtitle_session_answers_the_ordinary_rhythm() {
   let packet = cue_packet();
   let mut dst = empty_subtitle_frame();
 
-  // Empty seat: the packet goes in.
+  // Empty slot: the packet goes in.
   assert_eq!(
     decoder.send_packet(&packet).expect("no fault"),
     Sent::Accepted,
   );
 
-  // Seat full. **Twice**, to pin that the answer is a state and not a
+  // Slot full. **Twice**, to pin that the answer is a state and not a
   // one-shot complaint that clears itself.
   for _ in 0..2 {
     assert_eq!(
@@ -451,7 +451,7 @@ fn the_feeder_loop_is_writable_against_the_trait_alone() {
   assert_eq!(
     (offers, cues),
     (1, 0),
-    "the first offer lands on an empty seat"
+    "the first offer lands on an empty slot"
   );
 
   feed(&mut decoder, &packet, &mut dst, &mut cues, &mut offers).expect("no fault");
@@ -463,7 +463,7 @@ fn the_feeder_loop_is_writable_against_the_trait_alone() {
 }
 
 /// **Regression: a terminal `Ended` must not be reversible without
-/// `flush`. Empty-seat ordering.**
+/// `flush`. Empty-slot ordering.**
 ///
 /// The subtitle seam is hand-rolled around `avcodec_decode_subtitle2`,
 /// which has no send/receive state machine — it decodes whatever it is
@@ -477,7 +477,7 @@ fn the_feeder_loop_is_writable_against_the_trait_alone() {
 /// a cue held in its output, and a `Received::Produced` on the next poll — the end of
 /// a stream un-ended, with no `flush` anywhere in the story.
 #[test]
-fn a_packet_after_eof_is_refused_on_an_empty_seat() {
+fn a_packet_after_eof_is_refused_on_an_empty_slot() {
   let mut decoder = subrip_decoder();
   let packet = cue_packet();
   let mut dst = empty_subtitle_frame();
@@ -500,11 +500,11 @@ fn a_packet_after_eof_is_refused_on_an_empty_seat() {
     );
   }
 
-  // And the end held: nothing was decoded into the seat.
+  // And the end held: nothing was decoded into the slot.
   assert_eq!(
     decoder.receive_frame(&mut dst).expect("no fault"),
     Received::Ended,
-    "the refused packet must not have filled the seat",
+    "the refused packet must not have filled the slot",
   );
 
   // `flush` is the only way back, and it really is a way back.
@@ -524,8 +524,8 @@ fn a_packet_after_eof_is_refused_on_an_empty_seat() {
 /// **Regression: the same reversal, held-cue ordering — and why the
 /// EOF gate sits *before* the held-cue gate.**
 ///
-/// With a cue in the seat the two gates disagree about what to answer,
-/// and only one order is safe. Checking the seat first answers
+/// With a cue in the slot the two gates disagree about what to answer,
+/// and only one order is safe. Checking the slot first answers
 /// `Sent::MustDrain` — an instruction to drain and re-offer — and the
 /// drained retry would then be *accepted*, reversing the end one call
 /// later instead of immediately. The fault has to win.
@@ -564,7 +564,7 @@ fn a_packet_after_eof_is_refused_under_a_held_cue() {
     Received::Ended,
   );
 
-  // And the drained seat does not reopen the send side.
+  // And the drained slot does not reopen the send side.
   assert!(
     matches!(
       decoder.send_packet(&packet),

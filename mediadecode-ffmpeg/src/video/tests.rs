@@ -1869,11 +1869,11 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
 }
 
 // ---------------------------------------------------------------------------
-//  R2: the end of the stream outranks the parked seat, on both send gates
+//  R2: the end of the stream outranks the parked slot, on both send gates
 // ---------------------------------------------------------------------------
 
 /// The cross product this lane needs: a session that has **accepted**
-/// end-of-stream *and* has a frame parked in its seat.
+/// end-of-stream *and* has a frame parked in its slot.
 ///
 /// Reaching it takes both halves at once — `send_eof` committed, then a
 /// delayed tail frame drained out of the decoder whose carrier
@@ -1894,7 +1894,7 @@ fn eof_with_a_parked_frame(
   // A seam that never fails keeps us on the hardware scratch; one that
   // raises probe-era exhaustion drops us onto the real software decoder
   // with the history replayed losslessly, so both scratches — the two
-  // the parked-seat gate exists for — are proved.
+  // the parked-slot gate exists for — are proved.
   let seam: Box<dyn HwInner> = if hw {
     Box::new(FakeHw::never_failing(w, h))
   } else {
@@ -1953,7 +1953,7 @@ fn eof_with_a_parked_frame(
   assert!(
     dec.sw_replay_frames_is_empty_for_test(),
     "the replay queue must be empty, or the park below lands in it \
-     instead of the scratch seat this lane is about",
+     instead of the scratch slot this lane is about",
   );
 
   // The end, accepted — this is what sets `eof_sent`.
@@ -1964,7 +1964,7 @@ fn eof_with_a_parked_frame(
   );
 
   // Now park a tail frame: the ceiling refuses the carrier, and the
-  // refusal is one another attempt could survive, so the seat keeps it.
+  // refusal is one another attempt could survive, so the slot keeps it.
   // SAFETY: only reached inside `in_subprocess`'s child — both callers of this
   // helper run under it — alone. The capped window runs one receive:
   // libavcodec and this crate's conversion, which check what they
@@ -1988,7 +1988,7 @@ fn eof_with_a_parked_frame(
 ///
 /// The arm's whole contract is *drain the output and this same offer
 /// becomes acceptable*. With `eof_sent` committed it never becomes
-/// acceptable — draining empties the seat and the retry faults anyway,
+/// acceptable — draining empties the slot and the retry faults anyway,
 /// until `flush`. So a caller that obeys the contract loops, drains,
 /// re-offers, and is refused: the same fault-under-back-pressure
 /// inversion the subtitle seam carried, one surface over.
@@ -2023,11 +2023,11 @@ fn a_post_eof_send_is_a_fault_not_backpressure(hw: bool) {
     )
   };
 
-  // --- with the seat still parked -----------------------------------
+  // --- with the slot still parked -----------------------------------
   let sent = dec.send_packet(&packet(4));
   assert!(
     is_after_eof(&sent),
-    "a packet after a committed EOF must be the fault even with the seat \
+    "a packet after a committed EOF must be the fault even with the slot \
      parked — `MustDrain` here promises a retry that can never succeed; got {sent:?}",
   );
   let eof_again = dec.send_eof();
@@ -2051,7 +2051,7 @@ fn a_post_eof_send_is_a_fault_not_backpressure(hw: bool) {
   }
   assert!(drained > 0, "the parked frame was never recovered");
 
-  // --- with the seat free -------------------------------------------
+  // --- with the slot free -------------------------------------------
   let sent_after = dec.send_packet(&packet(5));
   assert!(
     is_after_eof(&sent_after),
@@ -2082,7 +2082,7 @@ fn a_post_eof_send_is_a_fault_not_backpressure_on_the_hardware_road() {
 }
 
 /// And the software scratch, after a probe-era fallback put us there —
-/// the two scratches are the reason the parked-seat gate exists at all,
+/// the two scratches are the reason the parked-slot gate exists at all,
 /// so the ordering is proved against both.
 #[test]
 fn a_post_eof_send_is_a_fault_not_backpressure_on_the_software_road() {
@@ -2230,7 +2230,7 @@ fn the_post_eof_fault_is_the_one_the_substrate_gives() {
   let (w, h) = (64u32, 48u32);
   let clip = encode_synthetic_clip(w, h, 8, 100);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
-  // Probe-era exhaustion puts the real software decoder in the seat —
+  // Probe-era exhaustion puts the real software decoder in the slot —
   // the fake seam has no EOF state machine to interrogate.
   let mut dec = CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(
     Box::new(FakeHw::failing(w, h, 0, 2)),
@@ -2258,7 +2258,7 @@ fn the_post_eof_fault_is_the_one_the_substrate_gives() {
   // private state is reachable; the point is that nothing below asks
   // the wrapper anything.
   let DecodeState::Sw(sw) = &mut dec.state else {
-    panic!("the software decoder must be the one in the seat");
+    panic!("the software decoder must be the one in the slot");
   };
   sw.send_eof().expect("the substrate takes the end");
 
@@ -2307,7 +2307,7 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
   // parked would send the retry to the software scratch — delivering a
   // stale frame, or refusing permanently and stranding a decoded one.
   // Both send roads can commit that fallback, so both refuse while the
-  // seat is taken.
+  // slot is taken.
   mediaio_ffmpeg::test_support::in_subprocess(
     "video::tests::a_parked_hardware_frame_is_delivered_before_any_fallback",
     || {
@@ -2393,7 +2393,7 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
       let after = dec.send_packet(&packet(1));
       assert!(
         !matches!(after, Ok(Sent::MustDrain)),
-        "with the seat free the send must reach the seam, got {after:?}",
+        "with the slot free the send must reach the seam, got {after:?}",
       );
     },
   );

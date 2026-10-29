@@ -1396,7 +1396,7 @@ fn a_packed_spec_above_255_channels_is_refused_at_construction() {
       assert_eq!(p.limit(), 255);
     }
     Err(other) => panic!("expected UnsupportedChannelCount, got {other:?}"),
-    Ok(_) => panic!("256 packed channels must not reach a frame's channel seat"),
+    Ok(_) => panic!("256 packed channels must not reach a frame's channel field"),
   }
 
   // The same refusal from the other end.
@@ -1414,7 +1414,7 @@ fn a_packed_spec_above_255_channels_is_refused_at_construction() {
   // as a *success* at 255: `swr` has its own, lower limit (`SWR_CH_MAX`
   // is 64) and answers EINVAL well before this arm's boundary. So the
   // claim this lane can make — and the one that matters — is that a
-  // count inside the seat is never attributed to *this* refusal. Every
+  // count inside the field's range is never attributed to *this* refusal. Every
   // ordinary count in the rest of this file constructs fine.
   let ok = ResampleSpec::new(
     48_000,
@@ -1426,7 +1426,7 @@ fn a_packed_spec_above_255_channels_is_refused_at_construction() {
       FfmpegResampler::new(ok, mono_16k(), mediadecode_ffmpeg::FrameLimits::default()),
       Err(ResampleError::UnsupportedChannelCount(_)),
     ),
-    "255 is inside the seat; whatever refuses it, it is not this ceiling",
+    "255 is inside the field's range; whatever refuses it, it is not this ceiling",
   );
 }
 
