@@ -549,6 +549,7 @@ pub struct StreamCodec {
   frame_duration: i32,
   block_align: i32,
   initial_padding: i32,
+  profile: i32,
   extradata: Vec<u8>,
 }
 
@@ -593,6 +594,14 @@ impl StreamCodec {
   /// An audio stream's bytes per block, or `0`.
   pub const fn block_align(&self) -> i32 {
     self.block_align
+  }
+
+  /// The stream's codec profile, as libavformat's writers compare it
+  /// (`AVCodecParameters.profile`) — MP4 writes its sync-sample table for
+  /// an AAC track whose profile is USAC's (`movenc.c` 3412–3418 in FFmpeg
+  /// 9.0.1) — or `AV_PROFILE_UNKNOWN`, `-99`, where none is stated.
+  pub const fn profile(&self) -> i32 {
+    self.profile
   }
 
   /// The samples an audio stream's encoder put before its first, or
@@ -773,6 +782,7 @@ impl<W> Output<W> {
         frame_duration,
         block_align: (*par).block_align,
         initial_padding: (*par).initial_padding,
+        profile: (*par).profile,
         extradata,
       })
     }

@@ -2815,3 +2815,31 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
     "before zero, moved"
   );
 }
+
+/// **MP4's sync-sample table is decided by movenc's own test** (Codex R7
+/// 1): its video, TrueHD, MPEG-H 3D Audio and USAC AAC tracks, USAC by the
+/// stream's profile alone (`movenc.c` 3412–3418) — USAC's profile gets the
+/// table whatever the configuration says; another profile, or none, gets
+/// none, a USAC configuration notwithstanding (the configuration is not an
+/// argument: movenc reads none).
+#[test]
+fn mp4s_sync_table_is_decided_by_the_streams_profile() {
+  const USAC: i32 = 41;
+  assert!(mp4_syncs(TrackKind::Video, CodecId::H264, -99));
+  assert!(mp4_syncs(TrackKind::Audio, CodecId::TRUEHD, -99));
+  assert!(
+    mp4_syncs(TrackKind::Audio, CodecId::AAC, USAC),
+    "USAC's profile"
+  );
+  for profile in [-99, 0, 1, 4, 28] {
+    assert!(
+      !mp4_syncs(TrackKind::Audio, CodecId::AAC, profile),
+      "AAC of profile {profile}"
+    );
+  }
+  assert!(
+    !mp4_syncs(TrackKind::Audio, CodecId::OPUS, USAC),
+    "the number is AAC's alone"
+  );
+  assert!(!mp4_syncs(TrackKind::Subtitle, CodecId::MOV_TEXT, -99));
+}

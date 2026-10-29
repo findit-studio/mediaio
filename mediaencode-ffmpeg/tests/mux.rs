@@ -6043,22 +6043,60 @@ fn marked_of(report: &mediaencode_ffmpeg::MuxReport) -> usize {
   .len()
 }
 
-/// **L71 — MP4 refuses by name an audio packet not marked a key frame
-/// whose codec's frames are not all key frames, and reports a video track
-/// none of whose packets is one** (table G): MP4 writes no sync-sample
-/// table for an audio track but TrueHD's, MPEG-H 3D Audio's and USAC
-/// AAC's, nor for a track none of whose samples is a key frame, and every
-/// sample of such a track reads back as one (`movenc.c` 3412–3418). AAC's
-/// descriptor counts no frame a key frame (`codec_desc.c` 2799–2803), so
-/// libavformat leaves an unmarked AAC packet as it is, and MP4 would make
-/// it a seek point: refused, untouched. Matroska keeps the flag: taken,
-/// read back unmarked, nothing reported. A video track none of whose
-/// packets is marked gets no sync-sample table, every sample a key frame
-/// by the file: reported at `finish`; one with a key frame gets its table.
+/// `path`'s first audio track as a one-track table, its stream's codec
+/// profile forced to `profile` and, where given, its configuration to
+/// `config` — an AAC track with USAC's profile over an AAC LC
+/// configuration, say, or the other way about, which no `ffmpeg` CLI
+/// encodes.
+fn audio_with(
+  path: &Path,
+  profile: i32,
+  config: Option<&[u8]>,
+) -> Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>> {
+  use ffmpeg_next::ffi::{AV_INPUT_BUFFER_PADDING_SIZE, av_freep, av_mallocz};
+  let mut table = table_of(path, TrackKind::Audio);
+  let index = table[0].side_data().stream_index();
+  let mut parameters = table[0].side_data().rebuild().expect("the parameters");
+  // SAFETY: `parameters` owns its `AVCodecParameters`, live for the
+  // writes; `profile` and `extradata_size` are plain integer fields, and
+  // the extradata is replaced as libavcodec allocates it — freed with
+  // `av_freep`, allocated zeroed with its padding by `av_mallocz`.
+  unsafe {
+    let par = parameters.as_mut_ptr();
+    (*par).profile = profile;
+    if let Some(config) = config {
+      av_freep(core::ptr::addr_of_mut!((*par).extradata).cast());
+      let data = av_mallocz(config.len() + AV_INPUT_BUFFER_PADDING_SIZE as usize).cast::<u8>();
+      assert!(!data.is_null(), "allocated");
+      core::ptr::copy_nonoverlapping(config.as_ptr(), data, config.len());
+      (*par).extradata = data;
+      (*par).extradata_size = i32::try_from(config.len()).expect("small");
+    }
+  }
+  *table[0].side_data_mut() =
+    CodecTicket::mirror(&parameters, index, usize::MAX).expect("the ticket");
+  table
+}
+
+/// **L71 — an unmarked packet MP4 writes as a key frame is taken and
+/// reported, by movenc's own test, the stream's profile** (table G; the
+/// Fable delta gate's C1; Codex R7 1): MP4 writes no sync-sample table for
+/// an audio track but TrueHD's, MPEG-H 3D Audio's and USAC AAC's
+/// (`movenc.c` 3412–3418), USAC judged by the stream's profile, not its
+/// configuration, so an unmarked AAC packet reads back a key frame, as it
+/// would marked: taken, reported. An AAC track whose stream carries USAC's
+/// profile over an AAC LC configuration gets the table where its flags
+/// mix: its unmarked packet reads back unmarked, nothing reported; one
+/// whose configuration is USAC's under AAC LC's profile gets none, and is
+/// reported. Matroska keeps the flag. A video track none of whose packets is marked
+/// gets no table, every sample a key frame by the file, reported at
+/// `finish`; one with a key frame gets its table.
 ///
-/// PLANT: the refusal dropped takes the AAC packet, read back marked.
+/// PLANT: USAC judged by the configuration's object type, as before Codex
+/// R7: the USAC-profiled track's unmarked packet reported, and the
+/// USAC-configured one's not.
 #[test]
-fn l71_mp4_refuses_a_seek_point_its_codec_does_not_promise() {
+fn l71_mp4_marks_by_its_sync_table_as_movenc_decides_it() {
   let Some(corpus) = Corpus::new() else { return };
   let source = corpus.multi_track_mkv();
   let (_, audio) = first_track(&source, TrackKind::Audio, 2);
@@ -6071,25 +6109,44 @@ fn l71_mp4_refuses_a_seek_point_its_codec_does_not_promise() {
         .with_flags(PacketFlags::empty()),
     )
   };
-  let mut muxer = muxer_into(
-    &output(&corpus, "l71.mp4"),
-    ContainerName::MP4,
-    table_of(&source, TrackKind::Audio),
-  );
-  muxer
-    .write_audio(audio_at(&audio_of(&audio[0]), 0))
-    .map_err(|error| error.map_packet(drop))
-    .expect("a key frame");
-  let offered = unmarked(21);
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
-  assert_eq!(
-    refusal,
-    FfmpegMuxRefusal::KeyFrameUnmarked {
-      track: TrackIndex::new(0)
+  /// `AV_PROFILE_AAC_LOW` and `AV_PROFILE_AAC_USAC` (`defs.h` 67, 76).
+  const LOW: i32 = 1;
+  const USAC: i32 = 41;
+  // An AudioSpecificConfig of object type 42, USAC's: 31, then 10 in six
+  // bits; 48 kHz, stereo (`mpeg4audio.c` 77–83).
+  const USAC_CONFIG: [u8; 3] = [0xF9, 0x46, 0x40];
+  for (name, profile, config, reported) in [
+    ("l71.mp4", LOW, None, 1),
+    ("l71-usac.mp4", USAC, None, 0),
+    ("l71-usac-config.mp4", LOW, Some(&USAC_CONFIG[..]), 1),
+  ] {
+    let target = output(&corpus, name);
+    let mut muxer = muxer_into(
+      &target,
+      ContainerName::MP4,
+      audio_with(&source, profile, config),
+    );
+    muxer
+      .write_audio(audio_at(&audio_of(&audio[0]), 0))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a key frame");
+    muxer
+      .write_audio(unmarked(21))
+      .map_err(|error| error.map_packet(drop))
+      .expect("taken: the file is the same as for it marked");
+    assert_eq!(marked_of(muxer.report()), reported, "{name}");
+    muxer.finish().expect("finished");
+    let written = std::fs::read(&target).expect("the file");
+    assert_eq!(
+      written.windows(4).any(|box_type| box_type == b"stss"),
+      reported == 0,
+      "{name}: the sync-sample table, by the profile"
+    );
+    if config.is_none() {
+      let keys: Vec<_> = packets(&target)[0].iter().map(|seen| seen.key).collect();
+      assert_eq!(keys, vec![true, reported == 1], "{name}: read back");
     }
-  );
-  untouched!(offered, back);
-  muxer.finish().expect("finished");
+  }
 
   let target = output(&corpus, "l71.mkv");
   let mut muxer = muxer_into(

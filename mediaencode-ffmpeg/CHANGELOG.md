@@ -45,9 +45,7 @@ crate moves only when it changes.
   write's move of every stream's times; an FLV packet decoded before the
   first one FLV wrote (`FfmpegMuxRefusal::BeforeFirstDts`); an MP4 `mov_text` cue before zero, or before the
   last cue's end where another track's packet can make MP4 mark that end
-  first; an MP4 audio packet not marked a key frame, of a codec whose
-  descriptor does not count every frame one, which MP4 would write as one
-  (`FfmpegMuxRefusal::KeyFrameUnmarked`); and a
+  first; and a
   packet's bytes or side data the container would refuse or write
   otherwise — an empty packet it drops, AAC in an ADTS header on a
   configured track no filter converts, partial PCM,
