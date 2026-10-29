@@ -424,6 +424,14 @@ crate moves only when it changes.
   AV1, VP9 and VVC track of no matrix coefficients, which FLV's metadata
   packet states not and its reader reads back as RGB
   (`MuxOpenError::ColourDescription`, new).
+  A coded side data value past the field a container writes it in, or its
+  reader reads it back into (`MuxOpenError::CodedSideData`, new): MP4's
+  and MOV's content light level past 65 535 — 70 000 read back as 4464 —
+  mastering chromaticities and ambient light past 65 535
+  fifty-thousandths, luminances and illuminance past `INT_MAX`
+  ten-thousandths, read back negative; MOV's stereo field of view and
+  disparity; FLV's light level past 65 535; MXF's luminance; MP3's
+  ReplayGain of a gain past ±51.1 dB or a peak past 512.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

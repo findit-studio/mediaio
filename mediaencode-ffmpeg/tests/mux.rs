@@ -16651,3 +16651,199 @@ fn l143_flv_refuses_a_track_whose_matrix_would_read_back_rgb() {
     opened_flv(&corpus, name, vec![row]).unwrap_or_else(|error| panic!("{name}: {error:?}"));
   }
 }
+
+/// `row`, its ticket carrying the coded side data `kind` of `bytes`, the
+/// libavutil struct it names.
+fn with_coded(
+  row: Described,
+  kind: ffmpeg_next::ffi::AVPacketSideDataType,
+  bytes: &[u8],
+) -> Described {
+  reticketed(row, |par| {
+    // SAFETY: `par` is live, its coded side data its own;
+    // `av_packet_side_data_new` appends an entry of `bytes.len()` bytes it
+    // allocates, which the copy fills.
+    unsafe {
+      let entry = ffmpeg_next::ffi::av_packet_side_data_new(
+        &mut par.coded_side_data,
+        &mut par.nb_coded_side_data,
+        kind,
+        bytes.len(),
+        0,
+      );
+      assert!(!entry.is_null(), "the side data's entry");
+      core::ptr::copy_nonoverlapping(bytes.as_ptr(), (*entry).data, bytes.len());
+    }
+  })
+}
+
+/// Native-endian words, as a libavutil struct holds them.
+fn words(values: &[i32]) -> Vec<u8> {
+  values
+    .iter()
+    .flat_map(|value| value.to_ne_bytes())
+    .collect()
+}
+
+/// An `AVMasteringDisplayMetadata`: its primaries and white point each
+/// `chroma`, its luminances `luminance`, both stated.
+fn mastering(chroma: (i32, i32), luminance: (i32, i32)) -> Vec<u8> {
+  let mut fields = Vec::new();
+  for _ in 0..8 {
+    fields.extend([chroma.0, chroma.1]);
+  }
+  fields.extend([luminance.0, luminance.1, luminance.0, luminance.1, 1, 1]);
+  words(&fields)
+}
+
+/// **L144 — a coded side data value the container writes in fewer bits
+/// than it holds, or reads back into fewer, is refused at open** (R11,
+/// Q868; `movenc.c` 2659–2735, 2384–2393; `mov.c` 6684–6814;
+/// `flvdec.c` 63–68; `mxfenc.c` 1222–1225; `mp3enc.c` 425–446): MP4's
+/// content light level of 70 000, which it writes in 16 bits and reads
+/// back 4464, and its mastering display's chromaticity of 2, past 65 535
+/// fifty-thousandths; MOV's mastering luminance of 214 749 cd/m², past
+/// `INT_MAX` ten-thousandths, which its reader reads back negative, and
+/// its ambient illuminance of 214 749 lux, past `INT_MAX` ten-thousandths,
+/// and its stereo field of view past `INT_MAX` thousandths of a degree; FLV's
+/// light level of 70 000, which its reader keeps in 16 bits; MXF's
+/// luminance of 214 749; MP3's ReplayGain of 52 dB, past its 9-bit field
+/// of tenths, and a peak of 512, past its 32-bit Q23 — each refused by
+/// name (`MuxOpenError::CodedSideData`), nothing written. The bounds
+/// themselves open: 65 535, 214 748, 51 dB, a peak below 512; MP4, which
+/// writes no field of view, opens of one.
+///
+/// PLANT: MP4's light level unjudged, its first table opened; the MP3
+/// gain's bound a tenth higher, 52 dB taken.
+#[test]
+fn l144_a_coded_side_data_value_past_its_field_is_refused() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let (h264, _) = recoded_fixture(&corpus, &[]);
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let video = || table_of(&source, TrackKind::Video).remove(0);
+  let hevc = || {
+    restated(
+      &h264,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+      &hevc_base(),
+      None,
+      None,
+    )
+  };
+  let prores = prores_mkv(&corpus);
+  let mp3 = audio_file(&corpus, "l16.mp3", "libmp3lame");
+  let light = |cll: i32| words(&[cll, 400]);
+  let stereo = |fov: i32| words(&[1, 0, 0, 0, 0, 0, 1, fov, 1]);
+  let gain = |track_gain: i32, peak: u32| {
+    let mut bytes = words(&[track_gain]);
+    bytes.extend(peak.to_ne_bytes());
+    bytes.extend(words(&[i32::MIN, 0]));
+    bytes
+  };
+  let refused = |name: &str, container: &str, row: Described, kind: T| {
+    let opened = opened_in(&corpus, name, container, vec![row]);
+    assert!(
+      matches!(opened, Err(MuxOpenError::CodedSideData { track, kind: of }) if track.get() == 0 && of == kind as i32),
+      "{name}: {opened:?}"
+    );
+  };
+  let taken = |name: &str, container: &str, row: Described| {
+    opened_in(&corpus, name, container, vec![row])
+      .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+  };
+  let cll = T::AV_PKT_DATA_CONTENT_LIGHT_LEVEL;
+  let mdcv = T::AV_PKT_DATA_MASTERING_DISPLAY_METADATA;
+  let stereo3d = T::AV_PKT_DATA_STEREO3D;
+  let rg = T::AV_PKT_DATA_REPLAYGAIN;
+  refused(
+    "l144-cll.mp4",
+    "mp4",
+    with_coded(video(), cll, &light(70_000)),
+    cll,
+  );
+  taken(
+    "l144-cll-max.mp4",
+    "mp4",
+    with_coded(video(), cll, &light(65_535)),
+  );
+  refused(
+    "l144-chroma.mp4",
+    "mp4",
+    with_coded(video(), mdcv, &mastering((2, 1), (1000, 1))),
+    mdcv,
+  );
+  refused(
+    "l144-luminance.mov",
+    "mov",
+    with_coded(video(), mdcv, &mastering((1, 3), (214_749, 1))),
+    mdcv,
+  );
+  taken(
+    "l144-luminance-max.mov",
+    "mov",
+    with_coded(video(), mdcv, &mastering((1, 3), (214_748, 1))),
+  );
+  let amve = T::AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT;
+  refused(
+    "l144-illuminance.mov",
+    "mov",
+    with_coded(video(), amve, &words(&[214_749, 1, 1, 3, 1, 3])),
+    amve,
+  );
+  taken(
+    "l144-illuminance-max.mov",
+    "mov",
+    with_coded(video(), amve, &words(&[214_748, 1, 1, 3, 1, 3])),
+  );
+  refused(
+    "l144-fov.mov",
+    "mov",
+    with_coded(video(), stereo3d, &stereo(2_147_484)),
+    stereo3d,
+  );
+  taken(
+    "l144-fov.mp4",
+    "mp4",
+    with_coded(video(), stereo3d, &stereo(2_147_484)),
+  );
+  refused(
+    "l144-cll.flv",
+    "flv",
+    with_coded(hevc(), cll, &light(70_000)),
+    cll,
+  );
+  taken(
+    "l144-cll-max.flv",
+    "flv",
+    with_coded(hevc(), cll, &light(65_535)),
+  );
+  refused(
+    "l144-luminance.mxf",
+    "mxf",
+    with_coded(
+      table_of(&prores, TrackKind::Video).remove(0),
+      mdcv,
+      &mastering((1, 3), (214_749, 1)),
+    ),
+    mdcv,
+  );
+  let mp3_row = || table_of(&mp3, TrackKind::Audio).remove(0);
+  refused(
+    "l144-gain.mp3",
+    "mp3",
+    with_coded(mp3_row(), rg, &gain(5_200_000, 0)),
+    rg,
+  );
+  refused(
+    "l144-peak.mp3",
+    "mp3",
+    with_coded(mp3_row(), rg, &gain(0, 51_200_000)),
+    rg,
+  );
+  taken(
+    "l144-gain-max.mp3",
+    "mp3",
+    with_coded(mp3_row(), rg, &gain(5_119_999, 51_199_999)),
+  );
+}

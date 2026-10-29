@@ -756,6 +756,7 @@
 //! | FLV, at open | big-endian PCM; an audio codec of no extended header — PCM, Swiff ADPCM, Nellymoser, G.711, Speex — of a layout not exactly mono or stereo; PCM's and Swiff ADPCM's 8 and 16 kHz, G.711's every rate but 8 kHz | its code the host's own order, read back little-endian; the multichannel header names the codec's fourcc, which it has none of, and `av_assert0` ends the process; written as the 5.5 kHz code, and G.711 read back at 8 kHz, with no metadata read before the stream exists (`flvenc.c` 140–240, 910–913, 497–540; `flvdec.c` 314–360, 1657–1670) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`] — L105 |
 //! | FLV, at open (R11, ruling 4: every refusal of its start, by grep `return AVERROR\|unsupported_codec\|goto error` over `get_audio_flags` and `flv_init`, 141–240 and 971–1081; its allocation and the keyframe index's flag, never set, aside) | MPEG-4 Part 2 and H.263; an audio codec at a rate its flags' table names no code for — MP3 but at 48, 44.1, 22.05 and 11.025 kHz, its other codecs of no extended header but at 44.1, 22.05, 11.025, 16, 8 and 5.512 kHz, Speex but at 16 kHz — and Speex of more than one channel; a native layout of no channel its multichannel configuration keeps, which its reader refuses (R11, Codex R10 1; table E); a video track past the first of another codec than VP9, AV1, H.264, HEVC and VVC, an audio track past the first of another than AAC, MP3, Opus, FLAC, AC-3 and E-AC-3; a codec of none of its tables, a data or subtitle stream but text — refused by `avformat_query_codec`, its tables naming neither | refused at its start, the header unwritten, as no part of the official specification, "FLV does not support sample rate", "FLV only supports mono Speex audio", "Unsupported multi-track video codec" / "audio codec" (`flv_init`, `flvenc.c` 985–1066; `get_audio_flags`, 141–240); the layout written as a mask of zero, which its reader refuses, the stream read back of no channels (739–744; `flvdec.c` 1733–1742) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::TrackLayout`] — L133, L134, L135 |
 //! | FLV, at open (R11, Q868) | an HEVC, AV1, VP9 or VVC track of no matrix coefficients, or of one past its table | its metadata packet states the matrix where it is specified, and its reader, its colour information in a zeroed context, reads an absent one back as RGB — a false claim (`flvenc.c` 555–608; `flvdec.c` 1261–1262) | [`MuxOpenError::ColourDescription`] — L143 |
+//! | MP4, MOV, FLV, the MXF muxers, MP3, at open (R11, Q868) | a coded side data value past its field: MP4's and MOV's content light level past 65 535, mastering display chromaticity past 65 535 fifty-thousandths and luminance past `INT_MAX` ten-thousandths, ambient illuminance past `INT_MAX` ten-thousandths and light past 65 535 fifty-thousandths; MOV's stereo field of view past `INT_MAX` thousandths of a degree and disparity past an `int`'s ten-thousandths; FLV's light level past 65 535; MXF's luminance past `INT_MAX` ten-thousandths; MP3's ReplayGain of a gain past ±51.1 dB or a peak past 512 | written cut into its field, or read back into an `int` or 16 bits: another value, negative past `INT_MAX` (`movenc.c` 2384–2393, 2466–2476, 2659–2735; `mov.c` 6684–6814, 7286–7296, 7396–7423; `flvdec.c` 63–68, 785–787; `mxfenc.c` 1222–1225, 1484–1489; `mxfdec.c` 1482–1490; `mp3enc.c` 425–446) | [`MuxOpenError::CodedSideData`] — L144 |
 //! | WAV, Wave64, AVI, ASF | a configured AAC track's ADTS packet; at open, an audio configuration past the WAVEFORMATEX's 16-bit `cbSize` | written as it comes into a stream whose format declares raw AAC; written, its size cut (`riffenc.c` 193–223) | [`PayloadRule::AdtsHeader`], [`MuxOpenError::ConfigurationInvalid`] — L87, L88 |
 //! | ASF | a decode time past its 32-bit presentation time, the preroll added; a presentation time past what its index counts in an `int` of seconds; a play duration past `i64` in 100 ns; an empty packet | written cut; refused after taking it; a signed overflow; no payload written (`asfenc.c` 886–1038) | [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::Empty`] — L86 |
 //! | ASF, at open | a video configuration past its format data's 16-bit size; a marker's title past its entry's 16-bit length; a chapter at 2^32 ms or later; the streaming form's header past its chunk's 16-bit length | each written, its length or send time cut (`asfenc.c` 645, 337, 297–308, 708–716) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSpan`], [`MuxOpenError::HeaderTooLong`] — L87 |
@@ -3175,6 +3176,28 @@ pub enum MuxOpenError {
   ColourDescription {
     /// The track.
     track: TrackIndex,
+  },
+  /// A track's coded side data of a value the container writes in fewer
+  /// bits than it holds, or its reader reads back into fewer, so that it
+  /// reads back as another (R11, Q868): MP4's and MOV's content light level
+  /// past 65 535, its mastering display's chromaticities past 65 535
+  /// fifty-thousandths and luminances past `INT_MAX` ten-thousandths, its
+  /// ambient viewing environment's illuminance past `INT_MAX`
+  /// ten-thousandths and light past 65 535 fifty-thousandths (`movenc.c`
+  /// 2659–2735; `mov.c` 6684–6814) — and MOV's stereo field of view past
+  /// `INT_MAX` thousandths of a degree and disparity past an `int`'s
+  /// ten-thousandths (2384–2393, 2466–2476; 7286–7296, 7396–7423); FLV's
+  /// content light level past 65 535, which its reader keeps in 16 bits
+  /// (`flvdec.c` 63–68, 785–787); MXF's mastering luminances past `INT_MAX`
+  /// ten-thousandths (`mxfenc.c` 1222–1225, 1484–1489; `mxfdec.c`
+  /// 1482–1490); MP3's ReplayGain of a gain past ±51.1 dB, its 9-bit field,
+  /// or a peak past 512, its 32-bit Q23 (`mp3enc.c` 425–446).
+  #[error("track {}'s coded side data of kind {kind} would read back as another", .track.get())]
+  CodedSideData {
+    /// The track.
+    track: TrackIndex,
+    /// The side data's kind: FFmpeg's `AV_PKT_DATA_*` value.
+    kind: i32,
   },
   /// An audio track of a muxer that rechunks PCM at its start — DAUD, GXF
   /// and the MXF muxers insert `pcm_rechunk` (table B of the census, see
@@ -10494,6 +10517,9 @@ fn judge<W, D: AsRef<[u8]>>(
       ) {
         return Err(MuxOpenError::ConfigurationInvalid { track, codec });
       }
+      if let Some(kind) = coded_side_data_wraps(audited, description) {
+        return Err(MuxOpenError::CodedSideData { track, kind });
+      }
       if family == Family::Mp4
         && description.kind() == TrackKind::Video
         && crops_away(description.side_data())
@@ -11590,6 +11616,133 @@ fn h26x_units(codec: CodecId) -> Option<Units> {
     c if c == CodecId::VVC => Some(Units::Vvc),
     _ => None,
   }
+}
+
+/// `av_rescale(a, b, c)`: `a` by `b` over `c`, rounded to the nearest, half
+/// away from zero, `INT64_MIN` for a `c` of none or a `b` below zero
+/// (`av_rescale_rnd`, `libavutil/mathematics.c` 58–100), of terms an
+/// `AVRational` holds.
+fn rescale_near(a: i64, b: i64, c: i64) -> i64 {
+  if c <= 0 || b < 0 {
+    return i64::MIN;
+  }
+  let magnitude = (i128::from(a).abs() * i128::from(b) + i128::from(c / 2)) / i128::from(c);
+  let rounded = if a < 0 { -magnitude } else { magnitude };
+  i64::try_from(rounded).unwrap_or(i64::MIN)
+}
+
+/// The coded side data of a track the container writes in fewer bits than
+/// it holds, or its reader reads back into fewer — its kind, the first such
+/// ([`MuxOpenError::CodedSideData`]; R11, Q868). Each entry's bytes are the
+/// libavutil struct it names, as the base holds them.
+fn coded_side_data_wraps<D, S>(
+  audited: Audited,
+  description: &TrackDescription<Ffmpeg, D, S>,
+) -> Option<i32>
+where
+  S: core::borrow::Borrow<CodecTicket>,
+{
+  use AVPacketSideDataType as T;
+  let ticket: &CodecTicket = description.side_data().borrow();
+  let int = |bytes: &[u8], at: usize| -> Option<i64> {
+    bytes
+      .get(at..at + 4)
+      .map(|word| i64::from(i32::from_ne_bytes([word[0], word[1], word[2], word[3]])))
+  };
+  let unsigned = |bytes: &[u8], at: usize| -> Option<u64> {
+    bytes
+      .get(at..at + 4)
+      .map(|word| u64::from(u32::from_ne_bytes([word[0], word[1], word[2], word[3]])))
+  };
+  let ratio = |bytes: &[u8], at: usize, by: i64| -> Option<i64> {
+    Some(rescale_near(int(bytes, at)?, by, int(bytes, at + 4)?))
+  };
+  let within = |value: Option<i64>, bounds: core::ops::RangeInclusive<i64>| {
+    value.is_none_or(|value| bounds.contains(&value))
+  };
+  let sixteen = 0..=i64::from(u16::MAX);
+  let positive = 0..=i64::from(i32::MAX);
+  let video = description.kind() == TrackKind::Video;
+  let codec = description.codec();
+  for entry in ticket.coded_side_data() {
+    let kind = entry.kind();
+    let bytes = entry.data();
+    let is = |of: T| kind == of as i32;
+    let wraps = match audited {
+      // `clli`, `mdcv` and `amve`, MP4's and MOV's modes alone (2958–2962).
+      Audited::Mov(MovMode::Mp4 | MovMode::Mov)
+        if video && is(T::AV_PKT_DATA_CONTENT_LIGHT_LEVEL) =>
+      {
+        unsigned(bytes, 0).is_some_and(|cll| cll > 0xFFFF)
+          || unsigned(bytes, 4).is_some_and(|fall| fall > 0xFFFF)
+      }
+      Audited::Mov(MovMode::Mp4 | MovMode::Mov)
+        if video
+          && is(T::AV_PKT_DATA_MASTERING_DISPLAY_METADATA)
+          && int(bytes, 80).is_some_and(|primaries| primaries != 0)
+          && int(bytes, 84).is_some_and(|luminance| luminance != 0) =>
+      {
+        (0..8).any(|index| !within(ratio(bytes, index * 8, 50_000), sixteen.clone()))
+          || [64, 72]
+            .into_iter()
+            .any(|at| !within(ratio(bytes, at, 10_000), positive.clone()))
+      }
+      Audited::Mov(MovMode::Mp4 | MovMode::Mov)
+        if video
+          && is(T::AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT)
+          && int(bytes, 0).is_some_and(|illuminance| illuminance != 0) =>
+      {
+        !within(ratio(bytes, 0, 10_000), positive.clone())
+          || [8, 16]
+            .into_iter()
+            .any(|at| !within(ratio(bytes, at, 50_000), sixteen.clone()))
+      }
+      // MOV's `hfov`, and its `dadj` where the eyes are written — a stereo
+      // type but 2D (2466–2501, 2996–2997).
+      Audited::Mov(MovMode::Mov) if video && is(T::AV_PKT_DATA_STEREO3D) => {
+        let two_d = int(bytes, 0) == Some(ffmpeg_next::ffi::AVStereo3DType::AV_STEREO3D_2D as i64);
+        (int(bytes, 28).is_some_and(|fov| fov != 0)
+          && !within(ratio(bytes, 28, 1000), positive.clone()))
+          || (!two_d
+            && int(bytes, 20).is_some_and(|adjustment| adjustment != 0)
+            && !within(
+              ratio(bytes, 20, 10_000),
+              i64::from(i32::MIN)..=i64::from(i32::MAX),
+            ))
+      }
+      Audited::Flv
+        if video
+          && [CodecId::HEVC, CodecId::AV1, CodecId::VP9, CodecId::VVC].contains(&codec)
+          && is(T::AV_PKT_DATA_CONTENT_LIGHT_LEVEL) =>
+      {
+        unsigned(bytes, 0).is_some_and(|cll| cll > 0xFFFF)
+          || unsigned(bytes, 4).is_some_and(|fall| fall > 0xFFFF)
+      }
+      Audited::Mxf(_)
+        if video
+          && is(T::AV_PKT_DATA_MASTERING_DISPLAY_METADATA)
+          && int(bytes, 84).is_some_and(|luminance| luminance != 0) =>
+      {
+        [64, 72]
+          .into_iter()
+          .any(|at| !within(ratio(bytes, at, 10_000), positive.clone()))
+      }
+      Audited::Mp3 if is(T::AV_PKT_DATA_REPLAYGAIN) && bytes.len() >= 16 => {
+        [0, 8]
+          .into_iter()
+          .filter_map(|at| int(bytes, at))
+          .filter(|&gain| gain != i64::from(i32::MIN))
+          .any(|gain| (gain / 10_000).abs() > 511)
+          || unsigned(bytes, 4)
+            .is_some_and(|peak| rescale_near(peak as i64, 1 << 23, 100_000) > i64::from(u32::MAX))
+      }
+      _ => false,
+    };
+    if wraps {
+      return Some(kind);
+    }
+  }
+  None
 }
 
 /// Whether the container's writer refuses `codec`'s configuration
