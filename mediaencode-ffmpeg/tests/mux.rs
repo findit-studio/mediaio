@@ -12902,3 +12902,1885 @@ fn l113_mp4s_dvd_subtitle_configuration_is_taken_where_it_reads_back() {
   );
   assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+//  The configuration writers MP4 and FLV call and ignore the answers of
+//  (R10, Codex R9 [high]): one law for each condition a stream the
+//  standards allow can reach, at open and as a packet's new extradata.
+// ---------------------------------------------------------------------------
+
+type Described = TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>;
+
+/// Bits as the standards' syntax writes them.
+#[derive(Clone, Default)]
+struct Syntax(Vec<bool>);
+
+impl Syntax {
+  /// `u(n)`.
+  fn u(mut self, value: u64, count: u32) -> Self {
+    for bit in (0..count).rev() {
+      self.0.push((value >> bit) & 1 == 1);
+    }
+    self
+  }
+
+  /// `ue(v)`.
+  fn ue(self, value: u32) -> Self {
+    let code = u64::from(value) + 1;
+    let len = 64 - code.leading_zeros();
+    self.u(0, len - 1).u(code, len)
+  }
+
+  /// Ones to the byte's end.
+  fn aligned(mut self) -> Self {
+    while self.0.len() % 8 != 0 {
+      self.0.push(true);
+    }
+    self
+  }
+
+  /// The RBSP: its stop bit and zeros to its byte's end.
+  fn rbsp(mut self) -> Vec<u8> {
+    self.0.push(true);
+    while self.0.len() % 8 != 0 {
+      self.0.push(false);
+    }
+    self
+      .0
+      .chunks(8)
+      .map(|byte| byte.iter().fold(0, |acc, &bit| (acc << 1) | u8::from(bit)))
+      .collect()
+  }
+}
+
+/// A NAL unit of `header` and `rbsp`, an emulation prevention byte after
+/// every two zeros a byte of 3 or less follows.
+fn escaped(header: &[u8], rbsp: &[u8]) -> Vec<u8> {
+  let mut out = header.to_vec();
+  let mut zeros = 0;
+  for &byte in rbsp {
+    if zeros >= 2 && byte <= 3 {
+      out.push(3);
+      zeros = 0;
+    }
+    out.push(byte);
+    zeros = if byte == 0 { zeros + 1 } else { 0 };
+  }
+  out
+}
+
+/// `units`, each behind a 4-byte start code.
+fn start_coded(units: &[&[u8]]) -> Vec<u8> {
+  units
+    .iter()
+    .flat_map(|unit| [&[0_u8, 0, 0, 1][..], unit].concat())
+    .collect()
+}
+
+/// A unit of `header` and as many bytes of 0x11 after it as make `len`.
+fn sized(header: &[u8], len: usize) -> Vec<u8> {
+  let mut unit = header.to_vec();
+  unit.resize(len, 0x11);
+  unit
+}
+
+/// `row` restated: of `codec`, stating `config`, of the codec tag `tag`
+/// and the pixel format `format` where given.
+fn restated(
+  row: &Described,
+  codec: ffmpeg_next::ffi::AVCodecID,
+  config: &[u8],
+  tag: Option<&[u8; 4]>,
+  format: Option<i32>,
+) -> Described {
+  restated_profile(row, codec, config, (tag, format, None))
+}
+
+/// [`restated`], of the profile `profile` where given.
+fn restated_profile(
+  row: &Described,
+  codec: ffmpeg_next::ffi::AVCodecID,
+  config: &[u8],
+  (tag, format, profile): (Option<&[u8; 4]>, Option<i32>, Option<i32>),
+) -> Described {
+  let index = row.side_data().stream_index();
+  let mut parameters = row.side_data().rebuild().expect("the parameters");
+  // SAFETY: `parameters` owns its `AVCodecParameters`, live for the
+  // writes; `codec_id` is written a value of its own enum, the tag and the
+  // format plain integers.
+  unsafe {
+    let par = parameters.as_mut_ptr();
+    (*par).codec_id = codec;
+    if let Some(tag) = tag {
+      (*par).codec_tag = u32::from_le_bytes(*tag);
+    }
+    if let Some(format) = format {
+      core::ptr::addr_of_mut!((*par).format).write(format);
+    }
+    if let Some(profile) = profile {
+      (*par).profile = profile;
+    }
+  }
+  let ticket = CodecTicket::mirror(&parameters, index, usize::MAX).expect("the ticket");
+  let id = CodecId::from_raw(codec as i32);
+  let params = match row.params() {
+    TrackParams::Video(params) => {
+      TrackParams::Video(mediaencode::mediaspine::demuxer::VideoTrackParams::new(
+        id,
+        params.width(),
+        params.height(),
+        params.pixel_format().clone(),
+        params.frame_rate(),
+      ))
+    }
+    other => other.duplicate(),
+  };
+  TrackDescription::new(row.timebase(), params, ticket)
+    .expect("a timed track")
+    .with_extradata(Some(bytes_of(config)))
+    .with_language(row.language().cloned())
+    .with_disposition(row.disposition())
+}
+
+/// The containers a configuration law runs in, and their extensions.
+fn mp4_and_flv() -> Vec<(ContainerName, &'static str)> {
+  vec![
+    (ContainerName::MP4, "mp4"),
+    (ContainerName::new("flv"), "flv"),
+  ]
+}
+
+/// A configuration law in each of `containers`, of `cases` — each a
+/// configuration, and whether the container refuses it. At open, a track
+/// `track` makes stating it: refused by name, nothing written; or taken,
+/// `frames` written and the file finished. As new extradata, where
+/// `packets`: after a track stating `base` opens, the first frame bringing
+/// it refused, handed back untouched, or taken; the frames written and the
+/// file finished either way.
+fn configuration_law(
+  corpus: &Corpus,
+  law: &str,
+  containers: &[(ContainerName, &str)],
+  track: &dyn Fn(&[u8]) -> Described,
+  (frames, base, packets): (&[Video], &[u8], bool),
+  cases: &[(&str, Vec<u8>, bool)],
+) {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let write = |muxer: &mut FfmpegOwnedMuxer<File>, frames: &[Video], what: &str| {
+    for frame in frames {
+      muxer
+        .write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone()))
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{what}: a frame: {error:?}"));
+    }
+  };
+  for (container, extension) in containers {
+    for (index, (name, config, refused)) in cases.iter().enumerate() {
+      let what = format!("{law} {name}, {extension}");
+      let target = output(corpus, &format!("{law}-{index}.{extension}"));
+      let opened = FfmpegOwnedMuxer::open(
+        File::create(&target).expect("create"),
+        container.clone(),
+        vec![track(config)],
+        &[],
+        PacketLimits::default(),
+      );
+      if *refused {
+        assert!(
+          matches!(opened, Err(MuxOpenError::ConfigurationInvalid { .. })),
+          "{what}: {:?}",
+          opened.map(drop)
+        );
+        assert_eq!(
+          std::fs::metadata(&target).expect("the file").len(),
+          0,
+          "{what}: nothing written"
+        );
+      } else {
+        let (mut muxer, _) = opened.unwrap_or_else(|error| panic!("{what}: {error:?}"));
+        write(&mut muxer, frames, &what);
+        muxer
+          .finish()
+          .unwrap_or_else(|error| panic!("{what}: {error:?}"));
+      }
+      if !packets {
+        continue;
+      }
+      let target = output(corpus, &format!("{law}-{index}-new.{extension}"));
+      let mut muxer = muxer_into(&target, container.clone(), vec![track(base)]);
+      let mut first = frames[0].clone();
+      first
+        .extra_mut()
+        .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, config)]);
+      let offered = VideoTrackPacket::new(TrackIndex::new(0), first);
+      if *refused {
+        let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+        assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{what}, new");
+        untouched!(offered, back);
+        write(&mut muxer, frames, &what);
+      } else {
+        muxer
+          .write_video(offered)
+          .map_err(|error| error.map_packet(drop))
+          .unwrap_or_else(|error| panic!("{what}, new: {error:?}"));
+        write(&mut muxer, &frames[1..], &what);
+      }
+      muxer
+        .finish()
+        .unwrap_or_else(|error| panic!("{what}, new: {error:?}"));
+    }
+  }
+}
+
+/// The H.264 laws' fixture: the corpus's H.264 track, its first three
+/// frames rewritten from length prefixes to start codes, and its SPS and
+/// PPS read off its `avcC`.
+fn h264_fixture(corpus: &Corpus) -> (Described, Vec<Video>, Vec<u8>, Vec<u8>) {
+  let (mut table, packets) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 3);
+  let row = table.remove(0);
+  let record = stream_extradata_of(&row);
+  assert_eq!(
+    (record[0], record[5] & 0x1F),
+    (1, 1),
+    "the premise: an avcC of one SPS"
+  );
+  let sps_len = usize::from(u16::from_be_bytes([record[6], record[7]]));
+  let sps = record[8..8 + sps_len].to_vec();
+  let at = 8 + sps_len;
+  assert_eq!(record[at], 1, "the premise: one PPS");
+  let pps_len = usize::from(u16::from_be_bytes([record[at + 1], record[at + 2]]));
+  let pps = record[at + 3..at + 3 + pps_len].to_vec();
+  let frames = packets
+    .iter()
+    .map(|packet| {
+      let frame = video_of(packet);
+      let mut bytes = Vec::new();
+      let mut rest = frame.data().as_ref();
+      while rest.len() >= 4 {
+        let len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        bytes.extend_from_slice(&[0, 0, 0, 1]);
+        bytes.extend_from_slice(&rest[4..4 + len]);
+        rest = &rest[4 + len..];
+      }
+      video_holding(&frame, &bytes)
+    })
+    .collect();
+  (row, frames, sps, pps)
+}
+
+/// An H.264 law: `cases` against `ff_isom_write_avcc`, in MP4 and FLV, at
+/// open and as new extradata after a track stating one SPS and one PPS.
+fn avcc_law(law: &str, cases: &dyn Fn(&[u8], &[u8]) -> Vec<(&'static str, Vec<u8>, bool)>) {
+  avcc_law_of(law, true, cases);
+}
+
+/// [`avcc_law`], on the packet road where `packets`.
+fn avcc_law_of(
+  law: &str,
+  packets: bool,
+  cases: &dyn Fn(&[u8], &[u8]) -> Vec<(&'static str, Vec<u8>, bool)>,
+) {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, frames, sps, pps) = h264_fixture(&corpus);
+  let base = start_coded(&[&sps, &pps]);
+  let track = |config: &[u8]| {
+    restated(
+      &row,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+      config,
+      None,
+      None,
+    )
+  };
+  configuration_law(
+    &corpus,
+    law,
+    &mp4_and_flv(),
+    &track,
+    (&frames, &base, packets),
+    &cases(&sps, &pps),
+  );
+}
+
+/// `count` copies of `unit`.
+fn copies(unit: &[u8], count: usize) -> Vec<&[u8]> {
+  vec![unit; count]
+}
+
+/// **L114a — an H.264 configuration of fewer than 7 bytes is refused**
+/// (`avc.c` 39–40; `movenc.c` 1584–1593; `flvenc.c` 897): `ff_isom_write_avcc`
+/// refuses it, of either form, and MP4 and FLV, ignoring the answer, leave
+/// the `avcC` or the sequence header empty — at open, nothing written, and
+/// as new extradata, the packet handed back; an `avcC` of 7 bytes, written
+/// as it is, taken. MP4's packet road refuses an `avcC` after an Annex B
+/// configuration for its form, beside.
+///
+/// PLANT: the length unjudged opens, and takes FLV's packet.
+#[test]
+fn l114a_an_h264_configuration_of_fewer_than_7_bytes_is_refused() {
+  avcc_law_of("l114a-avcc", false, &|sps, _| {
+    vec![
+      (
+        "an avcC of six bytes",
+        vec![1, sps[1], 0, 0x1F, 0xFF, 0xE1],
+        true,
+      ),
+      (
+        "an avcC of seven bytes",
+        vec![1, sps[1], 0, 0x1F, 0xFF, 0xE1, 0],
+        false,
+      ),
+    ]
+  });
+  avcc_law("l114a", &|sps, pps| {
+    vec![
+      (
+        "six bytes of a start code",
+        vec![0, 0, 0, 1, 0x67, sps[1]],
+        true,
+      ),
+      ("an SPS and a PPS", start_coded(&[sps, pps]), false),
+    ]
+  });
+}
+
+/// **L114b — a 32nd SPS is refused** (`avc.c` 75–78): H.264 numbers 32
+/// sequence parameter sets, and `ff_isom_write_avcc` refuses the 32nd of
+/// an Annex B configuration; 31 taken.
+///
+/// PLANT: the count unjudged opens, and takes the packet.
+#[test]
+fn l114b_an_h264_configuration_of_32_spss_is_refused() {
+  avcc_law("l114b", &|sps, pps| {
+    vec![
+      (
+        "32 SPSs",
+        start_coded(&[copies(sps, 32), vec![pps]].concat()),
+        true,
+      ),
+      (
+        "31 SPSs",
+        start_coded(&[copies(sps, 31), vec![pps]].concat()),
+        false,
+      ),
+    ]
+  });
+}
+
+/// **L114c — a 256th PPS is refused** (`avc.c` 83–86): H.264 numbers 256
+/// picture parameter sets; 255 taken.
+///
+/// PLANT: the count unjudged opens, and takes the packet.
+#[test]
+fn l114c_an_h264_configuration_of_256_ppss_is_refused() {
+  avcc_law("l114c", &|sps, pps| {
+    vec![
+      (
+        "256 PPSs",
+        start_coded(&[vec![sps], copies(pps, 256)].concat()),
+        true,
+      ),
+      (
+        "255 PPSs",
+        start_coded(&[vec![sps], copies(pps, 255)].concat()),
+        false,
+      ),
+    ]
+  });
+}
+
+/// **L114d — a 256th SPS extension is refused** (`avc.c` 91–94); 255
+/// taken.
+///
+/// PLANT: the count unjudged opens, and takes the packet.
+#[test]
+fn l114d_an_h264_configuration_of_256_sps_extensions_is_refused() {
+  avcc_law("l114d", &|sps, pps| {
+    let extension: &[u8] = &[0x6D, 0x80];
+    vec![
+      (
+        "256 extensions",
+        start_coded(&[vec![sps, pps], copies(extension, 256)].concat()),
+        true,
+      ),
+      (
+        "255 extensions",
+        start_coded(&[vec![sps, pps], copies(extension, 255)].concat()),
+        false,
+      ),
+    ]
+  });
+}
+
+/// **L114e — an SPS past 65 535 bytes is refused** (`avc.c` 75–78): its
+/// length is written in 16 bits, and `ff_isom_write_avcc` refuses it; one
+/// of 65 535 taken.
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l114e_an_h264_sps_past_65_535_bytes_is_refused() {
+  avcc_law("l114e", &|sps, pps| {
+    vec![
+      (
+        "an SPS of 65 536 bytes",
+        start_coded(&[&sized(&sps[..4], 65_536), pps]),
+        true,
+      ),
+      (
+        "an SPS of 65 535 bytes",
+        start_coded(&[&sized(&sps[..4], 65_535), pps]),
+        false,
+      ),
+    ]
+  });
+}
+
+/// **L114f — a PPS past 65 535 bytes is refused** (`avc.c` 83–86).
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l114f_an_h264_pps_past_65_535_bytes_is_refused() {
+  avcc_law("l114f", &|sps, pps| {
+    vec![
+      (
+        "a PPS of 65 536 bytes",
+        start_coded(&[sps, &sized(&pps[..1], 65_536)]),
+        true,
+      ),
+      (
+        "a PPS of 65 535 bytes",
+        start_coded(&[sps, &sized(&pps[..1], 65_535)]),
+        false,
+      ),
+    ]
+  });
+}
+
+/// **L114g — an SPS extension past 65 535 bytes is refused** (`avc.c`
+/// 91–94).
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l114g_an_h264_sps_extension_past_65_535_bytes_is_refused() {
+  avcc_law("l114g", &|sps, pps| {
+    vec![
+      (
+        "an extension of 65 536 bytes",
+        start_coded(&[sps, pps, &sized(&[0x6D], 65_536)]),
+        true,
+      ),
+      (
+        "an extension of 65 535 bytes",
+        start_coded(&[sps, pps, &sized(&[0x6D], 65_535)]),
+        false,
+      ),
+    ]
+  });
+}
+
+/// **L114h — an H.264 configuration of no SPS is refused** (`avc.c`
+/// 106–109): the SPSs with their lengths fewer than 6 bytes — none, or
+/// one of three; one of four taken.
+///
+/// PLANT: the SPSs unjudged opens, and takes the packet.
+#[test]
+fn l114h_an_h264_configuration_of_no_sps_is_refused() {
+  avcc_law("l114h", &|sps, pps| {
+    vec![
+      ("no SPS", start_coded(&[pps, pps]), true),
+      (
+        "an SPS of three bytes",
+        start_coded(&[&sps[..3], pps]),
+        true,
+      ),
+      (
+        "an SPS of four bytes",
+        start_coded(&[&sps[..4], pps]),
+        false,
+      ),
+    ]
+  });
+}
+
+/// **L114i — an H.264 configuration of no PPS is refused** (`avc.c`
+/// 106–109): its PPS may come in band, and `ff_isom_write_avcc` refuses
+/// the configuration.
+///
+/// PLANT: the PPS unjudged opens, and takes the packet.
+#[test]
+fn l114i_an_h264_configuration_of_no_pps_is_refused() {
+  avcc_law("l114i", &|sps, pps| {
+    vec![
+      ("no PPS", start_coded(&[sps, sps]), true),
+      ("an SPS and a PPS", start_coded(&[sps, pps]), false),
+    ]
+  });
+}
+
+/// An HEVC NAL unit header: its type, its layer, a temporal id of zero.
+fn hevc_header(kind: u8, layer: u8) -> [u8; 2] {
+  ((u16::from(kind) << 9) | (u16::from(layer) << 3) | 1).to_be_bytes()
+}
+
+/// A general profile, tier and level: Main, level 3.1.
+fn hevc_general_ptl(syntax: Syntax) -> Syntax {
+  syntax
+    .u(0, 2)
+    .u(0, 1)
+    .u(1, 5)
+    .u(0x6000_0000, 32)
+    .u(0x9000_0000_0000, 48)
+    .u(93, 8)
+}
+
+/// An HEVC VPS `id` of one layer, or of two whose second, `alpha`, its
+/// extension names an auxiliary alpha layer.
+fn hevc_vps(id: u8, alpha: Option<u8>) -> Vec<u8> {
+  let syntax = Syntax::default()
+    .u(u64::from(id), 4)
+    .u(1, 1)
+    .u(1, 1)
+    .u(u64::from(alpha.is_some()), 6)
+    .u(0, 3)
+    .u(1, 1)
+    .u(0xFFFF, 16);
+  let syntax = hevc_general_ptl(syntax)
+    .u(1, 1)
+    .ue(4)
+    .ue(0)
+    .ue(0)
+    .u(0, 6)
+    .ue(0)
+    .u(0, 1);
+  let syntax = match alpha {
+    None => syntax.u(0, 1),
+    Some(layer) => syntax
+      .u(1, 1)
+      .aligned()
+      .u(93, 8)
+      .u(0, 1)
+      .u(0x1000, 16)
+      .u(0, 3)
+      .u(1, 1)
+      .u(u64::from(layer), 6)
+      .u(1, 1),
+  };
+  escaped(&hevc_header(32, 0), &syntax.rbsp())
+}
+
+/// An HEVC SPS of the base layer, or of `layer` as its VPS `vps`'s
+/// multilayer extension, of `short_term` short-term reference picture
+/// sets and `long_term` long-term reference pictures where any.
+fn hevc_sps(layer: u8, vps: u8, short_term: u32, long_term: Option<u32>) -> Vec<u8> {
+  let mut syntax = Syntax::default().u(u64::from(vps), 4);
+  if layer == 0 {
+    syntax = hevc_general_ptl(syntax.u(0, 3).u(1, 1))
+      .ue(0)
+      .ue(1)
+      .ue(64)
+      .ue(64)
+      .u(0, 1)
+      .ue(0)
+      .ue(0);
+  } else {
+    syntax = syntax.u(7, 3).ue(1).u(0, 1);
+  }
+  syntax = syntax.ue(4);
+  if layer == 0 {
+    syntax = syntax.u(1, 1).ue(4).ue(0).ue(0);
+  }
+  syntax = syntax
+    .ue(0)
+    .ue(1)
+    .ue(0)
+    .ue(1)
+    .ue(0)
+    .ue(0)
+    .u(0, 4)
+    .ue(short_term);
+  for index in 0..short_term {
+    if index > 0 {
+      syntax = syntax.u(0, 1);
+    }
+    syntax = syntax.ue(1).ue(0).ue(0).u(1, 1);
+  }
+  syntax = match long_term {
+    None => syntax.u(0, 1),
+    Some(count) => {
+      let mut syntax = syntax.u(1, 1).ue(count);
+      for _ in 0..count {
+        syntax = syntax.u(0, 8).u(1, 1);
+      }
+      syntax
+    }
+  };
+  escaped(&hevc_header(33, layer), &syntax.u(0, 4).rbsp())
+}
+
+/// An HEVC PPS.
+fn hevc_pps() -> Vec<u8> {
+  let syntax = Syntax::default()
+    .ue(0)
+    .ue(0)
+    .u(0, 7)
+    .ue(0)
+    .ue(0)
+    .ue(0)
+    .u(0, 3)
+    .ue(0)
+    .ue(0)
+    .u(0, 10);
+  escaped(&hevc_header(34, 0), &syntax.rbsp())
+}
+
+/// An `hvcC` of `arrays`, each its NAL unit type and units.
+fn hvcc_record(arrays: &[(u8, Vec<Vec<u8>>)]) -> Vec<u8> {
+  let mut record = vec![
+    1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 93, 0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00,
+    0x00, 0x0F,
+  ];
+  record.push(u8::try_from(arrays.len()).expect("arrays"));
+  for (kind, units) in arrays {
+    record.push(0x80 | kind);
+    record.extend_from_slice(&u16::try_from(units.len()).expect("count").to_be_bytes());
+    for unit in units {
+      record.extend_from_slice(&u16::try_from(unit.len()).expect("length").to_be_bytes());
+      record.extend_from_slice(unit);
+    }
+  }
+  record
+}
+
+/// A video track recoded to `codec`, of `tag` where given, of the corpus's
+/// H.264 track; its three frames holding `frame` instead, in their times.
+fn recoded_fixture(corpus: &Corpus, frame: &[u8]) -> (Described, Vec<Video>) {
+  let (row, frames, ..) = h264_fixture(corpus);
+  let frames = frames
+    .iter()
+    .map(|video| video_holding(video, frame))
+    .collect();
+  (row, frames)
+}
+
+/// A configuration law over the corpus's H.264 track recoded to `codec`,
+/// of the codec tag `tag` where given, its frames holding `frame`.
+fn recoded_law(
+  corpus: &Corpus,
+  law: &str,
+  containers: &[(ContainerName, &str)],
+  (codec, tag, frame): (ffmpeg_next::ffi::AVCodecID, Option<&[u8; 4]>, &[u8]),
+  (base, packets): (&[u8], bool),
+  cases: &[(&str, Vec<u8>, bool)],
+) {
+  let (row, frames) = recoded_fixture(corpus, frame);
+  let track = |config: &[u8]| restated(&row, codec, config, tag, None);
+  configuration_law(
+    corpus,
+    law,
+    containers,
+    &track,
+    (&frames, base, packets),
+    cases,
+  );
+}
+
+/// An HEVC law: `cases` against `ff_isom_write_hvcc` in `containers`, of
+/// the tag `tag` where given, after a track stating `base` on the packet
+/// road where `packets`.
+fn hvcc_law(
+  law: &str,
+  containers: &[(ContainerName, &str)],
+  tag: Option<&[u8; 4]>,
+  (base, packets): (&[u8], bool),
+  cases: &[(&str, Vec<u8>, bool)],
+) {
+  let Some(corpus) = Corpus::new() else { return };
+  let slice = start_coded(&[&escaped(&hevc_header(19, 0), &[0xAF, 0x88, 0x42])]);
+  recoded_law(
+    &corpus,
+    law,
+    containers,
+    (ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC, tag, &slice),
+    (base, packets),
+    cases,
+  );
+}
+
+/// The HEVC laws' parameter sets: a VPS, an SPS and a PPS, Annex B.
+fn hevc_base() -> Vec<u8> {
+  start_coded(&[&hevc_vps(0, None), &hevc_sps(0, 0, 1, None), &hevc_pps()])
+}
+
+/// The HEVC laws' record of `vps`, `sps` and `pps` units.
+fn hevc_record(vps: usize, sps: usize, pps: usize) -> Vec<u8> {
+  hvcc_record(&[
+    (32, vec![hevc_vps(0, None); vps]),
+    (33, vec![hevc_sps(0, 0, 1, None); sps]),
+    (34, vec![hevc_pps(); pps]),
+  ])
+}
+
+fn matroska() -> Vec<(ContainerName, &'static str)> {
+  vec![(ContainerName::MATROSKA, "mkv")]
+}
+
+/// **L115a — an HEVC configuration of fewer than 6 bytes is refused**
+/// (`hevc.c` 1294–1296; `movenc.c` 1639–1652; `flvenc.c` 889); one of
+/// its parameter sets taken.
+///
+/// PLANT: the length unjudged opens, and takes FLV's packet.
+#[test]
+fn l115a_an_hevc_configuration_of_fewer_than_6_bytes_is_refused() {
+  hvcc_law(
+    "l115a",
+    &mp4_and_flv(),
+    None,
+    (&hevc_base(), true),
+    &[
+      ("five bytes", vec![0, 0, 0, 1, 0x40], true),
+      ("its parameter sets", hevc_base(), false),
+    ],
+  );
+}
+
+/// **L115b — an `hvcC` of fewer than 23 bytes is refused** (`hevc.c`
+/// 1302–1303): its fixed fields alone take 23.
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l115b_an_hvcc_of_fewer_than_23_bytes_is_refused() {
+  let record = hevc_record(1, 1, 1);
+  hvcc_law(
+    "l115b",
+    &mp4_and_flv(),
+    None,
+    (&record, true),
+    &[
+      ("22 bytes", record[..22].to_vec(), true),
+      ("the record", record.clone(), false),
+    ],
+  );
+}
+
+/// **L115c — an `hvcC` whose unit runs past it is refused**, in Matroska
+/// too (`hevc.c` 1339–1341): `ff_isom_write_hvcc` answers success having
+/// written nothing, and Matroska writes the track of no configuration.
+///
+/// PLANT: the record's walk unjudged opens, and takes the packet.
+#[test]
+fn l115c_an_hvcc_whose_unit_runs_past_it_is_refused_in_matroska_too() {
+  let record = hevc_record(1, 1, 1);
+  let cases = [
+    (
+      "cut a byte short",
+      record[..record.len() - 1].to_vec(),
+      true,
+    ),
+    ("the record", record.clone(), false),
+  ];
+  hvcc_law("l115c", &mp4_and_flv(), None, (&record, true), &cases);
+  hvcc_law("l115c-mkv", &matroska(), None, (&record, false), &cases);
+}
+
+/// **L115d — an `hvcC` array of 65 536 units is refused** (`hevc.c`
+/// 875–876): the record counts each in 16 bits; 65 535 taken.
+///
+/// PLANT: the count unjudged opens, and takes the packet.
+#[test]
+fn l115d_an_hvcc_array_of_65_536_units_is_refused() {
+  let seis = |count: usize| {
+    hvcc_record(&[
+      (32, vec![hevc_vps(0, None)]),
+      (33, vec![hevc_sps(0, 0, 1, None)]),
+      (34, vec![hevc_pps()]),
+      (39, vec![Vec::new(); count.min(65_535)]),
+      (39, vec![Vec::new(); count.saturating_sub(65_535)]),
+    ])
+  };
+  hvcc_law(
+    "l115d",
+    &mp4_and_flv(),
+    None,
+    (&hevc_record(1, 1, 1), true),
+    &[
+      ("65 536 SEIs", seis(65_536), true),
+      ("65 535 SEIs", seis(65_535), false),
+    ],
+  );
+}
+
+/// **L115e — MP4's `hvc1` refuses a configuration of no VPS, or of more
+/// than 16** (`hevc.c` 1146–1149; `movenc.c` 1645): its arrays are
+/// complete, and the writer holds them to it; FLV's are not, and take
+/// none.
+///
+/// PLANT: the completeness unjudged opens, and takes the packet.
+#[test]
+fn l115e_mp4s_hvc1_refuses_a_configuration_of_no_vps_or_17() {
+  let cases = |refused: bool| {
+    vec![
+      ("no VPS", hevc_record(0, 1, 1), refused),
+      ("17 VPSs", hevc_record(17, 1, 1), refused),
+      ("16 VPSs", hevc_record(16, 1, 1), false),
+    ]
+  };
+  let mp4 = vec![(ContainerName::MP4, "mp4")];
+  hvcc_law(
+    "l115e",
+    &mp4,
+    Some(b"hvc1"),
+    (&hevc_record(1, 1, 1), true),
+    &cases(true),
+  );
+  hvcc_law(
+    "l115e-hev1",
+    &mp4,
+    Some(b"hev1"),
+    (&hevc_record(1, 1, 1), true),
+    &cases(false),
+  );
+  let flv = vec![(ContainerName::new("flv"), "flv")];
+  hvcc_law(
+    "l115e-flv",
+    &flv,
+    None,
+    (&hevc_record(1, 1, 1), true),
+    &cases(false),
+  );
+}
+
+/// **L115f — MP4's `hvc1` refuses a configuration of no SPS or PPS, or of
+/// more than 16 SPSs or 64 PPSs** (`hevc.c` 1150–1153).
+///
+/// PLANT: the completeness unjudged opens, and takes the packet.
+#[test]
+fn l115f_mp4s_hvc1_refuses_no_sps_or_pps_or_too_many() {
+  hvcc_law(
+    "l115f",
+    &[(ContainerName::MP4, "mp4")],
+    Some(b"hvc1"),
+    (&hevc_record(1, 1, 1), true),
+    &[
+      ("no SPS", hevc_record(1, 0, 1), true),
+      ("17 SPSs", hevc_record(1, 17, 1), true),
+      ("16 SPSs", hevc_record(1, 16, 1), false),
+      ("no PPS", hevc_record(1, 1, 0), true),
+      ("65 PPSs", hevc_record(1, 1, 65), true),
+      ("64 PPSs", hevc_record(1, 1, 64), false),
+    ],
+  );
+}
+
+/// **L115g — an HEVC configuration of neither form is refused** (`hevc.c`
+/// 1347–1350): neither an `hvcC` of version 1 nor Annex B.
+///
+/// PLANT: the form unjudged opens, and takes the packet.
+#[test]
+fn l115g_an_hevc_configuration_of_neither_form_is_refused() {
+  let record = hevc_record(1, 1, 1);
+  let mut other = record.clone();
+  other[0] = 2;
+  hvcc_law(
+    "l115g",
+    &mp4_and_flv(),
+    None,
+    (&record, true),
+    &[
+      ("of version 2", other, true),
+      ("the record", record.clone(), false),
+    ],
+  );
+}
+
+/// **L115h — an HEVC unit past 65 535 bytes is refused**, in Matroska too
+/// (`hevc.c` 879–881, 1187–1197): written with its length cut to 16 bits,
+/// success answered; one of 65 535 taken.
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l115h_an_hevc_unit_past_65_535_bytes_is_refused_in_matroska_too() {
+  let with = |len: usize| {
+    start_coded(&[
+      &hevc_vps(0, None),
+      &hevc_sps(0, 0, 1, None),
+      &hevc_pps(),
+      &sized(&hevc_header(39, 0), len),
+    ])
+  };
+  let cases = [
+    ("an SEI of 65 536 bytes", with(65_536), true),
+    ("an SEI of 65 535 bytes", with(65_535), false),
+  ];
+  hvcc_law("l115h", &mp4_and_flv(), None, (&hevc_base(), true), &cases);
+  hvcc_law(
+    "l115h-mkv",
+    &matroska(),
+    None,
+    (&hevc_base(), false),
+    &cases,
+  );
+}
+
+/// **L115i — an alpha layer's SPS whose VPS the configuration holds not
+/// earlier is refused** (`hevc.c` 630–643, 418–440): a VPS extension
+/// naming an auxiliary alpha layer keeps that layer's parameter sets, and
+/// a multilayer SPS of a VPS the record holds not is refused.
+///
+/// PLANT: the VPS's lookup unjudged opens, and takes the packet.
+#[test]
+fn l115i_an_alpha_layers_sps_of_no_vps_is_refused() {
+  let with = |vps: u8| {
+    start_coded(&[
+      &hevc_vps(0, Some(1)),
+      &hevc_sps(0, 0, 1, None),
+      &hevc_sps(1, vps, 0, None),
+      &hevc_pps(),
+    ])
+  };
+  hvcc_law(
+    "l115i",
+    &mp4_and_flv(),
+    None,
+    (&hevc_base(), true),
+    &[("of VPS 1", with(1), true), ("of VPS 0", with(0), false)],
+  );
+}
+
+/// **L115j — an HEVC SPS of 32 long-term reference pictures is refused**
+/// (`hevc.c` 724–733): the standard allows 32, libavcodec reads 32
+/// (`hevc/ps.c` 1522–1528), and `ff_isom_write_hvcc` refuses more than 31;
+/// 31 taken.
+///
+/// PLANT: the count unjudged opens, and takes the packet.
+#[test]
+fn l115j_an_hevc_sps_of_32_long_term_pictures_is_refused() {
+  let with = |count: u32| {
+    start_coded(&[
+      &hevc_vps(0, None),
+      &hevc_sps(0, 0, 1, Some(count)),
+      &hevc_pps(),
+    ])
+  };
+  hvcc_law(
+    "l115j",
+    &mp4_and_flv(),
+    None,
+    (&hevc_base(), true),
+    &[("32", with(32), true), ("31", with(31), false)],
+  );
+}
+
+/// **L122 — the trust model's boundary: an HEVC SPS of 65 short-term
+/// reference picture sets is taken** (`hevc.c` 714–716): the standard
+/// caps them at 64, and `ff_isom_write_hvcc` refuses more, an SPS no
+/// stream the standards allow holds — the parse stops there, unrefused,
+/// as the module's documentation states the class.
+///
+/// PLANT: the trust model's stop refused refuses it at open.
+#[test]
+fn l122_an_hevc_sps_past_the_standards_cap_rests_on_the_trust_model() {
+  hvcc_law(
+    "l122",
+    &mp4_and_flv(),
+    None,
+    (&hevc_base(), true),
+    &[(
+      "65 sets",
+      start_coded(&[&hevc_vps(0, None), &hevc_sps(0, 0, 65, None), &hevc_pps()]),
+      false,
+    )],
+  );
+}
+
+/// A VVC NAL unit of `kind`, of a byte past its header.
+fn vvc_unit(kind: u8) -> Vec<u8> {
+  vec![0x00, (kind << 3) | 1, 0x80]
+}
+
+/// A VVC law: `cases` against `ff_isom_write_vvcc` in `containers`.
+fn vvcc_law(
+  law: &str,
+  containers: &[(ContainerName, &str)],
+  (base, packets): (&[u8], bool),
+  cases: &[(&str, Vec<u8>, bool)],
+) {
+  let Some(corpus) = Corpus::new() else { return };
+  let frame = start_coded(&[&vvc_unit(8)]);
+  recoded_law(
+    &corpus,
+    law,
+    containers,
+    (ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_VVC, None, &frame),
+    (base, packets),
+    cases,
+  );
+}
+
+/// The VVC laws' Annex B configuration: `vps` VPSs, `sps` SPSs, `pps`
+/// PPSs.
+fn vvc_sets(vps: usize, sps: usize, pps: usize) -> Vec<u8> {
+  let (v, s, p) = (vvc_unit(14), vvc_unit(15), vvc_unit(16));
+  let mut units = copies(&v, vps);
+  units.extend(copies(&s, sps));
+  units.extend(copies(&p, pps));
+  start_coded(&units)
+}
+
+/// **L116a — a VVC configuration of fewer than 6 bytes is refused**
+/// (`vvc.c` 875–877; `movenc.c` 1706–1723; `flvenc.c` 891).
+///
+/// PLANT: the length unjudged opens, and takes FLV's packet.
+#[test]
+fn l116a_a_vvc_configuration_of_fewer_than_6_bytes_is_refused() {
+  vvcc_law(
+    "l116a-vvcc",
+    &mp4_and_flv(),
+    (&vvc_sets(0, 1, 1), false),
+    &[
+      ("a vvcC of five bytes", vec![0xFF, 0, 0, 0, 0], true),
+      ("a vvcC of six bytes", vec![0xFF, 0, 0, 0, 0, 0], false),
+    ],
+  );
+  vvcc_law(
+    "l116a",
+    &mp4_and_flv(),
+    (&vvc_sets(0, 1, 1), true),
+    &[
+      ("five bytes of a start code", vec![0, 0, 0, 1, 0], true),
+      ("an SPS and a PPS", vvc_sets(0, 1, 1), false),
+    ],
+  );
+}
+
+/// **L116b — a VVC configuration of neither form is refused** (`vvc.c`
+/// 878–885): neither a `vvcC`, its first five bits set, nor Annex B.
+///
+/// PLANT: the form unjudged opens, and takes the packet.
+#[test]
+fn l116b_a_vvc_configuration_of_neither_form_is_refused() {
+  let record = vec![0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+  vvcc_law(
+    "l116b",
+    &mp4_and_flv(),
+    (&record, true),
+    &[
+      (
+        "a byte before its sets",
+        [&[0x02][..], &vvc_sets(0, 1, 1)].concat(),
+        true,
+      ),
+      ("a record", record.clone(), false),
+    ],
+  );
+}
+
+/// **L116c — a VVC configuration of more than 16 VPSs is refused**
+/// (`vvc.c` 680–681).
+///
+/// PLANT: the count unjudged opens, and takes the packet.
+#[test]
+fn l116c_a_vvc_configuration_of_17_vpss_is_refused() {
+  vvcc_law(
+    "l116c",
+    &mp4_and_flv(),
+    (&vvc_sets(0, 1, 1), true),
+    &[
+      ("17 VPSs", vvc_sets(17, 1, 1), true),
+      ("16 VPSs", vvc_sets(16, 1, 1), false),
+    ],
+  );
+}
+
+/// **L116d — a VVC configuration of no SPS, or of more than 16, is
+/// refused** (`vvc.c` 682–683).
+///
+/// PLANT: the count unjudged opens, and takes the packet.
+#[test]
+fn l116d_a_vvc_configuration_of_no_sps_or_17_is_refused() {
+  vvcc_law(
+    "l116d",
+    &mp4_and_flv(),
+    (&vvc_sets(0, 1, 1), true),
+    &[
+      ("no SPS", vvc_sets(1, 0, 1), true),
+      ("17 SPSs", vvc_sets(0, 17, 1), true),
+      ("16 SPSs", vvc_sets(0, 16, 1), false),
+    ],
+  );
+}
+
+/// **L116e — a VVC configuration of no PPS, or of more than 64, is
+/// refused** (`vvc.c` 684–685).
+///
+/// PLANT: the count unjudged opens, and takes the packet.
+#[test]
+fn l116e_a_vvc_configuration_of_no_pps_or_65_is_refused() {
+  vvcc_law(
+    "l116e",
+    &mp4_and_flv(),
+    (&vvc_sets(0, 1, 1), true),
+    &[
+      ("no PPS", vvc_sets(0, 1, 0), true),
+      ("65 PPSs", vvc_sets(0, 1, 65), true),
+      ("64 PPSs", vvc_sets(0, 1, 64), false),
+    ],
+  );
+}
+
+/// **L116f — a VVC unit past 65 535 bytes is refused**, in Matroska too
+/// (`vvc.c` 471, 779–785): written with its length cut to 16 bits,
+/// success answered.
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l116f_a_vvc_unit_past_65_535_bytes_is_refused_in_matroska_too() {
+  let with = |len: usize| {
+    start_coded(&[
+      &vvc_unit(15),
+      &vvc_unit(16),
+      &sized(&[0x00, (23 << 3) | 1], len),
+    ])
+  };
+  let cases = [
+    ("an SEI of 65 536 bytes", with(65_536), true),
+    ("an SEI of 65 535 bytes", with(65_535), false),
+  ];
+  vvcc_law("l116f", &mp4_and_flv(), (&vvc_sets(0, 1, 1), true), &cases);
+  vvcc_law(
+    "l116f-mkv",
+    &matroska(),
+    (&vvc_sets(0, 1, 1), false),
+    &cases,
+  );
+}
+
+/// **L116g — a VVC array of 65 536 units is refused**, in Matroska too
+/// (`vvc.c` 460–473): its 16-bit count wraps, the record written
+/// otherwise, success answered. New extradata of its size passes the
+/// side data's budget, refused first.
+///
+/// PLANT: the count unjudged opens.
+#[test]
+fn l116g_a_vvc_array_of_65_536_units_is_refused_in_matroska_too() {
+  let with = |count: usize| {
+    let (s, p, sei) = (vvc_unit(15), vvc_unit(16), vvc_unit(23));
+    start_coded(&[vec![&s[..], &p[..]], copies(&sei, count)].concat())
+  };
+  let cases = [
+    ("65 536 SEIs", with(65_536), true),
+    ("65 535 SEIs", with(65_535), false),
+  ];
+  let containers = [mp4_and_flv(), matroska()].concat();
+  vvcc_law("l116g", &containers, (&vvc_sets(0, 1, 1), false), &cases);
+}
+
+/// EVC units, each behind its 4-byte length.
+fn length_prefixed_units(units: &[&[u8]]) -> Vec<u8> {
+  units
+    .iter()
+    .flat_map(|unit| {
+      [
+        &u32::try_from(unit.len()).expect("length").to_be_bytes()[..],
+        unit,
+      ]
+      .concat()
+    })
+    .collect()
+}
+
+/// An EVC NAL unit header of `kind`.
+fn evc_header(kind: u8) -> [u8; 2] {
+  [(kind + 1) << 1, 0]
+}
+
+/// An EVC SPS of bit depths `luma` and `chroma` less eight.
+fn evc_sps(luma: u32, chroma: u32) -> Vec<u8> {
+  let syntax = Syntax::default()
+    .ue(0)
+    .u(1, 8)
+    .u(51, 8)
+    .u(0, 32)
+    .u(0, 32)
+    .ue(1)
+    .ue(64)
+    .ue(64)
+    .ue(luma)
+    .ue(chroma)
+    .u(0, 1);
+  [&evc_header(24)[..], &syntax.rbsp()].concat()
+}
+
+/// An EVC law: `cases` against `ff_isom_write_evcc` in MP4.
+fn evcc_law(law: &str, packets: bool, cases: &[(&str, Vec<u8>, bool)]) {
+  let Some(corpus) = Corpus::new() else { return };
+  let frame = length_prefixed_units(&[&[&evc_header(1)[..], &[0x80]].concat()]);
+  recoded_law(
+    &corpus,
+    law,
+    &[(ContainerName::MP4, "mp4")],
+    (ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_EVC, None, &frame),
+    (&evc_base(), packets),
+    cases,
+  );
+}
+
+/// The EVC laws' configuration: an SPS and a PPS.
+fn evc_base() -> Vec<u8> {
+  length_prefixed_units(&[&evc_sps(2, 2), &[&evc_header(25)[..], &[0x80]].concat()])
+}
+
+/// **L117a — an EVC configuration of fewer than 8 bytes is refused**
+/// (`evc.c` 293–295; `movenc.c` 1676–1691).
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l117a_an_evc_configuration_of_fewer_than_8_bytes_is_refused() {
+  evcc_law(
+    "l117a",
+    true,
+    &[
+      ("seven bytes", vec![0, 0, 0, 3, 0x32, 0, 0x80], true),
+      ("an SPS and a PPS", evc_base(), false),
+    ],
+  );
+}
+
+/// **L117b — an EVC unit whose header has the forbidden bit or no type is
+/// refused** (`evc.c` 312–316; `evc.h` 32–46).
+///
+/// PLANT: the header unjudged opens, and takes the packet.
+#[test]
+fn l117b_an_evc_unit_of_the_forbidden_bit_or_no_type_is_refused() {
+  evcc_law(
+    "l117b",
+    true,
+    &[
+      (
+        "the forbidden bit",
+        [evc_base(), length_prefixed_units(&[&[0xB2, 0]])].concat(),
+        true,
+      ),
+      (
+        "no type",
+        [evc_base(), length_prefixed_units(&[&[0, 0]])].concat(),
+        true,
+      ),
+      ("an SPS and a PPS", evc_base(), false),
+    ],
+  );
+}
+
+/// **L117c — an EVC configuration of no SPS, or of more than 16, is
+/// refused** (`evc.c` 219–223).
+///
+/// PLANT: the count unjudged opens, and takes the packet.
+#[test]
+fn l117c_an_evc_configuration_of_no_sps_or_17_is_refused() {
+  let sps = evc_sps(2, 2);
+  evcc_law(
+    "l117c",
+    true,
+    &[
+      (
+        "no SPS",
+        length_prefixed_units(&[&[&evc_header(25)[..], &[0x80]].concat()]),
+        true,
+      ),
+      ("17 SPSs", length_prefixed_units(&copies(&sps, 17)), true),
+      ("16 SPSs", length_prefixed_units(&copies(&sps, 16)), false),
+    ],
+  );
+}
+
+/// **L117d — an EVC SPS of a bit depth past 14 is refused** (`evc.c`
+/// 96–98): the record holds three bits of it, and the writer refuses
+/// more than 6.
+///
+/// PLANT: the depth unjudged opens, and takes the packet.
+#[test]
+fn l117d_an_evc_sps_of_a_bit_depth_past_14_is_refused() {
+  evcc_law(
+    "l117d",
+    true,
+    &[
+      ("luma 15", length_prefixed_units(&[&evc_sps(7, 6)]), true),
+      ("chroma 15", length_prefixed_units(&[&evc_sps(6, 7)]), true),
+      ("14", length_prefixed_units(&[&evc_sps(6, 6)]), false),
+    ],
+  );
+}
+
+/// **L117e — an EVC SPS of a byte is refused** (`evc.c` 67–71): its
+/// reader past the unit's header takes fewer than none.
+///
+/// PLANT: the reader's length unjudged opens, and takes the packet.
+#[test]
+fn l117e_an_evc_sps_of_a_byte_is_refused() {
+  evcc_law(
+    "l117e",
+    true,
+    &[
+      (
+        "an SPS of a byte",
+        [evc_base(), length_prefixed_units(&[&[0x32], &[0x34, 0]])].concat(),
+        true,
+      ),
+      ("an SPS and a PPS", evc_base(), false),
+    ],
+  );
+}
+
+/// **L117f — an EVC unit past 65 535 bytes is refused** (`evc.c` 129–131,
+/// 266–271): written with its length cut to 16 bits, success answered.
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l117f_an_evc_unit_past_65_535_bytes_is_refused() {
+  let with = |len: usize| {
+    [
+      evc_base(),
+      length_prefixed_units(&[&sized(&evc_header(28), len)]),
+    ]
+    .concat()
+  };
+  evcc_law(
+    "l117f",
+    true,
+    &[
+      ("65 536 bytes", with(65_536), true),
+      ("65 535 bytes", with(65_535), false),
+    ],
+  );
+}
+
+/// **L117g — an EVC array of 65 536 units is refused** (`evc.c` 112–131):
+/// its 16-bit count wraps. New extradata of its size passes the side
+/// data's budget, refused first.
+///
+/// PLANT: the count unjudged opens.
+#[test]
+fn l117g_an_evc_array_of_65_536_units_is_refused() {
+  let sei = [&evc_header(28)[..], &[0x80]].concat();
+  let with = |count: usize| [evc_base(), length_prefixed_units(&copies(&sei, count))].concat();
+  evcc_law(
+    "l117g",
+    false,
+    &[
+      ("65 536 SEIs", with(65_536), true),
+      ("65 535 SEIs", with(65_535), false),
+    ],
+  );
+}
+
+/// An LCEVC unit of `kind` — 29 IDR, 28 non-IDR — of `blocks` and its stop
+/// byte.
+fn lcevc_unit_of(kind: u8, blocks: &[&[u8]]) -> Vec<u8> {
+  let mut unit = vec![0x40 | (kind << 1) | 1, 0xFF];
+  for block in blocks {
+    unit.extend_from_slice(block);
+  }
+  unit.push(0x80);
+  unit
+}
+
+/// LCEVC blocks: a sequence configuration of a byte; a global
+/// configuration of resolution type 17, 1280 × 720.
+const LCEVC_SEQUENCE: [u8; 2] = [0x20, 0x11];
+const LCEVC_GLOBAL: [u8; 3] = [0x41, 17 << 1, 0x40];
+
+/// An additional information block of `len` bytes, its size in a
+/// multi-byte count.
+fn lcevc_info(len: usize) -> Vec<u8> {
+  let mut size = Vec::new();
+  let mut left = len;
+  loop {
+    size.insert(0, u8::try_from(left & 0x7F).expect("seven bits"));
+    left >>= 7;
+    if left == 0 {
+      break;
+    }
+  }
+  let last = size.len() - 1;
+  for byte in &mut size[..last] {
+    *byte |= 0x80;
+  }
+  let mut block = vec![0xE5];
+  block.extend(size);
+  block.resize(block.len() + len, 0x11);
+  block
+}
+
+/// An LCEVC law: `cases` against `ff_isom_write_lvcc` in MP4.
+fn lvcc_law(law: &str, packets: bool, cases: &[(&str, Vec<u8>, bool)]) {
+  let Some(corpus) = Corpus::new() else { return };
+  let frame = start_coded(&[&lcevc_unit_of(28, &[&[0x23, 0x11, 0x11, 0x11]])]);
+  let base = start_coded(&[&lcevc_unit_of(29, &[&LCEVC_SEQUENCE, &LCEVC_GLOBAL])]);
+  recoded_law(
+    &corpus,
+    law,
+    &[(ContainerName::MP4, "mp4")],
+    (ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_LCEVC, None, &frame),
+    (&base, packets),
+    cases,
+  );
+}
+
+/// **L118a — an LCEVC configuration of at most 6 bytes is refused**
+/// (`lcevc.c` 281–282; `movenc.c` 1693–1704).
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l118a_an_lcevc_configuration_of_6_bytes_is_refused() {
+  lvcc_law(
+    "l118a-lvcc",
+    false,
+    &[
+      ("an lvcC of six bytes", vec![1, 0, 0, 0, 0, 0], true),
+      ("an lvcC of seven bytes", vec![1, 0, 0, 0, 0, 0, 0], false),
+    ],
+  );
+  lvcc_law(
+    "l118a",
+    true,
+    &[
+      (
+        "six bytes of a start code",
+        vec![0, 0, 0, 1, 0x7B, 0xFF],
+        true,
+      ),
+      (
+        "an IDR unit",
+        start_coded(&[&lcevc_unit_of(29, &[&LCEVC_SEQUENCE, &LCEVC_GLOBAL])]),
+        false,
+      ),
+    ],
+  );
+}
+
+/// **L118b — an LCEVC configuration of no IDR or non-IDR unit is
+/// refused** (`lcevc.c` 316–319).
+///
+/// PLANT: the units unjudged opens, and takes the packet.
+#[test]
+fn l118b_an_lcevc_configuration_of_no_idr_unit_is_refused() {
+  lvcc_law(
+    "l118b",
+    true,
+    &[
+      (
+        "a unit of another type",
+        start_coded(&[&lcevc_unit_of(1, &[&LCEVC_SEQUENCE])]),
+        true,
+      ),
+      (
+        "a non-IDR unit",
+        start_coded(&[&lcevc_unit_of(28, &[&LCEVC_SEQUENCE, &LCEVC_GLOBAL])]),
+        false,
+      ),
+    ],
+  );
+}
+
+/// **L118c — an LCEVC unit of no sequence or no global configuration is
+/// refused** (`lcevc.c` 139–140).
+///
+/// PLANT: the blocks unjudged opens, and takes the packet.
+#[test]
+fn l118c_an_lcevc_unit_of_no_sequence_or_global_configuration_is_refused() {
+  lvcc_law(
+    "l118c",
+    true,
+    &[
+      (
+        "no global configuration",
+        start_coded(&[&lcevc_unit_of(29, &[&LCEVC_SEQUENCE])]),
+        true,
+      ),
+      (
+        "no sequence configuration",
+        start_coded(&[&lcevc_unit_of(29, &[&LCEVC_GLOBAL])]),
+        true,
+      ),
+      (
+        "both",
+        start_coded(&[&lcevc_unit_of(29, &[&LCEVC_SEQUENCE, &LCEVC_GLOBAL])]),
+        false,
+      ),
+    ],
+  );
+}
+
+/// **L118d — an LCEVC unit written past 65 535 bytes is refused**
+/// (`lcevc.c` 141–147): its length written in 16 bits, cut, success
+/// answered.
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l118d_an_lcevc_unit_past_65_535_bytes_is_refused() {
+  // Written: 3 bytes, the sequence block's 2, the global block's 3, and the
+  // information block's type byte, its 3 size bytes and its payload.
+  let with = |total: usize| {
+    start_coded(&[&lcevc_unit_of(
+      29,
+      &[
+        &LCEVC_SEQUENCE,
+        &lcevc_info(total - 3 - 2 - 3 - 4),
+        &LCEVC_GLOBAL,
+      ],
+    )])
+  };
+  lvcc_law(
+    "l118d",
+    true,
+    &[
+      ("65 536 bytes", with(65_536), true),
+      ("65 535 bytes", with(65_535), false),
+    ],
+  );
+}
+
+/// **L118e — an LCEVC configuration of 65 536 IDR units is refused**
+/// (`lcevc.c` 331–334): their count is written in 16 bits. New extradata
+/// of its size passes the side data's budget, refused first.
+///
+/// PLANT: the count unjudged opens.
+#[test]
+fn l118e_an_lcevc_configuration_of_65_536_idr_units_is_refused() {
+  let unit = lcevc_unit_of(29, &[&LCEVC_SEQUENCE, &LCEVC_GLOBAL]);
+  lvcc_law(
+    "l118e",
+    false,
+    &[
+      ("65 536 units", start_coded(&copies(&unit, 65_536)), true),
+      ("65 535 units", start_coded(&copies(&unit, 65_535)), false),
+    ],
+  );
+}
+
+/// A VP9 law: the corpus's VP9 track of the pixel format of `cases`, in
+/// MP4 and FLV; the format is the stream's, no packet's.
+fn vpcc_law(law: &str, cases: &[(&str, i32, bool)]) {
+  let Some(corpus) = Corpus::new() else { return };
+  let (mut table, packets) = first_track(&vp9_webm(&corpus), TrackKind::Video, 3);
+  let row = table.remove(0);
+  let config = stream_extradata_of(&row);
+  let frames: Vec<Video> = packets.iter().map(video_of).collect();
+  for (name, format, refused) in cases {
+    let track = |config: &[u8]| {
+      restated(
+        &row,
+        ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_VP9,
+        config,
+        None,
+        Some(*format),
+      )
+    };
+    configuration_law(
+      &corpus,
+      &format!("{law}-{format}"),
+      &mp4_and_flv(),
+      &track,
+      (&frames, &config, false),
+      &[(name, config.clone(), *refused)],
+    );
+  }
+}
+
+/// **L119a — a VP9 track of a pixel format of no descriptor is refused**
+/// (`vpcc.c` 59–68, 157–158; `movenc.c` 1628–1637; `flvenc.c` 895): the
+/// `vpcC` reads the stream's format whatever its configuration.
+///
+/// PLANT: the descriptor unjudged opens.
+#[test]
+fn l119a_a_vp9_track_of_no_pixel_format_is_refused() {
+  use ffmpeg_next::ffi::AVPixelFormat as P;
+  vpcc_law(
+    "l119a",
+    &[
+      ("no format", P::AV_PIX_FMT_NONE as i32, true),
+      ("4:2:0", P::AV_PIX_FMT_YUV420P as i32, false),
+    ],
+  );
+}
+
+/// **L119b — a VP9 track of 4:4:0 is refused** (`vpcc.c` 38–56): VP9's
+/// profiles 1 and 3 take it, and the `vpcC` names no such subsampling.
+///
+/// PLANT: the subsampling unjudged opens.
+#[test]
+fn l119b_a_vp9_track_of_4_4_0_is_refused() {
+  use ffmpeg_next::ffi::AVPixelFormat as P;
+  vpcc_law(
+    "l119b",
+    &[
+      ("4:4:0", P::AV_PIX_FMT_YUV440P as i32, true),
+      ("4:4:4", P::AV_PIX_FMT_YUV444P as i32, false),
+    ],
+  );
+}
+
+/// **L119c — a VP9 configuration past what `init_get_bits8` takes, read
+/// for an unknown profile, is refused** (`vpcc.c` 163–171): at open, and
+/// MP4's first sample where the track states none, which MP4 takes as
+/// its configuration (`movenc.c` 7024–7041). FLV's packet road writes no
+/// sample as a configuration.
+///
+/// PLANT: the reader's bound unjudged opens, and takes the sample.
+#[test]
+fn l119c_a_vp9_configuration_past_the_reader_is_refused() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (mut table, packets) = first_track(&vp9_webm(&corpus), TrackKind::Video, 1);
+  let row = table.remove(0);
+  let frame = video_of(&packets[0]);
+  // `init_get_bits8` takes 268 435 391 bytes at most.
+  let past = 268_435_392;
+  let unknown = |config: &[u8]| {
+    restated_profile(
+      &row,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_VP9,
+      config,
+      (None, None, Some(-99)),
+    )
+  };
+  let large = vec![0x11_u8; past];
+  for (container, extension) in mp4_and_flv() {
+    let target = output(&corpus, &format!("l119c.{extension}"));
+    let refused = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      container,
+      vec![unknown(&large)],
+      &[],
+      PacketLimits::default(),
+    );
+    assert!(
+      matches!(refused, Err(MuxOpenError::ConfigurationInvalid { .. })),
+      "{extension}: {:?}",
+      refused.map(drop)
+    );
+  }
+  drop(large);
+  let target = output(&corpus, "l119c-sample.mp4");
+  let mut muxer = muxer_with(
+    &target,
+    ContainerName::MP4,
+    vec![unknown(&[])],
+    filters(false),
+  );
+  let mut sample = frame.data().as_ref().to_vec();
+  sample.resize(past, 0);
+  let offered = VideoTrackPacket::new(TrackIndex::new(0), video_holding(&frame, &sample));
+  drop(sample);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(refusal, payload(PayloadRule::NewExtradata));
+  untouched!(offered, back);
+  drop((offered, back));
+  muxer
+    .write_video(VideoTrackPacket::new(TrackIndex::new(0), frame))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a sample the reader takes");
+  muxer.finish().expect("finished");
+}
+
+/// AVS3, which the base names no constant for.
+const AVS3_ID: ffmpeg_next::ffi::AVCodecID = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_AVS3;
+
+/// **L120a — an AVS3 configuration of fewer than 4 bytes is refused**
+/// (`movenc.c` 1599–1602, 1618–1626): `mov_write_av3c` refuses it, the
+/// `av3c` left empty; and one of none, refused as missing.
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l120a_an_avs3_configuration_of_fewer_than_4_bytes_is_refused() {
+  let Some(corpus) = Corpus::new() else { return };
+  recoded_law(
+    &corpus,
+    "l120a",
+    &[(ContainerName::MP4, "mp4")],
+    (AVS3_ID, None, &[0, 0, 1, 0xB0, 0x11]),
+    (&[1, 0, 0, 0], true),
+    &[
+      ("three bytes", vec![1, 0, 0], true),
+      ("four", vec![1, 0, 0, 0], false),
+    ],
+  );
+  let (row, _) = recoded_fixture(&corpus, &[0x11]);
+  let target = output(&corpus, "l120a-none.mp4");
+  let refused = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    vec![restated(&row, AVS3_ID, &[], None, None)],
+    &[],
+    PacketLimits::default(),
+  );
+  assert!(
+    matches!(refused, Err(MuxOpenError::ConfigurationMissing { .. })),
+    "{:?}",
+    refused.map(drop)
+  );
+}
+
+/// **L120b — an AVS3 sequence header past 65 535 bytes is refused**
+/// (`movenc.c` 1610–1611): written behind its 16-bit length, cut.
+///
+/// PLANT: the length unjudged opens, and takes the packet.
+#[test]
+fn l120b_an_avs3_sequence_header_past_65_535_bytes_is_refused() {
+  let Some(corpus) = Corpus::new() else { return };
+  recoded_law(
+    &corpus,
+    "l120b",
+    &[(ContainerName::MP4, "mp4")],
+    (AVS3_ID, None, &[0, 0, 1, 0xB0, 0x11]),
+    (&[1, 0, 0, 0], true),
+    &[
+      ("65 536 bytes", vec![0; 65_536], true),
+      ("65 535 bytes", vec![0; 65_535], false),
+    ],
+  );
+}
+
+/// **L120c — a VC-1 configuration of no sequence header is refused**
+/// (`movenc.c` 1102–1160, 2915–2916): `mov_write_dvc1_tag` refuses it and
+/// MP4 writes the sample entry of no `dvc1` — VC-1's simple and main
+/// profiles' `STRUCT_C` among them.
+///
+/// PLANT: the sequence header unjudged opens, and takes the packet.
+#[test]
+fn l120c_a_vc1_configuration_of_no_sequence_header_is_refused() {
+  let Some(corpus) = Corpus::new() else { return };
+  let header = vec![0, 0, 1, 0x0F, 0xC8, 0x0A];
+  recoded_law(
+    &corpus,
+    "l120c",
+    &[(ContainerName::MP4, "mp4")],
+    (
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_VC1,
+      None,
+      &[0, 0, 1, 0x0D, 0x11],
+    ),
+    (&header, true),
+    &[
+      ("a STRUCT_C", vec![0x4E, 0x09, 0x30, 0x01], true),
+      (
+        "an entry point alone",
+        vec![0, 0, 1, 0x0E, 0x48, 0x80],
+        true,
+      ),
+      ("an advanced sequence header", header.clone(), false),
+    ],
+  );
+}
+
+/// **L121 — FLV's `extract_extradata` road** (`extract_extradata.c`
+/// 166–275; `flvenc.c` 1250–1263, 1495–1501): on an H.264 or HEVC track of
+/// no configuration, a packet of no unit the filter splits off — one of
+/// length prefixes — is refused by name (the filter refuses it and
+/// libavformat drops it); a packet whose parameter sets make a
+/// configuration the writer refuses — an SPS and no PPS — is refused as its
+/// new extradata; then the packets of sets the writer takes, taken.
+///
+/// PLANT: each refusal removed takes the packet.
+#[test]
+fn l121_flvs_filter_makes_a_configuration_the_writer_must_take() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, frames, sps, pps) = h264_fixture(&corpus);
+  let target = output(&corpus, "l121.flv");
+  let mut muxer = muxer_with(
+    &target,
+    ContainerName::new("flv"),
+    vec![restated(
+      &row,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+      &[],
+      None,
+      None,
+    )],
+    filters(true),
+  );
+  let frame = frames[0].data().as_ref().to_vec();
+  // A unit behind a 4-byte length no start code lies in.
+  let prefixed = vec![0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x10];
+  let units = nal_units_of(&frame);
+  let slices: Vec<&[u8]> = units
+    .iter()
+    .copied()
+    .filter(|unit| unit[0] & 0x1F != 7 && unit[0] & 0x1F != 8)
+    .collect();
+  for (name, bytes, rule) in [
+    ("length-prefixed", prefixed, PayloadRule::NalUnits),
+    (
+      "an SPS and no PPS",
+      start_coded(&[vec![&sps[..]], slices.clone()].concat()),
+      PayloadRule::NewExtradata,
+    ),
+  ] {
+    let offered = VideoTrackPacket::new(TrackIndex::new(0), video_holding(&frames[0], &bytes));
+    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    assert_eq!(refusal, payload(rule), "{name}");
+    untouched!(offered, back);
+  }
+  let whole = start_coded(&[vec![&sps[..], &pps[..]], slices].concat());
+  muxer
+    .write_video(VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_holding(&frames[0], &whole),
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the sets the writer takes");
+  for frame in &frames[1..] {
+    muxer
+      .write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone()))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  muxer.finish().expect("finished");
+  let record = stream_extradata_of(&table_of(&target, TrackKind::Video)[0]);
+  assert_eq!(
+    (record.first(), record.get(5).map(|count| count & 0x1F)),
+    (Some(&1), Some(1)),
+    "read back an avcC of the packet's one SPS"
+  );
+  // HEVC: a packet of no unit split off, refused alike.
+  let target = output(&corpus, "l121-hevc.flv");
+  let mut muxer = muxer_with(
+    &target,
+    ContainerName::new("flv"),
+    vec![restated(
+      &row,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+      &[],
+      None,
+      None,
+    )],
+    filters(true),
+  );
+  let offered = VideoTrackPacket::new(
+    TrackIndex::new(0),
+    video_holding(&frames[0], &[0, 0, 0, 3, 0x26, 0x01, 0xAF]),
+  );
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(refusal, payload(PayloadRule::NalUnits), "HEVC");
+  untouched!(offered, back);
+}
+
+/// The NAL units of an Annex B `bytes`, each after its start code.
+fn nal_units_of(bytes: &[u8]) -> Vec<&[u8]> {
+  let starts: Vec<usize> = (0..bytes.len().saturating_sub(3))
+    .filter(|&at| bytes[at..at + 3] == [0, 0, 1])
+    .map(|at| at + 3)
+    .collect();
+  starts
+    .iter()
+    .enumerate()
+    .map(|(index, &start)| {
+      let end = starts.get(index + 1).map_or(bytes.len(), |&next| {
+        let mut end = next - 3;
+        while end > start && bytes[end - 1] == 0 {
+          end -= 1;
+        }
+        end
+      });
+      &bytes[start..end]
+    })
+    .collect()
+}

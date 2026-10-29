@@ -91,6 +91,11 @@ crate moves only when it changes.
 - `extras::packet_side_data_name`: libavcodec's name for a packet
   side-data type, asked as the integer it is on the wire, or `None`
   where this build names no such type.
+- `ffi::pix_fmt_sampling`: what libavutil's descriptor of a pixel format
+  states of its sampling (`ffi::PixFmtSampling`) — its chroma planes'
+  subsampling and its first component's depth — or `None` where it keeps
+  no descriptor for the integer asked, any integer a valid question
+  (`av_pix_fmt_desc_get`).
 
 ## [0.21.0] - 2026-10-24
 

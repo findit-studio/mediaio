@@ -898,6 +898,16 @@ pub(crate) mod c_shims {
       desc: *const ffmpeg_next::ffi::AVPixFmtDescriptor,
     ) -> c_int;
 
+    /// Takes `AVPixelFormat` as `c_int`, answering the descriptor
+    /// libavutil keeps for that format — or null for any integer outside
+    /// its table, which it bounds-checks before indexing
+    /// (`pixdesc.c`'s `av_pix_fmt_desc_get`). The pointer is into the
+    /// static `av_pix_fmt_descriptors` table, live and unwritten for the
+    /// process; the struct holds no enum.
+    pub(crate) fn av_pix_fmt_desc_get(
+      pix_fmt: c_int,
+    ) -> *const ffmpeg_next::ffi::AVPixFmtDescriptor;
+
     /// Takes `AVPixelFormat` as `c_int`, so an id straight out of
     /// [`av_pix_fmt_desc_get_id`] can be priced without ever being an
     /// enum.
@@ -1044,6 +1054,56 @@ pub fn find_decoder_raw(id: c_int) -> Option<ptr::NonNull<AVCodec>> {
   // SAFETY: `avcodec_find_decoder` takes any integer and answers null or
   // a pointer into libavcodec's static codec table.
   ptr::NonNull::new(unsafe { c_shims::avcodec_find_decoder(id) }.cast_mut())
+}
+
+/// What libavutil's descriptor of a pixel format states of its planes'
+/// sampling: the chroma planes' horizontal and vertical subsampling, each
+/// as a power of two (`log2_chroma_w`, `log2_chroma_h`), and the bit depth
+/// of its first component (`comp[0].depth`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixFmtSampling {
+  log2_chroma_w: u8,
+  log2_chroma_h: u8,
+  depth: c_int,
+}
+
+impl PixFmtSampling {
+  /// The chroma planes' horizontal subsampling, as a power of two.
+  pub const fn log2_chroma_w(&self) -> u8 {
+    self.log2_chroma_w
+  }
+
+  /// The chroma planes' vertical subsampling, as a power of two.
+  pub const fn log2_chroma_h(&self) -> u8 {
+    self.log2_chroma_h
+  }
+
+  /// The first component's bit depth.
+  pub const fn depth(&self) -> c_int {
+    self.depth
+  }
+}
+
+/// The sampling libavutil's descriptor states of the pixel format `raw`
+/// (`av_pix_fmt_desc_get`, as `av_pix_fmt_get_chroma_sub_sample` reads
+/// it), or `None` where it keeps no descriptor for it — `AV_PIX_FMT_NONE`
+/// among them. Any integer is a valid question.
+pub fn pix_fmt_sampling(raw: c_int) -> Option<PixFmtSampling> {
+  // SAFETY: the redeclared lookup takes any integer and answers null or a
+  // pointer into libavutil's static descriptor table, which holds no enum;
+  // each field is read through `addr_of!` as the plain integer it is,
+  // without forming a reference.
+  unsafe {
+    let desc = c_shims::av_pix_fmt_desc_get(raw);
+    if desc.is_null() {
+      return None;
+    }
+    Some(PixFmtSampling {
+      log2_chroma_w: ptr::addr_of!((*desc).log2_chroma_w).read(),
+      log2_chroma_h: ptr::addr_of!((*desc).log2_chroma_h).read(),
+      depth: ptr::addr_of!((*desc).comp[0].depth).read(),
+    })
+  }
 }
 
 /// Visits the formats a hardware frame can be downloaded to — the

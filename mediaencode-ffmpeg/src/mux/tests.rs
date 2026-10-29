@@ -2555,20 +2555,21 @@ fn the_annex_b_rewrite_is_bounded_by_its_start_codes() {
 /// leaves no picture.
 #[test]
 fn the_configurations_mp4s_trailer_refuses_are_known_at_open() {
+  const MP4: (Family, Audited) = (Family::Mp4, Audited::Mov(MovMode::Mp4));
+  const MATROSKA: (Family, Audited) = (Family::Matroska, Audited::Matroska);
+  // A stream of no tag, no pixel format, an unknown profile.
+  const NONE: (u32, i32, i32) = (0, -1, -99);
   let flac = [0u8; 34];
-  assert!(!configuration_invalid(Family::Mp4, CodecId::FLAC, &flac));
+  assert!(!configuration_invalid(MP4, CodecId::FLAC, NONE, &flac));
+  assert!(configuration_invalid(MP4, CodecId::FLAC, NONE, &flac[..33]));
   assert!(configuration_invalid(
-    Family::Mp4,
+    MP4,
     CodecId::FLAC,
-    &flac[..33]
-  ));
-  assert!(configuration_invalid(
-    Family::Mp4,
-    CodecId::FLAC,
+    NONE,
     &[flac.as_slice(), &[0; 4]].concat()
   ));
   assert!(
-    !configuration_invalid(Family::Matroska, CodecId::FLAC, &flac[..33]),
+    !configuration_invalid(MATROSKA, CodecId::FLAC, NONE, &flac[..33]),
     "Matroska's header writes it"
   );
   // An OpusHead of 19 bytes, mapping family 0; of family 1, two bytes and
@@ -2582,11 +2583,7 @@ fn the_configurations_mp4s_trailer_refuses_are_known_at_open() {
   assert!(!opus_head_written(&head), "family 1 with no table");
   head.extend([1, 0, 0, 1]);
   assert!(opus_head_written(&head));
-  assert!(configuration_invalid(
-    Family::Mp4,
-    CodecId::OPUS,
-    &head[..10]
-  ));
+  assert!(configuration_invalid(MP4, CodecId::OPUS, NONE, &head[..10]));
   // TTML's header strings: none, or a terminated string and another.
   assert!(ttml_header_strings(b""));
   assert!(ttml_header_strings(b"a\0b\0"));
@@ -2595,11 +2592,12 @@ fn the_configurations_mp4s_trailer_refuses_are_known_at_open() {
   assert!(!ttml_header_strings(b"a\0"));
   assert!(!ttml_header_strings(b"a\0b"));
   assert!(configuration_invalid(
-    Family::Mp4,
+    MP4,
     CodecId::TTML,
+    NONE,
     b"lavc-ttmlenca\0"
   ));
-  assert!(!configuration_invalid(Family::Mp4, CodecId::TTML, b"<tt/>"));
+  assert!(!configuration_invalid(MP4, CodecId::TTML, NONE, b"<tt/>"));
   // Frame cropping: 16 bytes of top, bottom, left and right.
   let crop = |top: u32, bottom: u32, left: u32, right: u32| {
     [top, bottom, left, right]
@@ -3510,4 +3508,820 @@ fn av1c_is_refused_where_ff_isom_write_av1c_would_fail() {
   let twice =
     av1_extracted_sequences(&cat(&[&sequence(&svt), frame, &sequence(&svt)])).expect("made");
   assert!(!av1c_written(&twice), "two sequence headers");
+}
+
+/// Bits as the standards' syntax writes them, for the configuration
+/// records' laws.
+#[derive(Clone, Default)]
+struct Syntax(Vec<bool>);
+
+impl Syntax {
+  /// `u(n)`.
+  fn u(mut self, value: u64, count: u32) -> Self {
+    for bit in (0..count).rev() {
+      self.0.push((value >> bit) & 1 == 1);
+    }
+    self
+  }
+
+  /// `ue(v)`.
+  fn ue(self, value: u32) -> Self {
+    let code = u64::from(value) + 1;
+    let len = 64 - code.leading_zeros();
+    self.u(0, len - 1).u(code, len)
+  }
+
+  /// `se(v)`.
+  fn se(self, value: i32) -> Self {
+    let mapped = if value > 0 {
+      2 * value.unsigned_abs() - 1
+    } else {
+      2 * value.unsigned_abs()
+    };
+    self.ue(mapped)
+  }
+
+  /// Ones to the byte's end.
+  fn aligned(mut self) -> Self {
+    while self.0.len() % 8 != 0 {
+      self.0.push(true);
+    }
+    self
+  }
+
+  /// The RBSP: its stop bit and zeros to its byte's end.
+  fn rbsp(mut self) -> Vec<u8> {
+    self.0.push(true);
+    while self.0.len() % 8 != 0 {
+      self.0.push(false);
+    }
+    self
+      .0
+      .chunks(8)
+      .map(|byte| byte.iter().fold(0, |acc, &bit| (acc << 1) | u8::from(bit)))
+      .collect()
+  }
+}
+
+/// A NAL unit of `header` and `rbsp`, an emulation prevention byte after
+/// every two zeros a byte of 3 or less follows.
+fn escaped(header: &[u8], rbsp: &[u8]) -> Vec<u8> {
+  let mut out = header.to_vec();
+  let mut zeros = 0;
+  for &byte in rbsp {
+    if zeros >= 2 && byte <= 3 {
+      out.push(3);
+      zeros = 0;
+    }
+    out.push(byte);
+    zeros = if byte == 0 { zeros + 1 } else { 0 };
+  }
+  out
+}
+
+/// `units`, each behind a 4-byte start code.
+fn start_coded(units: &[&[u8]]) -> Vec<u8> {
+  units
+    .iter()
+    .flat_map(|unit| [&[0_u8, 0, 0, 1][..], unit].concat())
+    .collect()
+}
+
+/// `count` copies of `unit`.
+fn copies(unit: &[u8], count: usize) -> Vec<&[u8]> {
+  vec![unit; count]
+}
+
+/// A NAL unit of `header` and `len - header.len()` bytes of 0x11.
+fn sized(header: &[u8], len: usize) -> Vec<u8> {
+  let mut unit = header.to_vec();
+  unit.resize(len, 0x11);
+  unit
+}
+
+#[test]
+fn h264s_configuration_is_judged_as_ff_isom_write_avcc_writes_it() {
+  use records::{Wrote, avcc};
+  let sps: &[u8] = &[0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40];
+  let pps: &[u8] = &[0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
+  let extension: &[u8] = &[0x6D, 0x80];
+  let with = |sps_n: usize, pps_n: usize, ext_n: usize| {
+    let mut units = copies(sps, sps_n);
+    units.extend(copies(pps, pps_n));
+    units.extend(copies(extension, ext_n));
+    start_coded(&units)
+  };
+  let big_sps = sized(&[0x67, 0x64], 65_536);
+  let big_pps = sized(&[0x68], 65_536);
+  let big_extension = sized(&[0x6D], 65_536);
+  let largest_sps = sized(&[0x67, 0x64], 65_535);
+  for (name, config, wrote) in [
+    (
+      "an avcC record",
+      vec![1, 0x64, 0, 0x1F, 0xFF, 0xE1, 0x00],
+      Wrote::Whole,
+    ),
+    (
+      "a record of six bytes",
+      vec![1, 0x64, 0, 0x1F, 0xFF, 0xE1],
+      Wrote::Failed,
+    ),
+    (
+      "six bytes of a start code",
+      vec![0, 0, 0, 1, 0x67, 0x64],
+      Wrote::Failed,
+    ),
+    ("an SPS and a PPS", with(1, 1, 0), Wrote::Whole),
+    (
+      "behind 3-byte start codes",
+      [&[0, 0, 1][..], sps, &[0, 0, 1], pps].concat(),
+      Wrote::Whole,
+    ),
+    ("31 SPSs", with(31, 1, 0), Wrote::Whole),
+    ("32 SPSs", with(32, 1, 0), Wrote::Failed),
+    ("255 PPSs", with(1, 255, 0), Wrote::Whole),
+    ("256 PPSs", with(1, 256, 0), Wrote::Failed),
+    ("255 SPS extensions", with(1, 1, 255), Wrote::Whole),
+    ("256 SPS extensions", with(1, 1, 256), Wrote::Failed),
+    (
+      "an SPS of 65 535 bytes",
+      start_coded(&[&largest_sps, pps]),
+      Wrote::Whole,
+    ),
+    (
+      "an SPS of 65 536 bytes",
+      start_coded(&[&big_sps, pps]),
+      Wrote::Failed,
+    ),
+    (
+      "a PPS of 65 536 bytes",
+      start_coded(&[sps, &big_pps]),
+      Wrote::Failed,
+    ),
+    (
+      "an SPS extension of 65 536 bytes",
+      start_coded(&[sps, pps, &big_extension]),
+      Wrote::Failed,
+    ),
+    ("no PPS", with(1, 0, 0), Wrote::Failed),
+    ("no SPS", with(0, 2, 0), Wrote::Failed),
+    (
+      "an SPS of three bytes",
+      start_coded(&[&[0x67, 0x64, 0x01], pps]),
+      Wrote::Failed,
+    ),
+    (
+      "an SPS of four bytes",
+      start_coded(&[&[0x67, 0x64, 0x01, 0x1F], pps]),
+      Wrote::Whole,
+    ),
+    (
+      "an SPS's trailing zeros dropped",
+      start_coded(&[&[0x67, 0x64, 0x01, 0x00, 0x00], pps]),
+      Wrote::Failed,
+    ),
+  ] {
+    assert_eq!(avcc(&config), wrote, "{name}");
+  }
+}
+
+/// An HEVC NAL unit header: its type, its layer, a temporal id of zero.
+fn hevc_header(kind: u8, layer: u8) -> [u8; 2] {
+  ((u16::from(kind) << 9) | (u16::from(layer) << 3) | 1).to_be_bytes()
+}
+
+/// A general profile, tier and level: Main, level 3.1.
+fn hevc_general_ptl(syntax: Syntax) -> Syntax {
+  syntax
+    .u(0, 2)
+    .u(0, 1)
+    .u(1, 5)
+    .u(0x6000_0000, 32)
+    .u(0x9000_0000_0000, 48)
+    .u(93, 8)
+}
+
+/// An HEVC VPS `id` of one layer, or of two whose second, `alpha`, its
+/// extension names an auxiliary alpha layer.
+fn hevc_vps(id: u8, alpha: Option<u8>) -> Vec<u8> {
+  let syntax = Syntax::default()
+    .u(u64::from(id), 4)
+    .u(1, 1)
+    .u(1, 1)
+    .u(u64::from(alpha.is_some()), 6)
+    .u(0, 3)
+    .u(1, 1)
+    .u(0xFFFF, 16);
+  let syntax = hevc_general_ptl(syntax)
+    .u(1, 1)
+    .ue(4)
+    .ue(0)
+    .ue(0)
+    .u(0, 6)
+    .ue(0)
+    .u(0, 1);
+  let syntax = match alpha {
+    None => syntax.u(0, 1),
+    // The extension: the second layer's level, no splitting, the
+    // auxiliary dimension alone, of one bit, its layer id given, alpha.
+    Some(layer) => syntax
+      .u(1, 1)
+      .aligned()
+      .u(93, 8)
+      .u(0, 1)
+      .u(0x1000, 16)
+      .u(0, 3)
+      .u(1, 1)
+      .u(u64::from(layer), 6)
+      .u(1, 1),
+  };
+  escaped(&hevc_header(32, 0), &syntax.rbsp())
+}
+
+/// An HEVC SPS of the base layer, or of `layer` as its VPS `vps`'s
+/// multilayer extension, of `short_term` short-term reference picture
+/// sets and `long_term` long-term reference pictures where any.
+fn hevc_sps(layer: u8, vps: u8, short_term: u32, long_term: Option<u32>) -> Vec<u8> {
+  let mut syntax = Syntax::default().u(u64::from(vps), 4);
+  if layer == 0 {
+    syntax = hevc_general_ptl(syntax.u(0, 3).u(1, 1))
+      .ue(0)
+      .ue(1)
+      .ue(64)
+      .ue(64)
+      .u(0, 1)
+      .ue(0)
+      .ue(0);
+  } else {
+    syntax = syntax.u(7, 3).ue(1).u(0, 1);
+  }
+  syntax = syntax.ue(4);
+  if layer == 0 {
+    syntax = syntax.u(1, 1).ue(4).ue(0).ue(0);
+  }
+  syntax = syntax
+    .ue(0)
+    .ue(1)
+    .ue(0)
+    .ue(1)
+    .ue(0)
+    .ue(0)
+    .u(0, 4)
+    .ue(short_term);
+  for index in 0..short_term {
+    if index > 0 {
+      syntax = syntax.u(0, 1);
+    }
+    syntax = syntax.ue(1).ue(0).ue(0).u(1, 1);
+  }
+  syntax = match long_term {
+    None => syntax.u(0, 1),
+    Some(count) => {
+      let mut syntax = syntax.u(1, 1).ue(count);
+      for _ in 0..count {
+        syntax = syntax.u(0, 8).u(1, 1);
+      }
+      syntax
+    }
+  };
+  escaped(&hevc_header(33, layer), &syntax.u(0, 4).rbsp())
+}
+
+/// An HEVC PPS.
+fn hevc_pps() -> Vec<u8> {
+  let syntax = Syntax::default()
+    .ue(0)
+    .ue(0)
+    .u(0, 7)
+    .ue(0)
+    .ue(0)
+    .se(0)
+    .u(0, 3)
+    .se(0)
+    .se(0)
+    .u(0, 6)
+    .u(0, 4);
+  escaped(&hevc_header(34, 0), &syntax.rbsp())
+}
+
+/// An `hvcC` of `arrays`, each its NAL unit type and units.
+fn hvcc_record(arrays: &[(u8, Vec<Vec<u8>>)]) -> Vec<u8> {
+  let mut record = vec![
+    1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 93, 0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00,
+    0x00, 0x0F,
+  ];
+  record.push(u8::try_from(arrays.len()).expect("arrays"));
+  for (kind, units) in arrays {
+    record.push(0x80 | kind);
+    record.extend_from_slice(&u16::try_from(units.len()).expect("count").to_be_bytes());
+    for unit in units {
+      record.extend_from_slice(&u16::try_from(unit.len()).expect("length").to_be_bytes());
+      record.extend_from_slice(unit);
+    }
+  }
+  record
+}
+
+#[test]
+fn hevcs_configuration_is_judged_as_ff_isom_write_hvcc_writes_it() {
+  use records::{Wrote, hvcc};
+  let (vps, sps, pps) = (hevc_vps(0, None), hevc_sps(0, 0, 1, None), hevc_pps());
+  let sei = |len: usize| sized(&hevc_header(39, 0), len);
+  let record = |vps_n: usize, sps_n: usize, pps_n: usize| {
+    hvcc_record(&[
+      (32, vec![vps.clone(); vps_n]),
+      (33, vec![sps.clone(); sps_n]),
+      (34, vec![pps.clone(); pps_n]),
+    ])
+  };
+  let whole = record(1, 1, 1);
+  let annex = |units: &[&[u8]]| start_coded(units);
+  let base = annex(&[&vps, &sps, &pps]);
+  let alpha_vps = hevc_vps(0, Some(1));
+  let layered = hvcc_record(&[
+    (32, vec![vps.clone()]),
+    (
+      33,
+      [vec![sps.clone(); 16], vec![hevc_sps(1, 0, 0, None)]].concat(),
+    ),
+    (34, vec![pps.clone()]),
+  ]);
+  let seis = hvcc_record(&[(39, vec![Vec::new(); 65_535]), (39, vec![Vec::new()])]);
+  #[rustfmt::skip]
+  let cases: Vec<(&str, Vec<u8>, bool, Wrote)> = vec![
+    ("five bytes", vec![1, 0, 0, 0, 0], false, Wrote::Failed),
+    ("five bytes of a start code", vec![0, 0, 0, 1, 0x40], false, Wrote::Failed),
+    ("a record", whole.clone(), true, Wrote::Whole),
+    ("a record of 22 bytes", whole[..22].to_vec(), false, Wrote::Failed),
+    ("a record whose unit runs past it", whole[..whole.len() - 1].to_vec(), false, Wrote::Corrupt),
+    ("a record of no VPS, incomplete", record(0, 1, 1), false, Wrote::Whole),
+    ("a record of no VPS, complete", record(0, 1, 1), true, Wrote::Failed),
+    ("16 SPSs, complete", record(1, 16, 1), true, Wrote::Whole),
+    ("17 SPSs, complete", record(1, 17, 1), true, Wrote::Failed),
+    ("64 PPSs, complete", record(1, 1, 64), true, Wrote::Whole),
+    ("65 PPSs, complete", record(1, 1, 65), true, Wrote::Failed),
+    ("17 VPSs, complete", record(17, 1, 1), true, Wrote::Failed),
+    ("no PPS, complete", record(1, 1, 0), true, Wrote::Failed),
+    ("a layer's SPS beside 16, complete", layered, true, Wrote::Whole),
+    ("65 536 SEIs over two arrays", seis, false, Wrote::Failed),
+    ("of neither form", [&[2, 0, 0, 1][..], &vps].concat(), false, Wrote::Failed),
+    ("Annex B", base.clone(), true, Wrote::Whole),
+    (
+      "an SPS of 31 long-term pictures",
+      annex(&[&vps, &hevc_sps(0, 0, 1, Some(31)), &pps]), true, Wrote::Whole,
+    ),
+    (
+      "an SPS of 32 long-term pictures",
+      annex(&[&vps, &hevc_sps(0, 0, 1, Some(32)), &pps]), false, Wrote::Failed,
+    ),
+    (
+      "an SPS of 65 short-term sets, the trust model's",
+      annex(&[&vps, &hevc_sps(0, 0, 65, None), &pps]), false, Wrote::Whole,
+    ),
+    (
+      "a layer's SPS no alpha names",
+      annex(&[&vps, &sps, &hevc_sps(1, 0, 0, Some(32)), &pps]), true, Wrote::Whole,
+    ),
+    (
+      "the alpha layer's SPS of 32 long-term pictures",
+      annex(&[&alpha_vps, &sps, &hevc_sps(1, 0, 0, Some(32)), &pps]), true, Wrote::Failed,
+    ),
+    (
+      "the alpha layer's SPS of 31",
+      annex(&[&alpha_vps, &sps, &hevc_sps(1, 0, 0, Some(31)), &pps]), true, Wrote::Whole,
+    ),
+    (
+      "the alpha layer's SPS of a VPS the record holds not",
+      annex(&[&alpha_vps, &sps, &hevc_sps(1, 1, 0, None), &pps]), true, Wrote::Failed,
+    ),
+    ("an SEI of 65 535 bytes", annex(&[&vps, &sps, &pps, &sei(65_535)]), true, Wrote::Whole),
+    ("an SEI of 65 536 bytes", annex(&[&vps, &sps, &pps, &sei(65_536)]), true, Wrote::Corrupt),
+  ];
+  for (name, config, complete, wrote) in cases {
+    assert_eq!(hvcc(&config, complete), wrote, "{name}");
+  }
+  // What `init_get_bits8` takes: a record, and a unit's RBSP — of a layer
+  // the record skips, which no other condition reaches.
+  let mut record = vec![0_u8; records::GET_BITS_BYTES_MAX + 1];
+  record[0] = 1;
+  assert_eq!(
+    hvcc(&record, false),
+    Wrote::Failed,
+    "a record past the reader"
+  );
+  record.pop();
+  assert_eq!(
+    hvcc(&record, false),
+    Wrote::Whole,
+    "a record of what the reader takes"
+  );
+  drop(record);
+  let layered = |len: usize| {
+    let mut config = start_coded(&[&vps, &sps, &pps]);
+    config.extend_from_slice(&[0, 0, 0, 1]);
+    config.extend_from_slice(&hevc_header(39, 1));
+    config.resize(config.len() + len - 2, 0x11);
+    config
+  };
+  assert_eq!(
+    hvcc(&layered(records::GET_BITS_BYTES_MAX + 1), false),
+    Wrote::Failed,
+    "a skipped layer's unit past the reader"
+  );
+  assert_eq!(
+    hvcc(&layered(records::GET_BITS_BYTES_MAX), false),
+    Wrote::Whole,
+    "a skipped layer's unit the reader takes"
+  );
+}
+
+/// A VVC NAL unit of `kind`, of a byte past its header.
+fn vvc_unit(kind: u8) -> Vec<u8> {
+  vec![0x00, (kind << 3) | 1, 0x80]
+}
+
+#[test]
+fn vvcs_configuration_is_judged_as_ff_isom_write_vvcc_writes_it() {
+  use records::{Wrote, vvcc};
+  let (vps, sps, pps, sei) = (vvc_unit(14), vvc_unit(15), vvc_unit(16), vvc_unit(23));
+  let with = |vps_n: usize, sps_n: usize, pps_n: usize| {
+    let mut units = copies(&vps, vps_n);
+    units.extend(copies(&sps, sps_n));
+    units.extend(copies(&pps, pps_n));
+    start_coded(&units)
+  };
+  let big = sized(&[0x00, (23 << 3) | 1], 65_536);
+  let largest = sized(&[0x00, (23 << 3) | 1], 65_535);
+  #[rustfmt::skip]
+  let cases: Vec<(&str, Vec<u8>, Wrote)> = vec![
+    ("five bytes", vec![0xFF, 0, 0, 0, 0], Wrote::Failed),
+    ("a record", vec![0xFF, 0, 0, 0, 0, 0], Wrote::Whole),
+    ("of neither form", vec![0x02, 0, 0, 1, 0, 0x79], Wrote::Failed),
+    ("an SPS and a PPS", with(0, 1, 1), Wrote::Whole),
+    ("no SPS", with(1, 0, 1), Wrote::Failed),
+    ("no PPS", with(1, 1, 0), Wrote::Failed),
+    ("16 VPSs", with(16, 1, 1), Wrote::Whole),
+    ("17 VPSs", with(17, 1, 1), Wrote::Failed),
+    ("16 SPSs", with(0, 16, 1), Wrote::Whole),
+    ("17 SPSs", with(0, 17, 1), Wrote::Failed),
+    ("64 PPSs", with(0, 1, 64), Wrote::Whole),
+    ("65 PPSs", with(0, 1, 65), Wrote::Failed),
+    ("an SEI of 65 535 bytes", start_coded(&[&sps, &pps, &largest]), Wrote::Whole),
+    ("an SEI of 65 536 bytes", start_coded(&[&sps, &pps, &big]), Wrote::Corrupt),
+    (
+      "65 535 SEIs",
+      start_coded(&[&[&sps[..], &pps[..]][..], &copies(&sei, 65_535)].concat()),
+      Wrote::Whole,
+    ),
+    (
+      "65 536 SEIs",
+      start_coded(&[&[&sps[..], &pps[..]][..], &copies(&sei, 65_536)].concat()),
+      Wrote::Corrupt,
+    ),
+  ];
+  for (name, config, wrote) in cases {
+    assert_eq!(vvcc(&config), wrote, "{name}");
+  }
+  // An SEI past what `init_get_bits8` takes: refused, before its length is
+  // cut.
+  let mut config = start_coded(&[&sps, &pps]);
+  config.extend_from_slice(&[0, 0, 0, 1, 0x00, (23 << 3) | 1]);
+  config.resize(config.len() + records::GET_BITS_BYTES_MAX - 1, 0x11);
+  assert_eq!(vvcc(&config), Wrote::Failed, "an SEI past the reader");
+}
+
+/// EVC units, each behind its 4-byte length.
+fn length_prefixed_units(units: &[&[u8]]) -> Vec<u8> {
+  units
+    .iter()
+    .flat_map(|unit| {
+      [
+        &u32::try_from(unit.len()).expect("length").to_be_bytes()[..],
+        unit,
+      ]
+      .concat()
+    })
+    .collect()
+}
+
+/// An EVC NAL unit header of `kind`.
+fn evc_header(kind: u8) -> [u8; 2] {
+  [(kind + 1) << 1, 0]
+}
+
+/// An EVC SPS `id` of `chroma` and bit depths `luma` and `chroma_depth`
+/// less eight.
+fn evc_sps(id: u32, chroma: u32, luma: u32, chroma_depth: u32) -> Vec<u8> {
+  let syntax = Syntax::default()
+    .ue(id)
+    .u(1, 8)
+    .u(51, 8)
+    .u(0, 32)
+    .u(0, 32)
+    .ue(chroma)
+    .ue(64)
+    .ue(64)
+    .ue(luma)
+    .ue(chroma_depth)
+    .u(0, 1);
+  [&evc_header(24)[..], &syntax.rbsp()].concat()
+}
+
+#[test]
+fn evcs_configuration_is_judged_as_ff_isom_write_evcc_writes_it() {
+  use records::{Wrote, evcc};
+  let sps = evc_sps(0, 1, 2, 2);
+  let pps = [&evc_header(25)[..], &[0x80]].concat();
+  let sei = [&evc_header(28)[..], &[0x80]].concat();
+  let units = |units: &[&[u8]]| length_prefixed_units(units);
+  let big = sized(&evc_header(28), 65_536);
+  #[rustfmt::skip]
+  let cases: Vec<(&str, Vec<u8>, Wrote)> = vec![
+    ("seven bytes", vec![0, 0, 0, 3, 0x32, 0, 0x80], Wrote::Failed),
+    ("a record", vec![1, 1, 51, 0, 0, 0, 0, 0], Wrote::Whole),
+    ("an SPS and a PPS", units(&[&sps, &pps]), Wrote::Whole),
+    ("no SPS", units(&[&pps, &pps]), Wrote::Failed),
+    ("16 SPSs", units(&copies(&sps, 16)), Wrote::Whole),
+    ("17 SPSs", units(&copies(&sps, 17)), Wrote::Failed),
+    ("a bit depth of 14", units(&[&evc_sps(0, 1, 6, 6), &pps]), Wrote::Whole),
+    ("a luma bit depth of 15", units(&[&evc_sps(0, 1, 7, 6), &pps]), Wrote::Failed),
+    ("a chroma bit depth of 15", units(&[&evc_sps(0, 1, 6, 7), &pps]), Wrote::Failed),
+    ("a bit depth held in 8 bits", units(&[&evc_sps(0, 1, 262, 6), &pps]), Wrote::Whole),
+    ("an id past 15, the trust model's", units(&[&evc_sps(16, 1, 7, 7), &pps]), Wrote::Whole),
+    ("a chroma format past 3, the trust model's", units(&[&evc_sps(0, 4, 7, 7), &pps]), Wrote::Whole),
+    ("an SPS of a byte", units(&[&sps, &[0x32], &pps]), Wrote::Failed),
+    ("a unit's header past what is left", units(&[&sps, &[0x34]]), Wrote::Failed),
+    ("a unit of the forbidden bit", units(&[&sps, &[0xB2, 0x00]]), Wrote::Failed),
+    ("a unit of no type", units(&[&sps, &[0x00, 0x00]]), Wrote::Failed),
+    ("a unit past what is left, the walk stopped", [units(&[&sps]), vec![0, 0, 0, 9, 0x50, 0]].concat(), Wrote::Whole),
+    ("an SEI of 65 536 bytes", units(&[&sps, &big]), Wrote::Corrupt),
+    ("65 535 SEIs", units(&[&[&sps[..]][..], &copies(&sei, 65_535)].concat()), Wrote::Whole),
+    ("65 536 SEIs", units(&[&[&sps[..]][..], &copies(&sei, 65_536)].concat()), Wrote::Corrupt),
+  ];
+  for (name, config, wrote) in cases {
+    assert_eq!(evcc(&config), wrote, "{name}");
+  }
+}
+
+/// An LCEVC unit of `kind` — 29 IDR, 28 non-IDR — of `blocks`, each a
+/// payload's size type and type byte, then its bytes, and its stop byte.
+fn lcevc_unit_of(kind: u8, blocks: &[&[u8]]) -> Vec<u8> {
+  let mut unit = vec![0x40 | (kind << 1) | 1, 0xFF];
+  for block in blocks {
+    unit.extend_from_slice(block);
+  }
+  unit.push(0x80);
+  unit
+}
+
+#[test]
+fn lcevcs_configuration_is_judged_as_ff_isom_write_lvcc_writes_it() {
+  use records::{Wrote, lvcc};
+  // A sequence configuration of a byte; a global configuration of two, of
+  // resolution type 17 — 1280 × 720 — or another.
+  let sequence: &[u8] = &[0x20, 0x11];
+  let global = |resolution: u8| vec![0x41, resolution << 1, 0x40];
+  let idr = lcevc_unit_of(29, &[sequence, &global(17)]);
+  let annex = |units: &[&[u8]]| start_coded(units);
+  let info = |len: usize| {
+    let mut block = vec![0xE5];
+    let mut size = Vec::new();
+    let mut left = len;
+    loop {
+      size.insert(0, u8::try_from(left & 0x7F).expect("seven bits"));
+      left >>= 7;
+      if left == 0 {
+        break;
+      }
+    }
+    let last = size.len() - 1;
+    for byte in &mut size[..last] {
+      *byte |= 0x80;
+    }
+    block.extend(size);
+    block.resize(block.len() + len, 0x11);
+    block
+  };
+  #[rustfmt::skip]
+  let cases: Vec<(&str, Vec<u8>, Wrote)> = vec![
+    ("six bytes", vec![0, 0, 0, 1, 0x7B, 0xFF], Wrote::Failed),
+    ("an lvcC of six bytes", vec![1, 0, 0, 0, 0, 0], Wrote::Failed),
+    ("an lvcC record", vec![1, 0, 0, 0, 0, 0, 0], Wrote::Whole),
+    ("an IDR unit", annex(&[&idr]), Wrote::Whole),
+    ("a non-IDR unit", annex(&[&lcevc_unit_of(28, &[sequence, &global(17)])]), Wrote::Whole),
+    ("no IDR or non-IDR unit", annex(&[&lcevc_unit_of(1, &[sequence])]), Wrote::Failed),
+    ("a unit of no global configuration", annex(&[&lcevc_unit_of(29, &[sequence])]), Wrote::Failed),
+    ("a unit of no sequence configuration", annex(&[&lcevc_unit_of(29, &[&global(17)])]), Wrote::Failed),
+    (
+      "a global configuration of a reserved resolution, the trust model's",
+      annex(&[&lcevc_unit_of(29, &[sequence, &global(50)])]), Wrote::Whole,
+    ),
+    ("a reserved size type, the trust model's", annex(&[&lcevc_unit_of(29, &[&[0xC0, 0, 0]])]), Wrote::Whole),
+    // Written: 3 bytes, the sequence block's 2, the global block's 3, and
+    // the information block's type byte, its 3 size bytes and payload.
+    (
+      "a unit of 65 535 bytes written",
+      annex(&[&lcevc_unit_of(29, &[sequence, &info(65_535 - 3 - 2 - 3 - 4), &global(17)])]),
+      Wrote::Whole,
+    ),
+    (
+      "a unit of 65 536 bytes written",
+      annex(&[&lcevc_unit_of(29, &[sequence, &info(65_536 - 3 - 2 - 3 - 4), &global(17)])]),
+      Wrote::Corrupt,
+    ),
+  ];
+  for (name, config, wrote) in cases {
+    assert_eq!(lvcc(&config), wrote, "{name}");
+  }
+  // A unit of more bits than `init_get_bits` takes: the split refuses.
+  let mut config = annex(&[&idr]);
+  config.extend_from_slice(&[0, 0, 0, 1, 0x40 | (1 << 1) | 1, 0xFF]);
+  config.resize(config.len() + records::GET_BITS_BYTES_MAX, 0x11);
+  config.push(0x80);
+  assert_eq!(lvcc(&config), Wrote::Failed, "a unit past the reader");
+}
+
+#[test]
+fn vp9s_vpcc_is_judged_as_ff_isom_write_vpcc_writes_it() {
+  use ffmpeg_next::ffi::AVPixelFormat as P;
+  use records::{GET_BITS_BYTES_MAX, Wrote, vpcc};
+  const UNKNOWN: i32 = -99;
+  let past = GET_BITS_BYTES_MAX + 1;
+  for (name, (len, format, profile), wrote) in [
+    ("4:2:0", (0, P::AV_PIX_FMT_YUV420P as i32, 0), Wrote::Whole),
+    ("4:2:2", (0, P::AV_PIX_FMT_YUV422P as i32, 1), Wrote::Whole),
+    ("4:4:4", (0, P::AV_PIX_FMT_YUV444P as i32, 1), Wrote::Whole),
+    ("RGB", (0, P::AV_PIX_FMT_GBRP as i32, 1), Wrote::Whole),
+    ("4:4:0", (0, P::AV_PIX_FMT_YUV440P as i32, 1), Wrote::Failed),
+    (
+      "no format",
+      (0, P::AV_PIX_FMT_NONE as i32, 0),
+      Wrote::Failed,
+    ),
+    ("a format past the table", (0, i32::MAX, 0), Wrote::Failed),
+    (
+      "an unknown profile's configuration read whole",
+      (GET_BITS_BYTES_MAX, P::AV_PIX_FMT_YUV420P as i32, UNKNOWN),
+      Wrote::Whole,
+    ),
+    (
+      "an unknown profile's configuration past the reader",
+      (past, P::AV_PIX_FMT_YUV420P as i32, UNKNOWN),
+      Wrote::Failed,
+    ),
+    (
+      "a known profile's configuration not read",
+      (past, P::AV_PIX_FMT_YUV420P as i32, 0),
+      Wrote::Whole,
+    ),
+    (
+      "a format of no depth's configuration past the reader",
+      (past, P::AV_PIX_FMT_VIDEOTOOLBOX as i32, 0),
+      Wrote::Failed,
+    ),
+  ] {
+    assert_eq!(vpcc(len, format, profile), wrote, "{name}");
+  }
+}
+
+#[test]
+fn avs3s_and_vc1s_configurations_are_judged_as_mp4_writes_them() {
+  use records::{Wrote, av3c, dvc1};
+  let mut long = vec![0_u8; 65_536];
+  long[0] = 0;
+  for (name, config, wrote) in [
+    ("three bytes", vec![1, 0, 0], Wrote::Failed),
+    ("a record", [&[1][..], &[0; 70_000]].concat(), Wrote::Whole),
+    (
+      "a sequence header of 65 535 bytes",
+      long[..65_535].to_vec(),
+      Wrote::Whole,
+    ),
+    (
+      "a sequence header of 65 536 bytes",
+      long.clone(),
+      Wrote::Corrupt,
+    ),
+  ] {
+    assert_eq!(av3c(&config), wrote, "AVS3: {name}");
+  }
+  let header = |profile: u8| vec![0, 0, 1, 0x0F, profile << 6 | 0x08, 0x0A];
+  let entry: &[u8] = &[0, 0, 1, 0x0E, 0x48, 0x80];
+  for (name, config, wrote) in [
+    (
+      "a simple profile's STRUCT_C",
+      vec![0x4E, 0x09, 0x30, 0x01],
+      Wrote::Failed,
+    ),
+    ("an advanced sequence header", header(3), Wrote::Whole),
+    (
+      "an advanced sequence header and an entry point",
+      [&header(3)[..], entry].concat(),
+      Wrote::Whole,
+    ),
+    ("an entry point alone", entry.to_vec(), Wrote::Failed),
+    (
+      "a byte before the sequence header",
+      [&[0x2B][..], &header(3)].concat(),
+      Wrote::Whole,
+    ),
+    (
+      "a sequence header of no byte",
+      vec![0x2B, 0, 0, 1, 0x0F],
+      Wrote::Failed,
+    ),
+    (
+      "a sequence header cut by the next marker",
+      [&[0, 0, 1, 0x0F][..], entry].concat(),
+      Wrote::Failed,
+    ),
+    (
+      "a main profile's sequence header, the trust model's",
+      header(1),
+      Wrote::Whole,
+    ),
+  ] {
+    assert_eq!(dvc1(&config), wrote, "VC-1: {name}");
+  }
+}
+
+#[test]
+fn flvs_filter_makes_h26x_configurations_as_extract_extradata_makes_them() {
+  use records::{Units, h2645_extracted};
+  let sps: &[u8] = &[0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40];
+  let pps: &[u8] = &[0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
+  let idr: &[u8] = &[0x65, 0x88, 0x84, 0x21];
+  let packet = |units: &[&[u8]]| start_coded(units);
+  // Each unit to the next start code, a 4-byte one's leading zero its own,
+  // behind a 4-byte start code of its own.
+  let made = |units: &[&[u8]]| -> Vec<u8> {
+    units
+      .iter()
+      .flat_map(|unit| [&[0_u8, 0, 0, 1][..], unit, &[0]].concat())
+      .collect()
+  };
+  assert_eq!(
+    h2645_extracted(Units::H264, &packet(&[sps, pps, idr])),
+    Ok(Some(made(&[sps, pps]))),
+    "its parameter sets, each behind a 4-byte start code"
+  );
+  assert_eq!(
+    h2645_extracted(Units::H264, &packet(&[sps, idr])),
+    Ok(Some(made(&[sps]))),
+    "an SPS alone"
+  );
+  assert_eq!(
+    h2645_extracted(Units::H264, &packet(&[pps, idr])),
+    Ok(None),
+    "no SPS"
+  );
+  assert_eq!(
+    h2645_extracted(Units::H264, &[0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x10]),
+    Err(()),
+    "length-prefixed: no start code"
+  );
+  assert_eq!(
+    h2645_extracted(Units::H264, &[0x65, 0x88, 0x84]),
+    Ok(None),
+    "three bytes"
+  );
+  assert_eq!(
+    h2645_extracted(Units::H264, &packet(&[&[0x80, 0x01]])),
+    Ok(None),
+    "its one unit's header of the forbidden bit, too little after it to search"
+  );
+  assert_eq!(
+    h2645_extracted(
+      Units::H264,
+      &[
+        0, 0, 1, 0x80, 0x01, 0, 0, 3, 1, 0, 0, 2, 0x11, 0x11, 0x11, 0x11
+      ]
+    ),
+    Err(()),
+    "a unit an escape and `00 00 02` end, its header refused, then a search reaching the end"
+  );
+  assert_eq!(
+    h2645_extracted(
+      Units::H264,
+      &[&[0, 0, 1][..], sps, &[0, 0, 1], pps, &[0, 0, 1], idr].concat()
+    ),
+    Ok(Some(packet(&[sps, pps]))),
+    "3-byte start codes"
+  );
+  let (vps, hsps, hpps) = (hevc_vps(0, None), hevc_sps(0, 0, 1, None), hevc_pps());
+  let slice = escaped(&hevc_header(19, 0), &[0xAF, 0x88]);
+  assert_eq!(
+    h2645_extracted(Units::Hevc, &packet(&[&vps, &hsps, &hpps, &slice])),
+    Ok(Some(made(&[&vps, &hsps, &hpps]))),
+  );
+  assert_eq!(
+    h2645_extracted(Units::Hevc, &packet(&[&hsps, &hpps, &slice])),
+    Ok(None),
+    "HEVC of no VPS"
+  );
+  let (vsps, vpps) = (vvc_unit(15), vvc_unit(16));
+  assert_eq!(
+    h2645_extracted(Units::Vvc, &packet(&[&vsps, &vpps, &vvc_unit(8)])),
+    Ok(Some(made(&[&vsps, &vpps]))),
+  );
 }

@@ -333,6 +333,21 @@ crate moves only when it changes.
   colours, the rest written unset, refused (`ConfigurationInvalid`); new
   extradata, which a new sample description holds unconverted, refused
   (`PayloadRule::NewExtradata`).
+  The configuration writers MP4 and FLV call and ignore the answer of —
+  `avcC`, `hvcC`, `vvcC`, `evcC`, `lvcC`, `vpcC`, `av3c` and `dvc1` —
+  mirrored from their source: a configuration a stream the standards
+  allow can bring that the writer refuses, cuts or writes empty, refused
+  at open (`ConfigurationInvalid`) and as a packet's new extradata
+  (`PayloadRule::NewExtradata`); a unit's length or an array's count its
+  16 bits cut or wrap, which Matroska writes too and answers success,
+  refused in Matroska as well; MP4's VP9 of no configuration judged at its
+  first sample, which its `vpcC` reads. Under FLV's `extract_extradata`,
+  the configuration the filter makes of each H.264, HEVC or VVC packet is
+  judged by the writer, and a packet of no unit the filter splits off is
+  refused (`PayloadRule::NalUnits`, new). A condition only a parameter
+  set the standard does not allow reaches — a value past the range it
+  caps, syntax that does not parse — rests on the trust model, and is not
+  refused.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
