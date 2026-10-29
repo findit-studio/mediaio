@@ -3332,3 +3332,182 @@ fn an_avi_xsub_cue_is_placed_one_packet_on_however_far() {
     Err(FfmpegMuxRefusal::FrameGap { .. })
   ));
 }
+
+/// AV1's configurations as `ff_isom_write_av1c` takes them (R9: ruling 4c;
+/// `av1.c` 125–502 in FFmpeg 9.0.1): an `av1C` record of version 1 and four
+/// bytes or more; or OBUs whose headers parse, holding one sequence header
+/// `parse_sequence_header` reads to its last bit — SVT-AV1's, a reduced
+/// still picture's, a monochrome one's, a twelve-bit Professional one's,
+/// and one of timing information, a `uvlc`, a decoder model, an operating
+/// point of a tier, frame ids, order hints, screen content tools and sRGB
+/// colour — and no empty metadata. The configuration FLV's
+/// `extract_extradata` makes is the unit's sequence headers, one of no
+/// bits split off unread.
+///
+/// PLANT: the exact bit count dropped takes a header of a bit to spare.
+#[test]
+fn av1c_is_refused_where_ff_isom_write_av1c_would_fail() {
+  /// `fields`' bits from the front, then AV1's trailing bits: a one, and
+  /// zeros to the byte.
+  fn trailed(fields: &[(u32, u32)]) -> Vec<u8> {
+    let mut bits = Vec::new();
+    for &(value, count) in fields {
+      for bit in (0..count).rev() {
+        bits.push(((value >> bit) & 1) == 1);
+      }
+    }
+    bits.push(true);
+    while bits.len() % 8 != 0 {
+      bits.push(false);
+    }
+    bits
+      .chunks(8)
+      .map(|byte| {
+        byte
+          .iter()
+          .fold(0_u8, |acc, &bit| (acc << 1) | u8::from(bit))
+      })
+      .collect()
+  }
+  /// A sequence header OBU of `payload`, its size one LEB128 byte.
+  fn sequence(payload: &[u8]) -> Vec<u8> {
+    let mut obu = vec![0x0A, u8::try_from(payload.len()).expect("short")];
+    obu.extend_from_slice(payload);
+    obu
+  }
+  // SVT-AV1's, of the temporal unit the integration tests' fixture holds.
+  let svt = [
+    0x02, 0x00, 0x00, 0x05, 0x15, 0x7F, 0xFC, 0x4A, 0xF9, 0x00, 0x40,
+  ];
+  // Profile, still picture, reduced header, level; four bits each of the
+  // dimensions' bits less one, then one bit each of the dimensions less
+  // one; the six tool flags; then the colour.
+  let reduced = |profile: u32| {
+    [
+      (profile, 3),
+      (1, 1),
+      (1, 1),
+      (0, 5),
+      (0, 4),
+      (0, 4),
+      (0, 1),
+      (0, 1),
+      (0, 3),
+      (0, 3),
+    ]
+  };
+  let with = |head: &[(u32, u32)], tail: &[(u32, u32)]| [head, tail].concat();
+  // 8-bit 4:2:0: no high bit depth, not monochrome, no colour description,
+  // a colour range, a chroma sample position, no separate UV delta, no
+  // film grain.
+  let still = trailed(&with(
+    &reduced(0),
+    &[(0, 1), (0, 1), (0, 1), (0, 1), (0, 2), (0, 1), (0, 1)],
+  ));
+  // Monochrome: a colour range, and no separate UV delta.
+  let mono = trailed(&with(
+    &reduced(0),
+    &[(0, 1), (1, 1), (0, 1), (0, 1), (0, 1)],
+  ));
+  let mono_spare = trailed(&with(
+    &reduced(0),
+    &[(0, 1), (1, 1), (0, 1), (0, 1), (0, 1), (0, 1)],
+  ));
+  // Professional, twelve bits, chroma subsampled both ways and its sample
+  // position read.
+  let professional = trailed(&with(
+    &reduced(2),
+    &[
+      (1, 1),
+      (1, 1),
+      (0, 1),
+      (0, 1),
+      (0, 1),
+      (1, 1),
+      (1, 1),
+      (0, 2),
+      (0, 1),
+      (0, 1),
+    ],
+  ));
+  #[rustfmt::skip]
+  let timed = trailed(&[
+    (0, 3), (0, 1), (0, 1),
+    // Timing information; an equal picture interval, its `uvlc` of three
+    // leading zeros; a decoder model of 4-bit buffer delays.
+    (1, 1), (1, 32), (30, 32), (1, 1), (0, 3), (1, 1), (0b101, 3),
+    (1, 1), (3, 5), (1, 32), (0, 10),
+    // A display delay; one operating point of level 8, so a tier bit, its
+    // decoder model and its display delay.
+    (1, 1), (0, 5), (0, 12), (8, 5), (1, 1), (1, 1), (5, 4), (6, 4), (0, 1), (1, 1), (2, 4),
+    // Four-bit dimensions; frame ids.
+    (3, 4), (3, 4), (15, 4), (15, 4), (1, 1), (0, 7),
+    // Tools; order hints; screen content tools chosen, integer motion
+    // vectors chosen; the order hint's bits.
+    (0, 3), (0, 4), (1, 1), (0, 2), (1, 1), (1, 1), (6, 3), (0, 3),
+    // BT.709 primaries, sRGB transfer, the identity matrix: no colour
+    // range, no subsampling.
+    (0, 1), (0, 1), (1, 1), (1, 8), (13, 8), (0, 8), (0, 1), (0, 1),
+  ]);
+  let cat = |parts: &[&[u8]]| parts.concat();
+  for (name, config, written) in [
+    ("none", Vec::new(), false),
+    ("an av1C record", vec![0x81, 0, 0, 0], true),
+    ("a short record", vec![0x81, 0, 0], false),
+    ("a record of version 2", vec![0x82, 0, 0, 0], false),
+    ("SVT-AV1's", sequence(&svt), true),
+    ("a reduced still picture's", sequence(&still), true),
+    ("a monochrome one's", sequence(&mono), true),
+    (
+      "a monochrome one of a bit to spare",
+      sequence(&mono_spare),
+      false,
+    ),
+    ("a Professional one's", sequence(&professional), true),
+    ("a timed one's", sequence(&timed), true),
+    ("two", cat(&[&sequence(&svt), &sequence(&svt)]), false),
+    (
+      "empty metadata first",
+      cat(&[&[0x2A, 0x00], &sequence(&svt)]),
+      false,
+    ),
+    (
+      "metadata first",
+      cat(&[&[0x2A, 0x01, 0x01], &sequence(&svt)]),
+      true,
+    ),
+    (
+      "a delimiter, padding",
+      cat(&[&[0x12, 0x00], &sequence(&svt), &[0x7A, 0x00]]),
+      true,
+    ),
+    ("a delimiter alone", vec![0x12, 0x00], false),
+    ("an empty sequence header", vec![0x0A, 0x00], false),
+    ("a one bit past", sequence(&cat(&[&svt, &[0x80]])), false),
+    ("a zero byte past", sequence(&cat(&[&svt, &[0x00]])), true),
+    (
+      "no trailing one",
+      sequence(&cat(&[&svt[..10], &[0x00]])),
+      false,
+    ),
+    ("of no size field", cat(&[&[0x08], &svt]), true),
+    ("a header cut", vec![0x0A], false),
+    ("an extension and no size", vec![0x0E, 0x00], false),
+    ("a size past the end", cat(&[&[0x0A, 0x0C], &svt]), false),
+  ] {
+    assert_eq!(av1c_written(&config), written, "{name}");
+  }
+  let frame: &[u8] = &[0x32, 0x01, 0x10];
+  let unit = cat(&[&[0x12, 0x00], &sequence(&svt), frame]);
+  assert_eq!(av1_extracted_sequences(&unit), Some(sequence(&svt)));
+  assert_eq!(av1_extracted_sequences(&cat(&[&[0x12, 0x00], frame])), None);
+  // A sequence header of no bits split off unread: the configuration made
+  // of the rest written, where the unit as a configuration is not.
+  let unread = cat(&[&[0x0A, 0x01, 0x00], &sequence(&svt)]);
+  assert!(!av1c_written(&unread));
+  let made = av1_extracted_sequences(&unread).expect("made");
+  assert!(av1c_written(&made));
+  let twice =
+    av1_extracted_sequences(&cat(&[&sequence(&svt), frame, &sequence(&svt)])).expect("made");
+  assert!(!av1c_written(&twice), "two sequence headers");
+}

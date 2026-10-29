@@ -11967,10 +11967,12 @@ fn l105_flv_refuses_the_legacy_audio_it_would_write_otherwise() {
 /// nothing at open, and a packet whose new extradata is Annex B turns the
 /// rewrite on, reported there; of none, `extract_extradata` makes an
 /// Annex B one of the first packet's parameter sets, reported at that
-/// packet.
+/// packet — an `avcC` the packet brings too replaced by it (R9: ruling 4c,
+/// the filter's side data).
 ///
-/// PLANT: the rewrite decided at open alone leaves the two later ones
-/// unreported.
+/// PLANT: the rewrite decided at open alone leaves the three later ones
+/// unreported; the packet's own configuration taken first leaves the
+/// replaced one unreported.
 #[test]
 fn l106_flvs_annex_b_rewrite_is_reported_where_the_configuration_makes_it() {
   use ffmpeg_next::ffi::AVPacketSideDataType as T;
@@ -12039,8 +12041,15 @@ fn l106_flvs_annex_b_rewrite_is_reported_where_the_configuration_makes_it() {
   let avcc = stream_extradata_of(&table_of(&corpus.multi_track_mkv(), TrackKind::Video)[0]);
   assert_eq!(avcc.first(), Some(&1), "the premise: an avcC");
   for (name, stated, side) in [
-    ("l106-switch.flv", Some(avcc), Some(configuration.clone())),
+    (
+      "l106-switch.flv",
+      Some(avcc.clone()),
+      Some(configuration.clone()),
+    ),
     ("l106-extracted.flv", Some(Vec::new()), None),
+    // `extract_extradata`'s configuration replaces the packet's own
+    // (`av_packet_add_side_data`, `libavcodec/packet.c` 197–212).
+    ("l106-replaced.flv", Some(Vec::new()), Some(avcc)),
   ] {
     let row = table_of(&annexb, TrackKind::Video)
       .remove(0)
@@ -12607,4 +12616,136 @@ fn l108_a_tracks_first_packet_brings_the_configuration_where_the_container_takes
     av1c,
     "AV1 read back configured"
   );
+}
+
+/// **L109 — AV1's configuration is refused where `ff_isom_write_av1c`
+/// would fail** (R9: ruling 4c; `av1.c` 399–502; `movenc.c` 1573–1582;
+/// `flvenc.c` 892–893, 1250–1263): MP4 and FLV write it through that
+/// function and ignore its failure, the `av1C` or the sequence header left
+/// empty. At open, nothing written: a record of version 2, a record of
+/// three bytes, two sequence headers, a sequence header of a bit to spare,
+/// refused; the fixture's record and its sequence header alone taken, each
+/// read back as that record. At a packet: new extradata of a record of
+/// version 2 refused, the packet handed back. FLV of no configuration,
+/// `extract_extradata` making it of each unit's sequence headers: a unit
+/// of two refused, one whose OBUs do not parse refused as the filter
+/// refuses it, the fixture's taken.
+///
+/// PLANT: each refusal removed opens, or takes its packet.
+#[test]
+fn l109_av1s_configuration_is_refused_where_ff_isom_write_av1c_would_fail() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let av1 = av1_mkv(&corpus);
+  let (table, frames) = whole_track(&av1, TrackKind::Video);
+  let record = stream_extradata_of(&table[0]);
+  assert_eq!(record.first(), Some(&0x81), "the premise: an av1C record");
+  let sequence = record[4..].to_vec();
+  assert!(
+    sequence[0] == 0x0A && sequence.len() == 2 + usize::from(sequence[1]) && sequence[1] < 0x7F,
+    "the premise: one sequence header after the record's four bytes"
+  );
+  let spare = {
+    let mut obu = vec![0x0A, sequence[1] + 1];
+    obu.extend_from_slice(&sequence[2..]);
+    obu.push(0x80);
+    obu
+  };
+  let flv = || ContainerName::new("flv");
+  let configured = |config: &[u8]| {
+    table_of(&av1, TrackKind::Video)
+      .into_iter()
+      .map(|row| row.with_extradata(Some(bytes_of(config))))
+      .collect::<Vec<_>>()
+  };
+  for (container, extension) in [(ContainerName::MP4, "mp4"), (flv(), "flv")] {
+    for (name, config) in [
+      ("version-2", vec![0x82, 0, 0, 0]),
+      ("short", record[..3].to_vec()),
+      ("two", [&sequence[..], &sequence[..]].concat()),
+      ("spare", spare.clone()),
+    ] {
+      let target = output(&corpus, &format!("l109-{name}.{extension}"));
+      let refused = FfmpegOwnedMuxer::open(
+        File::create(&target).expect("create"),
+        container.clone(),
+        configured(&config),
+        &[],
+        PacketLimits::default(),
+      );
+      assert!(
+        matches!(
+          refused,
+          Err(MuxOpenError::ConfigurationInvalid { codec, .. }) if codec == CodecId::AV1
+        ),
+        "{name}.{extension}: {:?}",
+        refused.map(drop)
+      );
+      assert_eq!(
+        std::fs::metadata(&target).expect("the file").len(),
+        0,
+        "{name}.{extension}: nothing written"
+      );
+    }
+    for (name, config) in [("record", &record), ("sequence", &sequence)] {
+      let target = output(&corpus, &format!("l109-{name}.{extension}"));
+      let mut muxer = muxer_into(&target, container.clone(), configured(config));
+      let mut first = video_of(&frames[0]);
+      first
+        .extra_mut()
+        .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x82, 0, 0, 0])]);
+      let offered = VideoTrackPacket::new(TrackIndex::new(0), first);
+      let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+      assert_eq!(
+        refusal,
+        payload(PayloadRule::NewExtradata),
+        "{name}.{extension}"
+      );
+      untouched!(offered, back);
+      for frame in &frames {
+        muxer
+          .write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(frame)))
+          .map_err(|error| error.map_packet(drop))
+          .expect("a frame");
+      }
+      muxer.finish().expect("finished");
+      assert_eq!(
+        stream_extradata_of(&table_of(&target, TrackKind::Video)[0]),
+        record,
+        "{name}.{extension}: read back as the record"
+      );
+    }
+  }
+
+  let target = output(&corpus, "l109-extracted.flv");
+  let mut muxer = muxer_with(&target, flv(), configured(&[]), filters(true));
+  let unit = video_of(&frames[0]);
+  assert!(
+    unit.data().as_ref().starts_with(&sequence),
+    "the premise: each unit opens on the sequence header"
+  );
+  for (name, bytes, rule) in [
+    (
+      "two",
+      [&sequence[..], unit.data().as_ref()].concat(),
+      PayloadRule::NewExtradata,
+    ),
+    (
+      "unparsed",
+      [&[0x80][..], unit.data().as_ref()].concat(),
+      PayloadRule::Obus,
+    ),
+  ] {
+    let offered = VideoTrackPacket::new(TrackIndex::new(0), video_holding(&unit, &bytes));
+    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    assert_eq!(refusal, payload(rule), "{name}");
+    untouched!(offered, back);
+  }
+  for frame in &frames {
+    muxer
+      .write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(frame)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame, its configuration made of it");
+  }
+  muxer.finish().expect("finished");
 }

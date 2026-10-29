@@ -191,7 +191,7 @@
 //! |---|---|---|---|
 //! | MPEG-4 Part 2, MPEG-1 and MPEG-2 video, MJPEG, PNG, JPEG 2000, TSCC2 (`mp4v`); AAC, MPEG-4 ALS, MP3, MP2, DTS, Vorbis, QCELP, EVRC (`mp4a`); DVD subtitles (`mp4s`) | `esds` (765–816) | as its decoder-specific information | kept |
 //! | H.264, HEVC, VVC, EVC, LCEVC, AVS3 | `avcC`, `hvcC` and `lhvC`, `vvcC`, `evcC`, `lvcC`, `av3c` (1584–1593, 1639–1674, 1706–1723, 1676–1704, 1618–1626) | whole | kept |
-//! | VP9, AV1, VC-1 | `vpcC`, `av1C`, `dvc1` (1628–1637, 1573–1582, 1186–1201) | parsed, or whole | kept |
+//! | VP9, AV1, VC-1 | `vpcC`, `av1C`, `dvc1` (1628–1637, 1573–1582, 1186–1201) | parsed, or whole; AV1's refused where `ff_isom_write_av1c` would fail, which leaves the box empty (`av1.c` 399–502; [`MuxOpenError::ConfigurationInvalid`], [`PayloadRule::NewExtradata`]; R9: ruling 4c — L109) | kept |
 //! | ALAC, FLAC, Opus, TrueHD | `alac`, `dfLa`, `dOps`, `dmlp` (672–676, 857–938) | whole, or parsed | kept |
 //! | Dirac, FFV1, MPEG-H 3D Audio | `glbl` (1203–1210) | whole | kept |
 //! | `mov_text` | the entry itself (2281–2282) | whole | kept |
@@ -273,7 +273,7 @@
 //! | `pcm_rechunk` | DAUD (`daud_init`, `daudenc.c` 44), GXF (`gxf_write_header`, `gxfenc.c` 724), MXF, MXF D-10, MXF OP-Atom (`mxf_init`, `mxfenc.c` 3081) | the start; an audio track — of PCM alone, which libavcodec admits to it (`av_bsf_init`, `libavcodec/bsf.c` 154–170) | packets of a fixed count of samples (`pcm_rechunk.c` 123–186); its start multiplies the channels by the bits per sample in `int`, and refuses a size past `INT_MAX` over it (49–58) | the product held at open ([`MuxOpenError::SampleSize`]); its packets are its options'; named at open ([`AutomaticFilter::PcmRechunk`]) |
 //! | `av1_metadata`, `td=insert` | IVF (`ivfenc.c` 46); OBU (`rawenc.c` 572) | IVF's start, whatever the option; OBU's first packet, `AUTO_BSF`; AV1 | the OBUs read and written back by CBS, each unit's write buffer at most `INT_MAX / 8` (`cbs.c` 342–372), the fragment summed in `size_t` (`cbs_av1.c` 1245–1265) and handed on as an `int` (`cbs.c` 472–474), which only shrinks it | nothing to hold; its refusals are the container's own; named at open ([`AutomaticFilter::Av1Metadata`]) |
 //! | `eia608_to_smpte436m` | MCC (`mcc_init`, `mccenc.c` 434), MXF (`mxf_init`, `mxfenc.c` 3104) | the start; EIA-608 | one ANC packet of at most 255 bytes, of at most 80 triples (`eia608_to_smpte436m.c` 168–209, 227) | nothing to hold; named at open ([`AutomaticFilter::Eia608ToSmpte436m`]) |
-//! | `extract_extradata` | FLV (`flvenc.c` 1501) | the first packet, `AUTO_BSF`, no configuration; H.264, HEVC, VVC, AV1, MPEG-4 | the packet less its parameter sets, each sum within the packet's or against `INT_MAX` (`extract_extradata.c` 102–116, 412–419) | nothing to hold; named at open, which its configuration decides ([`AutomaticFilter::ExtractExtradata`]) |
+//! | `extract_extradata` | FLV (`flvenc.c` 1501) | the first packet, `AUTO_BSF`, no configuration; H.264, HEVC, VVC, AV1, MPEG-4 | the packet less its parameter sets, each sum within the packet's or against `INT_MAX` (`extract_extradata.c` 102–116, 412–419); AV1's unit whose OBUs do not parse refused (`av1_parse.c` 56–97); the configuration it makes replacing the packet's own (`packet.c` 197–212) | nothing to hold; named at open, which its configuration decides ([`AutomaticFilter::ExtractExtradata`]); AV1's refusal mirrored ([`PayloadRule::Obus`]), and the configuration it makes judged as the packet's would be (R9: ruling 4c — L109) |
 //! | `h264_mp4toannexb`, `hevc_mp4toannexb`, `vvc_mp4toannexb` | MPEG-TS (`mpegtsenc.c` 2331) and RTP MPEG-TS's MPEG-TS, nested in a context of its own whose option stays on (`rtpenc_mpegts.c` 67); MXF and MXF OP-Atom, not MXF D-10 (`mxfenc.c` 3636, 3707–3758); the raw H.264, VVC and HEVC muxers (`rawenc.c` 391, 416, 441) | the first packet, `AUTO_BSF` — the nested context's own — of five bytes or more opening on no start code, MPEG-TS's on a 3-byte one where the configuration is length-prefixed; H.264, HEVC, VVC — MXF's H.264 alone | start codes for lengths, parameter sets before an IDR, counted in 64 bits against `INT_MAX` (`h264_mp4toannexb.c` 291, 420–424; `hevc_mp4toannexb.c` 199–206; `vvc_mp4toannexb.c` 287–294) | nothing to hold; named at the write of the packet that inserts it ([`AutomaticFilter::H264Mp4ToAnnexB`], [`HevcMp4ToAnnexB`](AutomaticFilter::HevcMp4ToAnnexB), [`VvcMp4ToAnnexB`](AutomaticFilter::VvcMp4ToAnnexB)) |
 //!
 //! **What moves each mirror** (grep G20 of #82): every mirror this muxer
@@ -344,7 +344,7 @@
 //! | AMR-NB: one frame a packet; ADPCM MS and IMA WAV: a frame size | 6983–7002 | not reached: MP4's tag table holds neither (`codec_mp4_tags`, 9230–9290), refused at open ([`MuxOpenError::CodecNotCarried`]); MOV's mode reaches it, its AMR and ADPCM booked (table H) |
 //! | no samples: less than a frame of a sized codec | 7006–7010 | [`PayloadRule::PartialSample`], [`PayloadRule::Empty`] |
 //! | the first packet taken as the configuration of H.264, HEVC, VVC, EVC, LCEVC, VP9, TrueHD or DNxHD where none is stated | 7024–7041 | H.264, HEVC, VVC, LCEVC and EVC refused at open ([`MuxOpenError::ConfigurationMissing`]); TrueHD refused at open; VP9's and DNxHD's boxes made from it, written |
-//! | new extradata: a sample description from the packet on, each written by its codec's writer at the trailer — AC-3's and E-AC-3's, `dac3` and `dec3`, from MP4's parse of the frames, APV's `apvC` from its packets', PCM's, TTML's and GoPro metadata's entries of no configuration, none of its bytes; MPEG-4 ALS, AAC, AV1 and FLAC's overwriting a configuration stated as none | 7044–7074, 7406–7420; grep G19 | where none of its bytes is written, reported dropped (the side-data table); FLAC's of 34 bytes ([`PayloadRule::FlacStreamInfo`]); Opus's an OpusHead `dOps` takes, H.264's, HEVC's, VVC's and LCEVC's of the track's form — Annex B or not — as the rewrite reads it ([`PayloadRule::NewExtradata`]); a track of MPEG-4 ALS, AAC, AV1 or FLAC that states none taken where its first packet brings one, which the trailer writes its sample entry of, and refused where it does not ([`PayloadRule::ConfigurationAbsent`]; R9: ruling 4a — L108) — not ISMV's, which writes its `moov` at its header, nor AVIF's |
+//! | new extradata: a sample description from the packet on, each written by its codec's writer at the trailer — AC-3's and E-AC-3's, `dac3` and `dec3`, from MP4's parse of the frames, APV's `apvC` from its packets', PCM's, TTML's and GoPro metadata's entries of no configuration, none of its bytes; MPEG-4 ALS, AAC, AV1 and FLAC's overwriting a configuration stated as none | 7044–7074, 7406–7420; grep G19 | where none of its bytes is written, reported dropped (the side-data table); FLAC's of 34 bytes ([`PayloadRule::FlacStreamInfo`]); Opus's an OpusHead `dOps` takes, H.264's, HEVC's, VVC's and LCEVC's of the track's form — Annex B or not — as the rewrite reads it, AV1's one `ff_isom_write_av1c` writes (R9: ruling 4c — L109) ([`PayloadRule::NewExtradata`]); a track of MPEG-4 ALS, AAC, AV1 or FLAC that states none taken where its first packet brings one, which the trailer writes its sample entry of, and refused where it does not ([`PayloadRule::ConfigurationAbsent`]; R9: ruling 4a — L108) — not ISMV's, which writes its `moov` at its header, nor AVIF's |
 //! | AAC framed in ADTS | 7076–7086 | [`PayloadRule::AdtsHeader`], [`PayloadRule::AdtsFrame`] |
 //! | the Annex B rewrite | 7087–7158 | reported ([`Rewrite::LengthPrefixed`]); its size, table B |
 //! | AV1's OBUs | 7159–7174 | [`PayloadRule::Obus`]; reported ([`Rewrite::ObusFiltered`]) |
@@ -370,7 +370,7 @@
 //! | `dmlp`, TrueHD | 911–939 | refused at open: MP4 writes TrueHD only as an experiment ([`MuxOpenError::CodecNotCarried`]) |
 //! | `chnl`, PCM's layout | 1299–1340 | [`MuxOpenError::ChannelLayout`] |
 //! | `SA3D` | 940–997 | not reached: read from stream metadata the context never sets |
-//! | the video configuration boxes — `avcC`, `hvcC`, `lhvC`, `vvcC`, `evcC`, `lvcC`, `apvC`, `vpcC`, `av1C`, `dvc1` | 2880–2930 | their writers' failures are ignored, the box left as far as it was written: AV1's and MPEG-4 ALS's absence taken where the first packet brings the configuration ([`PayloadRule::ConfigurationAbsent`] where it does not; R9: ruling 4a), ALAC's refused at open ([`MuxOpenError::ConfigurationMissing`]; 672–676, 765–816); the rest is the configuration's own |
+//! | the video configuration boxes — `avcC`, `hvcC`, `lhvC`, `vvcC`, `evcC`, `lvcC`, `apvC`, `vpcC`, `av1C`, `dvc1` | 2880–2930 | their writers' failures are ignored, the box left as far as it was written: AV1's and MPEG-4 ALS's absence taken where the first packet brings the configuration ([`PayloadRule::ConfigurationAbsent`] where it does not; R9: ruling 4a), AV1's configuration `ff_isom_write_av1c` fails on refused at open and at the packet bringing it ([`MuxOpenError::ConfigurationInvalid`], [`PayloadRule::NewExtradata`]; R9: ruling 4c — L109), ALAC's refused at open ([`MuxOpenError::ConfigurationMissing`]; 672–676, 765–816); the rest is the configuration's own |
 //! | frame cropping that leaves no picture | 3024–3036 | [`MuxOpenError::Cropping`] |
 //! | TTML's codec tag | 2259–2280 | not reached: the header refuses `dfxp` outside ISMV first (8603–8609), a fault at open |
 //! | libavcodec's TTML joined into one document: its header strings, its size | `movenc_ttml.c` 236–317; `ttmlenc.c` 82–122 | [`MuxOpenError::ConfigurationInvalid`]; [`PayloadRule::DocumentSize`] |
@@ -654,9 +654,9 @@
 //! | MP3, at open | a table of more than 255 chapters | its ID3v2 table of contents counts them in 8 bits, wrapped (`write_ctoc`, `id3v2enc.c` 274) | [`MuxOpenError::ChapterCount`] — L80 |
 //! | IVF | a dimension past 65535 | written cut into its 16-bit field (`ivfenc.c` 65–66) | [`MuxOpenError::Dimensions`] — L77 |
 //! | WAV | a packet past 4 GiB of file; of every codec tag but integer PCM's, a packet past 2^32 samples of presentation span, its duration counted | the sizes left at their placeholders, the file broken; the fact chunk's count cut, read back as the stream's length (`wavenc.c` 409–495) | [`PayloadRule::FileSize`] — L78, L104 |
-//! | FLV | a reordering H.264, MPEG-4, HEVC, AV1, VP9 or VVC packet with no presentation time; a decode time past 32 bits of milliseconds; a composition time past 24 bits; a tag past 24 bits of size; ADTS AAC no filter converts; AAC with no configuration whose first packet brings none | refused after taking the packet; written cut; written cut; refused after taking the packet; refused after taking the first, the rest written with their headers in; an empty sequence header, unreadable (`flvenc.c` 1252–1352, 807–860) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`PayloadRule::TagSize`], [`PayloadRule::AdtsHeader`], [`PayloadRule::ConfigurationAbsent`] — L50, L82 |
+//! | FLV | a reordering H.264, MPEG-4, HEVC, AV1, VP9 or VVC packet with no presentation time; a decode time past 32 bits of milliseconds; a composition time past 24 bits; a tag past 24 bits of size; ADTS AAC no filter converts; AAC with no configuration whose first packet brings none; AV1's new configuration — the packet's, or the one `extract_extradata` makes of its sequence headers — `ff_isom_write_av1c` fails on, and under that filter a unit whose OBUs do not parse | refused after taking the packet; written cut; written cut; refused after taking the packet; refused after taking the first, the rest written with their headers in; an empty sequence header, unreadable; an empty sequence header; refused by the filter (`flvenc.c` 1252–1352, 807–860, 892–893; `av1_parse.c` 56–97) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`PayloadRule::TagSize`], [`PayloadRule::AdtsHeader`], [`PayloadRule::ConfigurationAbsent`], [`PayloadRule::NewExtradata`], [`PayloadRule::Obus`] — L50, L82, L109 |
 //! | AVI | a frame more than 60 000 frames after the stream's place, but XSUB's, whose gaps it fills not; H.264 it tags `H264` not opening on a start code; at open, raw video of no tag of another pixel format than its bits name | refused after taking it; the first refused after taking it, the rest written as they are; written, "unreadable" (`avienc.c` 744–778, 446–461) | [`FfmpegMuxRefusal::FrameGap`], [`PayloadRule::StartCode`], [`MuxOpenError::ConfigurationInvalid`] — L84 |
-//! | FLV, at open | Opus or FLAC with no configuration; H.264, HEVC, VVC, AV1, MPEG-4 or AAC with none and the filters off | the header's `av_assert0` ends the process; written behind an empty sequence header (`flvenc.c` 853, 1491–1503) | [`MuxOpenError::ConfigurationMissing`] — L82 |
+//! | FLV, at open | Opus or FLAC with no configuration; H.264, HEVC, VVC, AV1, MPEG-4 or AAC with none and the filters off; AV1's configuration `ff_isom_write_av1c` fails on | the header's `av_assert0` ends the process; written behind an empty sequence header; an empty sequence header (`flvenc.c` 853, 1491–1503, 892–893) | [`MuxOpenError::ConfigurationMissing`], [`MuxOpenError::ConfigurationInvalid`] — L82, L109 |
 //! | FLV, at open | big-endian PCM; an audio codec of no extended header — PCM, Swiff ADPCM, Nellymoser, G.711, Speex — of a layout not exactly mono or stereo; PCM's and Swiff ADPCM's 8 and 16 kHz, G.711's every rate but 8 kHz | its code the host's own order, read back little-endian; the multichannel header names the codec's fourcc, which it has none of, and `av_assert0` ends the process; written as the 5.5 kHz code, and G.711 read back at 8 kHz, with no metadata read before the stream exists (`flvenc.c` 140–240, 910–913, 497–540; `flvdec.c` 314–360, 1657–1670) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`] — L105 |
 //! | WAV, Wave64, AVI, ASF | a configured AAC track's ADTS packet; at open, an audio configuration past the WAVEFORMATEX's 16-bit `cbSize` | written as it comes into a stream whose format declares raw AAC; written, its size cut (`riffenc.c` 193–223) | [`PayloadRule::AdtsHeader`], [`MuxOpenError::ConfigurationInvalid`] — L87, L88 |
 //! | ASF | a decode time past its 32-bit presentation time, the preroll added; a presentation time past what its index counts in an `int` of seconds; a play duration past `i64` in 100 ns; an empty packet | written cut; refused after taking it; a signed overflow; no payload written (`asfenc.c` 886–1038) | [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::Empty`] — L86 |
@@ -2558,7 +2558,9 @@ pub enum PayloadRule {
   PartialSample,
   /// AV1 whose OBUs do not parse: MP4 writes a sample of a negative size,
   /// and Matroska refuses the packet after taking it (`av1.c` 33–81, over
-  /// libavcodec's `parse_obu_header`, `av1_parse.h` 92–134).
+  /// libavcodec's `parse_obu_header`, `av1_parse.h` 92–134); FLV's
+  /// `extract_extradata` refuses it (`ff_av1_packet_split`, `av1_parse.c`
+  /// 56–97; R9: ruling 4c).
   #[error("the packet's OBUs do not parse")]
   Obus,
   /// Matroska WavPack whose blocks do not parse whole: Matroska refuses
@@ -2630,7 +2632,12 @@ pub enum PayloadRule {
   /// extradata, its writer's at the trailer (7044–7074); MP4 H.264, HEVC,
   /// VVC or LCEVC new extradata of the other form than the track's — Annex
   /// B or not — which turns the length-prefix rewrite on or off for the
-  /// packets after it (7087–7158); Matroska AAC's not an AudioSpecificConfig
+  /// packets after it (7087–7158); MP4 and FLV AV1's one
+  /// `ff_isom_write_av1c` fails on, which both writers ignore, the `av1C`
+  /// or the sequence header left empty (`movenc.c` 1573–1582; `flvenc.c`
+  /// 892–893, 1250–1263) — FLV's the caller's, or the one
+  /// `extract_extradata` makes of the unit's sequence headers, which
+  /// replaces it (R9: ruling 4c); Matroska AAC's not an AudioSpecificConfig
   /// libavcodec parses, or larger than the space Matroska's header reserved
   /// for the track's configuration (`mkv_check_new_extra_data`,
   /// `matroskaenc.c` 3065–3082; `mkv_update_codecprivate`, 1334–1365) —
@@ -2925,7 +2932,10 @@ pub enum MuxOpenError {
   /// 877–910), MP4 TTML's from libavcodec's TTML encoder whose header
   /// strings are not two terminated strings
   /// (`ttml_set_header_values_from_extradata`, `ttmlenc.c` 82–122, which
-  /// the trailer's joined document is written by). Of table H: one ADTS
+  /// the trailer's joined document is written by), and MP4 AV1's one
+  /// `ff_isom_write_av1c` fails on, the `av1C` left empty (`av1.c`
+  /// 399–502; R9: ruling 4c). Of table H: FLV AV1's that function fails on,
+  /// its sequence header left empty (`flvenc.c` 892–893); one ADTS
   /// cannot write in its headers, FLAC's opening with its `fLaC` marker,
   /// AVI's raw video of no tag of another pixel format than its bits name,
   /// and one past the 16-bit size its header counts it in — the `cbSize`
@@ -3922,7 +3932,17 @@ impl FlvTag {
         || (codec == CodecId::H264 && multitrack),
       rewritten: flv_rewrites(codec, extradata),
       codec,
-      extracts: extracts && [CodecId::H264, CodecId::HEVC, CodecId::VVC].contains(&codec),
+      // The codecs `flv_check_bitstream` inserts it for (`flvenc.c`
+      // 1495–1501).
+      extracts: extracts
+        && [
+          CodecId::H264,
+          CodecId::HEVC,
+          CodecId::VVC,
+          CodecId::AV1,
+          CodecId::MPEG4,
+        ]
+        .contains(&codec),
     }
   }
 }
@@ -4158,6 +4178,9 @@ enum ExtradataRule {
   /// MP4 H.264, HEVC, VVC or LCEVC: of the track's form — Annex B, which
   /// the packets after it are rewritten from, or not.
   Form { codec: CodecId, annex_b: bool },
+  /// MP4 and FLV AV1: one `ff_isom_write_av1c` writes ([`av1c_written`];
+  /// R9: ruling 4c).
+  Av1c,
   /// Matroska AAC: an AudioSpecificConfig libavcodec parses, within the
   /// space Matroska's header reserved — and none at all where the header
   /// reserved no output sampling frequency, which every new configuration
@@ -4393,6 +4416,8 @@ impl PacketRules {
           codec: id,
           annex_b: length_prefixed(family, id, codec.extradata()),
         }
+      } else if (mp4 || flv) && id == CodecId::AV1 {
+        ExtradataRule::Av1c
       } else if matroska && id == CodecId::AAC {
         // `mkv_assemble_native_codecprivate` reserves `MAX_PCE_SIZE` for a
         // track with no configuration, and the configuration's own length
@@ -4558,13 +4583,37 @@ fn obus_parse(bytes: &[u8]) -> bool {
 }
 
 /// The length of the OBU `buf` starts with — its header and its payload —
-/// as libavcodec's `parse_obu_header` reads it (`av1_parse.h` 92–134 in
-/// FFmpeg 9.0.1), or `None` where it refuses one: the forbidden bit set, a
-/// header running past the ten bytes it reads or past the packet, or a
-/// payload running past the packet. A header is a byte, an extension byte
-/// where flagged, and a LEB128 size of up to eight bytes where flagged
-/// (`leb.h` 57–68); without one the OBU runs to the packet's end.
+/// as libavcodec's `parse_obu_header` reads it ([`obu_header`]).
 fn obu_len(buf: &[u8]) -> Option<usize> {
+  obu_header(buf).map(|obu| obu.len)
+}
+
+/// An OBU's header as libavcodec's `parse_obu_header` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObuHeader {
+  /// `obu_type`.
+  kind: u8,
+  /// The header's bytes, where the payload starts (`start_pos`).
+  start: usize,
+  /// The header's and the payload's bytes.
+  len: usize,
+}
+
+/// `AV1_OBU_SEQUENCE_HEADER`, `AV1_OBU_METADATA`, and the tile group, the
+/// frame and the tile list, of no trailing bits (`libavcodec/av1.h` 30–39
+/// in FFmpeg 9.0.1).
+const AV1_OBU_SEQUENCE_HEADER: u8 = 1;
+const AV1_OBU_METADATA: u8 = 5;
+const AV1_OBU_UNTRAILED: [u8; 3] = [4, 6, 8];
+
+/// The header of the OBU `buf` starts with, as libavcodec's
+/// `parse_obu_header` reads it (`av1_parse.h` 92–134 in FFmpeg 9.0.1), or
+/// `None` where it refuses one: the forbidden bit set, a header running
+/// past the ten bytes it reads or past the packet, or a payload running
+/// past the packet. A header is a byte, an extension byte where flagged,
+/// and a LEB128 size of up to eight bytes where flagged (`leb.h` 57–68);
+/// without one the OBU runs to the packet's end.
+fn obu_header(buf: &[u8]) -> Option<ObuHeader> {
   let window = &buf[..buf.len().min(10)];
   let first = *window.first()?;
   if first & 0x80 != 0 {
@@ -4596,7 +4645,231 @@ fn obu_len(buf: &[u8]) -> Option<usize> {
   if len > buf.len() as u64 {
     return None;
   }
-  usize::try_from(len).ok()
+  Some(ObuHeader {
+    kind: (first >> 3) & 0x0F,
+    start: header,
+    len: usize::try_from(len).ok()?,
+  })
+}
+
+/// The bits of the payload `payload` of an OBU of type `kind` libavcodec's
+/// parsers read (`get_obu_bit_length`, `av1_parse.h` 136–166 in FFmpeg
+/// 9.0.1): a tile group's, a tile list's and a frame's every bit; another
+/// type's less its trailing zero bytes, then its last one bit and the zeros
+/// after it, none where it is all zeros. `None` where it answers `ERANGE`,
+/// past `INT_MAX / 8` bytes.
+fn av1_obu_bits(payload: &[u8], kind: u8) -> Option<usize> {
+  const LIMIT: usize = i32::MAX as usize / 8;
+  if AV1_OBU_UNTRAILED.contains(&kind) {
+    return (payload.len() <= LIMIT).then_some(payload.len() * 8);
+  }
+  let Some(last) = payload.iter().rposition(|&byte| byte != 0) else {
+    return Some(0);
+  };
+  let size = last + 1;
+  if size > LIMIT {
+    return None;
+  }
+  Some(size * 8 - (payload[last].trailing_zeros() as usize + 1))
+}
+
+/// Whether `ff_isom_write_av1c` writes `config` without failing (`av1.c`
+/// 399–502 in FFmpeg 9.0.1): MP4's `av1C` writer and FLV's sequence header
+/// ignore its failure, the box or the header left empty (`movenc.c`
+/// 1573–1582; `flvenc.c` 892–893), and Matroska's header refuses the track
+/// (`matroskaenc.c` 1160–1166) — R9: ruling 4c. Its conditions: an
+/// `AV1CodecConfigurationRecord`, its marker bit set, of version 1 and at
+/// least four bytes, written as it is; else a run of OBUs whose headers
+/// parse ([`obu_header`]), holding one sequence header, of a payload
+/// `parse_sequence_header` reads to its last bit
+/// ([`av1_sequence_header_parses`]), and no metadata OBU of an empty
+/// payload.
+fn av1c_written(config: &[u8]) -> bool {
+  let Some(&first) = config.first() else {
+    return false;
+  };
+  if first & 0x80 != 0 {
+    return first & 0x7F == 1 && config.len() >= 4;
+  }
+  let mut sequences = 0;
+  let mut rest = config;
+  while !rest.is_empty() {
+    let Some(obu) = obu_header(rest) else {
+      return false;
+    };
+    let payload = &rest[obu.start..obu.len];
+    match obu.kind {
+      AV1_OBU_SEQUENCE_HEADER => {
+        sequences += 1;
+        if payload.is_empty() || sequences > 1 || !av1_sequence_header_parses(payload) {
+          return false;
+        }
+      }
+      AV1_OBU_METADATA if payload.is_empty() => return false,
+      _ => {}
+    }
+    rest = &rest[obu.len..];
+  }
+  sequences == 1
+}
+
+/// Whether libavformat's `parse_sequence_header` reads the sequence header
+/// OBU payload `payload` to exactly its last bit (`av1.c` 206–343, with
+/// `uvlc` 125–138 and `parse_color_config` 140–203, in FFmpeg 9.0.1): its
+/// bits counted as `get_obu_bit_length` counts them ([`av1_obu_bits`]),
+/// within what `init_get_bits` takes, and read as it reads them — a read
+/// past the last one running on, as the checked reader's does, so that
+/// the count of bits left is no longer zero, which it refuses.
+fn av1_sequence_header_parses(payload: &[u8]) -> bool {
+  let Some(end) = av1_obu_bits(payload, AV1_OBU_SEQUENCE_HEADER) else {
+    return false;
+  };
+  // `init_get_bits` refuses `INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE * 8`
+  // bits and more (`get_bits.h` 517–526).
+  if end >= i32::MAX as usize - 64 * 8 {
+    return false;
+  }
+  let mut bits = Bits {
+    bytes: payload,
+    at: 0,
+  };
+  let profile = bits.read(3);
+  bits.skip(1); // still_picture
+  let reduced = bits.read(1) == 1;
+  if reduced {
+    bits.skip(5); // seq_level_idx[0]
+  } else {
+    let mut decoder_model = false;
+    let mut delay_bits = 0;
+    if bits.read(1) == 1 {
+      // timing_info: num_units_in_display_tick, time_scale.
+      bits.skip(64);
+      if bits.read(1) == 1 {
+        // num_ticks_per_picture_minus_1, `uvlc`: its leading zeros, read
+        // while a bit is left, at most 32, then its one bit and as many
+        // bits as zeros — none past 31.
+        let mut zeros = 0;
+        while zeros < 32 {
+          if bits.at >= end || bits.read(1) == 1 {
+            break;
+          }
+          zeros += 1;
+        }
+        if zeros < 32 {
+          bits.skip(zeros);
+        }
+      }
+      decoder_model = bits.read(1) == 1;
+      if decoder_model {
+        delay_bits = bits.read(5) as usize + 1;
+        // num_units_in_decoding_tick; buffer_removal_time_length_minus_1,
+        // frame_presentation_time_length_minus_1.
+        bits.skip(32 + 10);
+      }
+    }
+    let display_delay = bits.read(1) == 1;
+    let points = bits.read(5) + 1;
+    for _ in 0..points {
+      bits.skip(12); // operating_point_idc
+      if bits.read(5) > 7 {
+        bits.skip(1); // seq_tier
+      }
+      if decoder_model && bits.read(1) == 1 {
+        // decoder_buffer_delay, encoder_buffer_delay, low_delay_mode_flag.
+        bits.skip(2 * delay_bits + 1);
+      }
+      if display_delay && bits.read(1) == 1 {
+        bits.skip(4); // initial_display_delay_minus_1
+      }
+    }
+  }
+  let width = bits.read(4) as usize + 1;
+  let height = bits.read(4) as usize + 1;
+  bits.skip(width + height);
+  if !reduced && bits.read(1) == 1 {
+    // delta_frame_id_length_minus_2, additional_frame_id_length_minus_1.
+    bits.skip(7);
+  }
+  // use_128x128_superblock, enable_filter_intra, enable_intra_edge_filter.
+  bits.skip(3);
+  if !reduced {
+    // enable_interintra_compound, enable_masked_compound,
+    // enable_warped_motion, enable_dual_filter.
+    bits.skip(4);
+    let order_hint = bits.read(1) == 1;
+    if order_hint {
+      bits.skip(2); // enable_jnt_comp, enable_ref_frame_mvs
+    }
+    let screen_content = if bits.read(1) == 1 { 2 } else { bits.read(1) };
+    if screen_content != 0 && bits.read(1) == 0 {
+      bits.skip(1); // seq_force_integer_mv
+    }
+    if order_hint {
+      bits.skip(3); // order_hint_bits_minus_1
+    }
+  }
+  // enable_superres, enable_cdef, enable_restoration.
+  bits.skip(3);
+  // `parse_color_config`: profiles 0, 1 and 2 are Main, High and
+  // Professional; BT.709 primaries, sRGB transfer and the identity matrix
+  // read no colour range.
+  let high_bitdepth = bits.read(1) == 1;
+  let twelve_bit = profile == 2 && high_bitdepth && bits.read(1) == 1;
+  let monochrome = profile != 1 && bits.read(1) == 1;
+  let (primaries, transfer, matrix) = if bits.read(1) == 1 {
+    (bits.read(8), bits.read(8), bits.read(8))
+  } else {
+    (2, 2, 2)
+  };
+  if monochrome {
+    bits.skip(1); // color_range, and no separate_uv_delta_q
+  } else {
+    if !(primaries == 1 && transfer == 13 && matrix == 0) {
+      bits.skip(1); // color_range
+      let (x, y) = match profile {
+        0 => (true, true),
+        1 => (false, false),
+        _ if twelve_bit => {
+          let x = bits.read(1) == 1;
+          (x, x && bits.read(1) == 1)
+        }
+        _ => (true, false),
+      };
+      if x && y {
+        bits.skip(2); // chroma_sample_position
+      }
+    }
+    bits.skip(1); // separate_uv_delta_q
+  }
+  bits.skip(1); // film_grain_params_present
+  bits.at == end
+}
+
+/// The sequence headers of the AV1 temporal unit `bytes` FLV's
+/// `extract_extradata` makes a configuration of, whole and in their order,
+/// or `None` where it holds none (`extract_extradata_av1`,
+/// `extract_extradata.c` 96–164, over `ff_av1_packet_split`,
+/// `av1_parse.c` 56–97, in FFmpeg 9.0.1): a sequence header of no
+/// bits split off unread, as is every OBU of none but a temporal delimiter
+/// or padding. The global metadata
+/// it adds too — HDR content light level, mastering display colour volume
+/// (81–93) — never fails `ff_isom_write_av1c`, as an OBU of no bits is
+/// never added and one of bits has a payload, so that what
+/// [`av1c_written`] answers of the configuration it answers of these. The
+/// unit's OBUs parse ([`obus_parse`]), or the filter refuses it.
+fn av1_extracted_sequences(bytes: &[u8]) -> Option<Vec<u8>> {
+  let mut sequences = Vec::new();
+  let mut rest = bytes;
+  while let Some(obu) = obu_header(rest) {
+    let raw = &rest[..obu.len];
+    if obu.kind == AV1_OBU_SEQUENCE_HEADER
+      && av1_obu_bits(&raw[obu.start..], obu.kind).is_some_and(|bits| bits > 0)
+    {
+      sequences.extend_from_slice(raw);
+    }
+    rest = &rest[obu.len..];
+  }
+  (!sequences.is_empty()).then_some(sequences)
 }
 
 /// Whether `bytes` is a run of WavPack blocks Matroska's reformatter
@@ -8260,18 +8533,37 @@ fn check_packet_rules(
   {
     return refused(PayloadRule::InBandConfiguration);
   }
+  // FLV AV1 under `extract_extradata`: a unit whose OBUs do not parse the
+  // filter refuses (`ff_av1_packet_split`, `av1_parse.c` 56–97), and the
+  // configuration it makes of the unit's sequence headers, which replaces
+  // the packet's own, FLV writes through `ff_isom_write_av1c`, ignoring
+  // its failure (`flvenc.c` 892–893, 1250–1263; R9: ruling 4c).
+  if let Some(tag) = rules.flv_tag
+    && tag.extracts
+    && tag.codec == CodecId::AV1
+  {
+    if !obus_parse(payload.bytes) {
+      return refused(PayloadRule::Obus);
+    }
+    if av1_extracted_sequences(payload.bytes).is_some_and(|made| !av1c_written(&made)) {
+      return refused(PayloadRule::NewExtradata);
+    }
+  }
   // FLV: the tag's data in its 24 bits — the packet as FLV writes it, its
   // flags before it (`flvenc.c` 1229–1252, 1314–1330, 1346–1352) — rewritten
   // as the configuration as of the packet reads, its new extradata taken
-  // first (1250–1263).
+  // first (1250–1263): `extract_extradata`'s where it makes one, which
+  // replaces the packet's own (`av_packet_add_side_data`,
+  // `libavcodec/packet.c` 197–212), else the packet's.
   let flv_rewrites = rules.flv_tag.map(|tag| {
+    if tag.extracts && extracts_extradata(tag.codec, payload.bytes) {
+      return true;
+    }
     match side_data(
       payload.side_data,
       AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
     ) {
       Some(new) if !new.is_empty() => flv_rewrites(tag.codec, new),
-      // `extract_extradata`'s, added after the packet's own (`av_packet_add_side_data`).
-      _ if tag.extracts && extracts_extradata(tag.codec, payload.bytes) => true,
       _ => state.flv_rewrites,
     }
   });
@@ -8461,6 +8753,13 @@ fn check_packet_rules(
       ExtradataRule::Any => true,
       ExtradataRule::OpusHead => opus_head_written(new),
       ExtradataRule::Form { codec, annex_b } => length_prefixed(Family::Mp4, codec, new) == annex_b,
+      // FLV's, unless `extract_extradata` replaces it with its own.
+      ExtradataRule::Av1c => {
+        av1c_written(new)
+          || rules
+            .flv_tag
+            .is_some_and(|tag| tag.extracts && av1_extracted_sequences(payload.bytes).is_some())
+      }
       ExtradataRule::AudioSpecificConfig {
         reserved,
         output_reserved,
@@ -9285,6 +9584,12 @@ where
     Audited::Flv if codec == CodecId::PCM_S16BE => {
       Some(MuxOpenError::CodecNotCarried { track, codec })
     }
+    // FLV writes AV1's configuration through `ff_isom_write_av1c`, whose
+    // failure it ignores, the sequence header left empty (`flvenc.c`
+    // 892–893; R9: ruling 4c).
+    Audited::Flv if codec == CodecId::AV1 && !extradata.is_empty() && !av1c_written(extradata) => {
+      Some(MuxOpenError::ConfigurationInvalid { track, codec })
+    }
     Audited::Flv
       if description.kind() == TrackKind::Audio
         && flv_legacy_audio(codec)
@@ -10035,12 +10340,16 @@ fn first_packet_configures(family: Family, audited: Audited, codec: CodecId) -> 
 }
 
 /// Whether `family`'s writer refuses `codec`'s configuration `extradata`
-/// at its trailer ([`MuxOpenError::ConfigurationInvalid`]; table C of the
-/// census): MP4 FLAC's not one 34-byte STREAMINFO (`dfLa`, `movenc.c`
-/// 857–876), MP4 Opus's not an OpusHead `dOps` takes ([`opus_head_written`]),
-/// MP4 TTML's from libavcodec's TTML encoder whose header strings do not
-/// parse ([`ttml_header_strings`]). A missing configuration is
-/// [`configuration_missing`]'s.
+/// at its trailer, or writes empty ([`MuxOpenError::ConfigurationInvalid`];
+/// table C of the census): MP4 FLAC's not one 34-byte STREAMINFO (`dfLa`,
+/// `movenc.c` 857–876), MP4 Opus's not an OpusHead `dOps` takes
+/// ([`opus_head_written`]), MP4 TTML's from libavcodec's TTML encoder whose
+/// header strings do not parse ([`ttml_header_strings`]); MP4 AV1's
+/// `ff_isom_write_av1c` fails on, the `av1C` left empty
+/// (`mov_write_av1c_tag`, 1573–1582; [`av1c_written`]; R9: ruling 4c) —
+/// Matroska's and WebM's header refusing it, libavformat's fault at open
+/// as its other private data's parsers' (`matroskaenc.c` 1160–1166). A
+/// missing configuration is [`configuration_missing`]'s.
 fn configuration_invalid(family: Family, codec: CodecId, extradata: &[u8]) -> bool {
   if family != Family::Mp4 || extradata.is_empty() {
     return false;
@@ -10048,6 +10357,7 @@ fn configuration_invalid(family: Family, codec: CodecId, extradata: &[u8]) -> bo
   match codec {
     c if c == CodecId::FLAC => extradata.len() != FLAC_STREAMINFO_BYTES,
     c if c == CodecId::OPUS => !opus_head_written(extradata),
+    c if c == CodecId::AV1 => !av1c_written(extradata),
     c if c == CodecId::TTML => extradata
       .strip_prefix(b"lavc-ttmlenc")
       .is_some_and(|strings| !ttml_header_strings(strings)),

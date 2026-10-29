@@ -308,7 +308,18 @@ crate moves only when it changes.
   configuration's packet among them, or an ADTS frame AAC's filter makes
   one of, the track reading back configured; a first packet bringing none
   refused (`PayloadRule::ConfigurationAbsent`, now these tracks' too), and
-  AAC's filter on such a track named at the packet that inserts it.
+  AAC's filter on such a track named at the packet that inserts it. AV1's
+  configuration `ff_isom_write_av1c` would fail on — an `av1C` record not
+  of version 1 or under four bytes; OBUs whose headers do not parse, of no
+  sequence header or two, of an empty metadata OBU, or of a sequence
+  header its parse does not read to the last bit — which MP4 and FLV write
+  as an empty box or sequence header, refused at open
+  (`ConfigurationInvalid`) and as a packet's new extradata
+  (`PayloadRule::NewExtradata`); in FLV of no configuration, the one
+  `extract_extradata` makes of a unit's sequence headers too, and a unit
+  whose OBUs do not parse, which the filter refuses (`PayloadRule::Obus`,
+  now FLV's too). The configuration `extract_extradata` makes replaces the
+  packet's own, and FLV's rewrite is decided by it.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
