@@ -58,8 +58,9 @@ Its versions are its own: they do not move with the rest of the family's.
   `nal_ref_idc` counts for nothing, as a discarded redundant slice's: a
   packet of such slices, or of discarded ones, alone is marked, no rule of
   a picture holding it (`KeptReason::Referenced`, `AwaitingReference`,
-  `AwaitingIntraSlice`, `IntraOnly`, `FrameNumGaps`, `ReorderUnfixed`), but
-  where a first field may wait at it, or an IDR unit keeps it.
+  `AwaitingIntraSlice`, `IntraOnly`, `FrameNumGaps`, `ReorderUnfixed`, and
+  before any sequence parameter set `MaybeField`), but where a first field
+  may wait at it, or an IDR unit keeps it.
 - The reference picture is awaited again at an IDR unit, which FFmpeg
   resets at whatever it makes of the slice, and after a packet not read
   whole that may hold one, or a start that may set the decoder's context

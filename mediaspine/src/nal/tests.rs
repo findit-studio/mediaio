@@ -1448,13 +1448,17 @@ fn an_hevc_record_is_detected_as_ffmpeg_detects_it() {
 
 #[test]
 fn an_h264_slice_is_read_for_its_field_wherever_an_sps_lets_fields_in() {
-  // Before any sequence parameter set, nothing.
+  // Before any sequence parameter set, nothing a picture may be made of: a
+  // slice whose header ends before its PPS id may be a field. One that
+  // names a PPS FFmpeg refuses — as every PPS before an SPS — makes no
+  // picture.
   let mut stream = h264(&[]);
   assert_eq!(stream.frames_only(), None);
   assert_eq!(
-    stream.read(&annex_b(&[b_slice()])),
+    stream.read(&annex_b(&[avc(0, 1, &[])])),
     kept(KeptReason::MaybeField)
   );
+  assert_eq!(stream.read(&annex_b(&[b_slice()])), Verdict::Disposable);
   // One of frames only, in-band: its packet kept, the next marked, whatever
   // picture parameter set its slices name.
   assert_eq!(
@@ -2633,6 +2637,41 @@ fn a_reference_slice_ffmpeg_refuses_in_its_header_counts_for_nothing() {
     read4(&mut fields, &[refused_reference]),
     kept(KeptReason::PendingField)
   );
+}
+
+#[test]
+fn a_packet_of_refused_slices_before_any_sps_holds_no_rule_of_a_picture() {
+  // Codex R4's packet: no extradata, then `00 00 01 61 f0`, a reference
+  // slice, not IDR, naming PPS 0, which no list holds before any SPS:
+  // FFmpeg refuses it in its header (`h264_slice.c` 1740–1746) and makes no
+  // picture of the packet. The walk proves it before the guard that keeps
+  // any picture before an SPS, whose field it cannot tell. Predicted, before
+  // this law: kept, `MaybeField`; planted, the old order of the guard and
+  // the walk, red.
+  let mut stream = NalStream::new(NalCodec::H264, &[]);
+  assert_eq!(stream.framing(), Some(Framing::AnnexB));
+  assert_eq!(stream.read(&[0, 0, 1, 0x61, 0xF0]), Verdict::Disposable);
+  // A slice FFmpeg may make a picture of stays `MaybeField`: one naming a
+  // PPS the list may hold — a PPS whose id the reading does not reach may
+  // be stored under any — and one whose header ends before its PPS id.
+  let mut may_hold = NalStream::new(NalCodec::H264, &[]);
+  assert_eq!(
+    may_hold.read(&[0, 0, 1, 0x68]),
+    kept(KeptReason::Companion(8))
+  );
+  assert_eq!(
+    may_hold.read(&[0, 0, 1, 0x01, 0xF0]),
+    kept(KeptReason::MaybeField)
+  );
+  assert_eq!(stream.read(&[0, 0, 1, 0x01]), kept(KeptReason::MaybeField));
+  // The guards: an IDR unit keeps its packet, and a seek leaves no field
+  // waiting to end again.
+  assert_eq!(
+    stream.read(&[0, 0, 1, 0x65, 0x88]),
+    kept(KeptReason::RandomAccess)
+  );
+  stream.seeked();
+  assert_eq!(stream.read(&[0, 0, 1, 0x61, 0xF0]), Verdict::Disposable);
 }
 
 #[test]

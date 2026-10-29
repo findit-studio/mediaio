@@ -75,7 +75,8 @@
 //! read for its field, and a packet is disposable only where it holds a
 //! frame, or both fields of a pair FFmpeg joins, and no field waits at it
 //! ([Fields](#fields)). Before a sequence parameter set has been read,
-//! nothing is ([`KeptReason::MaybeField`]).
+//! nothing is ([`KeptReason::MaybeField`]) but a packet FFmpeg makes no
+//! picture of, every slice of it refused in its header ([Fields](#fields)).
 //!
 //! Beside the slices, only access unit delimiters (9), filler data
 //! (12) and an SEI unit whose every message its own picture alone takes up
@@ -709,10 +710,12 @@ pub enum KeptReason {
   /// An H.264 picture of `nal_ref_idc` 0 that may be one field of a pair,
   /// which FFmpeg's decoder joins with its other field across packets,
   /// where the reading cannot tell: no sequence parameter set has been
-  /// read, or, where one lets a picture be a field (`frame_mbs_only_flag`
-  /// 0), a slice's header does not read as FFmpeg reads it — the picture
-  /// parameter set it names, or the sequence parameter set that one was
-  /// read with, not known for certain ([Fields](self#fields)).
+  /// read — but where FFmpeg refuses every slice of the packet in its
+  /// header, or discards it, and makes no picture — or, where one lets a
+  /// picture be a field (`frame_mbs_only_flag` 0), a slice's header does not
+  /// read as FFmpeg reads it — the picture parameter set it names, or the
+  /// sequence parameter set that one was read with, not known for certain
+  /// ([Fields](self#fields)).
   MaybeField,
   /// An H.264 field of `nal_ref_idc` 0 whose packet does not hold it
   /// together with its complementary field, as one pair FFmpeg's decoder
@@ -1596,8 +1599,9 @@ impl NalStream {
 impl NalStream {
   /// What keeps an H.264 `packet`, read in `framing` against what earlier
   /// packets taught, for its pictures' fields, if anything does:
-  /// [`KeptReason::MaybeField`] before any sequence parameter set, or where
-  /// a slice's header does not read as FFmpeg reads it;
+  /// [`KeptReason::MaybeField`] before any sequence parameter set, where a
+  /// slice may make a picture, or where a slice's header does not read as
+  /// FFmpeg reads it;
   /// [`KeptReason::UnpairedField`] where the packet holds a field FFmpeg
   /// does not join with its complementary field in the packet;
   /// [`KeptReason::PendingField`] where a first field may wait at the
@@ -1612,9 +1616,6 @@ impl NalStream {
   /// packet, one the walk does not follow among them, may set the context
   /// up again.
   fn fields_verdict(&self, packet: &[u8], framing: Framing) -> Slices {
-    if !self.sps_seen {
-      return Slices::Kept(KeptReason::MaybeField);
-    }
     // The packet's pictures as FFmpeg's decoder takes them where no field
     // waits and none has gone unmatched: a frame, or a pair it joins.
     let mut walk = Walk::new(Pairing::Settled, 0, self.context);
@@ -1641,6 +1642,12 @@ impl NalStream {
       } else {
         Slices::NoPicture
       };
+    }
+    // Before any sequence parameter set, whether a picture is a field is
+    // not known: a packet FFmpeg makes no picture of, above, is the only one
+    // proven.
+    if !self.sps_seen {
+      return Slices::Kept(KeptReason::MaybeField);
     }
     if !self.fields_possible {
       return if walk.flushed {
