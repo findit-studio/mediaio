@@ -50,6 +50,35 @@ fn pps(pps_id: u32, sps_id: u32) -> Vec<u8> {
   unit
 }
 
+/// [`pps`], then the tail FFmpeg reads where bits are left and the SPS's
+/// profile lets it (`h264_ps.c` 794–810): `transform_8x8_mode_flag`, no
+/// scaling matrix, a second chroma offset of 0.
+fn pps_tail(pps_id: u32, sps_id: u32, transform_8x8: bool) -> Vec<u8> {
+  let mut bits = Bits::new();
+  bits
+    .ue(pps_id)
+    .ue(sps_id)
+    .bit(0)
+    .bit(0)
+    .ue(0)
+    .ue(0)
+    .ue(0)
+    .bit(0)
+    .bits(0, 2)
+    .se(0)
+    .se(0)
+    .se(0)
+    .bit(1)
+    .bit(0)
+    .bit(0)
+    .bit(u32::from(transform_8x8))
+    .bit(0)
+    .se(0);
+  let mut unit = vec![0x68];
+  unit.extend_from_slice(&bits.finish());
+  unit
+}
+
 /// An H.264 slice — B of `nal_ref_idc` 0, P else — its header's first
 /// fields as FFmpeg reads them before it starts a picture:
 /// `first_mb_in_slice`, `slice_type`, `pic_parameter_set_id` and a four-bit
@@ -222,6 +251,13 @@ enum Vui {
   RestrictedAfterAll,
   /// A VUI without the restriction.
   Unrestricted,
+  /// The restriction, of a reorder depth of 1, after an extended sample
+  /// aspect ratio of these two, and a colour description of this matrix
+  /// where it is given.
+  Described {
+    sar: (u32, u32),
+    matrix: Option<u32>,
+  },
 }
 
 impl Sps {
@@ -339,6 +375,35 @@ impl Sps {
       }
       Vui::Unrestricted => {
         bits.bit(1).bits(0, 8).bit(0);
+      }
+      Vui::Described { sar, matrix } => {
+        // An extended SAR, no overscan, the signal type and its colour
+        // description where a matrix is given, no chroma sites, timing, HRD
+        // or `pic_struct`; then the restriction.
+        bits
+          .bit(1)
+          .bit(1)
+          .bits(255, 8)
+          .bits(sar.0, 16)
+          .bits(sar.1, 16);
+        bits.bit(0);
+        match matrix {
+          Some(matrix) => {
+            bits
+              .bit(1)
+              .bits(5, 3)
+              .bit(0)
+              .bit(1)
+              .bits(1, 8)
+              .bits(1, 8)
+              .bits(matrix, 8);
+          }
+          None => {
+            bits.bit(0);
+          }
+        }
+        bits.bit(0).bit(0).bit(0).bit(0).bit(0);
+        restriction(&mut bits, 1);
       }
     }
     let mut unit = vec![0x67];
@@ -1319,11 +1384,22 @@ fn an_h264_slice_is_read_for_its_field_wherever_an_sps_lets_fields_in() {
   // picture (`h264_slice.c` 1740–1746): nothing of the pairing moves.
   assert_eq!(stream.read(&annex_b(&[b_slice()])), Verdict::Disposable);
   // A later one of frames only does not make every slice a frame again, but
-  // the slices of a picture parameter set read on it are frames.
+  // the slices of a picture parameter set read on it are frames. Its size
+  // another, FFmpeg sets its context up again at its first picture
+  // (`h264_slice.c` 1066–1092, 1136–1165), a flush: that picture awaits a
+  // reference picture, as after a seek.
   let _ = stream.read(&annex_b(&[avc_sps(), pps(0, 0)]));
   assert_eq!(stream.frames_only(), Some(false));
   assert_eq!(
     stream.read(&annex_b(&[slice_of(0, 0, 0, 1, None)])),
+    kept(KeptReason::AwaitingReference)
+  );
+  assert_eq!(
+    stream.read(&annex_b(&[slice_of(2, 0, 0, 1, None)])),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    stream.read(&annex_b(&[slice_of(0, 0, 0, 2, None)])),
     Verdict::Disposable
   );
   // A record's: an `avcC` of a PAFF/MBAFF-capable SPS, and reference and
@@ -2511,11 +2587,14 @@ fn a_reference_field_and_a_non_reference_one_are_never_joined() {
 #[test]
 fn each_slice_is_read_by_the_sps_its_pps_was_read_on() {
   // SPS 0 codes frames only, its `frame_num` of four bits; SPS 1 lets fields
-  // in, its `frame_num` of six. PPS 0 is read on SPS 0, PPS 1 on SPS 1.
+  // in, its `frame_num` of six, of the same size in frame macroblocks, so
+  // that FFmpeg passes from one to the other without setting its context up
+  // again (`h264_slice.c` 1066–1123). PPS 0 is read on SPS 0, PPS 1 on SPS 1.
   let wide = Sps {
     id: 1,
     frames_only: false,
     log2_max_frame_num_minus4: 2,
+    height_in_map_units_minus1: 33,
     ..Sps::HIGH
   };
   let mut stream = h264(&[]);
@@ -2585,8 +2664,103 @@ fn each_slice_is_read_by_the_sps_its_pps_was_read_on() {
     )])),
     kept(KeptReason::UnpairedField)
   );
-  // Two fields of one frame naming two picture parameter sets: FFmpeg may
-  // refuse the second (`h264_slice.c` 2150–2163).
+}
+
+/// A non-reference pair whose second field FFmpeg refuses: `between` read
+/// after the first field, in the packet. The first field waits on, so the
+/// next packet's pair, which would be marked were the pair joined, finds it
+/// unmatched (`h264_slice.c` 1583–1587) and is kept for it.
+fn parted_by(stream: &mut NalStream, between: &[Vec<u8>]) {
+  let mut packet = vec![field_slice(0, 1, false)];
+  packet.extend_from_slice(between);
+  packet.push(field_slice(0, 1, true));
+  assert!(!read4(stream, &packet).is_disposable());
+  assert!(
+    matches!(
+      stream.pairing,
+      Pairing::Waiting(Waiting {
+        bottom: false,
+        frame_num: 1,
+        reference: false,
+        ..
+      })
+    ),
+    "{:?}",
+    stream.pairing
+  );
+  assert_eq!(
+    read4(stream, &[field_slice(0, 1, false), field_slice(0, 1, true)]),
+    kept(KeptReason::PendingField)
+  );
+  assert_eq!(stream.pairing, Pairing::Settled);
+  assert!(stream.unmatched > 0);
+}
+
+#[test]
+fn a_picture_parameter_set_replaced_between_two_fields_parts_them() {
+  // A second field in the packet of its first is no first slice
+  // (`h264_slice.c` 2072, before the first field ends at 2111–2114), so
+  // FFmpeg holds its picture parameter set to the active one by what it
+  // compares (2150–2163), never by its id. PPS 0 read again between the
+  // fields, on the same SPS, `transform_8x8_mode` 1: "PPS changed between
+  // slices". Predicted, before this law: the pair joined, and the next
+  // pair marked; planted, the id compared again, red.
+  let mut stream = h264(&interlaced_avcc());
+  parted_by(&mut stream, &[pps_tail(0, 0, true)]);
+}
+
+#[test]
+fn a_picture_parameter_set_read_on_another_sps_between_two_fields_parts_them() {
+  // SPS 1, SPS 0 but its id; PPS 0 read again on it between the fields:
+  // another `sps_id` (2153). The planted id comparison: red.
+  let mut stream = h264(&interlaced_avcc());
+  let one = Sps {
+    id: 1,
+    frames_only: false,
+    ..Sps::HIGH
+  };
+  let _ = read4(&mut stream, &[one.unit()]);
+  parted_by(&mut stream, &[pps(0, 1)]);
+}
+
+#[test]
+fn an_sps_read_again_between_two_fields_parts_them_where_ffmpeg_makes_another_object() {
+  // SPS 0 again, its `nal_ref_idc` 2 — the same set, but FFmpeg's copy of
+  // its unit, `data`, another (`h264_ps.c` 297–306), so FFmpeg makes a new
+  // object (581–587) — and PPS 0 read on it, between the fields: "SPS
+  // changed in the middle of the frame" (`h264_slice.c` 2159–2163). Planted,
+  // the SPS told by its id: red.
+  let mut stream = h264(&interlaced_avcc());
+  let mut renamed = interlaced_sps();
+  renamed[0] = 0x47;
+  parted_by(&mut stream, &[renamed, pps(0, 0)]);
+}
+
+#[test]
+fn an_sps_and_a_pps_read_again_alike_between_two_fields_keep_the_pair() {
+  // The same SPS again, byte for byte: FFmpeg keeps its object (`h264_ps.c`
+  // 581–584), and PPS 0 read again on it compares alike, its other content
+  // aside. The pair joins, and the next one is marked. Planted, every SPS
+  // read again a new object: red.
+  let mut stream = h264(&interlaced_avcc());
+  let _ = read4(
+    &mut stream,
+    &[
+      field_slice(0, 1, false),
+      interlaced_sps(),
+      pps(0, 0),
+      field_slice(0, 1, true),
+    ],
+  );
+  assert_eq!(stream.pairing, Pairing::Settled);
+  assert_eq!(
+    read4(
+      &mut stream,
+      &[field_slice(0, 1, false), field_slice(0, 1, true)]
+    ),
+    Verdict::Disposable
+  );
+  // Two picture parameter sets alike in what FFmpeg compares join one pair.
   let mut two = h264(&interlaced_avcc());
   let _ = read4(&mut two, &[pps(1, 0)]);
   assert_eq!(
@@ -2597,8 +2771,199 @@ fn each_slice_is_read_by_the_sps_its_pps_was_read_on() {
         slice_of(0, 0, 1, 1, Some(Structure::Bottom))
       ]
     ),
-    kept(KeptReason::MaybeField)
+    Verdict::Disposable
   );
+  // And a slice of the picture naming the other: one picture still.
+  assert_eq!(
+    read4(
+      &mut two,
+      &[
+        field_slice(0, 1, false),
+        slice_of(0, 8, 1, 1, Some(Structure::Top)),
+        field_slice(0, 1, true)
+      ]
+    ),
+    Verdict::Disposable
+  );
+}
+
+#[test]
+fn ffmpeg_keeps_an_sps_object_only_for_the_same_copy_of_its_unit() {
+  let unit = interlaced_sps();
+  let canon = Canon::of(&unit);
+  assert!(matches!(canon, Canon::Known { .. }));
+  assert_eq!(canon.same(Canon::of(&unit)), Some(true));
+  // Another `nal_ref_idc`: another first byte of `data`.
+  let mut renamed = unit.clone();
+  renamed[0] = 0x47;
+  assert_eq!(canon.same(Canon::of(&renamed)), Some(false));
+  // Not told: a unit FFmpeg's splitter may end or read past at `00 00 00`,
+  // one whose RBSP ends in a zero byte, and one of more than 128 bytes —
+  // which is told apart from a shorter one.
+  assert_eq!(Canon::of(&[0x67, 0x64, 0, 0, 0, 0x80]), Canon::Unknown);
+  assert_eq!(Canon::of(&[0x67, 0x64, 0, 0, 3]), Canon::Unknown);
+  let long = [vec![0x67], vec![0x5A; 200]].concat();
+  assert_eq!(Canon::of(&long), Canon::Long);
+  assert_eq!(canon.same(Canon::Long), Some(false));
+  assert_eq!(Canon::Long.same(Canon::Long), None);
+  // FFmpeg's copy is of the RBSP: a `03` after two zero bytes dropped, the
+  // byte after it whatever it is (`h2645_parse.c` 101–118).
+  assert_eq!(
+    Canon::of(&[0x67, 0, 0, 3, 5, 0x80]).same(Canon::of(&[0x67, 0, 0, 5, 0x80])),
+    Some(true)
+  );
+  // In the list: the same unit again keeps the entry's object, another
+  // makes a fresh one, which a PPS read after it is read on.
+  let mut stream = h264(&interlaced_avcc());
+  let Slot::Holds(first) = stream.sets.sps[0] else {
+    panic!("SPS 0 held");
+  };
+  let _ = read4(&mut stream, &[unit.clone()]);
+  assert_eq!(stream.sets.sps[0], Slot::Holds(first));
+  let _ = read4(&mut stream, &[renamed]);
+  let Slot::Holds(second) = stream.sets.sps[0] else {
+    panic!("SPS 0 held");
+  };
+  assert_eq!(first.object.same(second.object), Some(false));
+  let Slot::Holds(pps_0) = stream.sets.pps[0] else {
+    panic!("PPS 0 held");
+  };
+  assert_eq!(pps_0.compared.sps, first.object);
+  let _ = read4(&mut stream, &[pps(0, 0)]);
+  let Slot::Holds(pps_0) = stream.sets.pps[0] else {
+    panic!("PPS 0 held");
+  };
+  assert_eq!(pps_0.compared.sps, second.object);
+}
+
+#[test]
+fn a_new_geometry_between_two_fields_sets_the_context_up_again() {
+  // A top field alone, then SPS 0 of another width, PPS 0 read on it, and
+  // the bottom field. At its first slice FFmpeg finds another size and sets
+  // its context up again (`h264_slice.c` 1066–1078, 1136–1165), flushing it:
+  // `first_field` 0 (`h264dec.c` 469, `h264_slice.c` 989). The bottom field
+  // is a first field, and waits; the top one is dropped, found unmatched by
+  // nothing. Predicted, before this law: the two joined, and the next pair
+  // marked; planted, no set-up again, red.
+  let mut stream = h264(&interlaced_avcc());
+  assert_eq!(
+    read4(&mut stream, &[field_slice(0, 1, false)]),
+    kept(KeptReason::UnpairedField)
+  );
+  let narrow = Sps {
+    frames_only: false,
+    width_in_mbs_minus1: 79,
+    ..Sps::HIGH
+  };
+  let _ = read4(
+    &mut stream,
+    &[narrow.unit(), pps(0, 0), field_slice(0, 1, true)],
+  );
+  assert!(
+    matches!(
+      stream.pairing,
+      Pairing::Waiting(Waiting { bottom: true, .. })
+    ),
+    "{:?}",
+    stream.pairing
+  );
+  assert_eq!(stream.unmatched, 0);
+  // What a flush unsets is awaited again.
+  assert!(!stream.pending.reference_seen);
+  // The next pair's top field joins the waiting bottom one (1604–1606), and
+  // its bottom field is refused (2124–2125): FFmpeg's state, which the
+  // packet moves.
+  assert_eq!(
+    read4(
+      &mut stream,
+      &[field_slice(0, 1, false), field_slice(0, 1, true)]
+    ),
+    kept(KeptReason::PendingField)
+  );
+  assert_eq!(stream.pairing, Pairing::Settled);
+  // A picture at which the context may be set up again is the first after a
+  // flush: of the same size it is not.
+  assert_eq!(
+    read4(&mut stream, &[frame_slice(2, 2)]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read4(&mut stream, &[frame_slice(0, 3)]),
+    Verdict::Disposable
+  );
+  let _ = read4(
+    &mut stream,
+    &[
+      Sps {
+        frames_only: false,
+        ..Sps::HIGH
+      }
+      .unit(),
+      pps(0, 0),
+    ],
+  );
+  assert_eq!(
+    read4(&mut stream, &[frame_slice(0, 3)]),
+    kept(KeptReason::AwaitingReference)
+  );
+}
+
+#[test]
+fn a_sample_aspect_ratio_or_a_colour_matrix_ffmpeg_finds_changed_sets_the_context_up_again() {
+  let described = |sar, matrix| {
+    Sps {
+      frames_only: false,
+      vui: Vui::Described { sar, matrix },
+      ..Sps::HIGH
+    }
+    .unit()
+  };
+  // From one SPS to another of the same size, ratio and matrix FFmpeg sets
+  // nothing up again: the same object or not, it compares what they hold.
+  let mut stream = h264(&avcc_of(3, &described((4, 3), Some(1))));
+  assert_eq!(
+    read4(&mut stream, &[frame_slice(0, 1)]),
+    Verdict::Disposable
+  );
+  let _ = read4(&mut stream, &[described((8, 6), Some(1)), pps(0, 0)]);
+  assert_eq!(
+    read4(&mut stream, &[frame_slice(0, 1)]),
+    Verdict::Disposable
+  );
+  // Another ratio (1094), or another matrix (1117–1123): set up again.
+  let _ = read4(&mut stream, &[described((16, 11), Some(1)), pps(0, 0)]);
+  assert_eq!(
+    read4(&mut stream, &[frame_slice(0, 1)]),
+    kept(KeptReason::AwaitingReference)
+  );
+  let _ = read4(&mut stream, &[frame_slice(2, 1)]);
+  let _ = read4(&mut stream, &[described((16, 11), Some(6)), pps(0, 0)]);
+  assert_eq!(
+    read4(&mut stream, &[frame_slice(0, 2)]),
+    kept(KeptReason::AwaitingReference)
+  );
+  // A ratio `av_image_check_sar` refuses at the picture's size, which
+  // `ff_set_sar` replaces with 0:1 (`utils.c` 106–119): FFmpeg finds the two
+  // apart at every first slice, and the reading may never say it does not.
+  assert_eq!(
+    sar_holds((65_535, 1), (1_073, 1_073), (1_920, 1_088)),
+    Some(false)
+  );
+  assert_eq!(
+    sar_holds((4, 3), (1_073, 1_073), (1_920, 1_088)),
+    Some(true)
+  );
+  assert_eq!(sar_holds((0, 1), (1, 1), (16, 16)), Some(true));
+  assert_eq!(sar_holds((1, 20), (1, 1), (32, 32)), None);
+  let mut refused = h264(&avcc_of(3, &described((65_535, 1), None)));
+  let _ = read4(&mut refused, &[frame_slice(2, 1)]);
+  for frame_num in 2..4 {
+    let _ = read4(&mut refused, &[frame_slice(2, frame_num)]);
+    assert_eq!(
+      read4(&mut refused, &[frame_slice(0, frame_num + 1)]),
+      kept(KeptReason::AwaitingReference)
+    );
+  }
 }
 
 #[test]
@@ -2769,7 +3134,17 @@ fn a_picture_parameter_set_is_read_as_ffmpeg_reads_it() {
       .header
       .expect("a header")
   };
-  sets.sps[0] = Slot::Holds(header(&interlaced_sps()));
+  let object = Object::Known {
+    sps_id: 0,
+    number: 1,
+    fresh: true,
+  };
+  let entry = |sps: &[u8]| SpsEntry {
+    header: header(sps),
+    object,
+    canon: Canon::of(sps),
+  };
+  sets.sps[0] = Slot::Holds(entry(&interlaced_sps()));
   let read = |bits: &mut Bits, sets: &ParameterSets| {
     let unit = bits.finish();
     pps_read(&unit, Reading::Rbsp, &sets.sps)
@@ -2806,7 +3181,12 @@ fn a_picture_parameter_set_is_read_as_ffmpeg_reads_it() {
       255,
       PpsHeader {
         sps: header(&interlaced_sps()),
-        redundant: false
+        redundant: false,
+        compared: Compared {
+          sps_id: Some(0),
+          transform_8x8: Some(false),
+          sps: object,
+        },
       }
     )
   );
@@ -2828,7 +3208,7 @@ fn a_picture_parameter_set_is_read_as_ffmpeg_reads_it() {
   }
   .unit();
   let mut deep = ParameterSets::EMPTY;
-  deep.sps[0] = Slot::Holds(header(&eleven));
+  deep.sps[0] = Slot::Holds(entry(&eleven));
   assert_eq!(read(&mut base(0, 0, 0, 0, 0), &deep), PpsRead::Refused);
   // The tail: `transform_8x8_mode_flag`, a scaling matrix of one list
   // written, and a second offset; a delta of 128, and an offset of 13.
@@ -2846,7 +3226,16 @@ fn a_picture_parameter_set_is_read_as_ffmpeg_reads_it() {
   };
   assert!(matches!(
     read(&mut tail(3, 2), &sets),
-    PpsRead::Stored(0, _)
+    PpsRead::Stored(
+      0,
+      PpsHeader {
+        compared: Compared {
+          transform_8x8: Some(true),
+          ..
+        },
+        ..
+      }
+    )
   ));
   assert_eq!(read(&mut tail(128, 2), &sets), PpsRead::Refused);
   assert_eq!(read(&mut tail(3, 13), &sets), PpsRead::Refused);
@@ -2857,11 +3246,20 @@ fn a_picture_parameter_set_is_read_as_ffmpeg_reads_it() {
     unit[2] = 0xC0;
     unit
   };
-  baseline.sps[0] = Slot::Holds(header(&constrained_sps));
+  baseline.sps[0] = Slot::Holds(entry(&constrained_sps));
   assert!(!header(&constrained_sps).pps_tail);
   assert!(matches!(
     read(&mut tail(128, 13), &baseline),
-    PpsRead::Stored(0, _)
+    PpsRead::Stored(
+      0,
+      PpsHeader {
+        compared: Compared {
+          transform_8x8: Some(false),
+          ..
+        },
+        ..
+      }
+    )
   ));
   // Cut short, it is undecided; unread to its id, the more so.
   let mut short = base(0, 0, 0, 0, 0).finish();

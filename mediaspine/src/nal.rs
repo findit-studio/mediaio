@@ -638,9 +638,11 @@ pub enum KeptReason {
   /// can cost a later picture its output (`h264_slice.c` 1305–1333).
   ReorderUnfixed,
   /// An H.264 picture before the first reference picture since the decoder
-  /// opened or was sought: FFmpeg's decoder takes its picture order count
-  /// up from the first picture it decodes after a flush (`h264_parse.c`
-  /// 293–294; `h264dec.c` 421, 438–467).
+  /// opened or was sought, or — where a picture may be a field — since a
+  /// picture at which it may have set its context up again, which flushes it
+  /// too (`h264_slice.c` 1136–1165): FFmpeg's decoder takes its picture
+  /// order count up from the first picture it decodes after a flush
+  /// (`h264_parse.c` 293–294; `h264dec.c` 421, 438–474).
   AwaitingReference,
   /// An H.264 picture holding an intra slice before any packet kept since
   /// the decoder opened or was sought has held one: FFmpeg's first intra
@@ -782,6 +784,9 @@ pub struct NalStream {
   /// For H.264: the first field FFmpeg's decoder may hold waiting for its
   /// pair ([Fields](self#fields)).
   pairing: Pairing,
+  /// For H.264: the decoder's context, as `h264_init_ps` holds the next
+  /// picture's sequence parameter set against it ([`Context`]).
+  context: Context,
   /// For H.264: how many fields may have gone unmatched in a decoder, each
   /// raising its `missing_fields` ([`KeptReason::UnmatchedFields`]): 0, at
   /// most 1, or more. It never falls.
@@ -818,6 +823,7 @@ impl NalStream {
       sets: ParameterSets::EMPTY,
       sets_moved: false,
       pairing: Pairing::Settled,
+      context: Context::Fresh,
       unmatched: 0,
       pending: Pending::OPENING,
       opened_carried: false,
@@ -884,11 +890,12 @@ impl NalStream {
     if (self.lengths, self.length_size) != self.opened {
       self.lost = true;
     }
-    // H.264's flush, and its opening, hold no first field (`h264dec.c` 469).
-    // A flushed decoder keeps its parameter-set lists, and one opened
-    // afresh holds the opening record's alone: where the two may differ,
-    // the reading knows neither.
+    // H.264's flush, and its opening, hold no first field (`h264dec.c` 469),
+    // nor a context set up (495). A flushed decoder keeps its parameter-set
+    // lists, and one opened afresh holds the opening record's alone: where
+    // the two may differ, the reading knows neither.
     self.pairing = Pairing::Settled;
+    self.context = Context::Fresh;
     if self.sets_moved {
       self.sets.forget();
     }
@@ -1460,10 +1467,12 @@ impl NalStream {
   /// does not join with its complementary field in the packet;
   /// [`KeptReason::PendingField`] where a first field may wait at the
   /// packet; [`KeptReason::UnmatchedFields`] for a pair after a field may
-  /// have gone unmatched. While every sequence parameter set the decoder
-  /// may read codes frames only, every picture is a frame and no field ever
-  /// waits. A packet holding a parameter set is kept for it, so the lists
-  /// its slices are read by here are the ones before it.
+  /// have gone unmatched; [`KeptReason::AwaitingReference`] where the
+  /// decoder may set its context up again at the packet's picture, which
+  /// flushes it. While every sequence parameter set the decoder may read
+  /// codes frames only, every picture is a frame and no field ever waits.
+  /// A packet holding a parameter set is kept for it, so the lists its
+  /// slices are read by here are the ones before it.
   fn fields_verdict(&self, packet: &[u8], framing: Framing) -> Option<KeptReason> {
     if !self.sps_seen {
       return Some(KeptReason::MaybeField);
@@ -1473,7 +1482,7 @@ impl NalStream {
     }
     // The packet's pictures as FFmpeg's decoder takes them where no field
     // waits and none has gone unmatched: a frame, or a pair it joins.
-    let mut walk = Walk::new(Pairing::Settled, 0);
+    let mut walk = Walk::new(Pairing::Settled, 0, self.context);
     let mut units = Units::new(packet, framing);
     while let Unit::Nal(nal) = units.next() {
       if nal
@@ -1504,23 +1513,29 @@ impl NalStream {
       Some(KeptReason::PendingField)
     } else if pair && self.unmatched > 0 {
       Some(KeptReason::UnmatchedFields)
+    } else if walk.flushed {
+      // The picture after a flush takes up what the flush left unset (the
+      // decoder's opening and its flush, `h264dec.c` 421, 438–474).
+      Some(KeptReason::AwaitingReference)
     } else {
       None
     }
   }
 
-  /// Moves FFmpeg's lists and its field pairing through an H.264 `packet`
-  /// the reading read whole in `framing`, unit by unit as the decoder takes
-  /// them (`decode_nal_units`, `h264dec.c` 583–787): each parameter set
-  /// into its list, and each slice read by the lists as they stand at it.
-  /// Where a field may be possible, the census's reference picture and
-  /// intra slice are the ones FFmpeg decodes, after `before`, what was seen
-  /// before the packet; an intra slice counts in a packet `kept` alone.
+  /// Moves FFmpeg's lists, its context and its field pairing through an
+  /// H.264 `packet` the reading read whole in `framing`, unit by unit as the
+  /// decoder takes them (`decode_nal_units`, `h264dec.c` 583–787): each
+  /// parameter set into its list, and each slice read by the lists as they
+  /// stand at it. Where a field may be possible, the census's reference
+  /// picture and intra slice are the ones FFmpeg decodes, after `before`,
+  /// what was seen before the packet, and the reference picture one since
+  /// the last flush a new context may have made; an intra slice counts in a
+  /// packet `kept` alone.
   fn fields_walk(&mut self, packet: &[u8], framing: Framing, before: Pending, kept: bool) {
     if self.codec != NalCodec::H264 {
       return;
     }
-    let mut walk = Walk::new(self.pairing, self.unmatched);
+    let mut walk = Walk::new(self.pairing, self.unmatched, self.context);
     let mut units = Units::new(packet, framing);
     while let Unit::Nal(nal) = units.next() {
       let Some(&header) = nal.first() else {
@@ -1530,11 +1545,15 @@ impl NalStream {
       // more of the packet (`h264dec.c` 717–727, 740–745).
       let certain = !walk.may_stop;
       match header & 0x1F {
+        // FFmpeg's splitter reads a unit of a packet read whole exactly as the
+        // reading frames it.
         7 => {
-          self.sps_into_lists(&nal[1..], certain);
+          self.sps_into_lists(nal, certain, true);
         }
         8 => {
-          if !self.pps_into_lists(&nal[1..], certain, false) {
+          let (stored, touched) = self.pps_into_lists(&nal[1..], certain, false);
+          walk.touched(touched);
+          if !stored {
             walk.may_stop = true;
           }
         }
@@ -1542,6 +1561,11 @@ impl NalStream {
         _ => {}
       }
     }
+    self.context = if walk.lost {
+      self.activated(walk.context)
+    } else {
+      walk.context
+    };
     // While every sequence parameter set codes frames only, every picture is
     // a frame: no field ever waits, and every slice FFmpeg reads it decodes.
     if self.fields_possible {
@@ -1552,7 +1576,7 @@ impl NalStream {
         self.pairing = walk.pairing;
         self.unmatched = walk.unmatched;
       }
-      self.pending.reference_seen = before.reference_seen || walk.reference;
+      self.pending.reference_seen = (before.reference_seen && !walk.flushed) || walk.reference;
       self.pending.intra_seen = before.intra_seen || (walk.intra && kept);
     }
     if packet.is_empty() {
@@ -1573,7 +1597,7 @@ impl NalStream {
     let mut slice = false;
     let mut visit = |nal: &[u8]| match nal.first().map(|&header| header & 0x1F) {
       Some(7) => {
-        self.sps_into_lists(&nal[1..], false);
+        self.sps_into_lists(nal, false, false);
       }
       Some(8) => {
         self.pps_into_lists(&nal[1..], false, false);
@@ -1588,10 +1612,29 @@ impl NalStream {
     if packet.is_empty() {
       self.ended();
     }
+    if slice {
+      self.context = self.activated(self.context);
+    }
     if slice && self.fields_possible {
       self.pairing = Pairing::Unknown;
       self.unmatched = UNMATCHED_MANY;
     }
+  }
+
+  /// The decoder's context where it was `context` and slices the reading
+  /// did not follow may have started pictures since: on the sequence
+  /// parameter set of any picture parameter set the list may hold, each
+  /// entry holding what it may have held through them.
+  fn activated(&self, context: Context) -> Context {
+    self
+      .sets
+      .pps
+      .iter()
+      .fold(context, |context, entry| match entry {
+        Slot::Empty => context,
+        Slot::Holds(pps) => context.or(context.started(&pps.sps)),
+        Slot::Unknown => Context::Unknown,
+      })
   }
 
   /// A packet of no bytes, which FFmpeg's H.264 decoder that takes it takes
@@ -1614,10 +1657,13 @@ impl NalStream {
     };
     if first != 1 {
       // Read for certain only where FFmpeg's splitter reads exactly the
-      // units the reading does.
+      // units the reading does; and a unit's trailing zero bytes stay where
+      // `00 00 01 E0` follows it (`h2645_parse.c` 626–629), so its copy is
+      // not told there.
       let mut certain = reads_whole(record, Framing::AnnexB);
+      let exact = !record.windows(4).any(|bytes| bytes == [0, 0, 1, 0xE0]);
       for nal in AfterStartCodes::new(record) {
-        certain &= self.set_into_lists(nal, certain, false);
+        certain &= self.set_into_lists(nal, certain, false, exact);
       }
       return;
     }
@@ -1645,13 +1691,14 @@ impl NalStream {
           return;
         };
         let payload = &entry[2..];
-        // An entry of one unit is read as that unit; one holding a start
-        // code FFmpeg splits otherwise than the reading can tell.
+        // An entry of one unit is read as that unit, which FFmpeg splits
+        // alone (`h264_parse.c` 421–464); one holding a start code FFmpeg
+        // splits otherwise than the reading can tell.
         let read = if find_start_code(payload).is_none() {
-          self.set_into_lists(trim_trailing_zeros(payload), certain, true)
+          self.set_into_lists(trim_trailing_zeros(payload), certain, true, true)
         } else {
           each_after_lengths(entry, 2, &mut |nal| {
-            self.set_into_lists(nal, false, true);
+            self.set_into_lists(nal, false, true, false);
           });
           false
         };
@@ -1667,11 +1714,12 @@ impl NalStream {
 
   /// One unit of an H.264 record into FFmpeg's lists, read for certain or
   /// only maybe, the unit of an `avcC` entry FFmpeg escapes and reads again
-  /// where it does not decode (`retry`); whether FFmpeg reads it, for
-  /// certain, without failing. A unit of another type FFmpeg passes over
-  /// ("Ignoring NAL type", `h264_parse.c` 400–404), as it passes over one
-  /// whose forbidden bit is set (`h2645_parse.c` 646–660).
-  fn set_into_lists(&mut self, nal: &[u8], certain: bool, retry: bool) -> bool {
+  /// where it does not decode (`retry`); `exact` where FFmpeg's splitter
+  /// reads the unit as the reading frames it ([`Canon::of`]); whether FFmpeg
+  /// reads it, for certain, without failing. A unit of another type FFmpeg
+  /// passes over ("Ignoring NAL type", `h264_parse.c` 400–404), as it passes
+  /// over one whose forbidden bit is set (`h2645_parse.c` 646–660).
+  fn set_into_lists(&mut self, nal: &[u8], certain: bool, retry: bool, exact: bool) -> bool {
     let Some(&header) = nal.first() else {
       return true;
     };
@@ -1679,44 +1727,60 @@ impl NalStream {
       return true;
     }
     match header & 0x1F {
-      7 => self.sps_into_lists(&nal[1..], certain) && certain,
-      8 => self.pps_into_lists(&nal[1..], certain, retry),
+      7 => self.sps_into_lists(nal, certain, exact) && certain,
+      8 => self.pps_into_lists(&nal[1..], certain, retry).0,
       _ => true,
     }
   }
 
-  /// An H.264 sequence parameter set — `payload`, its bytes after the
-  /// header — that FFmpeg's decoder reads, for certain or only maybe, into
-  /// its list as FFmpeg moves it: by the reading it adopts, where its
-  /// strict reading of the RBSP succeeds (`h264dec.c` 699–716, `h264_ps.c`
-  /// 581–587), and else by any it may adopt, or none ([`sps_proof`]'s
-  /// readings); whether FFmpeg stores it for certain. FFmpeg 9.0.1 keeps
-  /// every picture parameter set read before on the sequence parameter set
-  /// it was read with (`remove_sps`, `h264_ps.c` 92–104, its removal of
-  /// them compiled out).
-  fn sps_into_lists(&mut self, payload: &[u8], certain: bool) -> bool {
-    let unit = up_to_start_code(payload);
+  /// An H.264 sequence parameter set — `nal`, its header byte first — that
+  /// FFmpeg's decoder reads, for certain or only maybe, into its list as
+  /// FFmpeg moves it: by the reading it adopts, where its strict reading of
+  /// the RBSP succeeds (`h264dec.c` 699–716, `h264_ps.c` 581–587), and else
+  /// by any it may adopt, or none ([`sps_proof`]'s readings); whether FFmpeg
+  /// stores it for certain. FFmpeg 9.0.1 keeps every picture parameter set
+  /// read before on the sequence parameter set object it was read with
+  /// (`remove_sps`, `h264_ps.c` 92–104, its removal of them compiled out),
+  /// and keeps the object an entry holds where the new set compares equal
+  /// to it whole, its copy of the unit among it (581–587): told by that copy
+  /// where it is `exact` to tell ([`Canon`]), and else perhaps.
+  fn sps_into_lists(&mut self, nal: &[u8], certain: bool, exact: bool) -> bool {
+    let unit = up_to_start_code(&nal[1..]);
     let rbsp = sps_facts(BitReader::new(unit, Reading::Rbsp));
     if rbsp.whole
       && let (Some(id), Some(header)) = (rbsp.id, rbsp.header)
     {
       let id = usize::from(id);
-      let held = if certain {
-        Slot::Holds(header)
+      let canon = if exact {
+        Canon::of(nal)
       } else {
-        self.sets.sps[id].or(Slot::Holds(header))
+        Canon::Unknown
       };
-      self.store_sps(id, held);
+      // Whether FFmpeg keeps the object the entry holds: none to keep, it
+      // makes one; another copy, it makes one too.
+      let kept = match self.sets.sps[id] {
+        Slot::Empty => Some(false),
+        Slot::Holds(entry) => entry.canon.same(canon),
+        Slot::Unknown => None,
+      };
+      if kept == Some(true) {
+        // The entry stands, whether FFmpeg reads the unit or not.
+      } else if certain {
+        let entry = SpsEntry {
+          header,
+          object: self.sets.object(id, kept == Some(false)),
+          canon,
+        };
+        self.store_sps(id, Slot::Holds(entry));
+      } else {
+        self.maybe_sps(id, Some(header));
+      }
       return certain;
     }
     for reading in [Reading::Rbsp, Reading::Bytes, Reading::Reescaped] {
       let facts = sps_facts(BitReader::new(unit, reading));
-      let held = facts.header.map_or(Slot::Unknown, Slot::Holds);
       match facts.id {
-        Some(id) => {
-          let id = usize::from(id);
-          self.store_sps(id, self.sets.sps[id].or(held));
-        }
+        Some(id) => self.maybe_sps(usize::from(id), facts.header),
         // A reading that does not reach its id may store under any.
         None => {
           for id in 0..self.sets.sps.len() {
@@ -1728,6 +1792,22 @@ impl NalStream {
     false
   }
 
+  /// List entry `id` of the sequence parameter sets where FFmpeg may have
+  /// left it as it was or stored a set reading as `header` in it, in an
+  /// object of its own or the one it held; `None` for a set the reading
+  /// cannot read so far.
+  fn maybe_sps(&mut self, id: usize, header: Option<SpsHeader>) {
+    let held = match (self.sets.sps[id], header) {
+      (Slot::Holds(entry), Some(header)) if entry.header == header => Slot::Holds(SpsEntry {
+        header,
+        object: self.sets.object(id, false),
+        canon: Canon::Unknown,
+      }),
+      _ => Slot::Unknown,
+    };
+    self.store_sps(id, held);
+  }
+
   /// An H.264 picture parameter set — `payload`, its bytes after the
   /// header — that FFmpeg's decoder reads, for certain or only maybe, into
   /// its list on the sequence parameter set it names as the list holds it
@@ -1735,44 +1815,55 @@ impl NalStream {
   /// list left as it was where FFmpeg refuses it ([`pps_read`]); the unit of
   /// an `avcC` entry that does not decode read again as its bytes stand
   /// (`retry`, `h264_parse.c` 421–464). Whether FFmpeg stores it for
-  /// certain.
-  fn pps_into_lists(&mut self, payload: &[u8], certain: bool, retry: bool) -> bool {
+  /// certain, and the entries it may have replaced.
+  fn pps_into_lists(&mut self, payload: &[u8], certain: bool, retry: bool) -> (bool, Touched) {
     let read = pps_read(payload, Reading::Rbsp, &self.sets.sps);
     let stored = matches!(read, PpsRead::Stored(..));
-    self.store_pps(read, certain);
+    let mut touched = self.store_pps(read, certain);
     if retry && !stored {
       // Unless under `AV_EF_EXPLODE`.
       let again = pps_read(payload, Reading::Bytes, &self.sets.sps);
-      self.store_pps(again, false);
+      touched = touched.and(self.store_pps(again, false));
     }
-    stored && certain
+    (stored && certain, touched)
   }
 
   /// What FFmpeg makes of a picture parameter set it reads so, into its
-  /// list, for certain or only maybe.
-  fn store_pps(&mut self, read: PpsRead, certain: bool) {
+  /// list, for certain or only maybe: a new object each time it stores one
+  /// (`h264_ps.c` 698–847), of which the entry keeps what the reading needs.
+  /// The entries it may have replaced.
+  fn store_pps(&mut self, read: PpsRead, certain: bool) -> Touched {
     match read {
       PpsRead::Stored(id, header) => {
-        let id = usize::from(id);
-        let held = if certain {
-          Slot::Holds(header)
-        } else {
-          self.sets.pps[id].or(Slot::Holds(header))
+        let held = match self.sets.pps[usize::from(id)] {
+          _ if certain => Slot::Holds(header),
+          Slot::Holds(entry) if (entry.sps, entry.redundant) == (header.sps, header.redundant) => {
+            Slot::Holds(PpsHeader {
+              compared: entry.compared.or(header.compared),
+              ..header
+            })
+          }
+          _ => Slot::Unknown,
         };
-        self.put_pps(id, held);
+        self.put_pps(usize::from(id), held);
+        Touched::One(id)
       }
-      PpsRead::Refused => {}
-      PpsRead::Undecided(Some(id)) => self.put_pps(usize::from(id), Slot::Unknown),
+      PpsRead::Refused => Touched::Nothing,
+      PpsRead::Undecided(Some(id)) => {
+        self.put_pps(usize::from(id), Slot::Unknown);
+        Touched::One(id)
+      }
       // A reading that does not reach its id may store under any.
       PpsRead::Undecided(None) => {
         for id in 0..self.sets.pps.len() {
           self.put_pps(id, Slot::Unknown);
         }
+        Touched::Every
       }
     }
   }
 
-  fn store_sps(&mut self, id: usize, held: Slot<SpsHeader>) {
+  fn store_sps(&mut self, id: usize, held: Slot<SpsEntry>) {
     if self.sets.sps[id] != held {
       self.sets.sps[id] = held;
       self.sets_moved = true;
@@ -2007,7 +2098,17 @@ fn sps_read(bits: &mut BitReader<'_>, facts: &mut SpsFacts) -> Option<()> {
     chroma_444: chroma_format_idc == 3,
     // 11 and 13 bits (`h264_ps.c` 741–750).
     refuses_pps: matches!(luma, 3 | 5),
+    geometry: Geometry {
+      mb_width: (width + 1) as u16,
+      mb_height: ((height + 1) * if frames_only { 1 } else { 2 }) as u16,
+      bit_depth: (luma + 8) as u8,
+      chroma_format_idc: chroma_format_idc as u8,
+    },
+    sar: None,
+    sar_holds: None,
+    matrix: Matrix::Unread,
   });
+  let (mut cropped_width, mut cropped_height) = (picture_width, picture_height);
   if bits.bits(1)? == 1 {
     let mut crop = [0_u64; 4];
     for offset in &mut crop {
@@ -2024,33 +2125,133 @@ fn sps_read(bits: &mut BitReader<'_>, facts: &mut SpsFacts) -> Option<()> {
     {
       return None;
     }
+    cropped_width -= (crop[0] + crop[1]) * step_x;
+    cropped_height -= (crop[2] + crop[3]) * step_y;
   }
-  facts.reorder_fixed = Some(bits.bits(1)? == 1 && vui_fixes_reorder(bits)?);
+  let vui = bits.bits(1)? == 1;
+  // FFmpeg's SAR is 0:1 where the VUI declares none (`h264_ps.c` 522–525).
+  let sar = if vui { vui_sar(bits)? } else { (0, 1) };
+  if let Some(header) = &mut facts.header {
+    // The sizes `ff_set_sar` may check it at: the cropped one, one a container
+    // gives within the same 16 (`init_dimensions`, `h264_slice.c` 937–953),
+    // or, cropping ignored, the coded one.
+    let least = |size: u64| size.next_multiple_of(16) - 15;
+    header.sar = Some(sar);
+    header.sar_holds = sar_holds(
+      sar,
+      (least(cropped_width), least(cropped_height)),
+      (picture_width, picture_height),
+    );
+  }
+  let matrix = if vui {
+    vui_matrix(bits)?
+  } else {
+    Matrix::Undeclared
+  };
+  if let Some(header) = &mut facts.header {
+    header.matrix = matrix;
+  }
+  facts.reorder_fixed = Some(vui && vui_fixes_reorder(bits)?);
   Some(())
 }
 
-/// Whether a VUI sets `bitstream_restriction_flag` with a
-/// `max_num_reorder_frames` of 15 at most, as `decode_vui_parameters` reads
-/// it (`h264_ps.c` 129–196; `h2645_vui.c` 37–98). `false` where FFmpeg
-/// leaves it unset or the depth is 16, `None` where FFmpeg refuses the
-/// parameter set first.
-fn vui_fixes_reorder(bits: &mut BitReader<'_>) -> Option<bool> {
-  // `aspect_ratio_info_present_flag`, `aspect_ratio_idc`, an extended SAR.
-  if bits.bits(1)? == 1 && bits.bits(8)? == 255 {
-    bits.bits(32)?;
+/// A VUI's `aspect_ratio_info_present_flag` and the sample aspect ratio
+/// after it, as `ff_h2645_decode_common_vui_params` holds it (`h2645_vui.c`
+/// 37–59): 0:1 where none is declared, an `aspect_ratio_idc` the table does
+/// not hold among them, and where an extended one is 0 either way.
+fn vui_sar(bits: &mut BitReader<'_>) -> Option<(u16, u16)> {
+  /// `ff_h2645_pixel_aspect` (`h2645data.c` 21–39).
+  const TABLE: [(u16, u16); 17] = [
+    (0, 1),
+    (1, 1),
+    (12, 11),
+    (10, 11),
+    (16, 11),
+    (40, 33),
+    (24, 11),
+    (20, 11),
+    (32, 11),
+    (80, 33),
+    (18, 11),
+    (15, 11),
+    (64, 33),
+    (160, 99),
+    (4, 3),
+    (3, 2),
+    (2, 1),
+  ];
+  if bits.bits(1)? == 0 {
+    return Some((0, 1));
   }
+  let idc = bits.bits(8)?;
+  Some(match idc {
+    255 => match (bits.bits(16)? as u16, bits.bits(16)? as u16) {
+      (0, _) | (_, 0) => (0, 1),
+      sar => sar,
+    },
+    _ => TABLE.get(idc as usize).copied().unwrap_or((0, 1)),
+  })
+}
+
+/// A VUI's overscan fields and its video signal type, as
+/// `ff_h2645_decode_common_vui_params` reads them (`h2645_vui.c` 60–85): the
+/// colour matrix where a colour description is present, a value FFmpeg
+/// names no colour space for read as 2, unspecified (`av_color_space_name`,
+/// `pixdesc.c` 3326–3345, 3856–3860).
+fn vui_matrix(bits: &mut BitReader<'_>) -> Option<Matrix> {
   // `overscan_info_present_flag`, `overscan_appropriate_flag`.
   if bits.bits(1)? == 1 {
     bits.bits(1)?;
   }
-  // `video_signal_type_present_flag`: the format, the range, and the
-  // colour description.
-  if bits.bits(1)? == 1 {
-    bits.bits(4)?;
-    if bits.bits(1)? == 1 {
-      bits.bits(24)?;
-    }
+  // `video_signal_type_present_flag`: the format, the range, and the colour
+  // description — primaries, transfer, matrix.
+  if bits.bits(1)? == 0 {
+    return Some(Matrix::Undeclared);
   }
+  bits.bits(4)?;
+  if bits.bits(1)? == 0 {
+    return Some(Matrix::Undeclared);
+  }
+  bits.bits(16)?;
+  let matrix = bits.bits(8)? as u8;
+  Some(Matrix::Declared(match matrix {
+    3 | 18.. => 2,
+    named => named,
+  }))
+}
+
+/// Whether FFmpeg keeps the sample aspect ratio `(num, den)` when it sets its
+/// context up on the sequence parameter set declaring it: `ff_set_sar`
+/// (`utils.c` 106–119) puts 0:1 in its place where `av_image_check_sar`
+/// refuses it at the picture's size (`imgutils.c` 323–342), and
+/// `h264_init_ps` then finds the two apart at every first slice, and sets
+/// the context up again (`h264_slice.c` 1094, 1136–1165). `None` where the
+/// sizes from `least` to `most` the check may be made at answer otherwise.
+fn sar_holds((num, den): (u16, u16), least: (u64, u64), most: (u64, u64)) -> Option<bool> {
+  let holds = |(width, height): (u64, u64)| {
+    if num == 0 || num == den {
+      true
+    } else if num < den {
+      width * u64::from(num) >= u64::from(den)
+    } else {
+      height * u64::from(den) >= u64::from(num)
+    }
+  };
+  if holds(least) {
+    Some(true)
+  } else if holds(most) {
+    None
+  } else {
+    Some(false)
+  }
+}
+
+/// Whether a VUI, after its video signal type, sets
+/// `bitstream_restriction_flag` with a `max_num_reorder_frames` of 15 at
+/// most, as `decode_vui_parameters` reads it (`h264_ps.c` 129–196;
+/// `h2645_vui.c` 37–98). `false` where FFmpeg leaves it unset or the depth
+/// is 16, `None` where FFmpeg refuses the parameter set first.
+fn vui_fixes_reorder(bits: &mut BitReader<'_>) -> Option<bool> {
   // `chroma_loc_info_present_flag`, its two sites.
   if bits.bits(1)? == 1 {
     bits.ue_31()?;
@@ -2146,13 +2347,186 @@ struct SpsHeader {
   /// A bit depth of 11 or 13, on which FFmpeg refuses every picture
   /// parameter set (`h264_ps.c` 741–750).
   refuses_pps: bool,
+  /// What `h264_init_ps` compares of the context it set up against it.
+  geometry: Geometry,
+  /// The sample aspect ratio, as FFmpeg holds it ([`vui_sar`]); `None`
+  /// where the reading does not reach it.
+  sar: Option<(u16, u16)>,
+  /// Whether FFmpeg keeps that ratio when it sets its context up on it
+  /// ([`sar_holds`]); `None` where the reading cannot tell.
+  sar_holds: Option<bool>,
+  /// The colour matrix it declares.
+  matrix: Matrix,
+}
+
+/// The colour matrix a sequence parameter set's VUI declares — its
+/// `matrix_coeffs`, where a colour description is present, a value FFmpeg
+/// has no name for read as 2, unspecified (`h2645_vui.c` 64–85) — which
+/// `h264_init_ps` compares against the decoder's (`h264_slice.c`
+/// 1117–1123).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Matrix {
+  Undeclared,
+  Declared(u8),
+  /// The reading does not reach it.
+  Unread,
+}
+
+/// What `h264_init_ps` compares of the sequence parameter set a picture
+/// starts on against the context it set up last (`h264_slice.c`
+/// 1066–1092): another size, bit depth or chroma format sets the context
+/// up again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Geometry {
+  /// `mb_width`: `pic_width_in_mbs_minus1` plus one.
+  mb_width: u16,
+  /// `mb_height` as FFmpeg holds it (`h264_ps.c` 449–457): in frame
+  /// macroblocks, twice the map units where `frame_mbs_only_flag` is 0.
+  mb_height: u16,
+  /// `bit_depth_luma`, 8 to 14.
+  bit_depth: u8,
+  chroma_format_idc: u8,
+}
+
+/// A sequence parameter set object FFmpeg holds: one entry of its list
+/// keeps it, and every picture parameter set read on it (`pps->sps`,
+/// `h264_ps.c` 738), and the decoder's context while a picture of it is
+/// active (`h->ps.sps`). FFmpeg makes one for each sequence parameter set
+/// it reads, but keeps the one an entry holds where the two compare equal
+/// whole (581–587), and compares two by their address (`h264_slice.c`
+/// 1066, 2159).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Object {
+  /// The object FFmpeg holds in list entry `sps_id` after the reading's
+  /// `number`th event of the lists: `fresh` where it is certainly one FFmpeg
+  /// made there, unlike every object made before it, and else perhaps the
+  /// one the entry held before.
+  Known {
+    sps_id: u8,
+    number: u32,
+    fresh: bool,
+  },
+  /// Any.
+  Unknown,
+}
+
+impl Object {
+  /// Whether `self` and `other` are one object; `None` where the reading
+  /// cannot tell.
+  fn same(self, other: Self) -> Option<bool> {
+    let (
+      Self::Known {
+        sps_id: one,
+        number: first,
+        fresh: first_fresh,
+      },
+      Self::Known {
+        sps_id: other,
+        number: second,
+        fresh: second_fresh,
+      },
+    ) = (self, other)
+    else {
+      return None;
+    };
+    if one != other {
+      return Some(false);
+    }
+    if first == second {
+      return Some(true);
+    }
+    // The later is apart from the earlier where it is certainly new.
+    let fresh = if first > second {
+      first_fresh
+    } else {
+      second_fresh
+    };
+    fresh.then_some(false)
+  }
+
+  /// The object where it may be `self` or `other`.
+  fn or(self, other: Self) -> Self {
+    if self == other { self } else { Self::Unknown }
+  }
+}
+
+/// The bytes of a sequence parameter set that [`Canon`] holds at most.
+const CANON_BYTES: usize = 128;
+
+/// FFmpeg's copy of a sequence parameter set's unit, `data` (`h264_ps.c`
+/// 297–306), which it compares with the rest when it reads one again
+/// (581–587): the unit's header and RBSP, emulation prevention bytes
+/// dropped, to its stop bit's byte — the bits `get_bit_length` leaves
+/// (`h2645_parse.c` 348–376), the stop bit put back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Canon {
+  /// These bytes, the first `len` of them, and zero bytes after.
+  Known { len: u8, bytes: [u8; CANON_BYTES] },
+  /// More than [`CANON_BYTES`] bytes.
+  Long,
+  /// The reading cannot tell.
+  Unknown,
+}
+
+impl Canon {
+  /// FFmpeg's copy of `nal`, an SPS unit FFmpeg's splitter reads exactly as
+  /// the reading frames it. Not told: a unit FFmpeg's splitter may end, or
+  /// read on, at a `00 00 00`, `00 00 01` or `00 00 02` in it (`h2645_parse.c`
+  /// 37–147), and one whose RBSP ends in a zero byte, which FFmpeg drops but
+  /// where the next bytes read `00 00 01 E0` (626–629).
+  fn of(nal: &[u8]) -> Self {
+    let Some((&header, payload)) = nal.split_first() else {
+      return Self::Unknown;
+    };
+    if up_to_start_code(payload).len() < payload.len() {
+      return Self::Unknown;
+    }
+    let mut bytes = [0; CANON_BYTES];
+    bytes[0] = header;
+    let (mut len, mut last) = (1_usize, header);
+    let mut rbsp = Rbsp::new(payload);
+    while let Some(byte) = rbsp.byte() {
+      if let Some(slot) = bytes.get_mut(len) {
+        *slot = byte;
+      }
+      len += 1;
+      last = byte;
+    }
+    if last == 0 {
+      return Self::Unknown;
+    }
+    match u8::try_from(len) {
+      Ok(len) if usize::from(len) <= CANON_BYTES => Self::Known { len, bytes },
+      _ => Self::Long,
+    }
+  }
+
+  /// Whether FFmpeg's two copies are equal; `None` where the reading cannot
+  /// tell.
+  fn same(self, other: Self) -> Option<bool> {
+    match (self, other) {
+      (Self::Known { .. }, Self::Known { .. }) => Some(self == other),
+      (Self::Known { .. }, Self::Long) | (Self::Long, Self::Known { .. }) => Some(false),
+      _ => None,
+    }
+  }
+}
+
+/// One entry of FFmpeg's sequence parameter set list: what the set says,
+/// and the object FFmpeg holds it in, with that object's copy of the unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SpsEntry {
+  header: SpsHeader,
+  object: Object,
+  canon: Canon,
 }
 
 /// What an H.264 picture parameter set in FFmpeg's list says, as far as a
 /// slice's header needs: the sequence parameter set it was read on, which
 /// every slice that names it is read by (`pps->sps`, `h264_ps.c` 738;
 /// `h264_slice.c` 1747–1749), and whether its slices carry a
-/// `redundant_pic_cnt`.
+/// `redundant_pic_cnt`; and what FFmpeg compares of it against the active
+/// one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PpsHeader {
   sps: SpsHeader,
@@ -2160,6 +2534,58 @@ struct PpsHeader {
   /// is above 0 before it starts or joins a picture (`h264_slice.c`
   /// 2081–2085).
   redundant: bool,
+  compared: Compared,
+}
+
+/// What FFmpeg compares of a slice's picture parameter set against the
+/// active one where the slice joins a picture, or starts its second field
+/// (`h264_slice.c` 2150–2163): its `sps_id`, its `transform_8x8_mode`, and
+/// the sequence parameter set object it was read on. Each `None`, or
+/// unknown, where the entry may hold either of two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Compared {
+  sps_id: Option<u8>,
+  transform_8x8: Option<bool>,
+  sps: Object,
+}
+
+impl Compared {
+  /// Whether FFmpeg lets a slice of `other` on while `self` is the active
+  /// picture parameter set; `None` where the reading cannot tell.
+  fn compatible(self, other: Self) -> Option<bool> {
+    fn differ<T: PartialEq>(one: Option<T>, two: Option<T>) -> bool {
+      matches!((one, two), (Some(one), Some(two)) if one != two)
+    }
+    if differ(self.sps_id, other.sps_id)
+      || differ(self.transform_8x8, other.transform_8x8)
+      || self.sps.same(other.sps) == Some(false)
+    {
+      return Some(false);
+    }
+    (self.sps_id.is_some()
+      && self.sps_id == other.sps_id
+      && self.transform_8x8.is_some()
+      && self.transform_8x8 == other.transform_8x8
+      && self.sps.same(other.sps) == Some(true))
+    .then_some(true)
+  }
+
+  /// What an entry compares as where it may hold `self` or `other`.
+  fn or(self, other: Self) -> Self {
+    Self {
+      sps_id: if self.sps_id == other.sps_id {
+        self.sps_id
+      } else {
+        None
+      },
+      transform_8x8: if self.transform_8x8 == other.transform_8x8 {
+        self.transform_8x8
+      } else {
+        None
+      },
+      sps: self.sps.or(other.sps),
+    }
+  }
 }
 
 /// One entry of FFmpeg's parameter-set lists, as far as the reading knows
@@ -2174,13 +2600,6 @@ enum Slot<T> {
   Unknown,
 }
 
-impl<T: PartialEq> Slot<T> {
-  /// What the entry holds where it may hold `self` or `other`.
-  fn or(self, other: Self) -> Self {
-    if self == other { self } else { Self::Unknown }
-  }
-}
-
 /// FFmpeg's H.264 parameter-set lists, `sps_list` and `pps_list`
 /// (`h264_ps.h`): 32 sequence parameter sets and 256 picture parameter sets
 /// by id, each entry as far as the reading knows it. An entry once filled
@@ -2188,8 +2607,10 @@ impl<T: PartialEq> Slot<T> {
 /// 87–104).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ParameterSets {
-  sps: [Slot<SpsHeader>; 32],
+  sps: [Slot<SpsEntry>; 32],
   pps: [Slot<PpsHeader>; 256],
+  /// The events that have made an [`Object`], numbered.
+  made: u32,
 }
 
 impl ParameterSets {
@@ -2197,7 +2618,24 @@ impl ParameterSets {
   const EMPTY: Self = Self {
     sps: [Slot::Empty; 32],
     pps: [Slot::Empty; 256],
+    made: 0,
   };
+
+  /// The object list entry `sps_id` holds after an event that makes one:
+  /// `fresh` where it is certainly new. Past `u32::MAX` events, unknown.
+  fn object(&mut self, sps_id: usize, fresh: bool) -> Object {
+    match (self.made.checked_add(1), u8::try_from(sps_id)) {
+      (Some(number), Ok(sps_id)) => {
+        self.made = number;
+        Object::Known {
+          sps_id,
+          number,
+          fresh,
+        }
+      }
+      _ => Object::Unknown,
+    }
+  }
 
   /// What the lists hold where every filled entry may hold anything. An
   /// empty one stays empty: it was empty at the opening too.
@@ -2357,6 +2795,8 @@ enum Head {
     /// 2094–2133).
     starts: bool,
     pps_id: u8,
+    /// What the list holds under `pps_id`.
+    pps: PpsHeader,
     picture: Picture,
     /// An IDR slice.
     idr: bool,
@@ -2380,8 +2820,8 @@ enum Head {
 /// code frames only, `field_pic_flag` and `bottom_field_flag` — a B slice
 /// refused without `direct_8x8_inference_flag`. What FFmpeg reads after
 /// them it refuses only where the stream breaks the standard (7.4.3); a
-/// conforming slice FFmpeg refuses for itself — of another picture
-/// parameter set than its picture's, or of reference and non-reference
+/// conforming slice FFmpeg refuses for itself — of a picture parameter set
+/// it tells apart from the active one, or of reference and non-reference
 /// fields — the walk takes as refused ([`Walk`]).
 fn slice_head(nal: &[u8], sets: &ParameterSets) -> Head {
   let Some((&header, payload)) = nal.split_first() else {
@@ -2438,6 +2878,7 @@ fn slice_head(nal: &[u8], sets: &ParameterSets) -> Head {
   Head::Read {
     starts: first_mb == 0,
     pps_id: pps_id as u8,
+    pps,
     picture: Picture {
       structure,
       frame_num,
@@ -2448,54 +2889,237 @@ fn slice_head(nal: &[u8], sets: &ParameterSets) -> Head {
   }
 }
 
+/// FFmpeg's H.264 decoder context as `h264_init_ps` holds the sequence
+/// parameter set a first slice makes the active one against it
+/// (`h264_slice.c` 1058–1170): whether it is set up, and what it compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Context {
+  /// Not set up (`context_initialized` 0): the decoder opened, or was
+  /// flushed (`h264dec.c` 476–499). No field waits, and what a flush unsets
+  /// is unset.
+  Fresh,
+  /// Set up so.
+  Set(Setup),
+  /// Anything.
+  Unknown,
+}
+
+/// What the decoder's context is set up as: the active sequence parameter
+/// set's geometry (`h->mb_width`, `h->mb_height`, `cur_bit_depth_luma`,
+/// `cur_chroma_format_idc`), and the codec context's sample aspect ratio
+/// and colour space, each `None` where the reading cannot tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Setup {
+  geometry: Geometry,
+  /// `avctx->sample_aspect_ratio`, as `ff_set_sar` set it at the last set-up
+  /// (`h264_slice.c` 975).
+  sar: Option<(u16, u16)>,
+  /// `avctx->colorspace`, as the last start of a sequence parameter set
+  /// declaring a colour matrix set it (1117–1123); before one, the
+  /// container's.
+  colorspace: Option<u8>,
+}
+
+/// Whether `h264_init_ps` sets the context up again at a picture's start,
+/// flushing the decoder ([`Context::reinit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reinit {
+  No,
+  Yes,
+  Maybe,
+}
+
+impl Context {
+  /// Whether `h264_init_ps` sets the context up again at a first slice
+  /// whose picture parameter set was read on `sps` (`h264_slice.c`
+  /// 1063–1165): where it finds another size, bit depth or chroma format
+  /// (`needs_reinit`, `must_reinit`, 1066–1092), another sample aspect ratio
+  /// (1094), or another colour matrix (1117–1123) — the pixel format,
+  /// compared too (1089–1092), following the bit depth, the chroma format
+  /// and the matrix (`get_pixel_format`, 787–923). FFmpeg compares the
+  /// sequence parameter set objects only to choose whether to compare those
+  /// (1066), and an object kept holds them unchanged. A context not set up
+  /// is set up without a flush (1137, 1151–1152).
+  fn reinit(self, sps: &SpsHeader) -> Reinit {
+    let setup = match self {
+      Self::Fresh => return Reinit::No,
+      Self::Unknown => return Reinit::Maybe,
+      Self::Set(setup) => setup,
+    };
+    if setup.geometry != sps.geometry {
+      return Reinit::Yes;
+    }
+    let mut maybe = false;
+    match (sps.sar, setup.sar) {
+      (Some(sar), Some(held)) if !same_ratio(sar, held) => return Reinit::Yes,
+      (Some(_), Some(_)) => {}
+      _ => maybe = true,
+    }
+    match (sps.matrix, setup.colorspace) {
+      (Matrix::Undeclared, _) => {}
+      (Matrix::Declared(matrix), Some(held)) if matrix != held => return Reinit::Yes,
+      (Matrix::Declared(_), Some(_)) => {}
+      _ => maybe = true,
+    }
+    if maybe { Reinit::Maybe } else { Reinit::No }
+  }
+
+  /// The context after a start on `sps`, set up again or not: its geometry;
+  /// its sample aspect ratio, the one `ff_set_sar` keeps — and where it is
+  /// not set up again, one the same as it, or the start would have set it up
+  /// again ([`sar_holds`]); and its colour matrix where it declares one.
+  fn started(self, sps: &SpsHeader) -> Self {
+    let colorspace = match (sps.matrix, self) {
+      (Matrix::Declared(matrix), _) => Some(matrix),
+      (Matrix::Undeclared, Self::Set(setup)) => setup.colorspace,
+      _ => None,
+    };
+    Self::Set(Setup {
+      geometry: sps.geometry,
+      sar: if sps.sar_holds == Some(true) {
+        sps.sar
+      } else {
+        None
+      },
+      colorspace,
+    })
+  }
+
+  /// The context where it may be `self` or `other`. One not set up is
+  /// answered for by any set up — a start on it flushes nothing, and none
+  /// of what a flush moves needs moving — but for its colour space, which
+  /// is whatever it was before, or the container's.
+  fn or(self, other: Self) -> Self {
+    match (self, other) {
+      (Self::Fresh, Self::Fresh) => Self::Fresh,
+      (Self::Fresh, Self::Set(setup)) | (Self::Set(setup), Self::Fresh) => Self::Set(Setup {
+        colorspace: None,
+        ..setup
+      }),
+      (Self::Set(one), Self::Set(two)) if one.geometry == two.geometry => Self::Set(Setup {
+        geometry: one.geometry,
+        sar: match (one.sar, two.sar) {
+          (Some(sar), Some(other)) if same_ratio(sar, other) => Some(sar),
+          _ => None,
+        },
+        colorspace: if one.colorspace == two.colorspace {
+          one.colorspace
+        } else {
+          None
+        },
+      }),
+      _ => Self::Unknown,
+    }
+  }
+}
+
+/// Whether two ratios FFmpeg holds — each of a denominator of 1 or more —
+/// are one, as `av_cmp_q` finds them (`rational.h` 89–99).
+fn same_ratio((num, den): (u16, u16), (other_num, other_den): (u16, u16)) -> bool {
+  u32::from(num) * u32::from(other_den) == u32::from(other_num) * u32::from(den)
+}
+
+/// The entries of the picture parameter set list a unit FFmpeg reads may
+/// have replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Touched {
+  Nothing,
+  One(u8),
+  Every,
+}
+
+impl Touched {
+  fn covers(self, pps_id: u8) -> bool {
+    match self {
+      Self::Nothing => false,
+      Self::One(one) => one == pps_id,
+      Self::Every => true,
+    }
+  }
+
+  /// What either `self` or `other` may have replaced.
+  fn and(self, other: Self) -> Self {
+    match (self, other) {
+      (Self::Nothing, touched) | (touched, Self::Nothing) => touched,
+      (Self::One(one), Self::One(two)) if one == two => self,
+      _ => Self::Every,
+    }
+  }
+}
+
 /// FFmpeg's H.264 decoder over the slices of one packet, in order
 /// (`ff_h264_queue_decode_slice`, `h264_slice.c` 2069–2193): which slice
 /// starts a picture — the packet's first, and after a first field one of
 /// `first_mb_in_slice` 0 — which joins the picture, and which is refused;
-/// the field pairing the pictures leave ([`Pairing::start`]); and of the
-/// slices it decodes, whether one is a reference picture's or intra.
+/// the active picture parameter set a first slice makes, and the context
+/// its start may set up again ([`Context::reinit`]); the field pairing the
+/// pictures leave ([`Pairing::start`]); and of the slices it decodes,
+/// whether one is a reference picture's or intra.
 struct Walk {
   pairing: Pairing,
   /// How many fields may have gone unmatched, as [`NalStream`] counts them.
   unmatched: u8,
+  /// The decoder's context, as the starts so far leave it.
+  context: Context,
   /// The picture the slices go to, `current_slice` above 0.
   current: Option<Current>,
+  /// FFmpeg's active picture parameter set, `h->ps.pps`, as the packet's
+  /// last first slice made it (`h264_init_ps`, `h264_slice.c` 1063–1064).
+  active: Option<Active>,
   /// A unit FFmpeg may refuse has been met: under `AV_EF_EXPLODE` it reads
   /// nothing after it (`h264dec.c` 717–727, 740–745).
   may_stop: bool,
   /// Where pictures start is no longer known: a slice the reading cannot
-  /// read, or a start FFmpeg may not make.
+  /// read, or a start FFmpeg may not make. FFmpeg may refuse it, so it may
+  /// stop there too.
   lost: bool,
   /// The pictures started, and the first of them.
   starts: u8,
   first: Option<Picture>,
-  /// A slice of a reference picture decoded.
+  /// A slice of a reference picture decoded, since the packet's first unit
+  /// or the last start at which the context may have been set up again.
   reference: bool,
   /// An intra slice decoded.
   intra: bool,
+  /// A start may have set the context up again, which flushes the decoder
+  /// (`ff_h264_flush_change`, `h264dec.c` 451–474).
+  flushed: bool,
 }
 
 /// The picture a packet's slices go to.
 #[derive(Debug, Clone, Copy)]
 struct Current {
   picture: Picture,
-  pps_id: u8,
   /// A first field, which a slice of `first_mb_in_slice` 0 ends.
   first_field: bool,
 }
 
+/// The active picture parameter set: the entry a first slice named, and
+/// what FFmpeg compares of it.
+#[derive(Debug, Clone, Copy)]
+struct Active {
+  pps_id: u8,
+  compared: Compared,
+  /// No unit read since may have replaced the entry: a slice naming it
+  /// names the active object itself.
+  untouched: bool,
+}
+
 impl Walk {
-  const fn new(pairing: Pairing, unmatched: u8) -> Self {
+  const fn new(pairing: Pairing, unmatched: u8, context: Context) -> Self {
     Self {
       pairing,
       unmatched,
+      context,
       current: None,
+      active: None,
       may_stop: false,
       lost: false,
       starts: 0,
       first: None,
       reference: false,
       intra: false,
+      flushed: false,
     }
   }
 
@@ -2504,9 +3128,9 @@ impl Walk {
     if self.lost {
       return;
     }
-    let (starts, pps_id, picture, idr, intra) = match head {
+    let (starts, pps_id, pps, picture, idr, intra) = match head {
       Head::Unreadable => {
-        self.lost = true;
+        self.lose();
         return;
       }
       Head::Refused => {
@@ -2516,50 +3140,128 @@ impl Walk {
       Head::Read {
         starts,
         pps_id,
+        pps,
         picture,
         idr,
         intra,
-      } => (starts, pps_id, picture, idr, intra),
+      } => (starts, pps_id, pps, picture, idr, intra),
     };
     let Some(current) = self.current else {
-      self.start(picture, pps_id, idr, intra);
+      // `current_slice` 0: a first slice (`h264_slice.c` 2072), whose picture
+      // parameter set FFmpeg makes the active one, whatever it makes of its
+      // picture (1063–1064).
+      self.start(picture, Some((pps_id, pps)), idr, intra);
       return;
     };
     // A slice after the picture's first is read against it: "Frame num
-    // change" (`h264_slice.c` 1752–1758).
+    // change" (1752–1758).
     if picture.frame_num != current.picture.frame_num {
       self.may_stop = true;
     } else if starts {
       // A new picture, after a first field (2111–2114), or, after a frame,
-      // an IDR one ("Broken frame packetizing", 2115–2123) — once its
-      // picture parameter set passes against the picture's (2150–2163):
-      // the same one does. Else refused (2124–2125).
-      let next = current.first_field || (idr && current.picture.structure == Structure::Frame);
-      if !next {
+      // an IDR one ("Broken frame packetizing", 2115–2123); else refused
+      // (2124–2125).
+      if !(current.first_field || (idr && current.picture.structure == Structure::Frame)) {
         self.may_stop = true;
-      } else if pps_id != current.pps_id {
-        self.lost = true;
-      } else {
-        self.current = None;
-        self.start(picture, pps_id, idr, intra);
+        return;
       }
-    } else if picture == current.picture && pps_id == current.pps_id {
-      // A slice of the picture (2167–2181).
-      self.intra |= intra;
+      // The picture ends, `current_slice` 0 (`h264_picture.c` 231); but the
+      // slice was no first slice at 2072, so FFmpeg holds its picture
+      // parameter set to the active one (2150–2163). Refused, the first field
+      // waits, and the next slice is a first slice.
+      self.current = None;
+      match self.compatible(pps_id, &pps) {
+        Some(true) => self.start(picture, None, idr, intra),
+        Some(false) => self.may_stop = true,
+        None => self.lose(),
+      }
+    } else if picture == current.picture && self.compatible(pps_id, &pps) == Some(true) {
+      // A slice of the picture (2150–2181), counted only where FFmpeg reads
+      // it.
+      if !self.may_stop {
+        self.intra |= intra;
+      }
     } else {
-      // Of another structure or `nal_ref_idc`, refused (2169–2176); of
-      // another picture parameter set, perhaps refused (2150–2163).
+      // Refused, or perhaps: of a picture parameter set FFmpeg may tell apart
+      // from the active one (2150–2163), or of another structure or
+      // `nal_ref_idc` (2169–2176).
       self.may_stop = true;
     }
   }
 
-  /// A slice that starts a picture (`h264_field_start`).
-  fn start(&mut self, picture: Picture, pps_id: u8, idr: bool, intra: bool) {
+  /// Whether FFmpeg lets on a slice of `pps`, the entry under `pps_id`,
+  /// against the active picture parameter set (`h264_slice.c` 2150–2163);
+  /// `None` where the reading cannot tell.
+  fn compatible(&self, pps_id: u8, pps: &PpsHeader) -> Option<bool> {
+    let active = self.active?;
+    if active.untouched && active.pps_id == pps_id {
+      return Some(true);
+    }
+    active.compared.compatible(pps.compared)
+  }
+
+  /// A unit FFmpeg reads that may have replaced the entries `touched`.
+  fn touched(&mut self, touched: Touched) {
+    if let Some(active) = &mut self.active
+      && touched.covers(active.pps_id)
+    {
+      active.untouched = false;
+    }
+  }
+
+  /// Where pictures start is no longer known, and FFmpeg may stop.
+  fn lose(&mut self) {
+    self.lost = true;
+    self.may_stop = true;
+  }
+
+  /// A slice that starts a picture (`h264_field_start`): a first slice, its
+  /// picture parameter set `first`, which `h264_init_ps` makes the active
+  /// one and may set the context up again against; or the second field of
+  /// a pair in the packet, which keeps the active one and the context
+  /// (1063, 1066).
+  fn start(&mut self, picture: Picture, first: Option<(u8, PpsHeader)>, idr: bool, intra: bool) {
     if self.may_stop {
-      self.lost = true;
+      self.lose();
       return;
     }
-    let (pairing, started) = self.pairing.start(picture, &mut self.unmatched);
+    let reinit = match first {
+      Some((pps_id, pps)) => {
+        self.active = Some(Active {
+          pps_id,
+          compared: pps.compared,
+          untouched: true,
+        });
+        let reinit = self.context.reinit(&pps.sps);
+        self.context = self.context.started(&pps.sps);
+        reinit
+      }
+      None => Reinit::No,
+    };
+    if reinit != Reinit::No {
+      // `ff_h264_flush_change`, then `h264_slice_header_init`: `first_field`
+      // 0 (`h264dec.c` 469, `h264_slice.c` 989), the waiting field dropped and
+      // found unmatched by nothing, and what the decoder awaits after a flush
+      // awaited again.
+      self.flushed = true;
+      self.reference = false;
+    }
+    let (pairing, started) = match reinit {
+      Reinit::No => self.pairing.start(picture, &mut self.unmatched),
+      Reinit::Yes => Pairing::Settled.start(picture, &mut self.unmatched),
+      Reinit::Maybe => {
+        let mut again = self.unmatched;
+        let (reset, reset_started) = Pairing::Settled.start(picture, &mut again);
+        let (kept, kept_started) = self.pairing.start(picture, &mut self.unmatched);
+        self.unmatched = self.unmatched.max(again);
+        let started = if reset_started == kept_started {
+          kept_started
+        } else {
+          Started::Maybe
+        };
+        (reset.or(kept), started)
+      }
+    };
     self.pairing = pairing;
     let first_field = match started {
       Started::Refused => {
@@ -2567,7 +3269,7 @@ impl Walk {
         return;
       }
       Started::Maybe => {
-        self.lost = true;
+        self.lose();
         return;
       }
       Started::First => true,
@@ -2575,7 +3277,6 @@ impl Walk {
     };
     self.current = Some(Current {
       picture,
-      pps_id,
       first_field,
     });
     self.first.get_or_insert(picture);
@@ -2627,7 +3328,7 @@ enum Stop {
 /// then the rest ([`pps_body`]). A unit holding `00 00 00`, `00 00 01` or
 /// `00 00 02` FFmpeg's splitter may end there (`h2645_parse.c` 101–132),
 /// which leaves the reading undecided.
-fn pps_read(payload: &[u8], reading: Reading, sps: &[Slot<SpsHeader>; 32]) -> PpsRead {
+fn pps_read(payload: &[u8], reading: Reading, sps: &[Slot<SpsEntry>; 32]) -> PpsRead {
   let unit = match reading {
     Reading::Rbsp => up_to_start_code(payload),
     Reading::Bytes | Reading::Reescaped => payload,
@@ -2655,9 +3356,10 @@ fn pps_read(payload: &[u8], reading: Reading, sps: &[Slot<SpsHeader>; 32]) -> Pp
 /// group, FFmpeg reading no other (FMO, 757–762); default reference counts
 /// to 32; `chroma_qp_index_offset` in −12 to 12; and, where bits are left
 /// and the sequence parameter set's profile allows (794–810),
-/// `transform_8x8_mode_flag`, the scaling matrices (`decode_scaling_list`,
-/// 201–229: deltas in −128 to 127) and a second offset in −12 to 12.
-fn pps_body(bits: &mut BitReader<'_>, sps: &[Slot<SpsHeader>; 32]) -> Result<PpsHeader, Stop> {
+/// `transform_8x8_mode_flag`, 0 where it is not read (788), the scaling
+/// matrices (`decode_scaling_list`, 201–229: deltas in −128 to 127) and a
+/// second offset in −12 to 12.
+fn pps_body(bits: &mut BitReader<'_>, sps: &[Slot<SpsEntry>; 32]) -> Result<PpsHeader, Stop> {
   fn read<T>(value: Option<T>) -> Result<T, Stop> {
     value.ok_or(Stop::Ran)
   }
@@ -2670,10 +3372,10 @@ fn pps_body(bits: &mut BitReader<'_>, sps: &[Slot<SpsHeader>; 32]) -> Result<Pps
     }
   }
   let sps_id = read(bits.ue_31())?;
-  let sps = match sps.get(sps_id as usize) {
+  let (sps, object) = match sps.get(sps_id as usize) {
     None | Some(Slot::Empty) => return Err(Stop::Refused),
     Some(Slot::Unknown) => return Err(Stop::Ran),
-    Some(Slot::Holds(sps)) => *sps,
+    Some(Slot::Holds(entry)) => (entry.header, entry.object),
   };
   if sps.refuses_pps {
     return Err(Stop::Refused);
@@ -2703,8 +3405,9 @@ fn pps_body(bits: &mut BitReader<'_>, sps: &[Slot<SpsHeader>; 32]) -> Result<Pps
   // `deblocking_filter_control_present_flag`, `constrained_intra_pred_flag`,
   // `redundant_pic_cnt_present_flag`.
   let flags = read(bits.bits(3))?;
+  let mut transform_8x8 = false;
   if bits.left() > 0 && sps.pps_tail {
-    let transform_8x8 = read(bits.bits(1))? == 1;
+    transform_8x8 = read(bits.bits(1))? == 1;
     if read(bits.bits(1))? == 1 {
       let lists_8x8 = match (transform_8x8, sps.chroma_444) {
         (false, _) => 0,
@@ -2725,6 +3428,11 @@ fn pps_body(bits: &mut BitReader<'_>, sps: &[Slot<SpsHeader>; 32]) -> Result<Pps
   Ok(PpsHeader {
     sps,
     redundant: flags & 1 == 1,
+    compared: Compared {
+      sps_id: Some(sps_id as u8),
+      transform_8x8: Some(transform_8x8),
+      sps: object,
+    },
   })
 }
 
