@@ -2534,7 +2534,8 @@ impl Walk {
       // an IDR one ("Broken frame packetizing", 2115–2123) — once its
       // picture parameter set passes against the picture's (2150–2163):
       // the same one does. Else refused (2124–2125).
-      if !current.first_field && !(idr && current.picture.structure == Structure::Frame) {
+      let next = current.first_field || (idr && current.picture.structure == Structure::Frame);
+      if !next {
         self.may_stop = true;
       } else if pps_id != current.pps_id {
         self.lost = true;
