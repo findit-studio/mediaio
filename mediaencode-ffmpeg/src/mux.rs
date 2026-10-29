@@ -1219,14 +1219,6 @@ impl Audited {
       Self::Mov(MovMode::Gp3 | MovMode::G3g2 | MovMode::F4v | MovMode::Ism)
     )
   }
-
-  /// Whether the muxer's start clears libavformat's automatic filters:
-  /// ISMV's empty `moov` (`mov_init`, `movenc.c` 8177–8189). AVIF's delayed
-  /// one sets no empty `moov` — the flag that would is derived before it is
-  /// set (8152–8156) — so its filters stand and it does not fragment.
-  const fn clears_filters(self) -> bool {
-    matches!(self, Self::Mov(MovMode::Ism))
-  }
 }
 
 /// The containers this release knows the losses of, from the muxers'
@@ -4930,9 +4922,11 @@ struct Sites {
 
 impl Sites {
   /// The MOV family: every muxer whose `check_bitstream` is MOV's
-  /// (`movenc.c` 9343–9512) but ISMV, whose start clears the automatic
-  /// filters ([`Audited::clears_filters`]). AVIF's, the last of the file,
-  /// has none.
+  /// (`movenc.c` 9343–9512) but ISMV, whose empty `moov` clears the
+  /// automatic filters at its start (`mov_init`, 8177–8189). AVIF's, the
+  /// last of the file, has none; its delayed `moov` sets no empty one — the
+  /// flag that would is derived before it is set (8152–8156) — so AVIF
+  /// neither fragments nor clears the filters.
   const MOV: [&'static str; 7] = ["mov", "3gp", "mp4", "psp", "3g2", "ipod", "f4v"];
 
   /// The filters the muxer named `muxer`, of MIME type `mime`, inserts. The
@@ -6351,8 +6345,6 @@ where
     output
       .set_automatic_filters(filters)
       .map_err(|error| MuxFault::new(MuxStage::Open, error))?;
-    // ISMV clears them at its start (table H).
-    let filters = filters && !audited.clears_filters();
 
     // **The whole table is judged before anything is added**, so a
     // refusal leaves nothing written.
