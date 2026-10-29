@@ -9691,8 +9691,8 @@ where
           && !mpeg_ts_opus_mapped(extradata, ticket.ch_layout().channels()))
         || (codec == ARIB_CAPTION
           && ![
-            ffmpeg_next::ffi::AV_PROFILE_ARIB_PROFILE_A as i32,
-            ffmpeg_next::ffi::AV_PROFILE_ARIB_PROFILE_C as i32,
+            ffmpeg_next::ffi::AV_PROFILE_ARIB_PROFILE_A,
+            ffmpeg_next::ffi::AV_PROFILE_ARIB_PROFILE_C,
           ]
           .contains(&ticket.profile())) =>
     {
@@ -11045,7 +11045,7 @@ enum LanguageSpace {
 /// FFmpeg 9.0.1): each code, and the place of the next entry for its
 /// language in another codespace — the ISO 639-2/B codes first, 484 of
 /// them, then 20 ISO 639-2/T codes, then 190 ISO 639-1 codes.
-const LANGUAGES: [(&str, u16); 694] = [
+static LANGUAGES: [(&str, u16); 694] = [
   ("aar", 504),
   ("abk", 505),
   ("ace", 2),
@@ -12314,7 +12314,9 @@ fn mpeg_ts_read_back<D: AsRef<[u8]>>(
     TrackKind::Subtitle
       if description.codec() == DVB_SUBTITLE
         && stream_extradata(description)
-          .chunks_exact(5)
+          .as_chunks::<5>()
+          .0
+          .iter()
           .any(|entry| (0x20..=0x25).contains(&entry[4])) =>
     {
       F::HEARING_IMPAIRED
