@@ -103,11 +103,13 @@
 //! ([`Uncarried::Filtered`], [`AutomaticFilter`]) — at open, where open
 //! decides it, else at the write of the packet that inserts it —
 //!
-//! - MP4 and Matroska strip AAC's ADTS headers where the track states no
-//!   configuration, making it from the first frame's header, and FLV and
-//!   LATM where the track's first packet is ADTS;
-//! - MP4, Matroska, WebM, MOV's other modes and IVF join VP9's hidden
-//!   frames, with the next frame the stream shows, into superframes;
+//! - the MOV family — ISMV and AVIF aside — and Matroska strip AAC's ADTS
+//!   headers where the track states no configuration, making it from the
+//!   first frame's header, and FLV and LATM where the track's first packet
+//!   is ADTS;
+//! - the MOV family — ISMV and AVIF aside — Matroska, WebM and IVF join
+//!   VP9's hidden frames, with the next frame the stream shows, into
+//!   superframes;
 //! - Matroska joins PGS segments into display sets;
 //! - DAUD, GXF and MXF cut PCM into packets of their counts of samples;
 //!   IVF and OBU put temporal delimiters before AV1's temporal units; MCC
@@ -334,7 +336,7 @@
 //! | check | source | here |
 //! |---|---|---|
 //! | a duration or a decode gap past `i32::MAX` ticks — the gap from the last sample MP4 wrote on the track, none before the first; a subtitle's negative duration, which libavformat hands on as it is — another track's it writes as zero, or its own guess (`mux.c` 605–633), reported ([`Rewrite::Durations`]); a composition offset past `i32` | `check_pkt` 6897–6928; 6955–6959 | [`FfmpegMuxRefusal::DurationTooLong`], [`DtsGap`](FfmpegMuxRefusal::DtsGap), [`NegativeDuration`](FfmpegMuxRefusal::NegativeDuration), [`PresentationOffset`](FfmpegMuxRefusal::PresentationOffset); the last sample written, table C″ |
-//! | AMR-NB: one frame a packet; ADPCM MS and IMA WAV: a frame size | 6983–7002 | not reached: MP4's tag table holds neither (`codec_mp4_tags`, 9230–9290), refused at open ([`MuxOpenError::CodecNotCarried`]); MOV's other modes reach it |
+//! | AMR-NB: one frame a packet; ADPCM MS and IMA WAV: a frame size | 6983–7002 | not reached: MP4's tag table holds neither (`codec_mp4_tags`, 9230–9290), refused at open ([`MuxOpenError::CodecNotCarried`]); MOV's mode reaches it, its AMR and ADPCM booked (table H) |
 //! | no samples: less than a frame of a sized codec | 7006–7010 | [`PayloadRule::PartialSample`], [`PayloadRule::Empty`] |
 //! | the first packet taken as the configuration of H.264, HEVC, VVC, EVC, LCEVC, VP9, TrueHD or DNxHD where none is stated | 7024–7041 | H.264, HEVC, VVC, LCEVC and EVC refused at open ([`MuxOpenError::ConfigurationMissing`]); TrueHD refused at open; VP9's and DNxHD's boxes made from it, written |
 //! | new extradata: a sample description from the packet on, each written by its codec's writer at the trailer — AC-3's and E-AC-3's, `dac3` and `dec3`, from MP4's parse of the frames, APV's `apvC` from its packets', PCM's, TTML's and GoPro metadata's entries of no configuration, none of its bytes; MPEG-4 ALS, AAC, AV1 and FLAC's overwriting a configuration stated as none | 7044–7074, 7406–7420; grep G19 | where none of its bytes is written, reported dropped (the side-data table); FLAC's of 34 bytes ([`PayloadRule::FlacStreamInfo`]); Opus's an OpusHead `dOps` takes, H.264's, HEVC's, VVC's and LCEVC's of the track's form — Annex B or not — as the rewrite reads it ([`PayloadRule::NewExtradata`]); a configuration stated as none refused at open, so none is overwritten |
@@ -419,7 +421,9 @@
 //! | the automatic filters | table B | table B | table B | table B's |
 //!
 //! **MP4, the header** (`mov_init`, 8129–8700; `mov_write_header`): refused
-//! by name first — TrueHD's experiment (8580–8587); libavformat's own
+//! by name first — TrueHD's experiment (8580–8587), a picture past 65535
+//! (8494–8497), MPEG audio layer III below 16 kHz (8562–8574), TTML's
+//! `dfxp` tag (8597–8611), and each mode's own (table H); libavformat's own
 //! faults at open otherwise.
 //!
 //! **Matroska and WebM, the header** (`mkv_init`, 3513–3560;
@@ -625,6 +629,7 @@
 //! | Ogg (`oggenc.c` 497–765) | none a packet keeps of its own: each page the granule of the last packet it ends, its end, a reader counting the others' times from the samples or frames ([`Rewrite::Timeline`]) — VP8's first frame read back at its end | none | none: Theora's and VP8's key frames in their granules, which the reader sets by the bitstream ([`Rewrite::SyncFromBitstream`]) | a lone Vorbis, FLAC or Opus stream's later strings metadata, as a chained stream's tags; Opus's first start skip, its pre-skip | the language; no flag | in an Opus stream's tags alone: the first 1000, by position from 0, a start of rounded whole seconds and its rounded milliseconds, no end |
 //! | ASF, its streaming form (`asfenc.c` 862–1050) | the decode time, as each payload's presentation time, 32 bits of milliseconds with the preroll's 3100 added — no presentation time | none | a video payload's; every audio packet reads back a key frame ([`Rewrite::KeyFramesMarked`]) | none | a language through its ISO 639-1 code, read back as ISO 639-2/B — a tag of none not handed, so that the stream has none; no flag | markers: a start in 100 ns, numbered by position, each ended where the next starts; the streaming form none |
 //! | MXF, MXF D-10, MXF OP-Atom (`mxfenc.c` 3222–3628) | none: each packet's times replaced by its count on its stream, the file counting edit units, its reader each stream's times from them ([`Rewrite::Timeline`]); PCM cut into the edit units of the video's frame rate, OP-Atom's of 25, the last padded with silence ([`AutomaticFilter::PcmRechunk`]); the packets past the last edit unit every track fills dropped at the end ([`Uncarried::Trailing`]) | none | none: its reader's parser judges the pictures ([`Rewrite::SyncFromBitstream`]) | none | none | none |
+//! | the MOV family's modes beside MP4 — MOV, 3GP, 3G2, PSP, iPod, F4V, ISMV, AVIF (`movenc.c`) | MP4's, its sample tables and edit list; F4V's and AVIF's moved by libavformat, of no `AVFMT_TS_NEGATIVE` ([`Uncarried::TimesShifted`]); ISMV fragmenting with no edit list, each track's times its own ([`Rewrite::Timeline`]), its every sample held until the trailer | MP4's | MP4's | MP4's; ISMV's start skip dropped | MOV's language through the Macintosh table, every other's packed; the enabled flag, MP4's mode its DASH roles too | MOV's and iPod's chapter track and Nero list, as MP4's; 3GP's, 3G2's, F4V's and ISMV's Nero list alone — the first 255, their starts in 100 ns, numbered by position from 0, the last ended at the file's end; PSP's and AVIF's none |
 //!
 //! **What each refuses**:
 //!
@@ -654,6 +659,8 @@
 //! | NUT, at open | raw video of a tag its tables do not hold; a video stream of no width or height, an audio one of no sample rate or channels, a configuration of 2^30 bytes or more; a chapter starting past its count; a time base not in lowest terms | written under the tables' first raw tag, RGB 5:5:5's, read back as that; a stream header its reader refuses; wrapped; a main header its reader refuses (`nut.c` 50; `nutdec.c` 233–240, 447–470; `nutenc.c` 601) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ChapterSpan`]; the time base handed reduced — L90 |
 //! | MXF, MXF D-10, MXF OP-Atom | an MPEG-2 picture of coding type 0, or of a profile and level MXF labels no codec for; a P or B picture, whose index offsets this release does not mirror; DNxHD's first frame short of its compression id, or of an id MXF labels none for; a frame of another size than a constant-bit-rate index counts — MXF D-10's of its bit rate, DNxHD's of its first; an empty packet; at the end, a track no packet reached | refused after taking it; its index written at the next segment, the whole file lost at an offset past a byte; refused after taking it; refused after taking it; an essence element of none; nothing written, the trailer failing (`mxfenc.c` 2361–2397, 2793–2858, 3325–3458, 3487–3606) | [`PayloadRule::FrameHeader`], [`PayloadRule::PredictedPicture`], [`PayloadRule::FrameSize`], [`PayloadRule::Empty`], [`FfmpegMuxRefusal::NoFrame`] — L99 |
 //! | MXF, MXF D-10, MXF OP-Atom, at open | a codec but MPEG-2, DNxHD and ProRes video — MXF D-10's MPEG-2 alone — and 16- and 24-bit PCM: H.264, DV, FFV1 and JPEG 2000, whose frame parsers this release has not audited, and the data and caption tracks, booked; a first track not the one video track, OP-Atom's second track, MXF D-10's audio track not its second; a frame rate MXF names no content package for, or none; no pixel format; ProRes of no profile its labels name; sound but at 48 kHz, OP-Atom's but mono; MXF D-10's video at a bit rate it names not, or at a rate but 25 and 30000/1001; its sound past eight channels, or of a block alignment not its channels' samples | refused at its start; or its label another standard's; or its writer dividing by the alignment (`mxfenc.c` 2941–3165, 3222–3248) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ConfigurationInvalid`] — L98 |
+//! | the MOV family's modes | MP4's packet rules; ISMV's and AVIF's samples past the buffer they are held in until the trailer | as MP4's; the buffer refusing the write, the sample tables counting bytes the file lacks (`movenc.c` 6961–6981; `aviobuf.c` 1281–1311) | as MP4's; [`PayloadRule::FragmentSize`] — L103 |
+//! | the MOV family's modes, at open | a codec this release admits not beside MP4's — MOV's raw video, DV, MPEG-2, H.263, DNxHD, ProRes, PCM, MP3, AMR, ADPCM, QDM2, G.726, iLBC, and H.264 of an intra profile or AVC-Intra tag; 3GP's and 3G2's H.263 and AMR; F4V's VP6; ISMV's WMA Pro and TTML; PSP's every codec but H.264, MPEG-4 Part 2 and AAC; AVIF's alpha plane — booked; a picture past 65535; MPEG audio layer III below 16 kHz outside MOV; TTML's `dfxp` tag outside ISMV; PSP's table of other than one video and one audio track, AVIF's of more than one; the Nero list's untitled chapter, a title past 255 bytes | refused at the start, written with no configuration box, or so that it reads back otherwise (`movenc.c` 1380–2140, 5040–5064, 6431–6448, 8129–8650) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`] — L102 |
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -794,7 +801,11 @@ struct Written {
 /// MPEG audio layer II, which the base names no constant for.
 const MP2: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MP2 as i32);
 
-/// The mode a muxer of the MOV family registers (`movenc.h` 38–46).
+/// The mode a muxer of the MOV family registers (`movenc.h` 38–46): one
+/// writer, MP4's packet path, each mode's differences its own rows of
+/// table H — its tag table and what of it this release admits
+/// ([`mov_admitted`]), its language, roles, covers and chapters, and
+/// ISMV's fragments and AVIF's held samples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MovMode {
   Mp4,
@@ -1159,14 +1170,62 @@ impl Audited {
     )
   }
 
-  /// The family whose packet rules the muxer meets.
+  /// The family whose packet rules the muxer meets: every mode of the
+  /// MOV family MP4's, one packet path (`mov_write_single_packet`,
+  /// `movenc.c` 6935–7445), each mode's differences its own rows (table H,
+  /// [`MovMode`]).
   const fn family(self) -> Family {
     match self {
-      Self::Mov(MovMode::Mp4) => Family::Mp4,
+      Self::Mov(_) => Family::Mp4,
       Self::Matroska => Family::Matroska,
       Self::WebM => Family::WebM,
       _ => Family::Other,
     }
+  }
+
+  /// Whether this release admits `codec` in the muxer: every codec its tag
+  /// table holds, but in the MOV family's modes beside MP4 those
+  /// [`mov_admitted`] names (table H).
+  fn admits(self, codec: CodecId) -> bool {
+    match self {
+      Self::Mov(mode) if mode != MovMode::Mp4 => mov_admitted(mode).contains(&codec),
+      _ => true,
+    }
+  }
+
+  /// Whether the MOV family's mode writes a cover: MP4's, iPod's and F4V's
+  /// iTunes metadata, written into the `moov` at the trailer
+  /// (`mov_write_udta_tag`, `movenc.c` 5077–5103; `mov_write_covr`,
+  /// 4815–4839). MOV's QuickTime strings and 3GP's 3GPP ones hold none,
+  /// PSP and AVIF write no `udta` (5445–5448), and ISMV writes its `moov`
+  /// at its header, before any packet (8155–8189, 8794–8800).
+  const fn writes_covers(self) -> bool {
+    matches!(self, Self::Mov(MovMode::Mp4 | MovMode::Ipod | MovMode::F4v))
+  }
+
+  /// Whether the MOV family's mode writes a chapter track, which its reader
+  /// lays over the Nero list: MP4's, MOV's and iPod's (`mov_init`,
+  /// `movenc.c` 8326–8327; `mov_create_chapter_track`, 7727–7815).
+  const fn chapter_track(self) -> bool {
+    matches!(self, Self::Mov(MovMode::Mp4 | MovMode::Mov | MovMode::Ipod))
+  }
+
+  /// Whether the MOV family's mode writes its chapters into the Nero list
+  /// alone: 3GP's, 3G2's, F4V's and ISMV's (`mov_write_udta_tag`, `movenc.c`
+  /// 5105–5106) — PSP and AVIF write no `udta` (5445–5448).
+  const fn nero_chapters(self) -> bool {
+    matches!(
+      self,
+      Self::Mov(MovMode::Gp3 | MovMode::G3g2 | MovMode::F4v | MovMode::Ism)
+    )
+  }
+
+  /// Whether the muxer's start clears libavformat's automatic filters:
+  /// ISMV's empty `moov` (`mov_init`, `movenc.c` 8177–8189). AVIF's delayed
+  /// one sets no empty `moov` — the flag that would is derived before it is
+  /// set (8152–8156) — so its filters stand and it does not fragment.
+  const fn clears_filters(self) -> bool {
+    matches!(self, Self::Mov(MovMode::Ism))
   }
 }
 
@@ -1197,6 +1256,14 @@ impl Family {
 /// document — is held to it (table B of the census, see [the
 /// module](self)).
 const PACKET_BYTES_MAX: u64 = i32::MAX as u64 - 65;
+
+/// The most bytes of a track's samples ISMV and AVIF hold until their
+/// trailer: a dynamic buffer refuses a write past `INT_MAX` and leaves the
+/// rest unwritten while the sample tables count it (`dyn_buf_write`,
+/// `aviobuf.c` 1281–1311; `mov_write_single_packet`, `movenc.c` 6961–6981),
+/// its close writes its padding into it, and AVIF counts its `mdat`'s size
+/// in an `int` of the buffer's and 8 (`avif_write_trailer`, 9190–9191).
+const FRAGMENT_BYTES_MAX: u64 = i32::MAX as u64 - 128;
 
 /// The most bytes Matroska and WebM take of one block — its payload as
 /// written and the side data written with it — so that a cluster holds
@@ -1247,6 +1314,9 @@ struct Bounds {
   /// The most bytes a container counts its file in where it counts it in
   /// 32 bits: WAV's ([`PayloadRule::FileSize`]).
   file: u64,
+  /// The most bytes of a track's samples ISMV and AVIF hold in a dynamic
+  /// buffer until their trailer ([`PayloadRule::FragmentSize`]).
+  fragment: u64,
 }
 
 impl Bounds {
@@ -1255,6 +1325,7 @@ impl Bounds {
     packet: PACKET_BYTES_MAX,
     block: MATROSKA_BLOCK_BYTES_MAX - MATROSKA_BLOCK_OVERHEAD,
     file: u32::MAX as u64,
+    fragment: FRAGMENT_BYTES_MAX,
   };
 }
 
@@ -1340,6 +1411,7 @@ impl MuxOptions {
         real.block
       },
       file: self.bounds.file,
+      fragment: self.bounds.fragment,
     };
     self
   }
@@ -1353,6 +1425,19 @@ impl MuxOptions {
   pub const fn with_lowered_file_bound(mut self, bytes: u64) -> Self {
     if bytes < self.bounds.file {
       self.bounds.file = bytes;
+    }
+    self
+  }
+
+  /// Lowers the bytes of a track's samples ISMV and AVIF hold until their
+  /// trailer — `INT_MAX` less the dynamic buffer's padding and AVIF's
+  /// `mdat` header — to `bytes`, never raising it: the laws' seam
+  /// ([`PayloadRule::FragmentSize`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_fragment_bound(mut self, bytes: u64) -> Self {
+    if bytes < self.bounds.fragment {
+      self.bounds.fragment = bytes;
     }
     self
   }
@@ -1568,9 +1653,11 @@ pub enum Uncarried {
   },
   /// A chapter the container does not write at all — table H of the
   /// census: no raw stream's writer, nor IVF's, WAV's, Wave64's, ADTS's,
-  /// FLAC's, FLV's, AVI's or ASF's streaming form's, writes a chapter
-  /// (FLAC's comment block holds the file's tags alone, `flacenc.c` 72–80;
-  /// `asfenc.c` 575).
+  /// FLAC's, FLV's, AVI's, ASF's streaming form's, the MPEG streams', the
+  /// MXF muxers', PSP's or AVIF's, writes a chapter (FLAC's comment block
+  /// holds the file's tags alone, `flacenc.c` 72–80; `asfenc.c` 575;
+  /// `movenc.c` 5445–5448); the Nero list 3GP, 3G2, F4V and ISMV write
+  /// their chapters into alone holds the first 255 (`movenc.c` 5043).
   Chapter {
     /// The chapter's position in the table the muxer was opened with.
     chapter: usize,
@@ -1791,7 +1878,16 @@ pub enum Rewrite {
   /// stream again — a video packet that shares one reads back with no time
   /// (`flush_packet`, `mpegenc.c` 640–968); and MPEG-TS's audio, gathered
   /// into PES packets of a few, the first one's times alone written
-  /// (`mpegtsenc.c` 2205–2236): reported at open.
+  /// (`mpegtsenc.c` 2205–2236): reported at open. And the MXF muxers, which
+  /// replace each packet's times with its count on its stream
+  /// (`mxf_interleave`, `mxfenc.c` 3618–3628); and ISMV, which fragments
+  /// with no edit list and writes each fragment's start into a `tfxd` box
+  /// FFmpeg's reader does not read, no `tfdt`: each track's decode times
+  /// read from zero, moved by its first composition offset, its reader
+  /// moving the presentation times past the largest negative one, so that
+  /// a track's start, and a packet before zero or marked discarded, move —
+  /// each track its own way (`movenc.c` 8177–8205, 7404–7410, 5876–5890,
+  /// 5734–5755): reported at open.
   Timeline,
   /// The container writes a packet's presentation time and not its decode
   /// time, which a reader takes to be the presentation time: IVF
@@ -2336,6 +2432,14 @@ pub enum PayloadRule {
   /// written.
   #[error("the MPEG-2 picture is predicted, which this release does not write into MXF")]
   PredictedPicture,
+  /// ISMV and AVIF: a sample that would take the track's samples past the
+  /// dynamic buffer they are held in until the trailer — `INT_MAX` bytes,
+  /// past which the buffer refuses the write and the sample tables count
+  /// bytes the file lacks (`mov_write_single_packet`, `movenc.c` 6961–6981;
+  /// `dyn_buf_write`, `aviobuf.c` 1281–1311); ISMV holds every sample of a
+  /// track until then, as no option this muxer sets flushes a fragment.
+  #[error("the sample would take what the container holds of the track past its buffer")]
+  FragmentSize,
   /// AAC framed in an ADTS header on a track whose configuration is
   /// stated, into MP4 or Matroska, which take raw AAC, where no automatic
   /// filter converts it: MP4 refuses the first such packet after taking it
@@ -2366,7 +2470,7 @@ pub enum PayloadRule {
   /// writes the packet at a negative size (94–95).
   ///
   /// In another container whose first packet inserts the filter — FLV,
-  /// LATM, MOV's other modes (table B) — a packet the filter refuses after
+  /// LATM (table B) — a packet the filter refuses after
   /// taking it, one whose program config element runs past its payload,
   /// which it would put out at a negative size, and, on a configured
   /// track, the ADTS packet that inserts it where libavcodec does not parse
@@ -2661,7 +2765,9 @@ pub enum MuxOpenError {
   /// NUT's of no width or height, whose stream header NUT's reader refuses
   /// (`decode_stream_header`, `nutdec.c` 456–457); or VP8's in Ogg, whose
   /// header holds the width and height in 16 bits and the aspect ratio's
-  /// terms in 24 (`ogg_build_vp8_headers`, `oggenc.c` 431–434).
+  /// terms in 24 (`ogg_build_vp8_headers`, `oggenc.c` 431–434); or the MOV
+  /// family's past 65535, which its start refuses (`mov_init`, `movenc.c`
+  /// 8494–8497).
   #[error("track {}'s dimensions do not fit the container's header", .track.get())]
   Dimensions {
     /// The track.
@@ -2812,7 +2918,10 @@ pub enum MuxOpenError {
   /// of a frame rate, a pixel format, a bit rate or a ProRes profile they
   /// refuse or label as another, and sound of a rate, channels or block
   /// alignment they refuse or write otherwise (`mxfenc.c` 2890–3165,
-  /// 3222–3248); and one Ogg's start refuses — FLAC's short of its 34-byte
+  /// 3222–3248); the MOV family's MPEG audio layer III below 16 kHz outside
+  /// MOV, and TTML of ISMV's `dfxp` tag outside ISMV, which its start
+  /// refuses (`mov_init`, `movenc.c` 8562–8574, 8597–8611); and one Ogg's
+  /// start refuses — FLAC's short of its 34-byte
   /// STREAMINFO,
   /// Speex's of its 80-byte header, Opus's of its 19-byte OpusHead,
   /// Vorbis's and Theora's not three headers, Theora's first short of its
@@ -2851,7 +2960,10 @@ pub enum MuxOpenError {
   /// A track the container has no place for where it lies in the table:
   /// MXF's and MXF D-10's first timed track not their one video track, or
   /// a second video track; MXF D-10's audio track not its second; MXF
-  /// OP-Atom's second track (`mxf_init`, `mxfenc.c` 2946–2966, 3043–3047).
+  /// OP-Atom's second track (`mxf_init`, `mxfenc.c` 2946–2966, 3043–3047);
+  /// PSP's of other than one video and one audio track, named at the first
+  /// track where one is missing (`mov_write_header`, `movenc.c` 6431–6448);
+  /// AVIF's second track, its alpha plane's booked (8250–8270).
   #[error("track {} has no place where it lies in the container's table", .track.get())]
   TrackLayout {
     /// The first track out of place.
@@ -2874,18 +2986,22 @@ pub enum MuxOpenError {
   /// Nero list and only a titled one into its chapter track
   /// (`mov_create_chapter_track`, `movenc.c` 7791–7807), and its reader
   /// lays the track's chapters over the list's by position, so the
-  /// chapters after it read back as others — table E of the census.
+  /// chapters after it read back as others — table E of the census; MOV
+  /// and iPod likewise. 3GP, 3G2, F4V and ISMV write the Nero list alone,
+  /// an untitled chapter there titled empty, which reads back so
+  /// (`mov_write_chpl_tag`, 5040–5064; `mov_read_chpl`, `mov.c` 614–650).
   #[error("chapter {chapter} has no title, which MP4's chapter track needs")]
   ChapterWithoutTitle {
     /// The chapter's position in the table.
     chapter: usize,
   },
-  /// A chapter title longer than the 16-bit length the container writes it
-  /// with: MP4's chapter track's (`movenc.c` 7797–7801), which reads back
-  /// cut; ASF's marker entry's, which counts its 12 bytes and the title in
+  /// A chapter title longer than the length the container writes it with:
+  /// MP4's, MOV's and iPod's chapter track's 16 bits (`movenc.c`
+  /// 7797–7801), the Nero list's 8 of 3GP, 3G2, F4V and ISMV (5052–5055),
+  /// each read back cut; ASF's marker entry's, which counts its 12 bytes and the title in
   /// UTF-16 with its terminator (`asf_write_markers`, `asfenc.c` 337), so
   /// that a reader stepping by it misreads the markers after.
-  #[error("chapter {chapter}'s title is longer than MP4's chapter track holds")]
+  #[error("chapter {chapter}'s title is longer than the container writes")]
   ChapterTitleTooLong {
     /// The chapter's position in the table.
     chapter: usize,
@@ -2978,6 +3094,8 @@ struct TrackState {
   key_times: Option<(i128, i128)>,
   /// The MXF muxers: what they have learned of the track's frames.
   mxf: MxfMirror,
+  /// ISMV and AVIF: the bytes of the track's samples they hold.
+  buffered: u64,
 }
 
 /// What the ADTS muxer knows of an AAC track's configuration
@@ -3223,6 +3341,9 @@ impl Shift {
     tracks: &[(TrackKind, CodecId, bool)],
   ) -> Option<Self> {
     let by_pts = match family {
+      // F4V and AVIF, of no `AVFMT_TS_NEGATIVE`, have libavformat's move
+      // by decode times (`movenc.c` 9500–9520).
+      Family::Mp4 if shifts => false,
       Family::Mp4 => return None,
       Family::Matroska | Family::WebM => {
         let mut by_pts = true;
@@ -3559,6 +3680,9 @@ struct PacketRules {
   /// The MXF muxers: what they read of the track's frames, and how they
   /// count its packets ([`MxfRules`]).
   mxf: Option<MxfRules>,
+  /// ISMV and AVIF: the track's samples held in a buffer until the
+  /// trailer ([`PayloadRule::FragmentSize`]).
+  buffered: bool,
 }
 
 /// What an MXF muxer does with a track's packets (`mxf_write_packet`,
@@ -3960,7 +4084,7 @@ impl PacketRules {
       Some(Earliest::Presentation(-matroska_codec_delay(
         kind, codec, time_base,
       )))
-    } else if family == Family::Other && shifts {
+    } else if matches!(family, Family::Other | Family::Mp4) && shifts {
       Some(Earliest::Decode(0))
     } else {
       None
@@ -4150,6 +4274,7 @@ impl PacketRules {
         .flatten(),
       ts_clock: audited == Audited::MpegTs,
       mxf: None,
+      buffered: matches!(audited, Audited::Mov(MovMode::Ism | MovMode::Avif)),
     }
   }
 }
@@ -4805,8 +4930,10 @@ struct Sites {
 
 impl Sites {
   /// The MOV family: every muxer whose `check_bitstream` is MOV's
-  /// (`movenc.c` 9343–9512). AVIF's, the last of the file, has none.
-  const MOV: [&'static str; 8] = ["mov", "3gp", "mp4", "psp", "3g2", "ipod", "ismv", "f4v"];
+  /// (`movenc.c` 9343–9512) but ISMV, whose start clears the automatic
+  /// filters ([`Audited::clears_filters`]). AVIF's, the last of the file,
+  /// has none.
+  const MOV: [&'static str; 7] = ["mov", "3gp", "mp4", "psp", "3g2", "ipod", "f4v"];
 
   /// The filters the muxer named `muxer`, of MIME type `mime`, inserts. The
   /// audio muxer named `matroska` (`audio/x-matroska`) is reached only in a
@@ -5873,12 +6000,15 @@ impl SideRules {
       if self.family == Family::Mp4 {
         // MP4 reads the end skip alone, and only to trim the track's end in
         // its edit list — which the last packet's sets — where the codec
-        // fixes a frame's samples (`movenc.c` 7311–7319, 7333–7342).
-        return Some(if self.frame_size == 0 {
-          Dropped
-        } else {
-          PossiblyDropped
-        });
+        // fixes a frame's samples (`movenc.c` 7311–7319, 7333–7342); ISMV,
+        // fragmenting, writes no edit list (8195–8205).
+        return Some(
+          if self.frame_size == 0 || self.audited == Some(Audited::Mov(MovMode::Ism)) {
+            Dropped
+          } else {
+            PossiblyDropped
+          },
+        );
       }
       // Matroska writes an audio block's end skip as its discard padding
       // (`matroskaenc.c` 2922–2934), and a start skip only as the stream's
@@ -6114,6 +6244,8 @@ struct Learned {
   key_times: Option<(i128, i128)>,
   /// The MXF muxers: what they know of the track's frames after it.
   mxf: Option<MxfMirror>,
+  /// The bytes the container writes of the packet's sample.
+  written: u64,
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
@@ -6219,6 +6351,8 @@ where
     output
       .set_automatic_filters(filters)
       .map_err(|error| MuxFault::new(MuxStage::Open, error))?;
+    // ISMV clears them at its start (table H).
+    let filters = filters && !audited.clears_filters();
 
     // **The whole table is judged before anything is added**, so a
     // refusal leaves nothing written.
@@ -6241,10 +6375,21 @@ where
     let mut spans = Vec::with_capacity(chapters.len());
     for (index, chapter) in chapters.iter().enumerate() {
       spans.push(chapter_span(index, chapter)?);
-      if family == Family::Mp4 {
+      // The chapter track's titles of a 16-bit length; the Nero list's of
+      // an 8-bit one, cut past it, and an untitled chapter's read back
+      // titled empty (`mov_write_chpl_tag`, `movenc.c` 5040–5064;
+      // `mov_read_chpl`, `mov.c` 614–650).
+      let longest = if audited.chapter_track() {
+        Some(usize::from(u16::MAX))
+      } else if audited.nero_chapters() {
+        Some(usize::from(u8::MAX))
+      } else {
+        None
+      };
+      if let Some(longest) = longest {
         match chapter.title() {
           None => return Err(MuxOpenError::ChapterWithoutTitle { chapter: index }),
-          Some(title) if title.as_str().len() > usize::from(u16::MAX) => {
+          Some(title) if title.as_str().len() > longest => {
             return Err(MuxOpenError::ChapterTitleTooLong { chapter: index });
           }
           Some(_) => {}
@@ -6288,7 +6433,7 @@ where
         .filter(|(_, road)| !matches!(road, Road::NotWritten))
         .map(|(description, _)| description),
     );
-    if family == Family::Mp4
+    if audited.chapter_track()
       && let Some(chapter) = mp4_chapter_sample_refused(chapters, &spans, movie_timescale)
     {
       return Err(MuxOpenError::ChapterSample { chapter });
@@ -6308,9 +6453,14 @@ where
     {
       return Err(MuxOpenError::StreamIds { track });
     }
-    // The MXF muxers place each track by its kind.
+    // The MXF muxers place each track by its kind; PSP and AVIF their few.
     if let Audited::Mxf(kind) = audited
       && let Some(track) = mxf_misplaced(kind, &tracks, &roads)
+    {
+      return Err(MuxOpenError::TrackLayout { track });
+    }
+    if let Audited::Mov(mode) = audited
+      && let Some(track) = mov_misplaced(mode, &tracks, &roads)
     {
       return Err(MuxOpenError::TrackLayout { track });
     }
@@ -6655,6 +6805,7 @@ where
           ),
           ..MxfMirror::default()
         },
+        buffered: 0,
       });
     }
 
@@ -7232,6 +7383,7 @@ where
     if let Some(mxf) = plan.learned.mxf {
       state.mxf = mxf;
     }
+    state.buffered += plan.learned.written;
     if let Some(sample) = plan.learned.sample {
       state.sample = Some(sample);
     }
@@ -8034,6 +8186,11 @@ fn check_packet_rules(
   } else {
     len
   };
+  // ISMV and AVIF hold the track's samples until the trailer — AV1's
+  // OBUs filtered, never longer (`ff_av1_filter_obus`).
+  if rules.buffered && state.buffered + written > bounds.fragment {
+    return refused(PayloadRule::FragmentSize);
+  }
   if rules.matroska_block && !config_only {
     // Every block the container writes of the packet — the packet as
     // written, or each packet the track's filter puts out with it — and
@@ -8112,6 +8269,7 @@ fn check_packet_rules(
     place,
     key_times,
     mxf,
+    written,
   })
 }
 
@@ -8574,7 +8732,7 @@ fn judge<W, D: AsRef<[u8]>>(
         }
         Road::Attachment
       }
-      Family::Mp4 if is_cover_codec(codec) => {
+      Family::Mp4 if is_cover_codec(codec) && audited.writes_covers() => {
         // Its one packet is built after the header is written; what its
         // builder would refuse is refused here, nothing written.
         if let Some(file) = description.file()
@@ -8592,7 +8750,10 @@ fn judge<W, D: AsRef<[u8]>>(
       _ => Road::NotWritten,
     },
     _ => {
-      if output.query_codec(codec) == CodecQuery::NotCarried || header_refuses(family, codec) {
+      if output.query_codec(codec) == CodecQuery::NotCarried
+        || header_refuses(family, codec)
+        || !audited.admits(codec)
+      {
         return Err(MuxOpenError::CodecNotCarried { track, codec });
       }
       if configuration_missing(
@@ -8613,7 +8774,7 @@ fn judge<W, D: AsRef<[u8]>>(
         return Err(MuxOpenError::Cropping { track });
       }
       let layout = LayoutView::of(description.side_data().ch_layout());
-      if family == Family::Mp4 && !mp4_pcm_layout_written(codec, layout) {
+      if audited == Audited::Mov(MovMode::Mp4) && !mp4_pcm_layout_written(codec, layout) {
         return Err(MuxOpenError::ChannelLayout { track });
       }
       if let Some(refusal) = audited_refusal(audited, track, description, filters) {
@@ -8939,6 +9100,138 @@ where
       Some(MuxOpenError::ConfigurationInvalid { track, codec })
     }
     Audited::Mxf(kind) => mxf_refusal(kind, track, description),
+    Audited::Mov(mode) => mov_refusal(mode, track, description),
+    _ => None,
+  }
+}
+
+/// The codecs this release admits in each mode of the MOV family beside
+/// MP4, whose codecs are its tag table's and tables C to C″'s: of the
+/// codecs each mode's tag table holds, those its paths write as MP4's do —
+/// a sample entry of the codec's own configuration box, the packets as
+/// MP4 writes them (`mov_write_video_tag`, `mov_write_audio_tag`,
+/// `mov_write_single_packet`). The rest are booked, each to be admitted by
+/// an audit of its own: MOV's raw video, DV, MPEG-2's XDCAM labels and
+/// partial sync samples, H.263, DNxHD, ProRes and its labels, PCM's
+/// QuickTime descriptions, AMR, ADPCM, QDM2, G.726 and iLBC (`movenc.c`
+/// 1380–1560, 1940–2140, 7348–7356, 7686–7720); 3GP's and 3G2's H.263 and
+/// AMR; F4V's VP6; ISMV's WMA Pro and TTML; PSP's every codec of MP4's but
+/// H.264, MPEG-4 Part 2 and AAC; AVIF's alpha plane.
+const fn mov_admitted(mode: MovMode) -> &'static [CodecId] {
+  match mode {
+    MovMode::Mp4 => &[],
+    MovMode::Mov => &[
+      CodecId::H264,
+      CodecId::HEVC,
+      CodecId::MPEG4,
+      CodecId::AAC,
+      CodecId::ALAC,
+      CodecId::AC3,
+      CodecId::EAC3,
+      CodecId::MOV_TEXT,
+    ],
+    MovMode::Ipod => &[
+      CodecId::H264,
+      CodecId::MPEG4,
+      CodecId::AAC,
+      CodecId::ALAC,
+      CodecId::AC3,
+      CodecId::MOV_TEXT,
+    ],
+    MovMode::Gp3 | MovMode::G3g2 => &[
+      CodecId::H264,
+      CodecId::MPEG4,
+      CodecId::AAC,
+      CodecId::MOV_TEXT,
+    ],
+    MovMode::Psp => &[CodecId::H264, CodecId::MPEG4, CodecId::AAC],
+    MovMode::F4v => &[CodecId::H264, CodecId::AAC, CodecId::MP3],
+    MovMode::Ism => &[CodecId::H264, CodecId::AAC],
+    MovMode::Avif => &[CodecId::AV1],
+  }
+}
+
+/// What the MOV family's start refuses of a timed track, by mode
+/// (`mov_init`, `movenc.c` 8448–8650), and the codecs a mode beside MP4
+/// admits ([`mov_admitted`]): in every mode a picture wider or taller
+/// than 65535 (8494–8497, [`MuxOpenError::Dimensions`]); MPEG audio layer
+/// III below 16 kHz outside MOV (8562–8574); TTML of ISMV's `dfxp` tag
+/// outside ISMV (8597–8611); MOV's H.264 of an intra profile, or an
+/// AVC-Intra tag, written with no `avcC` (1970–2030, 2899–2903) —
+/// booked ([`MuxOpenError::CodecNotCarried`]).
+fn mov_refusal<D: AsRef<[u8]>>(
+  mode: MovMode,
+  track: TrackIndex,
+  description: &TrackDescription<Ffmpeg, D, CodecTicket>,
+) -> Option<MuxOpenError> {
+  const DFXP: u32 = u32::from_le_bytes(*b"dfxp");
+  const AVC_INTRA: [&[u8; 4]; 13] = [
+    b"ai5p", b"ai5q", b"ai52", b"ai53", b"ai55", b"ai56", b"ai1p", b"ai1q", b"ai12", b"ai13",
+    b"ai15", b"ai16", b"AVin",
+  ];
+  let codec = description.codec();
+  let ticket = description.side_data();
+  if description.kind() == TrackKind::Video
+    && (ticket.width() > i32::from(u16::MAX) || ticket.height() > i32::from(u16::MAX))
+  {
+    return Some(MuxOpenError::Dimensions { track });
+  }
+  if mode == MovMode::Mov
+    && codec == CodecId::H264
+    && (ticket.profile() & ffmpeg_next::ffi::AV_PROFILE_H264_INTRA != 0
+      || AVC_INTRA
+        .iter()
+        .any(|tag| u32::from_le_bytes(**tag) == ticket.codec_tag()))
+  {
+    return Some(MuxOpenError::CodecNotCarried { track, codec });
+  }
+  if (mode != MovMode::Mov && codec == CodecId::MP3 && ticket.sample_rate() < 16_000)
+    || (mode != MovMode::Ism && codec == CodecId::TTML && ticket.codec_tag() == DFXP)
+  {
+    return Some(MuxOpenError::ConfigurationInvalid { track, codec });
+  }
+  None
+}
+
+/// The first track the MOV family's mode has no place for where it lies in
+/// the table: PSP writes one video and one audio track and no other, a
+/// cover aside (`mov_write_header`, `movenc.c` 6431–6448) — the first track
+/// where one of the two is missing; AVIF one video track, its alpha plane's
+/// second booked (`mov_init`, 8250–8270).
+fn mov_misplaced<D, S>(
+  mode: MovMode,
+  tracks: &[TrackDescription<Ffmpeg, D, S>],
+  roads: &[Road],
+) -> Option<TrackIndex> {
+  let timed: Vec<(usize, TrackKind)> = tracks
+    .iter()
+    .zip(roads)
+    .enumerate()
+    .filter(|(_, (_, road))| **road == Road::Timed)
+    .map(|(index, (description, _))| (index, description.kind()))
+    .collect();
+  match mode {
+    MovMode::Psp => {
+      let (mut video, mut audio) = (0, 0);
+      for &(index, kind) in &timed {
+        let count = match kind {
+          TrackKind::Video => &mut video,
+          TrackKind::Audio => &mut audio,
+          _ => return Some(TrackIndex::new(index)),
+        };
+        *count += 1;
+        if *count > 1 {
+          return Some(TrackIndex::new(index));
+        }
+      }
+      (video != 1 || audio != 1)
+        .then(|| TrackIndex::new(timed.first().map_or(0, |&(index, _)| index)))
+    }
+    MovMode::Avif => timed
+      .iter()
+      .enumerate()
+      .find(|(position, (_, kind))| *position > 0 || *kind != TrackKind::Video)
+      .map(|(_, &(index, _))| TrackIndex::new(index)),
     _ => None,
   }
 }
@@ -9646,6 +9939,7 @@ fn rewrites(
       mp4 && codec == CodecId::TTML && ttml_encoder,
       Rewrite::ParagraphsJoined,
     ),
+    (audited == Audited::Mov(MovMode::Ism), Rewrite::Timeline),
     (
       mp4 && (codec == CodecId::VC1 || codec == CodecId::TRUEHD),
       Rewrite::SyncFromBitstream,
@@ -9698,7 +9992,7 @@ fn losses<D: AsRef<[u8]>>(
   let kept = match audited.kept_for(description) {
     Some(kept) => kept,
     None => kept(
-      family,
+      (family, audited),
       road,
       description.kind(),
       description.codec(),
@@ -9832,6 +10126,12 @@ enum LanguageRule {
   /// subtitling or teletext descriptor as it is and read back so; any
   /// other not, or as `und`.
   ThreeBytes,
+  /// MOV's: a tag the Macintosh language table holds, written as its code
+  /// and read back as the table's first entry of it — itself; any other
+  /// written as "unspecified", which reads back as none
+  /// (`ff_mov_iso639_to_lang`, `isom.c` 233–258, 260–280, 91–231;
+  /// `movenc.c` 8455–8458).
+  Macintosh,
   /// None.
   Dropped,
 }
@@ -9855,10 +10155,25 @@ impl LanguageRule {
           == Some(tag)
       }
       Self::ThreeBytes => tag.len() == 3,
+      Self::Macintosh => !tag.is_empty() && MAC_LANGUAGES.contains(&tag),
       Self::Dropped => false,
     }
   }
 }
+
+/// The Macintosh language table's tags, by code (`mov_mdhd_language_map`,
+/// `isom.c` 91–231): a code's entry empty where it names none.
+const MAC_LANGUAGES: [&str; 139] = [
+  "eng", "fra", "ger", "ita", "dut", "sve", "spa", "dan", "por", "nor", "heb", "jpn", "ara", "fin",
+  "gre", "ice", "mlt", "tur", "hr ", "chi", "urd", "hin", "tha", "kor", "lit", "pol", "hun", "est",
+  "lav", "smi", "fo ", "per", "rus", "chi", "", "iri", "alb", "ron", "ces", "slk", "slv", "yid",
+  "sr ", "mac", "bul", "ukr", "bel", "uzb", "kaz", "aze", "aze", "arm", "geo", "mol", "kir", "tgk",
+  "tuk", "mon", "", "pus", "kur", "kas", "snd", "tib", "nep", "san", "mar", "ben", "asm", "guj",
+  "pa ", "ori", "mal", "kan", "tam", "tel", "sin", "bur", "khm", "lao", "vie", "ind", "tgl", "may",
+  "may", "amh", "tir", "orm", "som", "swa", "kin", "run", "nya", "mlg", "epo", "", "", "", "", "",
+  "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+  "", "", "", "", "wel", "baq", "cat", "lat", "que", "grn", "aym", "tat", "uig", "dzo", "jav",
+];
 
 /// A codespace of libavformat's language table (`AVLangCodespace`,
 /// `avlanguage.h`).
@@ -11040,7 +11355,7 @@ fn nut_time_base_count<D: AsRef<[u8]>>(
 /// 9.0.1, and its demuxer's for what reads back. A container this release
 /// does not know keeps everything, as far as anything is claimed.
 fn kept(
-  family: Family,
+  (family, audited): (Family, Audited),
   road: Road,
   kind: TrackKind,
   codec: CodecId,
@@ -11112,17 +11427,27 @@ fn kept(
       }
     }
     // The track's enabled flag (`enable_tracks`, `movenc.c` 7883–7923)
-    // and the DASH role `kind` boxes (4338–4356, `isom.c` 450–462).
+    // and, MP4's mode alone, the DASH role `kind` boxes (4338–4356,
+    // 4375–4378; `isom.c` 450–462); MOV's language through the Macintosh
+    // table, every other mode's packed (8455–8458).
     (Family::Mp4, Road::Timed) => Kept {
-      language: LanguageRule::Packed,
-      flags: D::DEFAULT
-        | D::HEARING_IMPAIRED
-        | D::CAPTIONS
-        | D::COMMENT
-        | D::VISUAL_IMPAIRED
-        | D::DESCRIPTIONS
-        | D::DUB
-        | D::FORCED,
+      language: if audited == Audited::Mov(MovMode::Mov) {
+        LanguageRule::Macintosh
+      } else {
+        LanguageRule::Packed
+      },
+      flags: if audited == Audited::Mov(MovMode::Mp4) {
+        D::DEFAULT
+          | D::HEARING_IMPAIRED
+          | D::CAPTIONS
+          | D::COMMENT
+          | D::VISUAL_IMPAIRED
+          | D::DESCRIPTIONS
+          | D::DUB
+          | D::FORCED
+      } else {
+        D::DEFAULT
+      },
       ..everything
     },
   }
@@ -11148,7 +11473,7 @@ fn stream_spec<'a, D: AsRef<[u8]>>(
   let declared = description.disposition();
   let written = declared.intersection(
     kept(
-      family,
+      (family, audited),
       road,
       description.kind(),
       description.codec(),
@@ -11270,6 +11595,43 @@ fn chapter_losses(
 ) -> Vec<Uncarried> {
   let mut lost = Vec::new();
   match family {
+    // 3GP's, 3G2's, F4V's and ISMV's Nero list alone: its first 255
+    // chapters, a start each in 100 ns, numbered by position from 0, its
+    // reader ending each where the next starts, the last at the file's end
+    // (`mov_write_chpl_tag`, `movenc.c` 5040–5064; `mov_read_chpl`, `mov.c`
+    // 614–650; `compute_chapters_end`, `demux.c` 2250–2285). PSP and AVIF
+    // write none.
+    Family::Mp4 if audited.nero_chapters() => {
+      const HUNDRED_NANOSECONDS: i64 = 10_000_000;
+      let written = chapters.len().min(255);
+      for (index, (chapter, &(start, end))) in chapters.iter().zip(spans).enumerate() {
+        if index >= written {
+          lost.push(Uncarried::Chapter { chapter: index });
+          continue;
+        }
+        if chapter.id() != index as i64 {
+          lost.push(Uncarried::ChapterId {
+            chapter: index,
+            id: chapter.id(),
+          });
+        }
+        let base = chapter.timebase();
+        let ends_where_the_next_starts = index + 1 < written
+          && match (chapters.get(index + 1), spans.get(index + 1)) {
+            (Some(next), Some(&(next_start, _))) => {
+              same_instant(end, base, next_start, next.timebase())
+                && counts_exactly(next_start, next.timebase(), HUNDRED_NANOSECONDS)
+            }
+            _ => false,
+          };
+        if !counts_exactly(start, base, HUNDRED_NANOSECONDS) || !ends_where_the_next_starts {
+          lost.push(Uncarried::ChapterSpan { chapter: index });
+        }
+      }
+    }
+    Family::Mp4 if !audited.chapter_track() => {
+      lost.extend((0..chapters.len()).map(|chapter| Uncarried::Chapter { chapter }));
+    }
     Family::Mp4 => {
       let movie_units = movie_timescale;
       for (index, (chapter, &(start, end))) in chapters.iter().zip(spans).enumerate() {

@@ -36,7 +36,7 @@ fn merge(
 /// The report table's language rule for a timed track of `family`.
 fn language(family: Family, tag: &str) -> bool {
   kept(
-    family,
+    (family, audited_for(family)),
     Road::Timed,
     TrackKind::Audio,
     CodecId::AAC,
@@ -54,7 +54,16 @@ fn timed_loses(
   codec: CodecId,
   flags: TrackDisposition,
 ) -> TrackDisposition {
-  flags.difference(kept(family, Road::Timed, kind, codec, flags).flags)
+  flags.difference(
+    kept(
+      (family, audited_for(family)),
+      Road::Timed,
+      kind,
+      codec,
+      flags,
+    )
+    .flags,
+  )
 }
 
 /// **MP4 keeps a language only where its three letters pack and unpack
@@ -187,7 +196,7 @@ fn each_container_reports_the_disposition_flags_it_drops() {
 fn an_attachment_road_keeps_what_its_container_writes_for_it() {
   use TrackDisposition as D;
   let attachment = kept(
-    Family::Matroska,
+    (Family::Matroska, Audited::Matroska),
     Road::Attachment,
     TrackKind::Attachment,
     CodecId::TTF,
@@ -197,7 +206,7 @@ fn an_attachment_road_keeps_what_its_container_writes_for_it() {
   assert!(attachment.language.keeps("und") && attachment.language.keeps(""));
   assert_eq!(attachment.flags, D::empty());
   let cover = kept(
-    Family::Mp4,
+    (Family::Mp4, Audited::Mov(MovMode::Mp4)),
     Road::Cover,
     TrackKind::Attachment,
     CodecId::PNG,
@@ -1172,6 +1181,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     place: 0,
     key_times: None,
     mxf: MxfMirror::default(),
+    buffered: 0,
   }
 }
 
@@ -2013,9 +2023,9 @@ fn each_container_keeps_the_side_data_it_has_a_place_for() {
 /// **The filters are those each muxer inserts, by grep 1 and 2 of the
 /// census** (table B): IVF's VP9 at its start, the filters on or off;
 /// Matroska's, WebM's and the MOV family's at the first packet, with them
-/// on; AVIF's none; AAC's in MP4 and Matroska for a track with no
-/// configuration, and in FLV, LATM and MOV's other modes undecided until
-/// the first packet; PGS's in Matroska's video muxer, and neither AAC's nor
+/// on; AVIF's and ISMV's none; AAC's in the MOV family and Matroska for a
+/// track with no configuration, and in FLV and LATM undecided until the
+/// first packet; PGS's in Matroska's video muxer, and neither AAC's nor
 /// PGS's in its audio one; PCM rechunked in DAUD, GXF and MXF.
 #[test]
 fn the_filters_are_those_each_muxer_inserts() {
@@ -2042,7 +2052,7 @@ fn the_filters_are_those_each_muxer_inserts() {
     );
   }
   for muxer in [
-    "matroska", "webm", "mov", "3gp", "mp4", "psp", "3g2", "ipod", "ismv", "f4v",
+    "matroska", "webm", "mov", "3gp", "mp4", "psp", "3g2", "ipod", "f4v",
   ] {
     assert_eq!(settle(muxer, None, CodecId::VP9, &[], true), vp9, "{muxer}");
     assert_eq!(
@@ -2051,14 +2061,14 @@ fn the_filters_are_those_each_muxer_inserts() {
       "{muxer}"
     );
   }
-  for muxer in ["avif", "mpegts", "flv", "nut"] {
+  for muxer in ["avif", "ismv", "mpegts", "flv", "nut"] {
     assert_eq!(
       settle(muxer, None, CodecId::VP9, &[], true),
       Filter::None,
       "{muxer}"
     );
   }
-  for muxer in ["mp4", "matroska"] {
+  for muxer in ["mp4", "matroska", "mov", "ipod"] {
     let filter = settle(muxer, None, CodecId::AAC, &[], true);
     assert_eq!(filter.named(), Some(A::AacAdtsToAsc), "{muxer}");
     assert_eq!(
@@ -2076,7 +2086,7 @@ fn the_filters_are_those_each_muxer_inserts() {
       "{muxer}: no filter with them off"
     );
   }
-  for muxer in ["flv", "latm", "mov", "ipod"] {
+  for muxer in ["flv", "latm"] {
     assert_eq!(
       settle(muxer, None, CodecId::AAC, &[0x11, 0x90], true),
       Filter::AdtsUndecided {

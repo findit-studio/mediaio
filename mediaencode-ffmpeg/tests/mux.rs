@@ -11154,3 +11154,451 @@ fn l99_mxf_refuses_what_its_frame_parsers_and_interleaving_lose() {
     })
   );
 }
+
+/// Each chapter of `path` as its id, its title and its span in
+/// milliseconds.
+fn chapter_rows(path: &Path) -> Vec<(i64, Option<String>, (i64, i64))> {
+  chapters(path)
+    .iter()
+    .map(|chapter| {
+      (
+        chapter.id(),
+        chapter.title().map(|title| title.as_str().to_owned()),
+        span_ms(chapter),
+      )
+    })
+    .collect()
+}
+
+/// **L100 — H.264 and AAC round-trip through the MOV family's modes
+/// beside MP4 — MOV, 3GP, 3G2, PSP, iPod, F4V — and the report says what
+/// each keeps** (table H; `movenc.c` 1380–1560, 2780–3110, 4330–4440,
+/// 5040–5110, 8129–8700): every packet reads back with its bytes, its key
+/// flag and its times — F4V's moved by libavformat, its writer of no
+/// negative times ([`Uncarried::TimesShifted`]); a language MOV writes
+/// through the Macintosh table and the others pack; the enabled flag
+/// alone of the DASH roles MP4's mode writes ([`Uncarried::Disposition`]);
+/// chapters MOV's and iPod's chapter track keeps as MP4's does, 3GP's,
+/// 3G2's and F4V's Nero list from their starts, its last ended at the
+/// file's end ([`Uncarried::ChapterSpan`]), PSP's none
+/// ([`Uncarried::Chapter`]).
+///
+/// PLANT: MOV's language taken packed; the roles taken as MP4's; the
+/// chapters taken as MP4's in every mode; F4V's move unmirrored.
+#[test]
+fn l100_streams_round_trip_through_the_mov_familys_modes() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let table = || {
+    let mut table = whole_table(&source);
+    table[1].set_language(Some("fra".into()));
+    table[1].set_disposition(TrackDisposition::DEFAULT | TrackDisposition::COMMENT);
+    table
+  };
+  let chapters = [
+    chapter_of(0, 0, 400, Some("one")),
+    chapter_of(1, 400, 1000, Some("two")),
+  ];
+  let offered = packets(&source);
+  for container in ["mov", "3gp", "3g2", "psp", "ipod", "f4v"] {
+    let target = output(&corpus, &format!("l100.{container}"));
+    let report = remuxed_to_the_end(&source, &target, container, table(), &chapters);
+    let lifted = container == "f4v";
+    assert_eq!(
+      report.uncarried().contains(&Uncarried::TimesShifted),
+      lifted,
+      "{container}"
+    );
+    // MOV's Macintosh table holds no `und`, which every other mode packs.
+    let mut kept = Vec::new();
+    if container == "mov" {
+      kept.push(Uncarried::Language {
+        track: TrackIndex::new(0),
+        tag: "und".into(),
+      });
+    }
+    kept.push(Uncarried::Disposition {
+      track: TrackIndex::new(1),
+      flags: TrackDisposition::COMMENT,
+    });
+    assert_eq!(
+      lines(&report, |line| matches!(
+        line,
+        Uncarried::Language { .. } | Uncarried::Disposition { .. }
+      )),
+      kept,
+      "{container}: the role MP4's mode alone writes"
+    );
+    let chapter_lines = lines(&report, |line| {
+      matches!(
+        line,
+        Uncarried::Chapter { .. } | Uncarried::ChapterId { .. } | Uncarried::ChapterSpan { .. }
+      )
+    });
+    match container {
+      "mov" | "ipod" => assert_eq!(chapter_lines, vec![], "{container}"),
+      "psp" => assert_eq!(
+        chapter_lines,
+        vec![
+          Uncarried::Chapter { chapter: 0 },
+          Uncarried::Chapter { chapter: 1 }
+        ],
+        "{container}"
+      ),
+      _ => assert_eq!(
+        chapter_lines,
+        vec![Uncarried::ChapterSpan { chapter: 1 }],
+        "{container}: the last ends at the file's end"
+      ),
+    }
+    if container != "psp" {
+      let back = chapter_rows(&target);
+      assert_eq!(
+        back[0],
+        (0, Some("one".to_owned()), (0, 400)),
+        "{container}"
+      );
+      assert_eq!(
+        (back[1].0, back[1].1.as_deref(), back[1].2.0),
+        (1, Some("two"), 400),
+        "{container}"
+      );
+    }
+    let back = packets(&target);
+    let lift = if lifted {
+      offered
+        .iter()
+        .filter_map(|track| in_ms(track.first().and_then(|first| first.dts)))
+        .min()
+        .map_or(0, |dts| (-dts).max(0))
+    } else {
+      0
+    };
+    for track in 0..2 {
+      assert_eq!(
+        back[track].len(),
+        offered[track].len(),
+        "{container} {track}"
+      );
+      for (index, (seen, sent)) in back[track].iter().zip(&offered[track]).enumerate() {
+        assert!(
+          seen.bytes == sent.bytes,
+          "{container} {track}/{index}: the bytes"
+        );
+        assert_eq!(
+          seen.key, sent.key,
+          "{container} {track}/{index}: the key flag"
+        );
+        assert!(
+          matches!((in_ms(seen.pts), in_ms(sent.pts)), (Some(a), Some(b)) if (a - b - lift).abs() <= 1),
+          "{container} {track}/{index}: presented at {:?}, offered at {:?}",
+          in_ms(seen.pts),
+          in_ms(sent.pts)
+        );
+      }
+    }
+    let rows: Vec<_> = FfmpegOwnedDemuxer::open(&target)
+      .expect("open")
+      .tracks()
+      .iter()
+      .map(|row| row.language().map(|tag| tag.as_str().to_owned()))
+      .collect();
+    assert_eq!(rows[1].as_deref(), Some("fra"), "{container}: the language");
+  }
+}
+
+/// **L101 — H.264 and AAC round-trip through ISMV, and AV1 through AVIF,
+/// and the report says what each keeps** (table H; `movenc.c` 5560–6160,
+/// 6935–7445, 8129–8250, 9153–9212): ISMV fragments, its start clearing
+/// the automatic filters and writing no edit list, every track's times
+/// counted from its first decode time, moved by its first composition
+/// offset, its reader moving the presentation times past the largest
+/// negative one, so that each track's times are its own
+/// ([`Rewrite::Timeline`]), a start skip dropped ([`Uncarried::SideData`])
+/// — every packet's bytes and key flag kept; AVIF writes its one AV1
+/// track's OBUs filtered ([`Rewrite::ObusFiltered`]), every frame read
+/// back from its sequence, the first also as the file's still picture,
+/// which its reader reads as a track of its own.
+///
+/// PLANT: ISMV's times reported kept; its filters taken as MOV's.
+#[test]
+fn l101_streams_round_trip_through_ismv_and_avif() {
+  let Some(corpus) = Corpus::new() else { return };
+  let rewritten = |track: usize, rewrite| Uncarried::Rewritten {
+    track: TrackIndex::new(track),
+    rewrite,
+  };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let target = output(&corpus, "l101.ismv");
+  let report = remuxed_to_the_end(&source, &target, "ismv", whole_table(&source), &[]);
+  assert_eq!(
+    field_rows(&report),
+    vec![
+      rewritten(0, Rewrite::Timeline),
+      rewritten(1, Rewrite::Timeline),
+      // MP4's own: the AAC packets' durations, the distance to the next.
+      rewritten(1, Rewrite::Durations),
+    ]
+  );
+  let offered = packets(&source);
+  let back = packets(&target);
+  for track in 0..2 {
+    assert_eq!(back[track].len(), offered[track].len(), "ISMV {track}");
+    for (index, (seen, sent)) in back[track].iter().zip(&offered[track]).enumerate() {
+      assert!(seen.bytes == sent.bytes, "ISMV {track}/{index}: the bytes");
+      assert_eq!(seen.key, sent.key, "ISMV {track}/{index}: the key flag");
+    }
+  }
+
+  let av1 = av1_mkv(&corpus);
+  let target = output(&corpus, "l101.avif");
+  let report = remuxed_to_the_end(&av1, &target, "avif", whole_table(&av1), &[]);
+  assert_eq!(
+    field_rows(&report),
+    vec![rewritten(0, Rewrite::ObusFiltered)]
+  );
+  // The still picture, its primary item, and the sequence beside it, each
+  // a track its reader reads.
+  let back: Vec<usize> = packets(&target).iter().map(Vec::len).collect();
+  assert_eq!(
+    back,
+    vec![1, packets(&av1)[0].len()],
+    "AVIF: the picture, then every frame"
+  );
+}
+
+/// **L102 — what the MOV family's modes refuse, or this release does not
+/// admit, is refused at open, nothing written** (table H; `movenc.c`
+/// 6431–6448, 8129–8650): a codec of a mode's tag table its paths write
+/// otherwise than MP4's — MOV's MP3 and PCM, 3GP's AMR, PSP's ALAC, F4V's
+/// AC-3 through its tag table, ISMV's subtitles, AVIF's every codec but
+/// AV1 — and MOV's H.264 of an intra profile, written with no `avcC`
+/// ([`MuxOpenError::CodecNotCarried`]); in every mode a picture past 65535
+/// ([`MuxOpenError::Dimensions`]), MPEG audio layer III below 16 kHz
+/// outside MOV ([`MuxOpenError::ConfigurationInvalid`]); PSP's table of
+/// other than one video and one audio track, AVIF's of more than one
+/// ([`MuxOpenError::TrackLayout`]); the Nero list's untitled chapter and
+/// title past 255 bytes ([`MuxOpenError::ChapterWithoutTitle`],
+/// [`MuxOpenError::ChapterTitleTooLong`]) — each beside a table that
+/// opens.
+///
+/// PLANT: each judgment off, its case opening or failing in FFmpeg.
+#[test]
+fn l102_the_mov_familys_modes_refuse_at_open_what_they_write_otherwise() {
+  let Some(corpus) = Corpus::new() else { return };
+  let open = |name: &str, container: &str, table, chapters: &[Chapter<Ffmpeg>]| {
+    let target = output(&corpus, name);
+    let result = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new(container),
+      table,
+      chapters,
+      PacketLimits::default(),
+    );
+    match result {
+      Ok((muxer, _)) => {
+        drop(muxer);
+        Ok(())
+      }
+      Err(error) => {
+        assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+        Err(error)
+      }
+    }
+  };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let video = || table_of(&source, TrackKind::Video).remove(0);
+  let sound = || table_of(&source, TrackKind::Audio).remove(0);
+  let mp3 = audio_file(&corpus, "l16.mp3", "libmp3lame");
+  let pcm = pcm_mkv(&corpus);
+  let alac = audio_file(&corpus, "alac.m4a", "alac");
+  let ac3 = audio_file(&corpus, "ac3.mkv", "ac3");
+  for (name, container, table, track) in [
+    (
+      "l102-mp3.mov",
+      "mov",
+      vec![table_of(&mp3, TrackKind::Audio).remove(0)],
+      0,
+    ),
+    (
+      "l102-pcm.mov",
+      "mov",
+      vec![table_of(&pcm, TrackKind::Audio).remove(0)],
+      0,
+    ),
+    (
+      "l102-alac.psp",
+      "psp",
+      vec![video(), table_of(&alac, TrackKind::Audio).remove(0)],
+      1,
+    ),
+    (
+      "l102-ac3.f4v",
+      "f4v",
+      vec![table_of(&ac3, TrackKind::Audio).remove(0)],
+      0,
+    ),
+    ("l102-h264.avif", "avif", vec![video()], 0),
+    (
+      "l102-intra.mov",
+      "mov",
+      vec![reticketed(video(), |par| {
+        par.profile = ffmpeg_next::ffi::AV_PROFILE_H264_HIGH_10_INTRA;
+      })],
+      0,
+    ),
+  ] {
+    assert!(
+      matches!(
+        open(name, container, table, &[]),
+        Err(MuxOpenError::CodecNotCarried { track: at, .. }) if at.get() == track
+      ),
+      "{name}"
+    );
+  }
+  open("l102.mov", "mov", vec![video(), sound()], &[]).expect("MOV: H.264 and AAC");
+  assert!(matches!(
+    open(
+      "l102-wide.mp4",
+      "mp4",
+      vec![reticketed(video(), |par| par.width = 65_536)],
+      &[]
+    ),
+    Err(MuxOpenError::Dimensions { .. })
+  ));
+  assert!(matches!(
+    open(
+      "l102-mp3.mp4",
+      "mp4",
+      vec![audio_rated(&mp3, 8_000).remove(0)],
+      &[]
+    ),
+    Err(MuxOpenError::ConfigurationInvalid { .. })
+  ));
+  open(
+    "l102-mp3.mp4",
+    "mp4",
+    vec![audio_rated(&mp3, 16_000).remove(0)],
+    &[],
+  )
+  .expect("16 kHz");
+  for (name, container, table, track) in [
+    ("l102-alone.psp", "psp", vec![video()], 0),
+    ("l102-two.psp", "psp", vec![video(), sound(), video()], 2),
+    (
+      "l102-two.avif",
+      "avif",
+      {
+        let av1 = av1_mkv(&corpus);
+        vec![
+          table_of(&av1, TrackKind::Video).remove(0),
+          table_of(&av1, TrackKind::Video).remove(0),
+        ]
+      },
+      1,
+    ),
+  ] {
+    assert!(
+      matches!(
+        open(name, container, table, &[]),
+        Err(MuxOpenError::TrackLayout { track: at }) if at.get() == track
+      ),
+      "{name}"
+    );
+  }
+  open("l102.psp", "psp", vec![video(), sound()], &[]).expect("PSP: one video, one audio");
+  let untitled = [chapter_of(0, 0, 500, None)];
+  assert!(matches!(
+    open("l102-untitled.3gp", "3gp", vec![video()], &untitled),
+    Err(MuxOpenError::ChapterWithoutTitle { chapter: 0 })
+  ));
+  let titled = |bytes: usize| [chapter_of(0, 0, 500, Some(&"a".repeat(bytes)))];
+  assert!(matches!(
+    open("l102-title.3gp", "3gp", vec![video()], &titled(256)),
+    Err(MuxOpenError::ChapterTitleTooLong { chapter: 0 })
+  ));
+  open("l102-title.3gp", "3gp", vec![video()], &titled(255)).expect("255 bytes");
+  // PSP writes no chapter at all: none refused, each reported.
+  open(
+    "l102-untitled.psp",
+    "psp",
+    vec![video(), sound()],
+    &untitled,
+  )
+  .expect("PSP");
+}
+
+/// **L103 — ISMV's and AVIF's held samples, and the Nero list's 255
+/// chapters** (table H; `movenc.c` 5040–5064, 6961–6981, 9153–9212): a
+/// sample that would take what ISMV or AVIF hold of a track until the
+/// trailer past the buffer it is held in is refused, the packet untouched
+/// ([`PayloadRule::FragmentSize`]); 3GP's chapters past the 255th are not
+/// written ([`Uncarried::Chapter`]).
+///
+/// PLANT: the bound off, the sample taken; the Nero list counted whole.
+#[test]
+fn l103_the_mov_familys_held_samples_and_nero_chapters() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let (table, frames) = first_track(&source, TrackKind::Audio, 2);
+  let first = audio_of(&frames[0]);
+  let bound = first.data().as_ref().len() as u64 + 10;
+  let mut muxer = muxer_with(
+    &output(&corpus, "l103.ismv"),
+    ContainerName::new("ismv"),
+    table,
+    MuxOptions::new().with_lowered_fragment_bound(bound),
+  );
+  muxer
+    .write_audio(AudioTrackPacket::new(TrackIndex::new(0), first.clone()))
+    .map_err(|error| error.map_packet(drop))
+    .expect("within the bound");
+  let next = AudioTrackPacket::new(TrackIndex::new(0), audio_of(&frames[1]));
+  let (refusal, back) = by_container(muxer.write_audio(next.clone()));
+  assert_eq!(refusal, payload(PayloadRule::FragmentSize));
+  untouched!(next, back);
+  muxer.finish().expect("finished");
+
+  let av1 = av1_mkv(&corpus);
+  let (table, frames) = first_track(&av1, TrackKind::Video, 2);
+  let unit = video_of(&frames[0]);
+  let mut muxer = muxer_with(
+    &output(&corpus, "l103.avif"),
+    ContainerName::new("avif"),
+    table,
+    MuxOptions::new().with_lowered_fragment_bound(unit.data().as_ref().len() as u64),
+  );
+  muxer
+    .write_video(VideoTrackPacket::new(TrackIndex::new(0), unit.clone()))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first frame");
+  let next = VideoTrackPacket::new(TrackIndex::new(0), video_of(&frames[1]));
+  let (refusal, back) = by_container(muxer.write_video(next.clone()));
+  assert_eq!(refusal, payload(PayloadRule::FragmentSize));
+  untouched!(next, back);
+  muxer.finish().expect("finished");
+
+  let chapters: Vec<_> = (0..257)
+    .map(|index| chapter_of(index, index * 2, index * 2 + 2, Some("c")))
+    .collect();
+  let target = output(&corpus, "l103.3gp");
+  let report = remuxed_to_the_end(&source, &target, "3gp", whole_table(&source), &chapters);
+  assert_eq!(
+    lines(&report, |line| matches!(line, Uncarried::Chapter { .. })),
+    vec![
+      Uncarried::Chapter { chapter: 255 },
+      Uncarried::Chapter { chapter: 256 }
+    ]
+  );
+  assert!(
+    report
+      .uncarried()
+      .contains(&Uncarried::ChapterSpan { chapter: 254 })
+  );
+  assert!(
+    !report
+      .uncarried()
+      .contains(&Uncarried::ChapterSpan { chapter: 253 })
+  );
+  assert_eq!(chapter_rows(&target).len(), 255);
+}

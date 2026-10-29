@@ -233,7 +233,26 @@ crate moves only when it changes.
   size than a constant-bit-rate index counts (`PayloadRule::FrameSize`,
   new), a predicted MPEG-2 picture, whose index offsets this release does
   not mirror (`PayloadRule::PredictedPicture`, new; long-GOP MPEG-2
-  booked), an empty packet; no language, no disposition, no chapter. A
+  booked), an empty packet; no language, no disposition, no chapter. The
+  MOV family's modes beside MP4 — `mov`, `3gp`, `3g2`, `psp`, `ipod`,
+  `f4v`, `ismv`, `avif` — meet MP4's rules, one writer, and their own:
+  each admits the codecs of its tag table its paths write as MP4's —
+  MOV's H.264, HEVC, MPEG-4, AAC, ALAC, AC-3, E-AC-3 and `mov_text`;
+  iPod's, 3GP's, 3G2's, PSP's, F4V's, ISMV's and AVIF's of those and AV1
+  as each table holds — the rest refused at open and booked
+  (`CodecNotCarried`); in every mode a picture past 65535 is refused
+  (`Dimensions`), and MP3 below 16 kHz outside MOV and TTML's `dfxp` tag
+  outside ISMV (`ConfigurationInvalid`) — MP4's own too; PSP's table of
+  other than one video and one audio track and AVIF's of more than one
+  (`TrackLayout`); MOV writes a language through the Macintosh table,
+  every other mode packs it; only MP4's mode writes the DASH roles; MP4,
+  iPod and F4V write a cover; MOV's and iPod's chapter track is MP4's, the
+  Nero list alone 3GP's, 3G2's, F4V's and ISMV's — 255 chapters, titles
+  of 255 bytes, an untitled chapter refused — PSP's and AVIF's none; F4V
+  and AVIF have libavformat move negative times (`TimesShifted`); ISMV
+  clears the automatic filters and writes each track's times its own
+  (`Rewrite::Timeline`); ISMV and AVIF hold a track's samples until the
+  trailer, refused past the buffer (`PayloadRule::FragmentSize`, new). A
   chapter's end is judged where the next chapter starts as written, in MP4
   and ASF too.
 - **Packet side data, by the side-data table.** What each container
