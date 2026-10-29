@@ -16,8 +16,10 @@ Its versions are its own: they do not move with the rest of the family's.
   their `with_` and `set_` builders) carry the container's
   `AV_DISPOSITION_*` bits as `mediaframe`'s `TrackDisposition`,
   re-exported from `mediaspine::demuxer`, whole — an unnamed bit
-  included. `from_track_info` copies it. `into_parts` keeps its shape: the
-  disposition, `Copy`, is read with `disposition()` before the split.
+  included. `from_track_info` copies it. `into_parts` keeps its shape and
+  drops the disposition, which `disposition()` reads before the split;
+  `TrackDescription::into_parts_with_disposition` splits a description
+  into every part, the disposition among them, losslessly.
 
 ## [0.1.1] - 2026-10-23
 

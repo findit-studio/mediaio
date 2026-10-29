@@ -1072,9 +1072,8 @@ fn l10_the_report_names_every_field_mp4s_cover_drops() {
     .iter()
     .position(|description| description.kind() == TrackKind::Attachment)
     .expect("the premise: a cover track");
-  let description = table.remove(cover);
-  let disposition = description.disposition();
-  let (timebase, params, _, cover_ticket, _, file) = description.into_parts();
+  let (timebase, params, _, cover_ticket, _, disposition, file) =
+    table.remove(cover).into_parts_with_disposition();
   let TrackParams::Attachment(params) = params else {
     panic!("the premise: the cover is an attachment");
   };

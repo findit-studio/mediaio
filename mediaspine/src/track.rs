@@ -316,8 +316,11 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
   /// Splits the description into its timebase, parameters, extradata,
   /// side data, language and — for an attachment track — its file.
   ///
-  /// The disposition is `Copy`, and is not among the parts: read it with
-  /// [`disposition`](Self::disposition) before the split.
+  /// **The disposition is dropped**: it is not among the parts. Read it
+  /// with [`disposition`](Self::disposition) before the split — it is
+  /// `Copy` — or split with
+  /// [`into_parts_with_disposition`](Self::into_parts_with_disposition),
+  /// which loses nothing.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn into_parts(
     self,
@@ -335,6 +338,43 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
       self.extradata,
       self.side_data,
       self.language,
+      self.file,
+    )
+  }
+
+  /// Splits the description into every part it holds, **losslessly**: its
+  /// timebase, parameters, extradata, side data, language, disposition
+  /// and — for an attachment track — its file, in the order a description
+  /// is built in.
+  ///
+  /// ```
+  /// # use mediaspine::{demuxer::DemuxAdapter, track::TrackDescription};
+  /// # fn split<E: DemuxAdapter, D, S>(description: TrackDescription<E, D, S>) {
+  /// let declared = description.disposition();
+  /// let (_timebase, _params, _extradata, _side_data, _language, disposition, _file) =
+  ///   description.into_parts_with_disposition();
+  /// assert_eq!(disposition, declared);
+  /// # }
+  /// ```
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_parts_with_disposition(
+    self,
+  ) -> (
+    Timebase,
+    TrackParams<E>,
+    Option<D>,
+    S,
+    Option<E::Text>,
+    TrackDisposition,
+    Option<AttachedFile<E, D>>,
+  ) {
+    (
+      self.timebase,
+      self.params,
+      self.extradata,
+      self.side_data,
+      self.language,
+      self.disposition,
       self.file,
     )
   }
@@ -643,7 +683,9 @@ mod tests {
   }
 
   /// Extradata is absent until it is given, and what goes in comes back
-  /// out of `into_parts` unchanged, with the side data beside it.
+  /// out of `into_parts_with_disposition` unchanged, with the side data
+  /// and the disposition beside it; `into_parts` gives the same, the
+  /// disposition left out.
   #[test]
   fn extradata_is_absent_until_given_and_every_part_comes_back() {
     const AVCC: &[u8] = &[0x01, 0x64, 0x00, 0x28];
@@ -660,15 +702,37 @@ mod tests {
     description.side_data_mut()[1] = 8;
     assert_eq!(description.side_data(), &[7, 8]);
 
-    let disposition = description.disposition();
-    let (timebase, params, extradata, side_data, language, file) = description.into_parts();
+    let description = description
+      .with_language(Some("eng"))
+      .with_disposition(TrackDisposition::DEFAULT | TrackDisposition::from_u32(0x0040_0000));
+    let (timebase, params, extradata, side_data, language, disposition, file) =
+      description.into_parts_with_disposition();
     assert_eq!(timebase, ms_tb());
     assert_eq!(params.kind(), TrackKind::Video);
     assert_eq!(extradata, Some(AVCC));
     assert_eq!(side_data, [7, 8]);
-    assert_eq!(language, None);
-    assert_eq!(disposition, TrackDisposition::empty());
+    assert_eq!(language, Some("eng"));
+    assert_eq!(
+      disposition,
+      TrackDisposition::DEFAULT | TrackDisposition::from_u32(0x0040_0000),
+      "the disposition, an unnamed bit included"
+    );
     assert!(file.is_none(), "a video track carries no file");
+
+    let description = TrackDescription::<Loopback, &[u8], ()>::new(
+      ms_tb(),
+      TrackParams::Video(VideoTrackParams::new(27, 1280, 720, 0, None)),
+      (),
+    )
+    .expect("a video track")
+    .with_extradata(Some(AVCC))
+    .with_disposition(TrackDisposition::DEFAULT);
+    let (timebase, _, extradata, (), language, file) = description.into_parts();
+    assert_eq!(
+      (timebase, extradata, language, file.is_none()),
+      (ms_tb(), Some(AVCC), None, true),
+      "the same parts, the disposition dropped"
+    );
   }
 
   const FONT: &[u8] = b"OTTO, the font's bytes";
