@@ -7966,3 +7966,714 @@ fn l84_avi_refuses_what_it_cannot_place() {
   );
   muxer.finish().expect("finished");
 }
+
+/// **L85 — WMV2 and WMA2 round-trip through ASF and its streaming form,
+/// and the report says what ASF changes** (table H; `asfenc.c` 893–1050):
+/// every packet reads back with its bytes and its decode time — written as
+/// its presentation time, moved by libavformat's shift — and a language
+/// whose ISO 639-1 code turns back into it, `eng`, is kept, while `fra`,
+/// which turns back into `fre`, and `ace`, which ISO 639-1 names no code
+/// for, are reported ([`Uncarried::Language`]) — `ace` not handed to ASF,
+/// which would number it as the first language it lists, so that it reads
+/// back with none, not as `eng`; ASF writes no duration
+/// ([`Rewrite::Durations`]); a chapter's end it does not write, its reader
+/// numbering them from 0 and ending each where the next starts, the last
+/// at the file's end ([`Uncarried::ChapterSpan`]). The streaming form
+/// writes no chapter ([`Uncarried::Chapter`]), and wraps its header and
+/// each packet in a chunk, which FFmpeg reads only over its MMS-over-HTTP
+/// protocol: unwrapped, it reads back the same.
+///
+/// PLANT: the language rule as given, `fra` unreported; `ace` handed,
+/// read back as `eng`; the markers' rule off, chapter 1's span unreported;
+/// the streaming form's chapters judged as markers, its losses unreported.
+#[test]
+fn l85_a_stream_round_trips_through_asf() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = picture_and_sound(
+    &corpus,
+    "wmv2-wma2.mkv",
+    &["-c:v", "wmv2"],
+    &["-c:a", "wmav2", "-ac", "2"],
+  );
+  let chapters = [
+    chapter_of(0, 0, 500, Some("one")),
+    chapter_of(1, 500, 1000, Some("two")),
+  ];
+  for container in ["asf", "asf_stream"] {
+    let target = output(&corpus, &format!("l85.{container}"));
+    let demuxer = FfmpegOwnedDemuxer::open(&source).expect("open");
+    let mut table: Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>> = demuxer
+      .tracks()
+      .iter()
+      .map(|row| {
+        TrackDescription::from_track_info(&**row, None, ticket(row)).expect("a description")
+      })
+      .collect();
+    // `ace` beside `eng` in the file, `fra` in the streaming form, whose
+    // reading back is the same writer's.
+    let second = if container == "asf" { "ace" } else { "fra" };
+    table[0].set_language(Some("eng".into()));
+    table[1].set_language(Some(second.into()));
+    let (mut muxer, report) = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new(container),
+      table,
+      &chapters,
+      PacketLimits::default(),
+    )
+    .expect("open");
+    let languages = lines(&report, |line| matches!(line, Uncarried::Language { .. }));
+    assert_eq!(
+      languages,
+      vec![Uncarried::Language {
+        track: TrackIndex::new(1),
+        tag: second.into(),
+      }],
+      "{container}"
+    );
+    let durations = |track| Uncarried::Rewritten {
+      track: TrackIndex::new(track),
+      rewrite: Rewrite::Durations,
+    };
+    assert_eq!(
+      field_rows(&report),
+      vec![durations(0), durations(1)],
+      "{container}"
+    );
+    let chapter_lines = lines(&report, |line| {
+      matches!(
+        line,
+        Uncarried::Chapter { .. } | Uncarried::ChapterSpan { .. } | Uncarried::ChapterId { .. }
+      )
+    });
+    assert_eq!(
+      chapter_lines,
+      if container == "asf" {
+        vec![Uncarried::ChapterSpan { chapter: 1 }]
+      } else {
+        vec![
+          Uncarried::Chapter { chapter: 0 },
+          Uncarried::Chapter { chapter: 1 },
+        ]
+      },
+      "{container}"
+    );
+    let mut demuxer = FfmpegOwnedDemuxer::open(&source).expect("open");
+    while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+      match packet {
+        DemuxedPacket::Video(p) => muxer
+          .write_video(VideoTrackPacket::new(p.track(), p.packet().clone()))
+          .map_err(|error| error.map_packet(drop)),
+        DemuxedPacket::Audio(p) => muxer
+          .write_audio(AudioTrackPacket::new(p.track(), p.packet().clone()))
+          .map_err(|error| error.map_packet(drop)),
+        other => panic!("{other:?}"),
+      }
+      .expect("a packet");
+    }
+    muxer.finish().expect("finished");
+    // The streaming form wraps the header and each packet in a chunk of its
+    // own — two bytes of type, two of length, eight more — which FFmpeg
+    // reads only through its MMS-over-HTTP protocol (`put_chunk`,
+    // `asfenc.c` 281–295): unwrapped, it is ASF.
+    let target = if container == "asf_stream" {
+      let bytes = std::fs::read(&target).expect("the file");
+      let (mut at, mut unwrapped) = (0, Vec::new());
+      while at + 12 <= bytes.len() {
+        let kind = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        let length = usize::from(u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]));
+        unwrapped.extend_from_slice(&bytes[at + 12..at + 4 + length]);
+        at += 4 + length;
+        if kind == 0x4524 {
+          break;
+        }
+      }
+      let plain = output(&corpus, "l85-unwrapped.asf");
+      std::fs::write(&plain, unwrapped).expect("write");
+      plain
+    } else {
+      target
+    };
+    let offered = timed_bytes(&source);
+    let back = timed_bytes(&target);
+    // WMA's first decode time lies before zero: libavformat moves every
+    // stream later by it (`mux.c` 636–717).
+    let lift = offered
+      .iter()
+      .filter_map(|track| track.first().and_then(|first| first.2))
+      .map(|dts| -dts)
+      .max()
+      .unwrap_or(0)
+      .max(0);
+    assert_eq!(back.len(), 2, "{container}");
+    for track in 0..2 {
+      assert_eq!(
+        back[track].len(),
+        offered[track].len(),
+        "{container} {track}"
+      );
+      for (index, (seen, sent)) in back[track].iter().zip(&offered[track]).enumerate() {
+        assert!(seen.0 == sent.0, "{container} {track}/{index}: the bytes");
+        assert_eq!(
+          seen.2,
+          sent.2.map(|dts| dts + lift),
+          "{container} {track}/{index}: decoded"
+        );
+      }
+    }
+    let read = FfmpegOwnedDemuxer::open(&target).expect("open");
+    assert_eq!(
+      read.tracks()[0].language().map(Utf8Bytes::as_str),
+      Some("eng"),
+      "{container}"
+    );
+    assert_eq!(
+      read.tracks()[1].language().map(Utf8Bytes::as_str),
+      if container == "asf" {
+        None
+      } else {
+        Some("fre")
+      },
+      "{container}"
+    );
+    let chapters: Vec<_> = read
+      .chapters()
+      .iter()
+      .map(|chapter| {
+        (
+          chapter.id(),
+          chapter.title().map(|title| title.as_str().to_owned()),
+          span_ms(chapter).0,
+        )
+      })
+      .collect();
+    if container == "asf" {
+      assert_eq!(
+        chapters,
+        [
+          (0, Some("one".to_owned()), 0),
+          (1, Some("two".to_owned()), 500)
+        ]
+      );
+      assert_eq!(span_ms(&read.chapters()[0]), (0, 500));
+    } else {
+      assert!(chapters.is_empty(), "{chapters:?}");
+    }
+  }
+}
+
+/// **L86 — ASF refuses a decode time past its 32-bit presentation time,
+/// its preroll added, and takes a late stream's early start, which its
+/// interleaving waits for** (table H; `put_payload_header`, `asfenc.c`
+/// 886, 937; 744): a packet at 2^32 − 3100 ms refused
+/// ([`FfmpegMuxRefusal::TimeWraps`]), one a millisecond before it taken.
+/// ASF sets libavformat's interleaving delta to 0, so that nothing is
+/// written before every stream holds a packet: eleven seconds of video,
+/// then an audio packet half a second before zero, which libavformat's
+/// shift then lifts with every stream — taken, not refused as after a
+/// first write. A presentation time past 2 147 479 996 900 ms, which ASF
+/// refuses after taking it (`asfenc.c` 1025–1029), refused
+/// ([`FfmpegMuxRefusal::PresentationOffset`]); a duration whose end passes
+/// `i64` in 100 ns ticks, the preroll's added (1030–1031), refused
+/// ([`FfmpegMuxRefusal::DurationTooLong`]), a millisecond shorter taken;
+/// an empty packet, of which ASF writes no payload (901), refused
+/// ([`PayloadRule::Empty`]).
+///
+/// PLANT: the field unjudged takes it; the delta counted as another
+/// container's refuses the audio; the presentation unjudged, ASF's own
+/// refusal after taking it; the play duration unjudged takes it; the
+/// empty packet taken.
+#[test]
+fn l86_asf_refuses_a_time_past_its_field() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = picture_and_sound(
+    &corpus,
+    "wmv2-wma2.mkv",
+    &["-c:v", "wmv2"],
+    &["-c:a", "wmav2", "-ac", "2"],
+  );
+  let (table, video) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&video[0]);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l86.asf"),
+    ContainerName::new("asf"),
+    table,
+  );
+  let track = TrackIndex::new(0);
+  let at = |time: i64| {
+    VideoTrackPacket::new(
+      track,
+      frame
+        .clone()
+        .with_pts(Some(ms(time)))
+        .with_dts(Some(ms(time))),
+    )
+  };
+  muxer
+    .write_video(at(0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first");
+  muxer
+    .write_video(at((1 << 32) - 3101))
+    .map_err(|error| error.map_packet(drop))
+    .expect("within the field");
+  let past = at((1 << 32) - 3100);
+  let (refusal, back) = by_container(muxer.write_video(past.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track,
+      dts: ms((1 << 32) - 3100),
+    }
+  );
+  untouched!(past, back);
+  muxer.finish().expect("finished");
+
+  let demuxer = FfmpegOwnedDemuxer::open(&source).expect("open");
+  let table: Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>> = demuxer
+    .tracks()
+    .iter()
+    .map(|row| TrackDescription::from_track_info(&**row, None, ticket(row)).expect("a description"))
+    .collect();
+  let (_, audio) = first_track(&source, TrackKind::Audio, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l86-late.asf"),
+    ContainerName::new("asf"),
+    table,
+  );
+  for index in 0..276 {
+    muxer
+      .write_video(at(40 * index))
+      .map_err(|error| error.map_packet(drop))
+      .expect("eleven seconds of video, held");
+  }
+  muxer
+    .write_audio(AudioTrackPacket::new(
+      TrackIndex::new(1),
+      audio_of(&audio[0])
+        .with_pts(Some(ms(-500)))
+        .with_dts(Some(ms(-500))),
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("before zero, every stream lifted with it");
+  muxer.finish().expect("finished");
+
+  let (table, _) = first_track(&source, TrackKind::Video, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l86-far.asf"),
+    ContainerName::new("asf"),
+    table,
+  );
+  let presented = |pts: i64, dts: i64| {
+    VideoTrackPacket::new(
+      track,
+      frame
+        .clone()
+        .with_pts(Some(ms(pts)))
+        .with_dts(Some(ms(dts))),
+    )
+  };
+  muxer
+    .write_video(presented(0, 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first");
+  let far = presented(2_147_479_996_901, 40);
+  let (refusal, back) = by_container(muxer.write_video(far.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::PresentationOffset {
+      track,
+      pts: ms(2_147_479_996_901),
+      dts: ms(40),
+    }
+  );
+  untouched!(far, back);
+  muxer
+    .write_video(presented(10_040, 40))
+    .map_err(|error| error.map_packet(drop))
+    .expect("presented ten seconds after its decode");
+  assert_eq!(
+    lines(muxer.report(), |line| matches!(
+      line,
+      Uncarried::Rewritten {
+        rewrite: Rewrite::PresentationTimes,
+        ..
+      }
+    )),
+    vec![Uncarried::Rewritten {
+      track,
+      rewrite: Rewrite::PresentationTimes,
+    }],
+    "ASF writes the decode time alone"
+  );
+  let lasting = |dts: i64, duration: i64| {
+    VideoTrackPacket::new(
+      track,
+      frame
+        .clone()
+        .with_pts(Some(ms(dts)))
+        .with_dts(Some(ms(dts)))
+        .with_duration(Some(ms(duration))),
+    )
+  };
+  // (80 + 3100 + duration) · 10^4 within `i64::MAX`.
+  let long = lasting(80, 922_337_203_682_298);
+  let (refusal, back) = by_container(muxer.write_video(long.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::DurationTooLong {
+      track,
+      duration: ms(922_337_203_682_298),
+    }
+  );
+  untouched!(long, back);
+  muxer
+    .write_video(lasting(80, 922_337_203_682_297))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a millisecond shorter");
+  let empty = VideoTrackPacket::new(
+    track,
+    video_holding(&frame, &[])
+      .with_pts(Some(ms(120)))
+      .with_dts(Some(ms(120))),
+  );
+  let (refusal, back) = by_container(muxer.write_video(empty.clone()));
+  assert_eq!(refusal, payload(PayloadRule::Empty));
+  untouched!(empty, back);
+  muxer.finish().expect("finished");
+}
+
+/// **L87 — what ASF, and the RIFF formats' audio header, cannot count is
+/// refused at open, nothing written** (table H): a chapter title whose
+/// marker entry passes 16 bits — 12 bytes and the title in UTF-16 with its
+/// terminator (`asfenc.c` 337) — refused
+/// ([`MuxOpenError::ChapterTitleTooLong`]), one a character shorter
+/// opening, and opening in the streaming form, which writes no marker; a
+/// chapter starting at 2^32 ms, whose marker's send time could pass its
+/// DWORD (297–308, 338), refused ([`MuxOpenError::ChapterSpan`]), one a
+/// millisecond earlier opening; a video configuration past the 16-bit
+/// format data size ASF writes it with (645), and an audio one past the
+/// WAVEFORMATEX's `cbSize` WAV, AVI and ASF write it after (`riffenc.c`
+/// 193–223), refused ([`MuxOpenError::ConfigurationInvalid`]), a byte
+/// shorter opening; and a table whose streaming header could pass the
+/// 16-bit length of its chunk (`asfenc.c` 281–295, 708–716) refused
+/// ([`MuxOpenError::HeaderTooLong`]), while one just within the bound
+/// writes its header's chunk with its length whole: the first data chunk
+/// lies where it says. A picture whose bytes the bitmap header AVI and ASF
+/// write counts past an `int` (`riffenc.c` 265) is refused
+/// ([`MuxOpenError::Dimensions`]), the largest square within it opening.
+///
+/// PLANT: each judgment off, its case opening.
+#[test]
+fn l87_asf_and_riff_refuse_at_open_what_their_fields_cannot_count() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = picture_and_sound(
+    &corpus,
+    "wmv2-wma2.mkv",
+    &["-c:v", "wmv2"],
+    &["-c:a", "wmav2", "-ac", "2"],
+  );
+  let table = |kinds: &[TrackKind], video: Option<usize>, audio: Option<usize>| {
+    let demuxer = FfmpegOwnedDemuxer::open(&source).expect("open");
+    demuxer
+      .tracks()
+      .iter()
+      .filter(|row| kinds.contains(&row.kind()))
+      .map(|row| {
+        let description =
+          TrackDescription::from_track_info(&**row, None, ticket(row)).expect("a description");
+        let bytes = match row.kind() {
+          TrackKind::Video => video,
+          _ => audio,
+        };
+        match bytes {
+          Some(len) => description.with_extradata(Some(bytes_of(&vec![0x5A; len]))),
+          None => description,
+        }
+      })
+      .collect::<Vec<_>>()
+  };
+  let open = |name: &str,
+              container: &str,
+              table: Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>>,
+              chapters: &[Chapter<Ffmpeg>]| {
+    let target = output(&corpus, name);
+    let result = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new(container),
+      table,
+      chapters,
+      PacketLimits::default(),
+    );
+    match result {
+      Ok((muxer, report)) => {
+        muxer.finish().expect("finished");
+        Ok(report)
+      }
+      Err(error) => {
+        assert_eq!(
+          std::fs::metadata(&target).expect("the file").len(),
+          0,
+          "{name}: nothing written"
+        );
+        Err(error)
+      }
+    }
+  };
+  let both = [TrackKind::Video, TrackKind::Audio];
+
+  let titled = |characters: usize| [chapter_of(0, 0, 500, Some(&"a".repeat(characters)))];
+  assert!(matches!(
+    open(
+      "l87-title.asf",
+      "asf",
+      table(&both, None, None),
+      &titled(32_761)
+    ),
+    Err(MuxOpenError::ChapterTitleTooLong { chapter: 0 })
+  ));
+  open(
+    "l87-title.asf",
+    "asf",
+    table(&both, None, None),
+    &titled(32_760),
+  )
+  .expect("12 bytes and 32 761 characters of UTF-16: 65 534");
+  let report = open(
+    "l87-title.asf_stream",
+    "asf_stream",
+    table(&both, None, None),
+    &titled(32_761),
+  )
+  .expect("no marker written");
+  assert_eq!(
+    lines(&report, |line| matches!(line, Uncarried::Chapter { .. })),
+    vec![Uncarried::Chapter { chapter: 0 }]
+  );
+
+  let starting = |start: i64| [chapter_of(0, start, start + 1000, Some("far"))];
+  assert!(matches!(
+    open(
+      "l87-start.asf",
+      "asf",
+      table(&both, None, None),
+      &starting(1 << 32)
+    ),
+    Err(MuxOpenError::ChapterSpan { chapter: 0 })
+  ));
+  open(
+    "l87-start.asf",
+    "asf",
+    table(&both, None, None),
+    &starting((1 << 32) - 1),
+  )
+  .expect("a millisecond earlier");
+
+  assert!(matches!(
+    open("l87-video.asf", "asf", table(&[TrackKind::Video], Some(65_496), None), &[]),
+    Err(MuxOpenError::ConfigurationInvalid { track, .. }) if track.get() == 0
+  ));
+  open(
+    "l87-video.asf",
+    "asf",
+    table(&[TrackKind::Video], Some(65_495), None),
+    &[],
+  )
+  .expect("40 bytes and 65 495: 65 535");
+  for container in ["wav", "avi", "asf"] {
+    let name = format!("l87-audio.{container}");
+    assert!(
+      matches!(
+        open(&name, container, table(&[TrackKind::Audio], None, Some(65_536)), &[]),
+        Err(MuxOpenError::ConfigurationInvalid { track, .. }) if track.get() == 0
+      ),
+      "{container}"
+    );
+    open(
+      &name,
+      container,
+      table(&[TrackKind::Audio], None, Some(65_535)),
+      &[],
+    )
+    .unwrap_or_else(|error| panic!("{container}: {error:?}"));
+  }
+  // The WAVEFORMATEXTENSIBLE's 22 bytes, for six channels of PCM in their
+  // native layout — WAV states it, Matroska not — and HE-AAC's 12, for its
+  // tag 0x1610, before the configuration.
+  #[rustfmt::skip]
+  let pcm51 = generated(&corpus, "pcm51.wav", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.2",
+    "-ac", "6", "-c:a", "pcm_s16le",
+  ]);
+  #[rustfmt::skip]
+  let heaac = generated(&corpus, "aac-1610.avi", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.2",
+    "-ac", "2", "-c:a", "aac", "-tag:a", "0x1610",
+  ]);
+  let configured = |path: &Path, len: usize| {
+    table_of(path, TrackKind::Audio)
+      .into_iter()
+      .map(|row| row.with_extradata(Some(bytes_of(&vec![0x5A; len]))))
+      .collect::<Vec<_>>()
+  };
+  for (path, beside) in [(&pcm51, 22), (&heaac, 12)] {
+    for container in ["wav", "avi", "asf"] {
+      let name = format!("l87-beside.{container}");
+      assert!(
+        matches!(
+          open(&name, container, configured(path, 65_536 - beside), &[]),
+          Err(MuxOpenError::ConfigurationInvalid { .. })
+        ),
+        "{container}, {beside}"
+      );
+      open(&name, container, configured(path, 65_535 - beside), &[])
+        .unwrap_or_else(|error| panic!("{container}, {beside}: {error:?}"));
+    }
+  }
+
+  // The bitmap header's count of a picture's bytes, an `int`: the largest
+  // square within it opens, one a pixel wider and taller is refused.
+  let bits = match table(&[TrackKind::Video], None, None)[0]
+    .side_data()
+    .bits_per_coded_sample()
+  {
+    0 => 24,
+    bits => i64::from(bits),
+  };
+  let side = (1..65_536_i64)
+    .rev()
+    .find(|side| side * side * bits + 7 <= i64::from(i32::MAX))
+    .expect("a side");
+  for container in ["avi", "asf"] {
+    let name = format!("l87-picture.{container}");
+    let sized = |side: i64| {
+      let side = i32::try_from(side).expect("a side");
+      video_sized(&source, side, side)
+    };
+    assert!(
+      matches!(
+        open(&name, container, sized(side + 1), &[]),
+        Err(MuxOpenError::Dimensions { track }) if track.get() == 0
+      ),
+      "{container}"
+    );
+    open(&name, container, sized(side), &[])
+      .unwrap_or_else(|error| panic!("{container}, {side}: {error:?}"));
+  }
+
+  // 600 and 470 a stream beside the configurations: WMA2's ten bytes and
+  // the video's, to 65 535 at most.
+  assert!(matches!(
+    open(
+      "l87-header.asf_stream",
+      "asf_stream",
+      table(&both, Some(63_986), None),
+      &[]
+    ),
+    Err(MuxOpenError::HeaderTooLong)
+  ));
+  let target = output(&corpus, "l87-header.asf_stream");
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::new("asf_stream"),
+    table(&both, Some(63_985), None),
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("within the bound");
+  let mut demuxer = FfmpegOwnedDemuxer::open(&source).expect("open");
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    match packet {
+      DemuxedPacket::Video(p) => muxer
+        .write_video(VideoTrackPacket::new(p.track(), p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      DemuxedPacket::Audio(p) => muxer
+        .write_audio(AudioTrackPacket::new(p.track(), p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      other => panic!("{other:?}"),
+    }
+    .expect("a packet");
+  }
+  muxer.finish().expect("finished");
+  let bytes = std::fs::read(&target).expect("the file");
+  let kind = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+  let length = usize::from(u16::from_le_bytes([bytes[2], bytes[3]]));
+  assert_eq!(kind(0), 0x4824, "the header's chunk");
+  assert!(length > 63_985, "the configuration within it");
+  assert_eq!(
+    kind(4 + length),
+    0x4424,
+    "the first data chunk where the length says"
+  );
+}
+
+/// **L88 — WAV, AVI and ASF take a configured AAC track's packets raw, and
+/// ASF's reader marks every audio packet a key frame** (table H): an
+/// ADTS-framed packet on a track whose configuration is stated, which
+/// they would write as it comes into a stream whose format declares raw
+/// AAC (`riffenc.c` 193–223), refused ([`PayloadRule::AdtsHeader`]), the
+/// raw frame taken; an AAC packet ASF is offered unmarked, which its
+/// reader marks a key frame (`asfdec_f.c` 1256–1259), reported at that
+/// packet ([`Rewrite::KeyFramesMarked`]), and read back marked.
+///
+/// PLANT: the raw rule off for them, the ADTS packet taken; ASF's audio
+/// not all key frames, the report silent.
+#[test]
+fn l88_riff_formats_take_aac_raw_and_asf_marks_its_audio() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, packets) = first_track(&source, TrackKind::Audio, 2);
+  let raw = audio_of(&packets[0]);
+  let mut framed = vec![0xFF, 0xF1, 0x4C, 0x80, 0x00, 0x00, 0xFC];
+  framed.extend_from_slice(raw.data().as_ref());
+  for container in ["wav", "avi", "asf"] {
+    let target = output(&corpus, &format!("l88.{container}"));
+    let mut muxer = muxer_into(
+      &target,
+      ContainerName::new(container),
+      table_of(&source, TrackKind::Audio),
+    );
+    let offered = audio_at(&audio_holding(&raw, &framed), 0);
+    let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+    assert_eq!(refusal, payload(PayloadRule::AdtsHeader), "{container}");
+    untouched!(offered, back);
+    muxer
+      .write_audio(audio_at(&raw, 0))
+      .map_err(|error| error.map_packet(drop))
+      .expect("the raw frame");
+    if container == "asf" {
+      let unmarked = audio_at(&audio_of(&packets[1]), 21);
+      let unmarked = AudioTrackPacket::new(
+        unmarked.track(),
+        unmarked.packet().clone().with_flags(PacketFlags::empty()),
+      );
+      muxer
+        .write_audio(unmarked)
+        .map_err(|error| error.map_packet(drop))
+        .expect("an unmarked frame");
+      assert_eq!(
+        lines(muxer.report(), |line| matches!(
+          line,
+          Uncarried::Rewritten {
+            rewrite: Rewrite::KeyFramesMarked,
+            ..
+          }
+        )),
+        vec![Uncarried::Rewritten {
+          track: TrackIndex::new(0),
+          rewrite: Rewrite::KeyFramesMarked,
+        }]
+      );
+    }
+    muxer.finish().expect("finished");
+    if container == "asf" {
+      let (_, back) = whole_track(&target, TrackKind::Audio);
+      assert!(
+        back
+          .iter()
+          .all(|packet| audio_of(packet).flags().contains(PacketFlags::KEY)),
+        "every audio packet read back a key frame"
+      );
+    }
+  }
+}

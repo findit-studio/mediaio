@@ -619,6 +619,7 @@
 //! | WAV, Wave64 (`wavenc.c` 378–416) | none | none | none | none | none | none |
 //! | AVI (`avienc.c` 744–913) | as each packet's place: video's frame, in its stream's ticks, a gap filled with empty frames; PCM's samples ([`Rewrite::Timeline`] where a time is not its place) — no presentation time | none | in the index | a PAL8 picture's palette | none | none |
 //! | FLV (`flvenc.c` 1209–1486) | the decode time, 32 bits of milliseconds; a composition time for H.264, MPEG-4 Part 2, HEVC and VVC alone, 24 bits | none | a video tag's; every audio tag reads back a key frame ([`Rewrite::KeyFramesMarked`]) | new extradata of AAC, H.264, MPEG-4, HEVC, VVC, AV1, VP9, Opus and FLAC, a new sequence header | none | none |
+//! | ASF, its streaming form (`asfenc.c` 862–1050) | the decode time, as each payload's presentation time, 32 bits of milliseconds with the preroll's 3100 added — no presentation time | none | a video payload's; every audio packet reads back a key frame ([`Rewrite::KeyFramesMarked`]) | none | a language through its ISO 639-1 code, read back as ISO 639-2/B — a tag of none not handed, so that the stream has none; no flag | markers: a start in 100 ns, numbered by position, each ended where the next starts; the streaming form none |
 //!
 //! **What each refuses**:
 //!
@@ -634,6 +635,10 @@
 //! | FLV | a reordering H.264, MPEG-4, HEVC, AV1, VP9 or VVC packet with no presentation time; a decode time past 32 bits of milliseconds; a composition time past 24 bits; a tag past 24 bits of size; ADTS AAC no filter converts; AAC with no configuration whose first packet brings none | refused after taking the packet; written cut; written cut; refused after taking the packet; refused after taking the first, the rest written with their headers in; an empty sequence header, unreadable (`flvenc.c` 1252–1352, 807–860) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`PayloadRule::TagSize`], [`PayloadRule::AdtsHeader`], [`PayloadRule::ConfigurationAbsent`] — L50, L82 |
 //! | AVI | a frame more than 60 000 frames after the stream's place; H.264 it tags `H264` not opening on a start code; at open, raw video of no tag of another pixel format than its bits name | refused after taking it; the first refused after taking it, the rest written as they are; written, "unreadable" (`avienc.c` 744–778, 446–461) | [`FfmpegMuxRefusal::FrameGap`], [`PayloadRule::StartCode`], [`MuxOpenError::ConfigurationInvalid`] — L84 |
 //! | FLV, at open | Opus or FLAC with no configuration; H.264, HEVC, VVC, AV1, MPEG-4 or AAC with none and the filters off | the header's `av_assert0` ends the process; written behind an empty sequence header (`flvenc.c` 853, 1491–1503) | [`MuxOpenError::ConfigurationMissing`] — L82 |
+//! | WAV, Wave64, AVI, ASF | a configured AAC track's ADTS packet; at open, an audio configuration past the WAVEFORMATEX's 16-bit `cbSize` | written as it comes into a stream whose format declares raw AAC; written, its size cut (`riffenc.c` 193–223) | [`PayloadRule::AdtsHeader`], [`MuxOpenError::ConfigurationInvalid`] — L87, L88 |
+//! | ASF | a decode time past its 32-bit presentation time, the preroll added; a presentation time past what its index counts in an `int` of seconds; a play duration past `i64` in 100 ns; an empty packet | written cut; refused after taking it; a signed overflow; no payload written (`asfenc.c` 886–1038) | [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::Empty`] — L86 |
+//! | ASF, at open | a video configuration past its format data's 16-bit size; a marker's title past its entry's 16-bit length; a chapter at 2^32 ms or later; the streaming form's header past its chunk's 16-bit length | each written, its length or send time cut (`asfenc.c` 645, 337, 297–308, 708–716) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSpan`], [`MuxOpenError::HeaderTooLong`] — L87 |
+//! | AVI, ASF, at open | a picture whose bytes pass an `int` | the bitmap header's count a signed overflow (`riffenc.c` 265) | [`MuxOpenError::Dimensions`] — L87 |
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -918,6 +923,16 @@ impl Audited {
         key: true,
         ..NOTHING
       }),
+      // `asf_write_packet` and `put_frame` (`asfenc.c` 1004–1050, 893–962):
+      // the decode time, written as each payload's presentation time; no
+      // duration; a video payload's key flag — an audio one's cleared, and
+      // the reader marks every audio packet a key frame (`asfdec_f.c`
+      // 1256–1259), which [`PacketRules::all_sync`] reports.
+      Self::Asf { .. } => Some(Written {
+        dts: true,
+        key: true,
+        ..NOTHING
+      }),
       // `avi_write_packet_internal` (`avienc.c` 868–913): a chunk a
       // packet, its place its time ([`PacketRules::avi`]), its key flag in
       // the index; no presentation time, no duration.
@@ -960,6 +975,15 @@ impl Audited {
         language: LanguageRule::Dropped,
         flags: TrackDisposition::empty(),
       }),
+      // ASF writes a stream's language as its ISO 639-1 code, which its
+      // reader turns back into ISO 639-2/B (`asf_write_header1`, `asfenc.c`
+      // 396–410; `asfdec_f.c` 843–853), and no disposition.
+      Self::Asf { .. } => Some(Kept {
+        filename: false,
+        mime_type: false,
+        language: LanguageRule::ThroughIso639_1,
+        flags: TrackDisposition::empty(),
+      }),
       _ => None,
     }
   }
@@ -977,6 +1001,7 @@ impl Audited {
         | Self::Ivf
         | Self::Flv
         | Self::Avi
+        | Self::Asf { .. }
     )
   }
 
@@ -1387,9 +1412,10 @@ pub enum Uncarried {
     flags: TrackDisposition,
   },
   /// A chapter the container does not write at all — table H of the
-  /// census: no raw stream's writer, nor IVF's, WAV's, Wave64's, ADTS's or
-  /// FLAC's, writes a chapter (FLAC's comment block holds the file's tags
-  /// alone, `flacenc.c` 72–80).
+  /// census: no raw stream's writer, nor IVF's, WAV's, Wave64's, ADTS's,
+  /// FLAC's, FLV's, AVI's or ASF's streaming form's, writes a chapter
+  /// (FLAC's comment block holds the file's tags alone, `flacenc.c` 72–80;
+  /// `asfenc.c` 575).
   Chapter {
     /// The chapter's position in the table the muxer was opened with.
     chapter: usize,
@@ -1399,7 +1425,8 @@ pub enum Uncarried {
   /// numbering chapters by their position (`mov.c`'s `chpl` and chapter
   /// track); Matroska numbers every chapter from 1 where one's id is 0 or
   /// repeats another's (`mkv_new_chapter_ids_needed`, `matroskaenc.c`
-  /// 2399–2442).
+  /// 2399–2442); MP3's ID3v2 chapters and ASF's markers are numbered by
+  /// position from 0 (table H).
   ChapterId {
     /// The chapter's position in the table the muxer was opened with.
     chapter: usize,
@@ -1411,8 +1438,11 @@ pub enum Uncarried {
   /// times in its movie timescale, which its streams' time bases make
   /// (`mov_init`, `movenc.c` 8427–8446), and its reader ends each chapter
   /// where the next starts (`mov_create_chapter_track`, `movenc.c`
-  /// 7727–7815); Matroska counts them in nanoseconds (2439–2440). Each
-  /// rescale rounds to the nearest (`av_rescale_q`).
+  /// 7727–7815); Matroska counts them in nanoseconds (2439–2440); MP3's
+  /// ID3v2 chapters in milliseconds, and ASF its markers' starts in 100 ns
+  /// with no end, its reader ending each where the next starts and the
+  /// last at the file's end (table H). Each rescale rounds to the nearest
+  /// (`av_rescale_q`).
   ChapterSpan {
     /// The chapter's position in the table.
     chapter: usize,
@@ -1794,10 +1824,13 @@ pub enum FfmpegMuxRefusal {
     /// The duration offered.
     duration: Timestamp,
   },
-  /// MP4: a duration of more than `i32::MAX` ticks of the stream's time
-  /// base, which MP4 refuses after taking the packet (`movenc.c`
-  /// 6925–6928).
-  #[error("track {}: the duration {} is longer than MP4 stores", .track.get(), .duration.pts())]
+  /// A duration longer than the container counts: MP4's of more than
+  /// `i32::MAX` ticks of the stream's time base, which MP4 refuses after
+  /// taking the packet (`movenc.c` 6925–6928); ASF's whose end, the
+  /// file's play duration, passes `i64` in 100 ns ticks, its preroll's
+  /// 3.1 s added, an overflow of a signed count (`asfenc.c` 372,
+  /// 1030–1031).
+  #[error("track {}: the duration {} is longer than the container counts", .track.get(), .duration.pts())]
   DurationTooLong {
     /// The track.
     track: TrackIndex,
@@ -1836,7 +1869,12 @@ pub enum FfmpegMuxRefusal {
   /// ticks (`movenc.c` 6955–6959; the offset is an `int`, `movenc.h` 58) —
   /// and FLV's 24, signed, in milliseconds, written cut for H.264, HEVC,
   /// VVC and MPEG-4 Part 2 (`flv_write_packet`, `flvenc.c` 1412–1416,
-  /// 1445–1449).
+  /// 1445–1449). ASF writes no presentation time but counts the seconds of
+  /// one in its index, in an `int`, refusing one past
+  /// 2 147 479 996 900 ms after taking the packet (`asfenc.c` 1025–1029,
+  /// 1037–1038): with the decode time within its 32-bit field
+  /// ([`FfmpegMuxRefusal::TimeWraps`]), a presentation more than
+  /// 2 · 10^12 ms after it.
   #[error(
     "track {}: presented at {}, decoded at {}: too far apart for the container",
     .track.get(), .pts.pts(), .dts.pts()
@@ -1862,7 +1900,10 @@ pub enum FfmpegMuxRefusal {
   },
   /// A decode time the container counts in fewer bits than it takes: FLV
   /// writes each tag's in 32 bits of milliseconds (`put_timestamp`,
-  /// `flvenc.c` 1284, 1352), so one of 2^32 or more is written cut.
+  /// `flvenc.c` 1284, 1352), so one of 2^32 or more is written cut; ASF
+  /// each payload's as its presentation time, in 32 bits of milliseconds
+  /// with its preroll's 3100 added (`put_payload_header`, `put_frame`,
+  /// `asfenc.c` 886, 937), so one of 2^32 − 3100 or more.
   #[error("track {}: decoded at {}, past what the container counts", .track.get(), .dts.pts())]
   TimeWraps {
     /// The track.
@@ -2004,7 +2045,10 @@ pub enum PayloadRule {
   /// No bytes: MP4 drops an empty packet (`movenc.c` 7431–7441), Matroska
   /// and WebM an empty audio packet (`matroskaenc.c` 3266–3268), and, with
   /// the automatic filters on, Matroska's PGS filter an empty PGS packet
-  /// (`pgs_frame_merge.c` 87–90). Not a configuration's packet, of no
+  /// (`pgs_frame_merge.c` 87–90); the raw streams' writers, MP3's and
+  /// WAV's write it as nothing, ADTS's and FLAC's none of it, IVF its frame
+  /// header alone, which FFmpeg's reader drops, and ASF cuts it into no
+  /// payload (table H). Not a configuration's packet, of no
   /// payload, whose new extradata the container takes first — MP4's MPEG-4
   /// ALS, AAC, AV1 and FLAC's (7412–7428), Matroska's AAC and FLAC's
   /// (3065–3097): taken, of no sample.
@@ -2019,6 +2063,12 @@ pub enum PayloadRule {
   /// packet is ADTS, whatever the configuration (`movenc.c` 9143–9145;
   /// `matroskaenc.c` 3635–3637), and then converts every ADTS packet: so
   /// this is refused with the filters off, and after a raw first packet.
+  /// FLV refuses an ADTS packet no filter converts after taking it, and
+  /// writes the rest with their headers in (`flvenc.c` 1331–1337); WAV,
+  /// Wave64, AVI and ASF, inserting no filter, write it as it comes into a
+  /// stream whose format declares raw AAC by its configuration
+  /// (`ff_put_wav_header`, `riffenc.c` 193–223) — every packet of a
+  /// configured track is refused so.
   #[error("the packet is AAC in an ADTS header, and the track takes raw AAC")]
   AdtsHeader,
   /// MP4 and Matroska AAC with no configuration, the automatic filters
@@ -2322,7 +2372,10 @@ pub enum MuxOpenError {
   },
   /// A video track whose width or height the container writes in fewer
   /// bits than it takes: IVF's header holds each in 16 (`ivf_write_header`,
-  /// `ivfenc.c` 65–66), which a reader takes back as written.
+  /// `ivfenc.c` 65–66), which a reader takes back as written; or whose
+  /// picture's bytes — its width by its height by its bits a sample — the
+  /// bitmap header AVI and ASF write count in an `int`
+  /// (`ff_put_bmp_header`, `riffenc.c` 265), a signed overflow past it.
   #[error("track {}'s dimensions do not fit the container's header", .track.get())]
   Dimensions {
     /// The track.
@@ -2445,15 +2498,22 @@ pub enum MuxOpenError {
     /// The codec.
     codec: CodecId,
   },
-  /// A configuration the container's writer refuses at its trailer, after
-  /// every packet was written — the whole file lost (table C of the
-  /// census): MP4 FLAC's not one 34-byte STREAMINFO (`dfLa`, `movenc.c`
-  /// 857–876), MP4 Opus's shorter than its OpusHead or than the channel
-  /// mapping table it names (`dOps`, 877–910), MP4 TTML's from libavcodec's
-  /// TTML encoder whose header strings are not two terminated strings
+  /// A configuration the container's writer refuses, or writes so that it
+  /// reads back as another. At its trailer, after every packet was written
+  /// — the whole file lost (table C of the census): MP4 FLAC's not one
+  /// 34-byte STREAMINFO (`dfLa`, `movenc.c` 857–876), MP4 Opus's shorter
+  /// than its OpusHead or than the channel mapping table it names (`dOps`,
+  /// 877–910), MP4 TTML's from libavcodec's TTML encoder whose header
+  /// strings are not two terminated strings
   /// (`ttml_set_header_values_from_extradata`, `ttmlenc.c` 82–122, which
-  /// the trailer's joined document is written by).
-  #[error("track {}'s configuration is one {codec:?} in this container refuses at its trailer", .track.get())]
+  /// the trailer's joined document is written by). Of table H: one ADTS
+  /// cannot write in its headers, FLAC's opening with its `fLaC` marker,
+  /// AVI's raw video of no tag of another pixel format than its bits name,
+  /// and one past the 16-bit size its header counts it in — the `cbSize`
+  /// of the WAVEFORMATEX WAV, Wave64, AVI and ASF write an audio stream's
+  /// in (`ff_put_wav_header`, `riffenc.c` 54–233), the format data size
+  /// ASF writes a video stream's bitmap header with (`asfenc.c` 645).
+  #[error("track {}'s configuration is not one {codec:?} in this container writes", .track.get())]
   ConfigurationInvalid {
     /// The track.
     track: TrackIndex,
@@ -2469,6 +2529,13 @@ pub enum MuxOpenError {
     /// The track.
     track: TrackIndex,
   },
+  /// `asf_stream`: a header longer than the 16-bit length of the chunk the
+  /// streaming form writes it in (`put_chunk`, `asfenc.c` 281–295,
+  /// 708–716), which it would write cut. Judged before the header is
+  /// written, by a bound on its length: each stream's objects at their
+  /// longest beside its configuration.
+  #[error("the header is longer than the container's chunk counts")]
+  HeaderTooLong,
   /// A chapter whose title holds a NUL.
   #[error("chapter {chapter}'s title holds a NUL byte")]
   ChapterTitleWithNul {
@@ -2485,8 +2552,11 @@ pub enum MuxOpenError {
     /// The chapter's position in the table.
     chapter: usize,
   },
-  /// MP4: a chapter title longer than the 16-bit length MP4's chapter
-  /// track writes it with (`movenc.c` 7797–7801), which reads back cut.
+  /// A chapter title longer than the 16-bit length the container writes it
+  /// with: MP4's chapter track's (`movenc.c` 7797–7801), which reads back
+  /// cut; ASF's marker entry's, which counts its 12 bytes and the title in
+  /// UTF-16 with its terminator (`asf_write_markers`, `asfenc.c` 337), so
+  /// that a reader stepping by it misreads the markers after.
   #[error("chapter {chapter}'s title is longer than MP4's chapter track holds")]
   ChapterTitleTooLong {
     /// The chapter's position in the table.
@@ -2494,7 +2564,10 @@ pub enum MuxOpenError {
   },
   /// A chapter that starts before zero or ends before it starts — a
   /// span no container writes (Matroska fails its header on one,
-  /// `matroskaenc.c` 2445–2451) — or one its own time base cannot count.
+  /// `matroskaenc.c` 2445–2451) — or one its own time base cannot count;
+  /// or ASF's starting 2^32 ms or later, whose marker's send time — the
+  /// index's last second before the start, a DWORD of milliseconds — may
+  /// pass it (`get_send_time`, `asfenc.c` 297–308, 338).
   #[error("chapter {chapter}'s span runs backwards or before zero")]
   ChapterSpan {
     /// The chapter's position in the table.
@@ -2751,6 +2824,11 @@ struct Shift {
   /// decode time lies before that of the first packet it wrote, its
   /// reference (`flvenc.c` 1267–1274).
   first_floor: bool,
+  /// Whether libavformat's interleaving writes ahead once the packets it
+  /// holds span `max_interleave_delta`: not ASF's, whose header sets it to
+  /// 0, so that it waits for every stream (`asfenc.c` 744; `mux.c`
+  /// 970–1003).
+  delta: bool,
   /// The decode time of the first packet the container wrote, moved, in its
   /// own stream's ticks: FLV's reference, as FLV keeps it.
   first: Option<i128>,
@@ -2858,6 +2936,7 @@ impl Shift {
       held,
       head: None,
       first_floor: muxer == "flv",
+      delta: !matches!(muxer, "asf" | "asf_stream"),
       first: None,
     })
   }
@@ -2953,6 +3032,7 @@ impl Shift {
       return false;
     };
     interleaved == holding + lacking
+      && self.delta
       && streams
         .filter(|held| !held.subtitle)
         .filter_map(|held| held.last_us)
@@ -3097,9 +3177,10 @@ struct PacketRules {
   /// STREAMINFO (`flac_write_audio_packet`, `flacenc.c` 283–301).
   config_bytes: Option<usize>,
   /// The bits the container counts a decode time in, as it writes it —
-  /// moved by libavformat's shift — past which it writes it cut: FLV's 32
-  /// ([`FfmpegMuxRefusal::TimeWraps`]).
-  dts_bits: Option<u32>,
+  /// moved by libavformat's shift, and by what the container adds — past
+  /// which it writes it cut: FLV's 32, ASF's 32 with its preroll's 3100
+  /// milliseconds added ([`FfmpegMuxRefusal::TimeWraps`]).
+  dts_field: Option<(u32, i128)>,
   /// The bits, signed, a composition offset is written in where it is not
   /// MP4's: FLV's 24 ([`FfmpegMuxRefusal::PresentationOffset`]).
   offset_bits: Option<u32>,
@@ -3110,6 +3191,11 @@ struct PacketRules {
   configuration_absent: bool,
   /// AVI: how it keeps a packet's time, as its place ([`AviPlace`]).
   avi: Option<AviPlace>,
+  /// ASF: a presentation time within what its index counts, and the
+  /// file's play duration within 64 bits of 100 ns ticks
+  /// ([`FfmpegMuxRefusal::PresentationOffset`],
+  /// [`FfmpegMuxRefusal::DurationTooLong`]).
+  asf: bool,
 }
 
 /// How AVI keeps a stream's packets' times, as their places
@@ -3402,6 +3488,7 @@ impl PacketRules {
     let raw = matches!(audited, Audited::Raw(_));
     let raw_flac = audited == Audited::Flac;
     let flv = audited == Audited::Flv;
+    let asf = matches!(audited, Audited::Asf { .. });
     let mp4 = family == Family::Mp4;
     let matroska = family == Family::Matroska;
     let either_matroska = matroska || family == Family::WebM;
@@ -3425,10 +3512,13 @@ impl PacketRules {
       // `adtsenc.c` 161–162; `flacenc.c` 299–300); IVF writes its frame
       // header alone, which FFmpeg's reader hands its parser as an empty
       // packet, put out for Theora alone (`ivfenc.c` 80–82; `ivfdec.c`
-      // 79–88; `parse_packet`, `demux.c` 1192–1203).
+      // 79–88; `parse_packet`, `demux.c` 1192–1203); ASF cuts a packet into
+      // payloads while bytes are left, so that an empty one makes none
+      // (`put_frame`, `asfenc.c` 901).
       no_empty: mp4
         || (either_matroska && kind == TrackKind::Audio)
         || raw
+        || asf
         || matches!(
           audited,
           Audited::Adts | Audited::Flac | Audited::Mp3 | Audited::Wav { .. } | Audited::Ivf
@@ -3452,13 +3542,22 @@ impl PacketRules {
           .contains(&id)))
         && codec.video_delay() > 0,
       // FLV refuses an ADTS first packet no filter converts after taking it,
-      // and writes the rest with their headers in (`flvenc.c` 1331–1337).
-      raw_aac: ((mp4 || matroska) && id == CodecId::AAC && !codec.extradata().is_empty())
+      // and writes the rest with their headers in (`flvenc.c` 1331–1337);
+      // WAV, Wave64, AVI and ASF write a configured track's as they come,
+      // its format declaring raw AAC (`riffenc.c` 193–223).
+      raw_aac: ((mp4
+        || matroska
+        || matches!(
+          audited,
+          Audited::Wav { .. } | Audited::Avi | Audited::Asf { .. }
+        ))
+        && id == CodecId::AAC
+        && !codec.extradata().is_empty())
         || (flv && id == CodecId::AAC),
       marks_key: id.intra_only(),
       all_sync: (mp4 && !mp4_syncs(kind, id, codec.profile()))
         || (either_matroska && kind == TrackKind::Subtitle)
-        || (flv && kind == TrackKind::Audio),
+        || ((flv || asf) && kind == TrackKind::Audio),
       syncs: mp4 && mp4_syncs(kind, id, codec.profile()),
       frame_bytes: if mp4 {
         mp4_frame_bytes(kind, codec)
@@ -3520,7 +3619,14 @@ impl PacketRules {
           && id == CodecId::H264
           && codec.codec_tag() == u32::from_le_bytes(*b"H264")),
       config_bytes: raw_flac.then_some(FLAC_STREAMINFO_BYTES),
-      dts_bits: flv.then_some(32),
+      dts_field: if flv {
+        Some((32, 0))
+      } else if asf {
+        Some((32, i128::from(ASF_PREROLL_MS)))
+      } else {
+        None
+      },
+
       offset_bits: (flv
         && [CodecId::H264, CodecId::MPEG4, CodecId::HEVC, CodecId::VVC].contains(&id))
       .then_some(24),
@@ -3532,6 +3638,7 @@ impl PacketRules {
           block: u64::try_from(block).unwrap_or(1),
         },
       }),
+      asf,
     }
   }
 }
@@ -5578,6 +5685,25 @@ where
           Some(_) => {}
         }
       }
+      // ASF's marker (`asf_write_markers`, `asfenc.c` 311–347): its entry's
+      // 16-bit length counts 12 bytes and the title in UTF-16 with its
+      // terminator; its send time, the index's second before the start in
+      // a DWORD of milliseconds (297–308, 338), can pass it only for a
+      // start at 2^32 ms or later.
+      if audited == (Audited::Asf { stream: false }) {
+        if chapter.title().is_some_and(|title| {
+          12 + 2 * (title.as_str().encode_utf16().count() + 1) > usize::from(u16::MAX)
+        }) {
+          return Err(MuxOpenError::ChapterTitleTooLong { chapter: index });
+        }
+        let base = chapter.timebase();
+        let start = spans[index].0;
+        if i128::from(start) * i128::from(base.num()) * 1000
+          >= (1_i128 << 32) * i128::from(base.den().get())
+        {
+          return Err(MuxOpenError::ChapterSpan { chapter: index });
+        }
+      }
     }
     // MP4's chapter track, whose samples MP4 makes at its header from the
     // chapters, counted in the movie timescale its streams' time bases make
@@ -5605,7 +5731,7 @@ where
       let stream = match road {
         Road::NotWritten => None,
         road => {
-          let spec = stream_spec(family, description, *road);
+          let spec = stream_spec((family, audited), description, *road);
           let stream = output
             .add_stream(&spec)
             .map_err(|error| MuxFault::new(MuxStage::Stream { track }, error))?;
@@ -5616,6 +5742,29 @@ where
           // sample name, logging that one of another pixel format "will be
           // unreadable" (`avi_write_header`, `avienc.c` 446–461).
           if audited == Audited::Avi && avi_raw_unreadable(&codec) {
+            return Err(MuxOpenError::ConfigurationInvalid {
+              track,
+              codec: codec.codec(),
+            });
+          }
+          // A configuration past the 16-bit size its header counts it in:
+          // the WAVEFORMATEX's `cbSize` WAV, Wave64, AVI and ASF write an
+          // audio stream's in (`ff_put_wav_header`), and the format data
+          // size ASF writes a video stream's bitmap header with
+          // (`asf_write_header1`, `asfenc.c` 645) — written whole, its size
+          // cut, so that a reader takes another length.
+          let riff_audio = kind == TrackKind::Audio
+            && matches!(
+              audited,
+              Audited::Wav { .. } | Audited::Avi | Audited::Asf { .. }
+            );
+          let asf_video = kind == TrackKind::Video && matches!(audited, Audited::Asf { .. });
+          if (riff_audio
+            && riff_extension_bytes(&codec, LayoutView::of(description.side_data().ch_layout()))
+              > usize::from(u16::MAX))
+            || (asf_video
+              && BITMAPINFOHEADER_BYTES + codec.extradata().len() > usize::from(u16::MAX))
+          {
             return Err(MuxOpenError::ConfigurationInvalid {
               track,
               codec: codec.codec(),
@@ -5690,6 +5839,20 @@ where
         }
       }
       states.push((kind, stream, *road, filter));
+    }
+    // `asf_stream` writes its header in a chunk of 16-bit length
+    // (`put_chunk`, `asfenc.c` 281–295, 708–716): bounded before it is
+    // written, each stream's objects at their longest beside its
+    // configuration ([`asf_stream_header_bound`]).
+    if audited == (Audited::Asf { stream: true })
+      && asf_stream_header_bound(
+        states
+          .iter()
+          .filter_map(|(_, stream, _, _)| stream.as_ref())
+          .map(|(_, codec)| codec.extradata().len()),
+      ) > u64::from(u16::MAX)
+    {
+      return Err(MuxOpenError::HeaderTooLong);
     }
     report.uncarried.extend(chapter_losses(
       (family, audited),
@@ -6641,13 +6804,40 @@ fn check_packet_rules(
     last_sample = Some(i128::from(output.dts_ticks));
     // A decode time the container counts in fewer bits, as it writes it:
     // moved by libavformat's shift, as far as the packet shows it.
-    if let Some(bits) = rules.dts_bits {
-      let written = i128::from(output.dts_ticks) + lift;
+    if let Some((bits, added)) = rules.dts_field {
+      let written = i128::from(output.dts_ticks) + lift + added;
       if !(0..1 << bits).contains(&written) {
         return Err(FfmpegMuxRefusal::TimeWraps {
           track,
           dts: output.dts,
         });
+      }
+    }
+    // ASF (`asf_write_packet`, `asfenc.c` 1023–1038), in its streams'
+    // milliseconds, moved by libavformat's shift: a presentation time past
+    // what its index counts in an `int` of seconds, refused after taking
+    // the packet — the decode time held within its field above, so only
+    // a presentation that far after it; and the file's play duration, the
+    // latest presentation's end in 100 ns ticks with the preroll's added,
+    // within `i64` (372, 1030–1031). A duration of zero libavformat guesses
+    // as a frame's (`mux.c` 605–633), and a negative one it writes as zero.
+    if rules.asf {
+      let presented = i128::from(output.pts_ticks.unwrap_or(output.dts_ticks)) + lift;
+      if let Some(pts) = output.pts
+        && presented > ASF_PRESENTATION_MAX_MS
+      {
+        return Err(FfmpegMuxRefusal::PresentationOffset {
+          track,
+          pts,
+          dts: output.dts,
+        });
+      }
+      if let Some(duration) = output.duration
+        && (presented + i128::from(output.duration_ticks.max(0)) + i128::from(ASF_PREROLL_MS))
+          * ASF_TICKS_A_MILLISECOND
+          > i128::from(i64::MAX)
+      {
+        return Err(FfmpegMuxRefusal::DurationTooLong { track, duration });
       }
     }
   }
@@ -7545,6 +7735,67 @@ fn avi_raw_unreadable(stream: &StreamCodec) -> bool {
 const RAWVIDEO: CodecId =
   CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_RAWVIDEO as i32);
 
+/// A bitmap header's own bytes (`ff_put_bmp_header`, `riffenc.c` 236–293).
+const BITMAPINFOHEADER_BYTES: usize = 40;
+
+/// The `cbSize` `ff_put_wav_header` writes for `stream` in 16 bits — the
+/// bytes after the WAVEFORMATEX's own 18 — as a count that may pass them
+/// (`riffenc.c` 54–233): the WAVEFORMATEXTENSIBLE's 22 beside the extension
+/// where its layout is native but not mono or stereo, its sample rate past
+/// 48 kHz, its codec E-AC-3 or DFPWM, or its samples past 16 bits but under
+/// the IEEE float tag; HE-AAC's 12 beside the configuration for its tag
+/// `0x1610`; else the extension alone. The extension is what the writer
+/// makes for MP3 (12 bytes), MPEG audio layer II (22), G.723.1 (10), GSM
+/// and IMA ADPCM (2), and the configuration for any other codec.
+fn riff_extension_bytes(stream: &StreamCodec, layout: LayoutView<'_>) -> usize {
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  let codec = stream.codec();
+  let is = |id: Id| codec == CodecId::from_raw(id as i32);
+  let extension = if codec == CodecId::MP3 {
+    12
+  } else if codec == MP2 {
+    22
+  } else if is(Id::AV_CODEC_ID_G723_1) {
+    10
+  } else if is(Id::AV_CODEC_ID_GSM_MS) || is(Id::AV_CODEC_ID_ADPCM_IMA_WAV) {
+    2
+  } else {
+    stream.extradata().len()
+  };
+  // `AV_CHANNEL_LAYOUT_MONO` and `_STEREO`: native, of one front centre
+  // channel, and of front left and right.
+  let native = layout.order == AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32;
+  let mono_or_stereo =
+    (layout.channels == 1 && layout.mask == 0x4) || (layout.channels == 2 && layout.mask == 0x3);
+  let extensible = (native && !mono_or_stereo)
+    || stream.sample_rate() > 48_000
+    || codec == CodecId::EAC3
+    || is(Id::AV_CODEC_ID_DFPWM)
+    || (codec.bits_per_sample() > 16 && stream.codec_tag() != 0x0003);
+  if extensible {
+    extension + 22
+  } else if stream.codec_tag() == 0x1610 {
+    stream.extradata().len() + 12
+  } else {
+    extension
+  }
+}
+
+/// A bound on the length `asf_stream` writes into its header chunk's
+/// 16-bit length (`asf_write_header1`, `asfenc.c` 360–733): the chunk's and
+/// the header object's own, the file's properties, the header extension
+/// with its language list, its mutual exclusion and its aspect ratios, the
+/// file's tags — libavformat's encoder tag alone, the creation time taken
+/// out — the codec list and the data object's header, 600 bytes; and for
+/// each stream at most 470 beside its configuration: its properties, its
+/// format at its longest (a WAVEFORMATEXTENSIBLE with the 22 bytes MPEG
+/// audio layer II's extension takes, or a bitmap header), its extended
+/// properties, its language, its place in the exclusion, its aspect ratio
+/// and its entry in the codec list, its codec's name at 64 characters.
+fn asf_stream_header_bound(configurations: impl Iterator<Item = usize>) -> u64 {
+  configurations.fold(600, |bound, bytes| bound + 470 + bytes as u64)
+}
+
 /// The track's place among the table's timed tracks of its kind before it:
 /// FLV's `track_idx_map` (`flvenc.c` 993–1060).
 fn kind_index<D, S>(tracks: &[TrackDescription<Ffmpeg, D, S>], index: usize) -> usize {
@@ -7608,6 +7859,23 @@ where
     }
     Audited::Ivf
       if ticket.width() > i32::from(u16::MAX) || ticket.height() > i32::from(u16::MAX) =>
+    {
+      Some(MuxOpenError::Dimensions { track })
+    }
+    // The bitmap header AVI and ASF write a video stream's picture with
+    // counts its bytes in an `int`: its width by its height by its bits a
+    // sample — 24 where it states none — and 7, over 8
+    // (`ff_put_bmp_header`, `riffenc.c` 265), past it a signed overflow.
+    Audited::Avi | Audited::Asf { .. }
+      if description.kind() == TrackKind::Video
+        && i128::from(ticket.width())
+          * i128::from(ticket.height())
+          * i128::from(match ticket.bits_per_coded_sample() {
+            0 => 24,
+            bits => bits,
+          })
+          + 7
+          > i128::from(i32::MAX) =>
     {
       Some(MuxOpenError::Dimensions { track })
     }
@@ -8188,6 +8456,12 @@ enum LanguageRule {
   /// `0x7F7F7F`, which packs to "unspecified" (`isom.c` 233–280;
   /// `movenc.c` 8455–8458). An empty tag is written as `und`.
   Packed,
+  /// ASF's: written as the tag's ISO 639-1 code and read back as that
+  /// code's ISO 639-2/B one, each by libavformat's table
+  /// (`ff_convert_lang_to`, `avlanguage.c` 741–770), so that a tag reads
+  /// back as itself only where it is the bibliographic code of a language
+  /// ISO 639-1 names; one without a code there is not written.
+  ThroughIso639_1,
   /// None.
   Dropped,
 }
@@ -8205,10 +8479,765 @@ impl LanguageRule {
           && bytes[0] != 0x60
           && bytes != [0x7F; 3]
       }
+      Self::ThroughIso639_1 => {
+        convert_language(tag, LanguageSpace::Iso639_1)
+          .and_then(|code| convert_language(code, LanguageSpace::Iso639_2Bibliographic))
+          == Some(tag)
+      }
       Self::Dropped => false,
     }
   }
 }
+
+/// A codespace of libavformat's language table (`AVLangCodespace`,
+/// `avlanguage.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanguageSpace {
+  Iso639_2Bibliographic,
+  Iso639_2Terminology,
+  Iso639_1,
+}
+
+/// libavformat's language table (`lang_table`, `avlanguage.c` 34–739 in
+/// FFmpeg 9.0.1): each code, and the place of the next entry for its
+/// language in another codespace — the ISO 639-2/B codes first, 484 of
+/// them, then 20 ISO 639-2/T codes, then 190 ISO 639-1 codes.
+const LANGUAGES: [(&str, u16); 694] = [
+  ("aar", 504),
+  ("abk", 505),
+  ("ace", 2),
+  ("ach", 3),
+  ("ada", 4),
+  ("ady", 5),
+  ("afa", 6),
+  ("afh", 7),
+  ("afr", 507),
+  ("ain", 9),
+  ("aka", 508),
+  ("akk", 11),
+  ("alb", 502),
+  ("ale", 13),
+  ("alg", 14),
+  ("alt", 15),
+  ("amh", 509),
+  ("ang", 17),
+  ("anp", 18),
+  ("apa", 19),
+  ("ara", 511),
+  ("arc", 21),
+  ("arg", 510),
+  ("arm", 492),
+  ("arn", 24),
+  ("arp", 25),
+  ("art", 26),
+  ("arw", 27),
+  ("asm", 512),
+  ("ast", 29),
+  ("ath", 30),
+  ("aus", 31),
+  ("ava", 513),
+  ("ave", 506),
+  ("awa", 34),
+  ("aym", 514),
+  ("aze", 515),
+  ("bad", 37),
+  ("bai", 38),
+  ("bak", 516),
+  ("bal", 40),
+  ("bam", 521),
+  ("ban", 42),
+  ("baq", 489),
+  ("bas", 44),
+  ("bat", 45),
+  ("bej", 46),
+  ("bel", 517),
+  ("bem", 48),
+  ("ben", 522),
+  ("ber", 50),
+  ("bho", 51),
+  ("bih", 519),
+  ("bik", 53),
+  ("bin", 54),
+  ("bis", 520),
+  ("bla", 56),
+  ("bnt", 57),
+  ("bos", 525),
+  ("bra", 59),
+  ("bre", 524),
+  ("btk", 61),
+  ("bua", 62),
+  ("bug", 63),
+  ("bul", 518),
+  ("bur", 498),
+  ("byn", 66),
+  ("cad", 67),
+  ("cai", 68),
+  ("car", 69),
+  ("cat", 526),
+  ("cau", 71),
+  ("ceb", 72),
+  ("cel", 73),
+  ("cha", 528),
+  ("chb", 75),
+  ("che", 527),
+  ("chg", 77),
+  ("chi", 503),
+  ("chk", 79),
+  ("chm", 80),
+  ("chn", 81),
+  ("cho", 82),
+  ("chp", 83),
+  ("chr", 84),
+  ("chu", 532),
+  ("chv", 533),
+  ("chy", 87),
+  ("cmc", 88),
+  ("cop", 89),
+  ("cor", 593),
+  ("cos", 529),
+  ("cpe", 92),
+  ("cpf", 93),
+  ("cpp", 94),
+  ("cre", 530),
+  ("crh", 96),
+  ("crp", 97),
+  ("csb", 98),
+  ("cus", 99),
+  ("cze", 485),
+  ("dak", 101),
+  ("dan", 535),
+  ("dar", 103),
+  ("day", 104),
+  ("del", 105),
+  ("den", 106),
+  ("dgr", 107),
+  ("din", 108),
+  ("div", 537),
+  ("doi", 110),
+  ("dra", 111),
+  ("dsb", 112),
+  ("dua", 113),
+  ("dum", 114),
+  ("dut", 499),
+  ("dyu", 116),
+  ("dzo", 538),
+  ("efi", 118),
+  ("egy", 119),
+  ("eka", 120),
+  ("elx", 121),
+  ("eng", 541),
+  ("enm", 123),
+  ("epo", 542),
+  ("est", 544),
+  ("ewe", 539),
+  ("ewo", 127),
+  ("fan", 128),
+  ("fao", 550),
+  ("fat", 130),
+  ("fij", 549),
+  ("fil", 132),
+  ("fin", 548),
+  ("fiu", 134),
+  ("fon", 135),
+  ("fre", 491),
+  ("frm", 137),
+  ("fro", 138),
+  ("frr", 139),
+  ("frs", 140),
+  ("fry", 552),
+  ("ful", 547),
+  ("fur", 143),
+  ("gaa", 144),
+  ("gay", 145),
+  ("gba", 146),
+  ("gem", 147),
+  ("geo", 494),
+  ("ger", 487),
+  ("gez", 150),
+  ("gil", 151),
+  ("gla", 554),
+  ("gle", 553),
+  ("glg", 555),
+  ("glv", 558),
+  ("gmh", 156),
+  ("goh", 157),
+  ("gon", 158),
+  ("gor", 159),
+  ("got", 160),
+  ("grb", 161),
+  ("grc", 162),
+  ("gre", 488),
+  ("grn", 556),
+  ("gsw", 165),
+  ("guj", 557),
+  ("gwi", 167),
+  ("hai", 168),
+  ("hat", 564),
+  ("hau", 559),
+  ("haw", 171),
+  ("heb", 560),
+  ("her", 567),
+  ("hil", 174),
+  ("him", 175),
+  ("hin", 561),
+  ("hit", 177),
+  ("hmn", 178),
+  ("hmo", 562),
+  ("hrv", 563),
+  ("hsb", 181),
+  ("hun", 565),
+  ("hup", 183),
+  ("iba", 184),
+  ("ibo", 571),
+  ("ice", 493),
+  ("ido", 574),
+  ("iii", 572),
+  ("ijo", 189),
+  ("iku", 577),
+  ("ile", 570),
+  ("ilo", 192),
+  ("ina", 568),
+  ("inc", 194),
+  ("ind", 569),
+  ("ine", 196),
+  ("inh", 197),
+  ("ipk", 573),
+  ("ira", 199),
+  ("iro", 200),
+  ("ita", 576),
+  ("jav", 579),
+  ("jbo", 203),
+  ("jpn", 578),
+  ("jpr", 205),
+  ("jrb", 206),
+  ("kaa", 207),
+  ("kab", 208),
+  ("kac", 209),
+  ("kal", 585),
+  ("kam", 211),
+  ("kan", 587),
+  ("kar", 213),
+  ("kas", 590),
+  ("kau", 589),
+  ("kaw", 216),
+  ("kaz", 584),
+  ("kbd", 218),
+  ("kha", 219),
+  ("khi", 220),
+  ("khm", 586),
+  ("kho", 222),
+  ("kik", 582),
+  ("kin", 640),
+  ("kir", 594),
+  ("kmb", 226),
+  ("kok", 227),
+  ("kom", 592),
+  ("kon", 581),
+  ("kor", 588),
+  ("kos", 231),
+  ("kpe", 232),
+  ("krc", 233),
+  ("krl", 234),
+  ("kro", 235),
+  ("kru", 236),
+  ("kua", 583),
+  ("kum", 238),
+  ("kur", 591),
+  ("kut", 240),
+  ("lad", 241),
+  ("lah", 242),
+  ("lam", 243),
+  ("lao", 600),
+  ("lat", 595),
+  ("lav", 603),
+  ("lez", 247),
+  ("lim", 598),
+  ("lin", 599),
+  ("lit", 601),
+  ("lol", 251),
+  ("loz", 252),
+  ("ltz", 596),
+  ("lua", 254),
+  ("lub", 602),
+  ("lug", 597),
+  ("lui", 257),
+  ("lun", 258),
+  ("luo", 259),
+  ("lus", 260),
+  ("mac", 495),
+  ("mad", 262),
+  ("mag", 263),
+  ("mah", 605),
+  ("mai", 265),
+  ("mak", 266),
+  ("mal", 608),
+  ("man", 268),
+  ("mao", 496),
+  ("map", 270),
+  ("mar", 610),
+  ("mas", 272),
+  ("may", 497),
+  ("mdf", 274),
+  ("mdr", 275),
+  ("men", 276),
+  ("mga", 277),
+  ("mic", 278),
+  ("min", 279),
+  ("mis", 280),
+  ("mkh", 281),
+  ("mlg", 604),
+  ("mlt", 612),
+  ("mnc", 284),
+  ("mni", 285),
+  ("mno", 286),
+  ("moh", 287),
+  ("mon", 609),
+  ("mos", 289),
+  ("mul", 290),
+  ("mun", 291),
+  ("mus", 292),
+  ("mwl", 293),
+  ("mwr", 294),
+  ("myn", 295),
+  ("myv", 296),
+  ("nah", 297),
+  ("nai", 298),
+  ("nap", 299),
+  ("nau", 614),
+  ("nav", 623),
+  ("nbl", 622),
+  ("nde", 616),
+  ("ndo", 618),
+  ("nds", 305),
+  ("nep", 617),
+  ("new", 307),
+  ("nia", 308),
+  ("nic", 309),
+  ("niu", 310),
+  ("nno", 620),
+  ("nob", 615),
+  ("nog", 313),
+  ("non", 314),
+  ("nor", 621),
+  ("nqo", 316),
+  ("nso", 317),
+  ("nub", 318),
+  ("nwc", 319),
+  ("nya", 624),
+  ("nym", 321),
+  ("nyn", 322),
+  ("nyo", 323),
+  ("nzi", 324),
+  ("oci", 625),
+  ("oji", 626),
+  ("ori", 628),
+  ("orm", 627),
+  ("osa", 329),
+  ("oss", 629),
+  ("ota", 331),
+  ("oto", 332),
+  ("paa", 333),
+  ("pag", 334),
+  ("pal", 335),
+  ("pam", 336),
+  ("pan", 630),
+  ("pap", 338),
+  ("pau", 339),
+  ("peo", 340),
+  ("per", 490),
+  ("phi", 342),
+  ("phn", 343),
+  ("pli", 631),
+  ("pol", 632),
+  ("pon", 346),
+  ("por", 634),
+  ("pra", 348),
+  ("pro", 349),
+  ("pus", 633),
+  ("que", 635),
+  ("raj", 352),
+  ("rap", 353),
+  ("rar", 354),
+  ("roa", 355),
+  ("roh", 636),
+  ("rom", 357),
+  ("rum", 500),
+  ("run", 637),
+  ("rup", 360),
+  ("rus", 639),
+  ("sad", 362),
+  ("sag", 645),
+  ("sah", 364),
+  ("sai", 365),
+  ("sal", 366),
+  ("sam", 367),
+  ("san", 641),
+  ("sas", 369),
+  ("sat", 370),
+  ("scn", 371),
+  ("sco", 372),
+  ("sel", 373),
+  ("sem", 374),
+  ("sga", 375),
+  ("sgn", 376),
+  ("shn", 377),
+  ("sid", 378),
+  ("sin", 646),
+  ("sio", 380),
+  ("sit", 381),
+  ("sla", 382),
+  ("slo", 501),
+  ("slv", 648),
+  ("sma", 385),
+  ("sme", 644),
+  ("smi", 387),
+  ("smj", 388),
+  ("smn", 389),
+  ("smo", 649),
+  ("sms", 391),
+  ("sna", 650),
+  ("snd", 643),
+  ("snk", 394),
+  ("sog", 395),
+  ("som", 651),
+  ("son", 397),
+  ("sot", 655),
+  ("spa", 543),
+  ("srd", 642),
+  ("srn", 401),
+  ("srp", 653),
+  ("srr", 403),
+  ("ssa", 404),
+  ("ssw", 654),
+  ("suk", 406),
+  ("sun", 656),
+  ("sus", 408),
+  ("sux", 409),
+  ("swa", 658),
+  ("swe", 657),
+  ("syc", 412),
+  ("syr", 413),
+  ("tah", 672),
+  ("tai", 415),
+  ("tam", 659),
+  ("tat", 670),
+  ("tel", 660),
+  ("tem", 419),
+  ("ter", 420),
+  ("tet", 421),
+  ("tgk", 661),
+  ("tgl", 665),
+  ("tha", 662),
+  ("tib", 484),
+  ("tig", 426),
+  ("tir", 663),
+  ("tiv", 428),
+  ("tkl", 429),
+  ("tlh", 430),
+  ("tli", 431),
+  ("tmh", 432),
+  ("tog", 433),
+  ("ton", 667),
+  ("tpi", 435),
+  ("tsi", 436),
+  ("tsn", 666),
+  ("tso", 669),
+  ("tuk", 664),
+  ("tum", 440),
+  ("tup", 441),
+  ("tur", 668),
+  ("tut", 443),
+  ("tvl", 444),
+  ("twi", 671),
+  ("tyv", 446),
+  ("udm", 447),
+  ("uga", 448),
+  ("uig", 673),
+  ("ukr", 674),
+  ("umb", 451),
+  ("und", 452),
+  ("urd", 675),
+  ("uzb", 676),
+  ("vai", 455),
+  ("ven", 677),
+  ("vie", 678),
+  ("vol", 679),
+  ("vot", 459),
+  ("wak", 460),
+  ("wal", 461),
+  ("war", 462),
+  ("was", 463),
+  ("wel", 486),
+  ("wen", 465),
+  ("wln", 680),
+  ("wol", 681),
+  ("xal", 468),
+  ("xho", 682),
+  ("yao", 470),
+  ("yap", 471),
+  ("yid", 683),
+  ("yor", 684),
+  ("ypk", 474),
+  ("zap", 475),
+  ("zbl", 476),
+  ("zen", 477),
+  ("zha", 685),
+  ("znd", 479),
+  ("zul", 687),
+  ("zun", 481),
+  ("zxx", 482),
+  ("zza", 483),
+  ("bod", 523),
+  ("ces", 531),
+  ("cym", 534),
+  ("deu", 536),
+  ("ell", 540),
+  ("eus", 545),
+  ("fas", 546),
+  ("fra", 551),
+  ("hye", 566),
+  ("isl", 575),
+  ("kat", 580),
+  ("mkd", 607),
+  ("mri", 606),
+  ("msa", 611),
+  ("mya", 613),
+  ("nld", 619),
+  ("ron", 638),
+  ("slk", 647),
+  ("sqi", 652),
+  ("zho", 686),
+  ("aa", 0),
+  ("ab", 1),
+  ("ae", 33),
+  ("af", 8),
+  ("ak", 10),
+  ("am", 16),
+  ("an", 22),
+  ("ar", 20),
+  ("as", 28),
+  ("av", 32),
+  ("ay", 35),
+  ("az", 36),
+  ("ba", 39),
+  ("be", 47),
+  ("bg", 64),
+  ("bh", 52),
+  ("bi", 55),
+  ("bm", 41),
+  ("bn", 49),
+  ("bo", 425),
+  ("br", 60),
+  ("bs", 58),
+  ("ca", 70),
+  ("ce", 76),
+  ("ch", 74),
+  ("co", 91),
+  ("cr", 95),
+  ("cs", 100),
+  ("cu", 85),
+  ("cv", 86),
+  ("cy", 464),
+  ("da", 102),
+  ("de", 149),
+  ("dv", 109),
+  ("dz", 117),
+  ("ee", 126),
+  ("el", 163),
+  ("en", 122),
+  ("eo", 124),
+  ("es", 399),
+  ("et", 125),
+  ("eu", 43),
+  ("fa", 341),
+  ("ff", 142),
+  ("fi", 133),
+  ("fj", 131),
+  ("fo", 129),
+  ("fr", 136),
+  ("fy", 141),
+  ("ga", 153),
+  ("gd", 152),
+  ("gl", 154),
+  ("gn", 164),
+  ("gu", 166),
+  ("gv", 155),
+  ("ha", 170),
+  ("he", 172),
+  ("hi", 176),
+  ("ho", 179),
+  ("hr", 180),
+  ("ht", 169),
+  ("hu", 182),
+  ("hy", 23),
+  ("hz", 173),
+  ("ia", 193),
+  ("id", 195),
+  ("ie", 191),
+  ("ig", 185),
+  ("ii", 188),
+  ("ik", 198),
+  ("io", 187),
+  ("is", 186),
+  ("it", 201),
+  ("iu", 190),
+  ("ja", 204),
+  ("jv", 202),
+  ("ka", 148),
+  ("kg", 229),
+  ("ki", 223),
+  ("kj", 237),
+  ("kk", 217),
+  ("kl", 210),
+  ("km", 221),
+  ("kn", 212),
+  ("ko", 230),
+  ("kr", 215),
+  ("ks", 214),
+  ("ku", 239),
+  ("kv", 228),
+  ("kw", 90),
+  ("ky", 225),
+  ("la", 245),
+  ("lb", 253),
+  ("lg", 256),
+  ("li", 248),
+  ("ln", 249),
+  ("lo", 244),
+  ("lt", 250),
+  ("lu", 255),
+  ("lv", 246),
+  ("mg", 282),
+  ("mh", 264),
+  ("mi", 269),
+  ("mk", 261),
+  ("ml", 267),
+  ("mn", 288),
+  ("mr", 271),
+  ("ms", 273),
+  ("mt", 283),
+  ("my", 65),
+  ("na", 300),
+  ("nb", 312),
+  ("nd", 303),
+  ("ne", 306),
+  ("ng", 304),
+  ("nl", 115),
+  ("nn", 311),
+  ("no", 315),
+  ("nr", 302),
+  ("nv", 301),
+  ("ny", 320),
+  ("oc", 325),
+  ("oj", 326),
+  ("om", 328),
+  ("or", 327),
+  ("os", 330),
+  ("pa", 337),
+  ("pi", 344),
+  ("pl", 345),
+  ("ps", 350),
+  ("pt", 347),
+  ("qu", 351),
+  ("rm", 356),
+  ("rn", 359),
+  ("ro", 358),
+  ("ru", 361),
+  ("rw", 224),
+  ("sa", 368),
+  ("sc", 400),
+  ("sd", 393),
+  ("se", 386),
+  ("sg", 363),
+  ("si", 379),
+  ("sk", 383),
+  ("sl", 384),
+  ("sm", 390),
+  ("sn", 392),
+  ("so", 396),
+  ("sq", 12),
+  ("sr", 402),
+  ("ss", 405),
+  ("st", 398),
+  ("su", 407),
+  ("sv", 411),
+  ("sw", 410),
+  ("ta", 416),
+  ("te", 418),
+  ("tg", 422),
+  ("th", 424),
+  ("ti", 427),
+  ("tk", 439),
+  ("tl", 423),
+  ("tn", 437),
+  ("to", 434),
+  ("tr", 442),
+  ("ts", 438),
+  ("tt", 417),
+  ("tw", 445),
+  ("ty", 414),
+  ("ug", 449),
+  ("uk", 450),
+  ("ur", 453),
+  ("uz", 454),
+  ("ve", 456),
+  ("vi", 457),
+  ("vo", 458),
+  ("wa", 466),
+  ("wo", 467),
+  ("xh", 469),
+  ("yi", 472),
+  ("yo", 473),
+  ("za", 478),
+  ("zh", 78),
+  ("zu", 480),
+  ("in", 195),
+  ("iw", 172),
+  ("ji", 472),
+  ("jw", 202),
+  ("mo", 358),
+  ("sh", 693),
+];
+
+/// The first entry and the count of each codespace's codes in
+/// [`LANGUAGES`] (`lang_table_offsets`, `lang_table_counts`).
+const LANGUAGE_SPACES: [(usize, usize); 3] = [(0, 484), (484, 20), (504, 190)];
+
+/// `tag`'s code in `target`, as `ff_convert_lang_to` finds it
+/// (`avlanguage.c` 741–770): the tag looked for in each codespace in turn,
+/// then its language's entries followed round to `target`'s, ISO 639-2/T
+/// falling back to ISO 639-2/B.
+fn convert_language(tag: &str, target: LanguageSpace) -> Option<&'static str> {
+  let mut entry = LANGUAGE_SPACES.iter().find_map(|&(start, count)| {
+    LANGUAGES[start..start + count]
+      .binary_search_by(|(code, _)| code.cmp(&tag))
+      .ok()
+      .map(|found| start + found)
+  })?;
+  let (start, count) = LANGUAGE_SPACES[target as usize];
+  for _ in 0..LANGUAGE_SPACES.len() {
+    if (start..start + count).contains(&entry) {
+      return Some(LANGUAGES[entry].0);
+    }
+    entry = usize::from(LANGUAGES[entry].1);
+  }
+  if target == LanguageSpace::Iso639_2Terminology {
+    return convert_language(tag, LanguageSpace::Iso639_2Bibliographic);
+  }
+  None
+}
+
+/// ASF's preroll, in milliseconds, added to every presentation time it
+/// writes (`PREROLL_TIME`, `asfenc.c` 245).
+const ASF_PREROLL_MS: i64 = 3100;
+
+/// The latest presentation time ASF takes, in milliseconds:
+/// `(INT_MAX - 3) / 10000 * ASF_INDEXED_INTERVAL - PREROLL_TIME`, so that
+/// its index's count of seconds stays an `int` (`asfenc.c` 1025–1029).
+const ASF_PRESENTATION_MAX_MS: i128 = (i32::MAX as i128 - 3) / 10_000 * 10_000_000 - 3100;
+
+/// ASF's 100 ns ticks a millisecond.
+const ASF_TICKS_A_MILLISECOND: i128 = 10_000;
 
 /// The report table: what `road` keeps in `family` of a track of `kind`
 /// and `codec` declaring `flags` — from each muxer's source in FFmpeg
@@ -8307,9 +9336,15 @@ fn kept(
 /// libavformat is what the report table keeps of it ([`kept`]), so that no
 /// flag the report names as dropped acts on the stream — MP4 would make a
 /// timed video stream marked as an attached picture into a cover
-/// (`is_cover_image`, `movenc.c` 7606–7620).
+/// (`is_cover_image`, `movenc.c` 7606–7620). ASF numbers a stream's
+/// language by its place in the file's list of the ISO 639-1 codes it
+/// converts the tags to, and leaves a stream whose tag converts to none
+/// numbered 0 — another stream's language, where one is listed
+/// (`asf_write_header1`, `asfenc.c` 394–417, 483–498): such a tag is not
+/// handed, so that the stream is written with none, as the report says
+/// ([`Uncarried::Language`]).
 fn stream_spec<'a, D: AsRef<[u8]>>(
-  family: Family,
+  (family, audited): (Family, Audited),
   description: &'a TrackDescription<Ffmpeg, D, CodecTicket>,
   road: Road,
 ) -> StreamSpec<'a> {
@@ -8325,9 +9360,13 @@ fn stream_spec<'a, D: AsRef<[u8]>>(
     )
     .flags,
   );
+  let language = description.language().map(Utf8Bytes::as_str).filter(|tag| {
+    !matches!(audited, Audited::Asf { .. })
+      || convert_language(tag, LanguageSpace::Iso639_1).is_some()
+  });
   let spec = StreamSpec::new(ticket, description.timebase())
     .with_disposition(written.bits() as i32)
-    .with_language(description.language().map(Utf8Bytes::as_str))
+    .with_language(language)
     .with_extradata(description.extradata().map(|bytes| bytes.as_ref()));
   let spec = match description.params() {
     TrackParams::Video(params) => spec.with_frame_rate(params.frame_rate()),
@@ -8494,6 +9533,33 @@ fn chapter_losses(
             || !in_int(start)
             || !in_int(end)
           {
+            lost.push(Uncarried::ChapterSpan { chapter: index });
+          }
+        }
+      }
+      // ASF's markers: a start alone, counted in 100 ns, the preroll added
+      // and taken back off; the reader numbers them by position, from 0,
+      // and ends each where the next starts, the last at the file's end
+      // (`asf_write_markers`, `asfenc.c` 311–347; `asf_read_marker`,
+      // `asfdec_f.c` 661–697; `compute_chapters_end`, `demux.c` 2250–2285).
+      // The streaming form writes none (575), as the arm below says.
+      Audited::Asf { stream: false } => {
+        const HUNDRED_NANOSECONDS: i64 = 10_000_000;
+        for (index, (chapter, &(start, end))) in chapters.iter().zip(spans).enumerate() {
+          if chapter.id() != index as i64 {
+            lost.push(Uncarried::ChapterId {
+              chapter: index,
+              id: chapter.id(),
+            });
+          }
+          let base = chapter.timebase();
+          let ends_where_the_next_starts = match (chapters.get(index + 1), spans.get(index + 1)) {
+            (Some(next), Some(&(next_start, _))) => {
+              same_instant(end, base, next_start, next.timebase())
+            }
+            _ => false,
+          };
+          if !counts_exactly(start, base, HUNDRED_NANOSECONDS) || !ends_where_the_next_starts {
             lost.push(Uncarried::ChapterSpan { chapter: index });
           }
         }

@@ -144,7 +144,24 @@ crate moves only when it changes.
   as its place, reported where it is not (`Rewrite::Timeline`); a frame
   past the 60 000 empty ones it fills a gap with
   (`FfmpegMuxRefusal::FrameGap`), H.264 it tags `H264` off a start code,
-  raw video it would write unreadable.
+  raw video it would write unreadable. ASF: a decode time past its 32-bit
+  presentation time with the preroll's 3.1 s (`TimeWraps`), a presentation
+  past what its index counts (`PresentationOffset`), a play duration past
+  `i64` in 100 ns (`FfmpegMuxRefusal::DurationTooLong`), an empty packet;
+  at open a video configuration past its 16-bit format data size, a
+  marker title past its entry's 16-bit length
+  (`MuxOpenError::ChapterTitleTooLong`), a chapter at 2^32 ms or later
+  (`MuxOpenError::ChapterSpan`), and a streaming header that could pass
+  its chunk's 16-bit length (`MuxOpenError::HeaderTooLong`, new); a
+  language through its ISO 639-1 code, a tag of none not handed, so that
+  the stream is not written under another stream's; its markers' spans and
+  ids, the streaming form writing none; every audio packet read back a key
+  frame (`Rewrite::KeyFramesMarked`); a late stream's early start taken, as
+  its interleaving waits for every stream. WAV, Wave64, AVI and ASF: an
+  audio configuration past the WAVEFORMATEX's 16-bit `cbSize`
+  (`MuxOpenError::ConfigurationInvalid`), a configured AAC track's ADTS
+  packet (`AdtsHeader`); AVI and ASF, a picture whose bytes pass the
+  bitmap header's `int` (`MuxOpenError::Dimensions`).
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

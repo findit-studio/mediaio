@@ -510,6 +510,25 @@ fn a_configuration_is_judged_and_its_rewrite_reported() {
     field_rows(Audited::Wav { w64: false }, CodecId::PCM_S16LE),
     vec![Rewrite::Timeline]
   );
+  // ASF: the decode time and the key flag, no duration — and an audio
+  // track's key flag, which its reader sets on every packet, is reported
+  // where a packet is offered unmarked, not at open.
+  for stream in [false, true] {
+    assert_eq!(
+      field_rows(Audited::Asf { stream }, CodecId::H264),
+      vec![Rewrite::Durations]
+    );
+    assert_eq!(
+      rewrites(
+        (Family::Other, Audited::Asf { stream }, TrackKind::Audio),
+        CodecId::AAC,
+        &[],
+        true
+      )
+      .collect::<Vec<_>>(),
+      vec![Rewrite::Durations]
+    );
+  }
 }
 
 /// The audited muxer a family's unit laws stand for.
@@ -2910,5 +2929,43 @@ fn matroska_reserves_aacs_output_rate_as_its_header_writes_it() {
   assert!(
     aac_output_rate_reserved(&[0x2B, 0x11, 0x88, 0x00]),
     "explicit SBR: 24 kHz, its extension 48 kHz"
+  );
+}
+
+/// **libavformat's language table, as `ff_convert_lang_to` reads it**
+/// (`avlanguage.c` 741–770): a bibliographic code to its ISO 639-1 one and
+/// back; a terminological one to its bibliographic sibling; a code no
+/// codespace names, none. ASF keeps a tag only where it is the round
+/// trip's own.
+#[test]
+fn a_language_converts_as_libavformat_converts_it() {
+  use LanguageSpace as L;
+  assert_eq!(convert_language("eng", L::Iso639_1), Some("en"));
+  assert_eq!(
+    convert_language("en", L::Iso639_2Bibliographic),
+    Some("eng")
+  );
+  assert_eq!(convert_language("fra", L::Iso639_1), Some("fr"));
+  assert_eq!(
+    convert_language("fr", L::Iso639_2Bibliographic),
+    Some("fre")
+  );
+  assert_eq!(
+    convert_language("fra", L::Iso639_2Bibliographic),
+    Some("fre")
+  );
+  assert_eq!(convert_language("ger", L::Iso639_2Terminology), Some("deu"));
+  assert_eq!(
+    convert_language("eng", L::Iso639_2Terminology),
+    Some("eng"),
+    "B where T is the same"
+  );
+  assert_eq!(convert_language("zzz", L::Iso639_1), None);
+  assert!(LanguageRule::ThroughIso639_1.keeps("eng"));
+  assert!(!LanguageRule::ThroughIso639_1.keeps("fra"));
+  assert!(!LanguageRule::ThroughIso639_1.keeps("en"));
+  assert!(
+    !LanguageRule::ThroughIso639_1.keeps("ace"),
+    "no ISO 639-1 code: not written"
   );
 }
