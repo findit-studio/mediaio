@@ -103,6 +103,7 @@
 //! | `open` | `av_guess_format`; the static muxer's `flags`; `avformat_alloc_output_context2`; `ctx.pb` and `ctx.flags` written | a NUL-terminated name live for the call; a non-null static muxer; a valid out-pointer, null on failure; the I/O context outlives the context, and is the caller's (`AVFMT_FLAG_CUSTOM_IO`) |
 //! | `container`, `container_mime_type`, `strict_decode_times`, `shifts_early_times` | the static muxer's `name` and `mime_type` (each bounded, `table_text`, the MIME type null where unstated) and `flags` | `oformat` is never null on a context `open` returned |
 //! | `sink_fault` | the I/O context's `error` (`pb`, kept from `open`) | the I/O context the `Output` owns, live as long as it is; a plain `int` libavformat writes only inside the `&mut self` calls, read after they return |
+//! | `position` | `avio_seek` of 0 from the current position (`pb`) | as `sink_fault`'s; `SEEK_CUR` of 0 answers the position from the context's own fields and calls no callback (`aviobuf.c` 258–261 in FFmpeg 9.0.1) |
 //! | `query_codec` | `avformat_query_codec` through a shim taking the codec id as `c_int` | no bindgen enum formed from an integer; libavformat searches its tag tables, never indexes them |
 //! | `streams`, `stream`, `stream_time_base` | `nb_streams`; `streams[index]`; a stream's `time_base` | `index < nb_streams`, checked first |
 //! | `stream_codec` | a stream's `codecpar` fields, the codec id and media type as integers, the extradata as `extradata_size` bytes; `av_get_audio_frame_duration2` | libavutil's allocation, null when empty; the call reads plain fields and writes nothing |
@@ -165,6 +166,7 @@
 //! | `av_packet_unref`, in the blank `Packet`'s `Drop` | `write_packet` | none: a no-op on the packet `av_interleaved_write_frame` left blank | — |
 //! | `av_write_trailer` | `write_trailer` | a negative code; the sink's panic, failed seek or failed write (`mux.c` 1270–1272 answers the last as its own) | the sink's fault, else `Ffmpeg`; the context `Finished` either way |
 //! | `avio_flush` and `AVIOContext.error` | `into_sink` | the first failed write, which the I/O context keeps | `SinkWrite`, after a panic and a failed seek |
+//! | `avio_seek`, of 0 from the current position | `position` | none: `SEEK_CUR` of 0 answers before any check that can fail (`aviobuf.c` 258–261) | — |
 //! | the sink's `flush`, through the guard | `into_sink` | its `io::Error` | `Sink`, last |
 //! | `av_dict_free`, `av_free`, in `free_chapter` | `add_chapter`, on each failure before the array takes the chapter | none | — |
 //! | `avformat_free_context`, `StreamIo`'s `Drop` and `into_inner` (`av_freep`, `avio_context_free`) | `into_sink`, `Drop` | none | — |
@@ -191,7 +193,7 @@ use ffmpeg_next::{
     av_dict_set, av_dynarray_add_nofree, av_free, av_freep, av_guess_format,
     av_interleaved_write_frame, av_mallocz, av_write_trailer, avcodec_parameters_copy,
     avformat_alloc_output_context2, avformat_free_context, avformat_new_stream,
-    avformat_write_header, avio_flush,
+    avformat_write_header, avio_flush, avio_seek,
   },
   format::context::StreamIo,
   packet::Mut,
@@ -720,6 +722,19 @@ impl<W> Output<W> {
       (true, Some(nz)) if den > 0 => Ok(Timebase::new(num, nz)),
       _ => Err(OutputError::TimeBase { stream, num, den }),
     }
+  }
+
+  /// The bytes libavformat has written into the sink so far, those its I/O
+  /// context still buffers among them — `avio_tell`, the position it
+  /// writes at next (`libavformat/avio.h` 494–497 in FFmpeg 9.0.1). Asked
+  /// after the header, the header's size: what a muxer that counts its
+  /// file in 32 bits counts it from.
+  pub fn position(&self) -> i64 {
+    // SAFETY: `pb` is the I/O context `io` owns, live for as long as this
+    // value is; `avio_seek` with `SEEK_CUR` and an offset of 0 reads the
+    // context's position and buffer pointers and answers without calling
+    // the sink or writing a field (`aviobuf.c` 236–261).
+    unsafe { avio_seek(self.pb.as_ptr(), 0, ffmpeg_next::ffi::SEEK_CUR) }
   }
 
   /// The number of streams added so far.

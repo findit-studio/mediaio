@@ -1506,8 +1506,8 @@ const PAST_I32_SECONDS: i64 = 1 << 31;
 /// (`guess_pkt_duration`, `mux.c` 605–633), and Matroska zero for a
 /// subtitle's (`matroskaenc.c` 3134), the cue read back with none: taken,
 /// the durations reported. MP4 refuses a subtitle's after taking the packet
-/// (`movenc.c` 6925–6928), and SRT drops the cue (`srtenc.c` 71–75):
-/// refused, untouched, the file holding only what was admitted.
+/// (`movenc.c` 6925–6928): refused, untouched, the file holding only what
+/// was admitted.
 ///
 /// PLANT: the refusal on every track refuses the video packet; on none, MP4
 /// refuses the cue after taking it.
@@ -1565,20 +1565,12 @@ fn l11_a_negative_duration_is_written_as_libavformat_makes_it() {
   let mov_text = mov_text_mp4(&corpus);
   let (mov_table, mov_cues) = first_track(&mov_text, TrackKind::Subtitle, 1);
   let base = mov_table[0].timebase();
-  for (name, container, table, cue) in [
-    (
-      "l11-cue.mp4",
-      ContainerName::MP4,
-      mov_table,
-      cue_on(0, &subtitle_of(&mov_cues[0]), base, (0, -1)),
-    ),
-    (
-      "l11-cue.srt",
-      ContainerName::new("srt"),
-      table_of(&source, TrackKind::Subtitle),
-      subtitle_at(&cue, 0, -40),
-    ),
-  ] {
+  for (name, container, table, cue) in [(
+    "l11-cue.mp4",
+    ContainerName::MP4,
+    mov_table,
+    cue_on(0, &subtitle_of(&mov_cues[0]), base, (0, -1)),
+  )] {
     let target = output(&corpus, name);
     let mut muxer = muxer_into(&target, container, table);
     let duration = cue.packet().duration().expect("a duration");
@@ -1593,9 +1585,8 @@ fn l11_a_negative_duration_is_written_as_libavformat_makes_it() {
     );
     untouched!(cue, back);
     muxer.finish().expect("finished");
-    // SRT writes nothing of its own; MP4's trailer writes the empty sample
-    // of a `mov_text` track that took no cue (`movenc.c` 9025–9031). The
-    // cue's bytes are nowhere.
+    // MP4's trailer writes the empty sample of a `mov_text` track that took
+    // no cue (`movenc.c` 9025–9031). The cue's bytes are nowhere.
     let empty = std::fs::metadata(&target).expect("the file").len() == 0;
     assert!(
       empty
@@ -4415,10 +4406,21 @@ fn l48_ivfs_vp9_superframes_are_bounded_with_the_filters_off() {
   .expect("open");
   assert_eq!(
     report.uncarried(),
-    &[Uncarried::Filtered {
-      track,
-      filter: AutomaticFilter::Vp9Superframe
-    }],
+    &[
+      Uncarried::Filtered {
+        track,
+        filter: AutomaticFilter::Vp9Superframe
+      },
+      // IVF writes the presentation time alone, and no key flag (table H).
+      Uncarried::Rewritten {
+        track,
+        rewrite: Rewrite::Durations
+      },
+      Uncarried::Rewritten {
+        track,
+        rewrite: Rewrite::SyncFromBitstream
+      },
+    ],
     "inserted at IVF's start, the filters off"
   );
   for (at, tag) in [(0, 1), (40, 2)] {
@@ -5329,18 +5331,19 @@ fn filtered(report: &mediaencode_ffmpeg::MuxReport) -> Vec<Uncarried> {
   lines(report, |line| matches!(line, Uncarried::Filtered { .. }))
 }
 
-/// **L62 — FLV's and LATM's AAC filter is named for its track at the
-/// packet that inserts it, once, and never where none is** (E″ of the
-/// census): their `check_bitstream` inserts `aac_adtstoasc` at a track's
-/// first packet where it opens with an ADTS header (`flvenc.c` 1491–1493;
-/// `latmenc.c` 255–257; `mux.c` 1063–1068). A transport stream's ADTS
+/// **L62 — FLV's AAC filter is named for its track at the packet that
+/// inserts it, once, and never where none is** (E″ of the census): its
+/// `check_bitstream` inserts `aac_adtstoasc` at a track's first packet
+/// where it opens with an ADTS header (`flvenc.c` 1491–1493; `mux.c`
+/// 1063–1068). LATM's does the same (`latmenc.c` 255–257), and is not
+/// audited (L73). A transport stream's ADTS
 /// frames: nothing is named at open, one line at the first frame's write,
 /// none more at the second. A configured track's raw AAC: none.
 ///
 /// PLANT: without the transition's line, the report names no filter for
 /// the frames it converts.
 #[test]
-fn l62_flv_and_latm_name_aacs_filter_at_the_packet_that_inserts_it() {
+fn l62_flv_names_aacs_filter_at_the_packet_that_inserts_it() {
   let Some(corpus) = Corpus::new() else { return };
   let ts = corpus.transport_stream();
   let (_, frames) = first_track(&ts, TrackKind::Audio, 2);
@@ -5350,7 +5353,7 @@ fn l62_flv_and_latm_name_aacs_filter_at_the_packet_that_inserts_it() {
     track: TrackIndex::new(0),
     filter: AutomaticFilter::AacAdtsToAsc,
   }];
-  for container in ["flv", "latm"] {
+  for container in ["flv"] {
     let mut muxer = muxer_into(
       &output(&corpus, &format!("l62.{container}")),
       ContainerName::new(container),
@@ -6469,4 +6472,1009 @@ fn l72_a_configurations_packet_is_taken_where_the_container_takes_it() {
   );
   untouched!(ignored, back);
   muxer.finish().expect("finished");
+}
+
+// ---------------------------------------------------------------------------
+//  H: the muxers this release audited.
+// ---------------------------------------------------------------------------
+
+/// The muxers this release audited, by the names libavformat resolves
+/// (table H of the census).
+const AUDITED: [&str; 45] = [
+  "mov",
+  "mp4",
+  "psp",
+  "3gp",
+  "3g2",
+  "ipod",
+  "ismv",
+  "f4v",
+  "avif",
+  "matroska",
+  "webm",
+  "mpegts",
+  "mpeg",
+  "vcd",
+  "vob",
+  "svcd",
+  "dvd",
+  "flv",
+  "avi",
+  "asf",
+  "asf_stream",
+  "nut",
+  "ogg",
+  "oga",
+  "ogv",
+  "opus",
+  "spx",
+  "mxf",
+  "mxf_d10",
+  "mxf_opatom",
+  "ivf",
+  "wav",
+  "w64",
+  "adts",
+  "ac3",
+  "eac3",
+  "dts",
+  "flac",
+  "mp2",
+  "mp3",
+  "h264",
+  "hevc",
+  "obu",
+  "m4v",
+  "mpeg2video",
+];
+
+/// **L73 — a muxer opens only where this release audited it** (table H of
+/// the census; the owner's ruling, R8): each muxer the linked libavformat
+/// registers, opened by its own name, is refused at open by that name
+/// where it is not audited ([`MuxOpenError::ContainerNotAudited`]) — before
+/// any stream is added, nothing written — or, where it writes no byte
+/// stream, as before ([`MuxOpenError::NoByteStream`]); each audited one
+/// passes the check, to the table's own refusal (a track whose ticket is
+/// another codec's, [`MuxOpenError::TicketMismatch`]), nothing written
+/// either.
+///
+/// PLANT: the check skipped: `srt` reaches the table's refusal.
+#[test]
+fn l73_a_muxer_opens_only_where_this_release_audited_it() {
+  use ffmpeg_next::ffi::{AVFMT_NOFILE, av_muxer_iterate};
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let demuxer = FfmpegOwnedDemuxer::open(&source).expect("open");
+  let row = demuxer
+    .tracks()
+    .iter()
+    .find(|row| row.kind() == TrackKind::Video)
+    .expect("a video track");
+  let pixel_format = match row.params() {
+    TrackParams::Video(params) => params.pixel_format().clone(),
+    other => panic!("expected video parameters, got {other:?}"),
+  };
+  // HEVC parameters over the H.264 stream's ticket.
+  let mismatched = || {
+    TrackDescription::new(
+      millis(),
+      TrackParams::Video(mediaencode::mediaspine::demuxer::VideoTrackParams::new(
+        CodecId::HEVC,
+        64,
+        64,
+        pixel_format.clone(),
+        None,
+      )),
+      ticket(row),
+    )
+    .expect("a description")
+  };
+  let target = output(&corpus, "l73.out");
+  let (mut registered, mut admitted, mut refused) = (0, Vec::new(), Vec::new());
+  let mut opaque = core::ptr::null_mut();
+  loop {
+    // SAFETY: `opaque` is the iteration state `av_muxer_iterate` keeps,
+    // null at the start; each answer is a static muxer, or null past the
+    // last, its `name` a static NUL-terminated string and `flags` a plain
+    // integer.
+    let (name, flags) = unsafe {
+      let muxer = av_muxer_iterate(&mut opaque);
+      if muxer.is_null() {
+        break;
+      }
+      (
+        std::ffi::CStr::from_ptr((*muxer).name)
+          .to_str()
+          .expect("a UTF-8 name"),
+        (*muxer).flags,
+      )
+    };
+    registered += 1;
+    // `stream_segment,ssegment`: a name list, matched by each name.
+    let first = name.split(',').next().expect("a name");
+    let result = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new(first.to_owned()),
+      vec![mismatched()],
+      &[],
+      PacketLimits::default(),
+    )
+    .map(drop);
+    assert_eq!(
+      std::fs::metadata(&target).expect("the file").len(),
+      0,
+      "{name}: nothing written"
+    );
+    if flags & AVFMT_NOFILE as i32 != 0 {
+      assert!(
+        matches!(result, Err(MuxOpenError::NoByteStream { .. })),
+        "{name}: {result:?}"
+      );
+    } else if AUDITED.contains(&first) {
+      assert!(
+        matches!(result, Err(MuxOpenError::TicketMismatch { track }) if track.get() == 0),
+        "{name}: past the check, {result:?}"
+      );
+      admitted.push(first);
+    } else {
+      assert!(
+        matches!(&result, Err(MuxOpenError::ContainerNotAudited { name: refused })
+          if refused.as_str() == name),
+        "{name}: {result:?}"
+      );
+      refused.push(first);
+    }
+  }
+  // FFmpeg 9.0.1 registers 185; a build leaves out those whose libraries
+  // it lacks, Chromaprint's among them.
+  assert!(
+    registered > 100,
+    "the linked libavformat's muxers: {registered}"
+  );
+  admitted.sort_unstable();
+  admitted.dedup();
+  assert_eq!(
+    admitted.len(),
+    AUDITED.len(),
+    "every audited name, each one muxer's"
+  );
+  assert!(refused.contains(&"srt") && refused.contains(&"image2pipe"));
+}
+
+/// Every packet of `path`'s first track of `kind`, and its one-track table.
+fn whole_track(path: &Path, kind: TrackKind) -> Track {
+  let mut demuxer = FfmpegOwnedDemuxer::open(path).expect("open");
+  let (index, description) = demuxer
+    .tracks()
+    .iter()
+    .enumerate()
+    .find(|(_, row)| row.kind() == kind)
+    .map(|(index, row)| {
+      (
+        index,
+        TrackDescription::from_track_info(&**row, None, ticket(row)).expect("a description"),
+      )
+    })
+    .expect("a track of the kind");
+  let mut packets = Vec::new();
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    if packet.track().get() == index {
+      packets.push(packet);
+    }
+  }
+  (vec![description], packets)
+}
+
+/// Writes `packets`, as read, into `container` at `target` over `table` —
+/// its one track the packets' — and answers the report.
+fn written_through(
+  target: &Path,
+  container: ContainerName,
+  (table, packets): Track,
+) -> mediaencode_ffmpeg::MuxReport {
+  let mut muxer = muxer_into(target, container, table);
+  for packet in &packets {
+    let track = TrackIndex::new(0);
+    match packet {
+      DemuxedPacket::Video(p) => muxer
+        .write_video(VideoTrackPacket::new(track, p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      DemuxedPacket::Audio(p) => muxer
+        .write_audio(AudioTrackPacket::new(track, p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      other => panic!("expected a video or an audio packet, got {other:?}"),
+    }
+    .unwrap_or_else(|error| panic!("{}: a packet as read: {error:?}", target.display()));
+  }
+  muxer.finish_into_sink().expect("finished").1
+}
+
+/// The bytes of `packets`, joined.
+fn joined_bytes(packets: &[DemuxedPacket<Ffmpeg, FfmpegBytes>]) -> Vec<u8> {
+  packets
+    .iter()
+    .flat_map(|packet| match packet {
+      DemuxedPacket::Video(p) => p.packet().data().as_ref().to_vec(),
+      DemuxedPacket::Audio(p) => p.packet().data().as_ref().to_vec(),
+      other => panic!("expected a video or an audio packet, got {other:?}"),
+    })
+    .collect()
+}
+
+/// The lines of `report` table H's field rows and table B's filters make.
+fn field_rows(report: &mediaencode_ffmpeg::MuxReport) -> Vec<Uncarried> {
+  lines(report, |line| {
+    matches!(
+      line,
+      Uncarried::Rewritten { .. } | Uncarried::Filtered { .. }
+    )
+  })
+}
+
+/// **L74 — one well-formed stream round-trips through each raw stream's
+/// muxer, IVF, WAV and Wave64, and the report says what each writes of it**
+/// (table H of the census): raw AC-3, E-AC-3, DTS, MPEG audio layer II and
+/// III, FLAC, MPEG-4 Part 2 and MPEG-2 video read back as the bytes
+/// written; ADTS reads back each raw AAC frame behind its header, and an
+/// ADTS stream as it was; H.264 and HEVC from Matroska and AV1 as as many
+/// packets as written, the first two converted to Annex B by the filter
+/// their first packet inserts, which writes the configuration; IVF's VP8
+/// and WAV's and Wave64's PCM as written. None of them writes a time — but
+/// IVF the presentation time, keeping no duration — nor a key flag, which
+/// the report says for the codecs that do not count every frame a key
+/// frame. A raw stream writes no configuration but what its packets carry,
+/// which MPEG-4's, MPEG-2's and AV1's first packets here do.
+#[test]
+fn l74_each_raw_stream_round_trips_through_its_muxer() {
+  let Some(corpus) = Corpus::new() else { return };
+  let track = TrackIndex::new(0);
+  let rewritten = |rewrites: &[Rewrite]| {
+    rewrites
+      .iter()
+      .map(|&rewrite| Uncarried::Rewritten { track, rewrite })
+      .collect::<Vec<_>>()
+  };
+  let timeline = rewritten(&[Rewrite::Timeline]);
+  let untimed = rewritten(&[Rewrite::Timeline, Rewrite::SyncFromBitstream]);
+  let sine = |name: &str, codec: &str, extra: &[&str]| {
+    let mut args = vec![
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:sample_rate=48000:duration=0.5",
+      "-ac",
+      "2",
+      "-c:a",
+      codec,
+    ];
+    args.extend_from_slice(extra);
+    generated(&corpus, name, &args)
+  };
+  let picture = |name: &str, codec: &str| {
+    generated(
+      &corpus,
+      name,
+      &[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x64:rate=25:duration=0.2",
+        "-c:v",
+        codec,
+      ],
+    )
+  };
+  // The streams whose bytes read back as written.
+  for (container, source, kind, expected) in [
+    (
+      "ac3",
+      sine("ac3.mkv", "ac3", &[]),
+      TrackKind::Audio,
+      timeline.clone(),
+    ),
+    (
+      "eac3",
+      sine("eac3.mkv", "eac3", &[]),
+      TrackKind::Audio,
+      timeline.clone(),
+    ),
+    (
+      "dts",
+      sine("dts.mkv", "dca", &["-strict", "-2"]),
+      TrackKind::Audio,
+      timeline.clone(),
+    ),
+    (
+      "mp2",
+      sine("mp2.mkv", "mp2", &[]),
+      TrackKind::Audio,
+      timeline.clone(),
+    ),
+    (
+      "mp3",
+      sine("mp3.mkv", "libmp3lame", &[]),
+      TrackKind::Audio,
+      timeline.clone(),
+    ),
+    (
+      "flac",
+      sine("flac.flac", "flac", &[]),
+      TrackKind::Audio,
+      timeline.clone(),
+    ),
+    ("wav", pcm_mkv(&corpus), TrackKind::Audio, timeline.clone()),
+    ("w64", pcm_mkv(&corpus), TrackKind::Audio, timeline.clone()),
+    (
+      "m4v",
+      // A raw stream's: its video object layer in band, as the raw
+      // muxer's stream needs it.
+      generated(
+        &corpus,
+        "mpeg4.m4v",
+        &[
+          "-f",
+          "lavfi",
+          "-i",
+          "testsrc2=size=64x64:rate=25:duration=0.2",
+          "-c:v",
+          "mpeg4",
+          "-f",
+          "m4v",
+        ],
+      ),
+      TrackKind::Video,
+      untimed.clone(),
+    ),
+    (
+      "mpeg2video",
+      picture("mpeg2.mkv", "mpeg2video"),
+      TrackKind::Video,
+      untimed.clone(),
+    ),
+    (
+      "adts",
+      corpus.transport_stream(),
+      TrackKind::Audio,
+      untimed.clone(),
+    ),
+    (
+      "ivf",
+      picture("vp8.webm", "libvpx"),
+      TrackKind::Video,
+      rewritten(&[Rewrite::Durations, Rewrite::SyncFromBitstream]),
+    ),
+  ] {
+    let target = output(&corpus, &format!("l74.{container}"));
+    let offered = whole_track(&source, kind);
+    let bytes = joined_bytes(&offered.1);
+    let report = written_through(&target, ContainerName::new(container), offered);
+    assert_eq!(field_rows(&report), expected, "{container}");
+    if let Err(error) = FfmpegOwnedDemuxer::open(&target) {
+      panic!("{container}: read back: {error:?}");
+    }
+    let back = packets(&target);
+    assert_eq!(back.len(), 1, "{container}: one track");
+    let read: Vec<u8> = back[0].iter().flat_map(|seen| seen.bytes.clone()).collect();
+    assert!(
+      read == bytes,
+      "{container}: the bytes written, {} of {}",
+      read.len(),
+      bytes.len()
+    );
+  }
+  // AAC with a configuration: each frame behind its header, of no CRC.
+  let (table, frames) = whole_track(&corpus.multi_track_mkv(), TrackKind::Audio);
+  let raw: Vec<Vec<u8>> = frames
+    .iter()
+    .map(|packet| audio_of(packet).data().as_ref().to_vec())
+    .collect();
+  let target = output(&corpus, "l74-configured.adts");
+  let report = written_through(&target, ContainerName::new("adts"), (table, frames));
+  assert_eq!(
+    field_rows(&report),
+    [rewritten(&[Rewrite::AdtsHeaders]), untimed.clone()].concat(),
+    "libavcodec's configuration, its sync extension among it"
+  );
+  let back = &packets(&target)[0];
+  assert_eq!(back.len(), raw.len(), "a frame a packet");
+  for (seen, raw) in back.iter().zip(&raw) {
+    assert_eq!(
+      &seen.bytes[7..],
+      &raw[..],
+      "the raw frame behind its header"
+    );
+  }
+  // The streams a filter converts.
+  for (container, source, filter) in [
+    (
+      "h264",
+      corpus.multi_track_mkv(),
+      Some(AutomaticFilter::H264Mp4ToAnnexB),
+    ),
+    (
+      "hevc",
+      // No B-frames: Matroska's reader gives no decode time to a frame
+      // that reorders.
+      generated(
+        &corpus,
+        "hevc.mkv",
+        &[
+          "-f",
+          "lavfi",
+          "-i",
+          "testsrc2=size=64x64:rate=25:duration=0.2",
+          "-c:v",
+          "libx265",
+          "-x265-params",
+          "bframes=0:log-level=none",
+        ],
+      ),
+      Some(AutomaticFilter::HevcMp4ToAnnexB),
+    ),
+    ("obu", av1_mkv(&corpus), Some(AutomaticFilter::Av1Metadata)),
+  ] {
+    let target = output(&corpus, &format!("l74.{container}"));
+    let offered = whole_track(&source, TrackKind::Video);
+    let count = offered.1.len();
+    let report = written_through(&target, ContainerName::new(container), offered);
+    let mut expected = filter
+      .map(|filter| vec![Uncarried::Filtered { track, filter }])
+      .unwrap_or_default();
+    expected.extend(untimed.clone());
+    let mut seen = field_rows(&report);
+    seen.sort_by_key(|line| format!("{line:?}"));
+    expected.sort_by_key(|line| format!("{line:?}"));
+    assert_eq!(seen, expected, "{container}");
+    assert_eq!(
+      packets(&target)[0].len(),
+      count,
+      "{container}: a packet a packet"
+    );
+  }
+}
+
+/// The track `packet` is on, as an audio packet on track 0.
+fn audio_on_zero(packet: Audio) -> AudioTrackPacket<Ffmpeg, FfmpegBytes> {
+  AudioTrackPacket::new(TrackIndex::new(0), packet)
+}
+
+/// **L75 — the ADTS muxer's refusals: what it cannot write in its headers,
+/// a header it would write twice, a frame its 13-bit length cannot count,
+/// and a frame without a header on a track with no configuration** (table
+/// H of the census; `adtsenc.c` 52–190): a stated configuration of USAC,
+/// an object type ADTS has no profile for, refused at open
+/// ([`MuxOpenError::ConfigurationInvalid`]); on a configured track, an
+/// ADTS frame ([`PayloadRule::AdtsHeader`]) and a raw frame of 8185 bytes,
+/// 8192 with its header ([`PayloadRule::AdtsFrameLength`]) — one of 8184
+/// taken; on a track with no configuration, a raw frame
+/// ([`PayloadRule::AdtsFrame`]), and new extradata the writer refuses
+/// ([`PayloadRule::NewExtradata`]) — one it takes configures the track,
+/// each raw frame read back behind its header from then on; an empty
+/// packet, which the writer drops ([`PayloadRule::Empty`]). Each refused
+/// by name, untouched.
+///
+/// PLANT: each check removed takes its packet.
+#[test]
+fn l75_the_adts_muxer_refuses_what_its_headers_cannot_carry() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let adts = || ContainerName::new("adts");
+  // USAC — object type 42, behind the escape — at 48 kHz, stereo.
+  let usac = [0xF9, 0x46, 0x40];
+  let refused = FfmpegOwnedMuxer::open(
+    File::create(output(&corpus, "l75-usac.adts")).expect("create"),
+    adts(),
+    audio_with(&source, 41, Some(&usac)),
+    &[],
+    PacketLimits::default(),
+  );
+  assert!(
+    matches!(refused, Err(MuxOpenError::ConfigurationInvalid { codec, .. }) if codec == CodecId::AAC),
+    "{:?}",
+    refused.map(drop)
+  );
+
+  let (table, frames) = first_track(&source, TrackKind::Audio, 2);
+  let raw = audio_of(&frames[0]);
+  let mut muxer = muxer_into(&output(&corpus, "l75.adts"), adts(), table);
+  let framed = audio_on_zero(audio_holding(&raw, &adts_frame_of(raw.data().as_ref(), 2)));
+  let long = audio_on_zero(audio_holding(&raw, &vec![0x21; 8185]));
+  let empty = audio_on_zero(audio_holding(&raw, &[]));
+  for (offered, rule) in [
+    (framed, PayloadRule::AdtsHeader),
+    (long, PayloadRule::AdtsFrameLength),
+    (empty, PayloadRule::Empty),
+  ] {
+    let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+    assert_eq!(refusal, payload(rule), "{rule:?}");
+    untouched!(offered, back);
+  }
+  muxer
+    .write_audio(audio_on_zero(audio_holding(&raw, &vec![0x21; 8184])))
+    .map_err(|error| error.map_packet(drop))
+    .expect("8191 bytes with its header");
+  muxer.finish().expect("finished");
+
+  let ts = corpus.transport_stream();
+  let (table, frames) = first_track(&ts, TrackKind::Audio, 3);
+  let first = audio_of(&frames[0]);
+  let bytes = first.data().as_ref();
+  // The frame's raw payload: past its seven bytes of header, and two of
+  // CRC where it has one.
+  let payload_of = |bytes: &[u8]| bytes[if bytes[1] & 1 == 1 { 7 } else { 9 }..].to_vec();
+  let unframed = audio_on_zero(audio_holding(&first, &payload_of(bytes)));
+  let target = output(&corpus, "l75-configures.adts");
+  let mut muxer = muxer_into(&target, adts(), table);
+  let (refusal, back) = by_container(muxer.write_audio(unframed.clone()));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::AdtsFrame),
+    "no header to write it behind"
+  );
+  untouched!(unframed, back);
+  let mut configuring = audio_holding(&first, &payload_of(bytes));
+  configuring
+    .extra_mut()
+    .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &usac)]);
+  let configuring = audio_on_zero(configuring);
+  let (refusal, back) = by_container(muxer.write_audio(configuring.clone()));
+  assert_eq!(refusal, payload(PayloadRule::NewExtradata), "USAC's");
+  untouched!(configuring, back);
+  // AAC LC at 48 kHz, stereo: from here on, a header before each frame.
+  for (index, frame) in frames.iter().enumerate() {
+    let mut raw = audio_holding(
+      &audio_of(frame),
+      &payload_of(audio_of(frame).data().as_ref()),
+    );
+    if index == 0 {
+      raw
+        .extra_mut()
+        .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x11, 0x90])]);
+    }
+    muxer
+      .write_audio(audio_on_zero(raw))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a raw frame, the track configured");
+  }
+  let after = audio_of(&frames[2])
+    .dts()
+    .expect("a decode time")
+    .saturating_add_duration(core::time::Duration::from_millis(100));
+  let framed = audio_on_zero(
+    audio_of(&frames[0])
+      .with_pts(Some(after))
+      .with_dts(Some(after)),
+  );
+  let (refusal, back) = by_container(muxer.write_audio(framed.clone()));
+  assert_eq!(refusal, payload(PayloadRule::AdtsHeader), "configured now");
+  untouched!(framed, back);
+  muxer.finish().expect("finished");
+  let back = &packets(&target)[0];
+  assert_eq!(back.len(), 3);
+  for (seen, frame) in back.iter().zip(&frames) {
+    assert_eq!(
+      &seen.bytes[7..],
+      &payload_of(audio_of(frame).data().as_ref())[..]
+    );
+  }
+}
+
+/// **L76 — FLAC and MP3 refuse at open what they would not write, and FLAC
+/// takes a STREAMINFO of no payload** (table H): a video track, which
+/// either writes only as one attached picture and this muxer makes none
+/// there ([`MuxOpenError::CodecNotCarried`]); FLAC with no configuration
+/// ([`MuxOpenError::ConfigurationMissing`]), and one opening with the
+/// `fLaC` marker, whose first 34 bytes the header would write as the
+/// STREAMINFO ([`MuxOpenError::ConfigurationInvalid`]). An empty FLAC
+/// packet is refused ([`PayloadRule::Empty`]); one carrying a STREAMINFO
+/// is taken, no frame written, and the trailer writes it into the header,
+/// where it reads back.
+///
+/// PLANT: the open refusals removed open the track; the configuration's
+/// road closed refuses the STREAMINFO's packet as empty.
+#[test]
+fn l76_flac_and_mp3_refuse_what_they_would_not_write() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let flac = audio_file(&corpus, "flac.flac", "flac");
+  let open = |name: &str, container: &str, table| {
+    FfmpegOwnedMuxer::open(
+      File::create(output(&corpus, name)).expect("create"),
+      ContainerName::new(container),
+      table,
+      &[],
+      PacketLimits::default(),
+    )
+    .map(drop)
+  };
+  for container in ["flac", "mp3"] {
+    assert!(
+      matches!(
+        open("l76-video.out", container, table_of(&source, TrackKind::Video)),
+        Err(MuxOpenError::CodecNotCarried { codec, .. }) if codec == CodecId::H264
+      ),
+      "{container}"
+    );
+  }
+  let streaminfo = table_of(&flac, TrackKind::Audio)[0]
+    .side_data()
+    .extradata()
+    .to_vec();
+  assert_eq!(streaminfo.len(), 34, "the premise: a STREAMINFO");
+  let marked = [&b"fLaC\x80\x00\x00\x22"[..], &streaminfo].concat();
+  assert!(matches!(
+    open("l76-none.flac", "flac", audio_with(&flac, -99, Some(&[]))),
+    Err(MuxOpenError::ConfigurationMissing { .. })
+  ));
+  assert!(matches!(
+    open(
+      "l76-marked.flac",
+      "flac",
+      audio_with(&flac, -99, Some(&marked))
+    ),
+    Err(MuxOpenError::ConfigurationInvalid { .. })
+  ));
+
+  let (table, frames) = first_track(&flac, TrackKind::Audio, 1);
+  let frame = audio_of(&frames[0]);
+  let target = output(&corpus, "l76.flac");
+  let mut muxer = muxer_into(&target, ContainerName::new("flac"), table);
+  muxer
+    .write_audio(audio_on_zero(frame.clone()))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  let empty = audio_on_zero(audio_holding(&frame, &[]));
+  let (refusal, back) = by_container(muxer.write_audio(empty.clone()));
+  assert_eq!(refusal, payload(PayloadRule::Empty));
+  untouched!(empty, back);
+  let mut updated = streaminfo.clone();
+  *updated.last_mut().expect("bytes") ^= 0xFF;
+  let mut configuring = audio_holding(&frame, &[]);
+  configuring
+    .extra_mut()
+    .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &updated)]);
+  muxer
+    .write_audio(audio_on_zero(configuring))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the STREAMINFO, of no frame");
+  muxer.finish().expect("finished");
+  let (written, _) = first_track(&target, TrackKind::Audio, 0);
+  assert_eq!(
+    written[0].side_data().extradata(),
+    &updated[..],
+    "the header's"
+  );
+  assert_eq!(packet_count(&target), 1, "no frame of it");
+}
+
+/// A one-track video table of `path`'s first video track, its stream
+/// stated `width` × `height`.
+fn video_sized(
+  path: &Path,
+  width: i32,
+  height: i32,
+) -> Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>> {
+  let mut table = table_of(path, TrackKind::Video);
+  let index = table[0].side_data().stream_index();
+  let mut parameters = table[0].side_data().rebuild().expect("the parameters");
+  // SAFETY: `parameters` owns its `AVCodecParameters`, live for the
+  // writes; `width` and `height` are plain integer fields.
+  unsafe {
+    let par = parameters.as_mut_ptr();
+    (*par).width = width;
+    (*par).height = height;
+  }
+  *table[0].side_data_mut() =
+    CodecTicket::mirror(&parameters, index, usize::MAX).expect("the ticket");
+  table
+}
+
+/// **L77 — IVF refuses a dimension past its 16-bit field, and reports the
+/// decode times and the side data it does not write** (table H;
+/// `ivfenc.c` 54–88): a width of 65536 refused at open
+/// ([`MuxOpenError::Dimensions`]), nothing written; a packet decoded
+/// before it is presented reported at that packet
+/// ([`Rewrite::DecodeTimes`]), read back at its presentation time; side
+/// data reported dropped, by name.
+///
+/// PLANT: the dimension unjudged opens the track.
+#[test]
+fn l77_ivf_refuses_a_dimension_past_its_field() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let vp8 = generated(
+    &corpus,
+    "vp8.webm",
+    &[
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=64x64:rate=25:duration=0.2",
+      "-c:v",
+      "libvpx",
+    ],
+  );
+  let target = output(&corpus, "l77-wide.ivf");
+  let refused = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::new("ivf"),
+    video_sized(&vp8, 65536, 64),
+    &[],
+    PacketLimits::default(),
+  );
+  assert!(
+    matches!(refused, Err(MuxOpenError::Dimensions { track }) if track.get() == 0),
+    "{:?}",
+    refused.map(drop)
+  );
+  assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+
+  let (table, frames) = first_track(&vp8, TrackKind::Video, 2);
+  let target = output(&corpus, "l77.ivf");
+  let mut muxer = muxer_into(&target, ContainerName::new("ivf"), table);
+  let track = TrackIndex::new(0);
+  muxer
+    .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first frame");
+  assert!(
+    lines(muxer.report(), |line| matches!(
+      line,
+      Uncarried::Rewritten {
+        rewrite: Rewrite::DecodeTimes,
+        ..
+      }
+    ))
+    .is_empty(),
+    "times that agree: nothing"
+  );
+  let mut late = video_of(&frames[1])
+    .with_pts(Some(ms(80)))
+    .with_dts(Some(ms(40)));
+  late
+    .extra_mut()
+    .set_side_data(vec![side(T::AV_PKT_DATA_A53_CC, &[1, 2, 3])]);
+  muxer
+    .write_video(VideoTrackPacket::new(track, late))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame decoded before it is presented");
+  assert_eq!(
+    lines(muxer.report(), |line| matches!(
+      line,
+      Uncarried::Rewritten {
+        rewrite: Rewrite::DecodeTimes,
+        ..
+      } | Uncarried::SideData { .. }
+    )),
+    vec![
+      Uncarried::SideData {
+        track,
+        kind: T::AV_PKT_DATA_A53_CC as i32,
+        name: Some("A53 Closed Captions"),
+        fate: SideDataFate::Dropped,
+      },
+      Uncarried::Rewritten {
+        track,
+        rewrite: Rewrite::DecodeTimes,
+      },
+    ]
+  );
+  muxer.finish().expect("finished");
+  let back = &packets(&target)[0];
+  assert_eq!(back[1].pts, Some(ms(80)), "presented as offered");
+  assert_ne!(back[1].dts, Some(ms(40)), "but not decoded as offered");
+}
+
+/// **L78 — WAV refuses the packet that would take its file past what its
+/// RIFF header counts, and Wave64 takes it** (table H; `wavenc.c`
+/// 418–495): with the 4 GiB lowered to 10 000 bytes, PCM packets are taken
+/// until the one after which the file, less eight, would pass it
+/// ([`PayloadRule::FileSize`]), refused by name, untouched; Wave64, whose
+/// sizes are 64-bit, takes them all.
+///
+/// PLANT: the size unjudged takes the packet.
+#[test]
+fn l78_wav_refuses_a_file_past_its_32_bit_size() {
+  let Some(corpus) = Corpus::new() else { return };
+  let pcm = pcm_mkv(&corpus);
+  let (table, frames) = whole_track(&pcm, TrackKind::Audio);
+  const BOUND: u64 = 10_000;
+  let options = MuxOptions::new().with_lowered_file_bound(BOUND);
+  let target = output(&corpus, "l78.wav");
+  let mut muxer = muxer_with(&target, ContainerName::new("wav"), table, options);
+  let mut taken = 0;
+  let refused = frames.iter().find_map(|frame| {
+    let offered = audio_on_zero(audio_of(frame));
+    match muxer.write_audio(offered.clone()) {
+      Ok(()) => {
+        taken += 1;
+        None
+      }
+      Err(error) => Some((offered, error)),
+    }
+  });
+  let (offered, error) = refused.expect("a packet past the bound");
+  let (refusal, back) = by_container(Err::<(), _>(error));
+  assert_eq!(refusal, payload(PayloadRule::FileSize));
+  untouched!(offered, back);
+  assert!(taken > 0, "the packets within it taken");
+  muxer.finish().expect("finished");
+  assert!(std::fs::metadata(&target).expect("the file").len() - 8 <= BOUND);
+
+  let (table, frames) = whole_track(&pcm, TrackKind::Audio);
+  let options = MuxOptions::new().with_lowered_file_bound(BOUND);
+  let mut muxer = muxer_with(
+    &output(&corpus, "l78.w64"),
+    ContainerName::new("w64"),
+    table,
+    options,
+  );
+  for frame in &frames {
+    muxer
+      .write_audio(audio_on_zero(audio_of(frame)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("Wave64 counts in 64 bits");
+  }
+  muxer.finish().expect("finished");
+}
+
+/// **L79 — a raw stream refuses what it would write unreadable, and an
+/// empty packet** (table H; `rawenc.c` 31–35, 386–443): H.264 into raw
+/// H.264 with the filters off, length-prefixed, refused
+/// ([`PayloadRule::StartCode`]) — the filter on converts it; MPEG-4 Part 2
+/// from Matroska, its video object layer in the track's configuration
+/// alone, refused at its first packet ([`PayloadRule::InBandConfiguration`]);
+/// an empty AC-3 packet, which the muxer writes as nothing
+/// ([`PayloadRule::Empty`]). Each by name, untouched.
+///
+/// PLANT: each check removed takes its packet.
+#[test]
+fn l79_a_raw_stream_refuses_what_it_would_write_unreadable() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (table, video) = first_track(&source, TrackKind::Video, 1);
+  let mut muxer = muxer_with(
+    &output(&corpus, "l79.h264"),
+    ContainerName::new("h264"),
+    table,
+    filters(false),
+  );
+  let offered = video_at(&video_of(&video[0]), Some(0), 0);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(refusal, payload(PayloadRule::StartCode), "length-prefixed");
+  untouched!(offered, back);
+  muxer.finish().expect("finished");
+
+  let mpeg4 = generated(
+    &corpus,
+    "mpeg4.mkv",
+    &[
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=64x64:rate=25:duration=0.2",
+      "-c:v",
+      "mpeg4",
+    ],
+  );
+  let (table, video) = first_track(&mpeg4, TrackKind::Video, 1);
+  assert!(
+    !table[0].side_data().extradata().is_empty(),
+    "the premise: the configuration out of band"
+  );
+  let mut muxer = muxer_into(
+    &output(&corpus, "l79.m4v"),
+    ContainerName::new("m4v"),
+    table,
+  );
+  let offered = video_at(&video_of(&video[0]), Some(0), 0);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(refusal, payload(PayloadRule::InBandConfiguration));
+  untouched!(offered, back);
+  muxer.finish().expect("finished");
+
+  let ac3 = audio_file(&corpus, "ac3.mkv", "ac3");
+  let (table, audio) = first_track(&ac3, TrackKind::Audio, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l79.ac3"),
+    ContainerName::new("ac3"),
+    table,
+  );
+  let empty = audio_on_zero(audio_holding(&audio_of(&audio[0]), &[]));
+  let (refusal, back) = by_container(muxer.write_audio(empty.clone()));
+  assert_eq!(refusal, payload(PayloadRule::Empty));
+  untouched!(empty, back);
+  muxer.finish().expect("finished");
+}
+
+/// **L80 — the chapters each simple muxer writes, and those it does not**
+/// (table H; table E's chapter rows): MP3's ID3v2 chapters, numbered by
+/// position from 0 and counted in milliseconds — a chapter's id other
+/// than its position reported ([`Uncarried::ChapterId`]), a span off the
+/// millisecond reported ([`Uncarried::ChapterSpan`]), each read back by
+/// its title; WAV's and the raw streams' none, each chapter reported
+/// ([`Uncarried::Chapter`]).
+///
+/// PLANT: the chapters a container does not write unreported.
+#[test]
+fn l80_the_chapters_each_simple_muxer_writes() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mp3 = audio_file(&corpus, "mp3.mkv", "libmp3lame");
+  let chapters = [
+    chapter_of(0, 0, 200, Some("first")),
+    Chapter::<Ffmpeg>::new(
+      7,
+      Timebase::new(1, NonZeroI32::new(2000).expect("non-zero")),
+      Timestamp::new(
+        400,
+        Timebase::new(1, NonZeroI32::new(2000).expect("non-zero")),
+      ),
+      Timestamp::new(
+        801,
+        Timebase::new(1, NonZeroI32::new(2000).expect("non-zero")),
+      ),
+    )
+    .with_title(Some("second".into())),
+  ];
+  let target = output(&corpus, "l80.mp3");
+  let (mut muxer, report) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::new("mp3"),
+    table_of(&mp3, TrackKind::Audio),
+    &chapters,
+    PacketLimits::default(),
+  )
+  .expect("open");
+  assert_eq!(
+    lines(&report, |line| matches!(
+      line,
+      Uncarried::Chapter { .. } | Uncarried::ChapterId { .. } | Uncarried::ChapterSpan { .. }
+    )),
+    vec![
+      Uncarried::ChapterId { chapter: 1, id: 7 },
+      Uncarried::ChapterSpan { chapter: 1 },
+    ]
+  );
+  let (_, frames) = whole_track(&mp3, TrackKind::Audio);
+  for frame in &frames {
+    muxer
+      .write_audio(audio_on_zero(audio_of(frame)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  muxer.finish().expect("finished");
+  let demuxer = FfmpegOwnedDemuxer::open(&target).expect("open");
+  let titles: Vec<_> = demuxer
+    .chapters()
+    .iter()
+    .map(|chapter| chapter.title().map(|title| title.as_str().to_owned()))
+    .collect();
+  assert_eq!(
+    titles,
+    [Some("first".to_owned()), Some("second".to_owned())]
+  );
+
+  for (container, source) in [
+    ("wav", pcm_mkv(&corpus)),
+    ("ac3", audio_file(&corpus, "ac3.mkv", "ac3")),
+  ] {
+    let (_, report) = FfmpegOwnedMuxer::open(
+      File::create(output(&corpus, &format!("l80.{container}"))).expect("create"),
+      ContainerName::new(container),
+      table_of(&source, TrackKind::Audio),
+      &chapters,
+      PacketLimits::default(),
+    )
+    .expect("open");
+    assert_eq!(
+      lines(&report, |line| matches!(line, Uncarried::Chapter { .. })),
+      vec![
+        Uncarried::Chapter { chapter: 0 },
+        Uncarried::Chapter { chapter: 1 }
+      ],
+      "{container}"
+    );
+  }
 }

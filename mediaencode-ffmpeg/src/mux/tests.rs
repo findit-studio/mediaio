@@ -390,7 +390,7 @@ fn a_rescale_rounds_as_av_rescale_q_does() {
 #[test]
 fn a_configuration_is_judged_and_its_rewrite_reported() {
   let rewrites_of = |family, _kind: TrackKind, codec, extradata: &[u8]| {
-    rewrites(family, codec, extradata, true).collect::<Vec<_>>()
+    rewrites((family, audited_for(family)), codec, extradata, true).collect::<Vec<_>>()
   };
   assert!(configuration_missing(Family::Mp4, CodecId::H264, &[], true));
   assert!(configuration_missing(Family::Mp4, CodecId::HEVC, &[], true));
@@ -486,11 +486,33 @@ fn a_configuration_is_judged_and_its_rewrite_reported() {
     rewrites_of(Family::Matroska, TrackKind::Audio, CodecId::WAVPACK, &[]),
     vec![Rewrite::WavPackHeaders]
   );
+  // Table H's field rows: a raw stream writes no time and no key flag;
+  // IVF the presentation time alone; WAV's PCM, whose every frame is a key
+  // frame, loses no flag.
+  let field_rows =
+    |audited, codec| rewrites((Family::Other, audited), codec, &[], true).collect::<Vec<_>>();
   assert_eq!(
-    rewrites_of(Family::Other, TrackKind::Video, CodecId::H264, &annex),
-    vec![],
-    "nothing is claimed for a container this release does not know",
+    field_rows(Audited::Raw(CodecId::H264), CodecId::H264),
+    vec![Rewrite::Timeline, Rewrite::SyncFromBitstream]
   );
+  assert_eq!(
+    field_rows(Audited::Ivf, CodecId::VP9),
+    vec![Rewrite::Durations, Rewrite::SyncFromBitstream]
+  );
+  assert_eq!(
+    field_rows(Audited::Wav { w64: false }, CodecId::PCM_S16LE),
+    vec![Rewrite::Timeline]
+  );
+}
+
+/// The audited muxer a family's unit laws stand for.
+fn audited_for(family: Family) -> Audited {
+  match family {
+    Family::Mp4 => Audited::Mov(MovMode::Mp4),
+    Family::Matroska => Audited::Matroska,
+    Family::WebM => Audited::WebM,
+    Family::Other => Audited::Mxf(MxfKind::Mxf),
+  }
 }
 
 /// **The durations a container does not keep are reported at open**:
@@ -501,7 +523,7 @@ fn a_configuration_is_judged_and_its_rewrite_reported() {
 #[test]
 fn a_duration_the_container_does_not_keep_is_reported() {
   let rewrites_of = |family, _kind: TrackKind, codec, default_duration| {
-    rewrites(family, codec, &[], default_duration).collect::<Vec<_>>()
+    rewrites((family, audited_for(family)), codec, &[], default_duration).collect::<Vec<_>>()
   };
   for family in [Family::Matroska, Family::WebM] {
     assert_eq!(
@@ -1099,6 +1121,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     filter: Filter::None,
     sides: SideRules {
       family: Family::Mp4,
+      audited: Some(Audited::Mov(MovMode::Mp4)),
       kind: TrackKind::Audio,
       codec: CodecId::EAC3,
       sample_rate: 48_000,
@@ -1110,6 +1133,8 @@ fn eac3_track(frame_size: i32) -> TrackState {
     cues: Cues::default(),
     ac3: Ac3State::default(),
     document: 0,
+    adts: None,
+    bytes: 0,
   }
 }
 
@@ -1813,6 +1838,7 @@ fn each_container_keeps_the_side_data_it_has_a_place_for() {
   };
   let rules = |family, kind, codec| SideRules {
     family,
+    audited: Some(audited_for(family)),
     kind,
     codec,
     sample_rate: 48_000,

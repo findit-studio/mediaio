@@ -14,8 +14,13 @@ crate moves only when it changes.
 ### Added
 
 - **The muxer**: `FfmpegMuxer` (view lane) and `FfmpegOwnedMuxer` (owned
-  lane) implement `Muxer` over libavformat for any container it names
-  (`ContainerName`). `open` takes the sink, the container, the track
+  lane) implement `Muxer` over libavformat for the containers this
+  release audited (`ContainerName`): the MOV family, Matroska and WebM,
+  MPEG-TS and the MPEG program streams, FLV, AVI, ASF, NUT, Ogg, MXF, IVF,
+  WAV and Wave64, and the raw streams of ADTS AAC, AC-3, E-AC-3, DTS,
+  FLAC, MPEG audio layers II and III, H.264, HEVC, AV1, MPEG-4 Part 2 and
+  MPEG-2 video — any other libavformat names is refused at open by the
+  muxer's name (`MuxOpenError::ContainerNotAudited`). `open` takes the sink, the container, the track
   table with each track's `CodecTicket`, the chapters and the packet
   limits, refuses by name what the container cannot take
   (`MuxOpenError`) and reports what it drops (`MuxReport`, `Uncarried`);
@@ -108,6 +113,26 @@ crate moves only when it changes.
   the end, which it frees unwritten, are counted at `finish`
   (`Uncarried::Unjoined`). A `mov_text` cue starting
   before the last one's end is written as MP4 writes it.
+- **The audited containers, by their census (table H).** What each
+  writes of a packet beside its bytes is reported where it leaves
+  something out: no time at all (`Rewrite::Timeline`), no duration
+  (`Rewrite::Durations`), the presentation time alone
+  (`Rewrite::DecodeTimes`) or the decode time alone
+  (`Rewrite::PresentationTimes`), no key flag for a codec that does not
+  count every frame one (`Rewrite::SyncFromBitstream`), ADTS's headers in
+  place of the configuration (`Rewrite::AdtsHeaders`), a chapter it writes
+  nowhere (`Uncarried::Chapter`), and the side data, language and flags
+  it drops. Refused: an empty packet the container would write as nothing
+  (`PayloadRule::Empty`); H.264 or HEVC into a raw stream not opening on a
+  start code that no filter converts (`PayloadRule::StartCode`); a raw
+  stream's first packet without the configuration the track states
+  (`PayloadRule::InBandConfiguration`); ADTS's configurations its header
+  cannot write, a second header, a frame past its 13-bit length, a
+  headless frame (`MuxOpenError::ConfigurationInvalid`,
+  `PayloadRule::AdtsHeader`, `AdtsFrameLength`, `AdtsFrame`); FLAC's and
+  MP3's video tracks, FLAC's missing or `fLaC`-marked configuration; IVF's
+  dimensions past 16 bits (`MuxOpenError::Dimensions`); a WAV file past
+  4 GiB (`PayloadRule::FileSize`).
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

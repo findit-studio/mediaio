@@ -77,6 +77,8 @@ crate moves only when it changes.
   codec fixes in each frame, block alignment, initial padding, profile
   and extradata — once `add_stream` made it; `Output::shifts_early_times`
   whether libavformat moves every stream's times for an early first one;
+  `Output::position` the bytes written so far, the header's size once it
+  is written;
   and `Output::set_automatic_filters` turns its automatic bitstream
   filters on or off — on by default, as libavformat's own — so that a
   caller who wants every packet to reach the muxer as handed over can
