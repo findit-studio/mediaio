@@ -1251,6 +1251,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     key_times: None,
     mxf: MxfMirror::default(),
     buffered: 0,
+    dts_shift: None,
     flv_rewrites: false,
     presented: None,
     configured: false,

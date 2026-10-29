@@ -11701,10 +11701,11 @@ fn l102_the_mov_familys_modes_refuse_at_open_what_they_write_otherwise() {
 
 /// **L103 — ISMV's and AVIF's held samples, and the Nero list's 255
 /// chapters** (table H; `movenc.c` 5040–5064, 6961–6981, 9153–9212): a
-/// sample that would take what ISMV or AVIF hold of a track until the
-/// trailer past the buffer it is held in is refused, the packet untouched
-/// ([`PayloadRule::FragmentSize`]); 3GP's chapters past the 255th are not
-/// written ([`Uncarried::Chapter`]).
+/// sample that would take what ISMV or AVIF write of a track into their
+/// dynamic buffer — counted from its first sample, though ISMV flushes it
+/// at each video key frame — past the buffer is refused, the packet
+/// untouched ([`PayloadRule::FragmentSize`]); 3GP's chapters past the
+/// 255th are not written ([`Uncarried::Chapter`]).
 ///
 /// PLANT: the bound off, the sample taken; the Nero list counted whole.
 #[test]
@@ -14783,4 +14784,320 @@ fn nal_units_of(bytes: &[u8]) -> Vec<&[u8]> {
       &bytes[start..end]
     })
     .collect()
+}
+
+/// ISMV's 10 MHz timescale, every track's (`movenc.c` 8622–8626): the laws
+/// count its ticks exactly.
+fn ism_ticks() -> Timebase {
+  Timebase::new(1, NonZeroI32::new(10_000_000).expect("non-zero"))
+}
+
+/// One second of H.264 at 25 frames a second with two B-frames and a key
+/// frame every tenth, its frames in decode order, each at its decode index
+/// in 40 ms steps and presented at its display index the stream's reorder
+/// delay later, in ISMV's ticks — and the delay: its first frame's
+/// composition offset, the shift ISMV moves every decode time by.
+#[rustfmt::skip]
+fn ism_frames(corpus: &Corpus) -> (PathBuf, Vec<(Video, i64, i64)>, i64) {
+  let source = generated(corpus, "bframes-gop10.mkv", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=1",
+    "-c:v", "libx264", "-preset", "medium", "-bf", "2", "-g", "10", "-keyint_min", "10",
+    "-sc_threshold", "0", "-pix_fmt", "yuv420p",
+  ]);
+  let (_, packets) = first_track(&source, TrackKind::Video, 25);
+  let frames: Vec<Video> = packets.iter().map(video_of).collect();
+  let shown: Vec<i64> = frames.iter().map(|frame| in_ms(frame.pts()).expect("a pts")).collect();
+  let start = *shown.iter().min().expect("frames");
+  let display: Vec<i64> = shown.iter().map(|at| (at - start) / 40).collect();
+  let delay = display
+    .iter()
+    .enumerate()
+    .map(|(index, &at)| index as i64 - at)
+    .max()
+    .expect("frames");
+  const FRAME: i64 = 400_000;
+  let timed = frames
+    .into_iter()
+    .zip(&display)
+    .enumerate()
+    .map(|(index, (frame, &at))| (frame, (at + delay) * FRAME, index as i64 * FRAME))
+    .collect();
+  (source, timed, delay * FRAME)
+}
+
+/// `frame` on `track`, presented at `pts` and decoded at `dts` ISMV ticks.
+fn ism_at(
+  track: usize,
+  frame: &Video,
+  pts: i64,
+  dts: i64,
+) -> VideoTrackPacket<Ffmpeg, FfmpegBytes> {
+  VideoTrackPacket::new(
+    TrackIndex::new(track),
+    frame
+      .clone()
+      .with_pts(Some(Timestamp::new(pts, ism_ticks())))
+      .with_dts(Some(Timestamp::new(dts, ism_ticks()))),
+  )
+}
+
+/// The frames `from..to` of `frames` written on `tracks` in turn, counted
+/// in `base` — ISMV's ticks over `per` — each moved `after` of them later.
+fn write_ism(
+  muxer: &mut FfmpegOwnedMuxer<File>,
+  tracks: &[usize],
+  frames: &[(Video, i64, i64)],
+  (from, to, after): (usize, usize, i64),
+  (base, per): (Timebase, i64),
+) {
+  for (frame, pts, dts) in &frames[from..to] {
+    for &track in tracks {
+      let packet = frame
+        .clone()
+        .with_pts(Some(Timestamp::new(pts / per + after, base)))
+        .with_dts(Some(Timestamp::new(dts / per + after, base)));
+      muxer
+        .write_video(VideoTrackPacket::new(TrackIndex::new(track), packet))
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("a frame at {dts}: {error:?}"));
+    }
+  }
+}
+
+/// **L123a — ISMV refuses a decode gap its second `check_pkt` call would
+/// move** (R10, L6; `movenc.c` 6897–6923, 7396–7410, 1248–1256): ISMV's
+/// negative composition offsets move each decode time by the track's first
+/// composition offset `s` between `check_pkt`'s two calls, its reference
+/// not, so that the second counts a gap `s` longer, and one of
+/// `INT_MAX − s` ticks — short of the first call's `INT_MAX` — is moved,
+/// its decode time rewritten `s − 1` ticks back, and the next fragment's
+/// flush asserts on it, ending the process. Refused by name, the packet
+/// handed back, before a predicted picture, and the file written whole
+/// without it; and before a key frame of one of two video tracks, whose
+/// flush libavformat's interleaving decides. A key frame of the file's
+/// only video track, which flushes before the second call, keeps the
+/// first's bound: refused at `INT_MAX`.
+///
+/// PLANT: the shift unmirrored, the predicted picture taken — FFmpeg then
+/// ends the process on `Assertion next_dts >= 0 failed at
+/// libavformat/movenc.c:1255`; the key frame's flush taken for any video
+/// track, the second table's key frame taken; the flushing key frame's
+/// gap unbounded, the third file's key frame taken; the shift the
+/// packet's own offset, the predicted picture's of none, it taken.
+#[test]
+fn l123a_ismv_refuses_a_gap_its_shifted_second_check_would_move() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (source, frames, shift) = ism_frames(&corpus);
+  assert!(shift > 0, "the premise: a reorder delay, {shift}");
+  let limit = i64::from(i32::MAX) - shift;
+  let key = |index: usize| frames[index].0.flags().contains(PacketFlags::KEY);
+  let predicted = (3..frames.len())
+    .find(|&index| !key(index))
+    .expect("a predicted picture");
+  let second_key = (1..frames.len())
+    .find(|&index| key(index))
+    .expect("a second key frame");
+
+  let target = output(&corpus, "l123a.ismv");
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::new("ismv"),
+    table_of(&source, TrackKind::Video),
+  );
+  write_ism(
+    &mut muxer,
+    &[0],
+    &frames,
+    (0, predicted, 0),
+    (ism_ticks(), 1),
+  );
+  let (frame, pts, dts) = &frames[predicted];
+  let after = limit - (dts - frames[predicted - 1].2);
+  let offered = ism_at(0, frame, pts + after, dts + after);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::DtsGap {
+      track: TrackIndex::new(0),
+      dts: Timestamp::new(dts + after, ism_ticks()),
+    }
+  );
+  untouched!(offered, back);
+  write_ism(
+    &mut muxer,
+    &[0],
+    &frames,
+    (predicted, frames.len(), 0),
+    (ism_ticks(), 1),
+  );
+  muxer.finish().expect("finished");
+  assert_eq!(packet_count(&target), frames.len());
+
+  // The only video track's key frame flushes before the second call: its
+  // bound is the first's, `INT_MAX`.
+  let target = output(&corpus, "l123a-key.ismv");
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::new("ismv"),
+    table_of(&source, TrackKind::Video),
+  );
+  write_ism(
+    &mut muxer,
+    &[0],
+    &frames,
+    (0, second_key, 0),
+    (ism_ticks(), 1),
+  );
+  let (frame, pts, dts) = &frames[second_key];
+  let after = i64::from(i32::MAX) - (dts - frames[second_key - 1].2);
+  let offered = ism_at(0, frame, pts + after, dts + after);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::DtsGap {
+      track: TrackIndex::new(0),
+      dts: Timestamp::new(dts + after, ism_ticks()),
+    },
+    "a key frame at INT_MAX"
+  );
+  untouched!(offered, back);
+  write_ism(
+    &mut muxer,
+    &[0],
+    &frames,
+    (second_key, frames.len(), 0),
+    (ism_ticks(), 1),
+  );
+  muxer.finish().expect("finished");
+
+  // Two video tracks: the first's key frame flushes the second's
+  // fragment, and whether the second's own then comes first rests on the
+  // interleaving.
+  let target = output(&corpus, "l123a-two.ismv");
+  let mut table = table_of(&source, TrackKind::Video);
+  table.extend(table_of(&source, TrackKind::Video));
+  let mut muxer = muxer_into(&target, ContainerName::new("ismv"), table);
+  write_ism(
+    &mut muxer,
+    &[0, 1],
+    &frames,
+    (0, second_key, 0),
+    (ism_ticks(), 1),
+  );
+  let (frame, pts, dts) = &frames[second_key];
+  muxer
+    .write_video(ism_at(0, frame, *pts, *dts))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first track's key frame");
+  let after = limit - (dts - frames[second_key - 1].2);
+  let offered = ism_at(1, frame, pts + after, dts + after);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::DtsGap {
+      track: TrackIndex::new(1),
+      dts: Timestamp::new(dts + after, ism_ticks()),
+    },
+    "beside another video track"
+  );
+  untouched!(offered, back);
+  muxer
+    .write_video(ism_at(1, frame, *pts, *dts))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the second track's key frame");
+  write_ism(
+    &mut muxer,
+    &[0, 1],
+    &frames,
+    (second_key + 1, frames.len(), 0),
+    (ism_ticks(), 1),
+  );
+  muxer.finish().expect("finished");
+  assert_eq!(packet_count(&target), 2 * frames.len());
+}
+
+/// **L123b — ISMV takes the gap one tick short of it, and the gap itself
+/// before a key frame of the file's only video track** (R10, L6;
+/// `movenc.c` 7445–7471): one tick short, the second call's count passes;
+/// before the only video track's key frame, the fragment's flush comes
+/// between the two calls, the second counting from the key frame's own
+/// decode time. MP4, of no negative composition offsets, counts once, and
+/// takes the gap ISMV refuses. Each file finishes, every packet read back,
+/// the gap kept.
+///
+/// PLANT: the bound a tick lower, the first gap refused; the key frame's
+/// flush unmirrored, the second refused; the shift MP4's too, the third
+/// refused.
+#[test]
+fn l123b_ismv_takes_the_gap_short_of_it_and_before_a_key_frame() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (source, frames, shift) = ism_frames(&corpus);
+  let limit = i64::from(i32::MAX) - shift;
+  let key = |index: usize| frames[index].0.flags().contains(PacketFlags::KEY);
+  let predicted = (3..frames.len())
+    .find(|&index| !key(index))
+    .expect("a predicted picture");
+  let second_key = (1..frames.len())
+    .find(|&index| key(index))
+    .expect("a second key frame");
+  // MP4's video timescale: the track's 1/1000 doubled to 16 000 (`movenc.c`
+  // 8485–8492), ISMV's ticks over 625.
+  let mp4 = (
+    Timebase::new(1, NonZeroI32::new(16_000).expect("non-zero")),
+    625,
+  );
+  for (name, container, (base, per), at, gap) in [
+    (
+      "short of it",
+      "ismv",
+      (ism_ticks(), 1),
+      predicted,
+      limit - 1,
+    ),
+    (
+      "before a key frame",
+      "ismv",
+      (ism_ticks(), 1),
+      second_key,
+      limit,
+    ),
+    // MP4, of no negative composition offsets: one count.
+    (
+      "in MP4",
+      "mp4",
+      mp4,
+      predicted,
+      i64::from(i32::MAX) - shift / 625,
+    ),
+  ] {
+    let target = output(&corpus, &format!("l123b-{at}.{container}"));
+    let mut muxer = muxer_into(
+      &target,
+      ContainerName::new(container),
+      table_of(&source, TrackKind::Video),
+    );
+    write_ism(&mut muxer, &[0], &frames, (0, at, 0), (base, per));
+    let after = gap - (frames[at].2 - frames[at - 1].2) / per;
+    write_ism(
+      &mut muxer,
+      &[0],
+      &frames,
+      (at, frames.len(), after),
+      (base, per),
+    );
+    muxer
+      .finish()
+      .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    let back = &packets(&target)[0];
+    assert_eq!(back.len(), frames.len(), "{name}: every packet");
+    let ticks = |index: usize| {
+      back[index]
+        .dts
+        .expect("a decode time")
+        .checked_rescale_with(base, Rounding::Nearest)
+        .expect("in the file's ticks")
+        .pts()
+    };
+    assert_eq!(ticks(at) - ticks(at - 1), gap, "{name}: the gap kept");
+  }
 }

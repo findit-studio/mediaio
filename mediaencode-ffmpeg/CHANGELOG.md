@@ -348,6 +348,16 @@ crate moves only when it changes.
   set the standard does not allow reaches — a value past the range it
   caps, syntax that does not parse — rests on the trust model, and is not
   refused.
+  ISMV's decode gap: its negative composition offsets move a packet's
+  decode time by the track's first composition offset between
+  `check_pkt`'s two calls, so that the second moves a gap of `i32::MAX`
+  less that offset into the past, and the next fragment's flush asserts,
+  ending the process — refused (`FfmpegMuxRefusal::DtsGap`), but before a
+  key frame of the file's only video track, whose flush comes between the
+  two calls, which keeps `i32::MAX`. ISMV flushes a fragment at every
+  video key frame, the trigger its header adds where none is set;
+  `PayloadRule::FragmentSize` counts a track's samples from its first,
+  stricter than FFmpeg.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
