@@ -325,6 +325,14 @@ crate moves only when it changes.
   half second less the first decode time to, refused where it would wrap
   (`FfmpegMuxRefusal::TimeWraps`), at the packet that would be written
   first.
+  MP4's DVD subtitles: the configuration's text palette, which MP4
+  writes as sixteen YUV colours and its reader writes back as a palette
+  text of its own, reported (`Rewrite::Configuration`, new), or
+  `Rewrite::PaletteMoved` (new) where the conversion moves a colour —
+  white reads back `fefefe`; a palette line of fewer than sixteen
+  colours, the rest written unset, refused (`ConfigurationInvalid`); new
+  extradata, which a new sample description holds unconverted, refused
+  (`PayloadRule::NewExtradata`).
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

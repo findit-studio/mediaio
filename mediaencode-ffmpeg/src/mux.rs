@@ -189,7 +189,7 @@
 //!
 //! | codecs | writer | reads the extradata | new extradata |
 //! |---|---|---|---|
-//! | MPEG-4 Part 2, MPEG-1 and MPEG-2 video, MJPEG, PNG, JPEG 2000, TSCC2 (`mp4v`); AAC, MPEG-4 ALS, MP3, MP2, DTS, Vorbis, QCELP, EVRC (`mp4a`); DVD subtitles (`mp4s`) | `esds` (765–816) | as its decoder-specific information | kept |
+//! | MPEG-4 Part 2, MPEG-1 and MPEG-2 video, MJPEG, PNG, JPEG 2000, TSCC2 (`mp4v`); AAC, MPEG-4 ALS, MP3, MP2, DTS, Vorbis, QCELP, EVRC (`mp4a`); DVD subtitles (`mp4s`) | `esds` (765–816) | as its decoder-specific information; DVD subtitles' text palette as sixteen YUV colours, which the reader writes back as a palette text of its own (7976–8045; `dvdclut.c` 28–70): reported ([`Rewrite::Configuration`], or [`Rewrite::PaletteMoved`] where the conversion moves a colour), a palette line of fewer than sixteen, the rest written unset, refused ([`MuxOpenError::ConfigurationInvalid`]) — R10, Codex R9 2, L113 | kept; DVD subtitles' refused ([`PayloadRule::NewExtradata`]: a new sample description holds it unconverted) |
 //! | H.264, HEVC, VVC, EVC, LCEVC, AVS3 | `avcC`, `hvcC` and `lhvC`, `vvcC`, `evcC`, `lvcC`, `av3c` (1584–1593, 1639–1674, 1706–1723, 1676–1704, 1618–1626) | whole | kept |
 //! | VP9, AV1, VC-1 | `vpcC`, `av1C`, `dvc1` (1628–1637, 1573–1582, 1186–1201) | parsed, or whole; AV1's refused where `ff_isom_write_av1c` would fail, which leaves the box empty (`av1.c` 399–502; [`MuxOpenError::ConfigurationInvalid`], [`PayloadRule::NewExtradata`]; R9: ruling 4c — L109) | kept |
 //! | ALAC, FLAC, Opus, TrueHD | `alac`, `dfLa`, `dOps`, `dmlp` (672–676, 857–938) | whole, or parsed | kept |
@@ -1884,6 +1884,16 @@ pub enum Rewrite {
   /// each track its own way (`movenc.c` 8177–8205, 7404–7410, 5876–5890,
   /// 5734–5755): reported at open.
   Timeline,
+  /// MP4's DVD subtitles: the configuration's text palette written as
+  /// sixteen YUV colours, which the reader turns back into a palette text
+  /// of its own, every colour as given (`mov_create_dvd_sub_decoder_specific_info`,
+  /// `movenc.c` 7990–8045; `ff_dvdclut_yuv_to_rgb`, `dvdclut.c` 50–70; `mov.c`
+  /// 11372–11389). Reported at open (R10, Codex R9 2).
+  Configuration,
+  /// MP4's DVD subtitles as [`Rewrite::Configuration`], a colour of the
+  /// palette moved by the conversion's integer arithmetic there and back:
+  /// read back as another colour. Reported at open (R10, Codex R9 2).
+  PaletteMoved,
   /// The container writes a packet's presentation time and not its decode
   /// time, which a reader takes to be the presentation time: IVF
   /// (`ivf_write_packet`, `ivfenc.c` 75–88). Reported at the first packet
@@ -4181,6 +4191,11 @@ enum ExtradataRule {
   /// MP4 and FLV AV1: one `ff_isom_write_av1c` writes ([`av1c_written`];
   /// R9: ruling 4c).
   Av1c,
+  /// MP4 DVD subtitles: none — a new sample description holds it as it
+  /// is, a text its reader takes for a palette of sixteen colours only at
+  /// 64 bytes, its own conversion made at the start alone (`movenc.c`
+  /// 7044–7074, 8751; R10, Codex R9 2).
+  Refused,
   /// Matroska AAC: an AudioSpecificConfig libavcodec parses, within the
   /// space Matroska's header reserved — and none at all where the header
   /// reserved no output sampling frequency, which every new configuration
@@ -4418,6 +4433,8 @@ impl PacketRules {
         }
       } else if (mp4 || flv) && id == CodecId::AV1 {
         ExtradataRule::Av1c
+      } else if mp4 && id == CodecId::DVD_SUBTITLE {
+        ExtradataRule::Refused
       } else if matroska && id == CodecId::AAC {
         // `mkv_assemble_native_codecprivate` reserves `MAX_PCE_SIZE` for a
         // track with no configuration, and the configuration's own length
@@ -8770,6 +8787,7 @@ fn check_packet_rules(
       ExtradataRule::Any => true,
       ExtradataRule::OpusHead => opus_head_written(new),
       ExtradataRule::Form { codec, annex_b } => length_prefixed(Family::Mp4, codec, new) == annex_b,
+      ExtradataRule::Refused => false,
       // FLV's, unless `extract_extradata` replaces it with its own.
       ExtradataRule::Av1c => {
         av1c_written(new)
@@ -10375,11 +10393,87 @@ fn configuration_invalid(family: Family, codec: CodecId, extradata: &[u8]) -> bo
     c if c == CodecId::FLAC => extradata.len() != FLAC_STREAMINFO_BYTES,
     c if c == CodecId::OPUS => !opus_head_written(extradata),
     c if c == CodecId::AV1 => !av1c_written(extradata),
+    // DVD subtitles: a palette line of fewer than sixteen colours, the rest
+    // written from the stack unset (`movenc.c` 7998–8016).
+    c if c == CodecId::DVD_SUBTITLE => {
+      dvd_sub_palette_colours(extradata).is_some_and(|colours| colours.len() < 16)
+    }
     c if c == CodecId::TTML => extradata
       .strip_prefix(b"lavc-ttmlenc")
       .is_some_and(|strings| !ttml_header_strings(strings)),
     _ => false,
   }
+}
+
+/// The colours of the last palette line MP4's DVD subtitle writer parses
+/// of `config`, as it parses them, or `None` where it finds none
+/// (`mov_create_dvd_sub_decoder_specific_info`, `movenc.c` 7990–8045): its
+/// lines split at carriage returns and line feeds, a line opening with
+/// `palette:` read by `sscanf` as up to sixteen hexadecimal colours of six
+/// digits at most, each after `, ` but the first — the scan stopping at
+/// the first that does not parse — and the walk stopping once a palette
+/// and a `size:` line are both seen.
+fn dvd_sub_palette_colours(config: &[u8]) -> Option<Vec<u32>> {
+  let text = config.split(|&byte| byte == 0).next().unwrap_or(&[]);
+  let (mut palette, mut size) = (None, false);
+  for line in text.split(|&byte| byte == b'\n' || byte == b'\r') {
+    if let Some(rest) = line.strip_prefix(b"palette:") {
+      let mut colours = Vec::new();
+      let mut at = 0;
+      while colours.len() < 16 {
+        if !colours.is_empty() {
+          if rest.get(at) != Some(&b',') {
+            break;
+          }
+          at += 1;
+        }
+        while rest.get(at).is_some_and(u8::is_ascii_whitespace) {
+          at += 1;
+        }
+        let digits = rest[at.min(rest.len())..]
+          .iter()
+          .take(6)
+          .take_while(|byte| byte.is_ascii_hexdigit())
+          .count();
+        if digits == 0 {
+          break;
+        }
+        let hex = core::str::from_utf8(&rest[at..at + digits]).ok()?;
+        colours.push(u32::from_str_radix(hex, 16).ok()?);
+        at += digits;
+      }
+      palette = Some(colours);
+    } else if line.starts_with(b"size:") {
+      size = true;
+    }
+    if palette.is_some() && size {
+      break;
+    }
+  }
+  palette
+}
+
+/// Whether MP4's DVD subtitle palette reads back with a colour moved, or
+/// `None` where MP4 writes no palette or one of fewer than sixteen colours
+/// ([`dvd_sub_palette_colours`]): each colour converted to YUV as
+/// `rgb_to_yuv` converts it (`movenc.c` 7976–7988) and back as
+/// `ff_dvdclut_yuv_to_rgb` (`dvdclut.c` 50–70, `colorspace.h` 30–42).
+fn dvd_sub_palette(config: &[u8]) -> Option<bool> {
+  let colours = dvd_sub_palette_colours(config).filter(|colours| colours.len() == 16)?;
+  let fix = |x: f64| (x * 1024.0 + 0.5) as i32;
+  let clip = |v: i32| v.clamp(0, 255);
+  Some(colours.iter().any(|&rgb| {
+    let [r, g, b] = [(rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF].map(|c| c as i32);
+    let y = clip((16_000 + 257 * r + 504 * g + 98 * b) / 1000);
+    let cb = clip((128_000 - 148 * r - 291 * g + 439 * b) / 1000) - 128;
+    let cr = clip((128_000 + 439 * r - 368 * g - 71 * b) / 1000) - 128;
+    let r_add = fix(1.402 * 255.0 / 224.0) * cr + 512;
+    let g_add = -fix(0.34414 * 255.0 / 224.0) * cb - fix(0.71414 * 255.0 / 224.0) * cr + 512;
+    let b_add = fix(1.772 * 255.0 / 224.0) * cb + 512;
+    let y = (y - 16) * fix(255.0 / 219.0);
+    let back = [r_add, g_add, b_add].map(|add| clip((y + add - 1024) >> 10) as u32);
+    (back[0] << 16 | back[1] << 8 | back[2]) != rgb
+  }))
 }
 
 /// MPEG-4 ALS, which the base names no constant for.
@@ -10681,6 +10775,14 @@ fn rewrites(
       Rewrite::ParagraphsJoined,
     ),
     (audited == Audited::Mov(MovMode::Ism), Rewrite::Timeline),
+    (
+      mp4 && codec == CodecId::DVD_SUBTITLE && dvd_sub_palette(extradata) == Some(false),
+      Rewrite::Configuration,
+    ),
+    (
+      mp4 && codec == CodecId::DVD_SUBTITLE && dvd_sub_palette(extradata) == Some(true),
+      Rewrite::PaletteMoved,
+    ),
     (
       mp4 && (codec == CodecId::VC1 || codec == CodecId::TRUEHD),
       Rewrite::SyncFromBitstream,

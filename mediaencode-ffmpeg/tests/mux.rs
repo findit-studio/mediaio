@@ -12799,3 +12799,106 @@ fn l112_the_program_streams_preload_is_refused_where_it_would_wrap() {
     muxer.finish().expect("finished");
   }
 }
+
+/// **L113 — MP4's DVD subtitle configuration is taken where it reads back,
+/// its rewrite reported** (R10, Codex R9 2; `movenc.c` 7976–8045, 7044–7074;
+/// `dvdclut.c` 28–70; `mov.c` 11372–11389): MP4 writes the text's palette
+/// as sixteen YUV colours, and its reader writes a palette text of its own
+/// back — every colour as given: reported (`Rewrite::Configuration`); a
+/// colour the integer conversion moves, white among them: reported
+/// (`Rewrite::PaletteMoved`); a palette line of fewer than sixteen, the
+/// rest written unset: refused at open, nothing written; new extradata,
+/// which a new sample description holds unconverted: refused, the packet
+/// handed back.
+///
+/// PLANT: each rule removed reports nothing, opens, or takes the packet.
+#[test]
+fn l113_mp4s_dvd_subtitle_configuration_is_taken_where_it_reads_back() {
+  use ffmpeg_next::ffi::{AVCodecID as Id, AVPacketSideDataType as T};
+  let Some(corpus) = Corpus::new() else { return };
+  #[rustfmt::skip]
+  let ass = generated(&corpus, "ass.mkv", &[
+    "-i",
+    written_text(&corpus, "two.srt", "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n2\n00:00:01,000 --> 00:00:02,000\nworld\n\n")
+      .to_str().expect("utf-8 path"),
+    "-c:s", "ass",
+  ]);
+  let palette = |colours: &[&str]| format!("size: 720x480\npalette: {}\n", colours.join(", "));
+  let row = |config: &str| {
+    recoded(
+      table_of(&ass, TrackKind::Subtitle).remove(0),
+      Id::AV_CODEC_ID_DVD_SUBTITLE,
+      config.as_bytes(),
+    )
+  };
+  let rewritten = |report: &mediaencode_ffmpeg::MuxReport, rewrite| {
+    report.uncarried().contains(&Uncarried::Rewritten {
+      track: TrackIndex::new(0),
+      rewrite,
+    })
+  };
+  let black = palette(&["000000"; 16]);
+  let white = palette(&[["000000"; 15].as_slice(), &["ffffff"]].concat());
+  let short = palette(&["000000"; 15]);
+  for (name, config, rewrite) in [
+    ("black", &black, Rewrite::Configuration),
+    ("white", &white, Rewrite::PaletteMoved),
+  ] {
+    let target = output(&corpus, &format!("l113-{name}.mp4"));
+    let (mut muxer, report) = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::MP4,
+      vec![row(config)],
+      &[],
+      PacketLimits::default(),
+    )
+    .expect("open");
+    assert!(
+      rewritten(&report, rewrite),
+      "{name}: {:?}",
+      report.uncarried()
+    );
+    let (_, cues) = whole_track(&ass, TrackKind::Subtitle);
+    let mut first = subtitle_of(&cues[0]);
+    first
+      .extra_mut()
+      .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, black.as_bytes())]);
+    let offered = SubtitleTrackPacket::new(TrackIndex::new(0), first);
+    let (refusal, back) = by_container(muxer.write_subtitle(offered.clone()));
+    assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{name}");
+    untouched!(offered, back);
+    muxer
+      .write_subtitle(SubtitleTrackPacket::new(
+        TrackIndex::new(0),
+        subtitle_of(&cues[0]),
+      ))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a cue");
+    muxer.finish().expect("finished");
+    // Read back: the reader's own palette text, each colour as the mirror
+    // computes it — white one level down in each channel.
+    let read = String::from_utf8(stream_extradata_of(
+      &table_of(&target, TrackKind::Subtitle)[0],
+    ))
+    .expect("text");
+    let last = if name == "white" { "fefefe" } else { "000000" };
+    assert!(
+      read.starts_with(&format!("palette: {}, {last}", ["000000"; 15].join(", "))),
+      "{name}: {read:?}"
+    );
+  }
+  let target = output(&corpus, "l113-short.mp4");
+  let refused = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    vec![row(&short)],
+    &[],
+    PacketLimits::default(),
+  );
+  assert!(
+    matches!(refused, Err(MuxOpenError::ConfigurationInvalid { .. })),
+    "{:?}",
+    refused.map(drop)
+  );
+  assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+}
