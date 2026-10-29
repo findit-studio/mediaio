@@ -140,7 +140,11 @@ crate moves only when it changes.
   (`AdtsHeader`), AAC with no configuration whose first packet brings none
   (`PayloadRule::ConfigurationAbsent`), and at open Opus or FLAC with no
   configuration, which its header asserts, and H.264, HEVC, VVC, AV1,
-  MPEG-4 or AAC with none and the filters off.
+  MPEG-4 or AAC with none and the filters off. AVI: a packet's time kept
+  as its place, reported where it is not (`Rewrite::Timeline`); a frame
+  past the 60 000 empty ones it fills a gap with
+  (`FfmpegMuxRefusal::FrameGap`), H.264 it tags `H264` off a start code,
+  raw video it would write unreadable.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

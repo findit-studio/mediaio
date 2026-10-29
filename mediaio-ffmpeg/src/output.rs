@@ -552,6 +552,9 @@ pub struct StreamCodec {
   block_align: i32,
   initial_padding: i32,
   profile: i32,
+  codec_tag: u32,
+  format: i32,
+  bits_per_coded_sample: i32,
   extradata: Vec<u8>,
 }
 
@@ -604,6 +607,25 @@ impl StreamCodec {
   /// 9.0.1) — or `AV_PROFILE_UNKNOWN`, `-99`, where none is stated.
   pub const fn profile(&self) -> i32 {
     self.profile
+  }
+
+  /// The codec tag the stream is written with, as the muxer's tag table
+  /// and libavformat's stream-copy rule settled it — `H264` for H.264 into
+  /// AVI where the source stated none — or `0`.
+  pub const fn codec_tag(&self) -> u32 {
+    self.codec_tag
+  }
+
+  /// A video stream's pixel format, or an audio stream's sample format,
+  /// as the integer it is stored as (`AVCodecParameters.format`).
+  pub const fn format(&self) -> i32 {
+    self.format
+  }
+
+  /// The bits a coded sample takes (`bits_per_coded_sample`): a raw
+  /// picture's bits per pixel, or `0`.
+  pub const fn bits_per_coded_sample(&self) -> i32 {
+    self.bits_per_coded_sample
   }
 
   /// The samples an audio stream's encoder put before its first, or
@@ -798,6 +820,9 @@ impl<W> Output<W> {
         block_align: (*par).block_align,
         initial_padding: (*par).initial_padding,
         profile: (*par).profile,
+        codec_tag: (*par).codec_tag,
+        format: (*par).format,
+        bits_per_coded_sample: (*par).bits_per_coded_sample,
         extradata,
       })
     }

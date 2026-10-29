@@ -7766,3 +7766,203 @@ fn l82_flv_refuses_what_its_tags_cannot_carry() {
     Err(MuxOpenError::CodecNotCarried { track, codec }) if track.get() == 1 && codec == CodecId::VP8
   ));
 }
+
+/// **L83 — MPEG-4 Part 2 and PCM round-trip through AVI, each time kept as
+/// the packet's place** (table H; `avienc.c` 744–913): video counted in
+/// its stream's ticks, each a frame, the gaps between frames filled with
+/// empty ones its reader skips; PCM counted in samples. Every packet reads
+/// back with its bytes and its times; AVI writes no duration
+/// ([`Rewrite::Durations`]).
+#[test]
+fn l83_a_stream_round_trips_through_avi() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = picture_and_sound(
+    &corpus,
+    "mpeg4-pcm.mkv",
+    &["-c:v", "mpeg4"],
+    &["-c:a", "pcm_s16le", "-ac", "2"],
+  );
+  let target = output(&corpus, "l83.avi");
+  let report = remux_through_ffmpeg(&source, ContainerName::new("avi"), &target);
+  for track in [0, 1] {
+    assert!(
+      report.uncarried().contains(&Uncarried::Rewritten {
+        track: TrackIndex::new(track),
+        rewrite: Rewrite::Durations,
+      }),
+      "track {track}: {report:?}"
+    );
+  }
+  let offered = timed_bytes(&source);
+  let back = timed_bytes(&target);
+  assert_eq!(back.len(), 2);
+  assert_eq!(
+    back[0].len(),
+    offered[0].len(),
+    "video: a packet a packet, the empty ones skipped"
+  );
+  for (index, (seen, sent)) in back[0].iter().zip(&offered[0]).enumerate() {
+    assert!(seen.0 == sent.0, "video {index}: the bytes");
+    assert_eq!(seen.2, sent.2, "video {index}: decoded");
+  }
+  let pcm = |track: &[(Vec<u8>, Option<i64>, Option<i64>)]| -> Vec<u8> {
+    track.iter().flat_map(|(bytes, ..)| bytes.clone()).collect()
+  };
+  assert!(pcm(&back[1]) == pcm(&offered[1]), "PCM: the samples");
+}
+
+/// **L84 — AVI's refusals, and what it moves** (table H; `avienc.c`
+/// 744–913): a frame more than 60 000 frames after the stream's place,
+/// which AVI would fill with empty frames no further
+/// ([`FfmpegMuxRefusal::FrameGap`]) — one 60 000 after taken; H.264 it
+/// tags `H264` not opening on a start code, which it checks and inserts no
+/// filter for ([`PayloadRule::StartCode`]); raw RGB video it would write
+/// as a bitmap of another pixel format, "unreadable"
+/// ([`MuxOpenError::ConfigurationInvalid`]). A PCM packet whose time is
+/// not the samples before it moves to them, reported
+/// ([`Rewrite::Timeline`]); MPEG-4 Part 2 presented in another order than
+/// decoded loses its presentation times ([`Rewrite::PresentationTimes`]).
+///
+/// PLANT: each check removed takes its packet, or opens; the report
+/// unmade.
+#[test]
+fn l84_avi_refuses_what_it_cannot_place() {
+  let Some(corpus) = Corpus::new() else { return };
+  let avi = || ContainerName::new("avi");
+  let track = TrackIndex::new(0);
+  let source = picture_and_sound(
+    &corpus,
+    "mpeg4-pcm.mkv",
+    &["-c:v", "mpeg4"],
+    &["-c:a", "pcm_s16le", "-ac", "2"],
+  );
+  let (table, video) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&video[0]);
+  let mut muxer = muxer_into(&output(&corpus, "l84.avi"), avi(), table);
+  muxer
+    .write_video(video_at(&frame, Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first frame: place 1 after it");
+  muxer
+    .write_video(video_at(&frame, Some(60_001), 60_001))
+    .map_err(|error| error.map_packet(drop))
+    .expect("60 000 empty frames before it");
+  let far = video_at(&frame, Some(120_003), 120_003);
+  let (refusal, back) = by_container(muxer.write_video(far.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::FrameGap {
+      track,
+      dts: ms(120_003),
+    }
+  );
+  untouched!(far, back);
+  muxer.finish().expect("finished");
+
+  let h264 = corpus.multi_track_mkv();
+  let (table, video) = first_track(&h264, TrackKind::Video, 1);
+  let mut muxer = muxer_into(&output(&corpus, "l84-h264.avi"), avi(), table);
+  let offered = video_at(&video_of(&video[0]), Some(0), 0);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::StartCode),
+    "length-prefixed, tagged H264"
+  );
+  untouched!(offered, back);
+  muxer.finish().expect("finished");
+
+  let rgb = generated(
+    &corpus,
+    "rgb24.mov",
+    &[
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=32x32:rate=25:duration=0.2",
+      "-c:v",
+      "rawvideo",
+      "-pix_fmt",
+      "rgb24",
+    ],
+  );
+  let refused = FfmpegOwnedMuxer::open(
+    File::create(output(&corpus, "l84-rgb.avi")).expect("create"),
+    avi(),
+    table_of(&rgb, TrackKind::Video),
+    &[],
+    PacketLimits::default(),
+  );
+  assert!(
+    matches!(refused, Err(MuxOpenError::ConfigurationInvalid { track, .. }) if track.get() == 0),
+    "{:?}",
+    refused.map(drop)
+  );
+
+  let (table, audio) = first_track(&source, TrackKind::Audio, 2);
+  let mut muxer = muxer_into(&output(&corpus, "l84-pcm.avi"), avi(), table);
+  muxer
+    .write_audio(audio_on_zero(
+      audio_of(&audio[0])
+        .with_pts(Some(ms(0)))
+        .with_dts(Some(ms(0))),
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first samples");
+  assert!(
+    lines(muxer.report(), |line| matches!(
+      line,
+      Uncarried::Rewritten {
+        rewrite: Rewrite::Timeline,
+        ..
+      }
+    ))
+    .is_empty(),
+    "at its place"
+  );
+  muxer
+    .write_audio(audio_on_zero(
+      audio_of(&audio[1])
+        .with_pts(Some(ms(500)))
+        .with_dts(Some(ms(500))),
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("samples after a gap, at the place after the first");
+  assert_eq!(
+    lines(muxer.report(), |line| matches!(
+      line,
+      Uncarried::Rewritten {
+        rewrite: Rewrite::Timeline,
+        ..
+      }
+    )),
+    vec![Uncarried::Rewritten {
+      track,
+      rewrite: Rewrite::Timeline,
+    }]
+  );
+  muxer.finish().expect("finished");
+
+  let reordering = picture_and_sound(
+    &corpus,
+    "mpeg4-bframes.mp4",
+    &["-c:v", "mpeg4", "-bf", "2"],
+    &["-c:a", "pcm_s16le", "-ac", "2"],
+  );
+  let (table, video) = whole_track(&reordering, TrackKind::Video);
+  let mut muxer = muxer_into(&output(&corpus, "l84-bframes.avi"), avi(), table);
+  for packet in &video {
+    muxer
+      .write_video(VideoTrackPacket::new(track, video_of(packet)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  assert!(
+    muxer.report().uncarried().contains(&Uncarried::Rewritten {
+      track,
+      rewrite: Rewrite::PresentationTimes,
+    }),
+    "presented in another order"
+  );
+  muxer.finish().expect("finished");
+}

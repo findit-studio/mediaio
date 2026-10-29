@@ -1140,6 +1140,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
       sample_rate: 48_000,
       frame_size,
       initial_padding: 0,
+      format: -1,
       extradata: Vec::new(),
     },
     written: false,
@@ -1148,6 +1149,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     document: 0,
     adts: None,
     bytes: 0,
+    place: 0,
   }
 }
 
@@ -1857,6 +1859,7 @@ fn each_container_keeps_the_side_data_it_has_a_place_for() {
     sample_rate: 48_000,
     frame_size: 1024,
     initial_padding: 1024,
+    format: -1,
     extradata: vec![0x11, 0x90],
   };
   let skip = |start: u32, end: u32| {

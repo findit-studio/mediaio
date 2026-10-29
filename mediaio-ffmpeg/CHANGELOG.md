@@ -74,8 +74,8 @@ crate moves only when it changes.
   keeps each packet from a rule libavformat would apply only after
   taking it: `Output::stream_codec` answers a stream's `StreamCodec` — its
   codec, video delay, sample rate, channels, frame size, the samples its
-  codec fixes in each frame, block alignment, initial padding, profile
-  and extradata — once `add_stream` made it; `Output::shifts_early_times`
+  codec fixes in each frame, block alignment, initial padding, profile,
+  codec tag, format, bits per coded sample and extradata — once `add_stream` made it; `Output::shifts_early_times`
   whether libavformat moves every stream's times for an early first one;
   `Output::position` the bytes written so far, the header's size once it
   is written;

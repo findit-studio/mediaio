@@ -617,6 +617,7 @@
 //! | the raw streams, ADTS, FLAC, MP3 (`rawenc.c` 31–35; `adtsenc.c` 154–208; `flacenc.c` 283–301; `mp3enc.c` 318–380) | none | none | none | FLAC: a 34-byte STREAMINFO, the last, written into the header at the trailer; MP3: skip samples, the first start skip and the last end skip, within 12 bits, in the LAME tag; ADTS: a configuration-less track's first new extradata, its fields in every header | none | MP3: ID3v2 chapters, by position, in milliseconds; the rest none |
 //! | IVF (`ivfenc.c` 75–88) | the presentation time | none | none | none | none | none |
 //! | WAV, Wave64 (`wavenc.c` 378–416) | none | none | none | none | none | none |
+//! | AVI (`avienc.c` 744–913) | as each packet's place: video's frame, in its stream's ticks, a gap filled with empty frames; PCM's samples ([`Rewrite::Timeline`] where a time is not its place) — no presentation time | none | in the index | a PAL8 picture's palette | none | none |
 //! | FLV (`flvenc.c` 1209–1486) | the decode time, 32 bits of milliseconds; a composition time for H.264, MPEG-4 Part 2, HEVC and VVC alone, 24 bits | none | a video tag's; every audio tag reads back a key frame ([`Rewrite::KeyFramesMarked`]) | new extradata of AAC, H.264, MPEG-4, HEVC, VVC, AV1, VP9, Opus and FLAC, a new sequence header | none | none |
 //!
 //! **What each refuses**:
@@ -631,6 +632,7 @@
 //! | IVF | a dimension past 65535 | written cut into its 16-bit field (`ivfenc.c` 65–66) | [`MuxOpenError::Dimensions`] — L77 |
 //! | WAV | a packet past 4 GiB of file | the sizes left at their placeholders, the file broken (`wavenc.c` 418–495) | [`PayloadRule::FileSize`] — L78 |
 //! | FLV | a reordering H.264, MPEG-4, HEVC, AV1, VP9 or VVC packet with no presentation time; a decode time past 32 bits of milliseconds; a composition time past 24 bits; a tag past 24 bits of size; ADTS AAC no filter converts; AAC with no configuration whose first packet brings none | refused after taking the packet; written cut; written cut; refused after taking the packet; refused after taking the first, the rest written with their headers in; an empty sequence header, unreadable (`flvenc.c` 1252–1352, 807–860) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`PayloadRule::TagSize`], [`PayloadRule::AdtsHeader`], [`PayloadRule::ConfigurationAbsent`] — L50, L82 |
+//! | AVI | a frame more than 60 000 frames after the stream's place; H.264 it tags `H264` not opening on a start code; at open, raw video of no tag of another pixel format than its bits name | refused after taking it; the first refused after taking it, the rest written as they are; written, "unreadable" (`avienc.c` 744–778, 446–461) | [`FfmpegMuxRefusal::FrameGap`], [`PayloadRule::StartCode`], [`MuxOpenError::ConfigurationInvalid`] — L84 |
 //! | FLV, at open | Opus or FLAC with no configuration; H.264, HEVC, VVC, AV1, MPEG-4 or AAC with none and the filters off | the header's `av_assert0` ends the process; written behind an empty sequence header (`flvenc.c` 853, 1491–1503) | [`MuxOpenError::ConfigurationMissing`] — L82 |
 
 use core::{fmt, marker::PhantomData};
@@ -916,6 +918,14 @@ impl Audited {
         key: true,
         ..NOTHING
       }),
+      // `avi_write_packet_internal` (`avienc.c` 868–913): a chunk a
+      // packet, its place its time ([`PacketRules::avi`]), its key flag in
+      // the index; no presentation time, no duration.
+      Self::Avi => Some(Written {
+        dts: true,
+        key: true,
+        ..NOTHING
+      }),
       _ => {
         let _ = kind;
         None
@@ -934,13 +944,17 @@ impl Audited {
       // 148–177; `mp3enc.c` 617–636).
       // FLV writes none either: its metadata is the file's
       // (`write_metadata`, `flvenc.c` 316–450).
+      // AVI neither: its stream name is a title, and an XSUB track's
+      // language written into it no reader takes back as one (`avienc.c`
+      // 488–503).
       Self::Raw(_)
       | Self::Adts
       | Self::Flac
       | Self::Mp3
       | Self::Wav { .. }
       | Self::Ivf
-      | Self::Flv => Some(Kept {
+      | Self::Flv
+      | Self::Avi => Some(Kept {
         filename: false,
         mime_type: false,
         language: LanguageRule::Dropped,
@@ -955,7 +969,14 @@ impl Audited {
   const fn censused(self) -> bool {
     matches!(
       self,
-      Self::Raw(_) | Self::Adts | Self::Flac | Self::Mp3 | Self::Wav { .. } | Self::Ivf | Self::Flv
+      Self::Raw(_)
+        | Self::Adts
+        | Self::Flac
+        | Self::Mp3
+        | Self::Wav { .. }
+        | Self::Ivf
+        | Self::Flv
+        | Self::Avi
     )
   }
 
@@ -1553,8 +1574,14 @@ pub enum Rewrite {
   /// the stream itself — its samples, or a frame rate it finds — so a
   /// track's start, the gaps and overlaps between its packets, and their
   /// durations are not kept as given. The raw streams (`AVFMT_NOTIMESTAMPS`)
-  /// and WAV and Wave64, which write none (`wavenc.c` 378–416). Reported at
-  /// open (table H of the census).
+  /// and WAV and Wave64, which write none (`wavenc.c` 378–416): reported
+  /// at open (table H of the census). And AVI, which keeps a packet's time
+  /// as its place — the frame it is of the stream's frames, a gap filled
+  /// with empty ones, or a PCM packet's first sample — so that a packet
+  /// whose time is not its place moves, and a stream's start with it
+  /// (`avienc.c` 744–766, 868–913): reported at the first such packet; a
+  /// stream of another codec whose block alignment its reader counts by,
+  /// at open.
   Timeline,
   /// The container writes a packet's presentation time and not its decode
   /// time, which a reader takes to be the presentation time: IVF
@@ -1838,6 +1865,17 @@ pub enum FfmpegMuxRefusal {
   /// `flvenc.c` 1284, 1352), so one of 2^32 or more is written cut.
   #[error("track {}: decoded at {}, past what the container counts", .track.get(), .dts.pts())]
   TimeWraps {
+    /// The track.
+    track: TrackIndex,
+    /// The decode time offered.
+    dts: Timestamp,
+  },
+  /// AVI: a packet more than 60 000 frames after the place the stream has
+  /// reached. AVI keeps a frame's time as its place, filling a gap with
+  /// empty frames — 60 000 at most, refusing past it after taking the
+  /// packet (`write_skip_frames`, `avienc.c` 744–766).
+  #[error("track {}: decoded at {}, more empty frames after the last than AVI fills", .track.get(), .dts.pts())]
+  FrameGap {
     /// The track.
     track: TrackIndex,
     /// The decode time offered.
@@ -2530,6 +2568,9 @@ struct TrackState {
   adts: Option<AdtsMirror>,
   /// The bytes of the track's packets the container has written.
   bytes: u64,
+  /// AVI: the place the stream has reached — frames written, empty ones
+  /// among them, or samples ([`AviPlace`]).
+  place: i128,
 }
 
 /// What the ADTS muxer knows of an AAC track's configuration
@@ -3067,6 +3108,19 @@ struct PacketRules {
   /// FLV AAC with no configuration and its automatic filter: the first
   /// packet must bring one ([`PayloadRule::ConfigurationAbsent`]).
   configuration_absent: bool,
+  /// AVI: how it keeps a packet's time, as its place ([`AviPlace`]).
+  avi: Option<AviPlace>,
+}
+
+/// How AVI keeps a stream's packets' times, as their places
+/// (`write_skip_frames`, `avienc.c` 744–766; `avi_write_packet_internal`,
+/// 868–913): a stream of no block alignment as the frame each is, a gap
+/// filled with empty frames, none before the first; a PCM stream as the
+/// samples before each, its block alignment a sample's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AviPlace {
+  Frames,
+  Samples { block: u64 },
 }
 
 /// What FLV writes before a packet's bytes in its tag, and whether it
@@ -3457,7 +3511,14 @@ impl PacketRules {
       file_bytes: (audited == Audited::Wav { w64: false })
         .then(|| (file + 8).saturating_sub(u64::try_from(header).unwrap_or(0))),
       in_band: (raw && !codec.extradata().is_empty()).then_some(id),
-      start_codes: raw && (id == CodecId::H264 || id == CodecId::HEVC),
+      // AVI checks an H.264 stream it tags `H264` for a start code
+      // (`ff_check_h264_startcode`, `avienc.c` 774–778), refusing the first
+      // packet without one after taking it and writing the rest as they
+      // are; it inserts no filter.
+      start_codes: (raw && (id == CodecId::H264 || id == CodecId::HEVC))
+        || (audited == Audited::Avi
+          && id == CodecId::H264
+          && codec.codec_tag() == u32::from_le_bytes(*b"H264")),
       config_bytes: raw_flac.then_some(FLAC_STREAMINFO_BYTES),
       dts_bits: flv.then_some(32),
       offset_bits: (flv
@@ -3465,6 +3526,12 @@ impl PacketRules {
       .then_some(24),
       flv_tag: None,
       configuration_absent: false,
+      avi: (audited == Audited::Avi).then(|| match codec.block_align() {
+        0 => AviPlace::Frames,
+        block => AviPlace::Samples {
+          block: u64::try_from(block).unwrap_or(1),
+        },
+      }),
     }
   }
 }
@@ -5099,6 +5166,8 @@ struct SideRules {
   sample_rate: i32,
   frame_size: i32,
   initial_padding: i32,
+  /// The stream's pixel or sample format, as the integer it is stored as.
+  format: i32,
   /// The stream's configuration: new extradata equal to it changes nothing.
   extradata: Vec<u8>,
 }
@@ -5115,6 +5184,7 @@ impl SideRules {
       sample_rate: 0,
       frame_size: 0,
       initial_padding: 0,
+      format: -1,
       extradata: Vec::new(),
     }
   }
@@ -5130,6 +5200,7 @@ impl SideRules {
       sample_rate: codec.sample_rate(),
       frame_size: codec.frame_size(),
       initial_padding: codec.initial_padding(),
+      format: codec.format(),
       extradata: codec.extradata().to_vec(),
     }
   }
@@ -5263,6 +5334,14 @@ impl SideRules {
         _ => Dropped,
       });
     }
+    // AVI writes a PAL8 picture's palette as a palette-change chunk
+    // (`ff_get_packet_palette`, `avienc.c` 802–850).
+    if is(T::AV_PKT_DATA_PALETTE)
+      && audited == Audited::Avi
+      && self.format == ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_PAL8 as i32
+    {
+      return None;
+    }
     if is(T::AV_PKT_DATA_SKIP_SAMPLES) {
       if data.iter().all(|&byte| byte == 0) {
         return None;
@@ -5360,6 +5439,9 @@ struct Learned {
   adts: Option<AdtsMirror>,
   /// The bytes the container writes of the packet.
   bytes: u64,
+  /// AVI: the place after the packet, and whether its time was not its
+  /// place ([`Rewrite::Timeline`]).
+  place: Option<(i128, bool)>,
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
@@ -5476,7 +5558,7 @@ where
         &output,
         (family, audited),
         sites,
-        (track, kind_index(&tracks, index)),
+        track,
         description,
         filters,
         limits,
@@ -5530,6 +5612,15 @@ where
           let codec = output
             .stream_codec(stream)
             .map_err(|error| MuxFault::new(MuxStage::Stream { track }, error))?;
+          // AVI writes raw video of no codec tag as the bitmap its bits per
+          // sample name, logging that one of another pixel format "will be
+          // unreadable" (`avi_write_header`, `avienc.c` 446–461).
+          if audited == Audited::Avi && avi_raw_unreadable(&codec) {
+            return Err(MuxOpenError::ConfigurationInvalid {
+              track,
+              codec: codec.codec(),
+            });
+          }
           // `pcm_rechunk`'s start counts an audio track's sample size in
           // `int` (table B), as the stream holds it.
           if sites.rechunk
@@ -5584,6 +5675,19 @@ where
           )
           .map(|rewrite| Uncarried::Rewritten { track, rewrite }),
         );
+        // AVI's reader counts the times of a stream of another codec than
+        // PCM's with a block alignment by it, which this muxer does not
+        // mirror (table H).
+        if audited == Audited::Avi
+          && kind == TrackKind::Audio
+          && codec.block_align() > 0
+          && codec.codec().bits_per_sample() == 0
+        {
+          report.uncarried.push(Uncarried::Rewritten {
+            track,
+            rewrite: Rewrite::Timeline,
+          });
+        }
       }
       states.push((kind, stream, *road, filter));
     }
@@ -5616,9 +5720,15 @@ where
       let mut rules = PacketRules::default();
       let mut sides = SideRules::unclaimed();
       let stream = match (stream, road) {
-        (Some((stream, codec)), Road::Timed) => {
+        (Some((stream, _)), Road::Timed) => {
           let time_base = output
             .stream_time_base(stream)
+            .map_err(|error| MuxFault::new(MuxStage::Header, error))?;
+          // The stream as the header left it: libavformat settles a codec
+          // tag of none at its start (`init_muxer`, `mux.c` 288–312), and
+          // a muxer's start may set more.
+          let codec = output
+            .stream_codec(stream)
             .map_err(|error| MuxFault::new(MuxStage::Header, error))?;
           rules = PacketRules::settle(
             (family, audited),
@@ -5688,6 +5798,7 @@ where
         document: rules.ttml_document.unwrap_or(0),
         adts: rules.adts,
         bytes: 0,
+        place: 0,
       });
     }
 
@@ -6100,8 +6211,14 @@ where
         uncarried.insert(0, line);
       }
     }
-    // Table H's field rows the packet shows: a time the container does not
-    // write, where its two differ.
+    // Table H's field rows the packet shows: AVI's time not its place; a
+    // time the container does not write, where its two differ.
+    if learned.place.is_some_and(|(_, moved)| moved) {
+      uncarried.push(Uncarried::Rewritten {
+        track,
+        rewrite: Rewrite::Timeline,
+      });
+    }
     if let Some(fields) = state.rules.fields
       && step.owns
       && pts_ticks.is_some_and(|pts| pts != dts_ticks)
@@ -6197,6 +6314,9 @@ where
       state.adts = Some(adts);
     }
     state.bytes += plan.learned.bytes;
+    if let Some((place, _)) = plan.learned.place {
+      state.place = place;
+    }
     if let Some(sample) = plan.learned.sample {
       state.sample = Some(sample);
     }
@@ -6642,6 +6762,31 @@ fn check_packet_rules(
   {
     return refused(PayloadRule::ConfigurationAbsent);
   }
+  // AVI: a packet's time as its place — after libavformat's shift, as far
+  // as the packet shows it — gaps of frames filled, 60 000 at most, none
+  // before the first (`avienc.c` 744–766, 868–913).
+  let place = match rules.avi {
+    Some(AviPlace::Frames) => {
+      let dts = i128::from(dts_ticks) + lift;
+      let mut place = state.place;
+      if state.written && dts > place {
+        if dts - place > 60_000 {
+          return Err(FfmpegMuxRefusal::FrameGap {
+            track,
+            dts: own.dts,
+          });
+        }
+        place = dts;
+      }
+      Some((place + 1, dts != place))
+    }
+    Some(AviPlace::Samples { block }) => {
+      let dts = i128::from(dts_ticks) + lift;
+      let samples = i128::from(payload.bytes.len() as u64 / block);
+      Some((state.place + samples, dts != state.place))
+    }
+    None => None,
+  };
   // WAV: the file's size, less eight, its data's pad byte among it, within
   // the 32 bits its RIFF header counts (`wav_write_trailer`, `wavenc.c`
   // 425–441).
@@ -6854,6 +6999,7 @@ fn check_packet_rules(
     durations,
     adts,
     bytes: payload.bytes.len() as u64,
+    place,
   })
 }
 
@@ -7263,7 +7409,7 @@ fn judge<W, D: AsRef<[u8]>>(
   output: &Output<W>,
   (family, audited): (Family, Audited),
   sites: Sites,
-  (track, index_in_kind): (TrackIndex, usize),
+  track: TrackIndex,
   description: &TrackDescription<Ffmpeg, D, CodecTicket>,
   filters: bool,
   limits: PacketLimits,
@@ -7358,8 +7504,7 @@ fn judge<W, D: AsRef<[u8]>>(
       if family == Family::Mp4 && !mp4_pcm_layout_written(codec, layout) {
         return Err(MuxOpenError::ChannelLayout { track });
       }
-      if let Some(refusal) = audited_refusal(audited, (track, index_in_kind), description, filters)
-      {
+      if let Some(refusal) = audited_refusal(audited, track, description, filters) {
         return Err(refusal);
       }
       Road::Timed
@@ -7367,6 +7512,38 @@ fn judge<W, D: AsRef<[u8]>>(
   };
   Ok((road, losses((family, audited), road, track, description)))
 }
+
+/// Whether AVI writes `stream`, raw video of no codec tag, as a bitmap of
+/// another pixel format than its own: the one AVI's list names for its
+/// bits per sample (`avpriv_pix_fmt_find(PIX_FMT_LIST_AVI)`,
+/// `libavcodec/raw.c` 42–53, 80–100), RGB 5:5:5 of 15 written as 16
+/// (`avienc.c` 440–445).
+fn avi_raw_unreadable(stream: &StreamCodec) -> bool {
+  use ffmpeg_next::ffi::AVPixelFormat as P;
+  if stream.codec() != RAWVIDEO
+    || stream.codec_tag() != 0
+    || stream.format() == P::AV_PIX_FMT_NONE as i32
+  {
+    return false;
+  }
+  let bits = match stream.bits_per_coded_sample() {
+    15 if stream.format() == P::AV_PIX_FMT_RGB555LE as i32 => 16,
+    bits => bits,
+  };
+  let named = match bits {
+    1 | 2 | 4 | 8 => P::AV_PIX_FMT_PAL8,
+    12 => P::AV_PIX_FMT_RGB444LE,
+    15 | 16 => P::AV_PIX_FMT_RGB555LE,
+    24 => P::AV_PIX_FMT_BGR24,
+    32 => P::AV_PIX_FMT_BGRA,
+    _ => P::AV_PIX_FMT_NONE,
+  };
+  stream.format() != named as i32
+}
+
+/// Raw video, which the base names no constant for.
+const RAWVIDEO: CodecId =
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_RAWVIDEO as i32);
 
 /// The track's place among the table's timed tracks of its kind before it:
 /// FLV's `track_idx_map` (`flvenc.c` 993–1060).
@@ -7393,7 +7570,7 @@ fn kind_index<D, S>(tracks: &[TrackDescription<Ffmpeg, D, S>], index: usize) -> 
 /// which libavcodec also takes (`flac.c` 35–55), is written cut.
 fn audited_refusal<D>(
   audited: Audited,
-  (track, index_in_kind): (TrackIndex, usize),
+  track: TrackIndex,
   description: &TrackDescription<Ffmpeg, D, CodecTicket>,
   filters: bool,
 ) -> Option<MuxOpenError>
