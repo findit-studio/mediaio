@@ -2773,12 +2773,17 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   // the first write, and settles the move.
   let alone = of(Family::Other, "mpegts", &[video, data]).expect("mirrored");
   assert!(alone.passthrough);
-  let moved = alone.take(0, (-40, -40, 0), ms).expect("before the write");
+  let moved = alone
+    .take(0, (-40, -40, 0), Some(0), ms)
+    .expect("before the write");
   assert!(moved.written);
   assert_eq!(moved.earliest, Some(Timestamp::new(-40, ms)));
-  assert!(moved.take(1, (-40, -40, 0), ms).is_ok(), "lifted to zero");
+  assert!(
+    moved.take(1, (-40, -40, 0), Some(0), ms).is_ok(),
+    "lifted to zero"
+  );
   assert_eq!(
-    moved.take(1, (-41, -41, 0), ms),
+    moved.take(1, (-41, -41, 0), Some(0), ms),
     Err(Early::BeforeEarliest),
     "left before it"
   );
@@ -2786,49 +2791,59 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   // Two: written once both hold a packet, the early one moving the other.
   let both = of(Family::Matroska, "matroska", &[video, audio]).expect("mirrored");
   assert!(!both.passthrough);
-  let held = both.take(0, (0, 0, 0), ms).expect("video");
+  let held = both.take(0, (0, 0, 0), Some(0), ms).expect("video");
   assert!(!held.written, "the audio may still come earlier");
-  let moved = held.take(1, (-30, -30, -21), ms).expect("before the write");
+  let moved = held
+    .take(1, (-30, -30, -21), Some(-21), ms)
+    .expect("before the write");
   assert!(moved.written);
   assert_eq!(moved.earliest, Some(Timestamp::new(-9, ms)));
-  assert!(moved.take(0, (-9, -9, 0), ms).is_ok());
-  assert_eq!(moved.take(0, (-10, -10, 0), ms), Err(Early::BeforeEarliest));
+  assert!(moved.take(0, (-9, -9, 0), Some(0), ms).is_ok());
+  assert_eq!(
+    moved.take(0, (-10, -10, 0), Some(0), ms),
+    Err(Early::BeforeEarliest)
+  );
 
   // Each stream's distance rounded up to its own tick.
   let mixed = of(Family::Other, "mpegts", &[video, audio]).expect("mirrored");
   let fine = mixed
-    .take(0, (-1, -1, 0), ninety)
-    .and_then(|shift| shift.take(1, (0, 0, 0), ms))
+    .take(0, (-1, -1, 0), Some(0), ninety)
+    .and_then(|shift| shift.take(1, (0, 0, 0), Some(0), ms))
     .expect("both held");
   assert!(fine.written);
   assert!(
-    fine.take(1, (-1, -1, 0), ms).is_ok(),
+    fine.take(1, (-1, -1, 0), Some(0), ms).is_ok(),
     "a tick of 90 kHz lifts a millisecond"
   );
-  assert_eq!(fine.take(1, (-2, -2, 0), ms), Err(Early::BeforeEarliest));
+  assert_eq!(
+    fine.take(1, (-2, -2, 0), Some(0), ms),
+    Err(Early::BeforeEarliest)
+  );
   let coarse = mixed
-    .take(1, (-1, -1, 0), ms)
-    .and_then(|shift| shift.take(0, (0, 0, 0), ninety))
+    .take(1, (-1, -1, 0), Some(0), ms)
+    .and_then(|shift| shift.take(0, (0, 0, 0), Some(0), ninety))
     .expect("both held");
   assert!(
-    coarse.take(0, (-90, -90, 0), ninety).is_ok(),
+    coarse.take(0, (-90, -90, 0), Some(0), ninety).is_ok(),
     "a millisecond is 90 ticks"
   );
   assert_eq!(
-    coarse.take(0, (-91, -91, 0), ninety),
+    coarse.take(0, (-91, -91, 0), Some(0), ninety),
     Err(Early::BeforeEarliest)
   );
 
   // The delay: written once the packets held span more than 10 s.
   let spanned = both
-    .take(0, (0, 0, 0), ms)
-    .and_then(|shift| shift.take(0, (10_000, 10_000, 0), ms))
+    .take(0, (0, 0, 0), Some(0), ms)
+    .and_then(|shift| shift.take(0, (10_000, 10_000, 0), Some(0), ms))
     .expect("video");
   assert!(!spanned.written, "10 s is not past the delay");
-  let late = spanned.take(0, (10_001, 10_001, 0), ms).expect("video");
+  let late = spanned
+    .take(0, (10_001, 10_001, 0), Some(0), ms)
+    .expect("video");
   assert!(late.written);
   assert_eq!(
-    late.take(1, (-22, -22, -21), ms),
+    late.take(1, (-22, -22, -21), Some(-21), ms),
     Err(Early::BeforeEarliest),
     "the audio's, after it"
   );
@@ -2840,15 +2855,15 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   )
   .expect("mirrored");
   let waiting = vp8
-    .take(1, (0, 0, -21), ms)
-    .and_then(|shift| shift.take(1, (20_000, 20_000, -21), ms))
+    .take(1, (0, 0, -21), Some(-21), ms)
+    .and_then(|shift| shift.take(1, (20_000, 20_000, -21), Some(-21), ms))
     .expect("audio");
   assert!(!waiting.written, "the interleaving waits on VP8");
   // ... and not by a subtitle's span.
   let cues = of(Family::Matroska, "matroska", &[video, audio, subtitle]).expect("mirrored");
   let waiting = cues
-    .take(0, (0, 0, 0), ms)
-    .and_then(|shift| shift.take(2, (20_000, 20_000, 0), ms))
+    .take(0, (0, 0, 0), Some(0), ms)
+    .and_then(|shift| shift.take(2, (20_000, 20_000, 0), Some(0), ms))
     .expect("video and a cue");
   assert!(!waiting.written, "a subtitle's span is left aside");
 
@@ -2856,8 +2871,8 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   let counted = of(Family::Other, "mpegts", &[video, audio, data]).expect("mirrored");
   assert!(!counted.passthrough);
   let written = counted
-    .take(0, (0, 0, 0), ms)
-    .and_then(|shift| shift.take(2, (0, 0, 0), ms))
+    .take(0, (0, 0, 0), Some(0), ms)
+    .and_then(|shift| shift.take(2, (0, 0, 0), Some(0), ms))
     .expect("video and data");
   assert!(written.written, "two hold a packet, as two are interleaved");
 
@@ -2867,28 +2882,31 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   for (muxer, refused) in [("flv", true), ("mpegts", false)] {
     let first = of(Family::Other, muxer, &[video, audio])
       .expect("mirrored")
-      .take(0, (5_000, 5_000, 0), ms)
-      .and_then(|shift| shift.take(0, (15_001, 15_001, 0), ms))
+      .take(0, (5_000, 5_000, 0), Some(0), ms)
+      .and_then(|shift| shift.take(0, (15_001, 15_001, 0), Some(0), ms))
       .expect("video, past the delay");
     assert!(first.written);
     assert_eq!(
-      first.take(1, (2_000, 2_000, 0), ms).err(),
+      first.take(1, (2_000, 2_000, 0), Some(0), ms).err(),
       refused.then_some(Early::BeforeFirst),
       "{muxer}"
     );
-    assert!(first.take(1, (5_000, 5_000, 0), ms).is_ok(), "{muxer}");
+    assert!(
+      first.take(1, (5_000, 5_000, 0), Some(0), ms).is_ok(),
+      "{muxer}"
+    );
   }
   let moved = of(Family::Other, "flv", &[video, audio])
     .expect("mirrored")
-    .take(0, (-100, -100, 0), ms)
-    .and_then(|shift| shift.take(0, (9_901, 9_901, 0), ms))
+    .take(0, (-100, -100, 0), Some(0), ms)
+    .and_then(|shift| shift.take(0, (9_901, 9_901, 0), Some(0), ms))
     .expect("video, past the delay");
   assert!(
-    moved.take(1, (-50, -50, 0), ms).is_ok(),
+    moved.take(1, (-50, -50, 0), Some(0), ms).is_ok(),
     "moved past zero, the first"
   );
   assert_eq!(
-    moved.take(1, (-150, -150, 0), ms),
+    moved.take(1, (-150, -150, 0), Some(0), ms),
     Err(Early::BeforeEarliest),
     "before zero, moved"
   );
@@ -3057,4 +3075,181 @@ fn a_dictionary_unpacks_as_libavformat_unpacks_it() {
   assert!(!dictionary_unpacks(b"title\0hello"), "unterminated");
   assert!(!dictionary_unpacks(b"\0hello\0"), "an empty key");
   assert!(!dictionary_unpacks(b"title\0"), "a key with no value");
+}
+
+/// **The ISO 639-1 block's tail is found as the C library's `bsearch`
+/// finds it** (R9: Fable R1; `avlanguage.c` 683–693, 748–755): libavformat's
+/// block of ISO 639-1 codes is out of order at its end, so that a binary
+/// search's answer there is its probes'. glibc's `bsearch` and macOS's —
+/// FreeBSD's — walked here over every code of the table and a few it holds
+/// not, agree, and the lookup follows them by name: every code each finds
+/// found at its entry, the ten neither finds not, `xh` and `yi` among the
+/// found — so that ASF keeps `xho` and `yid`, and not `chi`.
+#[test]
+fn the_iso_639_1_tail_is_found_as_the_c_librarys_bsearch_finds_it() {
+  use core::cmp::Ordering;
+  type Search = fn(&str, &[(&str, u16)]) -> Option<usize>;
+  fn glibc(key: &str, block: &[(&str, u16)]) -> Option<usize> {
+    let (mut low, mut high) = (0, block.len());
+    while low < high {
+      let middle = (low + high) / 2;
+      match key.cmp(block[middle].0) {
+        Ordering::Less => high = middle,
+        Ordering::Greater => low = middle + 1,
+        Ordering::Equal => return Some(middle),
+      }
+    }
+    None
+  }
+  fn bsd(key: &str, block: &[(&str, u16)]) -> Option<usize> {
+    let (mut base, mut limit) = (0, block.len());
+    while limit != 0 {
+      let probe = base + (limit >> 1);
+      match key.cmp(block[probe].0) {
+        Ordering::Equal => return Some(probe),
+        Ordering::Greater => {
+          base = probe + 1;
+          limit -= 1;
+        }
+        Ordering::Less => {}
+      }
+      limit >>= 1;
+    }
+    None
+  }
+  let found = |search: Search, tag: &str| {
+    LANGUAGE_SPACES.iter().find_map(|&(start, count)| {
+      search(tag, &LANGUAGES[start..start + count]).map(|at| start + at)
+    })
+  };
+  let mut unfound = Vec::new();
+  for &(code, _) in LANGUAGES.iter().chain(&[("zzz", 0), ("xx", 0), ("", 0)]) {
+    let by_glibc = found(glibc, code);
+    assert_eq!(
+      by_glibc,
+      found(bsd, code),
+      "{code}: the two libraries agree"
+    );
+    assert_eq!(language_entry(code), by_glibc, "{code}");
+    if by_glibc.is_none() && LANGUAGES.iter().any(|&(held, _)| held == code) {
+      unfound.push(code);
+    }
+  }
+  assert_eq!(unfound, ISO_639_1_UNFOUND, "the codes named, and no other");
+  assert!(LanguageRule::ThroughIso639_1.keeps("xho"));
+  assert!(LanguageRule::ThroughIso639_1.keeps("yid"));
+  assert!(!LanguageRule::ThroughIso639_1.keeps("chi"));
+  assert!(!LanguageRule::ThroughIso639_1.keeps("zul"));
+}
+
+/// **MPEG-TS's descriptors' codes, as its loops write them** (R9: Codex R8
+/// [high]; `mpegtsenc.c` 696–797): the ISO 639 descriptor's, each run of
+/// three bytes before a comma or three bytes left in all — a comma among
+/// them — any other run skipped, 63 at most; the DVB subtitle and teletext
+/// descriptors', three bytes and one skipped while three are left. A tag
+/// is kept where it reads back as its codes joined by commas.
+#[test]
+fn mpeg_ts_writes_a_languages_codes_as_its_loops_do() {
+  let iso = |tag: &str| mpeg_ts_iso639_codes(tag.as_bytes()).join(&b","[..]);
+  let dvb = |tag: &str| mpeg_ts_dvb_codes(tag.as_bytes()).join(&b","[..]);
+  assert_eq!(iso("eng,fra"), b"eng,fra");
+  assert_eq!(iso("english,fr,deu"), b"deu", "runs not of three skipped");
+  assert_eq!(iso("eng,"), b"eng");
+  assert_eq!(
+    iso("eng,a,b"),
+    b"eng,a,b",
+    "three bytes left, a comma among them"
+  );
+  let many = (0..64)
+    .map(|index: u8| {
+      format!(
+        "a{}{}",
+        char::from(b'a' + index / 26),
+        char::from(b'a' + index % 26)
+      )
+    })
+    .collect::<Vec<_>>()
+    .join(",");
+  assert_eq!(
+    mpeg_ts_iso639_codes(many.as_bytes()).len(),
+    63,
+    "255 / 4 codes"
+  );
+  assert_eq!(dvb("english"), b"eng,ish");
+  assert_eq!(dvb("eng,fra"), b"eng,fra");
+  assert_eq!(dvb("eng-fra"), b"eng,fra", "any byte skipped");
+  assert!(mpeg_ts_dvb_codes(b"en").is_empty());
+  assert!(LanguageRule::Iso639Codes.keeps("eng,fra"));
+  assert!(!LanguageRule::Iso639Codes.keeps("english"));
+  assert!(!LanguageRule::Iso639Codes.keeps(&many));
+  assert!(LanguageRule::DvbCodes.keeps("eng,fra"));
+  assert!(!LanguageRule::DvbCodes.keeps("eng-fra"));
+  assert!(!LanguageRule::DvbCodes.keeps("en"));
+}
+
+/// **AVI places an XSUB cue one packet on, however far on its time** (R9:
+/// Codex R8 [medium]; `avienc.c` 745–766, 407–408; `avidec.c` 686–699,
+/// 1548–1590): `write_skip_frames` fills no gap of an XSUB stream, and its
+/// reader counts its cues by packet in the main header's frame period — so
+/// that a cue 100 000 ticks after the first is placed one packet on, never
+/// refused, and reported where its time is not its count's; on the frames'
+/// road, a stream of no block alignment's, it would be refused past the
+/// 60 000 empty frames AVI fills (L84: AVI's tag tables name no XSUB, so
+/// that the open refuses it first).
+///
+/// PLANT: XSUB on the frames' road refuses its far cue.
+#[test]
+fn an_avi_xsub_cue_is_placed_one_packet_on_however_far() {
+  let place = |road: AviPlace| {
+    let mut state = eac3_track(0);
+    state.stream = Some((0, millis()));
+    state.rules = PacketRules {
+      avi: Some(road),
+      ..PacketRules::default()
+    };
+    let mut steps = Vec::new();
+    for at in [0, 100_000] {
+      let timed = timed_at(at);
+      let payload = Payload {
+        bytes: b"[00:00:00.000-00:00:01.000]",
+        key: true,
+        flags: PacketFlags::KEY,
+        side_data: &[],
+      };
+      let step = Step {
+        owns: true,
+        emits: Emits::OWN,
+        largest: Some(payload.bytes.len() as u64),
+        held: None,
+        inserted: None,
+      };
+      match check_packet_rules(
+        &state,
+        millis(),
+        Neighbours::default(),
+        (timed, &[timed], 0),
+        payload,
+        step,
+        Bounds::REAL,
+      ) {
+        Ok(learned) => {
+          let (next, moved) = learned.place.expect("a place");
+          state.place = next;
+          state.written = true;
+          steps.push(Ok(moved));
+        }
+        Err(refusal) => steps.push(Err(refusal)),
+      }
+    }
+    steps
+  };
+  assert_eq!(
+    place(AviPlace::Packets { reader: (1, 25) }),
+    [Ok(false), Ok(true)],
+    "the first at its place, the second one packet on, 40 ms, offered at 100 s"
+  );
+  assert!(matches!(
+    place(AviPlace::Frames)[1],
+    Err(FfmpegMuxRefusal::FrameGap { .. })
+  ));
 }

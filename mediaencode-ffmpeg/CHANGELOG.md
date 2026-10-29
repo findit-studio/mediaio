@@ -279,6 +279,29 @@ crate moves only when it changes.
   too). MP3: a table of more than 255 chapters, which its table of
   contents counts in 8 bits, refused (`MuxOpenError::ChapterCount`, new).
   `MuxOpenError::ChapterWithoutTitle`'s message is now any container's.
+  MPEG-TS writes a language as the codes its descriptors' loops write: an
+  audio stream's ISO 639 descriptor each run of three bytes between
+  commas, 63 at most — `eng,fra` read back whole, not reported, a 64th
+  code reported dropped — and the DVB subtitle and teletext descriptors
+  three bytes and one skipped; the PMT counted at each descriptor's exact
+  size, a table past its section refused (`StreamIds`) where FFmpeg
+  writes no PMT and answers success; a DVB subtitle or teletext language
+  past its descriptor's 8-bit length refused
+  (`MuxOpenError::LanguageTooLong`, new); a DVB subtitle's or teletext's
+  configuration of another size than its codes' entries refused
+  (`ConfigurationInvalid`), none refused (`ConfigurationMissing`), as each
+  reads back otherwise; a visually impaired audio stream's descriptions
+  and a DVB subtitle's hearing-impaired subtitling type reported added
+  (`Uncarried::DispositionAdded`). AVI's XSUB has its own road, no gap
+  filled and its place a packet on, though AVI's tag tables name no XSUB,
+  which the open refuses. ASF's languages follow the C library's search
+  over libavformat's ISO 639-1 block, out of order at its tail: `xho` and
+  `yid` kept, the ten codes the search finds not named. After
+  libavformat's first write, the MPEG program stream takes a time within
+  its preload before zero, which it writes whole, and F4V and AVIF a time
+  before zero, as MP4 takes negative times. The Nero list's untitled
+  chapter stays refused, as it reads back titled empty, and big-endian PCM
+  in the program stream, as it reads back as DVD PCM.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
