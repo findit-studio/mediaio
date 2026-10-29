@@ -42,7 +42,7 @@ const FORMAT_TEXT_MAX_BYTES: usize = 1024;
 /// inside that family a file is — an `.mp4` against an `.m4a` — is a
 /// question it did not answer and one nothing here can answer for it.
 /// A door that returned a single word would have had to pick, and a
-/// pick is the guess this whole seat exists to avoid.
+/// pick is the guess this whole design exists to avoid.
 ///
 /// # Crossing into a typed vocabulary
 ///

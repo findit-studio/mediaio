@@ -11,8 +11,8 @@
 //! n9.0 declares, in the struct's own order, and a field nobody
 //! compared is a field this file does not have. `avcodec_parameters_
 //! to_context` reads a different subset per medium — video takes the
-//! colour and geometry seats, audio takes the layout and padding
-//! seats, subtitle takes only width and height — and every one of the
+//! colour and geometry fields, audio takes the layout and padding
+//! fields, subtitle takes only width and height — and every one of the
 //! thirty-two is read on at least one of those branches, so nothing
 //! here is decorative.
 //!
@@ -27,10 +27,10 @@
 //! Plus one container the CLI cannot produce and this file therefore
 //! assembles byte by byte: a MOV whose video sample entry carries a
 //! `colr` atom of colour type `prof`, which libavformat turns into an
-//! `AV_PKT_DATA_ICC_PROFILE` entry of `coded_side_data`. That seat is
+//! `AV_PKT_DATA_ICC_PROFILE` entry of `coded_side_data`. That field is
 //! the one this crate's parameter budgets were written for, and
 //! minting it is what lets the sweep prove a *demuxer* populates it
-//! rather than only that an absent seat crosses. Nothing binary is
+//! rather than only that an absent field crosses. Nothing binary is
 //! committed: see [`mint_mp4_with_icc_profile`].
 //!
 //! Then the shapes no container will hand over at all — a custom
@@ -73,7 +73,7 @@ use mediadecode_ffmpeg::{
 /// Compares two `AVCodecParameters` field by field, returning one
 /// message per disagreement.
 ///
-/// Every enum seat is read as the raw `i32` it is on the wire rather
+/// Every enum field is read as the raw `i32` it is on the wire rather
 /// than through its bindgen enum — the same discipline the mirror
 /// itself is written to, and for the same reason: a comparator that
 /// materialised an unnamed discriminant would be undefined behaviour
@@ -248,7 +248,7 @@ unsafe fn compare(src: *const AVCodecParameters, dst: *const AVCodecParameters) 
   scalar!(width);
   scalar!(height);
 
-  // 16-24. the video seats
+  // 16-24. the video fields
   rational!(sample_aspect_ratio);
   rational!(framerate);
   raw_enum!(field_order);
@@ -330,7 +330,7 @@ unsafe fn compare(src: *const AVCodecParameters, dst: *const AVCodecParameters) 
     // means nothing — the same defect the mirror itself carried.
   }
 
-  // 26-32. the audio seats, and the alpha mode
+  // 26-32. the audio fields, and the alpha mode
   scalar!(sample_rate);
   scalar!(block_align);
   scalar!(frame_size);
@@ -380,7 +380,7 @@ fn assert_round_trip(original: &Parameters, what: &str) -> CodecTicket {
 /// [`mint_mp4_with_icc_profile`], written into the corpus directory so
 /// it lives and dies with the run. It is in this list because it is
 /// the only container in it that carries stream-level
-/// `coded_side_data`, and a sweep that never saw that seat populated
+/// `coded_side_data`, and a sweep that never saw that field populated
 /// would be a sweep that proved nothing about it.
 fn fixtures(corpus: &support::Corpus) -> Vec<(&'static str, std::path::PathBuf)> {
   let minted = corpus.dir().join("icc.mp4");
@@ -441,7 +441,7 @@ fn every_stream_of_every_fixture_rebuilds_into_itself() {
   assert!(streams >= 16, "only {streams} streams swept");
   // Not decoration: a corpus that happened to carry no extradata
   // would pass every assertion above while proving nothing about the
-  // seat this whole road is really about — the SPS/PPS a decoder
+  // field this whole road is really about — the SPS/PPS a decoder
   // cannot start without.
   assert!(
     with_extradata >= 4,
@@ -451,7 +451,7 @@ fn every_stream_of_every_fixture_rebuilds_into_itself() {
   // this build: no container the `ffmpeg` CLI can mint carries
   // stream-level side data — `-metadata:s:v rotate=` no longer writes
   // a display matrix, and MOV, MP4 and Matroska emit none of their
-  // own. So the sweep would have proved only that an *absent* seat
+  // own. So the sweep would have proved only that an *absent* field
   // crosses. `icc.mp4` is minted here for exactly that reason, and
   // this assertion is what keeps it in the list.
   assert!(
@@ -475,7 +475,7 @@ fn every_track_row_hands_back_the_parameters_the_file_declared() {
   for (name, path) in fixtures(&corpus) {
     // The row's own parameters, read straight from libavformat, are
     // the reference. The row is built from the same stream, so the two
-    // must agree seat for seat.
+    // must agree field for field.
     let input = ffmpeg_next::format::input(&path).expect("open for reference");
     let reference: Vec<Parameters> = input.streams().map(|s| s.parameters()).collect();
 
@@ -702,7 +702,7 @@ fn a_custom_channel_map_survives_the_round_trip() {
   assert_eq!(&layout.map()[2].name_bytes()[..3], b"FC\0");
   // The `mask` arm is a pointer under this order, so the mirror must
   // report nothing there rather than an address.
-  assert_eq!(layout.mask(), 0, "a pointer leaked into the mask seat");
+  assert_eq!(layout.mask(), 0, "a pointer leaked into the mask field");
 }
 
 /// **A custom order with no map is refused, not reproduced.**
@@ -762,7 +762,7 @@ fn a_custom_layout_without_a_map_is_refused() {
 
   // A *negative* count is the same refusal, and it did not used to be.
   //
-  // `mirror` measured the footprint before it read a single seat, and
+  // `mirror` measured the footprint before it read a single field, and
   // for a custom order that measurement is
   // `nb_channels * size_of::<AVChannelCustom>()` — a count that will
   // not convert to a `usize` is a footprint that cannot be computed, so
@@ -894,12 +894,12 @@ fn a_layout_carrying_user_private_data_is_refused() {
   let mut parameters = Parameters::new();
   let mut anything = 0u8;
   // SAFETY: `parameters` owns a live `AVCodecParameters`. `opaque` is
-  // a plain pointer seat FFmpeg never dereferences; it is restored to
+  // a plain pointer field FFmpeg never dereferences; it is restored to
   // null below so `avcodec_parameters_free` never sees the borrow.
   unsafe {
     let par = parameters.as_mut_ptr();
     // A mask means something only under an order that defines it —
-    // see the scalar-seat fixture's note.
+    // see the scalar-field fixture's note.
     core::ptr::write_unaligned(
       core::ptr::addr_of_mut!((*par).ch_layout.order).cast::<i32>(),
       AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32,
@@ -925,7 +925,7 @@ fn a_layout_carrying_user_private_data_is_refused() {
     (*parameters.as_mut_ptr()).ch_layout.opaque = core::ptr::null_mut();
   }
   // And with the pointer gone, the same layout mirrors cleanly — the
-  // refusal is about the seat, not about the layout.
+  // refusal is about the field, not about the layout.
   assert_round_trip(&parameters, "a mask layout");
 }
 
@@ -1012,10 +1012,10 @@ fn matrix_bytes() -> Vec<u8> {
 ///
 /// # Why this is minted rather than transcoded
 ///
-/// `coded_side_data` is the seat this crate's parameter budgets were
+/// `coded_side_data` is the field this crate's parameter budgets were
 /// *written for*: a MOV `prof` atom is where an attacker-sized ICC
 /// profile arrives, and finding it there is what killed the wholesale
-/// `avcodec_parameters_copy`. It is also the one seat no `ffmpeg` CLI
+/// `avcodec_parameters_copy`. It is also the one field no `ffmpeg` CLI
 /// invocation will produce — censused directly: `-metadata:s:v rotate=`
 /// no longer writes a display matrix, and MOV, MP4 and Matroska emit no
 /// stream-level side data of their own.
@@ -1023,11 +1023,11 @@ fn matrix_bytes() -> Vec<u8> {
 /// So the container is assembled here, byte by byte. Nothing binary is
 /// committed — the same law the generated corpus keeps, held one step
 /// further: this fixture needs no `ffmpeg` CLI either, so the lane that
-/// proves the seat runs everywhere.
+/// proves the field runs everywhere.
 ///
 /// The track carries no samples, and nothing here decodes. What is
-/// being proved is that a *demuxer* populated the seat and that the
-/// seat survived the round trip, which the header alone settles.
+/// being proved is that a *demuxer* populated the field and that the
+/// field survived the round trip, which the header alone settles.
 fn mint_mp4_with_icc_profile(icc: &[u8]) -> Vec<u8> {
   let be32 = |v: u32| v.to_be_bytes().to_vec();
   let be16 = |v: u16| v.to_be_bytes().to_vec();
@@ -1169,9 +1169,9 @@ fn icc_profile_bytes(len: usize) -> Vec<u8> {
   icc
 }
 
-/// **The `coded_side_data` seat, proved through a real demuxer.**
+/// **The `coded_side_data` field, proved through a real demuxer.**
 ///
-/// Every other assertion about that seat in this file is made over
+/// Every other assertion about that field in this file is made over
 /// parameters built by hand, which shows the mirror carries what it is
 /// handed and says nothing about whether a container ever hands it
 /// anything. This lane closes the other half: libavformat parses the
@@ -1186,7 +1186,7 @@ fn a_minted_container_carries_its_icc_profile_through_the_ticket() {
   let path = dir.path().join("icc.mp4");
   std::fs::write(&path, mint_mp4_with_icc_profile(&icc)).expect("write the minted container");
 
-  // First, that libavformat really did populate the seat. If this
+  // First, that libavformat really did populate the field. If this
   // fails the fixture is wrong rather than the mirror, so it is
   // asserted separately and says so.
   let input = ffmpeg_next::format::input(&path).expect("libavformat opens the minted container");
@@ -1217,7 +1217,7 @@ fn a_minted_container_carries_its_icc_profile_through_the_ticket() {
     icc.as_slice(),
     "the profile bytes differ"
   );
-  // The seat is charged, so a forged atom meets the same ceiling a real
+  // The field is charged, so a forged atom meets the same ceiling a real
   // profile does.
   assert!(
     ticket.footprint_bytes() >= icc.len(),
@@ -1268,20 +1268,20 @@ fn an_oversized_minted_profile_is_refused_at_open() {
   );
 }
 
-/// Every scalar seat, set to a value that is not its default, so a
+/// Every scalar field, set to a value that is not its default, so a
 /// field the rebuild forgot to write cannot hide behind
 /// `avcodec_parameters_alloc`'s own initialisation.
 ///
-/// This is the assertion that would have caught `alpha_mode` — a seat
+/// This is the assertion that would have caught `alpha_mode` — a field
 /// new in FFmpeg n9.0, absent from the mirror's first draft, and
 /// invisible to the corpus because every fixture leaves it at zero.
 #[test]
-fn every_scalar_seat_is_written_back() {
+fn every_scalar_field_is_written_back() {
   support::init_ffmpeg();
   let mut parameters = Parameters::new();
   // SAFETY: `parameters` owns a live `AVCodecParameters`; every write
   // below is a scalar store into a struct nothing else references.
-  // Enum seats are written as the raw patterns they are on the wire,
+  // Enum fields are written as the raw patterns they are on the wire,
   // and the values are chosen inside each enum's real range so the
   // struct stays one libavcodec would accept.
   unsafe {
@@ -1333,7 +1333,7 @@ fn every_scalar_seat_is_written_back() {
     (*par).seek_preroll = 30;
   }
 
-  let ticket = assert_round_trip(&parameters, "every scalar seat");
+  let ticket = assert_round_trip(&parameters, "every scalar field");
 
   // And the ticket reports what it mirrored, not a default: the
   // accessors are the consumer's road and a wrong one is as bad as a
@@ -1374,7 +1374,7 @@ fn every_scalar_seat_is_written_back() {
   assert_eq!(ticket.initial_padding(), 1_024);
   assert_eq!(ticket.trailing_padding(), 512);
   assert_eq!(ticket.seek_preroll(), 30);
-  // `AVMEDIA_TYPE_VIDEO` is zero, so this seat is the one place a
+  // `AVMEDIA_TYPE_VIDEO` is zero, so this field is the one place a
   // "wrote nothing" bug and a correct mirror agree — which is why the
   // round trip above, not this line, is the assertion that matters.
   assert_eq!(ticket.codec_type(), 0);

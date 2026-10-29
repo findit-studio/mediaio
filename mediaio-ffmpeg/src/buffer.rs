@@ -49,20 +49,20 @@
 //! exception: a plane path with no ceiling, an attachment whose
 //! payload was copied by `avcodec_parameters_copy` before its budget
 //! was charged, a resampler amplifying a small input into a huge
-//! output, and then `coded_side_data` — a third heap seat on the same
+//! output, and then `coded_side_data` — a third heap field on the same
 //! wholesale parameter copy, where a MOV `prof` atom puts an ICC
 //! profile. None of them were exceptions. They were rows nobody had
 //! written down.
 //!
 //! The third one is why the table below has a section it did not need
 //! at first. `FfmpegBytes` is not the only place this crate copies
-//! attacker-sized bytes: `AVCodecParameters` has heap seats of its own,
+//! attacker-sized bytes: `AVCodecParameters` has heap fields of its own,
 //! and the wholesale FFI copy that used to duplicate them took every
 //! one — including any this crate had never enumerated. That copy is
 //! gone; see
 //! [`bounded_clone_parameters`](crate::extras::bounded_clone_parameters),
 //! and [`CodecTicket`](crate::CodecTicket), which took the track row's
-//! copy one step further: those three seats are now owned Rust, and
+//! copy one step further: those three fields are now owned Rust, and
 //! `extradata` lands in an `FfmpegBytes` like every other file-sized
 //! buffer here.
 //!
@@ -85,27 +85,27 @@
 //! # The other heap this crate copies
 //!
 //! `AVCodecParameters` is the same class of exposure — three heap
-//! seats, all sized by the file — so its rows belong in the same
-//! accounting. Since the track row went owned, one of those seats
+//! fields, all sized by the file — so its rows belong in the same
+//! accounting. Since the track row went owned, one of those fields
 //! *is* an [`FfmpegBytes`]: [`CodecTicket`](crate::CodecTicket) holds
 //! `extradata` in one, and each `coded_side_data` payload in another.
 //!
 //! | construction site | what it carries | what bounds it |
 //! |---|---|---|
 //! | [`CodecTicket::mirror`](crate::CodecTicket::mirror), `extradata` | SPS/PPS and codec headers, into an [`FfmpegBytes`] | [`DemuxLimits::max_codec_parameter_bytes`](crate::DemuxLimits::max_codec_parameter_bytes), measured by `measure_parameters` before a byte is read |
-//! | …, `coded_side_data` | the descriptor array and each entry's payload — a MOV `prof` atom's ICC profile among them — into owned entries | the same seat, counting the array as well as the payloads |
-//! | …, `ch_layout` custom map | a channel map, into owned entries | the same seat |
-//! | [`CodecTicket::rebuild`](crate::CodecTicket::rebuild) | the same three seats, back into a fresh `AVCodecParameters` for a decoder to open from | nothing further, and nothing further is needed: it allocates exactly [`CodecTicket::footprint_bytes`](crate::CodecTicket::footprint_bytes), which is the number the mirror already admitted — no file-controlled input reaches it |
-//! | [`bounded_clone_parameters`](crate::extras::bounded_clone_parameters) | the same three seats, `AVCodecParameters` to `AVCodecParameters` | the same measurement. Off the demux road since the track row went owned; it is the decoder's own re-clone (`decoder::try_clone_parameters`), bounded by [`DecoderLimits::max_codec_parameter_bytes`](crate::DecoderLimits::max_codec_parameter_bytes) |
+//! | …, `coded_side_data` | the descriptor array and each entry's payload — a MOV `prof` atom's ICC profile among them — into owned entries | the same limit, counting the array as well as the payloads |
+//! | …, `ch_layout` custom map | a channel map, into owned entries | the same limit |
+//! | [`CodecTicket::rebuild`](crate::CodecTicket::rebuild) | the same three fields, back into a fresh `AVCodecParameters` for a decoder to open from | nothing further, and nothing further is needed: it allocates exactly [`CodecTicket::footprint_bytes`](crate::CodecTicket::footprint_bytes), which is the number the mirror already admitted — no file-controlled input reaches it |
+//! | [`bounded_clone_parameters`](crate::extras::bounded_clone_parameters) | the same three fields, `AVCodecParameters` to `AVCodecParameters` | the same measurement. Off the demux road since the track row went owned; it is the decoder's own re-clone (`decoder::try_clone_parameters`), bounded by [`DecoderLimits::max_codec_parameter_bytes`](crate::DecoderLimits::max_codec_parameter_bytes) |
 //! | `demuxer::admit_streams` | nothing — it only measures | runs over **every** stream before the track loop mirrors anything, and charges the whole-file [`max_total_codec_parameter_bytes`](crate::DemuxLimits::max_total_codec_parameter_bytes) |
-//! | `decoder::build_codec_context` → `avcodec_parameters_to_context` | the same three seats, copied *into* an `AVCodecContext` | **the choke point**: measured and admitted against [`DecoderLimits::max_codec_parameter_bytes`](crate::DecoderLimits::max_codec_parameter_bytes) right there. Every decoder in this crate opens through this function — the four session `open`s, the HW probe's `build_state`, its per-backend advances, the software fallback — and none of them reaches `avcodec_parameters_to_context` any other way |
+//! | `decoder::build_codec_context` → `avcodec_parameters_to_context` | the same three fields, copied *into* an `AVCodecContext` | **the choke point**: measured and admitted against [`DecoderLimits::max_codec_parameter_bytes`](crate::DecoderLimits::max_codec_parameter_bytes) right there. Every decoder in this crate opens through this function — the four session `open`s, the HW probe's `build_state`, its per-backend advances, the software fallback — and none of them reaches `avcodec_parameters_to_context` any other way |
 //! | `image::FfmpegImageDecoder::decode` → `boundary::try_packet_copy` | the caller's compressed bytes, duplicated into an `AVPacket` | [`DecoderLimits::max_image_input_bytes`](crate::DecoderLimits::max_image_input_bytes), defaulting to the attachment family so the direct road is no more permissive than the demuxed one |
-//! | `boundary::ffmpeg_packet_from_{video,audio,subtitle}_packet` → `try_packet_copy` | the caller's compressed bytes, duplicated into an `AVPacket` — **the send leg** | [`DecoderLimits::max_packet_bytes`](crate::DecoderLimits::max_packet_bytes), judged before the allocation. The same seat the receive leg (`payload_of`) judges, so a byte count refused coming out of a container is refused going into a decoder |
-//! | still `pal8` palette plane | a fixed `AVPALETTE_SIZE` run | the **format**, not a seat: 256 × `AV_PIX_FMT_RGB32`, always, with no number a file gets to choose |
+//! | `boundary::ffmpeg_packet_from_{video,audio,subtitle}_packet` → `try_packet_copy` | the caller's compressed bytes, duplicated into an `AVPacket` — **the send leg** | [`DecoderLimits::max_packet_bytes`](crate::DecoderLimits::max_packet_bytes), judged before the allocation. The same limit the receive leg (`payload_of`) judges, so a byte count refused coming out of a container is refused going into a decoder |
+//! | still `pal8` palette plane | a fixed `AVPALETTE_SIZE` run | the **format**, not a limit: 256 × `AV_PIX_FMT_RGB32`, always, with no number a file gets to choose |
 //!
 //! # The rule
 //!
-//! **A carrier whose size comes from a file is bounded by a seat in
+//! **A carrier whose size comes from a file is bounded by a limit in
 //! [`crate::limits`]; a carrier whose size is a property of a format is
 //! bounded by that format.** There is no third kind, and a site that
 //! looks like one has not been thought about yet.
@@ -116,17 +116,17 @@
 //! enumerated, which is a budget bypass that arrives with the next
 //! FFmpeg release rather than with the next commit.
 //!
-//! # The substrate's knobs, and where this crate stops
+//! # The substrate's options, and where this crate stops
 //!
 //! Everything above is **tier one** of the [resource governance
 //! contract][gov]: allocations this crate makes itself, each bounded by
-//! a named seat or by a format. This table is that tier's proof.
+//! a named limit or by a format. This table is that tier's proof.
 //!
-//! Tier two is the other half — FFmpeg's own resource knobs, set at
+//! Tier two is the other half — FFmpeg's own resource options, set at
 //! every point libavcodec and libavformat offer one. They bound
 //! allocations this crate does not make and could not otherwise see:
 //!
-//! | knob | where it is set | what it bounds |
+//! | option | where it is set | what it bounds |
 //! |---|---|---|
 //! | `AVCodecContext.max_pixels` | every opened decoder | the caller's pixel limit, **verbatim**, applied by `ff_set_dimensions` to the raw dimensions. Extent, not cost: what a frame *costs* is the byte judge's question, two rows down |
 //! | the `get_format` coded-dims ask | the hardware road | the **pool's own declared extent**, asked of `avcodec_get_hw_frames_parameters` before the pool is initialised — `max_pixels` is applied to the *display* dims, which a cropped stream can make 2000x smaller |
@@ -137,14 +137,14 @@
 //! | `max_streams` | both demux entrypoints | the `AVStream` array a header can conjure |
 //! | the `AVIOContext` byte meter | the **reader** demux entrypoint | total bytes libavformat is handed, hard — past the budget the reader stops answering |
 //!
-//! Two of those knobs used to carry *translated* byte ceilings —
+//! Two of those options used to carry *translated* byte ceilings —
 //! `max_pixels` as `min(the caller's limit, bytes / 16)` and
 //! `max_samples` as `bytes / 8` — so that the byte budget could bite
 //! before libavcodec allocated. Both translations charged every stream
 //! the worst format in existence, and both over-refused ordinary media:
 //! a 1920x1080 `yuv420p` frame under a 4 MiB budget, a 6-channel `s16`
 //! frame under 64 KiB. They are gone. The byte budget is enforced by
-//! the `get_buffer2` judge, which is *itself* a pre-allocation seat —
+//! the `get_buffer2` judge, which is *itself* a pre-allocation check —
 //! `get_buffer2` **is** the allocation — and prices the frame's real
 //! format at its real dimensions. An exact judge at the allocation
 //! beats an approximate one before it.
@@ -161,17 +161,17 @@
 //! built to bound; together they cover every interposition point FFmpeg
 //! exposes, which is not the same as covering FFmpeg.
 //!
-//! ## What the demux seats cannot reach, and why they exist anyway
+//! ## What the demux limits cannot reach, and why they exist anyway
 //!
 //! `avformat_open_input` and `avformat_find_stream_info` build the
 //! attached picture, the extradata and the coded side data out of the
-//! file themselves. The attachment and parameter seats in the table
+//! file themselves. The attachment and parameter limits in the table
 //! above therefore measure this crate's *copies* of buffers libavformat
 //! has already allocated — too late, by construction, to have prevented
 //! the original.
 //!
 //! A parser cannot allocate from bytes it was never handed, so the
-//! input is bounded instead: that is what the probe knobs and the byte
+//! input is bounded instead: that is what the probe options and the byte
 //! meter are for. What is **not** bounded is allocation *amplification*
 //! inside a parser — a container can describe, in a handful of bytes, a
 //! structure whose in-memory form is far larger, and nothing outside
@@ -182,18 +182,18 @@
 //!
 //! The hard meter also does not reach the **path** entrypoint: it needs
 //! an `AVIOContext` this crate owns, and a path is opened by
-//! libavformat's own protocol layer. The probe knobs still apply there;
+//! libavformat's own protocol layer. The probe options still apply there;
 //! a caller who wants the meter on a file opens it as a reader.
 //!
 //! That gap is **tier three**, and it is named rather than hedged: see
 //! the [contract][gov] for the boundary and for the OS-level instrument
 //! a deployment needing a hard memory bound puts underneath all of
-//! this. This crate is not a hypervisor for FFmpeg, and its seats
+//! this. This crate is not a hypervisor for FFmpeg, and its limits
 //! compose with that instrument rather than replacing it.
 //!
 //! [gov]: mediaspine::adapter#the-resource-governance-contract
 //!
-//! And the capstone, which is what every seat in this table is finally
+//! And the capstone, which is what every limit in this table is finally
 //! for: **a judge must dominate the allocator's arithmetic, not the
 //! payload's.** A budget compared against what the bytes weigh is not a
 //! budget on what will be spent — see [`crate::footprint`] for the
@@ -211,7 +211,7 @@
 //!
 //! And the corollary the seventh bought, about the *inputs* to every
 //! guard above rather than the guards themselves: **a number a file
-//! chooses is judged or refused, never clipped.** A seat that bounds a
+//! chooses is judged or refused, never clipped.** A limit that bounds a
 //! byte product still trusts the fields the product is computed from,
 //! so a clamped sample count or channel count does not trip any budget
 //! — it produces a smaller, plausible frame that no ceiling has any
@@ -303,7 +303,7 @@ enum Inner {
   /// intermediate `Vec` and no second copy.
   ///
   /// An inline-capable carrier — `smol_bytes::Bytes`, which the text
-  /// seats use — was rejected rather than overlooked: inline storage
+  /// fields use — was rejected rather than overlooked: inline storage
   /// makes `Clone` copy small payloads, and [`FfmpegBytes::ptr_eq`],
   /// the amputation contract's own instrument, asks whether a clone
   /// was a refcount bump. A carrier that sometimes copies cannot
@@ -406,7 +406,7 @@ impl FfmpegBytes {
   /// near side of a conversion. `swr` consumes its input as it runs, so
   /// an allocation that fails afterwards leaves a caller with nothing
   /// to retry and samples that are simply gone — which is what the
-  /// owned lane did until this seat existed.
+  /// owned lane did until this reservation existed.
   ///
   /// The bytes are zeroed rather than left uninitialised: a carrier
   /// built from a partly-written reservation must still be a `[u8]` a

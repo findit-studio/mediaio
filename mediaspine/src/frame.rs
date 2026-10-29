@@ -18,7 +18,7 @@
 //! not on the timeline, which is the same fact
 //! [`AttachmentPacket`](crate::demuxer::AttachmentPacket) states one
 //! tier down on the packet side. A household that has no timestamps
-//! has no seats for them either — an `Option<Timestamp>` that is
+//! has no fields for them either — an `Option<Timestamp>` that is
 //! always `None` is a field that invites a caller to look.
 //!
 //! # `Clone` on a frame is a refcount bump
@@ -663,7 +663,7 @@ impl<E, D> SubtitleFrame<E, D> {
 /// The fourth household, and the only one with no timestamps. Cover
 /// art, an embedded thumbnail, a poster frame: one picture, present
 /// for the whole file or not at all. Giving it `pts` / `duration`
-/// seats that are always `None` would invite a caller to read them and
+/// fields that are always `None` would invite a caller to read them and
 /// a backend to invent them, which is why they are absent rather than
 /// empty.
 ///

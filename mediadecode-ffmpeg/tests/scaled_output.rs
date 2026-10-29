@@ -230,10 +230,10 @@ fn a_mid_stream_request_takes_effect_from_the_next_frame() {
   assert_eq!(after, (320, 180), "the very next frame carries the request");
 }
 
-/// The two refusals this seat mints itself, on the road that could
+/// The two refusals this decoder mints itself, on the road that could
 /// otherwise have honored them: a zero extent and an upscale. Neither
 /// is an error — and each returns the session to full coded size, which
-/// is what the trait says an `Unsupported` answer from this seat means
+/// is what the trait says an `Unsupported` answer from this decoder means
 /// and the only reading a caller can act on without risking a second
 /// resample of an already-fitted picture.
 #[test]
@@ -275,7 +275,7 @@ fn zero_and_upscale_requests_are_refused_and_return_the_session_to_full_size() {
 
   // **And a refusal after an acceptance returns the session to full
   // size**, which is what the trait says an `Unsupported` answer from
-  // this seat means. A caller acting on it resamples for itself, so a
+  // this decoder means. A caller acting on it resamples for itself, so a
   // session that went on fitting to the older request would have it
   // resample an already-fitted picture — irreversibly.
   assert_eq!(

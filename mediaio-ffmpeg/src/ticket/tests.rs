@@ -2,7 +2,7 @@ use super::*;
 
 use crate::extras::TrackExtra;
 
-/// Builds an `AVCodecParameters` with the heap seats a file controls.
+/// Builds an `AVCodecParameters` with the heap fields a file controls.
 ///
 /// The same discipline the bounded clone's own fixture uses: a shape
 /// the `ffmpeg` CLI cannot mint is built here, by hand, beside the
@@ -94,7 +94,7 @@ fn parameters_with_custom_layout(channels: usize) -> Parameters {
 
 /// [`parameters_with_custom_layout`], with the **last** entry's
 /// sixteen-byte name filled edge to edge so it carries no NUL, and an
-/// `extradata` seat of `extradata` bytes beside it.
+/// `extradata` field of `extradata` bytes beside it.
 ///
 /// The last entry rather than the first on purpose: a validation that
 /// walks only far enough to feel thorough passes this, and a
@@ -201,7 +201,7 @@ fn an_unspecified_layout_mirrors_without_reading_its_union() {
   assert_eq!(mask, 0, "and the union is left as the allocator zeroed it");
 
   // A native layout still round-trips its mask, so the assertions above
-  // are about the order rather than about the mask seat having gone
+  // are about the order rather than about the mask field having gone
   // quiet.
   let native =
     CodecTicket::mirror(&parameters_with_native_layout(), 2, usize::MAX).expect("mirror");
@@ -259,7 +259,7 @@ fn a_custom_name_without_a_terminator_is_refused_at_the_mirror() {
 /// The ordering is invisible to a test that only checks *which* error
 /// comes back for a file with one fault — both orderings refuse. So
 /// this file has **two** faults at once: a malformed channel map and an
-/// `extradata` seat far over the budget. Whichever check runs first
+/// `extradata` field far over the budget. Whichever check runs first
 /// names the error, and that makes the assertion a statement about
 /// order rather than about outcome.
 ///
@@ -304,7 +304,7 @@ fn a_malformed_layout_is_refused_before_the_footprint_is_measured() {
 ///
 /// The partially-built `Parameters` is dropped inside each `rebuild`
 /// that fails — `out` is a local, and the error return drops it — so
-/// the destructor walk over a struct whose seats are half-attached
+/// the destructor walk over a struct whose fields are half-attached
 /// executes here too. That is the other half of what these branches
 /// promise: not merely that they report, but that what they report
 /// over can be freed.
@@ -316,7 +316,7 @@ fn every_rebuild_allocation_that_fails_is_named() {
       const HUGE: usize = 8 * 1024 * 1024;
 
       // Each case: what the ticket holds, the cap that admits the
-      // struct itself but refuses the seat, and the seat's name.
+      // struct itself but refuses the field, and the field's name.
       let extradata =
         CodecTicket::mirror(&parameters_with(HUGE, 0), 2, usize::MAX).expect("an uncapped mirror");
       let payload =
@@ -328,7 +328,7 @@ fn every_rebuild_allocation_that_fails_is_named() {
       let layout = CodecTicket::mirror(&parameters_with_custom_layout(64), 5, usize::MAX)
         .expect("an uncapped mirror");
 
-      for (ticket, cap, seat, index) in [
+      for (ticket, cap, field, index) in [
         (&extradata, 64 * 1024, "extradata", 2usize),
         (&payload, 64 * 1024, "a side-data payload", 3),
         (&array, 1024, "the side-data descriptor array", 4),
@@ -344,10 +344,10 @@ fn every_rebuild_allocation_that_fails_is_named() {
           Err(ParametersError::Copy(ref p)) => assert_eq!(
             p.stream_index(),
             index,
-            "{seat}: the refusal named the wrong stream",
+            "{field}: the refusal named the wrong stream",
           ),
-          Err(other) => panic!("{seat}: expected ParametersCopy, got {other:?}"),
-          Ok(()) => panic!("{seat}: an allocation that could not happen was reported as success"),
+          Err(other) => panic!("{field}: expected ParametersCopy, got {other:?}"),
+          Ok(()) => panic!("{field}: an allocation that could not happen was reported as success"),
         }
 
         // And the same rebuild succeeds once the allocator does, so
@@ -357,7 +357,7 @@ fn every_rebuild_allocation_that_fails_is_named() {
         let measured = unsafe { measure_parameters(rebuilt.as_ptr()) }
           .and_then(|f| f.total())
           .expect("measurable");
-        assert_eq!(measured, ticket.footprint_bytes(), "{seat}");
+        assert_eq!(measured, ticket.footprint_bytes(), "{field}");
       }
     },
   );
@@ -534,13 +534,13 @@ fn the_debug_prints_sizes_rather_than_payloads() {
 /// `AVDOVIDecoderConfigurationRecord` (`dv_version_major,
 /// dv_version_minor, dv_profile, dv_level, rpu_present_flag,
 /// el_present_flag, bl_present_flag, dv_bl_signal_compatibility_id,
-/// dv_md_compression` — nine one-byte seats, per
+/// dv_md_compression` — nine one-byte fields, per
 /// `libavutil/dovi_meta.h`).
 ///
 /// No `ffmpeg` CLI recipe mints a `dvcC`/`dvvC` box (real Dolby Vision
 /// encoding needs Dolby's own tools, which this workspace does not
 /// carry), so — the same road [`parameters_with`]'s ICC-profile arm and
-/// `codec_ticket_parity.rs`'s minted MOV both take for a seat no
+/// `codec_ticket_parity.rs`'s minted MOV both take for a field no
 /// container the CLI can produce — the side-data entry is built by
 /// hand, at the `AVCodecParameters` boundary [`CodecTicket::mirror`]
 /// actually reads.
@@ -624,7 +624,7 @@ fn dolby_vision_config_refuses_a_short_payload() {
   let ticket = CodecTicket::mirror(&truncated, 11, usize::MAX).expect("mirror");
   assert!(
     ticket.dolby_vision_config().is_none(),
-    "a 6-byte payload has no compatibility_id seat (offset 7)"
+    "a 6-byte payload has no compatibility_id field (offset 7)"
   );
   // The un-truncated sibling parses, so the refusal above is about the
   // length and not some other mistake in the fixture.

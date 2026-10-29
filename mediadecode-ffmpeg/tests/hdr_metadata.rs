@@ -34,7 +34,7 @@ use mediadecode_ffmpeg::{
 /// # Panics
 /// If the file has no video stream, opening fails, or no frame comes
 /// back within the first 64 packets — any of which means the fixture
-/// itself is broken, not that the seat under test refused correctly.
+/// itself is broken, not that the field under test refused correctly.
 fn first_video_frame(path: &std::path::Path) -> OwnedVideoFrame {
   let mut input = ffmpeg_next::format::input(path).expect("open the minted clip");
   let stream = input
@@ -79,7 +79,7 @@ fn first_video_frame(path: &std::path::Path) -> OwnedVideoFrame {
   panic!("the input ended before a frame was produced");
 }
 
-/// PQ transfer, BT.2020 primaries, and both static HDR seats populated
+/// PQ transfer, BT.2020 primaries, and both static HDR fields populated
 /// with the exact numbers `libx265` was asked to write — the same
 /// numbers `convert::tests::parse_mastering_display_reads_a_real_
 /// hdr10_payload` pins as a unit fixture, now reached through an
@@ -115,7 +115,7 @@ fn hdr10_hevc_decodes_pq_bt2020_and_static_hdr_metadata() {
 }
 
 /// A real, different transfer characteristic (HLG, not PQ) with no
-/// static HDR side data at all — both HDR10-only seats read `None`,
+/// static HDR side data at all — both HDR10-only fields read `None`,
 /// not a leftover default from some other clip.
 #[test]
 fn hlg_hevc_decodes_hlg_transfer_with_absent_static_hdr_metadata() {

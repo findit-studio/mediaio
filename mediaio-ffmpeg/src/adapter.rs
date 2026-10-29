@@ -8,7 +8,7 @@
 //! Decoder) reads cleanly: `VideoPacket<Ffmpeg, FfmpegBytes>` etc.
 //!
 //! `DemuxAdapter` bundles the other three, and `Ffmpeg` fills all four
-//! seats with itself — the demux tier's `CodecId` bound (one
+//! slots with itself — the demux tier's `CodecId` bound (one
 //! codec-identifier namespace across a container's whole track table) is
 //! trivially satisfied when every family already binds
 //! [`crate::CodecId`].
@@ -64,7 +64,7 @@ impl ImageAdapter for Ffmpeg {
   type CodecId = CodecId;
   type PixelFormat = PixelFormat;
   // The packet an image decoder is fed is the attachment packet the
-  // demuxer hands out — one type, both seats, so a cover-art payload
+  // demuxer hands out — one type, both slots, so a cover-art payload
   // goes straight from `next_packet` into `decode` with nothing to
   // convert in between.
   type PacketExtra = AttachmentPacketExtra;
@@ -104,7 +104,7 @@ impl DemuxAdapter for Ffmpeg {
   // `demuxer::lossy_text` for the one residue that remains and why it
   // is not attacker-scaled.
   //
-  // It is also the carrier every text seat in this household is
+  // It is also the carrier every text slot in this household is
   // supposed to be on.
   type Text = Utf8Bytes;
 }

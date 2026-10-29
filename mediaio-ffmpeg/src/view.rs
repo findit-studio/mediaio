@@ -23,7 +23,7 @@
 //!   pointers own what they name.
 //! * **Budgets judge sizes, not copies.** A view costs no bytes, but a
 //!   ceiling on frame and packet size is a ceiling on what a caller
-//!   will be handed and asked to hold — so every seat that fires on
+//!   will be handed and asked to hold — so every limit that fires on
 //!   the owned lane fires identically here.
 //! * **Every constructor that takes an extent is crate-private**, and
 //!   the one that takes row geometry checks it rather than asserting

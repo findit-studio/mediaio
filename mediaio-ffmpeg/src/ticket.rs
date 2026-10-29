@@ -13,9 +13,9 @@
 //! The crate already answers that class one way: it mirrors what a
 //! consumer needs into owned Rust —
 //! [`TrackParams`](mediaspine::demuxer::TrackParams) mirrors the
-//! common seats, [`SideDataEntry`] mirrors a frame's metadata,
+//! common fields, [`SideDataEntry`] mirrors a frame's metadata,
 //! [`FfmpegBytes`] mirrors its pixels. [`CodecTicket`] walks that road
-//! its last mile: **every** seat of an `AVCodecParameters`, held as
+//! its last mile: **every** field of an `AVCodecParameters`, held as
 //! owned bytes and plain integers, with `Sync` arriving by
 //! construction rather than by an `unsafe impl` over FFI.
 //!
@@ -24,7 +24,7 @@
 //! * [`CodecTicket::mirror`] reads a live `AVCodecParameters` into the
 //!   ticket. It is the only place that reads one.
 //! * [`CodecTicket::rebuild`] allocates a fresh `AVCodecParameters` and
-//!   writes every seat back. It is the only place in this crate's
+//!   writes every field back. It is the only place in this crate's
 //!   track-row road that allocates one, and what it hands back is what
 //!   `avcodec_parameters_to_context` is fed — unchanged from before the
 //!   mirror existed.
@@ -43,8 +43,8 @@
 //! # The reading discipline, inherited
 //!
 //! Not one bindgen enum is materialised out of FFmpeg memory. Every
-//! open C enum seat — the media type, the codec id, the field order,
-//! the five colour seats, the alpha mode, the channel order, a custom
+//! open C enum field — the media type, the codec id, the field order,
+//! the five colour fields, the alpha mode, the channel order, a custom
 //! channel's id, a side-data type id — travels as **the raw 32-bit
 //! pattern it is on the wire**, read and written through the same
 //! `i32` cast, so a value this build's bindings cannot name is still a
@@ -76,10 +76,10 @@ use crate::{
   extras::{ExtradataPolicy, SideDataEntry, measure_parameters},
 };
 
-/// A verbatim `AVRational` seat.
+/// A verbatim `AVRational` field.
 ///
 /// Its own type rather than a [`mediatime::Timebase`] because the two
-/// seats it carries — `sample_aspect_ratio` and `framerate` — are not
+/// fields it carries — `sample_aspect_ratio` and `framerate` — are not
 /// timebases and are not always valid ratios: FFmpeg spells "unknown"
 /// as a zero numerator (`sample_aspect_ratio`) or as `0/1`
 /// (`framerate`), and a mirror that normalised either would fail its
@@ -109,7 +109,7 @@ impl Ratio {
   }
 }
 
-/// The Dolby Vision decoder configuration record's two routing seats —
+/// The Dolby Vision decoder configuration record's two routing fields —
 /// the profile number and the base-layer signal-compatibility id —
 /// read from the container's `dvcC`/`dvvC`/`dwvC` box when present.
 ///
@@ -159,7 +159,7 @@ const DOVI_CONFIG_PROFILE_OFFSET: usize = 2;
 /// profile (1) + level (1) + three one-byte presence flags (3).
 const DOVI_CONFIG_COMPATIBILITY_ID_OFFSET: usize = 7;
 /// Minimum payload length [`parse_dolby_vision_config`] needs — enough
-/// to read the compatibility id, the later of the two seats. The full
+/// to read the compatibility id, the later of the two fields. The full
 /// struct FFmpeg n9.0 allocates is nine bytes (a ninth,
 /// `dv_md_compression`, follows); this function reads neither that
 /// byte nor relies on the struct's total size, which its own header
@@ -170,7 +170,7 @@ const DOVI_CONFIG_MIN_BYTES: usize = DOVI_CONFIG_COMPATIBILITY_ID_OFFSET + 1;
 /// FFmpeg's `AVDOVIDecoderConfigurationRecord` (`dv_version_major,
 /// dv_version_minor, dv_profile, dv_level, rpu_present_flag,
 /// el_present_flag, bl_present_flag, dv_bl_signal_compatibility_id,
-/// [dv_md_compression]`, every seat one byte) — into the two routing
+/// [dv_md_compression]`, every field one byte) — into the two routing
 /// numbers. `None` when the payload is shorter than
 /// [`DOVI_CONFIG_MIN_BYTES`] — a version-skew or corrupt entry.
 fn parse_dolby_vision_config(bytes: &[u8]) -> Option<DolbyVisionConfig> {
@@ -267,7 +267,7 @@ impl ChannelLayoutTicket {
   // that answers it now.
 }
 
-/// Every seat of one stream's `AVCodecParameters`, owned.
+/// Every field of one stream's `AVCodecParameters`, owned.
 ///
 /// # The roster
 ///
@@ -275,16 +275,16 @@ impl ChannelLayoutTicket {
 /// order. Nothing is elided as "video only" or "audio only":
 /// `avcodec_parameters_to_context` reads a different subset per medium
 /// but the *file* carries whatever it carries, and a mirror that kept
-/// only one medium's subset would lose a seat the moment a container
+/// only one medium's subset would lose a field the moment a container
 /// declared something unusual.
 ///
-/// They land in three kinds. Three seats own heap and become owned
+/// They land in three kinds. Three fields own heap and become owned
 /// Rust: `extradata`, `coded_side_data`, and `ch_layout`'s custom map.
 /// Two are lengths of those — `extradata_size` and
 /// `nb_coded_side_data` — and are **not stored**: a carrier already
 /// knows its own length, and a second copy of it is a second thing to
 /// keep in agreement. The remaining twenty-seven are scalars, held as
-/// the integers (or, for the two `AVRational` seats, the [`Ratio`])
+/// the integers (or, for the two `AVRational` fields, the [`Ratio`])
 /// they are.
 ///
 /// # `Send + Sync`, by construction
@@ -355,7 +355,7 @@ pub struct CodecTicket {
 impl CodecTicket {
   /// Mirrors a live set of codec parameters into an owned ticket.
   ///
-  /// `budget` is the ceiling the mirror's heap seats must fit under,
+  /// `budget` is the ceiling the mirror's heap fields must fit under,
   /// measured before a byte is copied — the same admission
   /// [`crate::extras::bounded_clone_parameters`] performs and the same
   /// number `admit_streams` charges against the session's total. A set
@@ -415,7 +415,7 @@ impl CodecTicket {
     // copies.** The demux road already ran this during admission, but
     // this constructor is reachable on its own, and it used to copy
     // `extradata` and every coded-side-data payload — the two
-    // attacker-sized seats — and only then reach
+    // attacker-sized fields — and only then reach
     // [`channel_layout_of`], which is where a malformed layout was
     // discovered. A deterministic refusal derivable from the struct's
     // own declared fields has no business arriving after two payload
@@ -430,7 +430,7 @@ impl CodecTicket {
     unsafe { validate_channel_layout(par, stream_index) }?;
 
     // Measured before a byte is copied, exactly as the bounded clone
-    // does it: the footprint enumerates the same three heap seats this
+    // does it: the footprint enumerates the same three heap fields this
     // mirror is about to read, and refusing here is what keeps an
     // attacker-sized `extradata` or ICC profile from being copied into
     // Rust memory just to be refused afterwards.
@@ -508,18 +508,18 @@ impl CodecTicket {
   /// )
   /// ```
   ///
-  /// Every seat that can hold a non-default value is written, so the
+  /// Every field that can hold a non-default value is written, so the
   /// result depends on the ticket rather than on what
   /// `avcodec_parameters_alloc` happened to leave behind. Stated
   /// exactly, because the difference is load-bearing:
   ///
   /// * The **twenty-seven scalars** are written unconditionally. Those
-  ///   are the seats `avcodec_parameters_alloc` gives non-zero defaults
+  ///   are the fields `avcodec_parameters_alloc` gives non-zero defaults
   ///   to — `format` is `-1`, `profile` and `level` are
   ///   `AV_PROFILE_UNKNOWN` / `AV_LEVEL_UNKNOWN`, both rationals are
   ///   `0/1`, and so on — so leaving any of them would let a default
   ///   masquerade as the file's own value.
-  /// * The **four descriptor seats** — `extradata` and
+  /// * The **four descriptor fields** — `extradata` and
   ///   `extradata_size`, `coded_side_data` and `nb_coded_side_data` —
   ///   are written only when the ticket has something to put there. On
   ///   the empty path they keep the allocator's zero, and that is
@@ -533,13 +533,13 @@ impl CodecTicket {
   ///
   /// That is what makes field-by-field parity with the original
   /// provable rather than hopeful, and
-  /// `tests/codec_ticket_parity.rs::every_scalar_seat_is_written_back`
-  /// is the assertion that a seat quietly relying on a default cannot
+  /// `tests/codec_ticket_parity.rs::every_scalar_field_is_written_back`
+  /// is the assertion that a field quietly relying on a default cannot
   /// pass.
   ///
   /// Fallible because allocation is: `ParametersAlloc` when the struct
   /// itself cannot be allocated, `ParametersCopy` carrying `ENOMEM`
-  /// when one of the heap seats cannot. Nothing here consults a
+  /// when one of the heap fields cannot. Nothing here consults a
   /// budget — the bytes are already resident and were admitted at
   /// [`Self::mirror`]; what this allocates is exactly
   /// [`Self::footprint_bytes`].
@@ -555,7 +555,7 @@ impl CodecTicket {
     }
 
     // SAFETY: `dst` is a live, freshly allocated `AVCodecParameters`
-    // whose heap seats are still null. Every write below is a scalar
+    // whose heap fields are still null. Every write below is a scalar
     // store, or an `addr_of_mut!` store of the same 32-bit pattern the
     // mirror read, into a struct nothing else holds a reference to.
     unsafe {
@@ -611,12 +611,12 @@ impl CodecTicket {
       );
     }
 
-    // The three heap seats, each allocated from FFmpeg's allocator so
+    // The three heap fields, each allocated from FFmpeg's allocator so
     // `avcodec_parameters_free` releases them with the struct — the
     // same allocator discipline `bounded_clone_parameters` uses, and
     // the same one `avcodec_parameters_copy` would have used.
     //
-    // SAFETY: `dst` is live and its heap seats are null; each
+    // SAFETY: `dst` is live and its heap fields are null; each
     // allocation below is checked, and each is attached to `dst`
     // before the next one is attempted, so a failure part way leaves
     // `out`'s own destructor a well-formed struct to free.
@@ -695,8 +695,8 @@ impl CodecTicket {
   /// `None` when [`Self::coded_side_data`] holds no
   /// `AV_PKT_DATA_DOVI_CONF` entry (an ordinary, non-Dolby-Vision
   /// stream — the overwhelming majority) or the entry's payload is too
-  /// short to hold both seats. Absent configuration answers absent,
-  /// same as every other seat this crate exposes as an `Option`.
+  /// short to hold both fields. Absent configuration answers absent,
+  /// same as every other field this crate exposes as an `Option`.
   ///
   /// This is the **configuration-record** half of Dolby Vision — the
   /// two numbers a consumer routes base-layer-vs-refuse on before a
@@ -715,7 +715,7 @@ impl CodecTicket {
       .and_then(|entry| parse_dolby_vision_config(entry.data()))
   }
   /// The pixel format (video) or sample format (audio), as the raw
-  /// integer both enums share this seat as.
+  /// integer both enums share this field as.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn format(&self) -> i32 {
     self.format
@@ -839,7 +839,7 @@ impl CodecTicket {
   /// The raw `AVAlphaMode` — how an alpha channel relates to the
   /// colour values, and the last field `AVCodecParameters` declares.
   ///
-  /// New in FFmpeg n9.0, and the seat this mirror's first draft
+  /// New in FFmpeg n9.0, and the field this mirror's first draft
   /// dropped: video-only, left at its zero by every fixture the corpus
   /// can mint, and therefore reading back identically whether it is
   /// mirrored or forgotten. The parity comparator names every field
@@ -854,7 +854,7 @@ impl core::fmt::Debug for CodecTicket {
   /// Sizes rather than payloads. An `extradata` blob and an ICC
   /// profile are both megabyte-scale and neither is readable; what a
   /// reader of a log wants is the stream's identity and whether the
-  /// heap seats are populated.
+  /// heap fields are populated.
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("CodecTicket")
       .field(
@@ -876,7 +876,7 @@ impl core::fmt::Debug for CodecTicket {
 }
 
 // ---------------------------------------------------------------------------
-//  Reading the three heap seats.
+//  Reading the three heap fields.
 // ---------------------------------------------------------------------------
 
 /// Copies `extradata` into an owned carrier — the payload only.
@@ -1166,11 +1166,11 @@ unsafe fn channel_layout_of(
 }
 
 // ---------------------------------------------------------------------------
-//  Writing the three heap seats.
+//  Writing the three heap fields.
 // ---------------------------------------------------------------------------
 
-/// The `ENOMEM` a heap seat's allocation reports when it fails.
-fn seat_alloc_failed(stream_index: usize) -> ParametersError {
+/// The `ENOMEM` a heap field's allocation reports when it fails.
+fn field_alloc_failed(stream_index: usize) -> ParametersError {
   ParametersError::Copy(ParametersCopy::new(
     stream_index,
     ffmpeg_next::Error::Other {
@@ -1193,11 +1193,11 @@ unsafe fn write_extradata(
   if payload.is_empty() {
     return Ok(());
   }
-  let size = i32::try_from(payload.len()).map_err(|_| seat_alloc_failed(stream_index))?;
+  let size = i32::try_from(payload.len()).map_err(|_| field_alloc_failed(stream_index))?;
   let padded = payload
     .len()
     .checked_add(AV_INPUT_BUFFER_PADDING_SIZE as usize)
-    .ok_or_else(|| seat_alloc_failed(stream_index))?;
+    .ok_or_else(|| field_alloc_failed(stream_index))?;
   // SAFETY: `av_mallocz` returns zeroed memory or null; the copy
   // writes exactly `payload.len()` bytes into an allocation that is
   // `AV_INPUT_BUFFER_PADDING_SIZE` longer, leaving the padding zero —
@@ -1205,7 +1205,7 @@ unsafe fn write_extradata(
   unsafe {
     let buffer = av_mallocz(padded).cast::<u8>();
     if buffer.is_null() {
-      return Err(seat_alloc_failed(stream_index));
+      return Err(field_alloc_failed(stream_index));
     }
     copy_nonoverlapping(payload.as_ptr(), buffer, payload.len());
     (*dst).extradata = buffer;
@@ -1228,11 +1228,11 @@ unsafe fn write_side_data(
   if entries.is_empty() {
     return Ok(());
   }
-  let count = i32::try_from(entries.len()).map_err(|_| seat_alloc_failed(stream_index))?;
+  let count = i32::try_from(entries.len()).map_err(|_| field_alloc_failed(stream_index))?;
   let bytes = entries
     .len()
     .checked_mul(core::mem::size_of::<AVPacketSideData>())
-    .ok_or_else(|| seat_alloc_failed(stream_index))?;
+    .ok_or_else(|| field_alloc_failed(stream_index))?;
 
   // SAFETY: `dst` is live with a null `coded_side_data`. The array is
   // attached before any payload is filled in, so a failure part way
@@ -1241,7 +1241,7 @@ unsafe fn write_side_data(
   unsafe {
     let array = av_mallocz(bytes).cast::<AVPacketSideData>();
     if array.is_null() {
-      return Err(seat_alloc_failed(stream_index));
+      return Err(field_alloc_failed(stream_index));
     }
     (*dst).coded_side_data = array;
     (*dst).nb_coded_side_data = count;
@@ -1258,7 +1258,7 @@ unsafe fn write_side_data(
       }
       let buffer = av_mallocz(payload.len()).cast::<u8>();
       if buffer.is_null() {
-        return Err(seat_alloc_failed(stream_index));
+        return Err(field_alloc_failed(stream_index));
       }
       copy_nonoverlapping(payload.as_ptr(), buffer, payload.len());
       write_unaligned(addr_of_mut!((*into).data), buffer);
@@ -1345,10 +1345,10 @@ unsafe fn write_channel_layout(
     )));
   }
 
-  let declared = i32::try_from(count).map_err(|_| seat_alloc_failed(stream_index))?;
+  let declared = i32::try_from(count).map_err(|_| field_alloc_failed(stream_index))?;
   let bytes = count
     .checked_mul(core::mem::size_of::<AVChannelCustom>())
-    .ok_or_else(|| seat_alloc_failed(stream_index))?;
+    .ok_or_else(|| field_alloc_failed(stream_index))?;
   // SAFETY: `av_mallocz` returns zeroed memory or null. The map and the
   // count it describes are attached together, before the entries are
   // filled in, so a later failure leaves a well-formed (zeroed) map for
@@ -1357,7 +1357,7 @@ unsafe fn write_channel_layout(
   unsafe {
     let map = av_mallocz(bytes).cast::<AVChannelCustom>();
     if map.is_null() {
-      return Err(seat_alloc_failed(stream_index));
+      return Err(field_alloc_failed(stream_index));
     }
     (*dst).ch_layout.u.map = map;
     (*dst).ch_layout.nb_channels = declared;
