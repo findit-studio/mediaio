@@ -16906,3 +16906,34 @@ fn l145_webm_refuses_a_stereo_mode_it_defines_not() {
   )
   .expect("Matroska's checkerboard");
 }
+
+/// **L146 — ASF refuses HEVC at open, by its query, whatever the tag**
+/// (R11, Q868 letter 11; `asfenc.c` 241–243; `riff.c` 519–521;
+/// `asfdec_f.c` 449–451): ASF's tag tables name no HEVC — its tags `HEVC`
+/// and `H265` are RIFF's unofficial ones, which ASF's reader alone falls
+/// back to — so that `avformat_query_codec` answers it not carried, and
+/// the open refuses it by name (`MuxOpenError::CodecNotCarried`), nothing
+/// written: MP4's `hev1`, which FFmpeg's tool copies into ASF unread, and
+/// `HEVC`, which the reader would take.
+///
+/// PLANT: the codec query's answer unread, MP4's `hev1` opened.
+#[test]
+fn l146_asf_refuses_hevc_whatever_its_tag() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, _) = recoded_fixture(&corpus, &[]);
+  for tag in [b"hev1", b"HEVC"] {
+    let track = restated(
+      &row,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+      &hevc_base(),
+      Some(tag),
+      None,
+    );
+    let name = format!("l146-{}.asf", String::from_utf8_lossy(tag));
+    let opened = opened_in(&corpus, &name, "asf", vec![track]);
+    assert!(
+      matches!(opened, Err(MuxOpenError::CodecNotCarried { track, codec }) if track.get() == 0 && codec == CodecId::HEVC),
+      "{name}: {opened:?}"
+    );
+  }
+}
