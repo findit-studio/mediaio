@@ -1,19 +1,21 @@
 //! `PacketFlags::DISPOSABLE` from the bitstream on interlaced H.264: a
 //! field pair whose fields ride in one packet marked as one picture, a pair
 //! split across packets kept whole, MBAFF and PicAFF frames marked as
-//! progressive ones — and on every fixture, dropping the marked packets
-//! changes no other picture's pixels.
+//! progressive ones, a pair whose second field FFmpeg refuses for the
+//! parameter sets read between them parted as FFmpeg parts it — and on
+//! every fixture, dropping the marked packets changes no other picture's
+//! pixels.
 //!
 //! The fixtures are made at run time. libx264 writes MBAFF frames (`-flags
 //! +ildct`) and frames under a sequence parameter set that lets fields in
 //! (`fake-interlaced`), through the `ffmpeg` CLI, as MP4 and as a raw
 //! stream. No encoder FFmpeg drives writes field pictures, so the PAFF
-//! stream is written here, field by field, of I_PCM and P_Skip
+//! streams are written here, field by field, of I_PCM and P_Skip
 //! macroblocks, which FFmpeg decodes exactly; FFmpeg's demuxer and muxer
-//! package it: the raw stream, which FFmpeg's parser splits one field to a
-//! packet; an MP4 the CLI copies it into, one field to a sample; and an MP4
-//! FFmpeg's muxer writes with each pair in one sample. Without the CLI the
-//! laws skip, saying why.
+//! package them: the raw stream, which FFmpeg's parser splits one field to
+//! a packet; an MP4 the CLI copies it into, one field to a sample; and an
+//! MP4 FFmpeg's muxer writes with each pair in one sample. Without the CLI
+//! the laws skip, saying why.
 
 use std::{
   collections::BTreeSet,
@@ -350,7 +352,7 @@ struct Paff {
 
 fn paff(dir: &Path) -> Paff {
   let raw = dir.join("paff.264");
-  std::fs::write(&raw, paff::stream()).expect("write the stream");
+  std::fs::write(&raw, paff::stream(&paff::plan())).expect("write the stream");
   let fields = dir.join("paff_fields.mp4");
   ffmpeg(&[
     "-i",
@@ -360,7 +362,7 @@ fn paff(dir: &Path) -> Paff {
     fields.to_str().expect("a UTF-8 path"),
   ]);
   let pairs = dir.join("paff_pairs.mp4");
-  paff::mux_pairs(&raw, &pairs);
+  paff::mux_pairs(&raw, &pairs, &paff::plan());
   Paff { raw, fields, pairs }
 }
 
@@ -415,6 +417,51 @@ fn paff_pairs_in_one_packet_are_marked_and_pairs_split_across_packets_kept_whole
       .any(|picture| picture.shape == paff::Shape::Pair && !picture.reference)
   );
   dropping_the_marked_packets_changes_no_other_picture("pairs", &track);
+}
+
+#[test]
+fn parameter_sets_read_between_two_fields_in_one_packet_part_them_as_ffmpeg_does() {
+  let Some(dir) = corpus() else {
+    return;
+  };
+  let plan = paff::parted();
+  let raw = dir.path().join("parted.264");
+  std::fs::write(&raw, paff::stream(&plan)).expect("write the stream");
+  let pairs = dir.path().join("parted_pairs.mp4");
+  paff::mux_pairs(&raw, &pairs, &plan);
+  // Split one field to a packet, each second field is its packet's first
+  // slice, which FFmpeg holds to no other (`h264_slice.c` 2072, 2150): every
+  // pair joins, and only the non-reference frames are marked.
+  let split = track(&raw);
+  let frames: Vec<usize> = plan
+    .iter()
+    .flat_map(|picture| match picture.shape {
+      paff::Shape::Pair => vec![None, None],
+      paff::Shape::Frame => vec![Some(picture.reference)],
+    })
+    .enumerate()
+    .filter(|(_, frame)| *frame == Some(false))
+    .map(|(index, _)| index)
+    .collect();
+  let marked: Vec<usize> = (0..split.packets.len())
+    .filter(|&index| disposable(&split.packets[index]))
+    .collect();
+  assert_eq!(marked, frames, "split");
+  dropping_the_marked_packets_changes_no_other_picture("parted, split", &split);
+  // Joined: the second field after PPS 0 of another `transform_8x8_mode`
+  // (2153–2158), and after SPS 0 of a new object and PPS 0 on it (2159–2163),
+  // refused; the first waits, and the next pair's bottom field joins it. Its
+  // top field FFmpeg refuses after the pair (2124–2125), and nothing waits
+  // after it. After SPS 0 again byte for byte, which FFmpeg keeps
+  // (`h264_ps.c` 581–584), the second field joins. Every non-reference
+  // picture nothing waits at is marked, as before.
+  let joined = track(&pairs);
+  assert_eq!(joined.packets.len(), plan.len());
+  let marked: Vec<usize> = (0..joined.packets.len())
+    .filter(|&index| disposable(&joined.packets[index]))
+    .collect();
+  assert_eq!(marked, [4, 5, 10, 12, 14], "joined");
+  dropping_the_marked_packets_changes_no_other_picture("parted, joined", &joined);
 }
 
 /// An H.264 PAFF stream FFmpeg decodes exactly, written whole: Main profile,
@@ -513,13 +560,37 @@ mod paff {
   pub struct Picture {
     pub shape: Shape,
     pub reference: bool,
+    /// A pair whose bottom field comes first.
+    pub bottom_first: bool,
+    /// What the pair's second field's access unit holds before its slice.
+    pub between: Between,
+  }
+
+  /// Parameter sets in a pair's second field's access unit, before its
+  /// slice.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  pub enum Between {
+    Nothing,
+    /// PPS 0 again, `transform_8x8_mode_flag` 1.
+    Transform,
+    /// SPS 0 again, its `nal_ref_idc` 2, and PPS 0 again on it,
+    /// `transform_8x8_mode_flag` 1.
+    Renamed,
+  }
+
+  const fn picture(shape: Shape, reference: bool) -> Picture {
+    Picture {
+      shape,
+      reference,
+      bottom_first: false,
+      between: Between::Nothing,
+    }
   }
 
   /// The pictures, in order: an IDR pair, then four times over a
   /// non-reference pair, a reference pair, a non-reference pair, a
   /// non-reference frame, a reference frame and a reference pair.
   pub fn plan() -> Vec<Picture> {
-    let picture = |shape, reference| Picture { shape, reference };
     let mut plan = vec![picture(Shape::Pair, true)];
     for _ in 0..4 {
       plan.extend([
@@ -534,7 +605,46 @@ mod paff {
     plan
   }
 
-  fn sps() -> Vec<u8> {
+  /// The pictures of a stream whose pairs FFmpeg parts where it holds two
+  /// fields in one packet to each other (`h264_slice.c` 2150–2163): a
+  /// non-reference pair with PPS 0 read again, of another
+  /// `transform_8x8_mode`, before its second field; one with SPS 0 read
+  /// again, a new object to FFmpeg, and PPS 0 on it; and one with that SPS
+  /// read again byte for byte, which FFmpeg keeps. After each of the first
+  /// two, a non-reference pair of its bottom field first, which joins the
+  /// waiting top field. Between them, references, and pictures nothing
+  /// waits at.
+  pub fn parted() -> Vec<Picture> {
+    let pair = |reference| picture(Shape::Pair, reference);
+    let frame = |reference| picture(Shape::Frame, reference);
+    let between = |between| Picture {
+      between,
+      ..pair(false)
+    };
+    let turned = Picture {
+      bottom_first: true,
+      ..pair(false)
+    };
+    vec![
+      pair(true),
+      between(Between::Transform),
+      turned,
+      pair(true),
+      pair(false),
+      frame(false),
+      frame(true),
+      between(Between::Renamed),
+      turned,
+      pair(true),
+      pair(false),
+      between(Between::Renamed),
+      pair(false),
+      pair(true),
+      frame(false),
+    ]
+  }
+
+  fn sps(header: u8) -> Vec<u8> {
     let mut bits = Bits::new();
     // Main, level 3.0, SPS 0; `log2_max_frame_num_minus4` 0, POC type 0 of
     // eight bits, two reference frames, no gaps; 4×2 map units of macroblock
@@ -561,10 +671,14 @@ mod paff {
     bits.bit(1).bits(1, 32).bits(50, 32).bit(1);
     bits.bit(0).bit(0).bit(0);
     bits.bit(1).bit(1).ue(0).ue(0).ue(16).ue(16).ue(0).ue(2);
-    bits.nal(0x67)
+    bits.nal(header)
   }
 
-  fn pps() -> Vec<u8> {
+  /// PPS 0, and where `transform_8x8` its tail, which FFmpeg reads under a
+  /// Main SPS of no constraint flags (`more_rbsp_data_in_pps`, `h264_ps.c`
+  /// 677–689): `transform_8x8_mode_flag` 1, no scaling matrix, a second
+  /// chroma offset of 0. No macroblock here reads the flag.
+  fn pps(transform_8x8: bool) -> Vec<u8> {
     let mut bits = Bits::new();
     bits
       .ue(0)
@@ -582,6 +696,9 @@ mod paff {
       .bit(1)
       .bit(0)
       .bit(0);
+    if transform_8x8 {
+      bits.bit(1).bit(0).se(0);
+    }
     bits.nal(0x68)
   }
 
@@ -669,29 +786,40 @@ mod paff {
     bits.nal((nal_ref_idc << 5) | nal_unit_type)
   }
 
-  /// The stream of [`plan`], in Annex B.
-  pub fn stream() -> Vec<u8> {
+  /// The stream of `plan`, in Annex B.
+  pub fn stream(plan: &[Picture]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut unit = |nal: Vec<u8>| {
       out.extend_from_slice(&[0, 0, 0, 1]);
       out.extend_from_slice(&nal);
     };
     let mut reference_frame_num: Option<u32> = None;
-    for (index, picture) in plan().into_iter().enumerate() {
+    for (index, picture) in plan.iter().enumerate() {
       let frame_num = reference_frame_num.map_or(0, |frame_num| (frame_num + 1) % 16);
       if picture.reference {
         reference_frame_num = Some(frame_num);
       }
-      let fields: &[Option<bool>] = match picture.shape {
-        Shape::Pair => &[Some(false), Some(true)],
-        Shape::Frame => &[None],
+      let fields: &[Option<bool>] = match (picture.shape, picture.bottom_first) {
+        (Shape::Pair, false) => &[Some(false), Some(true)],
+        (Shape::Pair, true) => &[Some(true), Some(false)],
+        (Shape::Frame, _) => &[None],
       };
-      for &field in fields {
-        let idr = index == 0 && field == Some(false);
+      for (at, &field) in fields.iter().enumerate() {
+        let idr = index == 0 && at == 0;
         unit(aud());
         if idr {
-          unit(sps());
-          unit(pps());
+          unit(sps(0x67));
+          unit(pps(false));
+        }
+        if at == 1 {
+          match picture.between {
+            Between::Nothing => {}
+            Between::Transform => unit(pps(true)),
+            Between::Renamed => {
+              unit(sps(0x47));
+              unit(pps(true));
+            }
+          }
         }
         unit(slice(index, field, frame_num, picture.reference, idr));
       }
@@ -701,8 +829,8 @@ mod paff {
 
   /// The stream at `raw` into an MP4 at `out`, through FFmpeg's demuxer and
   /// muxer, each pair of fields in one packet: the packets FFmpeg's parser
-  /// splits, one to a field, joined again by [`plan`].
-  pub fn mux_pairs(raw: &Path, out: &Path) {
+  /// splits, one to a field, joined again by `plan`, the stream's.
+  pub fn mux_pairs(raw: &Path, out: &Path, plan: &[Picture]) {
     let mut input = ffmpeg_next::format::input(raw).expect("open the raw stream");
     let parameters = input
       .streams()
@@ -724,7 +852,7 @@ mod paff {
     }
     output.write_header().expect("the header");
     let time_base = output.stream(0).expect("the stream").time_base();
-    for (index, picture) in plan().into_iter().enumerate() {
+    for (index, picture) in plan.iter().enumerate() {
       let mut data = packets.pop().expect("a field or frame");
       if picture.shape == Shape::Pair {
         data.extend_from_slice(&packets.pop().expect("its second field"));
