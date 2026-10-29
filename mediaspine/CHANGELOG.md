@@ -22,7 +22,14 @@ Its versions are its own: they do not move with the rest of the family's.
   wait at it, and a pair only while no field may have gone unmatched. A
   pair split across packets, as FFmpeg's parser splits a raw or MPEG-TS
   stream's, is kept whole, both halves: dropping one moves the other's
-  pairing, and the next frame's.
+  pairing, and the next frame's. Two slices' parameter sets are held to
+  each other by what FFmpeg compares — a second field's picture parameter
+  set to the active one's `sps_id`, `transform_8x8_mode` and sequence
+  parameter set object, an object FFmpeg keeps only for a set read again
+  byte for byte — never by their ids; and a picture whose sequence
+  parameter set gives the decoder another size, bit depth, chroma format,
+  sample aspect ratio or colour matrix is taken as FFmpeg takes it, its
+  context set up again and flushed.
 - `KeptReason::UnpairedField`, `KeptReason::PendingField` and
   `KeptReason::UnmatchedFields`: an interlaced packet kept for its fields.
 
@@ -33,7 +40,9 @@ Its versions are its own: they do not move with the rest of the family's.
   every picture of `nal_ref_idc` 0.
 - After such a sequence parameter set, the reference picture and the intra
   slice an H.264 reading awaits are counted only where FFmpeg decodes
-  them.
+  them, and the reference picture is awaited again after a picture at
+  which the decoder may set its context up again, which flushes it
+  (`KeptReason::AwaitingReference`).
 - An H.264 sequence parameter set's id is read as FFmpeg's
   `get_ue_golomb_31` reads it, 31 among the ids FFmpeg takes.
 
