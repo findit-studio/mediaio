@@ -1169,6 +1169,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     adts: None,
     bytes: 0,
     place: 0,
+    key_times: None,
   }
 }
 
@@ -2967,5 +2968,35 @@ fn a_language_converts_as_libavformat_converts_it() {
   assert!(
     !LanguageRule::ThroughIso639_1.keeps("ace"),
     "no ISO 639-1 code: not written"
+  );
+}
+
+/// **NUT's time bases, as its header sets them** (`choose_timebase`,
+/// `nut_write_header`, `nutenc.c` 48–59, 749–753): an audio stream's its
+/// sample rate's; any other's made at least 1/48000 fine, its numerator
+/// divided by 2, 3, 5, 7, 9, 11 and 13 while it divides, then its
+/// denominator doubled below 2^24 — every tick of the base handed a whole
+/// number of the new one's.
+#[test]
+fn nuts_time_base_is_the_one_its_header_chooses() {
+  assert_eq!(
+    nut_time_base(TrackKind::Audio, 44_100, (1, 1000)),
+    (1, 44_100)
+  );
+  assert_eq!(nut_time_base(TrackKind::Video, 0, (1, 1000)), (1, 64_000));
+  assert_eq!(
+    nut_time_base(TrackKind::Video, 0, (1001, 30_000)),
+    (1, 60_000)
+  );
+  assert_eq!(nut_time_base(TrackKind::Video, 0, (1, 90_000)), (1, 90_000));
+  assert_eq!(nut_time_base(TrackKind::Video, 0, (1, 25)), (1, 51_200));
+  assert_eq!(
+    nut_time_base(TrackKind::Subtitle, 0, (17, 1000)),
+    (17, 1_024_000)
+  );
+  assert_eq!(
+    nut_time_base(TrackKind::Audio, 0, (1, 1000)),
+    (1, 64_000),
+    "an audio stream of no sample rate as any other"
   );
 }

@@ -161,7 +161,19 @@ crate moves only when it changes.
   audio configuration past the WAVEFORMATEX's 16-bit `cbSize`
   (`MuxOpenError::ConfigurationInvalid`), a configured AAC track's ADTS
   packet (`AdtsHeader`); AVI and ASF, a picture whose bytes pass the
-  bitmap header's `int` (`MuxOpenError::Dimensions`).
+  bitmap header's `int` (`MuxOpenError::Dimensions`). NUT: a reordering
+  packet with no presentation time (`MissingPts`); a key frame presented
+  before its stream's last, or at it but decoded at another time, which
+  its index asserts against at the trailer
+  (`FfmpegMuxRefusal::KeyFrameOrder`, new); a presentation time past its
+  64-bit count of time bases (`TimeWraps`, whose field is now
+  `timestamp`); at open raw video of a tag its tables do not hold, a
+  stream header its reader refuses, a chapter past its count; its time
+  bases handed reduced, as its reader needs them; the presentation time
+  and key flag kept, the decode time made by its reader
+  (`Rewrite::DecodeTimes`), the language and six flags kept, chapters
+  numbered from 1. A subtitle's negative duration is refused only where
+  the container writes a duration.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

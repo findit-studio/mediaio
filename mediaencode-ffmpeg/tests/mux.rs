@@ -7652,7 +7652,7 @@ fn l82_flv_refuses_what_its_tags_cannot_carry() {
       at(Some(1 << 32), 1 << 32),
       FfmpegMuxRefusal::TimeWraps {
         track,
-        dts: ms(1 << 32),
+        timestamp: ms(1 << 32),
       },
     ),
     (
@@ -8223,7 +8223,7 @@ fn l86_asf_refuses_a_time_past_its_field() {
     refusal,
     FfmpegMuxRefusal::TimeWraps {
       track,
-      dts: ms((1 << 32) - 3100),
+      timestamp: ms((1 << 32) - 3100),
     }
   );
   untouched!(past, back);
@@ -8341,6 +8341,530 @@ fn l86_asf_refuses_a_time_past_its_field() {
   assert_eq!(refusal, payload(PayloadRule::Empty));
   untouched!(empty, back);
   muxer.finish().expect("finished");
+}
+
+/// The H.264 that reorders and the AAC of L81 and L82, in `name`'s
+/// container: Matroska stores no decode time for a frame that reorders,
+/// MP4 does.
+fn h264_aac(corpus: &Corpus, name: &str) -> PathBuf {
+  picture_and_sound(
+    corpus,
+    name,
+    &[
+      "-c:v", "libx264", "-preset", "medium", "-bf", "2", "-g", "25", "-pix_fmt", "yuv420p",
+    ],
+    &["-c:a", "aac", "-ac", "2"],
+  )
+}
+
+/// `path`'s whole table, each row described.
+fn whole_table(path: &Path) -> Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>> {
+  FfmpegOwnedDemuxer::open(path)
+    .expect("open")
+    .tracks()
+    .iter()
+    .map(|row| TrackDescription::from_track_info(&**row, None, ticket(row)).expect("a description"))
+    .collect()
+}
+
+/// A time in milliseconds, rounded to the nearest.
+fn in_ms(time: Option<Timestamp>) -> Option<i64> {
+  time.map(|time| {
+    time
+      .checked_rescale_with(millis(), Rounding::Nearest)
+      .map(|time| time.pts())
+      .expect("a time in milliseconds")
+  })
+}
+
+/// **L89 — H.264 that reorders and AAC round-trip through NUT, and the
+/// report says what NUT keeps** (table H; `nutenc.c` 545–612, 963–1184):
+/// every packet reads back with its bytes, its key flag and its
+/// presentation time, moved by libavformat's shift; NUT writes no decode
+/// time — its reader makes one of the presentation times and the stream's
+/// decode delay — reported at the first packet whose times differ
+/// ([`Rewrite::DecodeTimes`]), and no duration ([`Rewrite::Durations`]);
+/// a stream's language is kept, and of its flags the default, dub,
+/// original, comment, lyrics and karaoke ones, the forced flag reported
+/// ([`Uncarried::Disposition`]); its chapters keep their spans and titles,
+/// numbered by their position from 1 ([`Uncarried::ChapterId`]). The
+/// video, of MP4's 1/12 800, is counted in 1/51 200, its tick halved until
+/// NUT's 1/48 000 is reached; the audio in its sample rate's ticks.
+///
+/// PLANT: the flags kept as every one, the forced flag unreported; the
+/// chapters' ids unjudged, chapter 1's unreported.
+#[test]
+fn l89_a_stream_round_trips_through_nut() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let target = output(&corpus, "l89.nut");
+  let mut table = whole_table(&source);
+  table[0].set_language(Some("eng".into()));
+  table[0].set_disposition(TrackDisposition::DEFAULT | TrackDisposition::FORCED);
+  table[1].set_language(Some("fra".into()));
+  table[1].set_disposition(TrackDisposition::COMMENT);
+  let chapters = [
+    chapter_of(1, 0, 500, Some("one")),
+    chapter_of(5, 500, 1000, Some("two")),
+  ];
+  let (mut muxer, report) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::new("nut"),
+    table,
+    &chapters,
+    PacketLimits::default(),
+  )
+  .expect("open");
+  assert_eq!(
+    lines(&report, |line| matches!(
+      line,
+      Uncarried::Disposition { .. } | Uncarried::Language { .. }
+    )),
+    vec![Uncarried::Disposition {
+      track: TrackIndex::new(0),
+      flags: TrackDisposition::FORCED,
+    }]
+  );
+  assert_eq!(
+    lines(&report, |line| matches!(
+      line,
+      Uncarried::Chapter { .. } | Uncarried::ChapterSpan { .. } | Uncarried::ChapterId { .. }
+    )),
+    vec![Uncarried::ChapterId { chapter: 1, id: 5 }]
+  );
+  let durations = |track| Uncarried::Rewritten {
+    track: TrackIndex::new(track),
+    rewrite: Rewrite::Durations,
+  };
+  assert_eq!(field_rows(&report), vec![durations(0), durations(1)]);
+  let mut demuxer = FfmpegOwnedDemuxer::open(&source).expect("open");
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    match packet {
+      DemuxedPacket::Video(p) => muxer
+        .write_video(VideoTrackPacket::new(p.track(), p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      DemuxedPacket::Audio(p) => muxer
+        .write_audio(AudioTrackPacket::new(p.track(), p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      other => panic!("{other:?}"),
+    }
+    .expect("a packet");
+  }
+  assert!(
+    muxer.report().uncarried().contains(&Uncarried::Rewritten {
+      track: TrackIndex::new(0),
+      rewrite: Rewrite::DecodeTimes,
+    }),
+    "the reordering video's decode times"
+  );
+  muxer.finish().expect("finished");
+
+  let offered = packets(&source);
+  let back = packets(&target);
+  // The first decode time, before zero: libavformat moves every stream
+  // later by it (`mux.c` 636–717).
+  let lift = offered
+    .iter()
+    .filter_map(|track| in_ms(track.first().and_then(|first| first.dts)))
+    .min()
+    .map_or(0, |dts| (-dts).max(0));
+  assert!(lift > 0, "the premise: decoded before zero");
+  assert_eq!(back.len(), 2);
+  for track in 0..2 {
+    assert_eq!(back[track].len(), offered[track].len(), "track {track}");
+    for (index, (seen, sent)) in back[track].iter().zip(&offered[track]).enumerate() {
+      assert!(seen.bytes == sent.bytes, "track {track}/{index}: the bytes");
+      assert_eq!(seen.key, sent.key, "track {track}/{index}: the key flag");
+      assert_eq!(
+        in_ms(seen.pts),
+        in_ms(sent.pts).map(|pts| pts + lift),
+        "track {track}/{index}: presented"
+      );
+    }
+  }
+  let read = FfmpegOwnedDemuxer::open(&target).expect("open");
+  let rows: Vec<_> = read
+    .tracks()
+    .iter()
+    .map(|row| {
+      (
+        row.language().map(|tag| tag.as_str().to_owned()),
+        row.disposition(),
+      )
+    })
+    .collect();
+  assert_eq!(
+    rows,
+    [
+      (Some("eng".to_owned()), TrackDisposition::DEFAULT),
+      (Some("fra".to_owned()), TrackDisposition::COMMENT),
+    ]
+  );
+  assert_eq!(
+    table_of(&source, TrackKind::Video)[0].timebase(),
+    Timebase::new(1, NonZeroI32::new(12_800).expect("non-zero")),
+    "the premise"
+  );
+  assert_eq!(
+    read.tracks()[0].timebase(),
+    Timebase::new(1, NonZeroI32::new(51_200).expect("non-zero"))
+  );
+  let chapters: Vec<_> = read
+    .chapters()
+    .iter()
+    .map(|chapter| {
+      (
+        chapter.id(),
+        chapter.title().map(|title| title.as_str().to_owned()),
+        span_ms(chapter),
+      )
+    })
+    .collect();
+  assert_eq!(
+    chapters,
+    [
+      (1, Some("one".to_owned()), (0, 500)),
+      (2, Some("two".to_owned()), (500, 1000)),
+    ]
+  );
+}
+
+/// An audio table of `path`'s first audio track, its stream stated at
+/// `rate` samples a second.
+fn audio_rated(path: &Path, rate: i32) -> Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>> {
+  let mut table = table_of(path, TrackKind::Audio);
+  let index = table[0].side_data().stream_index();
+  let mut parameters = table[0].side_data().rebuild().expect("the parameters");
+  // SAFETY: `parameters` owns its `AVCodecParameters`, live for the
+  // write; `sample_rate` is a plain integer field.
+  unsafe {
+    (*parameters.as_mut_ptr()).sample_rate = rate;
+  }
+  *table[0].side_data_mut() =
+    CodecTicket::mirror(&parameters, index, usize::MAX).expect("the ticket");
+  table
+}
+
+/// **L90 — NUT's refusals** (table H; `nutenc.c` 329–333, 466–472,
+/// 615–667, 963–1184): a packet of a reordering stream with no
+/// presentation time, which NUT refuses after taking it
+/// ([`FfmpegMuxRefusal::MissingPts`]); a key frame presented before the
+/// stream's last key frame, or at it but decoded at another time, which
+/// NUT's index asserts against at its trailer
+/// ([`FfmpegMuxRefusal::KeyFrameOrder`]) — two subtitle cues at one time
+/// taken; after libavformat's first write, a frame decoded before zero
+/// and presented after it, whose decode time a syncpoint would count
+/// unsigned ([`FfmpegMuxRefusal::BeforeZero`]); with three time bases, a
+/// presentation time past what NUT's 64-bit count of them holds — which
+/// bounds the decode time no later than it — refused
+/// ([`FfmpegMuxRefusal::TimeWraps`]), and a chapter starting past it
+/// ([`MuxOpenError::ChapterSpan`]), one a tick earlier taken. A
+/// subtitle's negative duration, which NUT does not write, is taken. At
+/// open: raw video of a tag NUT's tables do not hold, which libavformat
+/// would write under the tables' first, RGB 5:5:5's
+/// ([`MuxOpenError::ConfigurationInvalid`]) — I420 raw video, which they
+/// hold, read back as itself; a video stream of no width and an audio one
+/// of no sample rate, whose stream headers NUT's reader refuses
+/// ([`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`]).
+/// A time base not in lowest terms, which NUT's reader refuses, is handed
+/// reduced: the file reads back.
+///
+/// PLANT: each check removed takes its packet, or opens; the time bases
+/// handed as they are, the file unreadable.
+#[test]
+fn l90_nut_refuses_what_its_frames_and_index_cannot_hold() {
+  let Some(corpus) = Corpus::new() else { return };
+  let nut = || ContainerName::new("nut");
+  let source = h264_aac(&corpus, "h264-aac.mkv");
+  let track = TrackIndex::new(0);
+  let (table, frames) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  let at = |pts: Option<i64>, dts: i64, key: bool| {
+    VideoTrackPacket::new(
+      track,
+      frame
+        .clone()
+        .with_pts(pts.map(ms))
+        .with_dts(Some(ms(dts)))
+        .with_flags(if key {
+          PacketFlags::KEY
+        } else {
+          PacketFlags::empty()
+        }),
+    )
+  };
+  let mut muxer = muxer_into(&output(&corpus, "l90-keys.nut"), nut(), table);
+  let offered = at(None, 0, true);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(refusal, FfmpegMuxRefusal::MissingPts { track });
+  untouched!(offered, back);
+  for (pts, dts, key) in [(200, 0, true), (220, 40, false)] {
+    muxer
+      .write_video(at(Some(pts), dts, key))
+      .map_err(|error| error.map_packet(drop))
+      .expect("in order");
+  }
+  for (pts, dts) in [(100, 80), (200, 80)] {
+    let offered = at(Some(pts), dts, true);
+    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    assert_eq!(
+      refusal,
+      FfmpegMuxRefusal::KeyFrameOrder {
+        track,
+        pts: ms(pts),
+      },
+      "presented at {pts}, decoded at {dts}"
+    );
+    untouched!(offered, back);
+  }
+  muxer
+    .write_video(at(Some(240), 80, true))
+    .map_err(|error| error.map_packet(drop))
+    .expect("after the last key frame");
+  muxer.finish().expect("finished");
+
+  // Eleven seconds of audio, which libavformat's interleaving writes ahead
+  // of the video: its first write settles no move.
+  let (_, audio) = first_track(&source, TrackKind::Audio, 1);
+  let sound = audio_of(&audio[0]);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l90-late.nut"),
+    nut(),
+    whole_table(&source),
+  );
+  for index in 0..516 {
+    muxer
+      .write_audio(AudioTrackPacket::new(
+        TrackIndex::new(1),
+        sound
+          .clone()
+          .with_pts(Some(ms(21 * index)))
+          .with_dts(Some(ms(21 * index))),
+      ))
+      .map_err(|error| error.map_packet(drop))
+      .expect("audio");
+  }
+  let early = at(Some(40), -80, true);
+  let (refusal, back) = by_container(muxer.write_video(early.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::BeforeZero {
+      track,
+      timestamp: ms(-80),
+    }
+  );
+  untouched!(early, back);
+  muxer.finish().expect("finished");
+
+  // Three time bases — the video's 1/64 000, the audio's 1/44 100, the
+  // chapter's 1/1000: a count is three times the time and its base's
+  // place, within `u64::MAX`.
+  let limit = (u64::MAX - 2) / 3;
+  let ok_ms = i64::try_from(limit / 64).expect("an i64");
+  let far = [chapter_of(1, 0, 1000, Some("one"))];
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(output(&corpus, "l90-far.nut")).expect("create"),
+    nut(),
+    whole_table(&source),
+    &far,
+    PacketLimits::default(),
+  )
+  .expect("open");
+  muxer
+    .write_audio(AudioTrackPacket::new(
+      TrackIndex::new(1),
+      sound.clone().with_pts(Some(ms(0))).with_dts(Some(ms(0))),
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("audio");
+  muxer
+    .write_video(at(Some(0), 0, true))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first frame");
+  let offered = at(Some(ok_ms + 1), ok_ms - 1, true);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track,
+      timestamp: ms(ok_ms + 1),
+    }
+  );
+  untouched!(offered, back);
+  muxer
+    .write_video(at(Some(ok_ms), ok_ms, true))
+    .map_err(|error| error.map_packet(drop))
+    .expect("within the count");
+  muxer.finish().expect("finished");
+  let start = i64::try_from(limit).expect("an i64");
+  for (start, refused) in [(start + 1, true), (start, false)] {
+    let opened = FfmpegOwnedMuxer::open(
+      File::create(output(&corpus, "l90-chapter.nut")).expect("create"),
+      nut(),
+      whole_table(&source),
+      &[chapter_of(1, start, start + 1000, Some("far"))],
+      PacketLimits::default(),
+    );
+    match opened {
+      Err(MuxOpenError::ChapterSpan { chapter: 0 }) if refused => {}
+      Ok((muxer, _)) if !refused => muxer.finish().expect("finished"),
+      other => panic!("a chapter at {start}: {:?}", other.map(drop)),
+    }
+  }
+
+  // A subtitle's negative duration is not written; two cues at one time
+  // are taken, the second key frame at the first's times.
+  let srt = written_text(
+    &corpus,
+    "two.srt",
+    "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n2\n00:00:01,000 --> 00:00:02,000\nworld\n\n",
+  );
+  let ass = generated(
+    &corpus,
+    "ass.mkv",
+    &["-i", srt.to_str().expect("utf-8 path"), "-c:s", "ass"],
+  );
+  let (table, cues) = first_track(&ass, TrackKind::Subtitle, 1);
+  let (mut muxer, report) = FfmpegOwnedMuxer::open(
+    File::create(output(&corpus, "l90-cues.nut")).expect("create"),
+    nut(),
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  assert_eq!(
+    field_rows(&report),
+    vec![Uncarried::Rewritten {
+      track,
+      rewrite: Rewrite::Durations,
+    }]
+  );
+  let cue = subtitle_of(&cues[0]);
+  for (pts, duration) in [(0, -1000), (1000, 500), (1000, 500)] {
+    muxer
+      .write_subtitle(subtitle_at(&cue, pts, duration))
+      .map_err(|error| error.map_packet(drop))
+      .unwrap_or_else(|error| panic!("the cue at {pts}: {error:?}"));
+  }
+  muxer.finish().expect("finished");
+
+  let open = |name: &str, table| {
+    let target = output(&corpus, name);
+    let result = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      nut(),
+      table,
+      &[],
+      PacketLimits::default(),
+    );
+    match result {
+      Ok((muxer, _)) => {
+        muxer.finish().expect("finished");
+        Ok(target)
+      }
+      Err(error) => {
+        assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+        Err(error)
+      }
+    }
+  };
+  let rgb = generated(
+    &corpus,
+    "rgb24.mov",
+    &[
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=32x32:rate=25:duration=0.2",
+      "-c:v",
+      "rawvideo",
+      "-pix_fmt",
+      "rgb24",
+    ],
+  );
+  assert!(matches!(
+    open("l90-rgb.nut", table_of(&rgb, TrackKind::Video)),
+    Err(MuxOpenError::ConfigurationInvalid { track, .. }) if track.get() == 0
+  ));
+  let i420 = generated(
+    &corpus,
+    "i420.y4m",
+    &[
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=32x32:rate=25:duration=0.2",
+      "-c:v",
+      "rawvideo",
+      "-pix_fmt",
+      "yuv420p",
+    ],
+  );
+  let (table, frames) = first_track(&i420, TrackKind::Video, 1);
+  let target = output(&corpus, "l90-i420.nut");
+  let mut muxer = muxer_into(&target, nut(), table);
+  muxer
+    .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  muxer.finish().expect("finished");
+  assert_eq!(
+    table_of(&target, TrackKind::Video)[0].side_data().format(),
+    ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32,
+    "read back as itself"
+  );
+  assert!(matches!(
+    open("l90-wide.nut", video_sized(&source, 0, 48)),
+    Err(MuxOpenError::Dimensions { track }) if track.get() == 0
+  ));
+  assert!(matches!(
+    open("l90-rate.nut", audio_rated(&source, 0)),
+    Err(MuxOpenError::ConfigurationInvalid { track, .. }) if track.get() == 0
+  ));
+
+  // A video time base of 2/180 000, and a chapter's of 2/2000.
+  let unreduced = |num: i32, den: i32| Timebase::new(num, NonZeroI32::new(den).expect("non-zero"));
+  let (description, frames) = first_track(&source, TrackKind::Video, 1);
+  let (_, params, extradata, side, _, _, _) = description
+    .into_iter()
+    .next()
+    .expect("a row")
+    .into_parts_with_disposition();
+  let table = vec![
+    TrackDescription::new(unreduced(2, 180_000), params, side)
+      .expect("a timed track")
+      .with_extradata(extradata),
+  ];
+  let base = unreduced(2, 2000);
+  let chapter = Chapter::<Ffmpeg>::new(1, base, Timestamp::new(0, base), Timestamp::new(250, base))
+    .with_title(Some("half".into()));
+  let target = output(&corpus, "l90-unreduced.nut");
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    nut(),
+    table,
+    &[chapter],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  muxer
+    .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  muxer.finish().expect("finished");
+  let read = FfmpegOwnedDemuxer::open(&target).expect("NUT's reader takes the file");
+  let titles: Vec<_> = read
+    .chapters()
+    .iter()
+    .map(|chapter| {
+      (
+        chapter.title().map(|title| title.as_str().to_owned()),
+        span_ms(chapter),
+      )
+    })
+    .collect();
+  assert_eq!(titles, [(Some("half".to_owned()), (0, 250))]);
 }
 
 /// **L87 — what ASF, and the RIFF formats' audio header, cannot count is

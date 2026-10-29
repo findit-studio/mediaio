@@ -565,7 +565,7 @@
 //! |---|---|---|
 //! | FLV | the first packet it wrote is its reference; a packet decoded before it, refused after taking it (`flvenc.c` 1267–1274) | mirrored ([`FfmpegMuxRefusal::BeforeFirstDts`]) |
 //! | ASF | a presentation time below −3.1 s, refused after taking it (`asfenc.c` 1025–1029) | libavformat's move makes every decode time, and so every presentation time, zero or more; one after its first write that the move leaves below, refused ([`FfmpegMuxRefusal::BeforeZero`]) |
-//! | NUT | a presentation time below zero, refused after taking it (`nutenc.c` 979–985) | as ASF's |
+//! | NUT | a presentation time below zero, refused after taking it (`nutenc.c` 979–985) | as ASF's — and judged on the decode time, no later: a syncpoint at the packet counts it unsigned (`put_tt`, 329–333, 1041) |
 //! | Matroska | a block below zero written with no cue (`matroskaenc.c` 969–970) | [`FfmpegMuxRefusal::BeforeZero`] |
 //! | MP4 | `check_pkt`'s reference, the last sample written (`movenc.c` 6897–6930) | table C″ |
 //! | MPEG-PS | the first packet's decode time, below the preload, raises the preload (`mpegenc.c` 1188–1199) | nothing refused after; the move first ([`FfmpegMuxRefusal::BeforeZero`]) |
@@ -619,6 +619,7 @@
 //! | WAV, Wave64 (`wavenc.c` 378–416) | none | none | none | none | none | none |
 //! | AVI (`avienc.c` 744–913) | as each packet's place: video's frame, in its stream's ticks, a gap filled with empty frames; PCM's samples ([`Rewrite::Timeline`] where a time is not its place) — no presentation time | none | in the index | a PAL8 picture's palette | none | none |
 //! | FLV (`flvenc.c` 1209–1486) | the decode time, 32 bits of milliseconds; a composition time for H.264, MPEG-4 Part 2, HEVC and VVC alone, 24 bits | none | a video tag's; every audio tag reads back a key frame ([`Rewrite::KeyFramesMarked`]) | new extradata of AAC, H.264, MPEG-4, HEVC, VVC, AV1, VP9, Opus and FLAC, a new sequence header | none | none |
+//! | NUT (`nutenc.c` 545–612, 963–1184) | the presentation time, in its stream's time base — an audio stream's sample rate's, any other's made at least 1/48 000 fine — and no decode time: its reader makes one of the presentation times and the decode delay ([`Rewrite::DecodeTimes`]) | none | each frame's | none | the language; the default, dub, original, comment, lyrics and karaoke flags | a start and a length in the chapter's own time base, exact, numbered by position from 1 |
 //! | ASF, its streaming form (`asfenc.c` 862–1050) | the decode time, as each payload's presentation time, 32 bits of milliseconds with the preroll's 3100 added — no presentation time | none | a video payload's; every audio packet reads back a key frame ([`Rewrite::KeyFramesMarked`]) | none | a language through its ISO 639-1 code, read back as ISO 639-2/B — a tag of none not handed, so that the stream has none; no flag | markers: a start in 100 ns, numbered by position, each ended where the next starts; the streaming form none |
 //!
 //! **What each refuses**:
@@ -639,6 +640,8 @@
 //! | ASF | a decode time past its 32-bit presentation time, the preroll added; a presentation time past what its index counts in an `int` of seconds; a play duration past `i64` in 100 ns; an empty packet | written cut; refused after taking it; a signed overflow; no payload written (`asfenc.c` 886–1038) | [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::Empty`] — L86 |
 //! | ASF, at open | a video configuration past its format data's 16-bit size; a marker's title past its entry's 16-bit length; a chapter at 2^32 ms or later; the streaming form's header past its chunk's 16-bit length | each written, its length or send time cut (`asfenc.c` 645, 337, 297–308, 708–716) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSpan`], [`MuxOpenError::HeaderTooLong`] — L87 |
 //! | AVI, ASF, at open | a picture whose bytes pass an `int` | the bitmap header's count a signed overflow (`riffenc.c` 265) | [`MuxOpenError::Dimensions`] — L87 |
+//! | NUT | a reordering stream's packet with no presentation time; a key frame presented before its stream's last, or at it but decoded at another time; a presentation time past its 64-bit count of time bases; after the first write, a frame decoded before zero | refused after taking it; the trailer's index asserts (`av_assert0`, 653), ending the process; written wrapped; a syncpoint's count of it unsigned (`nutenc.c` 329–333, 615–667, 979–985, 1041, 1071–1073) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::KeyFrameOrder`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::BeforeZero`] — L90 |
+//! | NUT, at open | raw video of a tag its tables do not hold; a video stream of no width or height, an audio one of no sample rate or channels, a configuration of 2^30 bytes or more; a chapter starting past its count; a time base not in lowest terms | written under the tables' first raw tag, RGB 5:5:5's, read back as that; a stream header its reader refuses; wrapped; a main header its reader refuses (`nut.c` 50; `nutdec.c` 233–240, 447–470; `nutenc.c` 601) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ChapterSpan`]; the time base handed reduced — L90 |
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -941,6 +944,15 @@ impl Audited {
         key: true,
         ..NOTHING
       }),
+      // `nut_write_packet` (`nutenc.c` 963–1184): the presentation time
+      // and the key flag of each frame; no duration, and no decode time —
+      // the reader makes one of the presentation times and the stream's
+      // decode delay (`write_streamheader`, 477).
+      Self::Nut => Some(Written {
+        pts: true,
+        key: true,
+        ..NOTHING
+      }),
       _ => {
         let _ = kind;
         None
@@ -984,6 +996,21 @@ impl Audited {
         language: LanguageRule::ThroughIso639_1,
         flags: TrackDisposition::empty(),
       }),
+      // NUT writes a stream's tags as its info, the language among them as
+      // `X-Language`, and six disposition flags by name, which its reader
+      // takes back (`write_streaminfo`, `nutenc.c` 545–585; `nut.c`
+      // 335–355; `nutdec.c` 590–612).
+      Self::Nut => Some(Kept {
+        filename: false,
+        mime_type: false,
+        language: LanguageRule::AsGiven,
+        flags: TrackDisposition::DEFAULT
+          .union(TrackDisposition::DUB)
+          .union(TrackDisposition::ORIGINAL)
+          .union(TrackDisposition::COMMENT)
+          .union(TrackDisposition::LYRICS)
+          .union(TrackDisposition::KARAOKE),
+      }),
       _ => None,
     }
   }
@@ -1002,6 +1029,7 @@ impl Audited {
         | Self::Flv
         | Self::Avi
         | Self::Asf { .. }
+        | Self::Nut
     )
   }
 
@@ -1426,7 +1454,7 @@ pub enum Uncarried {
   /// track); Matroska numbers every chapter from 1 where one's id is 0 or
   /// repeats another's (`mkv_new_chapter_ids_needed`, `matroskaenc.c`
   /// 2399–2442); MP3's ID3v2 chapters and ASF's markers are numbered by
-  /// position from 0 (table H).
+  /// position from 0, NUT's from 1 (table H).
   ChapterId {
     /// The chapter's position in the table the muxer was opened with.
     chapter: usize,
@@ -1807,16 +1835,16 @@ pub enum FfmpegMuxRefusal {
     /// The timestamp.
     timestamp: Timestamp,
   },
-  /// A subtitle's negative duration, outside Matroska and WebM.
-  /// libavformat hands a subtitle's on as it is (`guess_pkt_duration`,
-  /// `mux.c` 605–611 in FFmpeg 9.0.1): MP4 refuses it after taking the
-  /// packet (`check_pkt`, `movenc.c` 6925–6928), or joins a TTML paragraph
-  /// into its document ending before it starts (`ttmlenc.c` 172); SRT drops
-  /// the cue (`srtenc.c` 71–75); WebVTT and ASS write it ending before it
-  /// starts (`webvttenc.c` 80, `assenc.c` 160). Any other track's
-  /// libavformat writes as zero, or as its own guess (605–633), and
-  /// Matroska and WebM a subtitle's as zero (`matroskaenc.c` 3134): taken,
-  /// and reported ([`Rewrite::Durations`]).
+  /// A subtitle's negative duration, where the container writes one but
+  /// Matroska and WebM. libavformat hands a subtitle's on as it is
+  /// (`guess_pkt_duration`, `mux.c` 605–611 in FFmpeg 9.0.1): MP4 refuses it
+  /// after taking the packet (`check_pkt`, `movenc.c` 6925–6928), or joins
+  /// a TTML paragraph into its document ending before it starts
+  /// (`ttmlenc.c` 172). Any other track's libavformat writes as zero, or as
+  /// its own guess (605–633), and Matroska and WebM a subtitle's as zero
+  /// (`matroskaenc.c` 3134): taken, and reported ([`Rewrite::Durations`]);
+  /// a container of table H that writes no duration — AVI's XSUB, NUT's
+  /// subtitles — ignores it, as the report says at open.
   #[error("track {}: the subtitle's duration {} is negative", .track.get(), .duration.pts())]
   NegativeDuration {
     /// The track.
@@ -1898,18 +1926,25 @@ pub enum FfmpegMuxRefusal {
     /// The track.
     track: TrackIndex,
   },
-  /// A decode time the container counts in fewer bits than it takes: FLV
-  /// writes each tag's in 32 bits of milliseconds (`put_timestamp`,
+  /// A time the container counts in fewer bits than it takes: FLV writes
+  /// each tag's decode time in 32 bits of milliseconds (`put_timestamp`,
   /// `flvenc.c` 1284, 1352), so one of 2^32 or more is written cut; ASF
-  /// each payload's as its presentation time, in 32 bits of milliseconds
-  /// with its preroll's 3100 added (`put_payload_header`, `put_frame`,
-  /// `asfenc.c` 886, 937), so one of 2^32 − 3100 or more.
-  #[error("track {}: decoded at {}, past what the container counts", .track.get(), .dts.pts())]
+  /// each payload's decode time as its presentation time, in 32 bits of
+  /// milliseconds with its preroll's 3100 added (`put_payload_header`,
+  /// `put_frame`, `asfenc.c` 886, 937), so one of 2^32 − 3100 or more; NUT
+  /// counts a syncpoint's decode time and its index's latest presentation
+  /// as the count of its time bases times the time plus that time base's
+  /// place, unsigned in 64 bits, and codes a frame's presentation time
+  /// whole with its low bits' span added, in an `int64_t` (`put_tt`,
+  /// `nutenc.c` 329–333, 1041, 622; 1071–1073), so that a presentation
+  /// time past either wraps — judged on it, which bounds the decode time,
+  /// no later.
+  #[error("track {}: {} lies past what the container counts", .track.get(), .timestamp.pts())]
   TimeWraps {
     /// The track.
     track: TrackIndex,
-    /// The decode time offered.
-    dts: Timestamp,
+    /// The time offered: the decode time, or NUT's presentation time.
+    timestamp: Timestamp,
   },
   /// AVI: a packet more than 60 000 frames after the place the stream has
   /// reached. AVI keeps a frame's time as its place, filling a gap with
@@ -1921,6 +1956,22 @@ pub enum FfmpegMuxRefusal {
     track: TrackIndex,
     /// The decode time offered.
     dts: Timestamp,
+  },
+  /// NUT: a key frame presented before its stream's last key frame, or at
+  /// its presentation but decoded at another time. NUT's index keeps the
+  /// first key frame of each stream after each syncpoint, and its trailer
+  /// asserts their presentation times increase (`av_assert0`,
+  /// `write_index`, `nutenc.c` 653), ending the process; a key frame of
+  /// the same presentation it leaves out where the one before is the last
+  /// syncpoint's (639–642). Which key frames the index keeps depends on
+  /// the bytes written, so every such key frame is refused but one decoded
+  /// with the last, which libavformat's interleaving hands on next to it.
+  #[error("track {}: a key frame presented at {}, not after the stream's last", .track.get(), .pts.pts())]
+  KeyFrameOrder {
+    /// The track.
+    track: TrackIndex,
+    /// The presentation time offered.
+    pts: Timestamp,
   },
   /// A time libavformat would hand the container before the earliest it
   /// writes. At its first write libavformat moves every stream's times
@@ -2375,7 +2426,9 @@ pub enum MuxOpenError {
   /// `ivfenc.c` 65–66), which a reader takes back as written; or whose
   /// picture's bytes — its width by its height by its bits a sample — the
   /// bitmap header AVI and ASF write count in an `int`
-  /// (`ff_put_bmp_header`, `riffenc.c` 265), a signed overflow past it.
+  /// (`ff_put_bmp_header`, `riffenc.c` 265), a signed overflow past it; or
+  /// NUT's of no width or height, whose stream header NUT's reader refuses
+  /// (`decode_stream_header`, `nutdec.c` 456–457).
   #[error("track {}'s dimensions do not fit the container's header", .track.get())]
   Dimensions {
     /// The track.
@@ -2512,7 +2565,11 @@ pub enum MuxOpenError {
   /// and one past the 16-bit size its header counts it in — the `cbSize`
   /// of the WAVEFORMATEX WAV, Wave64, AVI and ASF write an audio stream's
   /// in (`ff_put_wav_header`, `riffenc.c` 54–233), the format data size
-  /// ASF writes a video stream's bitmap header with (`asfenc.c` 645).
+  /// ASF writes a video stream's bitmap header with (`asfenc.c` 645); and
+  /// NUT's raw video of a tag its tables do not hold, written under their
+  /// first, RGB 5:5:5's (`nut.c` 50), and a stream header its reader
+  /// refuses — an audio stream of no sample rate or channels, a
+  /// configuration of 2^30 bytes or more (`nutdec.c` 447–470).
   #[error("track {}'s configuration is not one {codec:?} in this container writes", .track.get())]
   ConfigurationInvalid {
     /// The track.
@@ -2567,7 +2624,9 @@ pub enum MuxOpenError {
   /// `matroskaenc.c` 2445–2451) — or one its own time base cannot count;
   /// or ASF's starting 2^32 ms or later, whose marker's send time — the
   /// index's last second before the start, a DWORD of milliseconds — may
-  /// pass it (`get_send_time`, `asfenc.c` 297–308, 338).
+  /// pass it (`get_send_time`, `asfenc.c` 297–308, 338); or NUT's whose
+  /// start, the count of its time bases times it plus its base's place,
+  /// passes 64 bits unsigned (`write_chapter`, `nutenc.c` 601).
   #[error("chapter {chapter}'s span runs backwards or before zero")]
   ChapterSpan {
     /// The chapter's position in the table.
@@ -2644,6 +2703,8 @@ struct TrackState {
   /// AVI: the place the stream has reached — frames written, empty ones
   /// among them, or samples ([`AviPlace`]).
   place: i128,
+  /// NUT: the last key frame's presentation and decode times, in ticks.
+  key_times: Option<(i128, i128)>,
 }
 
 /// What the ADTS muxer knows of an AAC track's configuration
@@ -3196,6 +3257,20 @@ struct PacketRules {
   /// ([`FfmpegMuxRefusal::PresentationOffset`],
   /// [`FfmpegMuxRefusal::DurationTooLong`]).
   asf: bool,
+  /// NUT: how it counts a time ([`NutTimes`]), and its key frames' order
+  /// ([`FfmpegMuxRefusal::KeyFrameOrder`]).
+  nut: Option<NutTimes>,
+}
+
+/// How NUT counts a stream's times (`put_tt`, `nutenc.c` 329–333; 1071–1073).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NutTimes {
+  /// The time bases the file counts — its streams' and its chapters',
+  /// each once.
+  count: u64,
+  /// The low bits a frame's presentation time is coded in: 7 for a time
+  /// base of a millisecond or coarser, else 14 (767–770).
+  msb_shift: u32,
 }
 
 /// How AVI keeps a stream's packets' times, as their places
@@ -3489,6 +3564,7 @@ impl PacketRules {
     let raw_flac = audited == Audited::Flac;
     let flv = audited == Audited::Flv;
     let asf = matches!(audited, Audited::Asf { .. });
+    let nut = audited == Audited::Nut;
     let mp4 = family == Family::Mp4;
     let matroska = family == Family::Matroska;
     let either_matroska = matroska || family == Family::WebM;
@@ -3505,7 +3581,13 @@ impl PacketRules {
       mp4,
       earliest,
       before_zero: None,
-      negative_duration: kind == TrackKind::Subtitle && !either_matroska,
+      // A container of table H that writes no duration ignores it, as the
+      // report says at open ([`Rewrite::Durations`]).
+      negative_duration: kind == TrackKind::Subtitle
+        && !either_matroska
+        && audited
+          .written(kind, id)
+          .is_none_or(|written| written.duration),
       // `ff_raw_write_packet` writes an empty packet as nothing, and so do
       // MP3's and WAV's; ADTS returns before it, and FLAC writes none of
       // it (`rawenc.c` 31–35; `mp3enc.c` 379; `wavenc.c` 383–384;
@@ -3529,7 +3611,10 @@ impl PacketRules {
       // FLV refuses a packet of these with no presentation time, which
       // libavformat makes up where the stream does not reorder
       // (`flvenc.c` 1276–1282; `mux.c` 531–532).
+      // NUT refuses a presentation time below zero, `AV_NOPTS_VALUE` among
+      // them, after taking the packet (`nutenc.c` 979–985).
       needs_pts: (family != Family::Other
+        || nut
         || (flv
           && [
             CodecId::H264,
@@ -3639,6 +3724,7 @@ impl PacketRules {
         },
       }),
       asf,
+      nut: None,
     }
   }
 }
@@ -5549,6 +5635,8 @@ struct Learned {
   /// AVI: the place after the packet, and whether its time was not its
   /// place ([`Rewrite::Timeline`]).
   place: Option<(i128, bool)>,
+  /// NUT: the key frame's presentation and decode times, in ticks.
+  key_times: Option<(i128, i128)>,
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
@@ -5690,6 +5778,14 @@ where
       // terminator; its send time, the index's second before the start in
       // a DWORD of milliseconds (297–308, 338), can pass it only for a
       // start at 2^32 ms or later.
+      // NUT's chapter start, the count of time bases times it and its
+      // base's place, unsigned in 64 bits (`write_chapter`, `nutenc.c` 601).
+      if audited == Audited::Nut {
+        let count = i128::from(nut_time_base_count(&tracks, &roads, chapters));
+        if i128::from(spans[index].0) > (i128::from(u64::MAX) - (count - 1)) / count {
+          return Err(MuxOpenError::ChapterSpan { chapter: index });
+        }
+      }
       if audited == (Audited::Asf { stream: false }) {
         if chapter.title().is_some_and(|title| {
           12 + 2 * (title.as_str().encode_utf16().count() + 1) > usize::from(u16::MAX)
@@ -5742,6 +5838,21 @@ where
           // sample name, logging that one of another pixel format "will be
           // unreadable" (`avi_write_header`, `avienc.c` 446–461).
           if audited == Audited::Avi && avi_raw_unreadable(&codec) {
+            return Err(MuxOpenError::ConfigurationInvalid {
+              track,
+              codec: codec.codec(),
+            });
+          }
+          // NUT writes raw video under its stream's tag, which its reader's
+          // decoder reads the pixel format of (`rawdec.c` 76–90): one its
+          // tables do not hold is left none, and libavformat settles the
+          // tables' first for raw video, RGB 5:5:5 little-endian's
+          // (`init_muxer`, `mux.c` 288–312; `nut.c` 50).
+          if audited == Audited::Nut
+            && codec.codec() == RAWVIDEO
+            && codec.codec_tag() == 0
+            && codec.format() != ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_RGB555LE as i32
+          {
             return Err(MuxOpenError::ConfigurationInvalid {
               track,
               codec: codec.codec(),
@@ -5864,7 +5975,11 @@ where
       output
         .add_chapter(
           chapter.id(),
-          chapter.timebase(),
+          if audited == Audited::Nut {
+            chapter.timebase().reduce()
+          } else {
+            chapter.timebase()
+          },
           start,
           end,
           chapter.title().map(Utf8Bytes::as_str),
@@ -5875,6 +5990,28 @@ where
       .write_header()
       .map_err(|error| MuxFault::new(MuxStage::Header, error))?;
     let header = output.position();
+    // NUT counts its streams' time bases, as its header set them, and its
+    // chapters', each once (`nut_write_header`, `nutenc.c` 744–786).
+    let nut_count = if audited == Audited::Nut {
+      let mut bases = Vec::new();
+      for (_, stream, _, _) in &states {
+        if let Some((stream, _)) = stream {
+          let base = output
+            .stream_time_base(*stream)
+            .map_err(|error| MuxFault::new(MuxStage::Header, error))?;
+          bases.push((base.num(), base.den().get()));
+        }
+      }
+      bases.extend(chapters.iter().map(|chapter| {
+        let base = chapter.timebase().reduce();
+        (base.num(), base.den().get())
+      }));
+      bases.sort_unstable();
+      bases.dedup();
+      bases.len() as u64
+    } else {
+      0
+    };
 
     let shifts = output.shifts_early_times();
     let mut track_states = Vec::with_capacity(states.len());
@@ -5900,6 +6037,16 @@ where
             (time_base, shifts),
             (header, bounds.file),
           );
+          if audited == Audited::Nut {
+            rules.nut = Some(NutTimes {
+              count: nut_count.max(1),
+              msb_shift: if 1000 * i64::from(time_base.num()) >= i64::from(time_base.den().get()) {
+                7
+              } else {
+                14
+              },
+            });
+          }
           if audited == Audited::Flv {
             rules.flv_tag = Some(FlvTag::of(
               kind,
@@ -5962,6 +6109,7 @@ where
         adts: rules.adts,
         bytes: 0,
         place: 0,
+        key_times: None,
       });
     }
 
@@ -6480,6 +6628,9 @@ where
     if let Some((place, _)) = plan.learned.place {
       state.place = place;
     }
+    if let Some(key_times) = plan.learned.key_times {
+      state.key_times = Some(key_times);
+    }
     if let Some(sample) = plan.learned.sample {
       state.sample = Some(sample);
     }
@@ -6809,7 +6960,7 @@ fn check_packet_rules(
       if !(0..1 << bits).contains(&written) {
         return Err(FfmpegMuxRefusal::TimeWraps {
           track,
-          dts: output.dts,
+          timestamp: output.dts,
         });
       }
     }
@@ -6838,6 +6989,24 @@ fn check_packet_rules(
           > i128::from(i64::MAX)
       {
         return Err(FfmpegMuxRefusal::DurationTooLong { track, duration });
+      }
+    }
+    // NUT, in its stream's ticks, moved by libavformat's shift: a
+    // syncpoint's decode time and the index's latest presentation, each the
+    // count of time bases times it and its base's place, unsigned in 64
+    // bits (`put_tt`, `nutenc.c` 329–333, 1041, 622), and a frame's
+    // presentation time with its low bits' span added where it is coded
+    // whole, an `int64_t` (1071–1073). The presentation time judged bounds
+    // the decode time too, which is no later.
+    if let Some(nut) = rules.nut {
+      let count = i128::from(nut.count);
+      let limit = (i128::from(u64::MAX) - (count - 1)) / count;
+      let presented = i128::from(output.pts_ticks.unwrap_or(output.dts_ticks)) + lift;
+      if presented > limit.min(i128::from(i64::MAX) - (1 << nut.msb_shift)) {
+        return Err(FfmpegMuxRefusal::TimeWraps {
+          track,
+          timestamp: output.pts.unwrap_or(output.dts),
+        });
       }
     }
   }
@@ -6976,6 +7145,27 @@ fn check_packet_rules(
       Some((state.place + samples, dts != state.place))
     }
     None => None,
+  };
+  // NUT's index (`write_index`, `nutenc.c` 615–667): a key frame — one
+  // libavformat marks so for a codec that counts every frame one among
+  // them (`mux.c` 820–821) — presented before the last, or at it but
+  // decoded at another time ([`FfmpegMuxRefusal::KeyFrameOrder`]).
+  let key_times = if rules.nut.is_some() && (payload.key || rules.marks_key) {
+    let times = (
+      i128::from(own.pts_ticks.unwrap_or(dts_ticks)),
+      i128::from(dts_ticks),
+    );
+    if let Some(last) = state.key_times
+      && (times.0 < last.0 || (times.0 == last.0 && times.1 != last.1))
+    {
+      return Err(FfmpegMuxRefusal::KeyFrameOrder {
+        track,
+        pts: own.pts.unwrap_or(own.dts),
+      });
+    }
+    Some(times)
+  } else {
+    None
   };
   // WAV: the file's size, less eight, its data's pad byte among it, within
   // the 32 bits its RIFF header counts (`wav_write_trailer`, `wavenc.c`
@@ -7190,6 +7380,7 @@ fn check_packet_rules(
     adts,
     bytes: payload.bytes.len() as u64,
     place,
+    key_times,
   })
 }
 
@@ -7861,6 +8052,23 @@ where
       if ticket.width() > i32::from(u16::MAX) || ticket.height() > i32::from(u16::MAX) =>
     {
       Some(MuxOpenError::Dimensions { track })
+    }
+    // NUT's reader refuses a stream header of a video stream of no width
+    // or height, an audio stream of no sample rate or channels, or a
+    // configuration of 2^30 bytes or more (`decode_stream_header`,
+    // `nutdec.c` 447–470), dropping the stream.
+    Audited::Nut
+      if description.kind() == TrackKind::Video
+        && (ticket.width() <= 0 || ticket.height() <= 0) =>
+    {
+      Some(MuxOpenError::Dimensions { track })
+    }
+    Audited::Nut
+      if (description.kind() == TrackKind::Audio
+        && (ticket.sample_rate() <= 0 || ticket.ch_layout().channels() <= 0))
+        || extradata.len() >= 1 << 30 =>
+    {
+      Some(MuxOpenError::ConfigurationInvalid { track, codec })
     }
     // The bitmap header AVI and ASF write a video stream's picture with
     // counts its bytes in an `int`: its width by its height by its bits a
@@ -9239,6 +9447,61 @@ const ASF_PRESENTATION_MAX_MS: i128 = (i32::MAX as i128 - 3) / 10_000 * 10_000_0
 /// ASF's 100 ns ticks a millisecond.
 const ASF_TICKS_A_MILLISECOND: i128 = 10_000;
 
+/// The time base NUT's header sets a stream to, from the one it is handed:
+/// an audio stream's sample rate's; any other's made at least 1/48000 fine
+/// — its numerator divided by 2, 3, 5, 7, 9, 11 and 13 while it divides,
+/// then its denominator doubled below 2^24 (`choose_timebase`,
+/// `nut_write_header`, `nutenc.c` 48–59, 749–753).
+fn nut_time_base(kind: TrackKind, sample_rate: i32, (num, den): (i32, i32)) -> (i32, i32) {
+  if kind == TrackKind::Audio && sample_rate != 0 {
+    return (1, sample_rate);
+  }
+  let (mut num, mut den) = (i64::from(num), i64::from(den));
+  if num <= 0 || den <= 0 {
+    return (num as i32, den as i32);
+  }
+  let mut j = 2;
+  while j < 14 {
+    while den / num < 48_000 && num % j == 0 {
+      num /= j;
+    }
+    j += 1 + i64::from(j > 2);
+  }
+  while den / num < 48_000 && den < 1 << 24 {
+    den <<= 1;
+  }
+  (num as i32, den as i32)
+}
+
+/// The time bases NUT's header will count: its streams', as
+/// [`nut_time_base`] sets them, and its chapters', each once.
+fn nut_time_base_count<D: AsRef<[u8]>>(
+  tracks: &[TrackDescription<Ffmpeg, D, CodecTicket>],
+  roads: &[Road],
+  chapters: &[Chapter<Ffmpeg>],
+) -> u64 {
+  let mut bases: Vec<(i32, i32)> = tracks
+    .iter()
+    .zip(roads)
+    .filter(|(_, road)| **road == Road::Timed)
+    .map(|(description, _)| {
+      let base = description.timebase().reduce();
+      nut_time_base(
+        description.kind(),
+        description.side_data().sample_rate(),
+        (base.num(), base.den().get()),
+      )
+    })
+    .collect();
+  bases.extend(chapters.iter().map(|chapter| {
+    let base = chapter.timebase().reduce();
+    (base.num(), base.den().get())
+  }));
+  bases.sort_unstable();
+  bases.dedup();
+  (bases.len() as u64).max(1)
+}
+
 /// The report table: what `road` keeps in `family` of a track of `kind`
 /// and `codec` declaring `flags` — from each muxer's source in FFmpeg
 /// 9.0.1, and its demuxer's for what reads back. A container this release
@@ -9364,7 +9627,15 @@ fn stream_spec<'a, D: AsRef<[u8]>>(
     !matches!(audited, Audited::Asf { .. })
       || convert_language(tag, LanguageSpace::Iso639_1).is_some()
   });
-  let spec = StreamSpec::new(ticket, description.timebase())
+  // NUT's reader refuses a time base not in lowest terms (`nutdec.c`
+  // 233–240), and NUT writes each as it is handed: the same rational,
+  // reduced, counts every time alike.
+  let time_base = if audited == Audited::Nut {
+    description.timebase().reduce()
+  } else {
+    description.timebase()
+  };
+  let spec = StreamSpec::new(ticket, time_base)
     .with_disposition(written.bits() as i32)
     .with_language(language)
     .with_extradata(description.extradata().map(|bytes| bytes.as_ref()));
@@ -9542,6 +9813,19 @@ fn chapter_losses(
       // and ends each where the next starts, the last at the file's end
       // (`asf_write_markers`, `asfenc.c` 311–347; `asf_read_marker`,
       // `asfdec_f.c` 661–697; `compute_chapters_end`, `demux.c` 2250–2285).
+      // NUT's: a start and a length in the chapter's own time base, exact;
+      // numbered by position from 1 (`write_chapter`, `nutenc.c` 587–612;
+      // `nutdec.c` 525–534).
+      Audited::Nut => {
+        for (index, chapter) in chapters.iter().enumerate() {
+          if chapter.id() != index as i64 + 1 {
+            lost.push(Uncarried::ChapterId {
+              chapter: index,
+              id: chapter.id(),
+            });
+          }
+        }
+      }
       // The streaming form writes none (575), as the arm below says.
       Audited::Asf { stream: false } => {
         const HUNDRED_NANOSECONDS: i64 = 10_000_000;
