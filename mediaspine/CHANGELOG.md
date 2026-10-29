@@ -46,6 +46,19 @@ Its versions are its own: they do not move with the rest of the family's.
   context up again, which flushes it (`KeptReason::AwaitingReference`).
 - An H.264 sequence parameter set's id is read as FFmpeg's
   `get_ue_golomb_31` reads it, 31 among the ids FFmpeg takes.
+- An H.264 slice of a picture parameter set that carries redundant counts
+  is read on to its `redundant_pic_cnt`, as FFmpeg reads it, where every
+  such slice was one the reading could not read: a primary picture's
+  slice is counted, and a redundant one, which FFmpeg discards, is no
+  reference picture, no intra slice and no field. A packet of redundant
+  slices alone is marked whatever their `nal_ref_idc`, but where a first
+  field may wait at it, or an IDR slice keeps it.
+- The reference picture is awaited again at an IDR unit, which FFmpeg
+  resets at whatever it makes of the slice, and after a packet not read
+  whole that may hold one, or a start that may set the decoder's context
+  up again (`KeptReason::AwaitingReference`); and a packet of slices that
+  start no picture is kept while a first field may wait, which FFmpeg ends
+  again at it (`KeptReason::PendingField`).
 
 ## [0.1.1] - 2026-10-23
 

@@ -72,6 +72,89 @@ fn pps(pps_id: u32, sps_id: u32) -> Vec<u8> {
   unit
 }
 
+/// [`pps`] of `redundant_pic_cnt_present_flag` 1: its slices carry a
+/// `redundant_pic_cnt`, and FFmpeg discards one of a count above 0
+/// (`h264_slice.c` 2081–2085).
+fn redundant_pps(pps_id: u32, sps_id: u32) -> Vec<u8> {
+  let mut bits = Bits::new();
+  bits
+    .ue(pps_id)
+    .ue(sps_id)
+    .bit(0)
+    .bit(0)
+    .ue(0)
+    .ue(0)
+    .ue(0)
+    .bit(0)
+    .bits(0, 2)
+    .se(0)
+    .se(0)
+    .se(0)
+    .bit(1)
+    .bit(0)
+    .bit(1);
+  let mut unit = vec![0x68];
+  unit.extend_from_slice(&bits.finish());
+  unit
+}
+
+/// A slice of a picture parameter set of [`redundant_pps`], under an SPS of
+/// `pic_order_cnt_type` 0 and four bits of it, as [`Sps::BASELINE`] and
+/// [`Sps::HIGH`] write: [`slice_of`]'s first fields, then
+/// `pic_order_cnt_lsb` and `redundant_pic_cnt` `count`. An I slice where
+/// `intra`, a P or B slice else.
+fn counted_slice(
+  nal_ref_idc: u8,
+  pps_id: u32,
+  frame_num: u32,
+  structure: Option<Structure>,
+  intra: bool,
+  count: u32,
+) -> Vec<u8> {
+  let slice_type = match (intra, nal_ref_idc) {
+    (true, _) => 7,
+    (false, 0) => 6,
+    (false, _) => 5,
+  };
+  let mut bits = Bits::new();
+  bits.ue(0).ue(slice_type).ue(pps_id).bits(frame_num, 4);
+  match structure {
+    None => {}
+    Some(Structure::Frame) => {
+      bits.bit(0);
+    }
+    Some(Structure::Top) => {
+      bits.bit(1).bit(0);
+    }
+    Some(Structure::Bottom) => {
+      bits.bit(1).bit(1);
+    }
+  }
+  bits.bits(2 * frame_num, 4).ue(count).ue(1).se(0);
+  avc(nal_ref_idc, 1, &bits.finish())
+}
+
+/// An IDR slice of a picture parameter set of [`redundant_pps`], `pps_id`,
+/// under an SPS of frames only and of [`counted_slice`]'s four bits of
+/// `frame_num` and of picture order count: I, `frame_num` 0, `idr_pic_id`
+/// 0, `pic_order_cnt_lsb` 0, then `redundant_pic_cnt` `count` and the rest
+/// of an IDR header.
+fn counted_idr(pps_id: u32, count: u32) -> Vec<u8> {
+  let mut bits = Bits::new();
+  bits
+    .ue(0)
+    .ue(7)
+    .ue(pps_id)
+    .bits(0, 4)
+    .ue(0)
+    .bits(0, 4)
+    .ue(count)
+    .bit(0)
+    .bit(0)
+    .se(0);
+  avc(3, 5, &bits.finish())
+}
+
 /// [`pps`], then the tail FFmpeg reads where bits are left and the SPS's
 /// profile lets it (`h264_ps.c` 794–810): `transform_8x8_mode_flag`, no
 /// scaling matrix, a second chroma offset of 0.
@@ -2048,6 +2131,375 @@ fn a_frame_at_which_the_context_is_set_up_again_awaits_a_reference() {
 }
 
 #[test]
+fn a_primary_picture_of_a_pps_of_redundant_counts_ends_the_waits() {
+  // A Baseline stream whose PPS carries redundant counts: FFmpeg reads each
+  // slice to its `redundant_pic_cnt` (`h264_slice.c` 1786–1812), and decodes
+  // one of a count of 0. Predicted, before this law: every slice of it
+  // unreadable, nothing counted, and the waits for a reference picture and
+  // an intra slice never over; planted, the count unread again, red.
+  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  assert_eq!(
+    read(&mut stream, &[redundant_pps(0, 0)]),
+    kept(KeptReason::Companion(8))
+  );
+  assert_eq!(
+    read(&mut stream, &[counted_slice(2, 0, 0, None, true, 0)]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read(
+      &mut stream,
+      &[
+        counted_slice(0, 0, 1, None, true, 0),
+        counted_slice(0, 0, 1, None, false, 0)
+      ]
+    ),
+    Verdict::Disposable
+  );
+}
+
+#[test]
+fn a_redundant_slice_ends_no_wait_and_moves_no_pairing() {
+  // A slice of a count above 0 FFmpeg reads and discards (`h264_slice.c`
+  // 2081–2085): no picture it decodes, and none it joins. Predicted, before
+  // this law: unreadable, and so kept; planted, a discarded slice taken for
+  // one FFmpeg decodes, red.
+  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  let _ = read(&mut stream, &[redundant_pps(0, 0)]);
+  let _ = read(&mut stream, &[counted_slice(2, 0, 0, None, true, 1)]);
+  assert!(!stream.pending.reference_seen);
+  assert!(!stream.pending.intra_seen);
+  assert_eq!(
+    read(&mut stream, &[counted_slice(0, 0, 0, None, false, 0)]),
+    kept(KeptReason::AwaitingReference)
+  );
+  // Fields: a top field waits, and a redundant bottom one joins nothing.
+  let mut fields = h264(&interlaced_avcc());
+  let _ = read4(&mut fields, &[redundant_pps(0, 0)]);
+  assert_eq!(
+    read4(
+      &mut fields,
+      &[counted_slice(0, 0, 1, Some(Structure::Top), false, 0)]
+    ),
+    kept(KeptReason::UnpairedField)
+  );
+  let _ = read4(
+    &mut fields,
+    &[counted_slice(0, 0, 1, Some(Structure::Bottom), false, 1)],
+  );
+  assert!(matches!(
+    fields.pairing,
+    Pairing::Waiting(Waiting { bottom: false, .. })
+  ));
+  assert_eq!(
+    read4(
+      &mut fields,
+      &[counted_slice(0, 0, 1, Some(Structure::Bottom), false, 0)]
+    ),
+    kept(KeptReason::UnpairedField)
+  );
+  assert_eq!(fields.pairing, Pairing::Settled);
+}
+
+#[test]
+fn a_packet_of_redundant_slices_alone_is_disposable_where_no_field_waits() {
+  // FFmpeg discards each (`h264_slice.c` 2081–2085): the packet makes no
+  // picture, and moves none of what one moves — whatever the slices'
+  // `nal_ref_idc`, whatever a picture would await. Predicted, before this
+  // law: kept, its slices unreadable; planted, the packet held to a
+  // picture's rules, red.
+  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  let _ = read(&mut stream, &[redundant_pps(0, 0)]);
+  assert_eq!(
+    read(&mut stream, &[counted_slice(2, 0, 0, None, true, 1)]),
+    Verdict::Disposable
+  );
+  assert_eq!(
+    read(
+      &mut stream,
+      &[
+        counted_slice(0, 0, 0, None, true, 2),
+        counted_slice(0, 0, 0, None, false, 1)
+      ]
+    ),
+    Verdict::Disposable
+  );
+  // One slice not proven discarded: the packet's picture is FFmpeg's, and
+  // its rules hold.
+  assert_eq!(
+    read(
+      &mut stream,
+      &[
+        counted_slice(0, 0, 0, None, false, 1),
+        counted_slice(0, 0, 0, None, false, 0)
+      ]
+    ),
+    kept(KeptReason::AwaitingReference)
+  );
+  // A first field waiting, FFmpeg ends it again at a packet of slices that
+  // starts no picture (`h264dec.c` 650, 1061–1076): kept. Planted, the
+  // waiting field passed over, red.
+  let mut fields = h264(&interlaced_avcc());
+  let _ = read4(&mut fields, &[redundant_pps(0, 0)]);
+  let _ = read4(
+    &mut fields,
+    &[counted_slice(2, 0, 1, Some(Structure::Top), false, 0)],
+  );
+  assert_eq!(
+    read4(
+      &mut fields,
+      &[counted_slice(2, 0, 1, Some(Structure::Bottom), false, 1)]
+    ),
+    kept(KeptReason::PendingField)
+  );
+}
+
+#[test]
+fn a_packet_of_slices_that_start_no_picture_is_kept_while_a_field_may_wait() {
+  // A reference top field waits; a packet whose one slice FFmpeg refuses —
+  // it names PPS 3, which the list does not hold — starts no picture, yet
+  // FFmpeg ends the waiting field again at it (`has_slice`,
+  // `ff_h264_field_end`, `h264dec.c` 650, 1061–1076), repeating its
+  // reference marking. Predicted, before this law: marked; planted, the
+  // waiting field passed over, red.
+  let mut stream = h264(&interlaced_avcc());
+  assert_eq!(
+    read4(&mut stream, &[field_slice(2, 1, false)]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read4(&mut stream, &[b_slice()]),
+    kept(KeptReason::PendingField)
+  );
+  assert!(matches!(stream.pairing, Pairing::Waiting(_)));
+  // With nothing waiting, it moves nothing.
+  let mut settled = h264(&interlaced_avcc());
+  assert_eq!(read4(&mut settled, &[b_slice()]), Verdict::Disposable);
+}
+
+#[test]
+fn a_redundant_slice_beside_a_primary_picture_keeps_nothing_of_its_own() {
+  // FFmpeg discards the redundant slice after its header (`h264_slice.c`
+  // 2081–2085): the packet's picture is the primary one, and the redundant
+  // slice's `nal_ref_idc` marks nothing, nor its intra slice `non_gray`
+  // (2032–2034). FFmpeg's `picture_intra_only` reads every slice, the
+  // redundant one among them (`h264dec.c` 501–551). Predicted, before this
+  // law: kept, every slice unreadable and no reference picture counted;
+  // planted, the redundant slice's reference or its intra slice counted,
+  // red.
+  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  let _ = read(&mut stream, &[redundant_pps(0, 0)]);
+  assert_eq!(
+    read(&mut stream, &[counted_slice(2, 0, 0, None, false, 0)]),
+    kept(KeptReason::Referenced)
+  );
+  assert!(stream.pending.reference_seen);
+  assert!(!stream.pending.intra_seen);
+  assert_eq!(
+    read(
+      &mut stream,
+      &[
+        counted_slice(0, 0, 1, None, false, 0),
+        counted_slice(2, 0, 1, None, true, 1)
+      ]
+    ),
+    Verdict::Disposable
+  );
+  // A primary picture of intra slices, a redundant P one beside it: not
+  // intra only to FFmpeg, but an intra slice it decodes.
+  assert_eq!(
+    read(
+      &mut stream,
+      &[
+        counted_slice(0, 0, 1, None, true, 0),
+        counted_slice(0, 0, 1, None, false, 1)
+      ]
+    ),
+    kept(KeptReason::AwaitingIntraSlice)
+  );
+}
+
+#[test]
+fn a_redundant_slice_of_another_frame_num_after_a_first_is_refused_and_ffmpeg_may_stop() {
+  // A slice after a picture's first is held to its `frame_num` in its header
+  // (`h264_slice.c` 1750–1756), before FFmpeg reads its count: "Frame num
+  // change", refused, and past it under `AV_EF_EXPLODE` FFmpeg reads no
+  // more of the packet (`h264dec.c` 740–745). Predicted, before this law:
+  // every slice unreadable, the pairing unknown after either packet;
+  // planted, the refusal passed over, the first packet's pair joined, red.
+  let mut stream = h264(&interlaced_avcc());
+  let _ = read4(&mut stream, &[redundant_pps(0, 0)]);
+  assert_eq!(
+    read4(
+      &mut stream,
+      &[
+        counted_slice(2, 0, 1, Some(Structure::Top), false, 0),
+        counted_slice(2, 0, 2, Some(Structure::Top), false, 1),
+        counted_slice(2, 0, 1, Some(Structure::Bottom), false, 0)
+      ]
+    ),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(stream.pairing, Pairing::Unknown);
+  // Of its picture's `frame_num`, it is discarded, and the pair joined.
+  let mut joined = h264(&interlaced_avcc());
+  let _ = read4(&mut joined, &[redundant_pps(0, 0)]);
+  let _ = read4(
+    &mut joined,
+    &[
+      counted_slice(2, 0, 1, Some(Structure::Top), false, 0),
+      counted_slice(2, 0, 1, Some(Structure::Top), false, 1),
+      counted_slice(2, 0, 1, Some(Structure::Bottom), false, 0),
+    ],
+  );
+  assert_eq!(joined.pairing, Pairing::Settled);
+}
+
+#[test]
+fn an_idr_unit_whose_slice_ffmpeg_discards_awaits_a_reference_again() {
+  // At a packet's first IDR unit FFmpeg removes every reference and resets
+  // the picture order count's take-up and `frame_num` (`idr`, `h264dec.c`
+  // 636–648, 438–448) before it reads the slice — here a redundant one it
+  // then discards, as FFmpeg's parser hands it on in a packet of its own,
+  // its first slice of `first_mb_in_slice` 0 (`h264_parser.c` 147–152).
+  // Predicted, before this law: the packet's slices unreadable, the reset
+  // unseen, and the picture after it marked; planted, an IDR unit passed
+  // over, red; planted, every IDR unit of a packet resetting, the
+  // primary's redundant picture beside it awaiting a reference again, red.
+  let mut stream = h264(&avcc(3));
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  let _ = read(&mut stream, &[redundant_pps(0, 0)]);
+  // A primary IDR picture, and a redundant one in its packet: FFmpeg resets
+  // at the first IDR unit alone (`idr_cleared`), and the primary picture is
+  // a reference.
+  assert_eq!(
+    read(&mut stream, &[counted_idr(0, 0), counted_idr(0, 1)]),
+    kept(KeptReason::RandomAccess)
+  );
+  assert_eq!(
+    read(&mut stream, &[counted_slice(0, 0, 1, None, false, 0)]),
+    Verdict::Disposable
+  );
+  // The redundant one alone.
+  assert_eq!(
+    read(&mut stream, &[counted_idr(0, 1)]),
+    kept(KeptReason::RandomAccess)
+  );
+  assert!(!stream.pending.reference_seen);
+  assert_eq!(
+    read(&mut stream, &[counted_slice(0, 0, 1, None, false, 0)]),
+    kept(KeptReason::AwaitingReference)
+  );
+  assert_eq!(
+    read(&mut stream, &[counted_slice(2, 0, 1, None, false, 0)]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read(&mut stream, &[counted_slice(0, 0, 2, None, false, 0)]),
+    Verdict::Disposable
+  );
+}
+
+#[test]
+fn a_packet_not_read_whole_that_may_hold_an_idr_unit_awaits_a_reference() {
+  // A packet the reading does not walk — one that switches the framing,
+  // which FFmpeg reads all the same (`h264dec.c` 602–607) — holding an IDR
+  // unit, at which FFmpeg resets whatever it makes of the slice (`idr`,
+  // 636–648): here a redundant one it discards. Predicted, before this law:
+  // marked; planted, an IDR unit there passed over, red.
+  let mut stream = h264(&avcc(3));
+  let annex = |nals: &[Vec<u8>]| {
+    let mut units = vec![avc(0, 9, &[0xF0])];
+    units.extend_from_slice(nals);
+    annex_b(&units)
+  };
+  let _ = stream.read(&lengths(4, &[redundant_pps(1, 0)]));
+  assert_eq!(
+    stream.read(&annex(&[counted_idr(1, 1)])),
+    kept(KeptReason::FramingChange)
+  );
+  assert_eq!(
+    stream.read(&annex(&[b_slice_0()])),
+    kept(KeptReason::AwaitingReference)
+  );
+  assert_eq!(
+    stream.read(&annex(&[p_slice()])),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(stream.read(&annex(&[b_slice_0()])), Verdict::Disposable);
+  // A slice of another kind there resets nothing.
+  assert_eq!(
+    stream.read(&lengths(4, &[b_slice_0()])),
+    kept(KeptReason::FramingChange)
+  );
+  assert_eq!(
+    stream.read(&lengths(4, &[b_slice_0()])),
+    Verdict::Disposable
+  );
+}
+
+#[test]
+fn a_packet_not_read_whole_that_may_set_the_context_up_again_awaits_a_reference() {
+  // SPS 0 declares one colour matrix and SPS 1 another: a start on SPS 1
+  // sets FFmpeg's context up again (`h264_slice.c` 1117–1123, 1136–1165),
+  // flushing it. A packet the reading does not walk may hold one; after
+  // it, a picture on SPS 2, which declares none and so sets nothing up
+  // itself, may be the first FFmpeg takes its picture order count up from
+  // again (`h264dec.c` 438–474). Predicted, before this law: marked;
+  // planted, the set-up there passed over, red.
+  let described = |id, matrix| {
+    Sps {
+      id,
+      vui: Vui::Described {
+        sar: (1, 1),
+        matrix,
+      },
+      ..Sps::BASELINE
+    }
+    .unit()
+  };
+  let mut stream = h264(&avcc_of(3, &described(0, Some(1))));
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  assert_eq!(
+    read(&mut stream, &[slice_of(2, 0, 0, 0, None)]),
+    kept(KeptReason::Referenced)
+  );
+  let _ = read(
+    &mut stream,
+    &[
+      described(1, Some(6)),
+      pps(1, 1),
+      described(2, None),
+      pps(2, 2),
+    ],
+  );
+  // On SPS 2, nothing set up.
+  assert_eq!(
+    read(&mut stream, &[slice_of(0, 0, 2, 1, None)]),
+    Verdict::Disposable
+  );
+  let mut malformed = lengths(4, &[slice_of(0, 0, 1, 1, None)]);
+  malformed.extend_from_slice(&[0, 0]);
+  assert_eq!(stream.read(&malformed), kept(KeptReason::Malformed));
+  assert_eq!(
+    read(&mut stream, &[slice_of(0, 0, 2, 1, None)]),
+    kept(KeptReason::AwaitingReference)
+  );
+  assert_eq!(
+    read(&mut stream, &[slice_of(2, 0, 2, 1, None)]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read(&mut stream, &[slice_of(0, 0, 2, 2, None)]),
+    Verdict::Disposable
+  );
+}
+
+#[test]
 fn the_first_hevc_packet_after_the_opening_a_seek_or_an_end_of_sequence_is_kept() {
   // FFmpeg's HEVC decoder takes its `eos` flag up with whatever packet it
   // reads next, and the flag decides whether the next CRA picture starts a
@@ -3118,28 +3570,14 @@ fn a_slice_the_reading_cannot_read_for_its_field_keeps_its_packet() {
     ),
     kept(KeptReason::MaybeField)
   );
-  // A picture parameter set of redundant counts: FFmpeg discards a slice
-  // of a count above 0, which the reading does not read (2081–2085).
-  let mut redundant = Bits::new();
-  redundant
-    .ue(2)
-    .ue(0)
-    .bit(0)
-    .bit(0)
-    .ue(0)
-    .ue(0)
-    .ue(0)
-    .bit(0)
-    .bits(0, 2)
-    .se(0)
-    .se(0)
-    .se(0)
-    .bit(1)
-    .bit(0)
-    .bit(1);
-  let _ = read4(&mut stream, &[avc(3, 8, &redundant.finish())]);
+  // A picture parameter set of redundant counts: a slice whose header ends
+  // before its `redundant_pic_cnt`, which FFmpeg may discard or not
+  // (2081–2085).
+  let _ = read4(&mut stream, &[redundant_pps(2, 0)]);
+  let mut short = Bits::new();
+  short.ue(0).ue(6).ue(2).bits(1, 4).bit(0).bits(6, 4);
   assert_eq!(
-    read4(&mut stream, &[slice_of(0, 0, 2, 1, Some(Structure::Frame))]),
+    read4(&mut stream, &[avc(0, 1, &short.finish())]),
     kept(KeptReason::MaybeField)
   );
 }
@@ -3314,6 +3752,7 @@ fn a_picture_parameter_set_is_read_as_ffmpeg_reads_it() {
       PpsHeader {
         sps: header(&interlaced_sps()),
         redundant: false,
+        pic_order_present: false,
         compared: Compared {
           sps_id: Some(0),
           transform_8x8: Some(false),
