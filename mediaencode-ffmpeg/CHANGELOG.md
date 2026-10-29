@@ -320,6 +320,11 @@ crate moves only when it changes.
   whose OBUs do not parse, which the filter refuses (`PayloadRule::Obus`,
   now FLV's too). The configuration `extract_extradata` makes replaces the
   packet's own, and FLV's rewrite is decided by it.
+- **The coordinator's R8 letters, built (R10).** The MPEG program
+  stream's preload, an `int` of microseconds its first write adds the
+  half second less the first decode time to, refused where it would wrap
+  (`FfmpegMuxRefusal::TimeWraps`), at the packet that would be written
+  first.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

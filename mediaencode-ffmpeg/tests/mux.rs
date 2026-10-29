@@ -12749,3 +12749,53 @@ fn l109_av1s_configuration_is_refused_where_ff_isom_write_av1c_would_fail() {
   }
   muxer.finish().expect("finished");
 }
+
+/// **L112 — the program stream's preload is refused where its `int`
+/// would wrap** (R10; `mpegenc.c` 89, 1189–1191): its first write adds
+/// the half second less the first decode time, in microseconds, to an
+/// `int` — on DVD whatever that time, elsewhere where it lies before the
+/// half second — so that a first time about 2147 s from it wraps: refused
+/// at the packet, handed back, and the next one, of a time it holds,
+/// taken.
+///
+/// PLANT: the wrap unjudged takes the far packet.
+#[test]
+fn l112_the_program_streams_preload_is_refused_where_it_would_wrap() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = picture_and_sound(
+    &corpus,
+    "mpeg2-mp2.mkv",
+    &["-c:v", "mpeg2video", "-bf", "0"],
+    &["-c:a", "mp2", "-ac", "2"],
+  );
+  let (_, frames) = first_track(&source, TrackKind::Video, 2);
+  for (container, far, near) in [
+    ("dvd", 2_200_000, 2_000_000),
+    ("mpeg", -2_200_000, -2_000_000),
+  ] {
+    let target = output(&corpus, &format!("l112.{container}"));
+    let mut muxer = muxer_into(
+      &target,
+      ContainerName::new(container),
+      table_of(&source, TrackKind::Video),
+    );
+    let offered = video_at(&video_of(&frames[0]), Some(far), far);
+    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    assert_eq!(
+      refusal,
+      FfmpegMuxRefusal::TimeWraps {
+        track: TrackIndex::new(0),
+        timestamp: ms(far),
+      },
+      "{container}"
+    );
+    untouched!(offered, back);
+    for (frame, at) in frames.iter().zip([near, near + 40]) {
+      muxer
+        .write_video(video_at(&video_of(frame), Some(at), at))
+        .map_err(|error| error.map_packet(drop))
+        .expect("a time the preload holds");
+    }
+    muxer.finish().expect("finished");
+  }
+}

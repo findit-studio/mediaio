@@ -577,7 +577,7 @@
 //! | NUT | a presentation time below zero, refused after taking it (`nutenc.c` 979–985) | as ASF's — and judged on the decode time, no later: a syncpoint at the packet counts it unsigned (`put_tt`, 329–333, 1041) |
 //! | Matroska | a block below zero written with no cue (`matroskaenc.c` 969–970) | [`FfmpegMuxRefusal::BeforeZero`] |
 //! | MP4 | `check_pkt`'s reference, the last sample written (`movenc.c` 6897–6930) | table C″ |
-//! | MPEG-PS | the first packet's decode time, below the preload, raises the preload (`mpegenc.c` 1188–1199); every time after written with it added (1201–1202), a 33-bit field (`put_timestamp`) | the move first; after the first write, a time it leaves before zero but within the preload taken, written whole — one past it refused ([`FfmpegMuxRefusal::BeforeZero`]; R9: Fable R3) — L93 |
+//! | MPEG-PS | the first packet's decode time, below the preload, raises the preload (`mpegenc.c` 1188–1199); every time after written with it added (1201–1202), a 33-bit field (`put_timestamp`) | the move first; after the first write, a time it leaves before zero but within the preload taken, written whole — one past it refused ([`FfmpegMuxRefusal::BeforeZero`]; R9: Fable R3) — L93; the preload an `int` of microseconds (89, 1189–1191), wrapped by a first time about 2147 s from the half second — before it, or after it on DVD: refused at the packet that would be written first ([`FfmpegMuxRefusal::TimeWraps`]; R10) — L112 |
 //! | F4V, AVIF | MP4's writer, of no `AVFMT_TS_NEGATIVE`: libavformat's move first (`movenc.c` 9500–9520) | after the first write, a time the move leaves before zero taken, as MP4 takes negative times, its edit list writing them (R9: Fable R3) — L100 |
 //! | MPEG-TS | a decode time below the clock reference: a warning (`mpegtsenc.c` 1606–1607) | nothing refused |
 //! | every other time G18 finds kept | a duration, a page's, a cue's or an index's start, a maximum, a base for RTP's clock — or a muxer refused at open (DASH, HDS, HLS, segment, smooth streaming) | nothing held below it |
@@ -7743,6 +7743,23 @@ where
           } else {
             (output.dts_ticks, output.dts)
           };
+          // The program stream's preload, an `int` of microseconds its first
+          // write adds the half second less the first packet's decode time
+          // to (`mpegenc.c` 89, 1189–1191): refused where it would wrap, at
+          // a packet before that write that would be the first written,
+          // the earliest held — the packet the write is decided by.
+          if let Some(dvd) = state.rules.ps_preload
+            && !next.written
+            && next
+              .head
+              .is_none_or(|head| Timestamp::new(output.dts_ticks, time_base) < head)
+            && ps_preload_wraps(i128::from(output.dts_ticks) + next.lift(time_base), dvd)
+          {
+            return Err(Refusal::Container(FfmpegMuxRefusal::TimeWraps {
+              track,
+              timestamp: output.dts,
+            }));
+          }
           next = next
             .take(
               track.get(),
@@ -11694,6 +11711,19 @@ const PS_PRELOAD_TICKS: i128 = 45_000;
 /// decoded before the half second, or always on DVD, the half second less
 /// its decode time — rescaled into microseconds and back as the muxer
 /// rescales it, to the nearest — and none else.
+/// Whether the program stream's preload, an `int` of microseconds, wraps
+/// when its first write, decoded at `first` of its 90 kHz ticks, adds the
+/// half second less that time to it (`mpegenc.c` 89, 1189–1191): its sum
+/// past `i32` — a first time about 2147 s from the half second, before it,
+/// or after it on DVD.
+fn ps_preload_wraps(first: i128, dvd: bool) -> bool {
+  (first < PS_PRELOAD_TICKS || dvd) && {
+    let micros = -first * 1_000_000;
+    let rescaled = (micros.abs() + 45_000) / 90_000 * micros.signum();
+    i32::try_from(500_000 + rescaled).is_err()
+  }
+}
+
 fn ps_preload_ticks(first: i128, dvd: bool) -> i128 {
   // `av_rescale`'s rounding to the nearest, half away from zero, of either
   // sign (`mathematics.c` 59–135).
