@@ -4023,7 +4023,12 @@ struct PacketRules {
 /// its decode time rewritten one tick past the reference into the moved
 /// count, that offset less one back; every later sample's is then out of
 /// range, and the next fragment's flush asserts on the duration it counts
-/// (`get_cluster_duration`, 1248–1256): the process ends.
+/// (`get_cluster_duration`, 1248–1256): the process ends. ISMV alone: CMAF
+/// forces the same offsets where no edit list is written (8183–8185,
+/// 8217–8218), and `negative_cts_offsets` is a flag of its own, but both
+/// are `movflags`, an option the header is never handed
+/// (`avformat_write_header`'s options null), so no other mode moves the
+/// count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IsmShift {
   /// Whether a key frame of the track flushes the fragment between the two
