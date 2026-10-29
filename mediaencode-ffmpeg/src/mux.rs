@@ -342,7 +342,7 @@
 //!
 //! | check | source | here |
 //! |---|---|---|
-//! | a duration or a decode gap past `i32::MAX` ticks — the gap from the last sample MP4 wrote on the track, none before the first; ISMV's gap `i32::MAX` less the track's first composition offset, which its negative composition offsets add to the gap `check_pkt`'s second call counts, the decode time moved by it and the reference not — the rewritten decode time lands that offset back, and the next fragment's flush asserts on it, ending the process (7396–7410, 1248–1256) — but before a key frame of the file's only video track, whose flush comes between the two calls (7445–7471; R10, L6); a subtitle's negative duration, which libavformat hands on as it is — another track's it writes as zero, or its own guess (`mux.c` 605–633), reported ([`Rewrite::Durations`]); a composition offset past `i32` | `check_pkt` 6897–6928; 6955–6959 | [`FfmpegMuxRefusal::DurationTooLong`], [`DtsGap`](FfmpegMuxRefusal::DtsGap), [`NegativeDuration`](FfmpegMuxRefusal::NegativeDuration), [`PresentationOffset`](FfmpegMuxRefusal::PresentationOffset); the last sample written, table C″ |
+//! | a duration or a decode gap past `i32::MAX` ticks — the gap from the last sample MP4 wrote on the track, none before the first; ISMV's gap `i32::MAX` less the track's first composition offset, which its negative composition offsets add to the gap `check_pkt`'s second call counts, the decode time moved by it and the reference not — the rewritten decode time lands that offset back, and the next fragment's flush asserts on it, ending the process (7396–7410, 1248–1256) — but before a key frame of its one video track, whose flush comes between the two calls (7445–7471; R10, L6), a second video track refused at open, booked to Q870 ([`MuxOpenError::TrackLayout`]; R11, Codex R10 2); a subtitle's negative duration, which libavformat hands on as it is — another track's it writes as zero, or its own guess (`mux.c` 605–633), reported ([`Rewrite::Durations`]); a composition offset past `i32` | `check_pkt` 6897–6928; 6955–6959 | [`FfmpegMuxRefusal::DurationTooLong`], [`DtsGap`](FfmpegMuxRefusal::DtsGap), [`NegativeDuration`](FfmpegMuxRefusal::NegativeDuration), [`PresentationOffset`](FfmpegMuxRefusal::PresentationOffset); the last sample written, table C″ |
 //! | AMR-NB: one frame a packet; ADPCM MS and IMA WAV: a frame size | 6983–7002 | not reached: MP4's tag table holds neither (`codec_mp4_tags`, 9230–9290), refused at open ([`MuxOpenError::CodecNotCarried`]); MOV's mode reaches it, its AMR and ADPCM booked (table H) |
 //! | no samples: less than a frame of a sized codec | 7006–7010 | [`PayloadRule::PartialSample`], [`PayloadRule::Empty`] |
 //! | the first packet taken as the configuration of H.264, HEVC, VVC, EVC, LCEVC, VP9, TrueHD or DNxHD where none is stated | 7024–7041 | H.264, HEVC, VVC, LCEVC and EVC refused at open ([`MuxOpenError::ConfigurationMissing`]); TrueHD refused at open; VP9's and DNxHD's boxes made from it, written |
@@ -762,8 +762,8 @@
 //! | NUT, at open | raw video of a tag its tables do not hold; a video stream of no width or height, an audio one of no sample rate or channels, a configuration of 2^30 bytes or more; a chapter starting past its count; a time base not in lowest terms | written under the tables' first raw tag, RGB 5:5:5's, read back as that; a stream header its reader refuses; wrapped; a main header its reader refuses (`nut.c` 50; `nutdec.c` 233–240, 447–470; `nutenc.c` 601) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ChapterSpan`]; the time base handed reduced — L90 |
 //! | MXF, MXF D-10, MXF OP-Atom | an MPEG-2 picture of coding type 0, or of a profile and level MXF labels no codec for; a P or B picture, whose index offsets this release does not mirror; DNxHD's first frame short of its compression id, or of an id MXF labels none for; a frame of another size than a constant-bit-rate index counts — MXF D-10's of its bit rate, DNxHD's of its first; an empty packet; at the end, a track no packet reached | refused after taking it; its index written at the next segment, the whole file lost at an offset past a byte; refused after taking it; refused after taking it; an essence element of none; nothing written, the trailer failing (`mxfenc.c` 2361–2397, 2793–2858, 3325–3458, 3487–3606) | [`PayloadRule::FrameHeader`], [`PayloadRule::PredictedPicture`], [`PayloadRule::FrameSize`], [`PayloadRule::Empty`], [`FfmpegMuxRefusal::NoFrame`] — L99 |
 //! | MXF, MXF D-10, MXF OP-Atom, at open | a codec but MPEG-2, DNxHD and ProRes video — MXF D-10's MPEG-2 alone — and 16- and 24-bit PCM: H.264, DV, FFV1 and JPEG 2000, whose frame parsers this release has not audited, and the data and caption tracks, booked; a first track not the one video track, OP-Atom's second track, MXF D-10's audio track not its second; a frame rate MXF names no content package for, or none; no pixel format; ProRes of no profile its labels name; sound but at 48 kHz, OP-Atom's but mono; MXF D-10's video at a bit rate it names not, or at a rate but 25 and 30000/1001; its sound past eight channels, or of a block alignment not its channels' samples | refused at its start; or its label another standard's; or its writer dividing by the alignment (`mxfenc.c` 2941–3165, 3222–3248) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ConfigurationInvalid`] — L98 |
-//! | the MOV family's modes | MP4's packet rules; ISMV's and AVIF's samples past the dynamic buffer they are written into — AVIF's held until its trailer, ISMV's until its next fragment's flush, counted here from the track's first sample, stricter than FFmpeg and losing nothing; ISMV's decode gap of `i32::MAX` less the track's first composition offset, but before a key frame of the file's only video track | as MP4's; the buffer refusing the write, the sample tables counting bytes the file lacks (`movenc.c` 6961–6981; `aviobuf.c` 1281–1311); the decode time rewritten that offset back, the next flush's `av_assert0` ending the process (6897–6923, 7396–7410, 1248–1256) | as MP4's; [`PayloadRule::FragmentSize`], [`FfmpegMuxRefusal::DtsGap`] — L103, L123 |
-//! | the MOV family's modes, at open | a codec this release admits not beside MP4's — MOV's raw video, DV, MPEG-2, H.263, DNxHD, ProRes, PCM, MP3, AMR, ADPCM, QDM2, G.726, iLBC, and H.264 of an intra profile or AVC-Intra tag; 3GP's and 3G2's H.263 and AMR; F4V's VP6; ISMV's WMA Pro and TTML; PSP's every codec but H.264, MPEG-4 Part 2 and AAC; AVIF's alpha plane — booked; a picture past 65535; MPEG audio layer III below 16 kHz outside MOV; TTML's `dfxp` tag outside ISMV; PSP's table of other than one video and one audio track, AVIF's of more than one; the Nero list's untitled chapter, which reads back titled empty, no longer untitled (R9: Fable R2, judged by the ruled rule), a title past 255 bytes, cut | refused at the start, written with no configuration box, or so that it reads back otherwise (`movenc.c` 1380–2140, 5040–5064, 6431–6448, 8129–8650) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`] — L102 |
+//! | the MOV family's modes | MP4's packet rules; ISMV's and AVIF's samples past the dynamic buffer they are written into — AVIF's held until its trailer, ISMV's until its next fragment's flush, counted here from the track's first sample, stricter than FFmpeg and losing nothing; ISMV's decode gap of `i32::MAX` less the track's first composition offset, but before a key frame of its one video track | as MP4's; the buffer refusing the write, the sample tables counting bytes the file lacks (`movenc.c` 6961–6981; `aviobuf.c` 1281–1311); the decode time rewritten that offset back, the next flush's `av_assert0` ending the process (6897–6923, 7396–7410, 1248–1256) | as MP4's; [`PayloadRule::FragmentSize`], [`FfmpegMuxRefusal::DtsGap`] — L103, L123 |
+//! | the MOV family's modes, at open | a codec this release admits not beside MP4's — MOV's raw video, DV, MPEG-2, H.263, DNxHD, ProRes, PCM, MP3, AMR, ADPCM, QDM2, G.726, iLBC, and H.264 of an intra profile or AVC-Intra tag; 3GP's and 3G2's H.263 and AMR; F4V's VP6; ISMV's WMA Pro and TTML; PSP's every codec but H.264, MPEG-4 Part 2 and AAC; AVIF's alpha plane — booked; a picture past 65535; MPEG audio layer III below 16 kHz outside MOV; TTML's `dfxp` tag outside ISMV; PSP's table of other than one video and one audio track, AVIF's of more than one; ISMV's second video track, whose key frames' flushes before `check_pkt`'s second count rest on libavformat's interleaving, which this release does not mirror — booked to Q870 (R11, Codex R10 2); the Nero list's untitled chapter, which reads back titled empty, no longer untitled (R9: Fable R2, judged by the ruled rule), a title past 255 bytes, cut | refused at the start, written with no configuration box, or so that it reads back otherwise (`movenc.c` 1380–2140, 5040–5064, 6431–6448, 8129–8650) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`] — L102, L132 |
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -2346,9 +2346,9 @@ pub enum FfmpegMuxRefusal {
   /// reference unmoved: there a gap of `i32::MAX` less that offset is
   /// refused too — the rewritten decode time would land that offset back,
   /// and the next fragment's flush assert on it, ending the process
-  /// (`movenc.c` 7396–7410, 1248–1256) — but before a key frame of the
-  /// file's only video track, whose flush comes between the two counts
-  /// (7445–7471).
+  /// (`movenc.c` 7396–7410, 1248–1256) — but before a key frame of its one
+  /// video track, whose flush comes between the two counts (7445–7471); a
+  /// second video track is refused at open ([`MuxOpenError::TrackLayout`]).
   #[error("track {}: the decode time {} lies too far after the last for MP4", .track.get(), .dts.pts())]
   DtsGap {
     /// The track.
@@ -3236,7 +3236,10 @@ pub enum MuxOpenError {
   /// OP-Atom's second track (`mxf_init`, `mxfenc.c` 2946–2966, 3043–3047);
   /// PSP's of other than one video and one audio track, named at the first
   /// track where one is missing (`mov_write_header`, `movenc.c` 6431–6448);
-  /// AVIF's second track, its alpha plane's booked (8250–8270).
+  /// AVIF's second track, its alpha plane's booked (8250–8270); ISMV's
+  /// second video track, booked to Q870: whether its key frames flush
+  /// before `check_pkt`'s second count rests on libavformat's interleaving
+  /// (7445–7471).
   #[error("track {} has no place where it lies in the container's table", .track.get())]
   TrackLayout {
     /// The first track out of place.
@@ -4033,12 +4036,10 @@ struct PacketRules {
 struct IsmShift {
   /// Whether a key frame of the track flushes the fragment between the two
   /// calls, the second's reference then the key frame's own decode time
-  /// (7445–7471): a key frame of the file's only video track, whose key
-  /// frames alone flush, each after a sample of its own. Beside another
-  /// video track, whose key frames flush too, whether the track's fragment
-  /// holds a sample at its key frame rests on libavformat's interleaving,
-  /// which this release does not mirror: such a gap is refused, stricter
-  /// than FFmpeg where the interleaving lets the flush come first.
+  /// (7445–7471): a key frame of ISMV's one video track, whose key frames
+  /// alone flush, each after a sample of its own. A second video track,
+  /// whose key frames would flush too, is refused at open, booked to Q870
+  /// ([`mov_misplaced`]).
   flushes_at_key: bool,
 }
 
@@ -7799,12 +7800,6 @@ where
       .iter()
       .filter(|(_, stream, _, _)| stream.is_some())
       .count();
-    let video_tracks = states
-      .iter()
-      .filter(|(kind, stream, road, _)| {
-        *kind == TrackKind::Video && stream.is_some() && *road == Road::Timed
-      })
-      .count();
     let mut track_states = Vec::with_capacity(states.len());
     for (index, (kind, stream, road, filter)) in states.into_iter().enumerate() {
       let track = TrackIndex::new(index);
@@ -7846,7 +7841,7 @@ where
           );
           if audited == Audited::Mov(MovMode::Ism) {
             rules.ism = Some(IsmShift {
-              flushes_at_key: kind == TrackKind::Video && video_tracks == 1,
+              flushes_at_key: kind == TrackKind::Video,
             });
           }
           // WAV's fact chunk counts the last duration libavformat hands
@@ -10631,7 +10626,13 @@ fn mov_refusal<D: AsRef<[u8]>>(
 /// the table: PSP writes one video and one audio track and no other, a
 /// cover aside (`mov_write_header`, `movenc.c` 6431–6448) — the first track
 /// where one of the two is missing; AVIF one video track, its alpha plane's
-/// second booked (`mov_init`, 8250–8270).
+/// second booked (`mov_init`, 8250–8270); ISMV one video track, a second
+/// booked to Q870: each video track's key frame flushes every track's
+/// fragment where the track holds a sample (`mov_write_single_packet`,
+/// 7445–7471), and whether it does before `check_pkt`'s second count of a
+/// packet its negative composition offsets moved ([`IsmShift`]) rests on
+/// the order libavformat's interleaving hands the tracks' packets on,
+/// which this release does not mirror.
 fn mov_misplaced<D, S>(
   mode: MovMode,
   tracks: &[TrackDescription<Ffmpeg, D, S>],
@@ -10666,6 +10667,11 @@ fn mov_misplaced<D, S>(
       .enumerate()
       .find(|(position, (_, kind))| *position > 0 || *kind != TrackKind::Video)
       .map(|(_, &(index, _))| TrackIndex::new(index)),
+    MovMode::Ism => timed
+      .iter()
+      .filter(|(_, kind)| *kind == TrackKind::Video)
+      .nth(1)
+      .map(|&(index, _)| TrackIndex::new(index)),
     _ => None,
   }
 }

@@ -14875,17 +14875,15 @@ fn write_ism(
 /// its decode time rewritten `s − 1` ticks back, and the next fragment's
 /// flush asserts on it, ending the process. Refused by name, the packet
 /// handed back, before a predicted picture, and the file written whole
-/// without it; and before a key frame of one of two video tracks, whose
-/// flush libavformat's interleaving decides. A key frame of the file's
-/// only video track, which flushes before the second call, keeps the
-/// first's bound: refused at `INT_MAX`.
+/// without it. A key frame of the one video track — a second is refused
+/// at open (L132) — flushes before the second call and keeps the first's
+/// bound: refused at `INT_MAX`.
 ///
 /// PLANT: the shift unmirrored, the predicted picture taken — FFmpeg then
 /// ends the process on `Assertion next_dts >= 0 failed at
-/// libavformat/movenc.c:1255`; the key frame's flush taken for any video
-/// track, the second table's key frame taken; the flushing key frame's
-/// gap unbounded, the third file's key frame taken; the shift the
-/// packet's own offset, the predicted picture's of none, it taken.
+/// libavformat/movenc.c:1255`; the flushing key frame's gap unbounded, the
+/// second file's key frame taken; the shift the packet's own offset, the
+/// predicted picture's of none, it taken.
 #[test]
 fn l123a_ismv_refuses_a_gap_its_shifted_second_check_would_move() {
   let Some(corpus) = Corpus::new() else { return };
@@ -14971,51 +14969,6 @@ fn l123a_ismv_refuses_a_gap_its_shifted_second_check_would_move() {
     (ism_ticks(), 1),
   );
   muxer.finish().expect("finished");
-
-  // Two video tracks: the first's key frame flushes the second's
-  // fragment, and whether the second's own then comes first rests on the
-  // interleaving.
-  let target = output(&corpus, "l123a-two.ismv");
-  let mut table = table_of(&source, TrackKind::Video);
-  table.extend(table_of(&source, TrackKind::Video));
-  let mut muxer = muxer_into(&target, ContainerName::new("ismv"), table);
-  write_ism(
-    &mut muxer,
-    &[0, 1],
-    &frames,
-    (0, second_key, 0),
-    (ism_ticks(), 1),
-  );
-  let (frame, pts, dts) = &frames[second_key];
-  muxer
-    .write_video(ism_at(0, frame, *pts, *dts))
-    .map_err(|error| error.map_packet(drop))
-    .expect("the first track's key frame");
-  let after = limit - (dts - frames[second_key - 1].2);
-  let offered = ism_at(1, frame, pts + after, dts + after);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
-  assert_eq!(
-    refusal,
-    FfmpegMuxRefusal::DtsGap {
-      track: TrackIndex::new(1),
-      dts: Timestamp::new(dts + after, ism_ticks()),
-    },
-    "beside another video track"
-  );
-  untouched!(offered, back);
-  muxer
-    .write_video(ism_at(1, frame, *pts, *dts))
-    .map_err(|error| error.map_packet(drop))
-    .expect("the second track's key frame");
-  write_ism(
-    &mut muxer,
-    &[0, 1],
-    &frames,
-    (second_key + 1, frames.len(), 0),
-    (ism_ticks(), 1),
-  );
-  muxer.finish().expect("finished");
-  assert_eq!(packet_count(&target), 2 * frames.len());
 }
 
 /// **L123b — ISMV takes the gap one tick short of it, and the gap itself
@@ -15673,4 +15626,45 @@ fn l131_flv_reads_flacs_layout_back_from_its_multichannel_configuration() {
       None,
     );
   }
+}
+
+/// **L132 — ISMV of a second video track is refused at open, booked to
+/// Q870** (R11, Codex R10 2; `movenc.c` 7396–7471): each video track's key
+/// frame flushes every track's fragment where the track holds a sample,
+/// and whether it does before `check_pkt`'s second count of a packet the
+/// negative composition offsets moved rests on the order libavformat's
+/// interleaving hands the tracks' packets on, which this release does not
+/// mirror. Two video tracks are refused by the second's name
+/// (`MuxOpenError::TrackLayout`) before anything is written; one video
+/// track beside an audio track opens, its packets under L123's rule.
+///
+/// PLANT: ISMV's second video track admitted, the first table opened.
+#[test]
+fn l132_ismv_of_a_second_video_track_is_refused_at_open() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let video = || table_of(&source, TrackKind::Video).remove(0);
+  let sound = || table_of(&source, TrackKind::Audio).remove(0);
+  let open = |name: &str, table| {
+    let target = output(&corpus, name);
+    let result = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new("ismv"),
+      table,
+      &[],
+      PacketLimits::default(),
+    );
+    (target, result.map(drop))
+  };
+  let (target, result) = open("l132-two.ismv", vec![sound(), video(), video()]);
+  assert!(
+    matches!(
+      result,
+      Err(MuxOpenError::TrackLayout { track }) if track == TrackIndex::new(2)
+    ),
+    "{result:?}"
+  );
+  assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+  let (_, result) = open("l132-one.ismv", vec![sound(), video()]);
+  result.expect("one video track");
 }
