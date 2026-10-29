@@ -3725,6 +3725,16 @@ fn opus_mkv(corpus: &Corpus) -> PathBuf {
   ])
 }
 
+/// [`opus_mkv`] 10 ms shorter, its encoder's last packet no lone
+/// table-of-contents byte: a stream MPEG-TS takes whole.
+#[rustfmt::skip]
+fn opus_of_two_bytes_mkv(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "opus-two-bytes.mkv", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.49",
+    "-ac", "2", "-c:a", "opus", "-strict", "-2",
+  ])
+}
+
 /// Two TTML paragraphs in MP4, from libavcodec's TTML encoder.
 #[rustfmt::skip]
 fn ttml_mp4(corpus: &Corpus) -> PathBuf {
@@ -8874,7 +8884,7 @@ fn recoded(
   codec: ffmpeg_next::ffi::AVCodecID,
   extradata: &[u8],
 ) -> TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket> {
-  use mediaencode::mediaspine::demuxer::{AudioTrackParams, VideoTrackParams};
+  use mediaencode::mediaspine::demuxer::{AudioTrackParams, SubtitleTrackParams, VideoTrackParams};
   let index = row.side_data().stream_index();
   let mut parameters = row.side_data().rebuild().expect("the parameters");
   // SAFETY: `parameters` owns its `AVCodecParameters`, live for the
@@ -8893,6 +8903,7 @@ fn recoded(
       params.pixel_format().clone(),
       params.frame_rate(),
     )),
+    TrackParams::Subtitle(_) => TrackParams::Subtitle(SubtitleTrackParams::new(id)),
     TrackParams::Audio(params) => TrackParams::Audio(AudioTrackParams::new(
       id,
       params.sample_rate(),
@@ -8949,6 +8960,11 @@ fn remuxed(
 /// millisecond of it, a reader counting it from the samples its source's
 /// milliseconds rounded.
 fn read_back_as(source: &Path, target: &Path, timed: &[usize]) {
+  read_back_lifted(source, target, timed, 0);
+}
+
+/// [`read_back_as`], every time read back `lift` milliseconds later.
+fn read_back_lifted(source: &Path, target: &Path, timed: &[usize], lift: i64) {
   let offered = packets(source);
   let back = packets(target);
   assert_eq!(back.len(), offered.len());
@@ -8960,7 +8976,7 @@ fn read_back_as(source: &Path, target: &Path, timed: &[usize]) {
       let (seen_ms, sent_ms) = (in_ms(seen.pts), in_ms(sent.pts));
       assert!(
         !timed.contains(&track)
-          || matches!((seen_ms, sent_ms), (Some(a), Some(b)) if (a - b).abs() <= 1),
+          || matches!((seen_ms, sent_ms), (Some(a), Some(b)) if (a - b - lift).abs() <= 1),
         "track {track}/{index}: presented at {seen_ms:?}, offered at {sent_ms:?}"
       );
     }
@@ -9445,6 +9461,702 @@ fn l92_ogg_refuses_what_its_start_and_granules_cannot_hold() {
   muxer.finish().expect("finished");
 }
 
+/// **L93 — MPEG-2 video and MPEG audio round-trip through the MPEG
+/// program stream's five muxers, and the report says what they keep**
+/// (table H; `mpegenc.c` 640–1257): every packet reads back with its bytes
+/// and its key flag, its reader's parser framing the stream again, and
+/// with its presentation time moved by the preload, or with none where its
+/// start shares a PES packet with an earlier one's — the first packet
+/// decoded before half a second, every stream's times moved so that it
+/// lies there ([`Uncarried::TimesShifted`]); the writer keeps the times of
+/// the first packet each PES packet holds the start of alone, the reader
+/// counting the others' ([`Rewrite::Timeline`]), and no key flag
+/// ([`Rewrite::SyncFromBitstream`] for the video). DVD writes its
+/// navigation packets beside them, which its reader takes for a data
+/// stream of their own.
+///
+/// PLANT: the preload unreported.
+#[test]
+fn l93_streams_round_trip_through_mpeg_ps() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = picture_and_sound(
+    &corpus,
+    "mpeg2-mp2.mkv",
+    &["-c:v", "mpeg2video", "-bf", "0"],
+    &["-c:a", "mp2", "-ac", "2"],
+  );
+  let rewritten = |track: usize, rewrite| Uncarried::Rewritten {
+    track: TrackIndex::new(track),
+    rewrite,
+  };
+  for container in ["mpeg", "vcd", "vob", "svcd", "dvd"] {
+    let target = output(&corpus, &format!("l93.{container}"));
+    let report = remuxed(&source, &target, container, whole_table(&source), &[]);
+    assert_eq!(
+      field_rows(&report),
+      vec![
+        rewritten(0, Rewrite::Timeline),
+        rewritten(0, Rewrite::SyncFromBitstream),
+        rewritten(1, Rewrite::Timeline),
+      ],
+      "{container}"
+    );
+    assert!(
+      report.uncarried().contains(&Uncarried::TimesShifted),
+      "{container}: the preload"
+    );
+    let offered = packets(&source);
+    let back = packets(&target);
+    let first = offered
+      .iter()
+      .filter_map(|track| in_ms(track.first().and_then(|first| first.dts)))
+      .min()
+      .expect("a first decode time");
+    let preload = 500 - first;
+    // The video and the audio as their reader numbers them; DVD's
+    // navigation packets a stream of their own.
+    let tracks: Vec<_> = FfmpegOwnedDemuxer::open(&target)
+      .expect("open")
+      .tracks()
+      .iter()
+      .map(|row| row.kind())
+      .collect();
+    if container == "dvd" {
+      assert!(tracks.contains(&TrackKind::Data), "{container}: {tracks:?}");
+    }
+    let of_kind = |kind: TrackKind| {
+      tracks
+        .iter()
+        .position(|&seen| seen == kind)
+        .unwrap_or_else(|| panic!("{container}: a {kind:?} track in {tracks:?}"))
+    };
+    for (track, kind) in [(0, TrackKind::Video), (1, TrackKind::Audio)] {
+      let seen = &back[of_kind(kind)];
+      assert_eq!(
+        seen.len(),
+        offered[track].len(),
+        "{container}: track {track}"
+      );
+      for (index, (seen, sent)) in seen.iter().zip(&offered[track]).enumerate() {
+        assert!(
+          seen.bytes == sent.bytes,
+          "{container} {track}/{index}: the bytes"
+        );
+        assert_eq!(
+          seen.key, sent.key,
+          "{container} {track}/{index}: the key flag"
+        );
+        // A packet whose start shares a PES packet with an earlier one's
+        // reads back with no time of its own.
+        let (seen_ms, sent_ms) = (in_ms(seen.pts), in_ms(sent.pts));
+        assert!(
+          index > 0 && seen_ms.is_none()
+            || matches!((seen_ms, sent_ms), (Some(a), Some(b)) if (a - b - preload).abs() <= 1),
+          "{container} {track}/{index}: presented at {seen_ms:?}, offered at {sent_ms:?}"
+        );
+      }
+    }
+  }
+}
+
+/// **L94 — the MPEG program stream's refusals** (table H; `mpegenc.c`
+/// 303–1257; `mpeg.c` 528–630): at open, a codec its start or its reader
+/// does not take — Opus; big-endian PCM, which reads back as DVD PCM; a
+/// subtitle but DVD's ([`MuxOpenError::CodecNotCarried`]); DVD PCM of a
+/// sample rate its header cannot name ([`MuxOpenError::ConfigurationInvalid`]);
+/// a ninth AC-3 stream, past AC-3's ids into DTS's; a third MPEG-2 video
+/// stream beside H.264, its id H.264's first; a 35th stream the system
+/// header has no room for ([`MuxOpenError::StreamIds`]) — each one fewer
+/// opening. In packets: an empty packet, which the writer writes nothing
+/// of ([`PayloadRule::Empty`]); a DVD PCM packet shorter than its 3-byte
+/// header ([`PayloadRule::PcmHeader`]); a time past half of `int64_t`'s
+/// range, which leaves the writer's clock no room before it overflows
+/// ([`FfmpegMuxRefusal::TimeWraps`]), a tick earlier taken.
+///
+/// PLANT: each check removed takes its packet, or opens.
+#[test]
+fn l94_mpeg_ps_refuses_what_its_ids_and_headers_cannot_hold() {
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  let Some(corpus) = Corpus::new() else { return };
+  let open = |name: &str, container: &str, table| {
+    let target = output(&corpus, name);
+    let result = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new(container),
+      table,
+      &[],
+      PacketLimits::default(),
+    );
+    match result {
+      Ok((muxer, _)) => {
+        muxer.finish().expect("finished");
+        Ok(())
+      }
+      Err(error) => {
+        assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+        Err(error)
+      }
+    }
+  };
+  let source = picture_and_sound(
+    &corpus,
+    "mpeg2-mp2.mkv",
+    &["-c:v", "mpeg2video", "-bf", "0"],
+    &["-c:a", "mp2", "-ac", "2"],
+  );
+  let pcm = pcm_mkv(&corpus);
+  let ac3 = audio_file(&corpus, "ac3.mkv", "ac3");
+  for (name, table) in [
+    ("l94-opus.mpg", table_of(&opus_mkv(&corpus), TrackKind::Audio)),
+    (
+      "l94-s16be.mpg",
+      vec![recoded(table_of(&pcm, TrackKind::Audio).remove(0), Id::AV_CODEC_ID_PCM_S16BE, &[])],
+    ),
+    (
+      "l94-ass.mpg",
+      table_of(
+        &generated(
+          &corpus,
+          "ass.mkv",
+          &[
+            "-i",
+            written_text(
+              &corpus,
+              "two.srt",
+              "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n2\n00:00:01,000 --> 00:00:02,000\nworld\n\n",
+            )
+            .to_str()
+            .expect("utf-8 path"),
+            "-c:s",
+            "ass",
+          ],
+        ),
+        TrackKind::Subtitle,
+      ),
+    ),
+  ] {
+    assert!(
+      matches!(
+        open(name, "mpeg", table),
+        Err(MuxOpenError::CodecNotCarried { .. })
+      ),
+      "{name}"
+    );
+  }
+  let dvd_pcm = |rate: i32| {
+    vec![recoded(
+      audio_rated(&pcm, rate).remove(0),
+      Id::AV_CODEC_ID_PCM_DVD,
+      &[],
+    )]
+  };
+  assert!(matches!(
+    open("l94-rate.vob", "vob", dvd_pcm(22_050)),
+    Err(MuxOpenError::ConfigurationInvalid { .. })
+  ));
+  open("l94-rate.vob", "vob", dvd_pcm(48_000)).expect("48 kHz");
+
+  let copies = |path: &Path, kind: TrackKind, count: usize| {
+    (0..count)
+      .map(|_| table_of(path, kind).remove(0))
+      .collect::<Vec<_>>()
+  };
+  assert!(matches!(
+    open("l94-ac3.vob", "vob", copies(&ac3, TrackKind::Audio, 9)),
+    Err(MuxOpenError::StreamIds { track }) if track.get() == 8
+  ));
+  open("l94-ac3.vob", "vob", copies(&ac3, TrackKind::Audio, 8)).expect("eight AC-3 ids");
+  let h264 = table_of(&corpus.multi_track_mkv(), TrackKind::Video).remove(0);
+  let mut videos = copies(&source, TrackKind::Video, 3);
+  videos.push(h264);
+  assert!(matches!(
+    open("l94-video.vob", "vob", videos),
+    Err(MuxOpenError::StreamIds { track }) if track.get() == 3
+  ));
+  let mut videos = copies(&source, TrackKind::Video, 2);
+  videos.push(table_of(&corpus.multi_track_mkv(), TrackKind::Video).remove(0));
+  open("l94-video.vob", "vob", videos).expect("two MPEG-2 ids before H.264's");
+  let mut many = copies(&source, TrackKind::Audio, 32);
+  many.extend(copies(&source, TrackKind::Video, 3));
+  assert!(matches!(
+    open("l94-many.mpg", "mpeg", many),
+    Err(MuxOpenError::StreamIds { track }) if track.get() == 34
+  ));
+  let mut many = copies(&source, TrackKind::Audio, 32);
+  many.extend(copies(&source, TrackKind::Video, 2));
+  open("l94-many.mpg", "mpeg", many).expect("a system header of 114 bytes");
+
+  let (table, frames) = first_track(&source, TrackKind::Audio, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l94-empty.mpg"),
+    ContainerName::new("mpeg"),
+    table,
+  );
+  let empty = audio_at(&audio_holding(&audio_of(&frames[0]), &[]), 0);
+  let (refusal, back) = by_container(muxer.write_audio(empty.clone()));
+  assert_eq!(refusal, payload(PayloadRule::Empty));
+  untouched!(empty, back);
+  muxer.finish().expect("finished");
+
+  // A time past half of `int64_t`'s range, in 90 kHz.
+  let (table, frames) = first_track(&source, TrackKind::Audio, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l94-end.mpg"),
+    ContainerName::new("mpeg"),
+    table,
+  );
+  let at_90k = Timebase::new(1, NonZeroI32::new(90_000).expect("non-zero"));
+  let ending = |at: i64| {
+    AudioTrackPacket::new(
+      TrackIndex::new(0),
+      audio_of(&frames[0])
+        .with_pts(Some(Timestamp::new(at, at_90k)))
+        .with_dts(Some(Timestamp::new(at, at_90k))),
+    )
+  };
+  muxer
+    .write_audio(ending(0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first");
+  let far = ending(i64::MAX / 2 + 1);
+  let (refusal, back) = by_container(muxer.write_audio(far.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: Timestamp::new(i64::MAX / 2 + 1, at_90k),
+    }
+  );
+  untouched!(far, back);
+  muxer
+    .write_audio(ending(i64::MAX / 2))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a tick earlier");
+  muxer.finish().expect("finished");
+
+  let (_, frames) = first_track(&pcm, TrackKind::Audio, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l94-pcm.vob"),
+    ContainerName::new("vob"),
+    dvd_pcm(48_000),
+  );
+  let short = audio_at(&audio_holding(&audio_of(&frames[0]), &[0, 1]), 0);
+  let (refusal, back) = by_container(muxer.write_audio(short.clone()));
+  assert_eq!(refusal, payload(PayloadRule::PcmHeader));
+  untouched!(short, back);
+  muxer
+    .write_audio(audio_at(
+      &audio_holding(&audio_of(&frames[0]), &[0, 1, 0x80, 0, 0]),
+      0,
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a header and a sample");
+  muxer.finish().expect("finished");
+}
+
+/// **L95 — H.264 that reorders, AAC, MPEG audio, AC-3 and Opus round-trip
+/// through MPEG-TS, and the report says what MPEG-TS keeps** (table H;
+/// `mpegtsenc.c` 537–2240): a video packet reads back with its times, in
+/// a PES packet of its own, its key flag, and an access unit delimiter put
+/// before it ([`Rewrite::AccessUnitDelimiters`]); audio gathered into PES
+/// packets, its times counted by the reader's parser ([`Rewrite::Timeline`]),
+/// AAC's frames behind the ADTS headers its configuration makes
+/// ([`Rewrite::AdtsHeaders`]), the rest as written, Opus's times moved
+/// past its pre-skip's start before zero ([`Uncarried::TimesShifted`]),
+/// its trims kept in its control headers — MPEG audio's and AC-3's, which
+/// MPEG-TS has no place for, reported dropped ([`Uncarried::SideData`]);
+/// no duration
+/// ([`Rewrite::Durations`]); the H.264 filter named at the packet
+/// it converts; an audio stream's language of three bytes, with the first
+/// of its clean-effects, hearing-impaired and visual-impaired flags, kept —
+/// the video's language and flags, and the audio's other flags, reported
+/// ([`Uncarried::Language`], [`Uncarried::Disposition`]).
+///
+/// PLANT: the delimiters unreported; the audio's flags kept as every one;
+/// the audio's times taken as written; Opus's trims reported dropped.
+#[test]
+fn l95_streams_round_trip_through_mpeg_ts() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let rewritten = |track: usize, rewrite| Uncarried::Rewritten {
+    track: TrackIndex::new(track),
+    rewrite,
+  };
+  let mut table = whole_table(&source);
+  table[0].set_language(Some("eng".into()));
+  table[0].set_disposition(TrackDisposition::DEFAULT);
+  table[1].set_language(Some("fra".into()));
+  table[1].set_disposition(TrackDisposition::HEARING_IMPAIRED | TrackDisposition::VISUAL_IMPAIRED);
+  let target = output(&corpus, "l95.ts");
+  let report = remuxed(&source, &target, "mpegts", table, &[]);
+  assert_eq!(
+    field_rows(&report),
+    vec![
+      rewritten(0, Rewrite::AccessUnitDelimiters),
+      rewritten(0, Rewrite::Durations),
+      rewritten(0, Rewrite::SyncFromBitstream),
+      rewritten(1, Rewrite::AdtsHeaders),
+      rewritten(1, Rewrite::Timeline),
+      rewritten(1, Rewrite::SyncFromBitstream),
+      // Named at the first packet, the one it converts.
+      Uncarried::Filtered {
+        track: TrackIndex::new(0),
+        filter: AutomaticFilter::H264Mp4ToAnnexB,
+      },
+    ]
+  );
+  assert_eq!(
+    lines(&report, |line| matches!(
+      line,
+      Uncarried::Language { .. } | Uncarried::Disposition { .. }
+    )),
+    vec![
+      Uncarried::Language {
+        track: TrackIndex::new(0),
+        tag: "eng".into(),
+      },
+      Uncarried::Disposition {
+        track: TrackIndex::new(0),
+        flags: TrackDisposition::DEFAULT,
+      },
+      Uncarried::Disposition {
+        track: TrackIndex::new(1),
+        flags: TrackDisposition::VISUAL_IMPAIRED,
+      },
+    ]
+  );
+  let offered = packets(&source);
+  let back = packets(&target);
+  let lift = offered
+    .iter()
+    .filter_map(|track| in_ms(track.first().and_then(|first| first.dts)))
+    .min()
+    .map_or(0, |dts| (-dts).max(0));
+  assert_eq!(back[0].len(), offered[0].len(), "a video packet a packet");
+  for (index, (seen, sent)) in back[0].iter().zip(&offered[0]).enumerate() {
+    assert!(
+      seen.bytes.starts_with(&[0, 0, 0, 1, 9]) || seen.bytes.starts_with(&[0, 0, 1, 9]),
+      "video {index}: behind a delimiter"
+    );
+    assert_eq!(seen.key, sent.key, "video {index}: the key flag");
+    assert_eq!(
+      in_ms(seen.pts),
+      in_ms(sent.pts).map(|pts| pts + lift),
+      "video {index}"
+    );
+    assert_eq!(
+      in_ms(seen.dts),
+      in_ms(sent.dts).map(|dts| dts + lift),
+      "video {index}"
+    );
+  }
+  assert_eq!(back[1].len(), offered[1].len(), "an AAC frame a packet");
+  for (index, (seen, sent)) in back[1].iter().zip(&offered[1]).enumerate() {
+    assert!(
+      seen.bytes.len() == sent.bytes.len() + 7 && seen.bytes[7..] == sent.bytes[..],
+      "AAC {index}: the frame behind its ADTS header"
+    );
+    assert!(
+      matches!((in_ms(seen.pts), in_ms(sent.pts)), (Some(a), Some(b)) if (a - b - lift).abs() <= 1),
+      "AAC {index}"
+    );
+  }
+  let read = FfmpegOwnedDemuxer::open(&target).expect("open");
+  let rows: Vec<_> = read
+    .tracks()
+    .iter()
+    .map(|row| {
+      (
+        row.language().map(|tag| tag.as_str().to_owned()),
+        row.disposition(),
+      )
+    })
+    .collect();
+  assert_eq!(
+    rows,
+    [
+      (None, TrackDisposition::empty()),
+      (Some("fra".to_owned()), TrackDisposition::HEARING_IMPAIRED),
+    ]
+  );
+
+  for (name, path) in [
+    ("mp2", audio_file(&corpus, "mp2.mkv", "mp2")),
+    ("ac3", audio_file(&corpus, "ac3.mkv", "ac3")),
+    ("opus", opus_of_two_bytes_mkv(&corpus)),
+  ] {
+    assert!(
+      packets(&path)[0]
+        .iter()
+        .all(|packet| packet.bytes.len() >= 2),
+      "{name}: the premise, no packet MPEG-TS refuses as too short"
+    );
+    let target = output(&corpus, &format!("l95-{name}.ts"));
+    let report = remuxed(
+      &path,
+      &target,
+      "mpegts",
+      table_of(&path, TrackKind::Audio),
+      &[],
+    );
+    assert_eq!(
+      field_rows(&report),
+      vec![rewritten(0, Rewrite::Timeline)],
+      "{name}"
+    );
+    // Opus's first packet, before zero by its pre-skip, moves the stream.
+    let lift = packets(&path)[0]
+      .first()
+      .and_then(|first| in_ms(first.pts))
+      .map_or(0, |pts| (-pts).max(0));
+    assert_eq!(
+      report.uncarried().contains(&Uncarried::TimesShifted),
+      lift > 0,
+      "{name}"
+    );
+    // Opus's start and end trims, in its control headers; MPEG audio's
+    // and AC-3's MPEG-TS has no place for.
+    let trims = lines(&report, |line| matches!(line, Uncarried::SideData { .. }));
+    if name == "opus" {
+      assert_eq!(trims, vec![], "{name}: the side data MPEG-TS keeps");
+    } else {
+      assert!(
+        trims.iter().all(|line| matches!(
+          line,
+          Uncarried::SideData {
+            fate: SideDataFate::Dropped,
+            ..
+          }
+        )),
+        "{name}: {trims:?}"
+      );
+    }
+    read_back_lifted(&path, &target, &[0], lift);
+  }
+}
+
+/// **L96 — MPEG-TS's refusals** (table H; `mpegtsenc.c` 216–2240): at open,
+/// a codec MPEG-TS writes as private data its reader may not name —
+/// Vorbis ([`MuxOpenError::CodecNotCarried`]); Opus of a channel mapping
+/// its PMT cannot describe, and AAC of a configuration ADTS cannot write
+/// ([`MuxOpenError::ConfigurationInvalid`]); a 91st MPEG audio stream with
+/// its language, starting past the PMT section's 988th byte, and a DVB
+/// subtitle stream of three codes that takes the section past its 1012
+/// ([`MuxOpenError::StreamIds`]), one fewer stream before each opening.
+/// In packets: a reordering H.264 packet with no presentation time
+/// ([`FfmpegMuxRefusal::MissingPts`]); with the filters off, H.264 off a
+/// start code, and an Annex B packet of four bytes
+/// ([`PayloadRule::StartCode`]); an AAC packet of one byte
+/// ([`PayloadRule::TooShort`]); a raw AAC frame on a track with no
+/// configuration ([`PayloadRule::AdtsFrame`]), and one past the 13 bits of
+/// its ADTS header ([`PayloadRule::AdtsFrameLength`]), an ADTS frame taken
+/// as it is; an empty packet ([`PayloadRule::Empty`]); a time past the
+/// room of its clock reference, 300 times its decode time in `int64_t`
+/// ([`FfmpegMuxRefusal::TimeWraps`]), one at it taken.
+///
+/// PLANT: each check removed takes its packet, or opens.
+#[test]
+fn l96_mpeg_ts_refuses_what_its_pmt_and_pes_cannot_hold() {
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  let Some(corpus) = Corpus::new() else { return };
+  let ts = || ContainerName::new("mpegts");
+  let open = |name: &str, table| {
+    let target = output(&corpus, name);
+    let result = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ts(),
+      table,
+      &[],
+      PacketLimits::default(),
+    );
+    match result {
+      Ok((muxer, _)) => {
+        muxer.finish().expect("finished");
+        Ok(())
+      }
+      Err(error) => {
+        assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+        Err(error)
+      }
+    }
+  };
+  let vorbis = picture_and_sound(
+    &corpus,
+    "vp8-vorbis.webm",
+    &["-c:v", "libvpx"],
+    &["-c:a", "vorbis", "-strict", "-2", "-ac", "2"],
+  );
+  assert!(matches!(
+    open("l96-vorbis.ts", table_of(&vorbis, TrackKind::Audio)),
+    Err(MuxOpenError::CodecNotCarried { .. })
+  ));
+  let opus = opus_mkv(&corpus);
+  let mut head = table_of(&opus, TrackKind::Audio)[0]
+    .side_data()
+    .extradata_ref()
+    .as_ref()
+    .to_vec();
+  head.truncate(19);
+  head[18] = 255;
+  assert!(matches!(
+    open(
+      "l96-opus.ts",
+      vec![
+        table_of(&opus, TrackKind::Audio)
+          .remove(0)
+          .with_extradata(Some(bytes_of(&head)))
+      ]
+    ),
+    Err(MuxOpenError::ConfigurationInvalid { .. })
+  ));
+  let aac = table_of(&corpus.multi_track_mkv(), TrackKind::Audio);
+  assert!(matches!(
+    open(
+      "l96-aac.ts",
+      aac
+        .into_iter()
+        .map(|row| row.with_extradata(Some(bytes_of(&[0xF8, 0x00]))))
+        .collect()
+    ),
+    Err(MuxOpenError::ConfigurationInvalid { .. })
+  ));
+  let mp2 = audio_file(&corpus, "mp2.mkv", "mp2");
+  let languaged = |count: usize| {
+    (0..count)
+      .map(|_| {
+        let mut row = table_of(&mp2, TrackKind::Audio).remove(0);
+        row.set_language(Some("eng".into()));
+        row
+      })
+      .collect::<Vec<_>>()
+  };
+  assert!(matches!(
+    open("l96-pmt.ts", languaged(91)),
+    Err(MuxOpenError::StreamIds { track }) if track.get() == 90
+  ));
+  open("l96-pmt.ts", languaged(90)).expect("90 streams of 11 bytes in the PMT");
+  // 88 streams to the 972nd byte, then a DVB subtitle stream of three
+  // codes — 31 bytes — within 1012; after 89, past it.
+  let ass = generated(
+    &corpus,
+    "ass.mkv",
+    &[
+      "-i",
+      written_text(
+        &corpus,
+        "two.srt",
+        "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n2\n00:00:01,000 --> 00:00:02,000\nworld\n\n",
+      )
+      .to_str()
+      .expect("utf-8 path"),
+      "-c:s",
+      "ass",
+    ],
+  );
+  let dvb = || {
+    let mut row = recoded(
+      table_of(&ass, TrackKind::Subtitle).remove(0),
+      Id::AV_CODEC_ID_DVB_SUBTITLE,
+      &[],
+    );
+    row.set_language(Some("eng,fra,deu".into()));
+    row
+  };
+  let mut full = languaged(88);
+  full.push(dvb());
+  open("l96-section.ts", full).expect("1003 bytes");
+  let mut full = languaged(89);
+  full.push(dvb());
+  assert!(matches!(
+    open("l96-section.ts", full),
+    Err(MuxOpenError::StreamIds { track }) if track.get() == 89
+  ));
+
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let (table, frames) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  let track = TrackIndex::new(0);
+  let mut muxer = muxer_with(&output(&corpus, "l96-h264.ts"), ts(), table, filters(false));
+  let missing = video_at(&frame, None, 0);
+  let (refusal, back) = by_container(muxer.write_video(missing.clone()));
+  assert_eq!(refusal, FfmpegMuxRefusal::MissingPts { track });
+  untouched!(missing, back);
+  for bytes in [frame.data().as_ref().to_vec(), vec![0, 0, 1, 0x65]] {
+    let offered = video_at(&video_holding(&frame, &bytes), Some(0), 0);
+    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    assert_eq!(refusal, payload(PayloadRule::StartCode));
+    untouched!(offered, back);
+  }
+  muxer.finish().expect("finished");
+
+  let (table, frames) = first_track(&source, TrackKind::Audio, 1);
+  let raw = audio_of(&frames[0]);
+  let mut muxer = muxer_into(&output(&corpus, "l96-aac.ts"), ts(), table);
+  for (bytes, rule) in [
+    (vec![0x21], PayloadRule::TooShort),
+    (vec![0x21; 8185], PayloadRule::AdtsFrameLength),
+    (vec![], PayloadRule::Empty),
+  ] {
+    let offered = audio_at(&audio_holding(&raw, &bytes), 0);
+    let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+    assert_eq!(refusal, payload(rule), "{} bytes", bytes.len());
+    untouched!(offered, back);
+  }
+  let mut framed = vec![0xFF, 0xF1, 0x4C, 0x80, 0x00, 0x00, 0xFC];
+  framed.extend_from_slice(raw.data().as_ref());
+  let length = framed.len();
+  framed[3] = 0x80 | ((length >> 11) & 3) as u8;
+  framed[4] = (length >> 3) as u8;
+  framed[5] = (((length & 7) << 5) | 0x1F) as u8;
+  muxer
+    .write_audio(audio_at(&audio_holding(&raw, &framed), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("an ADTS frame, written as it is");
+  muxer.finish().expect("finished");
+  // A time past the clock's room, `i64::MAX / 600` ticks of 90 kHz.
+  let (table, frames) = first_track(&mp2, TrackKind::Audio, 1);
+  let mut muxer = muxer_into(&output(&corpus, "l96-clock.ts"), ts(), table);
+  let at_90k = Timebase::new(1, NonZeroI32::new(90_000).expect("non-zero"));
+  let at = |ticks: i64| {
+    AudioTrackPacket::new(
+      TrackIndex::new(0),
+      audio_of(&frames[0])
+        .with_pts(Some(Timestamp::new(ticks, at_90k)))
+        .with_dts(Some(Timestamp::new(ticks, at_90k))),
+    )
+  };
+  muxer
+    .write_audio(at(0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first");
+  let far = at(i64::MAX / 600 + 1);
+  let (refusal, back) = by_container(muxer.write_audio(far.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: Timestamp::new(i64::MAX / 600 + 1, at_90k),
+    }
+  );
+  untouched!(far, back);
+  muxer
+    .write_audio(at(i64::MAX / 600))
+    .map_err(|error| error.map_packet(drop))
+    .expect("within it");
+  muxer.finish().expect("finished");
+
+  let bare: Vec<_> = table_of(&source, TrackKind::Audio)
+    .into_iter()
+    .map(|row| row.with_extradata(Some(bytes_of(&[]))))
+    .collect();
+  let mut muxer = muxer_with(&output(&corpus, "l96-bare.ts"), ts(), bare, filters(false));
+  let offered = audio_at(&raw, 0);
+  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  assert_eq!(refusal, payload(PayloadRule::AdtsFrame));
+  untouched!(offered, back);
+  muxer.finish().expect("finished");
+}
+
 /// **L87 — what ASF, and the RIFF formats' audio header, cannot count is
 /// refused at open, nothing written** (table H): a chapter title whose
 /// marker entry passes 16 bits — 12 bytes and the title in UTF-16 with its
@@ -9778,4 +10490,643 @@ fn l88_riff_formats_take_aac_raw_and_asf_marks_its_audio() {
       );
     }
   }
+}
+
+/// MPEG-2 video of intra pictures alone and 48 kHz PCM in Matroska, the
+/// sound 30 ms longer than the picture: 25 frames, 49 440 samples.
+#[rustfmt::skip]
+fn mxf_source(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "mxf-source.mkv", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=1",
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1.03",
+    "-map", "0:v", "-map", "1:a",
+    "-c:v", "mpeg2video", "-g", "1", "-bf", "0", "-c:a", "pcm_s16le", "-ac", "2",
+  ])
+}
+
+/// MPEG-2 video of intra pictures alone, in Matroska, by itself.
+#[rustfmt::skip]
+fn intra_mpeg2_mkv(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "mpeg2-intra.mkv", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=0.4",
+    "-c:v", "mpeg2video", "-g", "1", "-bf", "0",
+  ])
+}
+
+/// MPEG-2 video of intra and predicted pictures, a picture in twelve
+/// intra, in Matroska.
+#[rustfmt::skip]
+fn long_gop_mkv(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "mpeg2-gop.mkv", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=0.4",
+    "-c:v", "mpeg2video", "-g", "12", "-bf", "0",
+  ])
+}
+
+/// DNxHR LB at 320 × 240 in Matroska: ten frames of one size.
+#[rustfmt::skip]
+fn dnxhr_mkv(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "dnxhr.mkv", &[
+    "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=0.4",
+    "-c:v", "dnxhd", "-profile:v", "dnxhr_lb", "-pix_fmt", "yuv422p",
+  ])
+}
+
+/// ProRes 422 Proxy at 320 × 240 in Matroska.
+#[rustfmt::skip]
+fn prores_mkv(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "prores.mkv", &[
+    "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=0.4",
+    "-c:v", "prores_ks", "-profile:v", "0", "-pix_fmt", "yuv422p10le",
+  ])
+}
+
+/// MXF D-10's 625-line picture: MPEG-2 4:2:2 at 50 Mbit/s, every frame
+/// 250 000 bytes, and stereo PCM, in MOV, whose `btrt` box carries the bit
+/// rate back.
+#[rustfmt::skip]
+fn imx_mov(corpus: &Corpus) -> PathBuf {
+  let m2v = generated(corpus, "imx.m2v", &[
+    "-f", "lavfi", "-i", "testsrc=size=720x608:rate=25:duration=0.2",
+    "-pix_fmt", "yuv422p", "-c:v", "mpeg2video", "-g", "1", "-bf", "0",
+    "-intra_vlc", "1", "-non_linear_quant", "1", "-dc", "10", "-qmax", "12",
+    "-b:v", "50M", "-minrate", "50M", "-maxrate", "50M", "-bufsize", "2000000",
+    "-rc_init_occupancy", "2000000", "-rc_max_vbv_use", "1", "-rc_min_vbv_use", "1",
+  ]);
+  generated(corpus, "imx.mov", &[
+    "-i", m2v.to_str().expect("utf-8 path"),
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.2",
+    "-c:v", "copy", "-c:a", "pcm_s16le", "-ac", "2",
+  ])
+}
+
+/// `row` with its ticket's parameters rewritten by `edit`.
+fn reticketed(
+  mut row: TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>,
+  edit: impl FnOnce(&mut ffmpeg_next::ffi::AVCodecParameters),
+) -> TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket> {
+  let index = row.side_data().stream_index();
+  let mut parameters = row.side_data().rebuild().expect("the parameters");
+  // SAFETY: `parameters` owns its `AVCodecParameters`, live for the edit,
+  // which writes plain fields.
+  edit(unsafe { &mut *parameters.as_mut_ptr() });
+  *row.side_data_mut() = CodecTicket::mirror(&parameters, index, usize::MAX).expect("the ticket");
+  row
+}
+
+/// `row`, a video track's, stating `frame_rate`.
+fn rerated(
+  row: TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>,
+  frame_rate: Option<Timebase>,
+) -> TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket> {
+  use mediaencode::mediaspine::demuxer::VideoTrackParams;
+  let (timebase, params, extradata, ticket, language, disposition, _) =
+    row.into_parts_with_disposition();
+  let params = match params {
+    TrackParams::Video(params) => TrackParams::Video(VideoTrackParams::new(
+      params.codec(),
+      params.width(),
+      params.height(),
+      params.pixel_format().clone(),
+      frame_rate,
+    )),
+    other => other,
+  };
+  TrackDescription::new(timebase, params, ticket)
+    .expect("a timed track")
+    .with_extradata(extradata)
+    .with_language(language)
+    .with_disposition(disposition)
+}
+
+/// Every packet of `path` written into a muxer of `container` over
+/// `table` at `target`, each as it is, and the muxer finished: the whole
+/// report, what only the end decides with it.
+fn remuxed_to_the_end(
+  path: &Path,
+  target: &Path,
+  container: &str,
+  table: Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>>,
+  chapters: &[Chapter<Ffmpeg>],
+) -> mediaencode_ffmpeg::MuxReport {
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(target).expect("create"),
+    ContainerName::new(container),
+    table,
+    chapters,
+    PacketLimits::default(),
+  )
+  .expect("open");
+  let mut demuxer = FfmpegOwnedDemuxer::open(path).expect("open");
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    match packet {
+      DemuxedPacket::Video(p) => muxer
+        .write_video(VideoTrackPacket::new(p.track(), p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      DemuxedPacket::Audio(p) => muxer
+        .write_audio(AudioTrackPacket::new(p.track(), p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      other => panic!("{other:?}"),
+    }
+    .expect("a packet");
+  }
+  muxer.finish_into_sink().expect("finished").1
+}
+
+/// Every packet's bytes of `packets`, one after another.
+fn joined(packets: &[Seen]) -> Vec<u8> {
+  packets
+    .iter()
+    .flat_map(|packet| packet.bytes.iter().copied())
+    .collect()
+}
+
+/// **L97 — MPEG-2 video and PCM round-trip through MXF and MXF D-10, DNxHD,
+/// MPEG-2 and PCM through MXF OP-Atom, and ProRes through MXF, and the
+/// report says what each keeps** (table H; `mxfenc.c` 2941–3658): a video
+/// packet reads back with its bytes, presented at its count of frames —
+/// the times the writer replaces with each packet's count on its stream,
+/// its reader counting them again ([`Rewrite::Timeline`]) — and MPEG-2's
+/// key flag judged by its reader's parser ([`Rewrite::SyncFromBitstream`]);
+/// PCM cut into the edit units of the video's frame rate, its bytes kept
+/// in order ([`AutomaticFilter::PcmRechunk`]), MXF D-10's through its AES3
+/// element; no language ([`Uncarried::Language`]); no chapter
+/// ([`Uncarried::Chapter`]). At the end the packets past the last edit
+/// unit every track fills — here the last of PCM's 26 units, padded with
+/// silence, beside 25 frames — are dropped, and reported
+/// ([`Uncarried::Trailing`]).
+///
+/// PLANT: the times reported kept; the trailing unit unreported, or the
+/// sound counted in its packets as offered.
+#[test]
+fn l97_streams_round_trip_through_mxf() {
+  let Some(corpus) = Corpus::new() else { return };
+  let rewritten = |track: usize, rewrite| Uncarried::Rewritten {
+    track: TrackIndex::new(track),
+    rewrite,
+  };
+  let source = mxf_source(&corpus);
+  let mut table = whole_table(&source);
+  table[1].set_language(Some("eng".into()));
+  let chapters = [chapter_of(1, 0, 500, Some("one"))];
+  let target = output(&corpus, "l97.mxf");
+  let report = remuxed_to_the_end(&source, &target, "mxf", table, &chapters);
+  assert_eq!(
+    field_rows(&report),
+    vec![
+      rewritten(0, Rewrite::Timeline),
+      rewritten(0, Rewrite::SyncFromBitstream),
+      Uncarried::Filtered {
+        track: TrackIndex::new(1),
+        filter: AutomaticFilter::PcmRechunk,
+      },
+      rewritten(1, Rewrite::Timeline),
+    ]
+  );
+  assert_eq!(
+    lines(&report, |line| matches!(
+      line,
+      Uncarried::Language { .. } | Uncarried::Chapter { .. } | Uncarried::Trailing { .. }
+    )),
+    vec![
+      Uncarried::Language {
+        track: TrackIndex::new(1),
+        tag: "eng".into(),
+      },
+      Uncarried::Chapter { chapter: 0 },
+      Uncarried::Trailing {
+        track: TrackIndex::new(1),
+        packets: 1,
+      },
+    ]
+  );
+  let offered = packets(&source);
+  let back = packets(&target);
+  assert_eq!(back[0].len(), offered[0].len(), "a frame a packet");
+  for (index, (seen, sent)) in back[0].iter().zip(&offered[0]).enumerate() {
+    assert!(seen.bytes == sent.bytes, "frame {index}: the bytes");
+    assert_eq!(seen.key, sent.key, "frame {index}: the key flag");
+    assert_eq!(in_ms(seen.pts), Some(40 * index as i64), "frame {index}");
+  }
+  // 25 edit units of 1920 samples, four bytes each: the 26th, its last 30
+  // ms padded, dropped.
+  assert_eq!(back[1].len(), 25, "an edit unit a packet");
+  assert!(back[1].iter().all(|packet| packet.bytes.len() == 1920 * 4));
+  assert!(
+    joined(&back[1])[..] == joined(&offered[1])[..25 * 1920 * 4],
+    "the samples, in order"
+  );
+  for (index, seen) in back[1].iter().enumerate() {
+    assert_eq!(in_ms(seen.pts), Some(40 * index as i64), "unit {index}");
+  }
+
+  // MXF D-10: its 50 Mbit/s frames, of 250 000 bytes each, and the sound
+  // through its AES3 element.
+  let imx = imx_mov(&corpus);
+  let table: Vec<_> = whole_table(&imx)
+    .into_iter()
+    .map(|row| match row.kind() {
+      TrackKind::Audio => reticketed(row, |par| par.block_align = 4),
+      _ => row,
+    })
+    .collect();
+  let target = output(&corpus, "l97-d10.mxf");
+  remuxed_to_the_end(&imx, &target, "mxf_d10", table, &[]);
+  let offered = packets(&imx);
+  let back = packets(&target);
+  assert_eq!(back[0].len(), offered[0].len(), "D-10: a frame a packet");
+  for (index, (seen, sent)) in back[0].iter().zip(&offered[0]).enumerate() {
+    assert!(seen.bytes == sent.bytes, "D-10 frame {index}: the bytes");
+  }
+  let sound = joined(&back[1]);
+  assert!(
+    sound[..] == joined(&offered[1])[..sound.len()],
+    "D-10: the samples, in order"
+  );
+
+  // OP-Atom: one track each — DNxHD, MPEG-2, mono PCM.
+  let mono = generated(
+    &corpus,
+    "mono.wav",
+    &[
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:sample_rate=48000:duration=0.4",
+      "-ac",
+      "1",
+      "-c:a",
+      "pcm_s16le",
+    ],
+  );
+  for (name, path, kind) in [
+    ("dnxhr", dnxhr_mkv(&corpus), TrackKind::Video),
+    ("mpeg2", intra_mpeg2_mkv(&corpus), TrackKind::Video),
+    ("mono", mono, TrackKind::Audio),
+  ] {
+    let target = output(&corpus, &format!("l97-{name}.mxf"));
+    let report = remuxed_to_the_end(&path, &target, "mxf_opatom", table_of(&path, kind), &[]);
+    assert!(
+      lines(&report, |line| matches!(line, Uncarried::Trailing { .. })).is_empty(),
+      "{name}: one track, nothing trailing"
+    );
+    let offered = packets(&path);
+    let offered = &offered[0];
+    let back = packets(&target);
+    if kind == TrackKind::Video {
+      assert_eq!(back[0].len(), offered.len(), "{name}: a frame a packet");
+      for (index, (seen, sent)) in back[0].iter().zip(offered).enumerate() {
+        assert!(seen.bytes == sent.bytes, "{name} {index}: the bytes");
+        assert_eq!(in_ms(seen.pts), Some(40 * index as i64), "{name} {index}");
+      }
+    } else {
+      let sound = joined(&back[0]);
+      assert!(
+        sound[..] == joined(offered)[..sound.len()] && sound.len() >= joined(offered).len(),
+        "{name}: the samples, in order, padded"
+      );
+    }
+  }
+
+  // ProRes in MXF, alone.
+  let prores = prores_mkv(&corpus);
+  let target = output(&corpus, "l97-prores.mxf");
+  remuxed_to_the_end(&prores, &target, "mxf", whole_table(&prores), &[]);
+  let offered = packets(&prores);
+  let back = packets(&target);
+  assert_eq!(back[0].len(), offered[0].len(), "ProRes: a frame a packet");
+  for (index, (seen, sent)) in back[0].iter().zip(&offered[0]).enumerate() {
+    assert!(seen.bytes == sent.bytes, "ProRes {index}: the bytes");
+  }
+}
+
+/// **L98 — what the MXF muxers cannot place, or this release does not
+/// admit, is refused at open, nothing written** (table H; `mxfenc.c`
+/// 2941–3165): a codec but MPEG-2, DNxHD and ProRes video — MXF D-10's
+/// MPEG-2 alone — and 16- and 24-bit PCM, H.264 among them, and every
+/// subtitle ([`MuxOpenError::CodecNotCarried`]); a table whose first track
+/// is not its one video track, OP-Atom's of two tracks, and MXF D-10's
+/// audio track third ([`MuxOpenError::TrackLayout`]); a frame rate MXF
+/// names no content package for, or none; no pixel format; ProRes of no
+/// profile its labels name; sound but at 48 kHz, of no channel, OP-Atom's
+/// but mono; MXF
+/// D-10's video at another bit rate than it names, or at 24 frames a
+/// second, which it labels 525-line; its sound of nine channels, or of a
+/// block alignment not its channels' samples, which its writer divides a
+/// packet by ([`MuxOpenError::ConfigurationInvalid`]). Each beside a table
+/// that opens.
+///
+/// PLANT: each judgment off, its case opening or failing in FFmpeg.
+#[test]
+fn l98_mxf_refuses_at_open_what_it_cannot_place() {
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  let Some(corpus) = Corpus::new() else { return };
+  let open = |name: &str, container: &str, table| {
+    let target = output(&corpus, name);
+    let result = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new(container),
+      table,
+      &[],
+      PacketLimits::default(),
+    );
+    match result {
+      Ok((muxer, _)) => {
+        drop(muxer);
+        Ok(())
+      }
+      Err(error) => {
+        assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+        Err(error)
+      }
+    }
+  };
+  let source = mxf_source(&corpus);
+  let video = || table_of(&source, TrackKind::Video).remove(0);
+  let sound = || table_of(&source, TrackKind::Audio).remove(0);
+  open("l98.mxf", "mxf", vec![video(), sound()]).expect("MPEG-2 and PCM");
+
+  let h264 = table_of(&corpus.multi_track_mkv(), TrackKind::Video).remove(0);
+  let aac = table_of(&corpus.multi_track_mkv(), TrackKind::Audio).remove(0);
+  let ass = generated(
+    &corpus,
+    "ass.mkv",
+    &[
+      "-i",
+      written_text(
+        &corpus,
+        "two.srt",
+        "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n2\n00:00:01,000 --> 00:00:02,000\nworld\n\n",
+      )
+      .to_str()
+      .expect("utf-8 path"),
+      "-c:s",
+      "ass",
+    ],
+  );
+  let caption = recoded(
+    table_of(&ass, TrackKind::Subtitle).remove(0),
+    Id::AV_CODEC_ID_EIA_608,
+    &[],
+  );
+  for (name, container, table, track) in [
+    ("l98-h264.mxf", "mxf", vec![h264], 0),
+    ("l98-aac.mxf", "mxf", vec![video(), aac], 1),
+    ("l98-608.mxf", "mxf", vec![video(), caption], 1),
+    (
+      "l98-dnxhr.mxf",
+      "mxf_d10",
+      table_of(&dnxhr_mkv(&corpus), TrackKind::Video),
+      0,
+    ),
+  ] {
+    assert!(
+      matches!(
+        open(name, container, table),
+        Err(MuxOpenError::CodecNotCarried { track: at, .. }) if at.get() == track
+      ),
+      "{name}"
+    );
+  }
+  for (name, container, table, track) in [
+    ("l98-first.mxf", "mxf", vec![sound(), video()], 0),
+    ("l98-two.mxf", "mxf", vec![video(), video()], 1),
+    ("l98-atom.mxf", "mxf_opatom", vec![video(), video()], 1),
+  ] {
+    assert!(
+      matches!(
+        open(name, container, table),
+        Err(MuxOpenError::TrackLayout { track: at }) if at.get() == track
+      ),
+      "{name}"
+    );
+  }
+  let rate = |num: i32, den: i32| Some(Timebase::new(num, NonZeroI32::new(den).expect("non-zero")));
+  let invalid = |name: &str, container: &str, table| {
+    assert!(
+      matches!(
+        open(name, container, table),
+        Err(MuxOpenError::ConfigurationInvalid { .. })
+      ),
+      "{name}"
+    );
+  };
+  invalid("l98-15.mxf", "mxf", vec![rerated(video(), rate(15, 1))]);
+  invalid("l98-none.mxf", "mxf", vec![rerated(video(), None)]);
+  open(
+    "l98-24.mxf",
+    "mxf",
+    vec![rerated(video(), rate(24_000, 1001))],
+  )
+  .expect("23.976");
+  invalid(
+    "l98-format.mxf",
+    "mxf",
+    vec![reticketed(video(), |par| par.format = -1)],
+  );
+  let prores = || table_of(&prores_mkv(&corpus), TrackKind::Video).remove(0);
+  invalid(
+    "l98-prores.mxf",
+    "mxf",
+    vec![reticketed(prores(), |par| par.profile = -99)],
+  );
+  open("l98-prores.mxf", "mxf", vec![prores()]).expect("ProRes 422 Proxy");
+  invalid(
+    "l98-44k.mxf",
+    "mxf",
+    vec![video(), audio_rated(&source, 44_100).remove(0)],
+  );
+  invalid("l98-stereo.mxf", "mxf_opatom", vec![sound()]);
+  invalid(
+    "l98-silent.mxf",
+    "mxf",
+    vec![
+      video(),
+      reticketed(sound(), |par| {
+        // SAFETY: the layout is the parameters' own, uninitialised to no
+        // channel.
+        unsafe { ffmpeg_next::ffi::av_channel_layout_uninit(&mut par.ch_layout) };
+        par.block_align = 0;
+      }),
+    ],
+  );
+
+  let imx = imx_mov(&corpus);
+  let picture = || table_of(&imx, TrackKind::Video).remove(0);
+  let stereo = || {
+    reticketed(table_of(&imx, TrackKind::Audio).remove(0), |par| {
+      par.block_align = 4
+    })
+  };
+  open("l98-d10.mxf", "mxf_d10", vec![picture(), stereo()]).expect("D-10");
+  assert!(matches!(
+    open("l98-d10-third.mxf", "mxf_d10", vec![picture(), stereo(), stereo()]),
+    Err(MuxOpenError::TrackLayout { track }) if track.get() == 2
+  ));
+  invalid(
+    "l98-d10-rate.mxf",
+    "mxf_d10",
+    vec![reticketed(picture(), |par| par.bit_rate = 25_000_000)],
+  );
+  invalid(
+    "l98-d10-24.mxf",
+    "mxf_d10",
+    vec![rerated(picture(), rate(24, 1))],
+  );
+  invalid(
+    "l98-d10-align.mxf",
+    "mxf_d10",
+    vec![picture(), reticketed(stereo(), |par| par.block_align = 0)],
+  );
+  invalid(
+    "l98-d10-nine.mxf",
+    "mxf_d10",
+    vec![
+      picture(),
+      reticketed(stereo(), |par| {
+        // SAFETY: the layout is the parameters' own, uninitialised and
+        // set afresh to nine unordered channels.
+        unsafe {
+          ffmpeg_next::ffi::av_channel_layout_uninit(&mut par.ch_layout);
+          ffmpeg_next::ffi::av_channel_layout_default(&mut par.ch_layout, 9);
+        }
+        par.block_align = 18;
+      }),
+    ],
+  );
+}
+
+/// **L99 — what the MXF muxers would refuse of a frame after taking it,
+/// or lose of a track at the end, is refused, the packet untouched**
+/// (table H; `mxfenc.c` 2361–2397, 2793–2858, 3325–3458, 3487–3606): an
+/// MPEG-2 picture predicted from others, whose index offsets this release
+/// does not mirror ([`PayloadRule::PredictedPicture`]); one of coding type
+/// 0, and one whose sequence extension states a profile and level MXF
+/// labels no codec for ([`PayloadRule::FrameHeader`]); a DNxHD stream's
+/// first frame of 43 bytes, and one of a compression id its labels do not
+/// name ([`PayloadRule::FrameHeader`]), a later frame of another size
+/// than the first, and an MXF D-10 frame of another than its bit rate's
+/// ([`PayloadRule::FrameSize`]); an empty packet ([`PayloadRule::Empty`]);
+/// and at the end a track no packet reached, without which the
+/// interleaving writes nothing ([`FfmpegMuxRefusal::NoFrame`]).
+///
+/// PLANT: each check off, its packet taken or failing in FFmpeg.
+#[test]
+fn l99_mxf_refuses_what_its_frame_parsers_and_interleaving_lose() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mxf = || ContainerName::new("mxf");
+  let gop = long_gop_mkv(&corpus);
+  let (table, frames) = first_track(&gop, TrackKind::Video, 2);
+  let mut muxer = muxer_into(&output(&corpus, "l99-gop.mxf"), mxf(), table);
+  muxer
+    .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("an intra picture");
+  let predicted = video_at(&video_of(&frames[1]), Some(40), 40);
+  let (refusal, back) = by_container(muxer.write_video(predicted.clone()));
+  assert_eq!(refusal, payload(PayloadRule::PredictedPicture));
+  untouched!(predicted, back);
+  // The intra picture with its first picture header's coding type 0, then
+  // with its sequence extension's profile Simple (5).
+  let intra = video_of(&frames[0]).data().as_ref().to_vec();
+  let header = intra
+    .windows(4)
+    .position(|window| window == [0, 0, 1, 0])
+    .expect("a picture header");
+  let mut untyped = intra.clone();
+  untyped[header + 5] &= !0x38;
+  let extension = intra
+    .windows(5)
+    .position(|window| window[..4] == [0, 0, 1, 0xb5] && window[4] & 0xf0 == 0x10)
+    .expect("a sequence extension");
+  let mut simple = intra.clone();
+  simple[extension + 4] = (simple[extension + 4] & 0xf8) | 5;
+  for bytes in [untyped, simple] {
+    let offered = video_at(&video_holding(&video_of(&frames[0]), &bytes), Some(40), 40);
+    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    assert_eq!(refusal, payload(PayloadRule::FrameHeader));
+    untouched!(offered, back);
+  }
+  let empty = video_at(&video_holding(&video_of(&frames[0]), &[]), Some(40), 40);
+  let (refusal, back) = by_container(muxer.write_video(empty.clone()));
+  assert_eq!(refusal, payload(PayloadRule::Empty));
+  untouched!(empty, back);
+  muxer
+    .write_video(video_at(&video_of(&frames[0]), Some(40), 40))
+    .map_err(|error| error.map_packet(drop))
+    .expect("an intra picture after");
+  muxer.finish().expect("finished");
+
+  // DNxHD: the first frame's compression id, then every frame its size.
+  let (table, frames) = first_track(&dnxhr_mkv(&corpus), TrackKind::Video, 2);
+  let first = video_of(&frames[0]).data().as_ref().to_vec();
+  let mut muxer = muxer_into(&output(&corpus, "l99-dnxhr.mxf"), mxf(), table);
+  let mut unnamed = first.clone();
+  unnamed[0x2b] ^= 0x40;
+  for bytes in [first[..43].to_vec(), unnamed] {
+    let offered = video_at(&video_holding(&video_of(&frames[0]), &bytes), Some(0), 0);
+    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    assert_eq!(refusal, payload(PayloadRule::FrameHeader));
+    untouched!(offered, back);
+  }
+  muxer
+    .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first frame");
+  let mut longer = video_of(&frames[1]).data().as_ref().to_vec();
+  longer.push(0);
+  let offered = video_at(&video_holding(&video_of(&frames[1]), &longer), Some(40), 40);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(refusal, payload(PayloadRule::FrameSize));
+  untouched!(offered, back);
+  muxer
+    .write_video(video_at(&video_of(&frames[1]), Some(40), 40))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame of the first's size");
+  muxer.finish().expect("finished");
+
+  // MXF D-10: a frame a byte short of its bit rate's.
+  let imx = imx_mov(&corpus);
+  let (table, frames) = first_track(&imx, TrackKind::Video, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l99-d10.mxf"),
+    ContainerName::new("mxf_d10"),
+    table,
+  );
+  let frame = video_of(&frames[0]).data().as_ref().to_vec();
+  assert_eq!(frame.len(), 250_000, "the premise: a frame of 50 Mbit/s");
+  let short = video_at(
+    &video_holding(&video_of(&frames[0]), &frame[..frame.len() - 1]),
+    Some(0),
+    0,
+  );
+  let (refusal, back) = by_container(muxer.write_video(short.clone()));
+  assert_eq!(refusal, payload(PayloadRule::FrameSize));
+  untouched!(short, back);
+  muxer
+    .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame of 250 000 bytes");
+  muxer.finish().expect("finished");
+
+  // A track no packet reached: the interleaving writes nothing.
+  let source = mxf_source(&corpus);
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l99-silent.mxf"),
+    mxf(),
+    whole_table(&source),
+  );
+  muxer
+    .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  let fault = muxer.finish().expect_err("a track that took no frame");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    fault.refusal(),
+    Some(FfmpegMuxRefusal::NoFrame {
+      track: TrackIndex::new(1)
+    })
+  );
 }

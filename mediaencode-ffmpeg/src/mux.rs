@@ -620,8 +620,11 @@
 //! | AVI (`avienc.c` 744–913) | as each packet's place: video's frame, in its stream's ticks, a gap filled with empty frames; PCM's samples ([`Rewrite::Timeline`] where a time is not its place) — no presentation time | none | in the index | a PAL8 picture's palette | none | none |
 //! | FLV (`flvenc.c` 1209–1486) | the decode time, 32 bits of milliseconds; a composition time for H.264, MPEG-4 Part 2, HEVC and VVC alone, 24 bits | none | a video tag's; every audio tag reads back a key frame ([`Rewrite::KeyFramesMarked`]) | new extradata of AAC, H.264, MPEG-4, HEVC, VVC, AV1, VP9, Opus and FLAC, a new sequence header | none | none |
 //! | NUT (`nutenc.c` 545–612, 963–1184) | the presentation time, in its stream's time base — an audio stream's sample rate's, any other's made at least 1/48 000 fine — and no decode time: its reader makes one of the presentation times and the decode delay ([`Rewrite::DecodeTimes`]) | none | each frame's | none | the language; the default, dub, original, comment, lyrics and karaoke flags | a start and a length in the chapter's own time base, exact, numbered by position from 1 |
+//! | MPEG-PS, its five names (`mpegenc.c` 303–1257) | the times of the first packet each PES packet holds the start of, 33 bits of 90 kHz, its reader's parser framing the stream again ([`Rewrite::Timeline`]); every stream moved by the preload where the first packet is decoded before half a second, on DVD always ([`Uncarried::TimesShifted`]) | none | none ([`Rewrite::SyncFromBitstream`]) | none | none | none |
+//! | MPEG-TS (`mpegtsenc.c` 537–2240) | a video, subtitle or data packet's times in a PES packet of its own, 33 bits of 90 kHz; audio gathered into PES packets of a few, the first one's times alone ([`Rewrite::Timeline`]) | none | none: a random-access mark the reader's parser judges again ([`Rewrite::SyncFromBitstream`]) | the PES stream id; Opus's end trim, in its control header | an audio stream's language of three bytes and the first of its clean-effects, hearing-impaired and visual-impaired flags; a DVB subtitle's or teletext's language; a DVB subtitle's hearing-impaired flag where its configuration states no type | none |
 //! | Ogg (`oggenc.c` 497–765) | none a packet keeps of its own: each page the granule of the last packet it ends, its end, a reader counting the others' times from the samples or frames ([`Rewrite::Timeline`]) — VP8's first frame read back at its end | none | none: Theora's and VP8's key frames in their granules, which the reader sets by the bitstream ([`Rewrite::SyncFromBitstream`]) | a lone Vorbis, FLAC or Opus stream's later strings metadata, as a chained stream's tags; Opus's first start skip, its pre-skip | the language; no flag | in an Opus stream's tags alone: the first 1000, by position from 0, a start of rounded whole seconds and its rounded milliseconds, no end |
 //! | ASF, its streaming form (`asfenc.c` 862–1050) | the decode time, as each payload's presentation time, 32 bits of milliseconds with the preroll's 3100 added — no presentation time | none | a video payload's; every audio packet reads back a key frame ([`Rewrite::KeyFramesMarked`]) | none | a language through its ISO 639-1 code, read back as ISO 639-2/B — a tag of none not handed, so that the stream has none; no flag | markers: a start in 100 ns, numbered by position, each ended where the next starts; the streaming form none |
+//! | MXF, MXF D-10, MXF OP-Atom (`mxfenc.c` 3222–3628) | none: each packet's times replaced by its count on its stream, the file counting edit units, its reader each stream's times from them ([`Rewrite::Timeline`]); PCM cut into the edit units of the video's frame rate, OP-Atom's of 25, the last padded with silence ([`AutomaticFilter::PcmRechunk`]); the packets past the last edit unit every track fills dropped at the end ([`Uncarried::Trailing`]) | none | none: its reader's parser judges the pictures ([`Rewrite::SyncFromBitstream`]) | none | none | none |
 //!
 //! **What each refuses**:
 //!
@@ -644,7 +647,13 @@
 //! | NUT | a reordering stream's packet with no presentation time; a key frame presented before its stream's last, or at it but decoded at another time; a presentation time past its 64-bit count of time bases; after the first write, a frame decoded before zero | refused after taking it; the trailer's index asserts (`av_assert0`, 653), ending the process; written wrapped; a syncpoint's count of it unsigned (`nutenc.c` 329–333, 615–667, 979–985, 1041, 1071–1073) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::KeyFrameOrder`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::BeforeZero`] — L90 |
 //! | Ogg | an empty packet; a VP8 frame ending before zero or at 2^31 ticks, a Theora one at 2^(63 − its key-frame shift); a packet whose granule is −1; a lone Vorbis, FLAC or Opus stream's later metadata update that does not unpack | an empty Ogg packet its reader drops, moving the next; a signed shift's overflow; a page read back with no time; the file ended and every later packet refused (`oggenc.c` 660–765) | [`PayloadRule::Empty`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::UnsetGranule`], [`PayloadRule::MetadataUpdate`] — L92 |
 //! | Ogg, at open | a codec but Vorbis, Theora, Speex, FLAC, Opus and VP8; no configuration but VP8's; one Ogg's start refuses — FLAC's short of its STREAMINFO, Speex's of its 80 bytes, Opus's of its 19, Vorbis's or Theora's not three headers, Theora's first short of 42; an audio stream of no sample rate; VP8 past 16 bits of width or height, or 24 of an aspect ratio's term | refused at the start; Theora's header read past its end; granules of no clock; written cut (`oggenc.c` 319–616) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationMissing`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Dimensions`] — L92 |
+//! | MPEG-PS | an empty packet; DVD PCM shorter than its 3-byte header | nothing written of it; refused after taking it (`mpegenc.c` 1168–1257) | [`PayloadRule::Empty`], [`PayloadRule::PcmHeader`] — L94 |
+//! | MPEG-PS, at open | a codec its start or its reader takes not — but MPEG audio, AC-3, DTS, DVD PCM, the video an elementary-stream probe names and DVD subtitles; big-endian PCM, which reads back as DVD PCM; DVD PCM its header cannot name; a stream id past its codec's range or on another's, or past the system header's room | refused at the start, or read back as another codec's or stream's (`mpegenc.c` 280–484; `mpeg.c` 528–630) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::StreamIds`] — L94 |
+//! | MPEG-TS | a reordering stream's packet with no presentation time; H.264, HEVC or VVC off a start code, or of fewer than 5 bytes, no filter converting it; AAC or Opus of fewer than 2 bytes; raw AAC on a track with no configuration, or past its ADTS header's 13 bits; an empty packet; a time past its clock reference's room | refused after taking the first, written without a time after; refused after taking the first, written as it is after; refused after taking it; written raw, unreadable, or cut; nothing of it, or a delimiter alone; an overflow (`mpegtsenc.c` 1869–2240) | [`FfmpegMuxRefusal::MissingPts`], [`PayloadRule::StartCode`], [`PayloadRule::TooShort`], [`PayloadRule::AdtsFrame`], [`PayloadRule::AdtsFrameLength`], [`PayloadRule::Empty`], [`FfmpegMuxRefusal::TimeWraps`] — L96 |
+//! | MPEG-TS, at open | a codec it writes as private data its reader may not name; AAC of a configuration ADTS cannot write; Opus of a channel mapping its PMT cannot describe; ARIB captions of another profile than A and C; a stream its PMT section has no room for | written unnamed; its nested ADTS muxer's start refuses it; an unknown mapping, undecodable; no descriptor; written undeclared, or no PMT at all (`mpegtsenc.c` 216–848, 1240–1268) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::StreamIds`] — L96 |
 //! | NUT, at open | raw video of a tag its tables do not hold; a video stream of no width or height, an audio one of no sample rate or channels, a configuration of 2^30 bytes or more; a chapter starting past its count; a time base not in lowest terms | written under the tables' first raw tag, RGB 5:5:5's, read back as that; a stream header its reader refuses; wrapped; a main header its reader refuses (`nut.c` 50; `nutdec.c` 233–240, 447–470; `nutenc.c` 601) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ChapterSpan`]; the time base handed reduced — L90 |
+//! | MXF, MXF D-10, MXF OP-Atom | an MPEG-2 picture of coding type 0, or of a profile and level MXF labels no codec for; a P or B picture, whose index offsets this release does not mirror; DNxHD's first frame short of its compression id, or of an id MXF labels none for; a frame of another size than a constant-bit-rate index counts — MXF D-10's of its bit rate, DNxHD's of its first; an empty packet; at the end, a track no packet reached | refused after taking it; its index written at the next segment, the whole file lost at an offset past a byte; refused after taking it; refused after taking it; an essence element of none; nothing written, the trailer failing (`mxfenc.c` 2361–2397, 2793–2858, 3325–3458, 3487–3606) | [`PayloadRule::FrameHeader`], [`PayloadRule::PredictedPicture`], [`PayloadRule::FrameSize`], [`PayloadRule::Empty`], [`FfmpegMuxRefusal::NoFrame`] — L99 |
+//! | MXF, MXF D-10, MXF OP-Atom, at open | a codec but MPEG-2, DNxHD and ProRes video — MXF D-10's MPEG-2 alone — and 16- and 24-bit PCM: H.264, DV, FFV1 and JPEG 2000, whose frame parsers this release has not audited, and the data and caption tracks, booked; a first track not the one video track, OP-Atom's second track, MXF D-10's audio track not its second; a frame rate MXF names no content package for, or none; no pixel format; ProRes of no profile its labels name; sound but at 48 kHz, OP-Atom's but mono; MXF D-10's video at a bit rate it names not, or at a rate but 25 and 30000/1001; its sound past eight channels, or of a block alignment not its channels' samples | refused at its start; or its label another standard's; or its writer dividing by the alignment (`mxfenc.c` 2941–3165, 3222–3248) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ConfigurationInvalid`] — L98 |
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -954,6 +963,26 @@ impl Audited {
       // frame's is in its granule, which the reader sets by the bitstream
       // (`ogg_validate_keyframe`, `oggdec.c` 810–830).
       Self::Ogg(_) => Some(NOTHING),
+      // `mpeg_mux_write_packet` and `flush_packet` (`mpegenc.c` 640–990,
+      // 1168–1257): the times of the first packet that starts in each PES
+      // packet alone, in 33 bits of 90 kHz, the reader's parser framing the
+      // stream again and counting the others'; no duration, no key flag.
+      Self::MpegPs(_) => Some(NOTHING),
+      // `mpegts_write_packet_internal` and `mpegts_write_pes` (`mpegtsenc.c`
+      // 1449–1700, 1869–2240): a video, subtitle or data packet each in a
+      // PES packet of its own, its times in 33 bits of 90 kHz; audio
+      // gathered into PES packets of a few, the first one's times alone,
+      // the reader's parser counting the others'; no duration and no key
+      // flag but a random-access mark the reader's parser judges again.
+      Self::MpegTs => Some(if kind == TrackKind::Audio {
+        NOTHING
+      } else {
+        Written {
+          pts: true,
+          dts: true,
+          ..NOTHING
+        }
+      }),
       // `nut_write_packet` (`nutenc.c` 963–1184): the presentation time
       // and the key flag of each frame; no duration, and no decode time —
       // the reader makes one of the presentation times and the stream's
@@ -963,16 +992,19 @@ impl Audited {
         key: true,
         ..NOTHING
       }),
-      _ => {
-        let _ = kind;
-        None
-      }
+      // `mxf_interleave` (`mxfenc.c` 3618–3628): each packet's times
+      // replaced by its count on its stream before it is interleaved, the
+      // file counting edit units and its reader each stream's times from
+      // them; no duration; no key flag, its reader's parser judging the
+      // pictures (`mxfdec.c` 3030).
+      Self::Mxf(_) => Some(NOTHING),
     }
   }
 
   /// What the muxer keeps of a timed track's fields — table E's row for a
   /// container of table H — or `None` where table E's own rows say: the
-  /// MOV family's and Matroska's.
+  /// MOV family's and Matroska's; MPEG-TS's, which depends on the track, is
+  /// [`Self::kept_for`]'s.
   const fn kept(self) -> Option<Kept> {
     match self {
       // None of the raw streams' writers, nor IVF's, WAV's, Wave64's,
@@ -984,6 +1016,8 @@ impl Audited {
       // AVI neither: its stream name is a title, and an XSUB track's
       // language written into it no reader takes back as one (`avienc.c`
       // 488–503).
+      // MXF neither: its packages' names are the file's
+      // (`mxf_write_header_metadata_sets`, `mxfenc.c` 1951–1998).
       Self::Raw(_)
       | Self::Adts
       | Self::Flac
@@ -991,7 +1025,8 @@ impl Audited {
       | Self::Wav { .. }
       | Self::Ivf
       | Self::Flv
-      | Self::Avi => Some(Kept {
+      | Self::Avi
+      | Self::Mxf(_) => Some(Kept {
         filename: false,
         mime_type: false,
         language: LanguageRule::Dropped,
@@ -1004,6 +1039,14 @@ impl Audited {
         filename: false,
         mime_type: false,
         language: LanguageRule::ThroughIso639_1,
+        flags: TrackDisposition::empty(),
+      }),
+      // MPEG-PS writes no tag and no disposition (`mpeg_mux_init`,
+      // `mpegenc.c` 303–580).
+      Self::MpegPs(_) => Some(Kept {
+        filename: false,
+        mime_type: false,
+        language: LanguageRule::Dropped,
         flags: TrackDisposition::empty(),
       }),
       // Ogg writes a stream's tags, the language among them, as its Vorbis
@@ -1030,8 +1073,68 @@ impl Audited {
           .union(TrackDisposition::LYRICS)
           .union(TrackDisposition::KARAOKE),
       }),
-      _ => None,
+      // MPEG-TS's depends on the track ([`Self::kept_for`]).
+      Self::MpegTs | Self::Mov(_) | Self::Matroska | Self::WebM => None,
     }
+  }
+
+  /// What the muxer keeps of `description`'s fields: [`Self::kept`], but
+  /// MPEG-TS's, which depends on the track (`mpegts_write_pmt`,
+  /// `mpegtsenc.c` 537–848): an audio stream's language of three bytes in
+  /// its ISO 639 descriptor, with the first of its clean-effects,
+  /// hearing-impaired and visual-impaired flags as the descriptor's audio
+  /// type — a descriptor written for a tag of fewer bytes as `und` where a
+  /// flag is set, and for none of more; a DVB subtitle or teletext
+  /// stream's language of three bytes, a DVB subtitle's hearing-impaired
+  /// flag as its subtitling type where its configuration states none; no
+  /// other stream's language or flag. The reader takes each back
+  /// (`mpegts.c`).
+  fn kept_for<D>(self, description: &TrackDescription<Ffmpeg, D, CodecTicket>) -> Option<Kept>
+  where
+    D: AsRef<[u8]>,
+  {
+    use TrackDisposition as F;
+    if self != Self::MpegTs {
+      return self.kept();
+    }
+    let none = Kept {
+      filename: false,
+      mime_type: false,
+      language: LanguageRule::Dropped,
+      flags: F::empty(),
+    };
+    let declared = description.disposition();
+    let tag = description.language().map_or(0, |tag| tag.as_str().len());
+    Some(match (description.kind(), description.codec()) {
+      (TrackKind::Audio, _) => {
+        let first = [F::CLEAN_EFFECTS, F::HEARING_IMPAIRED, F::VISUAL_IMPAIRED]
+          .into_iter()
+          .find(|flag| declared.contains(*flag))
+          .unwrap_or(F::empty());
+        // The descriptor is written for a tag of three bytes, or — as
+        // `und` — for a shorter one or none where a flag is set.
+        let descriptor = tag == 3 || (tag < 3 && !first.is_empty());
+        Kept {
+          language: LanguageRule::ThreeBytes,
+          flags: if descriptor { first } else { F::empty() },
+          ..none
+        }
+      }
+      (TrackKind::Subtitle, codec) if codec == DVB_SUBTITLE => Kept {
+        language: LanguageRule::ThreeBytes,
+        flags: if stream_extradata(description).len() < 5 {
+          F::HEARING_IMPAIRED
+        } else {
+          F::empty()
+        },
+        ..none
+      },
+      (TrackKind::Subtitle, codec) if codec == DVB_TELETEXT => Kept {
+        language: LanguageRule::ThreeBytes,
+        ..none
+      },
+      _ => none,
+    })
   }
 
   /// Whether table H's rows for the muxer are written: what it writes of a
@@ -1050,6 +1153,9 @@ impl Audited {
         | Self::Asf { .. }
         | Self::Nut
         | Self::Ogg(_)
+        | Self::MpegPs(_)
+        | Self::MpegTs
+        | Self::Mxf(_)
     )
   }
 
@@ -1290,7 +1396,8 @@ pub enum AutomaticFilter {
   /// insert it at their start whatever the automatic filters say
   /// (`daudenc.c` 44; `gxfenc.c` 724; `mxfenc.c` 3081): the track's
   /// samples are cut into packets of the count the muxer names, their
-  /// times counted from the first (`pcm_rechunk.c` 123–186).
+  /// times counted from the first, the last padded with silence to its
+  /// count (`pcm_rechunk.c` 123–186).
   PcmRechunk,
   /// `av1_metadata`, inserting a temporal delimiter before each temporal
   /// unit that opens without one — IVF's AV1 at its start, whatever the
@@ -1515,6 +1622,19 @@ pub enum Uncarried {
     /// it from [`CarrierMuxer::take_held`].
     packets: u64,
   },
+  /// MXF and MXF D-10: a track's packets past the last edit unit every
+  /// track fills, which their interleaving drops when the stream ends —
+  /// each packet's time its count on its stream, the interleaving writes
+  /// only the edit units every stream reaches (`mxf_interleave_get_packet`,
+  /// `mxfenc.c` 3557–3606), PCM counted in the packets `pcm_rechunk` cuts
+  /// of it ([`AutomaticFilter::PcmRechunk`]). Reported by
+  /// [`CarrierMuxer::finish_into_sink`], with the report it hands back.
+  Trailing {
+    /// The track.
+    track: TrackIndex,
+    /// How many packets the interleaving dropped, as it counts them.
+    packets: u64,
+  },
   /// E-AC-3 packets MP4 was still joining into one sample when the muxer
   /// finished: frames of fewer than six audio blocks, held back until six
   /// make up a sample (`handle_eac3`, `movenc.c` 586–603 in FFmpeg 9.0.1),
@@ -1528,7 +1648,8 @@ pub enum Uncarried {
     /// How many packets MP4 held.
     packets: u64,
   },
-  /// Every stream's times written later than offered — the chapters' not.
+  /// Every stream's times written at other times than offered — the
+  /// chapters' not.
   /// libavformat moves them all where the first packet it writes — or one
   /// its interleaving holds then — lies before the earliest its stream's
   /// container writes, by that packet's distance before it, each stream's
@@ -1539,7 +1660,10 @@ pub enum Uncarried {
   /// without `AVFMT_TS_NEGATIVE` decode times below zero. Reported once, at
   /// the first packet that makes it certain ([`CarrierMuxer::report`]); a
   /// packet after the first write that the move leaves before the earliest
-  /// is refused ([`FfmpegMuxRefusal::BeforeZero`]).
+  /// is refused ([`FfmpegMuxRefusal::BeforeZero`]). The MPEG program stream
+  /// moves them again at its first packet, by its preload of half a second
+  /// less that packet's decode time where it lies below it, and on DVD
+  /// always (`mpeg_mux_write_packet`, `mpegenc.c` 1186–1201): reported so.
   TimesShifted,
   /// Packet side data of a kind the container has no place for on the
   /// track, or keeps in part — the side-data table (see [the
@@ -1661,8 +1785,13 @@ pub enum Rewrite {
   /// stream of another codec whose block alignment its reader counts by,
   /// at open. And Ogg, which writes each page's granule — the end of the
   /// last packet it ends — alone, a reader counting the others' times from
-  /// the samples or frames (`oggenc.c` 704–765; `oggdec.c` 790–810):
-  /// reported at open.
+  /// the samples or frames (`oggenc.c` 704–765; `oggdec.c` 790–810); and
+  /// the MPEG program stream, which writes the times of the first packet
+  /// that starts in each PES packet alone, its reader's parser framing the
+  /// stream again — a video packet that shares one reads back with no time
+  /// (`flush_packet`, `mpegenc.c` 640–968); and MPEG-TS's audio, gathered
+  /// into PES packets of a few, the first one's times alone written
+  /// (`mpegtsenc.c` 2205–2236): reported at open.
   Timeline,
   /// The container writes a packet's presentation time and not its decode
   /// time, which a reader takes to be the presentation time: IVF
@@ -1675,7 +1804,9 @@ pub enum Rewrite {
   /// census). Reported at the first packet whose two times differ, where
   /// the stream counts them.
   PresentationTimes,
-  /// AAC into ADTS: each packet is written behind a header made of the
+  /// AAC into ADTS, or into MPEG-TS, whose nested ADTS muxer writes a
+  /// configured track's raw frames (`mpegtsenc.c` 1253–1280, 1973–2005):
+  /// each packet is written behind a header made of the
   /// configuration's object type, sampling frequency and channel
   /// configuration — the program config element written once, before the
   /// first (`adts_write_frame_header`, `adtsenc.c` 116–152, 157–190) — and
@@ -1683,6 +1814,13 @@ pub enum Rewrite {
   /// PS's, is left for a decoder to find. Reported at open, where the
   /// configuration is not the two bytes a reader makes of that header.
   AdtsHeaders,
+  /// MPEG-TS H.264, HEVC and VVC: an access unit delimiter is put before
+  /// each picture that carries none — before its first NAL unit, or in
+  /// H.264's place of one found further in — and an IDR picture that
+  /// carries no parameter sets in band is given the configuration's
+  /// (`h26x_prefix_aud`, `mpegtsenc.c` 1845–1864, 1902–2070): each
+  /// packet reads back with them. Reported at open.
+  AccessUnitDelimiters,
 }
 
 /// What the container could not carry: what is known at open, and what
@@ -1961,7 +2099,14 @@ pub enum FfmpegMuxRefusal {
   /// whole with its low bits' span added, in an `int64_t` (`put_tt`,
   /// `nutenc.c` 329–333, 1041, 622; 1071–1073), so that a presentation
   /// time past either wraps — judged on it, which bounds the decode time,
-  /// no later.
+  /// no later; Ogg a VP8 frame's end in its granule's upper 32 bits and a
+  /// Theora frame's past its key-frame shift, each a signed shift, and
+  /// any other packet's end in `int64_t` (`oggenc.c` 718–750); the MPEG
+  /// program stream every time with its preload added and its clock run
+  /// past it, in `int64_t` — refused past half of its range (`mpegenc.c`
+  /// 1080, 1144, 1201–1202); MPEG-TS its clock reference, 300 times the
+  /// first decode time, in `int64_t` — refused past `i64::MAX / 600`
+  /// (`mpegtsenc.c` 1887–1890).
   #[error("track {}: {} lies past what the container counts", .track.get(), .timestamp.pts())]
   TimeWraps {
     /// The track.
@@ -2091,14 +2236,18 @@ pub enum FfmpegMuxRefusal {
     /// What about its bytes.
     rule: PayloadRule,
   },
-  /// MP4 AC-3 or E-AC-3: a track that took no frame when the muxer
-  /// finished. MP4 writes the track's configuration (`dac3`, `dec3`) from
-  /// the first frame it parsed, and fails its trailer — the whole file —
-  /// without one (`movenc.c` 424–429, 619–623 in FFmpeg 9.0.1). Where a
-  /// check needs the whole stream it is made at the first packet that
-  /// decides it; this one no packet decides, so `finish` makes it, before
-  /// the trailer, and names it in its fault ([`MuxFault::refusal`]).
-  #[error("track {} took no frame, and MP4 writes its configuration from its first", .track.get())]
+  /// A track that took no frame when the muxer finished, whose container
+  /// fails its trailer — the whole file — without one: MP4 AC-3 or E-AC-3,
+  /// whose configuration (`dac3`, `dec3`) MP4 writes from the first frame
+  /// it parsed (`movenc.c` 424–429, 619–623 in FFmpeg 9.0.1); any MXF
+  /// track, whose interleaving writes only the edit units every track
+  /// reaches, so that none is written and the file's header with it
+  /// (`mxf_interleave_get_packet`, `mxfenc.c` 3557–3606; `mxf_write_footer`,
+  /// 3487–3496). Where a check needs the whole stream it is made at the
+  /// first packet that decides it; this one no packet decides, so `finish`
+  /// makes it, before the trailer, and names it in its fault
+  /// ([`MuxFault::refusal`]).
+  #[error("track {} took no frame, without which the container's trailer fails", .track.get())]
   NoFrame {
     /// The track.
     track: TrackIndex,
@@ -2133,8 +2282,12 @@ pub enum PayloadRule {
   /// the automatic filters on, Matroska's PGS filter an empty PGS packet
   /// (`pgs_frame_merge.c` 87–90); the raw streams' writers, MP3's and
   /// WAV's write it as nothing, ADTS's and FLAC's none of it, IVF its frame
-  /// header alone, which FFmpeg's reader drops, and ASF cuts it into no
-  /// payload (table H). Not a configuration's packet, of no
+  /// header alone, which FFmpeg's reader drops, ASF cuts it into no
+  /// payload, Ogg writes it as an empty Ogg packet, which its reader drops,
+  /// the MPEG program stream keeps its descriptor, which no PES packet
+  /// writes, MPEG-TS a PES packet of no payload, and the MXF muxers an
+  /// essence element of none, or for PCM nothing (table H). Not a
+  /// configuration's packet, of no
   /// payload, whose new extradata the container takes first — MP4's MPEG-4
   /// ALS, AAC, AV1 and FLAC's (7412–7428), Matroska's AAC and FLAC's
   /// (3065–3097): taken, of no sample.
@@ -2149,6 +2302,40 @@ pub enum PayloadRule {
   /// (`ogg_check_new_metadata`, `oggenc.c` 660–702, 714–715).
   #[error("the packet's metadata update does not unpack, which fails the Ogg muxer")]
   MetadataUpdate,
+  /// The MPEG program stream's DVD PCM: a packet shorter than the 3-byte
+  /// header the writer takes off it and writes afresh, refused after
+  /// taking it (`mpeg_mux_write_packet`, `mpegenc.c` 1206–1216).
+  #[error("the DVD PCM packet is shorter than its 3-byte header")]
+  PcmHeader,
+  /// MPEG-TS: an AAC or Opus packet of fewer than the two bytes MPEG-TS
+  /// reads its sync word of, refused after taking it
+  /// (`mpegts_write_packet_internal`, `mpegtsenc.c` 1971–1975, 2072–2075).
+  #[error("the packet is shorter than the container reads")]
+  TooShort,
+  /// The MXF muxers: a frame whose header they read their codec's label
+  /// or their index of and cannot, which they refuse after taking it — an
+  /// MPEG-2 picture of coding type 0, or one after whose sequence
+  /// extension the profile and level, its own or the stream's, are a pair
+  /// MXF D-10 aside names no codec for (`mxf_parse_mpeg2_frame`,
+  /// `mxfenc.c` 2793–2858); DNxHD's first frame of fewer than the 44 bytes
+  /// its compression id ends at, or of an id their table does not hold
+  /// (`mxf_parse_dnxhd_frame`, 2361–2397).
+  #[error("the frame's header is not one the MXF muxer reads its codec from")]
+  FrameHeader,
+  /// The MXF muxers: a video frame of another size than the stream's
+  /// fixed one, which their constant-bit-rate index counts every frame in
+  /// — MXF D-10's, of its bit rate, and DNxHD's, of its first frame —
+  /// refused after taking it (`mxf_write_packet`, `mxfenc.c` 3386–3394).
+  #[error("the frame is not of the size the container's constant-bit-rate index counts")]
+  FrameSize,
+  /// The MXF muxers: an MPEG-2 picture predicted from others — a P or B
+  /// picture — whose index entries' offsets, written a byte each at the
+  /// next index segment and judged there, this release does not mirror
+  /// (`mxf_write_index_table_segment`, `mxfenc.c` 2022–2177): long-GOP
+  /// MPEG-2 in MXF is booked for an audit of its own. An intra picture is
+  /// written.
+  #[error("the MPEG-2 picture is predicted, which this release does not write into MXF")]
+  PredictedPicture,
   /// AAC framed in an ADTS header on a track whose configuration is
   /// stated, into MP4 or Matroska, which take raw AAC, where no automatic
   /// filter converts it: MP4 refuses the first such packet after taking it
@@ -2517,7 +2704,11 @@ pub enum MuxOpenError {
   /// MP4, experimental there (`mov_init`, `movenc.c` 8580–8587 in FFmpeg
   /// 9.0.1), and ATRAC3, Cook, RealAudio 2.0, SIPR and RealVideo 1.0, 2.0
   /// and 3.0 in Matroska, which it does not yet write (`mkv_init`,
-  /// `matroskaenc.c` 3518–3530).
+  /// `matroskaenc.c` 3518–3530). Of table H, a codec the container's start
+  /// or its reader takes not, and in the MXF muxers H.264, DV, FFV1 and
+  /// JPEG 2000 video and the data and caption tracks, whose frame parsers
+  /// and essence this release has not audited — each booked to be
+  /// admitted by an audit of its own.
   #[error("the container cannot store track {}'s codec {codec:?}", .track.get())]
   CodecNotCarried {
     /// The track.
@@ -2615,8 +2806,14 @@ pub enum MuxOpenError {
   /// NUT's raw video of a tag its tables do not hold, written under their
   /// first, RGB 5:5:5's (`nut.c` 50), and a stream header its reader
   /// refuses — an audio stream of no sample rate or channels, a
-  /// configuration of 2^30 bytes or more (`nutdec.c` 447–470); and one
-  /// Ogg's start refuses — FLAC's short of its 34-byte STREAMINFO,
+  /// configuration of 2^30 bytes or more (`nutdec.c` 447–470); the MPEG
+  /// program stream's DVD PCM of a sample rate, a sample size or channels
+  /// its header cannot name (`mpegenc.c` 390–411); the MXF muxers' video
+  /// of a frame rate, a pixel format, a bit rate or a ProRes profile they
+  /// refuse or label as another, and sound of a rate, channels or block
+  /// alignment they refuse or write otherwise (`mxfenc.c` 2890–3165,
+  /// 3222–3248); and one Ogg's start refuses — FLAC's short of its 34-byte
+  /// STREAMINFO,
   /// Speex's of its 80-byte header, Opus's of its 19-byte OpusHead,
   /// Vorbis's and Theora's not three headers, Theora's first short of its
   /// 42 bytes, whose fields Ogg reads — or an audio stream of no sample
@@ -2635,6 +2832,29 @@ pub enum MuxOpenError {
   #[error("track {}'s frame cropping leaves no picture, which MP4's trailer refuses", .track.get())]
   Cropping {
     /// The track.
+    track: TrackIndex,
+  },
+  /// A stream the container has no room to declare. The MPEG program
+  /// stream: one whose id, counted from its codec's first, passes its
+  /// codec's range or lands on another stream's — read back as another
+  /// codec's stream, or as the other stream — or one the system header has
+  /// no room for in its pack (`mpeg_mux_init`, `mpegenc.c` 336–484;
+  /// `mpeg.c` 565–620). MPEG-TS: one its PMT section has no room for —
+  /// starting past its 988th byte, written undeclared, or making it pass
+  /// 1012, the PMT then not written at all (`mpegtsenc.c` 216–222,
+  /// 562–565, 845–848).
+  #[error("track {} has no room to be declared in the container", .track.get())]
+  StreamIds {
+    /// The first track past it.
+    track: TrackIndex,
+  },
+  /// A track the container has no place for where it lies in the table:
+  /// MXF's and MXF D-10's first timed track not their one video track, or
+  /// a second video track; MXF D-10's audio track not its second; MXF
+  /// OP-Atom's second track (`mxf_init`, `mxfenc.c` 2946–2966, 3043–3047).
+  #[error("track {} has no place where it lies in the container's table", .track.get())]
+  TrackLayout {
+    /// The first track out of place.
     track: TrackIndex,
   },
   /// `asf_stream`: a header longer than the 16-bit length of the chunk the
@@ -2756,6 +2976,8 @@ struct TrackState {
   place: i128,
   /// NUT: the last key frame's presentation and decode times, in ticks.
   key_times: Option<(i128, i128)>,
+  /// The MXF muxers: what they have learned of the track's frames.
+  mxf: MxfMirror,
 }
 
 /// What the ADTS muxer knows of an AAC track's configuration
@@ -3322,6 +3544,86 @@ struct PacketRules {
   /// Ogg: a lone Vorbis, FLAC or Opus stream, whose later packets'
   /// strings metadata Ogg writes as a chained stream's tags.
   ogg_metadata: bool,
+  /// The MPEG program stream: whether its preload moves every stream's
+  /// times at its first packet — `Some(true)` on DVD, which always moves
+  /// them so that it lies at the preload (`mpegenc.c` 1186–1201).
+  ps_preload: Option<bool>,
+  /// DVD PCM: each packet opens with its 3-byte header
+  /// ([`PayloadRule::PcmHeader`]).
+  pcm_header: bool,
+  /// MPEG-TS: what it does with the track's packets ([`TsRules`]).
+  ts: Option<TsRules>,
+  /// MPEG-TS: every time within its clock's room
+  /// ([`FfmpegMuxRefusal::TimeWraps`]).
+  ts_clock: bool,
+  /// The MXF muxers: what they read of the track's frames, and how they
+  /// count its packets ([`MxfRules`]).
+  mxf: Option<MxfRules>,
+}
+
+/// What an MXF muxer does with a track's packets (`mxf_write_packet`,
+/// `mxfenc.c` 3325–3458; `mxf_interleave`, 3618–3628).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MxfRules {
+  /// What it reads of the track's frames.
+  frames: MxfFrames,
+  /// PCM: the bytes a sample takes across its channels, and the frame
+  /// rate — the video's, OP-Atom's 25 — whose edit units `pcm_rechunk`
+  /// cuts its samples into (`mxf_init`, 3036–3083), as its numerator and
+  /// denominator.
+  rechunk: Option<(u64, (i64, i64))>,
+}
+
+/// What an MXF muxer reads of a frame before it writes it
+/// (`mxf_write_packet`, `mxfenc.c` 3350–3396).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MxfFrames {
+  /// MPEG-2 video: every frame's start codes ([`mxf_mpeg2_frame`]) — MXF
+  /// D-10's of the fixed size its bit rate gives a frame, in bytes.
+  Mpeg2 {
+    /// MXF D-10: the frame size.
+    d10: Option<u64>,
+  },
+  /// DNxHD: the first frame's compression id ([`mxf_dnxhd_first`]), every
+  /// frame of the first's size.
+  Dnxhd,
+  /// ProRes, whose profile is judged at open, and PCM: nothing.
+  Unread,
+}
+
+/// What an MXF muxer has learned of a track's frames ([`MxfRules`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MxfMirror {
+  /// MPEG-2: the profile and level its stream holds, which a frame's
+  /// sequence extension sets (`mxf_parse_mpeg2_frame`, `mxfenc.c`
+  /// 2802–2806).
+  profile_level: (i32, i32),
+  /// DNxHD: its first frame's size, which its index counts every frame in.
+  frame_size: Option<u64>,
+  /// The packets handed to its interleaving.
+  packets: u64,
+}
+
+/// What MPEG-TS does with a track's packets (`mpegts_write_packet_internal`,
+/// `mpegtsenc.c` 1869–2240).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TsRules {
+  /// H.264, HEVC or VVC: each packet opens on a start code, five bytes at
+  /// least, where no filter converts it (`check_h26x_startcode`,
+  /// 1777–1792).
+  StartCodes,
+  /// AAC: two bytes at least; an ADTS frame written as it is; any other
+  /// packet put behind an ADTS header the configuration makes, within its
+  /// 13 bits — or, with no configuration, written as it is, unreadable
+  /// (1969–2004).
+  Aac {
+    /// Whether the track states its configuration.
+    configured: bool,
+    /// The program config element the first header carries.
+    pce: usize,
+  },
+  /// Opus: two bytes at least (2072–2075).
+  Opus,
 }
 
 /// How Ogg counts a packet's granule (`ogg_write_packet_internal`,
@@ -3682,12 +3984,26 @@ impl PacketRules {
       // packet, put out for Theora alone (`ivfenc.c` 80–82; `ivfdec.c`
       // 79–88; `parse_packet`, `demux.c` 1192–1203); ASF cuts a packet into
       // payloads while bytes are left, so that an empty one makes none
-      // (`put_frame`, `asfenc.c` 901).
+      // (`put_frame`, `asfenc.c` 901); Ogg drops one with side data and
+      // writes one without as an empty Ogg packet, which its reader drops,
+      // moving the next one's time (`ogg_write_packet`, `oggenc.c` 766–771);
+      // the MPEG program stream keeps its descriptor, which no PES packet
+      // writes, its time lost (`mpeg_mux_write_packet`, `mpegenc.c`
+      // 1218–1236); MPEG-TS writes a PES packet of no payload, which is
+      // nothing, or a delimiter alone, and an audio one's time the next
+      // one's (`mpegts_write_packet_internal`, `mpegtsenc.c` 2216–2232;
+      // `mpegts_write_pes`, 1521); the MXF muxers an essence element of
+      // none, `pcm_rechunk` none of an empty PCM packet (`mxfenc.c`
+      // 3447–3453; `pcm_rechunk.c` 130, 155–156).
       no_empty: mp4
         || (either_matroska && kind == TrackKind::Audio)
         || raw
         || asf
-        || matches!(audited, Audited::Ogg(_))
+        || matches!(
+          audited,
+          Audited::Ogg(_) | Audited::MpegPs(_) | Audited::MpegTs
+        )
+        || matches!(audited, Audited::Mxf(_))
         || matches!(
           audited,
           Audited::Adts | Audited::Flac | Audited::Mp3 | Audited::Wav { .. } | Audited::Ivf
@@ -3702,6 +4018,7 @@ impl PacketRules {
       // them, after taking the packet (`nutenc.c` 979–985).
       needs_pts: (family != Family::Other
         || nut
+        || audited == Audited::MpegTs
         || (flv
           && [
             CodecId::H264,
@@ -3815,6 +4132,24 @@ impl PacketRules {
       ogg: matches!(audited, Audited::Ogg(_)).then(|| ogg_granule(codec, time_base)),
       guessed: None,
       ogg_metadata: false,
+      ps_preload: match audited {
+        Audited::MpegPs(kind) => Some(kind == PsKind::Dvd),
+        _ => None,
+      },
+      pcm_header: matches!(audited, Audited::MpegPs(_)) && id == PCM_DVD,
+      ts: (audited == Audited::MpegTs)
+        .then(|| match id {
+          CodecId::H264 | CodecId::HEVC | CodecId::VVC => Some(TsRules::StartCodes),
+          CodecId::AAC => Some(TsRules::Aac {
+            configured: !codec.extradata().is_empty(),
+            pce: adts_configuration(codec.extradata()).map_or(0, |config| config.pce),
+          }),
+          CodecId::OPUS => Some(TsRules::Opus),
+          _ => None,
+        })
+        .flatten(),
+      ts_clock: audited == Audited::MpegTs,
+      mxf: None,
     }
   }
 }
@@ -5636,6 +5971,16 @@ impl SideRules {
     {
       return None;
     }
+    // MPEG-TS writes a packet's PES stream id as its PES packet's, which its
+    // reader puts on each packet it reads, and an Opus packet's end trim in
+    // its control header beside the start the initial padding makes
+    // (`mpegtsenc.c` 1883–1886, 2079–2111).
+    if audited == Audited::MpegTs
+      && (is(T::AV_PKT_DATA_MPEGTS_STREAM_ID)
+        || (is(T::AV_PKT_DATA_SKIP_SAMPLES) && self.codec == CodecId::OPUS))
+    {
+      return None;
+    }
     // Ogg writes a lone Vorbis, FLAC or Opus stream's strings metadata on
     // a packet after its first as a chained stream's tags: its trailer,
     // then its start and header again (`ogg_check_new_metadata`,
@@ -5767,6 +6112,8 @@ struct Learned {
   place: Option<(i128, bool)>,
   /// NUT: the key frame's presentation and decode times, in ticks.
   key_times: Option<(i128, i128)>,
+  /// The MXF muxers: what they know of the track's frames after it.
+  mxf: Option<MxfMirror>,
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
@@ -5948,6 +6295,41 @@ where
     }
     // MP4's default selection, which needs the whole table (table E).
     let defaults_added = mp4_defaults_added(family, &tracks, &roads);
+    // The MPEG program stream numbers its streams by codec from each
+    // codec's first id (table H).
+    if let Audited::MpegPs(kind) = audited
+      && let Some(track) = mpeg_ps_ids_overflow(kind, &tracks, &roads)
+    {
+      return Err(MuxOpenError::StreamIds { track });
+    }
+    // MPEG-TS declares every stream in one PMT section.
+    if audited == Audited::MpegTs
+      && let Some(track) = mpeg_ts_pmt_overflow(&tracks, &roads)
+    {
+      return Err(MuxOpenError::StreamIds { track });
+    }
+    // The MXF muxers place each track by its kind.
+    if let Audited::Mxf(kind) = audited
+      && let Some(track) = mxf_misplaced(kind, &tracks, &roads)
+    {
+      return Err(MuxOpenError::TrackLayout { track });
+    }
+    // The MXF muxers cut PCM into the edit units of the video's frame rate,
+    // OP-Atom's of its audio edit rate, 25 (`mxf_init`, `mxfenc.c`
+    // 3036–3083; `opatom_options`).
+    let mxf_rate = match audited {
+      Audited::Mxf(MxfKind::OpAtom) => Some((25, 1)),
+      Audited::Mxf(_) => tracks
+        .iter()
+        .zip(&roads)
+        .find(|(description, road)| **road == Road::Timed && description.kind() == TrackKind::Video)
+        .and_then(|(description, _)| match description.params() {
+          TrackParams::Video(params) => params.frame_rate(),
+          _ => None,
+        })
+        .map(|rate| (i64::from(rate.num()), i64::from(rate.den().get()))),
+      _ => None,
+    };
     // Ogg writes chapters into an Opus stream's tags alone.
     let ogg_opus = matches!(audited, Audited::Ogg(_))
       && tracks
@@ -6220,6 +6602,9 @@ where
             rules.ttml_document =
               Some((codec.extradata().len() + language) as u64 + TTML_DOCUMENT_OVERHEAD);
           }
+          if let Audited::Mxf(mxf) = audited {
+            rules.mxf = Some(MxfRules::of(mxf, &tracks[index], &codec, mxf_rate));
+          }
           sides = SideRules::of((family, audited), kind, &codec);
           sides.alone = ogg_streams == 1;
           Some((stream, time_base))
@@ -6263,6 +6648,13 @@ where
         bytes: 0,
         place: 0,
         key_times: None,
+        mxf: MxfMirror {
+          profile_level: (
+            tracks[index].side_data().profile(),
+            tracks[index].side_data().level(),
+          ),
+          ..MxfMirror::default()
+        },
       });
     }
 
@@ -6353,8 +6745,10 @@ where
   /// report — [`Muxer::finish`], keeping both. The report gains what only
   /// the stream's end decides: the packets an automatic filter still held
   /// ([`Uncarried::Held`]), the E-AC-3 packets MP4 still joined
-  /// ([`Uncarried::Unjoined`]), and where MP4 ends an E-AC-3 track's last
-  /// joined sample short of its packets ([`Rewrite::Durations`]).
+  /// ([`Uncarried::Unjoined`]), where MP4 ends an E-AC-3 track's last
+  /// joined sample short of its packets ([`Rewrite::Durations`]), and the
+  /// packets MXF's interleaving drops past the last edit unit every track
+  /// fills ([`Uncarried::Trailing`]).
   pub fn finish_into_sink(mut self) -> Result<(W, MuxReport), MuxFault> {
     // A trailer the container would fail for want of a frame no packet was
     // left to decide, or would end the process over the last sample's
@@ -6378,6 +6772,41 @@ where
           MuxStage::Trailer,
           FfmpegMuxRefusal::LastSampleTooLong { track },
         ));
+      }
+    }
+    // The MXF muxers' interleaving writes only the edit units every track
+    // reaches, each packet's time its count on its stream, and drops the
+    // rest when the stream ends; a track no packet reached leaves none
+    // written, the file's header with them, and the trailer fails
+    // (`mxf_interleave_get_packet`, `mxfenc.c` 3557–3606;
+    // `mxf_write_footer`, 3487–3496). Each track counted as the
+    // interleaving counts it: PCM in the packets `pcm_rechunk` cuts.
+    let units: Vec<(TrackIndex, u64)> = self
+      .tracks
+      .iter()
+      .enumerate()
+      .filter_map(|(index, state)| {
+        let rules = state.rules.mxf?;
+        let count = match rules.rechunk {
+          Some((sample_bytes, rate)) => mxf_rechunked(state.bytes, sample_bytes, rate),
+          None => state.mxf.packets,
+        };
+        Some((TrackIndex::new(index), count))
+      })
+      .collect();
+    if let Some(&(track, _)) = units.iter().find(|(_, count)| *count == 0) {
+      return Err(MuxFault::refused(
+        MuxStage::Trailer,
+        FfmpegMuxRefusal::NoFrame { track },
+      ));
+    }
+    let reached = units.iter().map(|&(_, count)| count).min().unwrap_or(0);
+    for &(track, count) in &units {
+      if count > reached {
+        self.report.uncarried.push(Uncarried::Trailing {
+          track,
+          packets: count - reached,
+        });
       }
     }
     for (index, state) in self.tracks.iter().enumerate() {
@@ -6701,12 +7130,28 @@ where
       }
     }
 
-    // The shift, once a packet before the earliest makes it certain.
-    if shift.as_ref().is_some_and(|shift| shift.earliest.is_some())
+    // The MPEG program stream's preload, at its first packet: every
+    // stream's times moved so that it lies half a second in where it lies
+    // before, and always on DVD (`mpegenc.c` 1186–1201), every stream
+    // counted in 90 kHz.
+    let first_write = shift.as_ref().is_some_and(|shift| shift.written)
+      && self.shift.as_ref().is_some_and(|shift| !shift.written);
+    let preloads = state.rules.ps_preload.is_some_and(|dvd| {
+      first_write
+        && shift
+          .as_ref()
+          .and_then(|shift| shift.first)
+          .is_some_and(|first| first < PS_PRELOAD_TICKS || (dvd && first != PS_PRELOAD_TICKS))
+    });
+    // The shift, once a packet before the earliest makes it certain — or
+    // the preload — reported once.
+    if ((shift.as_ref().is_some_and(|shift| shift.earliest.is_some())
       && self
         .shift
         .as_ref()
-        .is_some_and(|shift| shift.earliest.is_none())
+        .is_some_and(|shift| shift.earliest.is_none()))
+      || preloads)
+      && !self.report.uncarried().contains(&Uncarried::TimesShifted)
     {
       uncarried.push(Uncarried::TimesShifted);
     }
@@ -6783,6 +7228,9 @@ where
     }
     if let Some(key_times) = plan.learned.key_times {
       state.key_times = Some(key_times);
+    }
+    if let Some(mxf) = plan.learned.mxf {
+      state.mxf = mxf;
     }
     if let Some(sample) = plan.learned.sample {
       state.sample = Some(sample);
@@ -7162,6 +7610,34 @@ fn check_packet_rules(
         });
       }
     }
+    // The MPEG program stream adds its preload to every time, moves its
+    // clock a tick past the earliest decode time and on by each pack it
+    // writes, in `int64_t` (`mpegenc.c` 1080, 1144, 1201–1202): a time past
+    // half of its range, which leaves the clock no room, refused.
+    if rules.ps_preload.is_some()
+      && i128::from(output.pts_ticks.unwrap_or(output.dts_ticks)).max(i128::from(output.dts_ticks))
+        + lift
+        > i128::from(i64::MAX / 2)
+    {
+      return Err(FfmpegMuxRefusal::TimeWraps {
+        track,
+        timestamp: output.pts.unwrap_or(output.dts),
+      });
+    }
+    // MPEG-TS counts its clock reference from the first decode time, 300
+    // times over, and its PES times, in `int64_t` (`mpegtsenc.c`
+    // 1887–1890, 1597–1611): a time past `i64::MAX / 600` refused, the
+    // clock's room.
+    if rules.ts_clock
+      && i128::from(output.pts_ticks.unwrap_or(output.dts_ticks)).max(i128::from(output.dts_ticks))
+        + lift
+        > i128::from(i64::MAX / 600)
+    {
+      return Err(FfmpegMuxRefusal::TimeWraps {
+        track,
+        timestamp: output.pts.unwrap_or(output.dts),
+      });
+    }
     // Ogg's granule (`ogg_write_packet_internal`, `oggenc.c` 718–750), of
     // the presentation time and the duration libavformat hands — a
     // negative one zero, a missing one its guess (`mux.c` 605–633). Ogg
@@ -7233,6 +7709,50 @@ fn check_packet_rules(
     .is_some_and(|data| !dictionary_unpacks(data))
   {
     return refused(PayloadRule::MetadataUpdate);
+  }
+  if rules.pcm_header && payload.bytes.len() < 3 {
+    return refused(PayloadRule::PcmHeader);
+  }
+  // What the MXF muxers read of a frame before they write it.
+  let mxf = match rules.mxf {
+    Some(mxf) => match mxf_frame(mxf.frames, state.mxf, payload.bytes) {
+      Ok(mirror) => Some(mirror),
+      Err(rule) => return refused(rule),
+    },
+    None => None,
+  };
+  // MPEG-TS's packets (`mpegts_write_packet_internal`, `mpegtsenc.c`
+  // 1869–2240).
+  match rules.ts {
+    Some(TsRules::StartCodes) => {
+      let annexb_filter = [step.inserted, state.filter.named()]
+        .into_iter()
+        .flatten()
+        .any(|filter| {
+          matches!(
+            filter,
+            AutomaticFilter::H264Mp4ToAnnexB
+              | AutomaticFilter::HevcMp4ToAnnexB
+              | AutomaticFilter::VvcMp4ToAnnexB
+          )
+        });
+      if !annexb_filter && (payload.bytes.len() < 5 || !annex_b(payload.bytes)) {
+        return refused(PayloadRule::StartCode);
+      }
+    }
+    Some(TsRules::Aac { .. } | TsRules::Opus) if payload.bytes.len() < 2 => {
+      return refused(PayloadRule::TooShort);
+    }
+    Some(TsRules::Aac { configured, pce }) if !adts_header(payload.bytes) => {
+      if !configured {
+        return refused(PayloadRule::AdtsFrame);
+      }
+      let first = if state.written { 0 } else { pce };
+      if ADTS_HEADER_BYTES + payload.bytes.len() + first > ADTS_FRAME_BYTES_MAX {
+        return refused(PayloadRule::AdtsFrameLength);
+      }
+    }
+    _ => {}
   }
   // AAC's filter converts the packet where it is inserted — at the track's
   // first packet, or at this one.
@@ -7591,6 +8111,7 @@ fn check_packet_rules(
     bytes: payload.bytes.len() as u64,
     place,
     key_times,
+    mxf,
   })
 }
 
@@ -8263,6 +8784,73 @@ where
     {
       Some(MuxOpenError::Dimensions { track })
     }
+    // MPEG-TS names a codec of its list alone (`get_dvb_stream_type`,
+    // `mpegtsenc.c` 352–455), writes a configured AAC track behind ADTS
+    // headers its start's nested ADTS muxer makes of the configuration,
+    // which refuses one ADTS cannot write (1240–1268), describes an Opus
+    // stream's channels where its mapping is one it knows (607–679), and
+    // ARIB captions of profile A or C (299–320).
+    Audited::MpegTs
+      if !MPEG_TS_CODECS
+        .iter()
+        .any(|&id| codec == CodecId::from_raw(id as i32)) =>
+    {
+      Some(MuxOpenError::CodecNotCarried { track, codec })
+    }
+    Audited::MpegTs
+      if (codec == CodecId::AAC
+        && !extradata.is_empty()
+        && adts_configuration(extradata).is_none())
+        || (codec == CodecId::OPUS
+          && !mpeg_ts_opus_mapped(extradata, ticket.ch_layout().channels()))
+        || (codec == ARIB_CAPTION
+          && ![
+            ffmpeg_next::ffi::AV_PROFILE_ARIB_PROFILE_A as i32,
+            ffmpeg_next::ffi::AV_PROFILE_ARIB_PROFILE_C as i32,
+          ]
+          .contains(&ticket.profile())) =>
+    {
+      Some(MuxOpenError::ConfigurationInvalid { track, codec })
+    }
+    // The MPEG program stream's start takes MPEG audio, AC-3, DTS, DVD and
+    // big-endian PCM, any video, any subtitle, and no other stream
+    // (`mpeg_mux_init`, `mpegenc.c` 342–475); its reader takes back MPEG
+    // audio, AC-3, DTS, DVD PCM — big-endian PCM, which the writer gives
+    // DVD's header, reads back as it — the video an elementary-stream
+    // probe names, and DVD subtitles alone, each by its stream id
+    // (`mpegps_read_packet`, `mpeg.c` 528–630).
+    Audited::MpegPs(_)
+      if ![
+        MP1,
+        MP2,
+        CodecId::MP3,
+        CodecId::AC3,
+        CodecId::DTS,
+        PCM_DVD,
+        MPEG1VIDEO,
+        CodecId::MPEG2VIDEO,
+        CodecId::MPEG4,
+        CodecId::H264,
+        CodecId::HEVC,
+        CodecId::VVC,
+        CAVS,
+        CodecId::DVD_SUBTITLE,
+      ]
+      .contains(&codec) =>
+    {
+      Some(MuxOpenError::CodecNotCarried { track, codec })
+    }
+    // DVD PCM: a sample rate of 48, 96, 44.1 or 32 kHz, 16, 20 or 24 bits a
+    // sample and at most 8 channels, which its header's fields count
+    // (`mpegenc.c` 390–411).
+    Audited::MpegPs(_)
+      if codec == PCM_DVD
+        && (![48_000, 96_000, 44_100, 32_000].contains(&ticket.sample_rate())
+          || ![16, 20, 24].contains(&ticket.bits_per_coded_sample())
+          || !(1..=8).contains(&ticket.ch_layout().channels())) =>
+    {
+      Some(MuxOpenError::ConfigurationInvalid { track, codec })
+    }
     // Ogg's start takes Vorbis, Theora, Speex, FLAC, Opus and VP8 alone, a
     // configuration for each but VP8 — FLAC's STREAMINFO of 34 bytes,
     // Speex's header of 80, Opus's OpusHead of 19, Vorbis's and Theora's
@@ -8350,7 +8938,319 @@ where
     Audited::Flac if extradata.len() < FLAC_STREAMINFO_BYTES || extradata.starts_with(b"fLaC") => {
       Some(MuxOpenError::ConfigurationInvalid { track, codec })
     }
+    Audited::Mxf(kind) => mxf_refusal(kind, track, description),
     _ => None,
+  }
+}
+
+/// What an MXF muxer refuses of a timed track at open (`mxf_init`,
+/// `mxfenc.c` 2941–3165), and what this release admits of it: MPEG-2
+/// video — MXF D-10's alone — DNxHD and ProRes, and PCM of 16 or 24 bits.
+/// H.264, DV, FFV1 and JPEG 2000 video, whose frame parsers this release
+/// has not audited, and the data and caption tracks are booked to be
+/// admitted, each by an audit of its own
+/// ([`MuxOpenError::CodecNotCarried`]). A video track needs a pixel format
+/// libavutil describes (2970–2976) and a frame rate MXF names a content
+/// package for (`mxf_init_timecode`, 2890–2911); MXF D-10's one of 25 or
+/// 30000/1001 exactly — its labels told apart by the time base's
+/// denominator, so that another rate is labelled as 525-line video — at a
+/// bit rate it names ([`mxf_d10_frame_bytes`]); ProRes a profile its
+/// labels name (`mxf_parse_prores_frame`, 2310–2333). An audio track
+/// needs 48 kHz (3038–3041) and a channel, which `pcm_rechunk`'s start
+/// refuses none of (`pcm_rechunk.c` 45–46); OP-Atom's one alone
+/// (3063–3066); MXF D-10's at most the eight its AES3 element holds, and
+/// a block alignment of its channels' samples, which its writer divides a
+/// packet by (`mxf_write_d10_audio_packet`, 3222–3248) — each refused
+/// ([`MuxOpenError::ConfigurationInvalid`]).
+fn mxf_refusal<D: AsRef<[u8]>>(
+  kind: MxfKind,
+  track: TrackIndex,
+  description: &TrackDescription<Ffmpeg, D, CodecTicket>,
+) -> Option<MuxOpenError> {
+  use ffmpeg_next::ffi::{AV_PROFILE_PRORES_PROXY, AV_PROFILE_PRORES_XQ, AVPixelFormat};
+  let codec = description.codec();
+  let ticket = description.side_data();
+  let refused = match description.kind() {
+    TrackKind::Video => {
+      let carried = if kind == MxfKind::D10 {
+        codec == CodecId::MPEG2VIDEO
+      } else {
+        [CodecId::MPEG2VIDEO, CodecId::DNXHD, CodecId::PRORES].contains(&codec)
+      };
+      if !carried {
+        return Some(MuxOpenError::CodecNotCarried { track, codec });
+      }
+      let rate = match description.params() {
+        TrackParams::Video(params) => params.frame_rate(),
+        _ => None,
+      };
+      !(0..AVPixelFormat::AV_PIX_FMT_NB as i32).contains(&ticket.format())
+        || !mxf_frame_rate(rate)
+        || (kind == MxfKind::D10
+          && rate.is_none_or(|rate| mxf_d10_frame_bytes(ticket.bit_rate(), rate).is_none()))
+        || (codec == CodecId::PRORES
+          && !(AV_PROFILE_PRORES_PROXY..=AV_PROFILE_PRORES_XQ).contains(&ticket.profile()))
+    }
+    TrackKind::Audio => {
+      if ![CodecId::PCM_S16LE, CodecId::PCM_S24LE].contains(&codec) {
+        return Some(MuxOpenError::CodecNotCarried { track, codec });
+      }
+      let channels = ticket.ch_layout().channels();
+      let sample = i64::from(channels) * i64::from(codec.bits_per_sample() / 8);
+      ticket.sample_rate() != 48_000
+        || channels < 1
+        || (kind == MxfKind::OpAtom && channels != 1)
+        || (kind == MxfKind::D10 && (channels > 8 || i64::from(ticket.block_align()) != sample))
+    }
+    _ => return Some(MuxOpenError::CodecNotCarried { track, codec }),
+  };
+  refused.then_some(MuxOpenError::ConfigurationInvalid { track, codec })
+}
+
+/// The first track an MXF muxer has no place for where it lies in the
+/// table (`mxf_init`, `mxfenc.c` 2946–2966, 3043–3047): OP-Atom writes one
+/// track; MXF and MXF D-10 a video track first and no other, MXF D-10 its
+/// audio track second.
+fn mxf_misplaced<D, S>(
+  kind: MxfKind,
+  tracks: &[TrackDescription<Ffmpeg, D, S>],
+  roads: &[Road],
+) -> Option<TrackIndex> {
+  tracks
+    .iter()
+    .zip(roads)
+    .enumerate()
+    .filter(|(_, (_, road))| **road == Road::Timed)
+    .enumerate()
+    .find(|(position, (_, (description, _)))| {
+      let video = description.kind() == TrackKind::Video;
+      match kind {
+        MxfKind::OpAtom => *position > 0,
+        MxfKind::Mxf => (*position == 0) != video,
+        MxfKind::D10 => {
+          (*position == 0) != video || (description.kind() == TrackKind::Audio && *position != 1)
+        }
+      }
+    })
+    .map(|(_, (index, _))| TrackIndex::new(index))
+}
+
+/// The frame rates MXF names a content package for, as numerator and
+/// denominator: the inverses of the frame periods its table holds
+/// (`mxf_content_package_rates`, `mxf.c` 196–218).
+const MXF_FRAME_RATES: [(i64, i64); 20] = [
+  (24, 1),
+  (24_000, 1001),
+  (25, 1),
+  (30, 1),
+  (30_000, 1001),
+  (48, 1),
+  (48_000, 1001),
+  (50, 1),
+  (60, 1),
+  (60_000, 1001),
+  (72, 1),
+  (72_000, 1001),
+  (75, 1),
+  (90, 1),
+  (90_000, 1001),
+  (96, 1),
+  (96_000, 1001),
+  (100, 1),
+  (120, 1),
+  (120_000, 1001),
+];
+
+/// Whether `rate` is a frame rate MXF names a content package for, by
+/// value (`ff_mxf_get_content_package_rate`, `mxf.c` 220–226, `av_cmp_q`)
+/// — the strict compliance a muxer opens with refusing any other, and a
+/// stream that states none (`mxf_init_timecode`, `mxfenc.c` 2890–2902;
+/// `mxf_init`, 2978–2981).
+fn mxf_frame_rate(rate: Option<Timebase>) -> bool {
+  rate.is_some_and(|rate| {
+    let (num, den) = (i64::from(rate.num()), i64::from(rate.den().get()));
+    num > 0
+      && den > 0
+      && MXF_FRAME_RATES
+        .iter()
+        .any(|&(rate_num, rate_den)| num * rate_den == rate_num * den)
+  })
+}
+
+/// MXF D-10's frame size: the bytes its constant bit rate gives a frame
+/// period, in `int64_t` (`mxf_init`, `mxfenc.c` 3006–3033) — for a frame
+/// rate of 25 or 30000/1001 exactly, the labels it names, and a bit rate of
+/// 30, 40 or 50 Mbit/s, or 49 999 840 bit/s at 30000/1001. `None` for any
+/// other: a rate it refuses, or one whose time base's denominator is not 25
+/// and which it labels as 525-line video.
+fn mxf_d10_frame_bytes(bit_rate: i64, rate: Timebase) -> Option<u64> {
+  let (num, den) = (i64::from(rate.num()), i64::from(rate.den().get()));
+  let pal = (num, den) == (25, 1);
+  let ntsc = (num, den) == (30_000, 1001);
+  let named = match bit_rate {
+    30_000_000 | 40_000_000 | 50_000_000 => pal || ntsc,
+    49_999_840 => ntsc,
+    _ => false,
+  };
+  // The time base is the rate's inverse: `bit_rate × den / (8 × num)`.
+  named.then(|| u64::try_from(bit_rate * den / (8 * num)).unwrap_or(0))
+}
+
+/// The pairs of an MPEG-2 profile and level, as MPEG-2's sequence extension
+/// codes them, MXF names a codec label for (`mxf_get_mpeg2_codec_ul`,
+/// `mxfenc.c` 2773–2791): Main profile at Main, High and High 1440; 4:2:2
+/// profile at Main and High.
+const MXF_MPEG2_LABELS: [(i32, i32); 5] = [(4, 8), (4, 4), (4, 6), (0, 5), (0, 2)];
+
+/// What an MXF muxer reads of an MPEG-2 frame, its start codes from the
+/// first byte to the fifth from the end (`mxf_parse_mpeg2_frame`,
+/// `mxfenc.c` 2793–2858): a sequence extension's profile and level, which
+/// the stream then holds; a picture's coding type, 0 refused
+/// ([`PayloadRule::FrameHeader`]), and P and B, whose index offsets this
+/// release does not mirror ([`PayloadRule::PredictedPicture`]); the scan
+/// ends at the first picture coding extension. Outside MXF D-10 the
+/// profile and level after it must be a pair it labels
+/// ([`MXF_MPEG2_LABELS`]). Answers the pair the stream holds after it.
+fn mxf_mpeg2_frame(
+  bytes: &[u8],
+  (profile, level): (i32, i32),
+  d10: bool,
+) -> Result<(i32, i32), PayloadRule> {
+  let (mut profile, mut level) = (profile, level);
+  let mut code: u32 = u32::MAX;
+  let mut at = 0;
+  while at + 4 < bytes.len() {
+    code = (code << 8) | u32::from(bytes[at]);
+    match code {
+      0x1b5 if bytes[at + 1] & 0xf0 == 0x10 => {
+        profile = i32::from(bytes[at + 1] & 0x07);
+        level = i32::from(bytes[at + 2] >> 4);
+      }
+      0x1b5 if at + 5 < bytes.len() && bytes[at + 1] & 0xf0 == 0x80 => break,
+      0x100 => match (bytes[at + 2] >> 3) & 0x07 {
+        0 => return Err(PayloadRule::FrameHeader),
+        2 | 3 => return Err(PayloadRule::PredictedPicture),
+        _ => {}
+      },
+      _ => {}
+    }
+    at += 1;
+  }
+  if !d10 && !MXF_MPEG2_LABELS.contains(&(profile, level)) {
+    return Err(PayloadRule::FrameHeader);
+  }
+  Ok((profile, level))
+}
+
+/// The compression ids of the DNxHD codec labels MXF names
+/// (`mxf_dnxhd_codec_uls`, `mxfenc.c` 2336–2359).
+const MXF_DNXHD_IDS: [u32; 20] = [
+  1235, 1237, 1238, 1241, 1242, 1243, 1244, 1250, 1251, 1252, 1253, 1256, 1258, 1259, 1260, 1270,
+  1271, 1272, 1273, 1274,
+];
+
+/// Whether an MXF muxer takes `bytes` as a DNxHD stream's first frame
+/// (`mxf_parse_dnxhd_frame`, `mxfenc.c` 2361–2397): its compression id, the
+/// big-endian `u32` at byte 0x28, one its labels name. It refuses a frame of
+/// fewer than 43 bytes and reads the id's last byte past one of 43, from
+/// its padding — refused here, a byte short of the id.
+fn mxf_dnxhd_first(bytes: &[u8]) -> bool {
+  bytes
+    .get(0x28..0x2c)
+    .is_some_and(|id| MXF_DNXHD_IDS.contains(&u32::from_be_bytes([id[0], id[1], id[2], id[3]])))
+}
+
+/// What an MXF muxer reads of a frame before it writes it, and what it
+/// knows of the track after (`mxf_write_packet`, `mxfenc.c` 3350–3396): an
+/// MPEG-2 frame's start codes ([`mxf_mpeg2_frame`]), MXF D-10's of its
+/// fixed size; a DNxHD stream's first frame's compression id
+/// ([`mxf_dnxhd_first`]) and every frame of the first's size, its
+/// constant-bit-rate index's unit ([`PayloadRule::FrameSize`]).
+fn mxf_frame(frames: MxfFrames, mirror: MxfMirror, bytes: &[u8]) -> Result<MxfMirror, PayloadRule> {
+  let mut next = MxfMirror {
+    packets: mirror.packets + 1,
+    ..mirror
+  };
+  let len = bytes.len() as u64;
+  match frames {
+    MxfFrames::Mpeg2 { d10 } => {
+      next.profile_level = mxf_mpeg2_frame(bytes, mirror.profile_level, d10.is_some())?;
+      if d10.is_some_and(|size| len != size) {
+        return Err(PayloadRule::FrameSize);
+      }
+    }
+    MxfFrames::Dnxhd => match mirror.frame_size {
+      None if !mxf_dnxhd_first(bytes) => return Err(PayloadRule::FrameHeader),
+      None => next.frame_size = Some(len),
+      Some(size) if len != size => return Err(PayloadRule::FrameSize),
+      Some(_) => {}
+    },
+    MxfFrames::Unread => {}
+  }
+  Ok(next)
+}
+
+/// The packets `pcm_rechunk` cuts `bytes` of 48 kHz PCM into, a sample
+/// `sample_bytes` across its channels: each the samples of one edit unit at
+/// `rate` frames a second — the count from the unit's start to the next's,
+/// each rounded to the nearest (`get_next_nb_samples`, `pcm_rechunk.c`
+/// 100–110; `av_rescale_q`) — the last padded with silence to its count
+/// when the stream ends (171–181).
+fn mxf_rechunked(bytes: u64, sample_bytes: u64, (num, den): (i64, i64)) -> u64 {
+  if bytes == 0 || sample_bytes == 0 || num <= 0 || den <= 0 {
+    return 0;
+  }
+  let samples = i128::from(bytes.div_ceil(sample_bytes));
+  let (num, den) = (i128::from(num), i128::from(den));
+  // The samples the first `units` edit units hold.
+  let held = |units: i128| i128::from(rescale_nearest(units, 48_000 * den, num));
+  let mut units = samples * num / (48_000 * den);
+  while held(units) < samples {
+    units += 1;
+  }
+  while units > 0 && held(units - 1) >= samples {
+    units -= 1;
+  }
+  u64::try_from(units).unwrap_or(u64::MAX)
+}
+
+impl MxfRules {
+  /// The rules of `description`'s track in `kind`, its stream holding
+  /// `codec`; `rate` the frame rate its PCM is cut by.
+  fn of<D: AsRef<[u8]>>(
+    kind: MxfKind,
+    description: &TrackDescription<Ffmpeg, D, CodecTicket>,
+    codec: &StreamCodec,
+    rate: Option<(i64, i64)>,
+  ) -> Self {
+    let frame_rate = match description.params() {
+      TrackParams::Video(params) => params.frame_rate(),
+      _ => None,
+    };
+    let frames = match codec.codec() {
+      CodecId::MPEG2VIDEO => MxfFrames::Mpeg2 {
+        d10: (kind == MxfKind::D10)
+          .then(|| {
+            frame_rate
+              .and_then(|rate| mxf_d10_frame_bytes(description.side_data().bit_rate(), rate))
+          })
+          .flatten(),
+      },
+      CodecId::DNXHD => MxfFrames::Dnxhd,
+      _ => MxfFrames::Unread,
+    };
+    let rechunk = (description.kind() == TrackKind::Audio)
+      .then(|| {
+        rate.map(|rate| {
+          (
+            u64::try_from(codec.channels()).unwrap_or(0)
+              * u64::from(codec.codec().bits_per_sample() / 8),
+            rate,
+          )
+        })
+      })
+      .flatten();
+    Self { frames, rechunk }
   }
 }
 
@@ -8756,10 +9656,14 @@ fn rewrites(
       Rewrite::WavPackHeaders,
     ),
     (
-      audited == Audited::Adts
+      (audited == Audited::Adts || (audited == Audited::MpegTs && codec == CodecId::AAC))
         && !extradata.is_empty()
         && adts_configuration(extradata).is_some_and(|rebuilt| rebuilt.rebuilt != extradata),
       Rewrite::AdtsHeaders,
+    ),
+    (
+      audited == Audited::MpegTs && [CodecId::H264, CodecId::HEVC, CodecId::VVC].contains(&codec),
+      Rewrite::AccessUnitDelimiters,
     ),
     (
       written.is_some_and(|written| !written.pts && !written.dts),
@@ -8782,7 +9686,7 @@ fn rewrites(
 /// order: the whole attachment where it is not written; else, by the
 /// report table ([`kept`]), an attachment's filename and MIME type, the
 /// language and the disposition flags the road keeps no field for.
-fn losses<D>(
+fn losses<D: AsRef<[u8]>>(
   (family, audited): (Family, Audited),
   road: Road,
   track: TrackIndex,
@@ -8791,7 +9695,7 @@ fn losses<D>(
   if road == Road::NotWritten {
     return vec![Uncarried::Attachment { track }];
   }
-  let kept = match audited.kept() {
+  let kept = match audited.kept_for(description) {
     Some(kept) => kept,
     None => kept(
       family,
@@ -8924,6 +9828,10 @@ enum LanguageRule {
   /// back as itself only where it is the bibliographic code of a language
   /// ISO 639-1 names; one without a code there is not written.
   ThroughIso639_1,
+  /// MPEG-TS's: a tag of three bytes, written into the stream's ISO 639,
+  /// subtitling or teletext descriptor as it is and read back so; any
+  /// other not, or as `und`.
+  ThreeBytes,
   /// None.
   Dropped,
 }
@@ -8946,6 +9854,7 @@ impl LanguageRule {
           .and_then(|code| convert_language(code, LanguageSpace::Iso639_2Bibliographic))
           == Some(tag)
       }
+      Self::ThreeBytes => tag.len() == 3,
       Self::Dropped => false,
     }
   }
@@ -9689,6 +10598,10 @@ fn convert_language(tag: &str, target: LanguageSpace) -> Option<&'static str> {
   None
 }
 
+/// The MPEG program stream's preload, half a second, in its 90 kHz ticks
+/// (`preload`, `mpegenc.c` 1306).
+const PS_PRELOAD_TICKS: i128 = 45_000;
+
 /// ASF's preroll, in milliseconds, added to every presentation time it
 /// writes (`PREROLL_TIME`, `asfenc.c` 245).
 const ASF_PREROLL_MS: i64 = 3100;
@@ -9862,6 +10775,232 @@ fn xiph_headers(extradata: &[u8], first: usize) -> Option<[&[u8]; 3]> {
   let header = |index: usize| extradata.get(starts[index]..starts[index] + lengths[index]);
   Some([header(0)?, header(1)?, header(2)?])
 }
+
+/// The first track whose stream id the MPEG program stream's start counts
+/// past its codec's range, or onto another stream's — so that its reader
+/// takes it for another codec's or another stream's — or past the 114
+/// bytes its system header has in a pack (`mpeg_mux_init`, `mpegenc.c`
+/// 336–484; `get_system_header_size`, 280–301; `mpegps_read_packet`,
+/// `mpeg.c` 565–620): MPEG audio from 0xc0 to 0xdf, video from 0xe0 —
+/// H.264 from 0xe2 — to 0xef, AC-3 from 0x80 to 0x87, DTS from 0x88 to
+/// 0x8f, DVD PCM from 0xa0 to 0xaf, subtitles from 0x20 to 0x3f; the system
+/// header 12 bytes and 3 a stream of MPEG audio or video, 3 for all the
+/// others, DVD's 18 whatever its streams.
+fn mpeg_ps_ids_overflow<D: AsRef<[u8]>>(
+  kind: PsKind,
+  tracks: &[TrackDescription<Ffmpeg, D, CodecTicket>],
+  roads: &[Road],
+) -> Option<TrackIndex> {
+  let (mut audio, mut ac3, mut dts, mut lpcm, mut video, mut h264, mut sub) = (0, 0, 0, 0, 0, 0, 0);
+  let mut header = 12;
+  let mut private = false;
+  for (index, (description, road)) in tracks.iter().zip(roads).enumerate() {
+    if *road != Road::Timed {
+      continue;
+    }
+    let codec = description.codec();
+    let (count, last, first) = match description.kind() {
+      TrackKind::Audio if codec == CodecId::AC3 => (&mut ac3, 0x87, 0x80),
+      TrackKind::Audio if codec == CodecId::DTS => (&mut dts, 0x8f, 0x88),
+      TrackKind::Audio if codec == PCM_DVD => (&mut lpcm, 0xaf, 0xa0),
+      TrackKind::Audio => (&mut audio, 0xdf, 0xc0),
+      TrackKind::Video if codec == CodecId::H264 => (&mut h264, 0xef, 0xe2),
+      TrackKind::Video => (&mut video, 0xef, 0xe0),
+      _ => (&mut sub, 0x3f, 0x20),
+    };
+    let id = first + *count;
+    *count += 1;
+    let private_id = id < 0xc0;
+    if !private_id || !private {
+      header += 3;
+    }
+    private |= private_id;
+    // A video id of the codecs past H.264's first lands on H.264's.
+    let collides = (description.kind() == TrackKind::Video) && video > 2 && h264 > 0;
+    if id > last || collides || (kind != PsKind::Dvd && header > 128 - 14) {
+      return Some(TrackIndex::new(index));
+    }
+  }
+  None
+}
+
+/// MPEG-TS's codecs the base names no constants for.
+const DVB_SUBTITLE: CodecId =
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_DVB_SUBTITLE as i32);
+const DVB_TELETEXT: CodecId =
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_DVB_TELETEXT as i32);
+const ARIB_CAPTION: CodecId =
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_ARIB_CAPTION as i32);
+
+/// The codecs MPEG-TS writes so that its reader names them again — a
+/// stream type of their own, or a registration or other descriptor — every
+/// other written as private data "that may not be recognized upon
+/// reading" (`get_dvb_stream_type`, `mpegtsenc.c` 352–455).
+const MPEG_TS_CODECS: [ffmpeg_next::ffi::AVCodecID; 27] = {
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  [
+    Id::AV_CODEC_ID_MPEG1VIDEO,
+    Id::AV_CODEC_ID_MPEG2VIDEO,
+    Id::AV_CODEC_ID_MPEG4,
+    Id::AV_CODEC_ID_H264,
+    Id::AV_CODEC_ID_HEVC,
+    Id::AV_CODEC_ID_VVC,
+    Id::AV_CODEC_ID_CAVS,
+    Id::AV_CODEC_ID_AVS2,
+    Id::AV_CODEC_ID_AVS3,
+    Id::AV_CODEC_ID_DIRAC,
+    Id::AV_CODEC_ID_VC1,
+    Id::AV_CODEC_ID_MP2,
+    Id::AV_CODEC_ID_MP3,
+    Id::AV_CODEC_ID_AAC,
+    Id::AV_CODEC_ID_AAC_LATM,
+    Id::AV_CODEC_ID_AC3,
+    Id::AV_CODEC_ID_EAC3,
+    Id::AV_CODEC_ID_DTS,
+    Id::AV_CODEC_ID_TRUEHD,
+    Id::AV_CODEC_ID_OPUS,
+    Id::AV_CODEC_ID_S302M,
+    Id::AV_CODEC_ID_TIMED_ID3,
+    Id::AV_CODEC_ID_SMPTE_2038,
+    Id::AV_CODEC_ID_SMPTE_KLV,
+    Id::AV_CODEC_ID_DVB_SUBTITLE,
+    Id::AV_CODEC_ID_DVB_TELETEXT,
+    Id::AV_CODEC_ID_ARIB_CAPTION,
+  ]
+};
+
+/// Whether MPEG-TS's PMT describes an Opus stream's channels: its OpusHead's
+/// mapping family 0 of up to two, family 1 of up to eight in Vorbis's order
+/// or its own, or none stated for up to two (`mpegts_write_pmt`,
+/// `mpegtsenc.c` 607–679) — any other written as an unknown mapping, which
+/// its reader cannot decode by.
+fn mpeg_ts_opus_mapped(extradata: &[u8], channels: i32) -> bool {
+  const COUPLED: [u8; 9] = [1, 0, 1, 1, 2, 2, 2, 3, 3];
+  const MAP_A: [[u8; 8]; 8] = [
+    [0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 1, 0, 0, 0, 0, 0, 0],
+    [0, 2, 1, 0, 0, 0, 0, 0],
+    [0, 1, 2, 3, 0, 0, 0, 0],
+    [0, 4, 1, 2, 3, 0, 0, 0],
+    [0, 4, 1, 2, 3, 5, 0, 0],
+    [0, 4, 1, 2, 3, 5, 6, 0],
+    [0, 6, 1, 2, 3, 4, 5, 7],
+  ];
+  let Ok(ch) = usize::try_from(channels) else {
+    return false;
+  };
+  if extradata.len() < 19 {
+    return ch <= 2;
+  }
+  match extradata[18] {
+    0 => ch <= 2,
+    1 if (1..=8).contains(&ch) && extradata.len() >= 21 + ch => {
+      let map = &extradata[21..21 + ch];
+      (usize::from(extradata[19]) == ch - usize::from(COUPLED[ch])
+        && extradata[20] == COUPLED[ch]
+        && map == &MAP_A[ch - 1][..ch])
+        || (ch >= 2
+          && usize::from(extradata[19]) == ch
+          && extradata[20] == 0
+          && map.iter().copied().eq(0..ch as u8))
+    }
+    _ => false,
+  }
+}
+
+/// The bytes MPEG-TS's PMT takes for a stream: its entry's 5 and its
+/// descriptors (`mpegts_write_pmt`, `mpegtsenc.c` 558–848) — AC-3's,
+/// E-AC-3's and SMPTE 302M's registration, Opus's registration and channel
+/// descriptor, an audio stream's ISO 639 descriptor, a DVB subtitle's or
+/// teletext's of each three-byte code its language is read as, ARIB
+/// captions', a video codec's registration, KLV's, SMPTE 2038's and timed
+/// ID3's.
+fn mpeg_ts_pmt_bytes<D: AsRef<[u8]>>(
+  description: &TrackDescription<Ffmpeg, D, CodecTicket>,
+) -> usize {
+  use TrackDisposition as F;
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  let codec = description.codec();
+  let is = |id: Id| codec == CodecId::from_raw(id as i32);
+  let tag = description.language().map_or("", Utf8Bytes::as_str);
+  // A DVB descriptor's codes: three bytes, then one skipped, while three
+  // are left — `und` for a tag of fewer.
+  let codes = |tag: &str| {
+    let mut left = if tag.len() >= 3 { tag.len() } else { 3 };
+    let mut codes = 0;
+    while left >= 3 {
+      codes += 1;
+      left -= 3;
+      left = left.saturating_sub(1);
+    }
+    codes
+  };
+  5 + match description.kind() {
+    TrackKind::Audio => {
+      let registration =
+        if is(Id::AV_CODEC_ID_AC3) || is(Id::AV_CODEC_ID_EAC3) || is(Id::AV_CODEC_ID_S302M) {
+          6
+        } else if codec == CodecId::OPUS {
+          10
+        } else {
+          0
+        };
+      let flagged = description
+        .disposition()
+        .intersects(F::CLEAN_EFFECTS | F::HEARING_IMPAIRED | F::VISUAL_IMPAIRED);
+      let language = if tag.len() == 3 || (tag.len() < 3 && flagged) {
+        6
+      } else {
+        0
+      };
+      registration + language
+    }
+    TrackKind::Subtitle if codec == DVB_SUBTITLE => 2 + 8 * codes(tag),
+    TrackKind::Subtitle if codec == DVB_TELETEXT => 2 + 5 * codes(tag),
+    TrackKind::Subtitle if codec == ARIB_CAPTION => 8,
+    TrackKind::Video
+      if is(Id::AV_CODEC_ID_DIRAC)
+        || is(Id::AV_CODEC_ID_VC1)
+        || codec == CodecId::HEVC
+        || is(Id::AV_CODEC_ID_CAVS)
+        || is(Id::AV_CODEC_ID_AVS2)
+        || is(Id::AV_CODEC_ID_AVS3) =>
+    {
+      6
+    }
+    TrackKind::Data if is(Id::AV_CODEC_ID_SMPTE_KLV) || is(Id::AV_CODEC_ID_SMPTE_2038) => 6,
+    TrackKind::Data if is(Id::AV_CODEC_ID_TIMED_ID3) => 15,
+    _ => 0,
+  }
+}
+
+/// The first track MPEG-TS's PMT has no room for: one that starts past its
+/// section's 988 bytes, written undeclared, or that makes it pass 1012,
+/// which `mpegts_write_section1` refuses, the PMT not written at all
+/// (`mpegtsenc.c` 216–222, 562–565, 845–848).
+fn mpeg_ts_pmt_overflow<D: AsRef<[u8]>>(
+  tracks: &[TrackDescription<Ffmpeg, D, CodecTicket>],
+  roads: &[Road],
+) -> Option<TrackIndex> {
+  let mut at = 4;
+  for (index, (description, road)) in tracks.iter().zip(roads).enumerate() {
+    if *road != Road::Timed {
+      continue;
+    }
+    at += mpeg_ts_pmt_bytes(description);
+    if at - mpeg_ts_pmt_bytes(description) > 988 || at > 1012 {
+      return Some(TrackIndex::new(index));
+    }
+  }
+  None
+}
+
+/// The MPEG program stream's codecs the base names no constants for.
+const MP1: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MP1 as i32);
+const PCM_DVD: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_PCM_DVD as i32);
+const MPEG1VIDEO: CodecId =
+  CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO as i32);
+const CAVS: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_CAVS as i32);
 
 /// Theora and Speex, which the base names no constants for.
 const THEORA: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_THEORA as i32);

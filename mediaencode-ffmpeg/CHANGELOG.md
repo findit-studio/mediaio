@@ -183,8 +183,59 @@ crate moves only when it changes.
   update that does not unpack (`PayloadRule::MetadataUpdate`, new); a lone
   stream's later metadata written as a chained stream's tags; chapters in
   an Opus stream's tags, their starts as its writer rounds them; the
-  language kept. A chapter's end is judged where the next chapter starts
-  as written, in MP4 and ASF too.
+  language kept. The MPEG program streams, under their five names: the
+  times of the first packet each PES packet holds the start of alone, the
+  reader's parser framing the stream again (`Rewrite::Timeline`); every
+  stream moved by the preload where the first packet is decoded before
+  half a second, on DVD always (`Uncarried::TimesShifted`); refused at
+  open a codec the start or the reader does not take — big-endian PCM,
+  which reads back as DVD PCM, among them — DVD PCM of a rate, depth or
+  channel count its header cannot name, and a stream past its codec's
+  stream ids or the system header's room (`MuxOpenError::StreamIds`,
+  new); refused in packets an empty packet, DVD PCM shorter than its
+  3-byte header (`PayloadRule::PcmHeader`, new), a time past half of
+  `int64_t`'s range (`TimeWraps`); no language, no disposition. MPEG-TS:
+  a video, subtitle or data packet's times kept, audio gathered into PES
+  packets of a few (`Rewrite::Timeline`), an access unit delimiter put
+  before each H.264, HEVC and VVC picture
+  (`Rewrite::AccessUnitDelimiters`, new), a configured AAC track's frames
+  behind ADTS headers (`Rewrite::AdtsHeaders`); refused at open a codec
+  it writes as private data its reader may not name, AAC of a
+  configuration ADTS cannot write, Opus of a channel mapping its PMT
+  cannot describe, ARIB captions of a profile but A and C, and a stream
+  its PMT section has no room for (`StreamIds`); refused in packets a
+  reordering packet with no presentation time (`MissingPts`), H.264,
+  HEVC or VVC off a start code no filter converts (`StartCode`), AAC or
+  Opus of fewer than 2 bytes (`PayloadRule::TooShort`, new), raw AAC on
+  a track with no configuration or past its ADTS header's 13 bits, an
+  empty packet, and a time past its clock reference's room (`TimeWraps`);
+  an audio stream's language of three bytes and the first of its
+  clean-effects, hearing-impaired and visual-impaired flags kept, a DVB
+  subtitle's and teletext's language. The MXF muxers, `mxf`, `mxf_d10`
+  and `mxf_opatom`: no time a packet keeps, each its count on its stream
+  (`Rewrite::Timeline`), MPEG-2's key frames by the bitstream; PCM cut
+  into the edit units of the video's frame rate; at the end the packets
+  past the last edit unit every track fills dropped and reported
+  (`Uncarried::Trailing`, new), and a track no packet reached refused, its
+  interleaving writing nothing without it (`FfmpegMuxRefusal::NoFrame`);
+  admitted MPEG-2 video — MXF D-10's alone, at 25 or 30000/1001 and the
+  bit rates it names — DNxHD and ProRes, and 16- and 24-bit PCM at
+  48 kHz, any other codec refused at open (`CodecNotCarried`), H.264, DV,
+  FFV1, JPEG 2000 and the data and caption tracks booked; refused at open
+  a track out of the place MXF gives it (`MuxOpenError::TrackLayout`,
+  new), a frame rate MXF names no content package for, no pixel format,
+  ProRes of no profile its labels name, sound of another rate, of no
+  channel, OP-Atom's of more than one, MXF D-10's of more than eight or of
+  a block alignment not its samples' (`ConfigurationInvalid`); refused in
+  packets an MPEG-2 picture of coding type 0 or of a profile and level MXF
+  labels no codec for, and DNxHD's first frame short of or past its
+  compression ids (`PayloadRule::FrameHeader`, new), a frame of another
+  size than a constant-bit-rate index counts (`PayloadRule::FrameSize`,
+  new), a predicted MPEG-2 picture, whose index offsets this release does
+  not mirror (`PayloadRule::PredictedPicture`, new; long-GOP MPEG-2
+  booked), an empty packet; no language, no disposition, no chapter. A
+  chapter's end is judged where the next chapter starts as written, in MP4
+  and ASF too.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
