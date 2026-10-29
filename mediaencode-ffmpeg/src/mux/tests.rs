@@ -4326,3 +4326,287 @@ fn flvs_filter_makes_h26x_configurations_as_extract_extradata_makes_them() {
     Ok(Some(made(&[&vsps, &vpps]))),
   );
 }
+
+/// **A track's channel layout reads back as each container writes it and
+/// each decoder reads it** (table E, R10's L1): RIFF's extensible form
+/// alone carries a mask, and that only below `0x40000`; Matroska, NUT, MXF
+/// and MP4 of no layout box write the count alone; FLAC's comment carries
+/// what its own order does not name, and its decoder fills its own order
+/// in where the container states none; FLV's multichannel configuration
+/// drops the channels it has no bit or id for; a decoder of its own layout
+/// keeps the declared one, a custom channel's name aside.
+#[test]
+fn channel_layouts_read_back_as_each_container_and_decoder_reads_them() {
+  use AVChannelOrder as Order;
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  const LFE2: u64 = 1 << 35;
+  const WIDE_LEFT: i32 = 31;
+  fn native(mask: u64) -> LayoutView<'static> {
+    LayoutView {
+      order: Order::AV_CHANNEL_ORDER_NATIVE as i32,
+      channels: mask.count_ones() as i32,
+      mask,
+      map: &[],
+    }
+  }
+  fn unordered(channels: i32) -> LayoutView<'static> {
+    LayoutView {
+      order: Order::AV_CHANNEL_ORDER_UNSPEC as i32,
+      channels,
+      mask: 0,
+      map: &[],
+    }
+  }
+  fn custom(map: &[CustomChannel]) -> LayoutView<'_> {
+    LayoutView {
+      order: Order::AV_CHANNEL_ORDER_CUSTOM as i32,
+      channels: map.len() as i32,
+      mask: 0,
+      map,
+    }
+  }
+  let id = |id: Id| CodecId::from_raw(id as i32);
+  let unnamed = |channel: i32| CustomChannel::new(channel, [0; 16]);
+  let reversed = [unnamed(1), unnamed(0)];
+  let wide = [unnamed(1), unnamed(0), unnamed(WIDE_LEFT)];
+  let mut left = [0; 16];
+  left[..4].copy_from_slice(b"left");
+  let named = [CustomChannel::new(0, left), unnamed(1)];
+  // First-order ambisonics: four channels, no others.
+  let ambisonic = LayoutView {
+    order: Order::AV_CHANNEL_ORDER_AMBISONIC as i32,
+    channels: 4,
+    mask: 0,
+    map: &[],
+  };
+  let at = |codec: CodecId, tag: u32, rate: i32| AudioStream { codec, tag, rate };
+  let pcm = at(CodecId::PCM_S16LE, 1, 48_000);
+  let flac = at(CodecId::FLAC, 0xF1AC, 48_000);
+  let wav = Audited::Wav { w64: false };
+  let mp4 = Audited::Mov(MovMode::Mp4);
+  let alone = |channels: i32| LayoutReadBack::Unordered { channels };
+  let mask = |mask: u64| LayoutReadBack::Native { mask };
+  let order = |channels: &[i32]| LayoutReadBack::Custom {
+    channels: channels.to_vec(),
+  };
+  // A codec this build has no decoder for keeps the container's.
+  let mpegh = id(Id::AV_CODEC_ID_MPEGH_3D_AUDIO);
+  let mpegh_back = if mediaio_ffmpeg::ffi::find_decoder_raw(mpegh.raw()).is_none() {
+    alone(6)
+  } else {
+    mask(0x60F)
+  };
+  let unknown = AVChannel::AV_CHAN_UNKNOWN as i32;
+  for (what, audited, stream, layout, back) in [
+    ("WAV PCM mono", wav, pcm, native(0x4), alone(1)),
+    ("WAV PCM stereo", wav, pcm, native(0x3), alone(2)),
+    ("WAV PCM 2.1", wav, pcm, native(0xB), mask(0xB)),
+    (
+      "WAV PCM past 0x40000",
+      wav,
+      pcm,
+      native(0x3 | LFE2),
+      alone(3),
+    ),
+    ("WAV PCM custom", wav, pcm, custom(&reversed), alone(2)),
+    ("WAV PCM unordered", wav, pcm, unordered(2), alone(2)),
+    (
+      "WAV PCM at 96 kHz",
+      wav,
+      at(CodecId::PCM_S16LE, 1, 96_000),
+      native(0x3),
+      mask(0x3),
+    ),
+    (
+      "WAV PCM of 24 bits",
+      wav,
+      at(CodecId::PCM_S24LE, 1, 48_000),
+      native(0x3),
+      mask(0x3),
+    ),
+    (
+      "WAV float",
+      wav,
+      at(CodecId::PCM_F32LE, 3, 48_000),
+      native(0x3),
+      alone(2),
+    ),
+    ("WAV ambisonic", wav, pcm, ambisonic, alone(4)),
+    (
+      "WAV WMA",
+      wav,
+      at(id(Id::AV_CODEC_ID_WMAV2), 0x161, 48_000),
+      native(0x3),
+      alone(2),
+    ),
+    (
+      "WAV ADPCM",
+      wav,
+      at(id(Id::AV_CODEC_ID_ADPCM_MS), 2, 48_000),
+      native(0x3),
+      alone(2),
+    ),
+    (
+      "WAV G.726, mono of its own",
+      wav,
+      at(id(Id::AV_CODEC_ID_ADPCM_G726), 0x45, 8_000),
+      native(0x4),
+      mask(0x4),
+    ),
+    (
+      "WAV MP3, of its own",
+      wav,
+      at(CodecId::MP3, 0x55, 48_000),
+      native(0x3),
+      mask(0x3),
+    ),
+    ("WAV FLAC stereo", wav, flac, native(0x3), mask(0x3)),
+    (
+      "WAV FLAC past 0x40000",
+      wav,
+      flac,
+      native(0x3 | LFE2),
+      mask(0x7),
+    ),
+    ("AVI PCM stereo", Audited::Avi, pcm, native(0x3), alone(2)),
+    (
+      "ASF PCM stereo",
+      Audited::Asf { stream: false },
+      pcm,
+      native(0x3),
+      alone(2),
+    ),
+    (
+      "Matroska PCM",
+      Audited::Matroska,
+      pcm,
+      native(0x3),
+      alone(2),
+    ),
+    (
+      "Matroska FLAC 2.1",
+      Audited::Matroska,
+      flac,
+      native(0xB),
+      mask(0xB),
+    ),
+    (
+      "Matroska FLAC stereo",
+      Audited::Matroska,
+      flac,
+      native(0x3),
+      mask(0x3),
+    ),
+    (
+      "Matroska FLAC past 0x3FFFF",
+      Audited::Matroska,
+      flac,
+      native(0x3 | LFE2),
+      mask(0x7),
+    ),
+    ("NUT PCM", Audited::Nut, pcm, native(0x3), alone(2)),
+    ("NUT FLAC 2.1", Audited::Nut, flac, native(0xB), mask(0x7)),
+    ("MP4 PCM mono", mp4, pcm, native(0x4), alone(1)),
+    ("MP4 PCM stereo", mp4, pcm, native(0x3), mask(0x3)),
+    (
+      "MP4 PCM custom",
+      mp4,
+      pcm,
+      custom(&reversed),
+      order(&[1, 0]),
+    ),
+    ("MP4 PCM named", mp4, pcm, custom(&named), mask(0x3)),
+    ("MP4 FLAC 2.1", mp4, flac, native(0xB), mask(0x7)),
+    (
+      "MP4 MPEG-H, of no decoder here",
+      mp4,
+      at(mpegh, 0, 48_000),
+      native(0x60F),
+      mpegh_back,
+    ),
+    (
+      "MXF PCM mono",
+      Audited::Mxf(MxfKind::OpAtom),
+      pcm,
+      native(0x4),
+      alone(1),
+    ),
+    (
+      "FLV FLAC, a wide channel",
+      Audited::Flv,
+      flac,
+      native(0x3 | 1 << WIDE_LEFT),
+      mask(0x7),
+    ),
+    (
+      "FLV FLAC custom, a wide channel",
+      Audited::Flv,
+      flac,
+      custom(&wide),
+      order(&[1, 0, unknown]),
+    ),
+    (
+      "FLV FLAC custom",
+      Audited::Flv,
+      flac,
+      custom(&reversed),
+      order(&[1, 0]),
+    ),
+    (
+      "FLV FLAC of LFE2",
+      Audited::Flv,
+      flac,
+      native(0x3 | LFE2),
+      mask(0x3 | LFE2),
+    ),
+    (
+      "FLV FLAC unordered",
+      Audited::Flv,
+      flac,
+      unordered(3),
+      mask(0xB),
+    ),
+    ("FLV PCM stereo", Audited::Flv, pcm, native(0x3), mask(0x3)),
+    (
+      "Ogg FLAC 2.1",
+      Audited::Ogg(OggKind::Ogg),
+      flac,
+      native(0xB),
+      mask(0x7),
+    ),
+    ("FLAC 2.1", Audited::Flac, flac, native(0xB), mask(0xB)),
+    (
+      "FLAC past 0x3FFFF",
+      Audited::Flac,
+      flac,
+      native(0x3 | LFE2),
+      mask(0x7),
+    ),
+    (
+      "Matroska AAC named, of its own",
+      Audited::Matroska,
+      at(CodecId::AAC, 0, 48_000),
+      custom(&named),
+      mask(0x3),
+    ),
+    (
+      "MPEG-PS DVD PCM, of its own",
+      Audited::MpegPs(PsKind::Dvd),
+      at(id(Id::AV_CODEC_ID_PCM_DVD), 0, 48_000),
+      native(0x3),
+      mask(0x3),
+    ),
+  ] {
+    let read = layout_read_back(audited, stream, layout);
+    assert_eq!(read, back, "{what}");
+    let named = layout
+      .map
+      .iter()
+      .any(|channel| channel.name_bytes()[0] != 0);
+    assert_eq!(
+      layout_kept(layout, &read),
+      !named && LayoutReadBack::canonical(layout) == read,
+      "{what}: kept"
+    );
+  }
+}

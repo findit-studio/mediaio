@@ -595,6 +595,7 @@
 //! | MP4's durations, where packets do not abut | kept only as the distance to the next decode time (`movenc.c` 1241–1259), counted between the samples MP4 writes (table C″) | reported as learned ([`Rewrite::Durations`]) |
 //! | an E-AC-3 track's last sample, joined | the edit list ends it at its last packet's duration (`movenc.c` 6940, 7329–7342), short of the frames it joins | reported at `finish` ([`Rewrite::Durations`]) |
 //! | an E-AC-3 track's frames short of a sample at its end | freed unwritten, the run MP4 joins them in (`mov_free`, `movenc.c` 7951–7955) | reported at `finish` ([`Uncarried::Unjoined`]), the packets counted, as VP9's held frames are (the Fable delta gate's R3); the joining reported at open ([`Rewrite::Ac3Parsed`]) |
+//! | an audio track's channel layout (R10, L1; grep L1) | RIFF's formats — WAV, Wave64, AVI, ASF — write a channel mask in their extensible form alone, for a native layout but mono and stereo, above 48 kHz, for E-AC-3 and DFPWM, and above 16 bits a sample but IEEE float's, and that mask only below `0x40000` (`riffenc.c` 79–84, 188–197), read back as its layout where it names the stream's channels, else as the count (`riffdec.c` 62–92, 141–275); Matroska and WebM, NUT, MXF and MP4 of no layout box write the count alone (`matroskaenc.c` 2130; `nutenc.c` 487; `mxfenc.c` 1714–1728; `movenc.c` 1438–1449), MP4's PCM of two channels and more its `chnl` box, read back as written (1299–1339, 1524–1525; `mov_chan.c` 768–859); raw FLAC and Matroska write FLAC's mask comment for a native layout within `0x3FFFF` its own order does not name, Ogg none (`flacenc.c` 244–259; `matroskaenc.c` 1077–1114); FLV a legacy codec's mono or stereo flag, read back as `av_channel_layout_default`'s, and an extended codec's multichannel configuration, of its first 18 mask bits and six from `AV_CHAN_LOW_FREQUENCY_2`, a custom map's channels of those, `AV_CHAN_UNKNOWN` for any other, and the default for another order (`flvenc.c` 722–761, 910–913; `flvdec.c` 1657–1669, 1706–1745); the decoder `avformat_find_stream_info` opens on the first packets keeps that or sets its own — every PCM, ADPCM and DPCM decoder but DVD PCM's, Blu-ray PCM's, SMPTE 302M's, G.722's, G.726's and VIMA's keeps it, as do 34 others and a codec of no decoder in the build, and FLAC's fills its own order in where the container states none of the stream's count (`libavcodec/flac.c` 173–185) — and a codec's own reads back as it is, which the trust model holds the declared layout to be; no container writes a custom channel's name | reported at open, once the header has settled the stream's codec tag, where it reads back otherwise ([`Uncarried::ChannelLayout`], [`LayoutReadBack`]) — L125–L131 and the unit law `channel_layouts_read_back_as_each_container_and_decoder_reads_them`; nothing refused: FLV's legacy codec of a layout but mono and stereo, whose multichannel header asserts, stays refused (L105), MP4's PCM of a layout its `chnl` box cannot write too ([`MuxOpenError::ChannelLayout`]), and every other container writes a count it holds whole |
 //!
 //! The report covers these fields and those of the tables above; a codec's
 //! parameters beyond its configuration — its color properties, its field
@@ -1857,6 +1858,116 @@ pub enum Uncarried {
     /// What became of it.
     fate: SideDataFate,
   },
+  /// An audio track's channel layout the file reads back otherwise than
+  /// declared — table E of the census: what the container writes of it,
+  /// as its reader reads that back, and as libavcodec's decoder of the
+  /// codec, which `avformat_find_stream_info` opens on the first packets,
+  /// keeps it or puts its own (`demux.c` 2926–2943, 3138–3163, 2566–2604
+  /// in FFmpeg 9.0.1). RIFF's formats — WAV's, Wave64's, AVI's, ASF's and
+  /// Matroska's `A_MS/ACM` — write a channel mask only in their
+  /// extensible form, and that only below `0x40000`: mono and stereo read
+  /// back of no order, as do a mask with a channel past it, a custom map
+  /// and an ambisonic layout (`riffenc.c` 79–84, 188–197); Matroska, NUT
+  /// and MXF write the count alone, and MP4 the count of a codec of no
+  /// layout box, mono PCM's among them; FLAC writes a mask comment only
+  /// for what its own order does not name, within `0x3FFFF`, and its
+  /// decoder puts its own order where the container states none. A codec
+  /// whose decoder sets its own layout reads back that one whatever the
+  /// container writes, and the trust model holds the declared layout to be
+  /// it; no container writes a custom channel's name. Reported at open,
+  /// once the header has settled the stream.
+  ChannelLayout {
+    /// The track.
+    track: TrackIndex,
+    /// What it reads back as.
+    read_back: LayoutReadBack,
+  },
+}
+
+/// The channel layout an audio track reads back with where it is not the
+/// one the track declared ([`Uncarried::ChannelLayout`]), as an
+/// `AVChannelLayout` states it.
+///
+/// Marked `#[non_exhaustive]`: an order a later release learns a container
+/// reads a layout back in joins as a variant.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LayoutReadBack {
+  /// The channel count alone, of no order (`AV_CHANNEL_ORDER_UNSPEC`).
+  Unordered {
+    /// The channels.
+    channels: i32,
+  },
+  /// The channels a mask names, in FFmpeg's native order
+  /// (`AV_CHANNEL_ORDER_NATIVE`).
+  Native {
+    /// The mask, an `AV_CH_*` bit a channel.
+    mask: u64,
+  },
+  /// Channels in an order of their own (`AV_CHANNEL_ORDER_CUSTOM`), none
+  /// named.
+  Custom {
+    /// Each channel's `AVChannel` id, in order.
+    channels: Vec<i32>,
+  },
+}
+
+impl LayoutReadBack {
+  /// How many channels it holds.
+  pub fn channels(&self) -> i32 {
+    match self {
+      Self::Unordered { channels } => *channels,
+      Self::Native { mask } => mask.count_ones() as i32,
+      Self::Custom { channels } => i32::try_from(channels.len()).unwrap_or(i32::MAX),
+    }
+  }
+
+  /// The channel at `index`, as `av_channel_layout_channel_from_index`
+  /// names it: the mask's bits from the lowest, or the map's; none of a
+  /// layout of no order.
+  fn channel_at(&self, index: i32) -> Option<i32> {
+    let index = usize::try_from(index).ok()?;
+    match self {
+      Self::Unordered { .. } => None,
+      Self::Native { mask } => (0..64).filter(|bit| mask & (1 << bit) != 0).nth(index),
+      Self::Custom { channels } => channels.get(index).copied(),
+    }
+  }
+
+  /// `layout` as FFmpeg's canonical form of it: a custom map whose channels
+  /// each name a bit of the mask, ascending, as that mask
+  /// (`av_channel_layout_retype`, `channel_layout.c` 887–979), another as
+  /// its map, unnamed; a native layout as its mask; an unspecified one by its
+  /// count; an ambisonic one channel by channel.
+  fn canonical(layout: LayoutView<'_>) -> Self {
+    use AVChannelOrder as Order;
+    if layout.order == Order::AV_CHANNEL_ORDER_UNSPEC as i32 {
+      return Self::Unordered {
+        channels: layout.channels,
+      };
+    }
+    if layout.order == Order::AV_CHANNEL_ORDER_NATIVE as i32 {
+      return Self::Native { mask: layout.mask };
+    }
+    let channels: Vec<i32> = (0..layout.channels)
+      .map(|index| {
+        layout
+          .channel_at(index)
+          .unwrap_or(AVChannel::AV_CHAN_NONE as i32)
+      })
+      .collect();
+    let native = channels.windows(2).all(|pair| pair[0] < pair[1])
+      && channels.iter().all(|&channel| (0..64).contains(&channel));
+    if native {
+      Self::Native {
+        mask: channels
+          .iter()
+          .fold(0, |mask, &channel| mask | (1 << channel)),
+      }
+    } else {
+      Self::Custom { channels }
+    }
+  }
 }
 
 /// What a container does to a track's packets on their way into the
@@ -2038,7 +2149,9 @@ impl MuxReport {
   /// its MIME type, the language, the disposition flags dropped, then
   /// those added, then the automatic filter and the container's own
   /// rewrites; then the chapters, in table order, each its id and its
-  /// span. What is learned while writing follows, in the order it was
+  /// span; then each audio track's channel layout that reads back
+  /// otherwise, once the header has settled the stream. What is learned
+  /// while writing follows, in the order it was
   /// learned: a track's durations, the side data of each kind a container
   /// drops; then, from [`CarrierMuxer::finish_into_sink`], the packets an
   /// automatic filter still held at the end, track by track.
@@ -6533,6 +6646,327 @@ fn mp4_pcm_layout_written(codec: CodecId, layout: LayoutView<'_>) -> bool {
     })
 }
 
+/// What libavcodec's decoder of an audio codec does with the channel
+/// layout its container reads back — the layout the track reads back
+/// with, since `avformat_find_stream_info` opens the decoder on the track's
+/// first packets and copies its layout into the stream (`demux.c`
+/// 2926–2943, 3138–3163, 2566–2604 in FFmpeg 9.0.1): table E of the census,
+/// each decoder's sources grepped for a write of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutDecoder {
+  /// It sets its own, from its bitstream, its configuration or its count —
+  /// the stream's, which the trust model holds the declared layout to be.
+  Own,
+  /// It keeps the container's, or the build has none for the codec.
+  Container,
+  /// FLAC's: the container's, where it names as many channels as the
+  /// stream holds; else FLAC's own order for the count
+  /// (`ff_flac_set_channel_layout`, `libavcodec/flac.c` 173–185).
+  Flac,
+}
+
+/// The audio codecs beside the PCM, ADPCM and DPCM blocks' whose decoder
+/// keeps the container's channel layout: of no write of it (the census's
+/// grep L1), or of one only where the container's count is not the
+/// stream's (`adxdec.c` 76–81; `alsdec.c` 327–332; `qoadec.c` 98–102;
+/// `shorten.c` 432–437), or where it states no count (`amrnbdec.c`
+/// 174–177; `amrwbdec.c` 115–118).
+const CONTAINER_LAYOUT_CODECS: [ffmpeg_next::ffi::AVCodecID; 34] = {
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  [
+    Id::AV_CODEC_ID_8SVX_EXP,
+    Id::AV_CODEC_ID_8SVX_FIB,
+    Id::AV_CODEC_ID_ACELP_KELVIN,
+    Id::AV_CODEC_ID_APAC,
+    Id::AV_CODEC_ID_APTX,
+    Id::AV_CODEC_ID_APTX_HD,
+    Id::AV_CODEC_ID_ATRAC1,
+    Id::AV_CODEC_ID_ATRAC3,
+    Id::AV_CODEC_ID_ATRAC3AL,
+    Id::AV_CODEC_ID_BONK,
+    Id::AV_CODEC_ID_DFPWM,
+    Id::AV_CODEC_ID_DSD_LSBF,
+    Id::AV_CODEC_ID_DSD_MSBF,
+    Id::AV_CODEC_ID_DSD_LSBF_PLANAR,
+    Id::AV_CODEC_ID_DSD_MSBF_PLANAR,
+    Id::AV_CODEC_ID_DST,
+    Id::AV_CODEC_ID_FASTAUDIO,
+    Id::AV_CODEC_ID_FTR,
+    Id::AV_CODEC_ID_G723_1,
+    Id::AV_CODEC_ID_G729,
+    Id::AV_CODEC_ID_HCA,
+    Id::AV_CODEC_ID_HCOM,
+    Id::AV_CODEC_ID_INTERPLAY_ACM,
+    Id::AV_CODEC_ID_MACE3,
+    Id::AV_CODEC_ID_MACE6,
+    Id::AV_CODEC_ID_MISC4,
+    Id::AV_CODEC_ID_FFWAVESYNTH,
+    Id::AV_CODEC_ID_WMAV1,
+    Id::AV_CODEC_ID_WMAV2,
+    Id::AV_CODEC_ID_MP4ALS,
+    Id::AV_CODEC_ID_QOA,
+    Id::AV_CODEC_ID_SHORTEN,
+    Id::AV_CODEC_ID_AMR_NB,
+    Id::AV_CODEC_ID_AMR_WB,
+  ]
+};
+
+/// The decoder `codec`'s layout meets ([`LayoutDecoder`]): FLAC's; the
+/// container's for every PCM id but DVD's, Blu-ray's and SMPTE 302M's,
+/// which read their own header (`pcm-dvd.c` 94–97; `pcm-bluray.c` 104–107;
+/// `s302m.c` 74–93), for every ADPCM id but G.722's, G.726's and VIMA's,
+/// which set mono or the count's default (`g722dec.c` 63–64; `g726.c`
+/// 436–437; `vima.c` 151–152), for every DPCM id, for
+/// [`CONTAINER_LAYOUT_CODECS`], and for a codec this build has no decoder
+/// for; else the decoder's own.
+fn layout_decoder(codec: CodecId) -> LayoutDecoder {
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  let raw = codec.raw();
+  let within = |first: Id, last: Id| (first as i32..=last as i32).contains(&raw);
+  let among = |ids: &[Id]| ids.iter().any(|&id| id as i32 == raw);
+  if codec == CodecId::FLAC {
+    LayoutDecoder::Flac
+  } else if (within(Id::AV_CODEC_ID_PCM_S16LE, Id::AV_CODEC_ID_PCM_SGA)
+    && !among(&[
+      Id::AV_CODEC_ID_PCM_DVD,
+      Id::AV_CODEC_ID_PCM_BLURAY,
+      Id::AV_CODEC_ID_S302M,
+    ]))
+    || (within(
+      Id::AV_CODEC_ID_ADPCM_IMA_QT,
+      Id::AV_CODEC_ID_ADPCM_IMA_ESCAPE,
+    ) && !among(&[
+      Id::AV_CODEC_ID_ADPCM_G722,
+      Id::AV_CODEC_ID_ADPCM_G726,
+      Id::AV_CODEC_ID_ADPCM_G726LE,
+      Id::AV_CODEC_ID_ADPCM_VIMA,
+    ]))
+    || within(Id::AV_CODEC_ID_ROQ_DPCM, Id::AV_CODEC_ID_CBD2_DPCM)
+    || among(&CONTAINER_LAYOUT_CODECS)
+    || mediaio_ffmpeg::ffi::find_decoder_raw(raw).is_none()
+  {
+    LayoutDecoder::Container
+  } else {
+    LayoutDecoder::Own
+  }
+}
+
+/// FLAC's own channel order by count, one to eight (`flac_channel_layouts`,
+/// `libavcodec/flac.c` 33–42): mono, stereo, 3.0, quad, 5.0 and 5.1 of side
+/// channels, 6.1, 7.1 — the layouts its writers name in no comment
+/// (`ff_flac_is_native_layout`, `flacenc_header.c` 50–62).
+const FLAC_LAYOUTS: [u64; 8] = [0x4, 0x3, 0x7, 0x33, 0x607, 0x60F, 0x70F, 0x63F];
+
+/// `av_channel_layout_default`'s layout by count, one to eight: the first
+/// of `channel_layout_map` of as many channels (`channel_layout.c`
+/// 190–231, 841–852) — mono, stereo, 2.1, 4.0, and 5.0 and 5.1 of back
+/// channels, 6.1, 7.1.
+const DEFAULT_LAYOUTS: [u64; 8] = [0x4, 0x3, 0xB, 0x107, 0x37, 0x3F, 0x70F, 0x63F];
+
+/// The fields of an audio stream RIFF's format reads beside its layout.
+#[derive(Debug, Clone, Copy)]
+struct AudioStream {
+  codec: CodecId,
+  /// The codec tag the header settled.
+  tag: u32,
+  rate: i32,
+}
+
+/// RIFF's audio format, WAV's, Wave64's, AVI's and ASF's
+/// (`ff_put_wav_header`, `riffenc.c` 54–232; `ff_get_wav_header`
+/// and `parse_waveformatex`, `riffdec.c` 62–92, 141–275): a
+/// WAVEFORMATEXTENSIBLE for a native layout but mono and stereo, above
+/// 48 kHz, for E-AC-3 and DFPWM, and above 16 bits a sample but IEEE
+/// float's (79–84), its channel mask the layout's below `0x40000`, else 0
+/// (188–197) — a custom map's pointer never below it, an unspecified
+/// layout's none — read back as the mask's layout where it names the
+/// stream's channels; anything else, the count alone.
+fn riff_layout(stream: AudioStream, layout: LayoutView<'_>) -> LayoutReadBack {
+  use AVChannelOrder as Order;
+  const DFPWM: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_DFPWM as i32);
+  let native = layout.order == Order::AV_CHANNEL_ORDER_NATIVE as i32;
+  let extensible = (native && layout.mask != 0x4 && layout.mask != 0x3)
+    || stream.rate > 48_000
+    || stream.codec == CodecId::EAC3
+    || stream.codec == DFPWM
+    || (stream.codec.bits_per_sample() > 16 && stream.tag != 0x0003);
+  let mask = if native || layout.order == Order::AV_CHANNEL_ORDER_AMBISONIC as i32 {
+    layout.mask
+  } else {
+    0
+  };
+  if extensible
+    && mask != 0
+    && mask < 0x4_0000
+    && mask.count_ones() == layout.channels.unsigned_abs()
+  {
+    LayoutReadBack::Native { mask }
+  } else {
+    LayoutReadBack::Unordered {
+      channels: layout.channels,
+    }
+  }
+}
+
+/// FLAC's channel mask comment, as raw FLAC and Matroska write it — for a
+/// native layout within `0x3FFFF` that its own order does not name
+/// (`flacenc.c` 244–259; `put_flac_codecpriv`, `matroskaenc.c` 1077–1114)
+/// — and read it back (`flacdec.c` 207–219; `matroska_parse_flac`,
+/// `matroskadec.c` 2183–2196); anything else, the count alone.
+fn flac_comment_layout(layout: LayoutView<'_>) -> LayoutReadBack {
+  if layout.order == AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32
+    && layout.mask & !0x3_FFFF == 0
+    && !FLAC_LAYOUTS.contains(&layout.mask)
+  {
+    LayoutReadBack::Native { mask: layout.mask }
+  } else {
+    LayoutReadBack::Unordered {
+      channels: layout.channels,
+    }
+  }
+}
+
+/// FLV's multichannel configuration, which it writes for an extended codec's
+/// track (`flv_write_multichannel_body`, `flvenc.c` 722–761; 910–913) and
+/// its reader takes (`flvdec.c` 1706–1745): a native mask of its first 18
+/// bits and its six from `AV_CHAN_LOW_FREQUENCY_2`, the rest dropped; a
+/// custom map's channels of those, `AV_CHAN_UNUSED`, and every other read
+/// back as `AV_CHAN_UNKNOWN`; any other order as `av_channel_layout_default`'s
+/// for the count — past eight channels, which FLAC's never are, the count
+/// alone.
+fn flv_multichannel_layout(layout: LayoutView<'_>) -> LayoutReadBack {
+  use AVChannelOrder as Order;
+  const KEPT: u64 = 0x3_FFFF | (0x3F << AVChannel::AV_CHAN_LOW_FREQUENCY_2 as u64);
+  if layout.order == Order::AV_CHANNEL_ORDER_NATIVE as i32 {
+    LayoutReadBack::Native {
+      mask: layout.mask & KEPT,
+    }
+  } else if layout.order == Order::AV_CHANNEL_ORDER_CUSTOM as i32 {
+    let low_2 = AVChannel::AV_CHAN_LOW_FREQUENCY_2 as i32;
+    LayoutReadBack::Custom {
+      channels: layout
+        .map
+        .iter()
+        .map(|channel| match channel.id() {
+          id @ (0..=17) => id,
+          id if (low_2..=low_2 + 5).contains(&id) => id,
+          id if id == AVChannel::AV_CHAN_UNUSED as i32 => id,
+          _ => AVChannel::AV_CHAN_UNKNOWN as i32,
+        })
+        .collect(),
+    }
+  } else {
+    default_layout(layout.channels)
+  }
+}
+
+/// `av_channel_layout_default` of `channels`, one to eight
+/// ([`DEFAULT_LAYOUTS`]); else the count alone.
+fn default_layout(channels: i32) -> LayoutReadBack {
+  usize::try_from(channels)
+    .ok()
+    .and_then(|channels| DEFAULT_LAYOUTS.get(channels.checked_sub(1)?))
+    .map_or(LayoutReadBack::Unordered { channels }, |&mask| {
+      LayoutReadBack::Native { mask }
+    })
+}
+
+/// What `audited` writes of an audio track's channel layout `layout`, as
+/// its reader reads it back, before a decoder (table E of the census, grep
+/// L1): RIFF's format ([`riff_layout`]); Matroska's and WebM's Channels
+/// element, the count alone (`matroskaenc.c` 2130; `matroskadec.c`
+/// 2881–2887), but FLAC's comment ([`flac_comment_layout`]) — a codec
+/// Matroska names not, which it would write as `A_MS/ACM` in RIFF's format,
+/// its query refuses at the normal compliance (`mkv_query_codec`,
+/// 3699–3713), the road unreached; raw FLAC's comment; MP4's PCM of two
+/// channels or more its `chnl` box, a configuration or each channel's
+/// position, read back as written (`mov_write_chnl_tag`, `movenc.c`
+/// 1299–1339, 1524–1525; `ff_mov_read_chnl`, `mov_chan.c` 768–859) — a
+/// layout it cannot write refused at open ([`MuxOpenError::ChannelLayout`]);
+/// FLV's legacy flag of one or two channels, read back as
+/// `av_channel_layout_default`'s (`flvdec.c` 1657–1669) — any other layout
+/// refused at open — and its extended codecs' multichannel configuration
+/// ([`flv_multichannel_layout`]); every other container's count alone —
+/// NUT's (`nutenc.c` 487; `nutdec.c` 470), MXF's (`mxfenc.c` 1714–1728;
+/// `mxfdec.c` 3066), MP4's other sample entries' (`movenc.c` 1438–1449;
+/// `mov.c` 2900–2901) and Ogg's FLAC (`oggparseflac.c`).
+fn container_layout(
+  audited: Audited,
+  stream: AudioStream,
+  layout: LayoutView<'_>,
+) -> LayoutReadBack {
+  let alone = LayoutReadBack::Unordered {
+    channels: layout.channels,
+  };
+  match audited {
+    Audited::Wav { .. } | Audited::Avi | Audited::Asf { .. } => riff_layout(stream, layout),
+    Audited::Matroska | Audited::WebM | Audited::Flac if stream.codec == CodecId::FLAC => {
+      flac_comment_layout(layout)
+    }
+    Audited::Mov(_) if MP4_PCM.contains(&stream.codec) && layout.channels > 1 => {
+      LayoutReadBack::canonical(layout)
+    }
+    Audited::Flv if stream.codec == CodecId::FLAC => flv_multichannel_layout(layout),
+    Audited::Flv => default_layout(layout.channels),
+    _ => alone,
+  }
+}
+
+/// The channel layout an audio track declared as `layout` reads back with
+/// out of `audited`'s file ([`Uncarried::ChannelLayout`]): the decoder's
+/// own, the stream's, which the trust model holds the declared one to be —
+/// a custom channel's name aside, which no container writes; the
+/// container's ([`container_layout`]); or FLAC's of it ([`LayoutDecoder`]).
+fn layout_read_back(
+  audited: Audited,
+  stream: AudioStream,
+  layout: LayoutView<'_>,
+) -> LayoutReadBack {
+  match layout_decoder(stream.codec) {
+    LayoutDecoder::Own => LayoutReadBack::canonical(layout),
+    LayoutDecoder::Container => container_layout(audited, stream, layout),
+    LayoutDecoder::Flac => {
+      let read = container_layout(audited, stream, layout);
+      if !matches!(read, LayoutReadBack::Unordered { .. }) && read.channels() == layout.channels {
+        read
+      } else {
+        usize::try_from(layout.channels)
+          .ok()
+          .and_then(|channels| FLAC_LAYOUTS.get(channels.checked_sub(1)?))
+          .map_or(
+            LayoutReadBack::Unordered {
+              channels: layout.channels,
+            },
+            |&mask| LayoutReadBack::Native { mask },
+          )
+      }
+    }
+  }
+}
+
+/// Whether a track declared as `layout` reads back with it, channel by
+/// channel as `av_channel_layout_compare` compares two (`channel_layout.c`
+/// 811–839): two of no order alike, one of no order and another apart —
+/// and no custom channel named.
+fn layout_kept(layout: LayoutView<'_>, back: &LayoutReadBack) -> bool {
+  use AVChannelOrder as Order;
+  let unordered = layout.order == Order::AV_CHANNEL_ORDER_UNSPEC as i32;
+  let named = layout.order == Order::AV_CHANNEL_ORDER_CUSTOM as i32
+    && layout
+      .map
+      .iter()
+      .any(|channel| channel.name_bytes()[0] != 0);
+  !named
+    && back.channels() == layout.channels
+    && match back {
+      LayoutReadBack::Unordered { .. } => unordered,
+      _ => {
+        !unordered
+          && (0..layout.channels).all(|index| layout.channel_at(index) == back.channel_at(index))
+      }
+    }
+}
+
 /// Which packet side data a container writes on a track, and what it keeps
 /// of it — the side-data table (see [the module](self)), from the muxers'
 /// source in FFmpeg 9.0.1.
@@ -7382,6 +7816,22 @@ where
           let codec = output
             .stream_codec(stream)
             .map_err(|error| MuxFault::new(MuxStage::Header, error))?;
+          // What the file reads the track's channel layout back as, by the
+          // codec tag the header settled (table E).
+          if kind == TrackKind::Audio {
+            let layout = LayoutView::of(tracks[index].side_data().ch_layout());
+            let stream = AudioStream {
+              codec: codec.codec(),
+              tag: codec.codec_tag(),
+              rate: codec.sample_rate(),
+            };
+            let read_back = layout_read_back(audited, stream, layout);
+            if !layout_kept(layout, &read_back) {
+              report
+                .uncarried
+                .push(Uncarried::ChannelLayout { track, read_back });
+            }
+          }
           rules = PacketRules::settle(
             (family, audited),
             kind,

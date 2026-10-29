@@ -39,8 +39,9 @@ use mediaencode::{
   },
 };
 use mediaencode_ffmpeg::{
-  AutomaticFilter, ContainerName, FfmpegMuxRefusal, FfmpegMuxer, FfmpegOwnedMuxer, MuxOpenError,
-  MuxOptions, MuxStage, OutputError, OutputText, PayloadRule, Rewrite, SideDataFate, Uncarried,
+  AutomaticFilter, ContainerName, FfmpegMuxRefusal, FfmpegMuxer, FfmpegOwnedMuxer, LayoutReadBack,
+  MuxOpenError, MuxOptions, MuxStage, OutputError, OutputText, PayloadRule, Rewrite, SideDataFate,
+  Uncarried,
 };
 use mediaio_ffmpeg::{
   CodecTicket, FfmpegBytes, PacketLimits,
@@ -15274,5 +15275,402 @@ fn l124b_matroskas_av1_refuses_a_configuration_past_its_room() {
       "{container}: no configuration"
     );
     untouched!(offered, back);
+  }
+}
+
+/// A fifth of a second of a tone at 48 kHz, panned by `pan` (its filter's
+/// syntax, each output channel the input's), in `codec`, into `name`'s
+/// container — `format` named where its extension does not say it.
+fn panned(corpus: &Corpus, name: &str, pan: &str, codec: &str, format: Option<&str>) -> PathBuf {
+  let pan = format!("pan={pan}");
+  let mut args = vec![
+    "-f",
+    "lavfi",
+    "-i",
+    "sine=frequency=440:sample_rate=48000:duration=0.2",
+    "-af",
+    &pan,
+    "-c:a",
+    codec,
+  ];
+  if let Some(format) = format {
+    args.extend(["-f", format]);
+  }
+  generated(corpus, name, &args)
+}
+
+/// The channel layout of `path`'s audio track as the demuxer reads it back.
+fn layout_read_back_of(path: &Path) -> LayoutReadBack {
+  use ffmpeg_next::ffi::AVChannelOrder as Order;
+  let (table, _) = first_track(path, TrackKind::Audio, 0);
+  let layout = table[0].side_data().ch_layout().clone();
+  if layout.order() == Order::AV_CHANNEL_ORDER_NATIVE as i32 {
+    LayoutReadBack::Native {
+      mask: layout.mask(),
+    }
+  } else if layout.order() == Order::AV_CHANNEL_ORDER_CUSTOM as i32 {
+    LayoutReadBack::Custom {
+      channels: layout.map().iter().map(|channel| channel.id()).collect(),
+    }
+  } else {
+    LayoutReadBack::Unordered {
+      channels: layout.channels(),
+    }
+  }
+}
+
+/// The layout fixtures: PCM of each layout — mono and stereo in QuickTime,
+/// whose `chan` box states them, 2.1, a stereo pair and LFE2, and a custom
+/// order in MP4, whose `chnl` box does, stereo of no order in WAV, stereo
+/// at 44.1 kHz, which FLV's legacy flags take — and FLAC's 2.1 raw, by its
+/// mask comment, and of LFE2 in FLV, by its multichannel configuration.
+struct Layouts {
+  mono: PathBuf,
+  stereo: PathBuf,
+  two_one: PathBuf,
+  lfe2: PathBuf,
+  reversed: PathBuf,
+  unordered: PathBuf,
+  stereo_44: PathBuf,
+  flac: PathBuf,
+  flac_lfe2: PathBuf,
+}
+
+impl Layouts {
+  fn of(corpus: &Corpus) -> Self {
+    let stereo = panned(
+      corpus,
+      "layout-stereo.mov",
+      "stereo|c0=c0|c1=c0",
+      "pcm_s16le",
+      None,
+    );
+    let unordered = output(corpus, "layout-unordered.wav");
+    if !unordered.exists() {
+      let status = std::process::Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-i"])
+        .arg(&stereo)
+        .args(["-c", "copy"])
+        .arg(&unordered)
+        .status()
+        .expect("the ffmpeg CLI runs");
+      assert!(status.success(), "ffmpeg made the WAV");
+    }
+    let stereo_44 = output(corpus, "layout-stereo-44.mov");
+    if !stereo_44.exists() {
+      let status = std::process::Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("sine=frequency=440:sample_rate=44100:duration=0.2")
+        .args(["-af", "pan=stereo|c0=c0|c1=c0", "-c:a", "pcm_s16le"])
+        .arg(&stereo_44)
+        .status()
+        .expect("the ffmpeg CLI runs");
+      assert!(status.success(), "ffmpeg made the 44.1 kHz stereo");
+    }
+    Self {
+      mono: panned(corpus, "layout-mono.mov", "mono|c0=c0", "pcm_s16le", None),
+      stereo,
+      two_one: panned(
+        corpus,
+        "layout-2.1.mp4",
+        "2.1|c0=c0|c1=c0|c2=c0",
+        "pcm_s16le",
+        None,
+      ),
+      lfe2: panned(
+        corpus,
+        "layout-lfe2.mp4",
+        "FL+FR+LFE2|c0=c0|c1=c0|c2=c0",
+        "pcm_s16le",
+        None,
+      ),
+      reversed: panned(
+        corpus,
+        "layout-reversed.mp4",
+        "FR+FL|c0=c0|c1=c0",
+        "pcm_s16le",
+        None,
+      ),
+      unordered,
+      stereo_44,
+      flac: panned(
+        corpus,
+        "layout-2.1.flac",
+        "2.1|c0=c0|c1=c0|c2=c0",
+        "flac",
+        None,
+      ),
+      flac_lfe2: panned(
+        corpus,
+        "layout-lfe2.flv",
+        "FL+FR+LFE2|c0=c0|c1=c0|c2=c0",
+        "flac",
+        None,
+      ),
+    }
+  }
+}
+
+/// Writes `source`'s audio track whole into `container` at `target`, and
+/// checks the report's channel layout line against `read_back` — none where
+/// it is `None` — and the file's layout against it, or `source`'s.
+fn layout_law(source: &Path, target: &Path, container: &str, read_back: Option<LayoutReadBack>) {
+  let what = format!("{} into {container}", source.display());
+  let (table, packets) = whole_track(source, TrackKind::Audio);
+  let mut muxer = muxer_into(target, ContainerName::new(container), table);
+  let lines = lines(muxer.report(), |line| {
+    matches!(line, Uncarried::ChannelLayout { .. })
+  });
+  assert_eq!(
+    lines,
+    read_back
+      .iter()
+      .map(|read_back| Uncarried::ChannelLayout {
+        track: TrackIndex::new(0),
+        read_back: read_back.clone(),
+      })
+      .collect::<Vec<_>>(),
+    "{what}: the report"
+  );
+  for packet in &packets {
+    muxer
+      .write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet)))
+      .map_err(|error| error.map_packet(drop))
+      .unwrap_or_else(|error| panic!("{what}: a packet: {error:?}"));
+  }
+  muxer
+    .finish()
+    .unwrap_or_else(|error| panic!("{what}: {error:?}"));
+  assert_eq!(
+    layout_read_back_of(target),
+    read_back.unwrap_or_else(|| layout_read_back_of(source)),
+    "{what}: the file"
+  );
+}
+
+/// **L125 — RIFF's formats read a channel layout back as their mask
+/// carries it** (R10, L1; table E; `riffenc.c` 79–84, 188–197; `riffdec.c`
+/// 62–92, 258–263): WAV, Wave64, AVI and ASF write the mask of an
+/// extensible format alone — a native layout but mono and stereo, below
+/// `0x40000` — so that PCM's mono and stereo read back of no order, and a
+/// mask past `0x40000` and a custom order of none, reported
+/// ([`Uncarried::ChannelLayout`]); 2.1 and a layout of no order read back
+/// as written; and in WAV, FLAC's decoder fills its own order in, and
+/// MP3's sets its own.
+///
+/// PLANT: mono and stereo written extensible, the report's lines missing;
+/// a mask past `0x40000` written, LFE2's line missing; a custom order read
+/// as its mask; FLAC of no order of its own, WAV's FLAC line added; MP3's
+/// decoder the container's, its line added.
+#[test]
+fn l125_riffs_formats_read_a_layout_back_as_their_mask_carries_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let layouts = Layouts::of(&corpus);
+  let alone = |channels: i32| Some(LayoutReadBack::Unordered { channels });
+  for container in ["wav", "w64", "avi", "asf"] {
+    for (source, read_back) in [
+      (&layouts.mono, alone(1)),
+      (&layouts.stereo, alone(2)),
+      (&layouts.two_one, None),
+      (&layouts.lfe2, alone(3)),
+      (&layouts.reversed, alone(2)),
+      (&layouts.unordered, None),
+    ] {
+      let name = source
+        .file_stem()
+        .expect("a name")
+        .to_string_lossy()
+        .into_owned();
+      layout_law(
+        source,
+        &output(&corpus, &format!("l125-{name}.{container}")),
+        container,
+        read_back,
+      );
+    }
+  }
+  let flac_stereo = panned(
+    &corpus,
+    "layout-stereo.flac",
+    "stereo|c0=c0|c1=c0",
+    "flac",
+    None,
+  );
+  layout_law(&flac_stereo, &output(&corpus, "l125-flac.wav"), "wav", None);
+  let mp3 = panned(
+    &corpus,
+    "layout-stereo.mp3",
+    "stereo|c0=c0|c1=c0",
+    "libmp3lame",
+    None,
+  );
+  layout_law(&mp3, &output(&corpus, "l125-mp3.wav"), "wav", None);
+}
+
+/// **L126 — Matroska reads a channel layout back as its count, but FLAC's
+/// by its comment** (R10, L1; table E; `matroskaenc.c` 1077–1114, 2130;
+/// `matroskadec.c` 2183–2196, 2881–2887): PCM stereo reads back of no
+/// order, reported; FLAC's 2.1 by its comment as written; FLAC's of LFE2,
+/// past the comment's `0x3FFFF`, as FLAC's own 3.0, reported.
+///
+/// PLANT: Matroska's PCM read as written, its line missing; the comment
+/// past `0x3FFFF`, LFE2's line missing.
+#[test]
+fn l126_matroska_reads_a_layout_back_as_its_count_but_flacs_by_its_comment() {
+  let Some(corpus) = Corpus::new() else { return };
+  let layouts = Layouts::of(&corpus);
+  for (source, name, read_back) in [
+    (
+      &layouts.stereo,
+      "pcm",
+      Some(LayoutReadBack::Unordered { channels: 2 }),
+    ),
+    (&layouts.flac, "flac", None),
+    (
+      &layouts.flac_lfe2,
+      "flac-lfe2",
+      Some(LayoutReadBack::Native { mask: 0x7 }),
+    ),
+  ] {
+    layout_law(
+      source,
+      &output(&corpus, &format!("l126-{name}.mkv")),
+      "matroska",
+      read_back,
+    );
+  }
+}
+
+/// **L127 — NUT reads a channel layout back as its count** (R10, L1;
+/// table E; `nutenc.c` 487; `nutdec.c` 470): PCM stereo of no order,
+/// FLAC's 2.1 as FLAC's own 3.0, each reported.
+///
+/// PLANT: NUT's layout read as written, both lines missing; FLAC of no
+/// order of its own, its line naming no order.
+#[test]
+fn l127_nut_reads_a_layout_back_as_its_count() {
+  let Some(corpus) = Corpus::new() else { return };
+  let layouts = Layouts::of(&corpus);
+  layout_law(
+    &layouts.stereo,
+    &output(&corpus, "l127-pcm.nut"),
+    "nut",
+    Some(LayoutReadBack::Unordered { channels: 2 }),
+  );
+  layout_law(
+    &layouts.flac,
+    &output(&corpus, "l127-flac.nut"),
+    "nut",
+    Some(LayoutReadBack::Native { mask: 0x7 }),
+  );
+}
+
+/// **L128 — MP4 reads PCM's layout back from its `chnl` box, mono's and
+/// FLAC's of its count** (R10, L1; table E; `movenc.c` 1299–1339,
+/// 1524–1525; `mov.c` 2900–2901; `mov_chan.c` 768–859): PCM stereo and a
+/// custom order read back as written; mono, of no `chnl`, of no order,
+/// reported; FLAC's 2.1 as FLAC's own 3.0, reported.
+///
+/// PLANT: mono read from a `chnl`, its line missing; PCM of two channels
+/// read as its count, stereo's line added.
+#[test]
+fn l128_mp4_reads_pcms_layout_back_from_its_chnl_box() {
+  let Some(corpus) = Corpus::new() else { return };
+  let layouts = Layouts::of(&corpus);
+  for (source, name, read_back) in [
+    (&layouts.stereo, "stereo", None),
+    (&layouts.reversed, "reversed", None),
+    (
+      &layouts.mono,
+      "mono",
+      Some(LayoutReadBack::Unordered { channels: 1 }),
+    ),
+    (
+      &layouts.flac,
+      "flac",
+      Some(LayoutReadBack::Native { mask: 0x7 }),
+    ),
+  ] {
+    layout_law(
+      source,
+      &output(&corpus, &format!("l128-{name}.mp4")),
+      "mp4",
+      read_back,
+    );
+  }
+}
+
+/// **L129 — MXF reads a channel layout back as its count** (R10, L1;
+/// table E; `mxfenc.c` 1714–1728; `mxfdec.c` 3066): OP-Atom's mono PCM of
+/// no order, reported.
+///
+/// PLANT: MXF's layout read as written, the line missing.
+#[test]
+fn l129_mxf_reads_a_layout_back_as_its_count() {
+  let Some(corpus) = Corpus::new() else { return };
+  let layouts = Layouts::of(&corpus);
+  layout_law(
+    &layouts.mono,
+    &output(&corpus, "l129.mxf"),
+    "mxf_opatom",
+    Some(LayoutReadBack::Unordered { channels: 1 }),
+  );
+}
+
+/// **L130 — Ogg reads FLAC's layout back as its count, raw FLAC by its
+/// comment** (R10, L1; table E; `flacenc.c` 244–259; `flacdec.c`
+/// 207–219): Ogg's FLAC 2.1 as FLAC's own 3.0, reported; raw FLAC's 2.1
+/// as written; its LFE2, past the comment's `0x3FFFF`, as 3.0, reported.
+///
+/// PLANT: Ogg's FLAC read as written, its line missing; the comment past
+/// `0x3FFFF`, LFE2's line missing.
+#[test]
+fn l130_ogg_reads_flacs_layout_back_as_its_count_raw_flac_by_its_comment() {
+  let Some(corpus) = Corpus::new() else { return };
+  let layouts = Layouts::of(&corpus);
+  let three = Some(LayoutReadBack::Native { mask: 0x7 });
+  layout_law(
+    &layouts.flac,
+    &output(&corpus, "l130.ogg"),
+    "ogg",
+    three.clone(),
+  );
+  layout_law(
+    &layouts.flac,
+    &output(&corpus, "l130-2.1.flac"),
+    "flac",
+    None,
+  );
+  layout_law(
+    &layouts.flac_lfe2,
+    &output(&corpus, "l130-lfe2.flac"),
+    "flac",
+    three,
+  );
+}
+
+/// **L131 — FLV reads FLAC's layout back from its multichannel
+/// configuration, and PCM's mono or stereo from its flag** (R10, L1; table
+/// E; `flvenc.c` 722–761, 910–913; `flvdec.c` 1657–1669, 1706–1745): FLAC's
+/// 2.1 and its LFE2, whose bit FLV keeps, as written; PCM's stereo as
+/// written — FLV's other changes are the unit law's, past what FLAC's own
+/// files carry.
+///
+/// PLANT: FLV's FLAC mask cut to its first 18 bits, LFE2's line added.
+#[test]
+fn l131_flv_reads_flacs_layout_back_from_its_multichannel_configuration() {
+  let Some(corpus) = Corpus::new() else { return };
+  let layouts = Layouts::of(&corpus);
+  for (source, name) in [
+    (&layouts.flac, "flac"),
+    (&layouts.flac_lfe2, "flac-lfe2"),
+    (&layouts.stereo_44, "pcm"),
+  ] {
+    layout_law(
+      source,
+      &output(&corpus, &format!("l131-{name}.flv")),
+      "flv",
+      None,
+    );
   }
 }

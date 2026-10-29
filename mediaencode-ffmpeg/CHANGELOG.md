@@ -354,6 +354,16 @@ crate moves only when it changes.
   set the standard does not allow reaches — a value past the range it
   caps, syntax that does not parse — rests on the trust model, and is not
   refused.
+  Every admitted container's channel layout, by the round trip — what it
+  writes of the layout, its reader's reading, and the decoder
+  `avformat_find_stream_info` opens: where the file reads back another,
+  reported at open (`Uncarried::ChannelLayout`, new, and
+  `LayoutReadBack`, new) — RIFF's mono and stereo of no order, its mask of
+  `0x40000` and up written as 0, and its custom orders; Matroska's, NUT's
+  and MXF's count alone, and MP4's of mono PCM and of FLAC; FLAC's own
+  order, which its decoder fills in where the container states none;
+  FLV's multichannel configuration's dropped channels; a custom channel's
+  name, which no container writes.
   ISMV's decode gap: its negative composition offsets move a packet's
   decode time by the track's first composition offset between
   `check_pkt`'s two calls, so that the second moves a gap of `i32::MAX`
