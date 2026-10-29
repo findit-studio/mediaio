@@ -16,7 +16,7 @@
 //! laws skip, saying why.
 
 use std::{
-  collections::{BTreeMap, BTreeSet},
+  collections::BTreeSet,
   hash::{DefaultHasher, Hash, Hasher},
   path::{Path, PathBuf},
   process::Command,
@@ -221,9 +221,9 @@ fn picture_hash(frame: &VideoFrame) -> u64 {
   hasher.finish()
 }
 
-/// Every picture a software session delivers for `packets`, by pts, each as
-/// its [`picture_hash`].
-fn decode(track: &Track, packets: &[&VideoPacket]) -> BTreeMap<i64, u64> {
+/// Every picture a software session delivers for `packets`, each as its pts
+/// and its [`picture_hash`], sorted.
+fn decode(track: &Track, packets: &[&VideoPacket]) -> Vec<(i64, u64)> {
   let mut decoder = FfmpegVideoStreamDecoder::open_from(
     VideoStreamDecoderOpen::new().with_path(DecodePath::Software),
     track.parameters.clone(),
@@ -232,14 +232,11 @@ fn decode(track: &Track, packets: &[&VideoPacket]) -> BTreeMap<i64, u64> {
   )
   .expect("open the session");
   let mut frame = empty_owned_video_frame();
-  let mut pictures = BTreeMap::new();
+  let mut pictures = Vec::new();
   let mut take = |decoder: &mut FfmpegVideoStreamDecoder, frame: &mut VideoFrame| {
     while let Received::Produced = decoder.receive_frame(frame).expect("decode cleanly") {
       let pts = frame.pts().expect("a picture's pts").pts();
-      assert!(
-        pictures.insert(pts, picture_hash(frame)).is_none(),
-        "two pictures at {pts}"
-      );
+      pictures.push((pts, picture_hash(frame)));
     }
   };
   for packet in packets {
@@ -255,6 +252,7 @@ fn decode(track: &Track, packets: &[&VideoPacket]) -> BTreeMap<i64, u64> {
     take(&mut decoder, &mut frame);
   }
   take(&mut decoder, &mut frame);
+  pictures.sort_unstable();
   pictures
 }
 
@@ -265,6 +263,11 @@ fn decode(track: &Track, packets: &[&VideoPacket]) -> BTreeMap<i64, u64> {
 fn dropping_the_marked_packets_changes_no_other_picture(name: &str, track: &Track) {
   let every: Vec<&VideoPacket> = track.packets.iter().collect();
   let whole = decode(track, &every);
+  let mut seen = BTreeSet::new();
+  assert!(
+    whole.iter().all(|&(pts, _)| seen.insert(pts)),
+    "{name}: two pictures at one pts in the whole decode"
+  );
   let marked: Vec<usize> = (0..track.packets.len())
     .filter(|&index| disposable(&track.packets[index]))
     .collect();
@@ -287,10 +290,10 @@ fn dropping_the_marked_packets_changes_no_other_picture(name: &str, track: &Trac
       .iter()
       .map(|&index| track.packets[index].pts().expect("a pts").pts())
       .collect();
-    let expected: BTreeMap<i64, u64> = whole
+    let expected: Vec<(i64, u64)> = whole
       .iter()
       .filter(|(pts, _)| !lost.contains(pts))
-      .map(|(&pts, &hash)| (pts, hash))
+      .copied()
       .collect();
     assert_eq!(
       rest,
