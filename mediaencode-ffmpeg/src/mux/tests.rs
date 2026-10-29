@@ -2561,8 +2561,9 @@ fn the_annex_b_rewrite_is_bounded_by_its_start_codes() {
 fn the_configurations_mp4s_trailer_refuses_are_known_at_open() {
   const MP4: (Family, Audited) = (Family::Mp4, Audited::Mov(MovMode::Mp4));
   const MATROSKA: (Family, Audited) = (Family::Matroska, Audited::Matroska);
-  // A stream of no tag, no pixel format, an unknown profile.
-  const NONE: (u32, i32, i32) = (0, -1, -99);
+  // A stream of no tag, no pixel format, an unknown profile, not flagged
+  // multilayer.
+  const NONE: ((u32, i32, i32), bool) = ((0, -1, -99), false);
   let flac = [0u8; 34];
   assert!(!configuration_invalid(MP4, CodecId::FLAC, NONE, &flac));
   assert!(configuration_invalid(MP4, CodecId::FLAC, NONE, &flac[..33]));

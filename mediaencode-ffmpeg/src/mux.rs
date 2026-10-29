@@ -422,13 +422,14 @@
 //! | | | neither an `hvcC` nor Annex B | a | refused — L115g |
 //! | | | Annex B: a unit of the five kept types — VPS, SPS, PPS, SEI — whose RBSP `init_get_bits8` takes not | a | refused — the unit law |
 //! | | | Annex B: a kept unit past 65 535 bytes, its 16-bit length cut, success answered | a | refused, Matroska's too — L115h |
-//! | | | Annex B: a unit of a layer but the base's and the alpha layer's a VPS extension names, skipped (888–889, 393–458) | — | mirrored: the VPS parsed for it |
+//! | | | a unit of a layer but the base's and the alpha layer's a VPS extension names before it, of Annex B — of an `hvcC`, of any layer but the base's, its VPSs unparsed — skipped, the record written without it, the layer's parameter sets lost (888–889, 393–458, 1340–1360) | a | refused, Matroska's and FLV's too — but in MP4 of a stream flagged multilayer, whose `lhvC` writes them, below (R11, ruling 1; [`records::hvcc_drops_layers`]) — L141 |
 //! | | | Annex B: a multilayer SPS whose VPS the record holds not before it (642–652) | a | refused — L115i |
 //! | | | Annex B: an SPS of more than 31 long-term reference pictures, which the standard allows to 32 (750–751; `hevc/ps.c` 1524) | a | refused — L115j |
 //! | | | Annex B: an SPS of more than 64 short-term reference picture sets, or of a set whose pictures' bits run past it (739–740, 609–610) | b | not refused — L122 |
 //! | | | Annex B: a set predicted from one past the count; the VPS's, PPS's and VUI's parses, whose failures are read and ignored | — | never reached; none |
 //! | | | complete: no VPS, SPS or PPS, or more than 16, 16 and 64 (1087–1093) | a | refused — L115e, L115f |
-//! | `ff_isom_write_lhvc` (`hevc.c` 1408–1413) | MP4's `lhvC` (1654–1674), for a stream flagged multilayer (2893–2898) | its answer read: logged, the box not written | — | never reached: the stream is handed the flags the report keeps, of which MP4 keeps no multilayer one ([`kept`]) |
+//! | `ff_isom_write_lhvc` (`hevc.c` 1408–1413) | MP4's `lhvC` (1654–1674), for a stream flagged multilayer (2893–2898) — handed the flag, which MP4 keeps where `lhvC` is written ([`kept`], [`handed_multilayer`]; R11, ruling 1) | its answer read: logged, the box not written — every layer's units walked and parsed, the record of the units of a layer past the base's: complete, of no such SPS or PPS, or of more than 16 and 64 | a | where `hvcC` drops a layer's units: refused, the layer lost — L141; of none: the flag lost, reported ([`Uncarried::Disposition`]) — L141 |
+//! | | | a unit written past 65 535 bytes, its length cut; a record whose arrays take fewer than 8 bytes — of no unit past the base layer's — which FFmpeg's reader refuses, the file with it (`mov.c` 8907–8914, 2248–2253) | a | refused ([`records::lhvc`]) — L141 |
 //! | `ff_isom_write_vvcc` (`vvc.c` 879–936) | MP4's `vvcC` (1706–1723), FLV (891); Matroska (1179) | fewer than 6 bytes | a | refused — L116a |
 //! | | | a `vvcC`, its first five bits set | — | written as it is |
 //! | | | neither a `vvcC` nor Annex B | a | refused — L116b |
@@ -735,7 +736,7 @@
 //! | Ogg (`oggenc.c` 497–765) | none a packet keeps of its own: each page the granule of the last packet it ends, its end, a reader counting the others' times from the samples or frames ([`Rewrite::Timeline`]) — VP8's first frame read back at its end | none | none: Theora's and VP8's key frames in their granules, which the reader sets by the bitstream ([`Rewrite::SyncFromBitstream`]) | a lone Vorbis, FLAC or Opus stream's later strings metadata, as a chained stream's tags; Opus's first start skip, its pre-skip | the language; no flag | in an Opus stream's tags alone: the first 1000, by position from 0, a start of rounded whole seconds and its rounded milliseconds, no end |
 //! | ASF, its streaming form (`asfenc.c` 862–1050) | the decode time, as each payload's presentation time, 32 bits of milliseconds with the preroll's 3100 added — no presentation time | none | a video payload's; every audio packet reads back a key frame ([`Rewrite::KeyFramesMarked`]) | none | a language through its ISO 639-1 code, read back as ISO 639-2/B — a tag of none not handed, so that the stream has none; the ten ISO 639-1 codes the table's search finds not, its tail out of order, read back with none, as glibc's and macOS's `bsearch` find them (`ISO_639_1_UNFOUND`; R9: Fable R1 — L110); no flag | markers: a start in 100 ns, numbered by position, each ended where the next starts; the streaming form none |
 //! | MXF, MXF D-10, MXF OP-Atom (`mxfenc.c` 3222–3628) | none: each packet's times replaced by its count on its stream, the file counting edit units, its reader each stream's times from them ([`Rewrite::Timeline`]); PCM cut into the edit units of the video's frame rate, OP-Atom's of 25, the last padded with silence ([`AutomaticFilter::PcmRechunk`]); the packets past the last edit unit every track fills dropped at the end ([`Uncarried::Trailing`]) | none | none: its reader's parser judges the pictures ([`Rewrite::SyncFromBitstream`]) | none | none | none |
-//! | the MOV family's modes beside MP4 — MOV, 3GP, 3G2, PSP, iPod, F4V, ISMV, AVIF (`movenc.c`) | MP4's, its sample tables and edit list — a constant-size audio track's, PCM's, as its places, each sample one tick ([`Rewrite::Timeline`]; R11, Q869 L7), in MP4's mode too; F4V's and AVIF's moved by libavformat, of no `AVFMT_TS_NEGATIVE` ([`Uncarried::TimesShifted`]); ISMV fragmenting with no edit list, each track's times its own ([`Rewrite::Timeline`]), a fragment flushed at every video key frame, the trigger its header adds where none is set (8815–8821) — an ISMV of no video key frame after the first holding the whole file until its trailer | MP4's | MP4's | MP4's; ISMV's start skip dropped | MOV's language through the Macintosh table, every other's packed; the enabled flag, MP4's mode its DASH roles too | MOV's and iPod's chapter track and Nero list, as MP4's; 3GP's, 3G2's, F4V's and ISMV's Nero list alone — the first 255, their starts in 100 ns, numbered by position from 0, the last ended at the file's end; PSP's and AVIF's none |
+//! | the MOV family's modes beside MP4 — MOV, 3GP, 3G2, PSP, iPod, F4V, ISMV, AVIF (`movenc.c`) | MP4's, its sample tables and edit list — a constant-size audio track's, PCM's, as its places, each sample one tick ([`Rewrite::Timeline`]; R11, Q869 L7), in MP4's mode too; F4V's and AVIF's moved by libavformat, of no `AVFMT_TS_NEGATIVE` ([`Uncarried::TimesShifted`]); ISMV fragmenting with no edit list, each track's times its own ([`Rewrite::Timeline`]), a fragment flushed at every video key frame, the trigger its header adds where none is set (8815–8821) — an ISMV of no video key frame after the first holding the whole file until its trailer | MP4's | MP4's | MP4's; ISMV's start skip dropped | MOV's language through the Macintosh table, every other's packed; the enabled flag, MP4's mode its DASH roles too, and HEVC's multilayer flag in `lhvC` (R11, ruling 1) | MOV's and iPod's chapter track and Nero list, as MP4's; 3GP's, 3G2's, F4V's and ISMV's Nero list alone — the first 255, their starts in 100 ns, numbered by position from 0, the last ended at the file's end; PSP's and AVIF's none |
 //!
 //! **What each refuses**:
 //!
@@ -4741,7 +4742,7 @@ impl PacketRules {
   /// took ([`Output::position`]).
   fn settle(
     (family, audited): (Family, Audited),
-    kind: TrackKind,
+    (kind, multilayer): (TrackKind, bool),
     codec: &StreamCodec,
     (time_base, shifts): (Timebase, bool),
     (header, file): (i64, u64),
@@ -4759,6 +4760,7 @@ impl PacketRules {
       (family, audited),
       id,
       (codec.codec_tag(), codec.format(), codec.profile()),
+      multilayer,
     );
     let earliest = if either_matroska {
       Some(Earliest::Presentation(-matroska_codec_delay(
@@ -8091,7 +8093,10 @@ where
           }
           rules = PacketRules::settle(
             (family, audited),
-            kind,
+            (
+              kind,
+              handed_multilayer((family, audited), road, &tracks[index]),
+            ),
             &codec,
             (time_base, shifts),
             (header, bounds.file),
@@ -10457,7 +10462,10 @@ fn judge<W, D: AsRef<[u8]>>(
       if configuration_invalid(
         (family, audited),
         codec,
-        (ticket.codec_tag(), ticket.format(), ticket.profile()),
+        (
+          (ticket.codec_tag(), ticket.format(), ticket.profile()),
+          handed_multilayer((family, audited), Road::Timed, description),
+        ),
         stream_extradata(description),
       ) {
         return Err(MuxOpenError::ConfigurationInvalid { track, codec });
@@ -10656,6 +10664,7 @@ where
         (Family::Other, audited),
         codec,
         (ticket.codec_tag(), ticket.format(), ticket.profile()),
+        false,
       )
       .is_some_and(|writer| {
         (!extradata.is_empty() || matches!(writer, Writer::Vpcc { .. }))
@@ -11490,7 +11499,9 @@ const AVS3: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID
 /// `format` and the profile `profile`, ignoring its answer (table C′′′ of
 /// the census; `movenc.c` 2880–2930; `flvenc.c` 886–899): the MOV
 /// family's `avcC`, `hvcC` — its arrays complete under the `hvc1` tag
-/// (1645) — `vvcC`, `evcC`, `lvcC`, `vpcC`, `av1C`, `av3c` and `dvc1`;
+/// (1645), and `lhvC` beside it where `multilayer`, the stream handed the
+/// multilayer flag (2893–2898; [`handed_multilayer`]) — `vvcC`, `evcC`,
+/// `lvcC`, `vpcC`, `av1C`, `av3c` and `dvc1`;
 /// FLV's `avcC`, `hvcC`, `vvcC`, `vpcC` and `av1C`. APV's `apvC` is MP4's
 /// parse of the packets, its writer of no answer (`apv.c` 80); Matroska's
 /// writers answer its header ([`configuration_invalid`]).
@@ -11498,6 +11509,7 @@ fn config_writer(
   (family, audited): (Family, Audited),
   codec: CodecId,
   (tag, format, profile): (u32, i32, i32),
+  multilayer: bool,
 ) -> Option<Writer> {
   let flv = audited == Audited::Flv;
   if family != Family::Mp4 && !flv {
@@ -11507,6 +11519,7 @@ fn config_writer(
     c if c == CodecId::H264 => Writer::Avcc,
     c if c == CodecId::HEVC => Writer::Hvcc {
       complete: !flv && hvc1(audited, tag),
+      lhvc: !flv && multilayer,
     },
     c if c == CodecId::VVC => Writer::Vvcc,
     c if c == CodecId::VP9 => Writer::Vpcc { format, profile },
@@ -11565,7 +11578,7 @@ fn h26x_units(codec: CodecId) -> Option<Units> {
 fn configuration_invalid(
   (family, audited): (Family, Audited),
   codec: CodecId,
-  stream: (u32, i32, i32),
+  (stream, multilayer): ((u32, i32, i32), bool),
   extradata: &[u8],
 ) -> bool {
   if family == Family::Matroska {
@@ -11576,12 +11589,15 @@ fn configuration_invalid(
     } else {
       Wrote::Whole
     };
-    return wrote == Wrote::Corrupt;
+    // HEVC: a layer's units the record skips, which Matroska writes no
+    // `lhvC` of (R11, ruling 1).
+    return wrote == Wrote::Corrupt
+      || (codec == CodecId::HEVC && wrote.whole() && records::hvcc_drops_layers(extradata));
   }
   if family != Family::Mp4 {
     return false;
   }
-  if let Some(writer) = config_writer((family, audited), codec, stream)
+  if let Some(writer) = config_writer((family, audited), codec, stream, multilayer)
     && (!extradata.is_empty() || matches!(writer, Writer::Vpcc { .. }))
     && !writer.writes(extradata).whole()
   {
@@ -12071,7 +12087,19 @@ fn losses<D: AsRef<[u8]>>(
   }
   let back =
     read_back(family, road, description, kept.flags) | mpeg_ts_read_back(audited, description);
-  let flags = description.disposition().difference(kept.flags | back);
+  let mut flags = description.disposition().difference(kept.flags | back);
+  // MP4's `lhvC`, which its multilayer flag reads back of, not written:
+  // a stream of no layer's units past the base's under `hvc1`, whose
+  // arrays it holds complete (R11, ruling 1; [`records::lhvc`]).
+  if handed_multilayer((family, audited), road, description)
+    && !records::lhvc(
+      stream_extradata(description),
+      hvc1(audited, description.side_data().codec_tag()),
+    )
+    .whole()
+  {
+    flags |= MULTILAYER;
+  }
   if !flags.is_empty() {
     lost.push(Uncarried::Disposition { track, flags });
   }
@@ -13645,14 +13673,17 @@ fn kept(
     // The track's enabled flag (`enable_tracks`, `movenc.c` 7883–7923)
     // and, MP4's mode alone, the DASH role `kind` boxes (4338–4356,
     // 4375–4378; `isom.c` 450–462); MOV's language through the Macintosh
-    // table, every other mode's packed (8455–8458).
+    // table, every other mode's packed (8455–8458); and HEVC's multilayer
+    // flag, of which every mode writes `lhvC`, its reader flagging the
+    // stream again where it reads one (2893–2898; `mov.c` 8878–8925) —
+    // where it is written ([`losses`]; R11, ruling 1).
     (Family::Mp4, Road::Timed) => Kept {
       language: if audited == Audited::Mov(MovMode::Mov) {
         LanguageRule::Macintosh
       } else {
         LanguageRule::Packed
       },
-      flags: if audited == Audited::Mov(MovMode::Mp4) {
+      flags: (if audited == Audited::Mov(MovMode::Mp4) {
         D::DEFAULT
           | D::HEARING_IMPAIRED
           | D::CAPTIONS
@@ -13663,10 +13694,41 @@ fn kept(
           | D::FORCED
       } else {
         D::DEFAULT
+      }) | if codec == CodecId::HEVC {
+        MULTILAYER
+      } else {
+        D::empty()
       },
       ..everything
     },
   }
+}
+
+/// `AV_DISPOSITION_MULTILAYER`: the stream holds more layers than one —
+/// MV-HEVC's views — which MP4 writes HEVC's `lhvC` for (`avformat.h`
+/// 719; `movenc.c` 2893–2898), and the base's flags name not.
+const MULTILAYER: TrackDisposition = TrackDisposition::from_bits_retain(1 << 21);
+
+/// Whether the stream a track becomes on `road` in `audited`, of
+/// `family`, is handed the multilayer flag: one it declares and the report
+/// table keeps — an MP4 HEVC track's, which MP4 writes into `lhvC`
+/// ([`kept`]; R11, ruling 1).
+fn handed_multilayer<D, S>(
+  (family, audited): (Family, Audited),
+  road: Road,
+  description: &TrackDescription<Ffmpeg, D, S>,
+) -> bool {
+  let declared = description.disposition();
+  declared.contains(MULTILAYER)
+    && kept(
+      (family, audited),
+      road,
+      description.kind(),
+      description.codec(),
+      declared,
+    )
+    .flags
+    .contains(MULTILAYER)
 }
 
 /// The stream a track becomes, on its road. The disposition handed to

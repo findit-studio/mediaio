@@ -400,6 +400,18 @@ struct Hvcc {
   alpha: u8,
   /// A unit kept past 65 535 bytes, its 16-bit length cut (856, 1194).
   cut: bool,
+  /// `lhvC`'s: the units of a layer past the base's, by array, which
+  /// `ff_isom_write_lhvc` alone writes and counts (1004–1013, 1186–1189).
+  upper: [u32; 5],
+  /// `lhvC`'s: such a unit past 65 535 bytes, its length cut.
+  upper_cut: bool,
+  /// `lhvC`'s: the bytes of its arrays, each array's three and each unit's
+  /// length and bytes, as written (1170–1192).
+  upper_bytes: u64,
+  /// A unit of a kept type `hvcC` skips for its layer — neither the base
+  /// layer's nor the alpha layer's a VPS extension names before it — lost
+  /// to the record (888–889; R11, ruling 1).
+  dropped: bool,
 }
 
 /// How a parse of a parameter set ends, as far as the record needs it.
@@ -431,18 +443,73 @@ enum Parse {
 /// than 31 long-term reference pictures, which the standard allows up to 32
 /// (`hevc/ps.c` 1524), refused (642–652, 750–751). Complete, it
 /// refuses arrays of no VPS, SPS or PPS, or of more than 16, 16 and 64
-/// (1087–1093). `ff_isom_write_lhvc` is never reached here: MP4 writes
-/// `lhvC` for a stream flagged multilayer alone (2893–2898), and the
-/// stream is handed only the flags the report keeps, of which MP4 keeps no
-/// multilayer one (`kept`, see [the module](super)).
+/// (1087–1093). A unit of a layer the record skips is lost to it
+/// ([`hvcc_drops_layers`]); MP4 writes those of a stream flagged
+/// multilayer into `lhvC` beside it ([`lhvc`]).
 pub(super) fn hvcc(config: &[u8], complete: bool) -> Wrote {
+  let record = match hvcc_walk(config, false) {
+    Ok(record) => record,
+    Err(wrote) => return wrote,
+  };
+  let [vps, sps, pps, ..] = record.counts;
+  if complete && (vps == 0 || vps > 16 || sps == 0 || sps > 16 || pps == 0 || pps > 64) {
+    Wrote::Failed
+  } else if record.cut {
+    Wrote::Corrupt
+  } else {
+    Wrote::Whole
+  }
+}
+
+/// Whether `ff_isom_write_hvcc` skips a unit of `config` for its layer, the
+/// record written without it (`hevc.c` 888–889): of an `hvcC`, every unit
+/// of a layer past the base's — no VPS parsed there, no alpha layer named;
+/// of Annex B units, one of neither the base layer nor the alpha layer a
+/// VPS extension named before it (R11, ruling 1). `false` where the record
+/// itself is refused ([`hvcc`]).
+pub(super) fn hvcc_drops_layers(config: &[u8]) -> bool {
+  hvcc_walk(config, false).is_ok_and(|record| record.dropped)
+}
+
+/// What `ff_isom_write_lhvc` does with an HEVC configuration (`hevc.c`
+/// 1408–1413): the walk `hvcc`'s, every layer's units kept and Annex B's
+/// parsed — a layer's SPS that does not parse failing it — and the record
+/// of the units of a layer past the base's alone, written by MP4 for a
+/// stream flagged multilayer (`movenc.c` 2893–2898, 1654–1674), its failure
+/// logged and the box not written. Complete, it refuses arrays of no such
+/// SPS or PPS, or of more than 16 and 64, its VPSs unjudged (1087–1093); a
+/// written unit of more than 65 535 bytes is written with its length cut.
+/// FFmpeg's reader merges its arrays into the configuration and flags the
+/// stream multilayer (`mov.c` 8878–8925) — but refuses, the file with it, a
+/// record whose arrays take fewer than 8 bytes, its size less 14 negative
+/// in `mov_realloc_extradata`'s unsigned test (8907–8914, 2248–2253): one
+/// of no unit of a layer past the base's, written of no array, `Corrupt`.
+pub(super) fn lhvc(config: &[u8], complete: bool) -> Wrote {
+  let record = match hvcc_walk(config, true) {
+    Ok(record) => record,
+    Err(wrote) => return wrote,
+  };
+  let [_, sps, pps, ..] = record.upper;
+  if complete && (sps == 0 || sps > 16 || pps == 0 || pps > 64) {
+    Wrote::Failed
+  } else if record.upper_cut || record.upper_bytes < 8 {
+    Wrote::Corrupt
+  } else {
+    Wrote::Whole
+  }
+}
+
+/// `write_configuration_record`'s walk of `config` (`hevc.c` 1293–1399),
+/// `lhvc` its `FLAG_IS_LHVC`: the record as it stands before it is
+/// written, or what the writer answers where the walk stops.
+fn hvcc_walk(config: &[u8], lhvc: bool) -> Result<Hvcc, Wrote> {
   if config.len() < 6 {
-    return Wrote::Failed;
+    return Err(Wrote::Failed);
   }
   let mut record = Hvcc::default();
   if config[0] == 1 {
     if config.len() < 23 || config.len() > GET_BITS_BYTES_MAX {
-      return Wrote::Failed;
+      return Err(Wrote::Failed);
     }
     let mut bits = Reader::new(config);
     // The record's fields before its arrays (1317–1338).
@@ -455,44 +522,37 @@ pub(super) fn hvcc(config: &[u8], complete: bool) -> Wrote {
       for _ in 0..nalus {
         let len = bits.read(16) as usize;
         if len as i64 > bits.left() / 8 {
-          return Wrote::Corrupt;
+          return Err(Wrote::Corrupt);
         }
         let start = bits.count() / 8;
         let nal = config.get(start..start + len).unwrap_or(&[]);
         if let Some(array) = HEVC_ARRAYS.iter().position(|&kept| kept == kind)
-          && hvcc_add(&mut record, nal, array, false) == Parse::Failed
+          && hvcc_add(&mut record, nal, array, (false, lhvc)) == Parse::Failed
         {
-          return Wrote::Failed;
+          return Err(Wrote::Failed);
         }
         bits.skip_long(len as i64 * 8);
       }
     }
   } else if !annex_b(config) {
-    return Wrote::Failed;
+    return Err(Wrote::Failed);
   } else {
     for (unit, [first, _]) in walked(config) {
       let kind = (first >> 1) & 0x3F;
       if let Some(array) = HEVC_ARRAYS.iter().position(|&kept| kept == kind)
-        && hvcc_add(&mut record, unit, array, true) == Parse::Failed
+        && hvcc_add(&mut record, unit, array, (true, lhvc)) == Parse::Failed
       {
-        return Wrote::Failed;
+        return Err(Wrote::Failed);
       }
     }
   }
-  let [vps, sps, pps, ..] = record.counts;
-  if complete && (vps == 0 || vps > 16 || sps == 0 || sps > 16 || pps == 0 || pps > 64) {
-    Wrote::Failed
-  } else if record.cut {
-    Wrote::Corrupt
-  } else {
-    Wrote::Whole
-  }
+  Ok(record)
 }
 
 /// `hvcc_add_nal_unit` (`hevc.c` 862–933) of the unit `nal` into the array
 /// `array`, `parsed` where the record is made of Annex B units, whose
-/// parameter sets it parses.
-fn hvcc_add(record: &mut Hvcc, nal: &[u8], array: usize, parsed: bool) -> Parse {
+/// parameter sets it parses, and `lhvc` where every layer's unit is kept.
+fn hvcc_add(record: &mut Hvcc, nal: &[u8], array: usize, (parsed, lhvc): (bool, bool)) -> Parse {
   if nal_rbsp_len(nal, 2) > GET_BITS_BYTES_MAX {
     return Parse::Failed;
   }
@@ -501,7 +561,8 @@ fn hvcc_add(record: &mut Hvcc, nal: &[u8], array: usize, parsed: bool) -> Parse 
   header.skip(1);
   let kind = header.read(6) as u8;
   let layer = header.read(6) as u8;
-  if layer > 0 && layer != record.alpha {
+  if !lhvc && layer > 0 && layer != record.alpha {
+    record.dropped = true;
     return Parse::Done;
   }
   if record.counts[array] >= u32::from(u16::MAX) {
@@ -509,6 +570,14 @@ fn hvcc_add(record: &mut Hvcc, nal: &[u8], array: usize, parsed: bool) -> Parse 
   }
   record.counts[array] += 1;
   record.cut |= nal.len() > usize::from(u16::MAX);
+  if layer > 0 {
+    if record.upper[array] == 0 {
+      record.upper_bytes += 3;
+    }
+    record.upper[array] += 1;
+    record.upper_cut |= nal.len() > usize::from(u16::MAX);
+    record.upper_bytes += 2 + u64::from(nal.len() as u16);
+  }
   if !parsed || !(32..=33).contains(&kind) {
     return Parse::Done;
   }
@@ -1610,8 +1679,9 @@ fn apv_frame_info(header: &[u8]) -> Option<ApvFrameInfo> {
 pub(super) enum Writer {
   /// `ff_isom_write_avcc`.
   Avcc,
-  /// `ff_isom_write_hvcc`, its arrays complete or not.
-  Hvcc { complete: bool },
+  /// `ff_isom_write_hvcc`, its arrays complete or not, and MP4's
+  /// `ff_isom_write_lhvc` beside it where the stream is flagged multilayer.
+  Hvcc { complete: bool, lhvc: bool },
   /// `ff_isom_write_vvcc`.
   Vvcc,
   /// `ff_isom_write_evcc`.
@@ -1633,7 +1703,21 @@ impl Writer {
   pub(super) fn writes(self, config: &[u8]) -> Wrote {
     match self {
       Self::Avcc => avcc(config),
-      Self::Hvcc { complete } => hvcc(config, complete),
+      // A layer's units `hvcC` skips are lost, but where `lhvC` writes
+      // them; a stream flagged multilayer whose `lhvC` fails of no such
+      // unit loses its flag alone, which the report names (R11, ruling 1).
+      Self::Hvcc {
+        complete,
+        lhvc: beside,
+      } => match hvcc(config, complete) {
+        Wrote::Whole if beside => match lhvc(config, complete) {
+          Wrote::Corrupt => Wrote::Corrupt,
+          Wrote::Failed if hvcc_drops_layers(config) => Wrote::Failed,
+          _ => Wrote::Whole,
+        },
+        Wrote::Whole if hvcc_drops_layers(config) => Wrote::Failed,
+        wrote => wrote,
+      },
       Self::Vvcc => vvcc(config),
       Self::Evcc => evcc(config),
       Self::Lvcc => lvcc(config),

@@ -409,6 +409,17 @@ crate moves only when it changes.
   and counts them in 8 bits, its parse failing at the 256th, its answer
   ignored: the packet whose frame would bring one is refused
   (`PayloadRule::ApvFrameInfo`, new).
+- **HEVC's layers, where its configuration records lose them (R11).**
+  `ff_isom_write_hvcc` keeps the base layer's units and the alpha layer's
+  a VPS extension names — of an `hvcC`, the base layer's alone: a
+  configuration's units of another layer, MV-HEVC's second view among
+  them, are refused (`MuxOpenError::ConfigurationInvalid`,
+  `PayloadRule::NewExtradata`) in Matroska, FLV and MP4 — but where MP4
+  writes them into `lhvC`: an MP4 HEVC track's multilayer flag
+  (`AV_DISPOSITION_MULTILAYER`) is now handed to the stream, `lhvC`'s
+  every condition mirrored; an `lhvC` of no such unit, which FFmpeg's
+  reader refuses with the whole file, refused; the flag reported lost
+  where `lhvC` is not written.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

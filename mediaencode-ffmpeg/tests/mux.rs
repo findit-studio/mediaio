@@ -16303,3 +16303,216 @@ fn l140_mp4_refuses_an_apv_frame_past_its_configurations_count() {
   assert_eq!(record[5], 1, "one entry");
   assert_eq!((record[6], record[7]), (1, 255), "the primary frame's 255");
 }
+
+/// An HEVC PPS of `layer`.
+fn hevc_pps_of(layer: u8) -> Vec<u8> {
+  let mut pps = hevc_pps();
+  pps[..2].copy_from_slice(&hevc_header(34, layer));
+  pps
+}
+
+/// `AV_DISPOSITION_MULTILAYER`, which the base's flags name not.
+fn multilayer() -> TrackDisposition {
+  TrackDisposition::from_bits_retain(1 << 21)
+}
+
+/// An HEVC configuration law over the corpus's track recoded to HEVC, of
+/// the tag `tag`, flagged multilayer where `flagged`.
+fn hevc_layer_law(
+  corpus: &Corpus,
+  law: &str,
+  containers: &[(ContainerName, &str)],
+  (tag, flagged): (&[u8; 4], bool),
+  (base, packets): (&[u8], bool),
+  cases: &[(&str, Vec<u8>, bool)],
+) {
+  let slice = start_coded(&[&escaped(&hevc_header(19, 0), &[0xAF, 0x88, 0x42])]);
+  let (row, frames) = recoded_fixture(corpus, &slice);
+  let track = |config: &[u8]| {
+    let row = restated(
+      &row,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+      config,
+      Some(tag),
+      None,
+    );
+    if flagged {
+      let flags = row.disposition() | multilayer();
+      row.with_disposition(flags)
+    } else {
+      row
+    }
+  };
+  configuration_law(
+    corpus,
+    law,
+    containers,
+    &track,
+    (&frames, base, packets),
+    cases,
+  );
+}
+
+/// **L141 — HEVC's parameter sets of a layer `hvcC` drops are refused, but
+/// where MP4 writes them into `lhvC`** (R11, ruling 1; `hevc.c` 888–889,
+/// 1000–1013, 1408–1413; `movenc.c` 2893–2898, 1654–1674; `mov.c`
+/// 8878–8925): `ff_isom_write_hvcc` keeps the base layer's units and the
+/// alpha layer's a VPS extension names, of Annex B; of an `hvcC`, the base
+/// layer's alone. A configuration of a second layer's SPS and PPS is
+/// refused in Matroska, FLV and MP4 (`MuxOpenError::ConfigurationInvalid`,
+/// `PayloadRule::NewExtradata`) — and taken where the layer is the alpha
+/// layer its VPS names. MP4 of a stream flagged multilayer writes them into
+/// `lhvC`, whose reader merges them back: taken, but under `hvc1` where the
+/// layer holds no PPS, `lhvC`'s arrays then incomplete and not written.
+///
+/// PLANT: the layers' drop unjudged, Matroska's first case opened; `lhvC`
+/// unmirrored, MP4's flagged layers refused.
+#[test]
+fn l141_hevcs_layers_hvcc_drops_are_refused_but_where_lhvc_takes_them() {
+  let Some(corpus) = Corpus::new() else { return };
+  let layered = start_coded(&[
+    &hevc_vps(0, None),
+    &hevc_sps(0, 0, 1, None),
+    &hevc_pps(),
+    &hevc_sps(1, 0, 0, None),
+    &hevc_pps_of(1),
+  ]);
+  let alpha = start_coded(&[
+    &hevc_vps(0, Some(1)),
+    &hevc_sps(0, 0, 1, None),
+    &hevc_pps(),
+    &hevc_sps(1, 0, 0, None),
+    &hevc_pps_of(1),
+  ]);
+  let sps_only = start_coded(&[
+    &hevc_vps(0, None),
+    &hevc_sps(0, 0, 1, None),
+    &hevc_pps(),
+    &hevc_sps(1, 0, 0, None),
+  ]);
+  let record = hvcc_record(&[
+    (32, vec![hevc_vps(0, None)]),
+    (33, vec![hevc_sps(0, 0, 1, None), hevc_sps(1, 0, 0, None)]),
+    (34, vec![hevc_pps(), hevc_pps_of(1)]),
+  ]);
+  let base = hevc_base();
+  let base_record = hevc_record(1, 1, 1);
+  let annex_b = |flagged_hvc1: Option<bool>| -> Vec<(&str, Vec<u8>, bool)> {
+    vec![
+      ("a second layer", layered.clone(), flagged_hvc1.is_none()),
+      ("the alpha layer", alpha.clone(), false),
+      (
+        "a second layer's SPS alone",
+        sps_only.clone(),
+        flagged_hvc1 != Some(false),
+      ),
+    ]
+  };
+  // Matroska, FLV, and MP4 of no multilayer flag: the layer lost.
+  hevc_layer_law(
+    &corpus,
+    "l141-mkv",
+    &matroska(),
+    (b"hev1", false),
+    (&base, false),
+    &annex_b(None),
+  );
+  hevc_layer_law(
+    &corpus,
+    "l141",
+    &mp4_and_flv(),
+    (b"hev1", false),
+    (&base, true),
+    &annex_b(None),
+  );
+  hevc_layer_law(
+    &corpus,
+    "l141-record",
+    &mp4_and_flv(),
+    (b"hev1", false),
+    (&base_record, true),
+    &[("an hvcC of a second layer", record.clone(), true)],
+  );
+  // MP4 flagged multilayer: `lhvC` takes the layer; under `hvc1` not of an
+  // SPS alone. The packet road's track states a second layer first, an
+  // `lhvC` of no unit refused (below).
+  for (tag, hvc1) in [(b"hev1", false), (b"hvc1", true)] {
+    hevc_layer_law(
+      &corpus,
+      &format!("l141-multilayer-{}", u8::from(hvc1)),
+      &[(ContainerName::MP4, "mp4")],
+      (tag, true),
+      (&layered, true),
+      &annex_b(Some(hvc1)),
+    );
+    hevc_layer_law(
+      &corpus,
+      &format!("l141-multilayer-record-{}", u8::from(hvc1)),
+      &[(ContainerName::MP4, "mp4")],
+      (tag, true),
+      (&record, true),
+      &[("an hvcC of a second layer", record.clone(), false)],
+    );
+  }
+  // Read back: the configuration holds the second layer's units, merged
+  // from `lhvC`, and the stream is flagged multilayer.
+  let target = output(&corpus, "l141-multilayer-0-0.mp4");
+  let back = table_of(&target, TrackKind::Video).remove(0);
+  assert!(back.disposition().contains(multilayer()), "flagged");
+  let config = back.side_data().extradata().to_vec();
+  let layer_one = hevc_pps_of(1);
+  assert!(
+    config
+      .windows(layer_one.len())
+      .any(|window| window == layer_one.as_slice()),
+    "the second layer's PPS in the configuration read back"
+  );
+  // The flag alone, of no second layer: under `hvc1` `lhvC` is not written,
+  // the flag lost, reported, the file read back unflagged; under `hev1` it
+  // is written of no array, which FFmpeg's reader refuses, the file with it
+  // (`mov.c` 8907–8914, 2248–2253): refused.
+  let slice = start_coded(&[&escaped(&hevc_header(19, 0), &[0xAF, 0x88, 0x42])]);
+  let (row, frames) = recoded_fixture(&corpus, &slice);
+  let flagged = |tag: &[u8; 4]| {
+    let row = restated(
+      &row,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+      &base,
+      Some(tag),
+      None,
+    );
+    let flags = row.disposition() | multilayer();
+    row.with_disposition(flags)
+  };
+  let target = output(&corpus, "l141-flag.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, vec![flagged(b"hvc1")]);
+  let dropped = lines(
+    muxer.report(),
+    |line| matches!(line, Uncarried::Disposition { flags, .. } if flags.contains(multilayer())),
+  );
+  assert_eq!(dropped.len(), 1, "{dropped:?}");
+  for frame in &frames {
+    muxer
+      .write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone()))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  muxer.finish().expect("finished");
+  assert!(
+    !table_of(&target, TrackKind::Video)
+      .remove(0)
+      .disposition()
+      .contains(multilayer()),
+    "read back unflagged"
+  );
+  let opened = opened_in(
+    &corpus,
+    "l141-flag-empty.mp4",
+    "mp4",
+    vec![flagged(b"hev1")],
+  );
+  assert!(
+    matches!(opened, Err(MuxOpenError::ConfigurationInvalid { track, .. }) if track.get() == 0),
+    "{opened:?}"
+  );
+}
