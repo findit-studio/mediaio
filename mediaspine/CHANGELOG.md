@@ -53,12 +53,13 @@ Its versions are its own: they do not move with the rest of the family's.
   reference picture, no intra slice and no field. A packet of redundant
   slices alone is marked whatever their `nal_ref_idc`, but where a first
   field may wait at it, or an IDR slice keeps it.
-- A packet whose every slice FFmpeg refuses in its header — one naming a
-  picture parameter set it does not hold, among them — or discards makes
-  no picture, and no rule of a picture holds it
-  (`KeptReason::AwaitingReference`, `AwaitingIntraSlice`, `IntraOnly`,
-  `FrameNumGaps`, `ReorderUnfixed`); a slice of `nal_ref_idc` above 0 FFmpeg
-  refuses still keeps its packet (`KeptReason::Referenced`).
+- A slice FFmpeg refuses in its header — one naming a picture parameter
+  set it does not hold, among them — makes no picture, and its
+  `nal_ref_idc` counts for nothing, as a discarded redundant slice's: a
+  packet of such slices, or of discarded ones, alone is marked, no rule of
+  a picture holding it (`KeptReason::Referenced`, `AwaitingReference`,
+  `AwaitingIntraSlice`, `IntraOnly`, `FrameNumGaps`, `ReorderUnfixed`), but
+  where a first field may wait at it, or an IDR unit keeps it.
 - The reference picture is awaited again at an IDR unit, which FFmpeg
   resets at whatever it makes of the slice, and after a packet not read
   whole that may hold one, or a start that may set the decoder's context

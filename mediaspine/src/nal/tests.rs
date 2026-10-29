@@ -746,15 +746,15 @@ fn an_avc_record_frames_lengths_of_one_to_four_bytes() {
 #[test]
 fn annex_b_reads_three_and_four_byte_start_codes_and_leading_and_trailing_zeros() {
   // No extradata, or extradata that is no `avcC`, is Annex B; without one
-  // the sequence parameter set arrives in-band.
-  for extradata in [&[][..], &annex_b(&[avc_sps()])[..]] {
+  // the parameter sets arrive in-band — PPS 0 among them, which the
+  // reference slice below names: a slice of a PPS FFmpeg does not hold it
+  // refuses, and its `nal_ref_idc` counts for nothing.
+  let sets = annex_b(&[avc_sps(), pps(0, 0)]);
+  for extradata in [&[][..], &sets[..]] {
     let mut stream = h264(extradata);
     assert_eq!(stream.framing(), Some(Framing::AnnexB));
     if extradata.is_empty() {
-      assert_eq!(
-        stream.read(&annex_b(&[avc_sps()])),
-        kept(KeptReason::Companion(7))
-      );
+      assert_eq!(stream.read(&sets), kept(KeptReason::Companion(7)));
     }
     let aud = avc(0, 9, &[0xF0]);
     let mut packet = vec![0, 0];
@@ -2100,11 +2100,12 @@ fn a_reference_picture_past_a_possible_stop_or_refused_ends_no_wait() {
     kept(KeptReason::AwaitingReference)
   );
   // And a reference slice FFmpeg refuses for a PPS it does not hold
-  // (`h264_slice.c` 1740–1746) is none it decodes. Planted, a refused
-  // slice counted a reference picture: red.
+  // (`h264_slice.c` 1740–1746) is none it decodes: its packet makes no
+  // picture, and the wait goes on. Planted, a refused slice counted a
+  // reference picture: red.
   assert_eq!(
     read(&mut stream, &[slice_of(2, 0, 3, 1, None)]),
-    kept(KeptReason::Referenced)
+    Verdict::Disposable
   );
   assert_eq!(
     read(&mut stream, &[b_slice_0()]),
@@ -2529,8 +2530,8 @@ fn a_packet_of_slices_ffmpeg_refuses_in_their_header_holds_no_rule_of_a_picture(
   // (`h264dec.c` 1061–1067) — observed, FFmpeg 9.0.1's CLI decoding five
   // such packets, 0 frames. It takes nothing up, sets no `non_gray`, resets
   // no `poc_offset`, fills no gap and outputs nothing: no rule of a picture
-  // holds it, and while no field waits, dropping it changes nothing. A
-  // slice of `nal_ref_idc` 2 among them keeps its packet by its own rule.
+  // holds it, and while no field waits, dropping it changes nothing — a
+  // slice of `nal_ref_idc` 2 among them, which counts for nothing, too.
   // Predicted, before this law: kept by each picture rule its stream's state
   // calls for; planted, a slice refused in its header taken for one FFmpeg
   // may start or join a picture at, red.
@@ -2543,7 +2544,7 @@ fn a_packet_of_slices_ffmpeg_refuses_in_their_header_holds_no_rule_of_a_picture(
   assert_eq!(read(&mut opening, &[b_slice()]), Verdict::Disposable);
   assert_eq!(
     read(&mut opening, &[avc(2, 1, &[0x9C, 0x84, 0x21])]),
-    kept(KeptReason::Referenced)
+    Verdict::Disposable
   );
   assert!(!opening.pending.reference_seen);
   assert_eq!(
@@ -2573,6 +2574,65 @@ fn a_packet_of_slices_ffmpeg_refuses_in_their_header_holds_no_rule_of_a_picture(
   };
   let mut reordered = h264(&avcc_of(3, &unfixed.unit()));
   assert_eq!(read(&mut reordered, &[b_slice()]), Verdict::Disposable);
+}
+
+#[test]
+fn a_reference_slice_ffmpeg_refuses_in_its_header_counts_for_nothing() {
+  // FFmpeg refuses a slice that names a PPS it does not hold in its header
+  // (`h264_slice.c` 1740–1746), which reads a `const` context and returns
+  // before `h264_field_start`: no state moves, and no picture is made,
+  // whatever the slice's `nal_ref_idc` — as a slice it discards for its
+  // `redundant_pic_cnt`. Its `nal_ref_idc` counts for nothing; a reference
+  // slice FFmpeg decodes beside it still keeps the packet. Predicted, before
+  // this law: kept, `Referenced`; planted, the refused slice's `nal_ref_idc`
+  // counted again, red.
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  let refused_reference = avc(2, 1, &[0x9C, 0x84, 0x21]);
+  let mut stream = h264(&avcc(3));
+  assert_eq!(
+    read(&mut stream, &[refused_reference.clone()]),
+    Verdict::Disposable
+  );
+  assert_eq!(
+    read(
+      &mut stream,
+      &[refused_reference.clone(), refused_reference.clone()]
+    ),
+    Verdict::Disposable
+  );
+  // Beside a reference picture FFmpeg decodes, of PPS 0, or a non-reference
+  // one: that picture's packet.
+  assert_eq!(
+    read(&mut stream, &[p_slice(), refused_reference.clone()]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read(&mut stream, &[b_slice_0(), refused_reference.clone()]),
+    Verdict::Disposable
+  );
+  // The guards. An IDR unit keeps its packet, its slice refused or not: at
+  // the packet's first FFmpeg resets before it reads the slice (`h264dec.c`
+  // 636–648).
+  assert_eq!(
+    read(&mut stream, &[avc(2, 5, &[0x9C, 0x84, 0x21])]),
+    kept(KeptReason::RandomAccess)
+  );
+  // An entry the reading does not know refuses nothing: a seek after the
+  // lists moved leaves every entry unknown.
+  let mut unknown = h264(&avcc(3));
+  let _ = read(&mut unknown, &[pps(3, 0)]);
+  unknown.seeked();
+  assert_eq!(
+    read(&mut unknown, &[refused_reference.clone()]),
+    kept(KeptReason::Referenced)
+  );
+  // A first field waiting, FFmpeg ends it again at the packet.
+  let mut fields = h264(&interlaced_avcc());
+  let _ = read4(&mut fields, &[field_slice(2, 1, false)]);
+  assert_eq!(
+    read4(&mut fields, &[refused_reference]),
+    kept(KeptReason::PendingField)
+  );
 }
 
 #[test]

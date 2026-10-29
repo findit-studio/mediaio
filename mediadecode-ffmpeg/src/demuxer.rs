@@ -5675,38 +5675,46 @@ mod tests {
   }
 
   /// An H.264 packet of length-framed NAL units: an access unit
-  /// delimiter, then a B slice of `nal_ref_idc` `reference` naming PPS 3,
-  /// which [`avcc`] does not hold. FFmpeg refuses the slice in its header,
-  /// "non-existing PPS 3 referenced", and decodes no picture of the packet
-  /// — observed, FFmpeg 9.0.1's CLI. The reading marks one of `nal_ref_idc`
-  /// 0, which makes no picture, and keeps one of 2 by its own rule.
+  /// delimiter, then [`avc_slice`]`(reference)`, a picture FFmpeg decodes.
   fn avc_packet(reference: u8) -> Vec<u8> {
-    vec![
-      0,
-      0,
-      0,
-      2,
-      0x09,
-      0xF0,
-      0,
-      0,
-      0,
-      4,
-      (reference << 5) | 1,
-      0x9C,
-      0x84,
-      0x21,
+    let slice = avc_slice(reference);
+    [
+      &[0, 0, 0, 2, 0x09, 0xF0][..],
+      &(slice.len() as u32).to_be_bytes(),
+      &slice,
     ]
+    .concat()
+  }
+
+  /// An H.264 slice of [`avcc`]'s PPS 0, its header byte first: for a
+  /// `reference` above 0 an IDR picture of that `nal_ref_idc`, one
+  /// macroblock I_16x16 of DC prediction and no residual; for 0 a
+  /// non-reference P picture of `frame_num` 1, its one macroblock skipped, a
+  /// copy of the IDR. FFmpeg 9.0.1's CLI decodes `avcc()`'s parameter sets,
+  /// then `avc_slice(2)` and `avc_slice(0)` twice, each after an access unit
+  /// delimiter, to three frames, no error.
+  fn avc_slice(reference: u8) -> Vec<u8> {
+    if reference == 0 {
+      // P, PPS 0, `frame_num` 1, no override or list modification, QP 26,
+      // the deblocking filter off; `mb_skip_run` 1.
+      vec![0x01, 0x9A, 0x25, 0x28]
+    } else {
+      // I, PPS 0, `frame_num` 0, `idr_pic_id` 0, the prior pictures output
+      // and no long-term one, QP 26, the deblocking filter off; `mb_type` 3
+      // (I_16x16, DC prediction, no coded block), DC chroma prediction,
+      // `mb_qp_delta` 0, and no luma DC coefficient.
+      vec![(reference << 5) | 5, 0x88, 0x84, 0xA2, 0x78]
+    }
   }
 
   /// A minimal `avcC` of four-byte lengths: a Baseline sequence parameter
   /// set of one macroblock coding frames only (`frame_mbs_only_flag` 1),
   /// without gaps in `frame_num`, its VUI fixing a reorder depth of one
-  /// (`bitstream_restriction_flag` 1); and a picture parameter set.
+  /// (`bitstream_restriction_flag` 1); and a CAVLC picture parameter set.
   fn avcc() -> Vec<u8> {
     vec![
       1, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0, 12, 0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x7A, 0x01, 0xB4, 0x11,
-      0x08, 0xA2, 0xC0, 1, 0, 4, 0x68, 0xEE, 0x3C, 0x80,
+      0x08, 0xA2, 0xC0, 1, 0, 4, 0x68, 0xCE, 0x3C, 0x80,
     ]
   }
 
@@ -5745,7 +5753,7 @@ mod tests {
     // A corrupt packet that switches the framing: the decoder reads it, so
     // the reading follows, and nothing corrupt is marked.
     let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
-    let annex = vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x01, 0x9C, 0x84, 0x21];
+    let annex = annex_b(avc_packet(0));
     let corrupt = video_packet(annex.clone(), vec![]).with_flags(PacketFlags::CORRUPT);
     let corrupt = marked_from_bitstream(Some(&mut bitstream), corrupt);
     assert_eq!(corrupt.flags(), PacketFlags::CORRUPT);
@@ -5757,7 +5765,7 @@ mod tests {
     let corrupt = marked_from_bitstream(Some(&mut bitstream), corrupt);
     assert_eq!(corrupt.flags(), PacketFlags::CORRUPT);
     // Past a reference picture, the same packet uncorrupted is marked.
-    let reference = vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x41, 0x9C, 0x84, 0x21];
+    let reference = annex_b(avc_packet(2));
     let read = marked_from_bitstream(Some(&mut bitstream), video_packet(reference, vec![]));
     assert!(!read.flags().contains(PacketFlags::DISPOSABLE));
     let read = marked_from_bitstream(Some(&mut bitstream), video_packet(annex, vec![]));
@@ -6792,11 +6800,20 @@ mod tests {
   }
 
   /// An H.264 reference picture's packet of one-byte lengths: an access
-  /// unit delimiter, then a slice of `nal_ref_idc` 2, 102 bytes in all.
+  /// unit delimiter, an IDR picture of `nal_ref_idc` 2 ([`avc_slice`]), and
+  /// filler data, 102 bytes in all. FFmpeg 9.0.1's CLI decodes its frame.
   fn one_byte_reference_packet() -> Vec<u8> {
-    let mut slice = vec![(2 << 5) | 1, 0x9C, 0x84, 0x21];
-    slice.resize(98, 0xAA);
-    [&[2, 0x09, 0xF0, slice.len() as u8][..], &slice].concat()
+    let slice = avc_slice(2);
+    let mut filler = vec![0x0C];
+    filler.resize(91, 0xFF);
+    filler.push(0x80);
+    [
+      &[2, 0x09, 0xF0, slice.len() as u8][..],
+      &slice,
+      &[filler.len() as u8],
+      &filler,
+    ]
+    .concat()
   }
 
   /// The OMA PDCF access units of [`write_oma_pdcf_mp4`]: each a reference
@@ -6804,23 +6821,29 @@ mod tests {
   /// its selective-encryption header (`0x80`, encrypted), its IV, then the
   /// AES-128-CBC ciphertext of the packet padded by RFC 2630, 129 bytes in
   /// all. Each IV, the encrypter's choice, begins with an H.264 slice's
-  /// first bytes: a reference one's for the first unit, and a
-  /// non-reference one's for the two after.
+  /// first bytes: for the first unit a reference I slice's of PPS 0, which
+  /// the reading reads; for the two after a non-reference B slice's naming
+  /// PPS 3, which the record does not hold, and FFmpeg refuses.
   fn oma_pdcf_units(key: &[u8; 16]) -> Vec<Vec<u8>> {
     let mut plaintext = one_byte_reference_packet();
     let pad = 16 - plaintext.len() % 16;
     plaintext.resize(plaintext.len() + pad, pad as u8);
-    [0x41u8, 0x01, 0x01]
-      .into_iter()
-      .enumerate()
-      .map(|(index, slice_header)| {
-        let mut iv = vec![slice_header, 0x9C, 0x84, 0x21, index as u8];
-        iv.resize(16, 0x5A);
-        let unit = [&[0x80][..], &iv, &aes_128_cbc(key, &iv, &plaintext, false)].concat();
-        assert_eq!(unit.len(), 129, "an OMA access unit");
-        unit
-      })
-      .collect()
+    [
+      [0x41u8, 0x88, 0x84, 0x21],
+      [0x01, 0x9C, 0x84, 0x21],
+      [0x01, 0x9C, 0x84, 0x21],
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, slice)| {
+      let mut iv = slice.to_vec();
+      iv.push(index as u8);
+      iv.resize(16, 0x5A);
+      let unit = [&[0x80][..], &iv, &aes_128_cbc(key, &iv, &plaintext, false)].concat();
+      assert_eq!(unit.len(), 129, "an OMA access unit");
+      unit
+    })
+    .collect()
   }
 
   /// Writes at `path` an MP4 of one H.264 track protected under OMA DRM 2's
@@ -6856,9 +6879,10 @@ mod tests {
   /// and nothing names it encrypted, at the open or on a packet. By default
   /// it is not read, and nothing is marked. Declared, it is read, and with
   /// one-byte lengths each unit's `0x80` header reads as a 128-byte NAL
-  /// unit led by its IV: the two IVs that begin as a non-reference slice
-  /// are marked, though each decrypts to a reference picture, which the
-  /// reading marks nowhere. That is the false mark
+  /// unit led by its IV: the first, beginning as a reference slice, is
+  /// kept; the two after, beginning as slices FFmpeg would refuse, make no
+  /// picture as read and are marked, though each decrypts to a reference
+  /// picture, which the reading marks nowhere. That is the false mark
   /// [`DemuxerOpen::plaintext_demuxers`] names as the caller's risk, and
   /// the limit the audit names ([`AUDITED_DEMUXERS`]); pinned here, never
   /// refused.
