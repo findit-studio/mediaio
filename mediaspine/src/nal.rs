@@ -134,7 +134,7 @@
 //! | a second field in its first's packet whose picture parameter set FFmpeg tells apart from the active one: another `sps_id` or `transform_8x8_mode`, or another SPS object — a parameter set read again between the fields among them | refused, "PPS changed between slices", "SPS changed in the middle of the frame" (2150–2163): the first field waits on | — | yes: observed, the next pair, its bottom field first, joining the waiting top field, its own top field refused (2124–2125); that pair dropped, the waiting field's frame is lost too | kept, for the parameter set; the next packet, [`KeptReason::PendingField`] |
 //! | the same, a picture parameter set FFmpeg compares alike: another of the same three, or one read again on an SPS read again byte for byte, whose object FFmpeg keeps (`h264_ps.c` 581–584) | joined | — | no: observed | a pair: disposable |
 //! | a picture whose SPS sets the decoder's context up again: another size, bit depth, chroma format, sample aspect ratio or colour matrix (`h264_slice.c` 1058–1170) | flushed (`h264dec.c` 451–474): `first_field` 0, a waiting field dropped, found unmatched by none; the picture order count and the gap in `frame_num` taken up afresh from this picture | the next picture sets the context up, and takes them up | yes: observed, the waiting top field dropped and the bottom one waiting, where an SPS of the same content, its object another, sets nothing up | kept: [`KeptReason::AwaitingReference`], until a reference picture |
-//! | a slice whose picture parameter set FFmpeg does not hold | refused, "non-existing PPS" (1740–1746): no picture starts | as read | no | as the packet's other units say |
+//! | a slice whose picture parameter set FFmpeg does not hold | refused in its header, "non-existing PPS" (1740–1746), as any slice of a type past 9, an inter IDR one, or under an SPS that lets fields in a B one without `direct_8x8_inference_flag` (1709–1766): no picture starts, nothing moves | as read | no | a packet of such slices, or of these and discarded ones, alone: no rule of a picture holding it — FFmpeg makes no picture of it, "no frame!" (`h264dec.c` 1061–1067; observed, FFmpeg 9.0.1's CLI) — and kept only by its units' own rules ([`KeptReason::Referenced`], [`KeptReason::RandomAccess`]) or while a field may wait |
 //! | a slice of `redundant_pic_cnt` above 0, a redundant picture's | read to its count — held, like any slice after a picture's first, to that picture's `frame_num` (1750–1756) — then discarded (2081–2085): it starts no picture and joins none, and marks, counts and sets nothing, `non_gray` among it (2032–2034) | nothing of it lost | no, where no field waits at it | a packet of such slices alone, disposable whatever their `nal_ref_idc`, no rule of a picture holding it; beside a primary picture, that picture's packet, the redundant slice keeping nothing; an IDR one, kept: [`KeptReason::RandomAccess`] |
 //! | an IDR unit whose slice FFmpeg does not decode: discarded, refused, or one the reading cannot read | at the packet's first IDR unit, before the slice is read, `idr` (`h264dec.c` 636–648): every reference removed, the picture order count's take-up and `frame_num` reset (438–448) | — | yes: the next picture decoded takes the count up | kept: [`KeptReason::RandomAccess`]; a reference picture awaited again, [`KeptReason::AwaitingReference`] |
 //! | a packet of slices that starts no picture, each refused or discarded, while a first field may wait | a packet of slices all the same (`has_slice`, `h264dec.c` 650): at its end FFmpeg ends the waiting field again (1061–1076; `ff_h264_field_end`, `h264_picture.c` 188–233), a reference field's marking run again | — | yes | kept: [`KeptReason::PendingField`] |
@@ -505,9 +505,10 @@
 //!   IDR, and nothing beside them but access unit delimiters, filler data
 //!   and SEI units of picture timing and filler payload alone;
 //! - where every slice of a type the decoder decodes (1, 5) is one it
-//!   discards so, read to its count ([Fields](#fields)), no first field may
-//!   wait at the packet; and none of the rules below holds it, for it makes
-//!   no picture and moves none of what one moves;
+//!   refuses in its header, or discards so, read to its count
+//!   ([Fields](#fields)), no first field may wait at the packet; and none
+//!   of the rules below holds it, for it makes no picture and moves none of
+//!   what one moves;
 //! - some slice is not intra, as FFmpeg reads a slice's type, or none is of
 //!   a type the decoder decodes (1, 5), so that it starts no picture;
 //! - a sequence parameter set has been read, and every one the decoder may
@@ -1207,9 +1208,9 @@ impl NalStream {
     let verdict = match kept {
       Some(reason) => Verdict::Kept(reason),
       None if pictures == 0 => Verdict::Kept(KeptReason::NoPicture),
-      // FFmpeg discards every slice: it makes no picture, and moves none of
-      // what one moves.
-      None if fields == Slices::Discarded => Verdict::Disposable,
+      // FFmpeg refuses or discards every slice: it makes no picture, and
+      // moves none of what one moves.
+      None if fields == Slices::NoPicture => Verdict::Disposable,
       // Under frame threading FFmpeg resets `poc_offset` at such a picture
       // (`h264dec.c` 501–551, `h264_slice.c` 1427–1430).
       None if self.codec == NalCodec::H264 && intra_only && decoded_slice => {
@@ -1533,7 +1534,7 @@ impl NalStream {
     // holds a frame, or a whole pair, and no field waits for it.
     if let Slices::Kept(reason) = fields {
       Read::Keeps(reason)
-    } else if fields == Slices::Discarded {
+    } else if fields == Slices::NoPicture {
       read
     } else if self.gaps_possible {
       Read::Keeps(KeptReason::FrameNumGaps)
@@ -1619,13 +1620,16 @@ impl NalStream {
     // A packet of slices that starts no picture FFmpeg still reads as one of
     // slices, and ends a first field waiting again at it (`has_slice`,
     // `ff_h264_field_end`, `h264dec.c` 650, 1061–1076), repeating a reference
-    // field's marking: kept wherever a field may wait.
+    // field's marking: kept wherever a field may wait. Where it refuses every
+    // slice in its header, which moves nothing (`h264_slice_header_parse`
+    // reads a `const` context), or discards it, the packet makes no picture
+    // (1061–1067).
     let waits = || walk.slices && self.pairing != Pairing::Settled;
-    if walk.slices && !walk.primary {
+    if walk.slices && !walk.may_picture {
       return if waits() {
         Slices::Kept(KeptReason::PendingField)
       } else {
-        Slices::Discarded
+        Slices::NoPicture
       };
     }
     if !self.fields_possible {
@@ -2997,10 +3001,11 @@ enum Slices {
   Kept(KeptReason),
   /// Nothing keeps it for its slices.
   Clear,
-  /// FFmpeg discards every slice of it for its `redundant_pic_cnt`
-  /// (`h264_slice.c` 2081–2085), and no field may wait at it: it makes no
-  /// picture, and the rules of a picture hold none of it.
-  Discarded,
+  /// FFmpeg refuses every slice of it in its header ([`Head::Refused`]) or
+  /// discards it for its `redundant_pic_cnt` (`h264_slice.c` 2081–2085), and
+  /// no field may wait at it: it makes no picture, and the rules of a
+  /// picture hold none of it.
+  NoPicture,
 }
 
 /// What FFmpeg's H.264 decoder reads of a slice before it starts or joins
@@ -3360,9 +3365,11 @@ struct Walk {
   /// The packet holds a slice unit (types 1 and 5), which sets FFmpeg's
   /// `has_slice` whatever it then makes of the slice (`h264dec.c` 650).
   slices: bool,
-  /// One of them the reading does not prove FFmpeg discards for its
-  /// `redundant_pic_cnt`.
-  primary: bool,
+  /// One of them FFmpeg may start or join a picture at: the reading proves
+  /// neither that FFmpeg refuses it in its header ([`Head::Refused`]) nor
+  /// that it discards it for its `redundant_pic_cnt`
+  /// ([`Head::Discarded`]).
+  may_picture: bool,
 }
 
 /// The picture a packet's slices go to.
@@ -3401,7 +3408,7 @@ impl Walk {
       flushed: false,
       idr_cleared: false,
       slices: false,
-      primary: false,
+      may_picture: false,
     }
   }
 
@@ -3410,8 +3417,8 @@ impl Walk {
   fn slice(&mut self, nal: &[u8], sets: &ParameterSets) {
     let head = slice_head(nal, sets);
     self.slices = true;
-    if !matches!(head, Head::Discarded { .. }) {
-      self.primary = true;
+    if !matches!(head, Head::Refused | Head::Discarded { .. }) {
+      self.may_picture = true;
     }
     // An IDR unit FFmpeg does not refuse first as one of inter type, which
     // ends the packet (`h264dec.c` 636–643): at the packet's first, before it

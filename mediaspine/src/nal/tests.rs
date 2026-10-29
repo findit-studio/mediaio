@@ -1048,18 +1048,23 @@ fn a_record_on_a_packet_of_no_bytes_is_read_by_hevc_and_not_by_h264() {
 #[test]
 fn a_seek_after_the_framing_moved_marks_nothing_again() {
   // Nothing moved: the framing is the same after the seek, and the
-  // reading awaits a reference picture again.
+  // reading awaits a reference picture again — the probes pictures FFmpeg
+  // decodes, of PPS 0: a slice it refuses makes no picture, which no rule
+  // of a picture holds.
   let mut stream = h264(&avcc(3));
   stream.seeked();
   assert_eq!(
-    stream.read(&lengths(4, &[b_slice()])),
+    stream.read(&lengths(4, &[b_slice_0()])),
     kept(KeptReason::AwaitingReference)
   );
   assert_eq!(
     stream.read(&lengths(4, &[p_slice()])),
     kept(KeptReason::Referenced)
   );
-  assert_eq!(stream.read(&lengths(4, &[b_slice()])), Verdict::Disposable);
+  assert_eq!(
+    stream.read(&lengths(4, &[b_slice_0()])),
+    Verdict::Disposable
+  );
   // Moved, then sought: a decoder that kept its framing and one opened
   // afresh read the next packet otherwise.
   stream.reconfigure(&annex_b(&[avc_sps()]));
@@ -1089,7 +1094,7 @@ fn a_seek_after_the_framing_moved_marks_nothing_again() {
     back.read(&lengths(4, &[p_slice()])),
     kept(KeptReason::Referenced)
   );
-  assert_eq!(back.read(&lengths(4, &[b_slice()])), Verdict::Disposable);
+  assert_eq!(back.read(&lengths(4, &[b_slice_0()])), Verdict::Disposable);
 }
 
 #[test]
@@ -1796,30 +1801,38 @@ fn an_h264_picture_of_intra_slices_alone_is_kept() {
   let mut stream = h264(&avcc(3));
   let mut read = |nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
   let slice = |payload: &[u8]| avc(0, 1, payload);
+  // A slice of `slice_type` `slice_type`, of PPS 0, its header read to its
+  // `frame_num`: a picture FFmpeg starts, but past 9. A slice FFmpeg refuses
+  // makes no picture, whose `poc_offset` nothing resets.
+  let typed = |slice_type: u32| {
+    let mut bits = Bits::new();
+    bits.ue(0).ue(slice_type).ue(0).bits(0, 4).se(0).ue(1);
+    slice(&bits.finish())
+  };
   // I and SI, of either range: `slice_type` 2, 7, 4 and 9.
-  for payload in [
-    &[0xB4, 0x84, 0x21][..],
-    &[0x88, 0x84, 0x21][..],
-    &[0x94, 0x84, 0x21][..],
-    &[0x8A, 0x84, 0x21][..],
-  ] {
+  for slice_type in [2, 7, 4, 9] {
     assert_eq!(
-      read(&[slice(payload)]),
+      read(&[typed(slice_type)]),
       kept(KeptReason::IntraOnly),
-      "{payload:x?}"
+      "{slice_type}"
     );
   }
-  // P, B, SP of either range, and past 9, which FFmpeg reads as P: 0, 1,
-  // 3, 8, 10 and 30.
-  for payload in [
-    &[0xC0, 0x84][..],
-    &[0xA0, 0x84][..],
-    &[0x90, 0x84][..],
-    &[0x89, 0x84, 0x21][..],
-    &[0x8B, 0x84, 0x21][..],
-    &[0x87, 0xE0][..],
-  ] {
-    assert_eq!(read(&[slice(payload)]), Verdict::Disposable, "{payload:x?}");
+  // P, B and SP of either range: 0, 1, 3, 5, 6 and 8.
+  for slice_type in [0, 1, 3, 5, 6, 8] {
+    assert_eq!(
+      read(&[typed(slice_type)]),
+      Verdict::Disposable,
+      "{slice_type}"
+    );
+  }
+  // Past 9, which FFmpeg's `picture_intra_only` reads as P (`h264dec.c`
+  // 537–544) and its header refuses (`h264_slice.c` 1712–1717): 10 and 30.
+  for slice_type in [10, 30] {
+    assert_eq!(
+      read(&[typed(slice_type)]),
+      Verdict::Disposable,
+      "{slice_type}"
+    );
   }
   // A picture of intra and inter slices.
   assert_eq!(read(&[i_slice(), b_slice()]), Verdict::Disposable);
@@ -1841,7 +1854,8 @@ fn an_h264_picture_of_intra_slices_alone_is_kept() {
 #[test]
 fn an_h264_sps_that_lets_frame_num_jump_marks_nothing() {
   // FFmpeg fills a gap in `frame_num` counting from the picture before,
-  // reference or not (`h264_slice.c` 1432–1530, `h264_picture.c` 202–203).
+  // reference or not (`h264_slice.c` 1432–1530, `h264_picture.c` 202–203),
+  // at a picture it starts: each probe one, of PPS 0.
   let gaps = Sps {
     gaps: true,
     ..Sps::BASELINE
@@ -1849,49 +1863,55 @@ fn an_h264_sps_that_lets_frame_num_jump_marks_nothing() {
   .unit();
   let mut record = h264(&avcc_of(3, &gaps));
   assert_eq!(
-    record.read(&lengths(4, &[b_slice()])),
+    record.read(&lengths(4, &[b_slice_0()])),
     kept(KeptReason::FrameNumGaps)
   );
   // In-band, for good.
   let mut stream = h264(&avcc(3));
-  assert_eq!(stream.read(&lengths(4, &[b_slice()])), Verdict::Disposable);
+  assert_eq!(
+    stream.read(&lengths(4, &[b_slice_0()])),
+    Verdict::Disposable
+  );
   assert_eq!(
     stream.read(&lengths(4, &[gaps])),
     kept(KeptReason::Companion(7))
   );
   assert_eq!(
-    stream.read(&lengths(4, &[b_slice()])),
+    stream.read(&lengths(4, &[b_slice_0()])),
     kept(KeptReason::FrameNumGaps)
   );
   let _ = stream.read(&lengths(4, &[avc_sps()]));
   assert_eq!(
-    stream.read(&lengths(4, &[b_slice()])),
+    stream.read(&lengths(4, &[b_slice_0()])),
     kept(KeptReason::FrameNumGaps)
   );
 }
 
 #[test]
 fn an_h264_packet_is_marked_only_where_every_sps_fixes_the_reorder_depth_at_15_or_less() {
+  // Each probe a picture FFmpeg starts, of PPS 0, whose output the depth
+  // decides.
   let reads = |vui: Vui| {
     let unit = Sps {
       vui,
       ..Sps::BASELINE
     }
     .unit();
-    h264(&avcc_of(3, &unit)).read(&lengths(4, &[b_slice()]))
+    h264(&avcc_of(3, &unit)).read(&lengths(4, &[b_slice_0()]))
   };
-  // No VUI, a VUI without the restriction, a depth of 16 — where a picture
-  // may follow 16 it precedes in output order and FFmpeg resets its record
-  // of them (`h264_slice.c` 1310–1328) — and one of 17, which FFmpeg
-  // refuses.
-  for vui in [
-    Vui::Absent,
-    Vui::Unrestricted,
-    Vui::Restricted(16),
-    Vui::Restricted(17),
-  ] {
+  // No VUI, a VUI without the restriction, and a depth of 16 — where a
+  // picture may follow 16 it precedes in output order and FFmpeg resets its
+  // record of them (`h264_slice.c` 1310–1328).
+  for vui in [Vui::Absent, Vui::Unrestricted, Vui::Restricted(16)] {
     assert_eq!(reads(vui), kept(KeptReason::ReorderUnfixed));
   }
+  // One of 17, which FFmpeg refuses (`h264_ps.c` 188–195): the record's
+  // PPS, read on it, is one the reading cannot know, so the probe's slice
+  // is one it cannot read, at which the context may be set up again.
+  assert_eq!(
+    reads(Vui::Restricted(17)),
+    kept(KeptReason::AwaitingReference)
+  );
   // Depths of 0 and 15, and a restriction past every field before it.
   for vui in [
     Vui::Restricted(0),
@@ -1900,12 +1920,13 @@ fn an_h264_packet_is_marked_only_where_every_sps_fixes_the_reorder_depth_at_15_o
   ] {
     assert_eq!(reads(vui), Verdict::Disposable);
   }
-  // A restriction the unit ends inside.
+  // A restriction the unit ends inside: kept as at a depth of 17, the PPS
+  // read on it one the reading cannot know.
   let whole = Sps::BASELINE.unit();
   let cut = &whole[..whole.len() - 2];
   assert_eq!(
-    h264(&avcc_of(3, cut)).read(&lengths(4, &[b_slice()])),
-    kept(KeptReason::ReorderUnfixed)
+    h264(&avcc_of(3, cut)).read(&lengths(4, &[b_slice_0()])),
+    kept(KeptReason::AwaitingReference)
   );
   // In-band, for good.
   let mut stream = h264(&avcc(3));
@@ -1917,7 +1938,7 @@ fn an_h264_packet_is_marked_only_where_every_sps_fixes_the_reorder_depth_at_15_o
   let _ = stream.read(&lengths(4, &[unrestricted]));
   let _ = stream.read(&lengths(4, &[avc_sps()]));
   assert_eq!(
-    stream.read(&lengths(4, &[b_slice()])),
+    stream.read(&lengths(4, &[b_slice_0()])),
     kept(KeptReason::ReorderUnfixed)
   );
 }
@@ -1926,11 +1947,12 @@ fn an_h264_packet_is_marked_only_where_every_sps_fixes_the_reorder_depth_at_15_o
 fn an_h264_reading_awaits_a_reference_picture_after_its_opening_and_every_seek() {
   // FFmpeg's decoder takes its picture order count up from the first
   // picture it decodes after it opens or is flushed (`h264_parse.c`
-  // 293–294).
+  // 293–294). Each probe is a picture FFmpeg decodes, of PPS 0: a slice it
+  // refuses makes no picture, which no rule of a picture holds.
   let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
   let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
   assert_eq!(
-    read(&mut stream, &[b_slice()]),
+    read(&mut stream, &[b_slice_0()]),
     kept(KeptReason::AwaitingReference)
   );
   // A slice data partition of a reference picture does not end the wait:
@@ -1940,7 +1962,7 @@ fn an_h264_reading_awaits_a_reference_picture_after_its_opening_and_every_seek()
     kept(KeptReason::Referenced)
   );
   assert_eq!(
-    read(&mut stream, &[b_slice()]),
+    read(&mut stream, &[b_slice_0()]),
     kept(KeptReason::AwaitingReference)
   );
   // A reference slice does.
@@ -1948,14 +1970,14 @@ fn an_h264_reading_awaits_a_reference_picture_after_its_opening_and_every_seek()
     read(&mut stream, &[p_slice()]),
     kept(KeptReason::Referenced)
   );
-  assert_eq!(read(&mut stream, &[b_slice()]), Verdict::Disposable);
+  assert_eq!(read(&mut stream, &[b_slice_0()]), Verdict::Disposable);
   // A seek starts the wait again, and an IDR slice ends it. One FFmpeg
   // refuses ends nothing: a unit of one byte past its header, whose
   // `pic_parameter_set_id` FFmpeg reads past its end and refuses
   // (`h264_slice.c` 1735–1739).
   stream.seeked();
   assert_eq!(
-    read(&mut stream, &[b_slice()]),
+    read(&mut stream, &[b_slice_0()]),
     kept(KeptReason::AwaitingReference)
   );
   assert_eq!(
@@ -1963,14 +1985,14 @@ fn an_h264_reading_awaits_a_reference_picture_after_its_opening_and_every_seek()
     kept(KeptReason::RandomAccess)
   );
   assert_eq!(
-    read(&mut stream, &[b_slice()]),
+    read(&mut stream, &[b_slice_0()]),
     kept(KeptReason::AwaitingReference)
   );
   assert_eq!(
     read(&mut stream, &[idr_slice()]),
     kept(KeptReason::RandomAccess)
   );
-  assert_eq!(read(&mut stream, &[b_slice()]), Verdict::Disposable);
+  assert_eq!(read(&mut stream, &[b_slice_0()]), Verdict::Disposable);
 }
 
 #[test]
@@ -1986,7 +2008,7 @@ fn an_intra_slice_waits_for_one_in_a_packet_kept_since_the_opening_or_a_seek() {
     read(&mut stream, &[p_slice()]),
     kept(KeptReason::Referenced)
   );
-  assert_eq!(read(&mut stream, &[b_slice()]), Verdict::Disposable);
+  assert_eq!(read(&mut stream, &[b_slice_0()]), Verdict::Disposable);
   assert_eq!(
     read(&mut stream, &[i_slice(), b_slice()]),
     kept(KeptReason::AwaitingIntraSlice)
@@ -2497,6 +2519,60 @@ fn a_packet_not_read_whole_that_may_set_the_context_up_again_awaits_a_reference(
     read(&mut stream, &[slice_of(0, 0, 2, 2, None)]),
     Verdict::Disposable
   );
+}
+
+#[test]
+fn a_packet_of_slices_ffmpeg_refuses_in_their_header_holds_no_rule_of_a_picture() {
+  // Every slice names PPS 3, which the lists do not hold: FFmpeg refuses
+  // each in its header, "non-existing PPS 3 referenced" (`h264_slice.c`
+  // 1740–1746), and makes no picture of the packet, "no frame!"
+  // (`h264dec.c` 1061–1067) — observed, FFmpeg 9.0.1's CLI decoding five
+  // such packets, 0 frames. It takes nothing up, sets no `non_gray`, resets
+  // no `poc_offset`, fills no gap and outputs nothing: no rule of a picture
+  // holds it, and while no field waits, dropping it changes nothing. A
+  // slice of `nal_ref_idc` 2 among them keeps its packet by its own rule.
+  // Predicted, before this law: kept by each picture rule its stream's state
+  // calls for; planted, a slice refused in its header taken for one FFmpeg
+  // may start or join a picture at, red.
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  let mut intra = Bits::new();
+  intra.ue(0).ue(7).ue(3).bits(0, 4).se(0).ue(1);
+  let refused_intra = avc(0, 1, &intra.finish());
+  // At the opening: no reference picture, no intra slice yet.
+  let mut opening = NalStream::new(NalCodec::H264, &avcc(3));
+  assert_eq!(read(&mut opening, &[b_slice()]), Verdict::Disposable);
+  assert_eq!(
+    read(&mut opening, &[avc(2, 1, &[0x9C, 0x84, 0x21])]),
+    kept(KeptReason::Referenced)
+  );
+  assert!(!opening.pending.reference_seen);
+  assert_eq!(
+    read(&mut opening, &[b_slice_0()]),
+    kept(KeptReason::AwaitingReference)
+  );
+  // A reference picture read, no intra slice yet; then one only intra.
+  let mut awaiting_intra = NalStream::new(NalCodec::H264, &avcc(3));
+  awaiting_intra.pending.reference_seen = true;
+  assert_eq!(
+    read(&mut awaiting_intra, &[refused_intra.clone(), b_slice()]),
+    Verdict::Disposable
+  );
+  assert!(!awaiting_intra.pending.intra_seen);
+  let mut intra_only = h264(&avcc(3));
+  assert_eq!(read(&mut intra_only, &[refused_intra]), Verdict::Disposable);
+  // Where `frame_num` may jump, or the reorder depth is not fixed.
+  let gaps = Sps {
+    gaps: true,
+    ..Sps::BASELINE
+  };
+  let mut gapped = h264(&avcc_of(3, &gaps.unit()));
+  assert_eq!(read(&mut gapped, &[b_slice()]), Verdict::Disposable);
+  let unfixed = Sps {
+    vui: Vui::Unrestricted,
+    ..Sps::BASELINE
+  };
+  let mut reordered = h264(&avcc_of(3, &unfixed.unit()));
+  assert_eq!(read(&mut reordered, &[b_slice()]), Verdict::Disposable);
 }
 
 #[test]
