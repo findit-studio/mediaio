@@ -595,7 +595,7 @@
 //! | MP4's durations, where packets do not abut | kept only as the distance to the next decode time (`movenc.c` 1241–1259), counted between the samples MP4 writes (table C″) | reported as learned ([`Rewrite::Durations`]) |
 //! | an E-AC-3 track's last sample, joined | the edit list ends it at its last packet's duration (`movenc.c` 6940, 7329–7342), short of the frames it joins | reported at `finish` ([`Rewrite::Durations`]) |
 //! | an E-AC-3 track's frames short of a sample at its end | freed unwritten, the run MP4 joins them in (`mov_free`, `movenc.c` 7951–7955) | reported at `finish` ([`Uncarried::Unjoined`]), the packets counted, as VP9's held frames are (the Fable delta gate's R3); the joining reported at open ([`Rewrite::Ac3Parsed`]) |
-//! | an audio track's channel layout (R10, L1; grep L1) | RIFF's formats — WAV, Wave64, AVI, ASF — write a channel mask in their extensible form alone, for a native layout but mono and stereo, above 48 kHz, for E-AC-3 and DFPWM, and above 16 bits a sample but IEEE float's, and that mask only below `0x40000` (`riffenc.c` 79–84, 188–197), read back as its layout where it names the stream's channels, else as the count (`riffdec.c` 62–92, 141–275); Matroska and WebM, NUT, MXF and MP4 of no layout box write the count alone (`matroskaenc.c` 2130; `nutenc.c` 487; `mxfenc.c` 1714–1728; `movenc.c` 1438–1449), MP4's PCM of two channels and more its `chnl` box, read back as written (1299–1339, 1524–1525; `mov_chan.c` 768–859); raw FLAC and Matroska write FLAC's mask comment for a native layout within `0x3FFFF` its own order does not name, Ogg none (`flacenc.c` 244–259; `matroskaenc.c` 1077–1114); FLV a legacy codec's mono or stereo flag, read back as `av_channel_layout_default`'s, and an extended codec's multichannel configuration, of its first 18 mask bits and six from `AV_CHAN_LOW_FREQUENCY_2`, a custom map's channels of those, `AV_CHAN_UNKNOWN` for any other, and the default for another order (`flvenc.c` 722–761, 910–913; `flvdec.c` 1657–1669, 1706–1745); the decoder `avformat_find_stream_info` opens on the first packets keeps that or sets its own — every PCM, ADPCM and DPCM decoder but DVD PCM's, Blu-ray PCM's, SMPTE 302M's, G.722's, G.726's and VIMA's keeps it, as do 34 others and a codec of no decoder in the build, and FLAC's fills its own order in where the container states none of the stream's count (`libavcodec/flac.c` 173–185) — and a codec's own reads back as it is, which the trust model holds the declared layout to be; no container writes a custom channel's name | reported at open, once the header has settled the stream's codec tag, where it reads back otherwise ([`Uncarried::ChannelLayout`], [`LayoutReadBack`]) — L125–L131 and the unit law `channel_layouts_read_back_as_each_container_and_decoder_reads_them`; nothing refused: FLV's legacy codec of a layout but mono and stereo, whose multichannel header asserts, stays refused (L105), MP4's PCM of a layout its `chnl` box cannot write too ([`MuxOpenError::ChannelLayout`]), and every other container writes a count it holds whole |
+//! | an audio track's channel layout (R10, L1; grep L1) | RIFF's formats — WAV, Wave64, AVI, ASF — write a channel mask in their extensible form alone, for a native layout but mono and stereo, above 48 kHz, for E-AC-3 and DFPWM, and above 16 bits a sample but IEEE float's, and that mask only below `0x40000` (`riffenc.c` 79–84, 188–197), read back as its layout where it names the stream's channels, else as the count (`riffdec.c` 62–92, 141–275); Matroska and WebM, NUT, MXF and MP4 of no layout box write the count alone (`matroskaenc.c` 2130; `nutenc.c` 487; `mxfenc.c` 1714–1728; `movenc.c` 1438–1449), MP4's PCM of two channels and more its `chnl` box, read back as written (1299–1339, 1524–1525; `mov_chan.c` 768–859); raw FLAC and Matroska write FLAC's mask comment for a native layout within `0x3FFFF` its own order does not name, Ogg none (`flacenc.c` 244–259; `matroskaenc.c` 1077–1114); FLV a legacy codec's mono or stereo flag, read back as `av_channel_layout_default`'s, and an extended codec's multichannel configuration, of its first 18 mask bits and six from `AV_CHAN_LOW_FREQUENCY_2`, a custom map's channels of those, `AV_CHAN_UNKNOWN` for any other, and the default for another order (`flvenc.c` 722–761, 910–913; `flvdec.c` 1657–1669, 1706–1745); the decoder `avformat_find_stream_info` opens on the first packets keeps that or sets its own — every PCM, ADPCM and DPCM decoder but DVD PCM's, Blu-ray PCM's, SMPTE 302M's, G.722's, G.726's and VIMA's keeps it, as do 34 others and a codec of no decoder in the build, and FLAC's fills its own order in where the container states none of the stream's count (`libavcodec/flac.c` 173–185) — and a codec's own reads back as it is, which the trust model holds the declared layout to be; no container writes a custom channel's name | reported at open, once the header has settled the stream's codec tag, where it reads back otherwise ([`Uncarried::ChannelLayout`], [`LayoutReadBack`]) — L125–L131 and the unit law `channel_layouts_read_back_as_each_container_and_decoder_reads_them`; refused at open where the reader refuses what the writer writes, before any decoder could set a layout its own: FLV's native mask of no channel its configuration keeps, written as zero, which its reader refuses at the first audio tag, the stream read back of no channels, which no decoder takes (`flvdec.c` 1733–1742; [`MuxOpenError::ChannelLayout`]; R11, Codex R10 1 — L135) — the one reader's refusal a written layout reaches, by grep of every reader's layout calls that can refuse (R11): RIFF's mask, its answer ignored (`riffdec.c` 73); FLAC's comment, checked and warned (`flacdec.c` 210–216, `matroskadec.c` 2189–2194); NUT's count of none (`nutdec.c` 470), refused at open already; MP4's and MOV's boxes, their readers' refusals ignored (`mov.c` 1236, 1261; 897, 1160, 1211, 8826, 9018–9100 the same); MXF's labels, which MXF writes none of (`mxfdec.c` 2618, 2680); FLV's custom count of none (`flvdec.c` 1715), past 255 channels, which no codec FLV takes reaches; FLV's legacy codec of a layout but mono and stereo, whose multichannel header asserts, stays refused (L105), MP4's PCM of a layout its `chnl` box cannot write too ([`MuxOpenError::ChannelLayout`]), and every other container writes a count it holds whole |
 //!
 //! The report covers these fields and those of the tables above; a codec's
 //! parameters beyond its configuration — its color properties, its field
@@ -748,7 +748,7 @@
 //! | AVI | a frame more than 60 000 frames after the stream's place, but XSUB's, whose gaps it fills not; H.264 it tags `H264` not opening on a start code; at open, raw video of no tag of another pixel format than its bits name | refused after taking it; the first refused after taking it, the rest written as they are; written, "unreadable" (`avienc.c` 744–778, 446–461) | [`FfmpegMuxRefusal::FrameGap`], [`PayloadRule::StartCode`], [`MuxOpenError::ConfigurationInvalid`] — L84 |
 //! | FLV, at open | Opus or FLAC with no configuration; H.264, HEVC, VVC, AV1, MPEG-4 or AAC with none and the filters off; AV1's configuration `ff_isom_write_av1c` fails on | the header's `av_assert0` ends the process; written behind an empty sequence header; an empty sequence header (`flvenc.c` 853, 1491–1503, 892–893) | [`MuxOpenError::ConfigurationMissing`], [`MuxOpenError::ConfigurationInvalid`] — L82, L109 |
 //! | FLV, at open | big-endian PCM; an audio codec of no extended header — PCM, Swiff ADPCM, Nellymoser, G.711, Speex — of a layout not exactly mono or stereo; PCM's and Swiff ADPCM's 8 and 16 kHz, G.711's every rate but 8 kHz | its code the host's own order, read back little-endian; the multichannel header names the codec's fourcc, which it has none of, and `av_assert0` ends the process; written as the 5.5 kHz code, and G.711 read back at 8 kHz, with no metadata read before the stream exists (`flvenc.c` 140–240, 910–913, 497–540; `flvdec.c` 314–360, 1657–1670) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`] — L105 |
-//! | FLV, at open (R11, ruling 4: every refusal of its start, by grep `return AVERROR\|unsupported_codec\|goto error` over `get_audio_flags` and `flv_init`, 141–240 and 971–1081; its allocation and the keyframe index's flag, never set, aside) | MPEG-4 Part 2 and H.263; an audio codec at a rate its flags' table names no code for — MP3 but at 48, 44.1, 22.05 and 11.025 kHz, its other codecs of no extended header but at 44.1, 22.05, 11.025, 16, 8 and 5.512 kHz, Speex but at 16 kHz — and Speex of more than one channel; a video track past the first of another codec than VP9, AV1, H.264, HEVC and VVC, an audio track past the first of another than AAC, MP3, Opus, FLAC, AC-3 and E-AC-3; a codec of none of its tables, a data or subtitle stream but text — refused by `avformat_query_codec`, its tables naming neither | refused at its start, the header unwritten, as no part of the official specification, "FLV does not support sample rate", "FLV only supports mono Speex audio", "Unsupported multi-track video codec" / "audio codec" (`flv_init`, `flvenc.c` 985–1066; `get_audio_flags`, 141–240) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::TrackLayout`] — L133, L134 |
+//! | FLV, at open (R11, ruling 4: every refusal of its start, by grep `return AVERROR\|unsupported_codec\|goto error` over `get_audio_flags` and `flv_init`, 141–240 and 971–1081; its allocation and the keyframe index's flag, never set, aside) | MPEG-4 Part 2 and H.263; an audio codec at a rate its flags' table names no code for — MP3 but at 48, 44.1, 22.05 and 11.025 kHz, its other codecs of no extended header but at 44.1, 22.05, 11.025, 16, 8 and 5.512 kHz, Speex but at 16 kHz — and Speex of more than one channel; a native layout of no channel its multichannel configuration keeps, which its reader refuses (R11, Codex R10 1; table E); a video track past the first of another codec than VP9, AV1, H.264, HEVC and VVC, an audio track past the first of another than AAC, MP3, Opus, FLAC, AC-3 and E-AC-3; a codec of none of its tables, a data or subtitle stream but text — refused by `avformat_query_codec`, its tables naming neither | refused at its start, the header unwritten, as no part of the official specification, "FLV does not support sample rate", "FLV only supports mono Speex audio", "Unsupported multi-track video codec" / "audio codec" (`flv_init`, `flvenc.c` 985–1066; `get_audio_flags`, 141–240); the layout written as a mask of zero, which its reader refuses, the stream read back of no channels (739–744; `flvdec.c` 1733–1742) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::TrackLayout`] — L133, L134, L135 |
 //! | WAV, Wave64, AVI, ASF | a configured AAC track's ADTS packet; at open, an audio configuration past the WAVEFORMATEX's 16-bit `cbSize` | written as it comes into a stream whose format declares raw AAC; written, its size cut (`riffenc.c` 193–223) | [`PayloadRule::AdtsHeader`], [`MuxOpenError::ConfigurationInvalid`] — L87, L88 |
 //! | ASF | a decode time past its 32-bit presentation time, the preroll added; a presentation time past what its index counts in an `int` of seconds; a play duration past `i64` in 100 ns; an empty packet | written cut; refused after taking it; a signed overflow; no payload written (`asfenc.c` 886–1038) | [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::Empty`] — L86 |
 //! | ASF, at open | a video configuration past its format data's 16-bit size; a marker's title past its entry's 16-bit length; a chapter at 2^32 ms or later; the streaming form's header past its chunk's 16-bit length | each written, its length or send time cut (`asfenc.c` 645, 337, 297–308, 708–716) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSpan`], [`MuxOpenError::HeaderTooLong`] — L87 |
@@ -3100,9 +3100,12 @@ pub enum MuxOpenError {
   /// layout is not exactly mono or stereo, for which FLV writes a
   /// multichannel header naming the codec's fourcc, which such a codec has
   /// none of: `av_assert0` ends the process (`flv_write_codec_header`,
-  /// `flvenc.c` 910–913; `write_codec_fourcc`, 497–540); and FLV's Speex of
+  /// `flvenc.c` 910–913; `write_codec_fourcc`, 497–540); FLV's Speex of
   /// more than one channel, which its start refuses (`get_audio_flags`,
-  /// 156–159).
+  /// 156–159); and FLV's native layout of no channel its multichannel
+  /// configuration keeps, written as a mask of zero, which its reader
+  /// refuses, the stream read back of no channels (`flvdec.c` 1733–1742;
+  /// R11, Codex R10 1).
   #[error("track {}'s channel layout is not one the container writes", .track.get())]
   ChannelLayout {
     /// The track.
@@ -6922,6 +6925,30 @@ fn flac_comment_layout(layout: LayoutView<'_>) -> LayoutReadBack {
   }
 }
 
+/// The channels of a native mask FLV's multichannel configuration keeps:
+/// its first 18 bits, which FLV's own table shares, and the six from
+/// `AV_CHAN_LOW_FREQUENCY_2`, which it moves to its bits 18–23
+/// (`flv_write_multichannel_body`, `flvenc.c` 739–744; `flvdec.c`
+/// 1736–1739).
+const FLV_KEPT: u64 = 0x3_FFFF | (0x3F << AVChannel::AV_CHAN_LOW_FREQUENCY_2 as u64);
+
+/// Whether FLV's reader refuses the multichannel configuration FLV writes
+/// of `layout`, so that the stream reads back of no channels, which no
+/// decoder takes, before one could set a layout its own: a native mask of
+/// no channel the configuration
+/// keeps ([`FLV_KEPT`]) — downmix's stereo, the wide and the surround
+/// direct pairs, the side and top surround pairs, binaural — written as
+/// zero, which `av_channel_layout_from_mask` refuses (`flvdec.c`
+/// 1733–1742; R11, Codex R10 1). FLV writes the configuration for every
+/// audio track of an extended header and of a layout neither mono nor
+/// stereo (`flv_write_codec_header`, `flvenc.c` 910–913), which such a mask
+/// never is. A custom map reads back whatever it holds, another order as
+/// the count's default; the count, which FLV writes in 8 bits (726), past
+/// 255 no codec FLV takes reaches — Opus's own count is 8 bits.
+fn flv_layout_unreadable(layout: LayoutView<'_>) -> bool {
+  layout.order == AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32 && layout.mask & FLV_KEPT == 0
+}
+
 /// FLV's multichannel configuration, which it writes for an extended codec's
 /// track (`flv_write_multichannel_body`, `flvenc.c` 722–761; 910–913) and
 /// its reader takes (`flvdec.c` 1706–1745): a native mask of its first 18
@@ -6932,10 +6959,9 @@ fn flac_comment_layout(layout: LayoutView<'_>) -> LayoutReadBack {
 /// alone.
 fn flv_multichannel_layout(layout: LayoutView<'_>) -> LayoutReadBack {
   use AVChannelOrder as Order;
-  const KEPT: u64 = 0x3_FFFF | (0x3F << AVChannel::AV_CHAN_LOW_FREQUENCY_2 as u64);
   if layout.order == Order::AV_CHANNEL_ORDER_NATIVE as i32 {
     LayoutReadBack::Native {
-      mask: layout.mask & KEPT,
+      mask: layout.mask & FLV_KEPT,
     }
   } else if layout.order == Order::AV_CHANNEL_ORDER_CUSTOM as i32 {
     let low_2 = AVChannel::AV_CHAN_LOW_FREQUENCY_2 as i32;
@@ -10437,6 +10463,15 @@ where
         && flv_legacy_audio(codec)
         && (!mono_or_stereo(LayoutView::of(ticket.ch_layout()))
           || (codec == SPEEX && ticket.ch_layout().channels() != 1)) =>
+    {
+      Some(MuxOpenError::ChannelLayout { track })
+    }
+    // FLV's reader refuses a native mask of no channel its multichannel
+    // configuration keeps ([`flv_layout_unreadable`]), before any decoder
+    // could set the layout its own (R11, Codex R10 1).
+    Audited::Flv
+      if description.kind() == TrackKind::Audio
+        && flv_layout_unreadable(LayoutView::of(ticket.ch_layout())) =>
     {
       Some(MuxOpenError::ChannelLayout { track })
     }

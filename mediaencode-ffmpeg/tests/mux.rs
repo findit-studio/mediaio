@@ -15854,3 +15854,92 @@ fn l134_flv_refuses_at_open_the_video_and_the_tables_its_start_refuses() {
     opened_flv(&corpus, name, table).unwrap_or_else(|error| panic!("{name}: {error:?}"));
   }
 }
+
+/// `row` declaring the native layout of `mask`, its ticket's layout alone
+/// rewritten.
+fn masked(row: Described, mask: u64) -> Described {
+  reticketed(row, |par| {
+    // SAFETY: `par` is live, its layout its own; `av_channel_layout_uninit`
+    // frees any map and `av_channel_layout_from_mask` writes a native one in
+    // place.
+    let written = unsafe {
+      ffmpeg_next::ffi::av_channel_layout_uninit(&mut par.ch_layout);
+      ffmpeg_next::ffi::av_channel_layout_from_mask(&mut par.ch_layout, mask)
+    };
+    assert_eq!(written, 0, "a mask of {mask:#x}");
+  })
+}
+
+/// **L135 — FLV refuses at open a native layout of no channel its
+/// multichannel configuration keeps** (R11, Codex R10 1; table E;
+/// `flvenc.c` 739–744, 910–913; `flvdec.c` 1733–1742): FLV writes the
+/// configuration for an AAC or FLAC track of a layout neither mono nor
+/// stereo, keeping a native mask's first 18 bits and the six from
+/// `AV_CHAN_LOW_FREQUENCY_2`; of downmix's stereo, the wide pair or the
+/// side surround pair it writes a mask of zero, which its reader refuses at
+/// the first audio tag, the stream read back of no channels, which no
+/// decoder takes — refused by name
+/// (`MuxOpenError::ChannelLayout`) before anything is written, before
+/// AAC's decoder could set a layout its own. The top side pair, which FLV
+/// keeps, opens, and the file reads back, every packet in it.
+///
+/// PLANT: the reader's refusal unmirrored, the first table opened; the
+/// six channels from `AV_CHAN_LOW_FREQUENCY_2` dropped from the kept mask,
+/// the top side pair refused.
+#[test]
+fn l135_flv_refuses_a_native_layout_its_reader_cannot_take() {
+  let Some(corpus) = Corpus::new() else { return };
+  use ffmpeg_next::ffi::AVChannel as C;
+  let bits = |channels: &[C]| -> u64 {
+    channels
+      .iter()
+      .fold(0, |mask, &channel| mask | 1 << (channel as u32))
+  };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let aac = || table_of(&source, TrackKind::Audio).remove(0);
+  let layouts = Layouts::of(&corpus);
+  let flac = || table_of(&layouts.flac, TrackKind::Audio).remove(0);
+  for (name, row) in [
+    (
+      "l135-aac-downmix.flv",
+      masked(
+        aac(),
+        bits(&[C::AV_CHAN_STEREO_LEFT, C::AV_CHAN_STEREO_RIGHT]),
+      ),
+    ),
+    (
+      "l135-aac-surround.flv",
+      masked(
+        aac(),
+        bits(&[
+          C::AV_CHAN_SIDE_SURROUND_LEFT,
+          C::AV_CHAN_SIDE_SURROUND_RIGHT,
+        ]),
+      ),
+    ),
+    (
+      "l135-flac-wide.flv",
+      masked(
+        flac(),
+        bits(&[
+          C::AV_CHAN_WIDE_LEFT,
+          C::AV_CHAN_WIDE_RIGHT,
+          C::AV_CHAN_SURROUND_DIRECT_LEFT,
+        ]),
+      ),
+    ),
+  ] {
+    let opened = opened_flv(&corpus, name, vec![row]);
+    assert!(
+      matches!(opened, Err(MuxOpenError::ChannelLayout { track }) if track.get() == 0),
+      "{name}: {opened:?}"
+    );
+  }
+  let (table, packets) = whole_track(&source, TrackKind::Audio);
+  let top = bits(&[C::AV_CHAN_TOP_SIDE_LEFT, C::AV_CHAN_TOP_SIDE_RIGHT]);
+  let table = table.into_iter().map(|row| masked(row, top)).collect();
+  let target = output(&corpus, "l135-aac-top.flv");
+  written_through(&target, ContainerName::new("flv"), (table, packets.clone()));
+  let (_, back) = whole_track(&target, TrackKind::Audio);
+  assert_eq!(back.len(), packets.len(), "every packet read back");
+}

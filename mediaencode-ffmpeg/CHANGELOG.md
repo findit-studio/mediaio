@@ -387,7 +387,12 @@ crate moves only when it changes.
   (`MuxOpenError::CodecNotCarried`); a video track past the first of
   another codec than VP9, AV1, H.264, HEVC and VVC, and an audio track
   past the first of another than AAC, MP3, Opus, FLAC, AC-3 and E-AC-3
-  (`MuxOpenError::TrackLayout`).
+  (`MuxOpenError::TrackLayout`). FLV's native channel layout of no channel
+  its multichannel configuration keeps — downmix's stereo, the wide, the
+  surround direct, the side and top surround and the binaural pairs —
+  written as a mask of zero, which its reader refuses, the stream read
+  back of no channels (`MuxOpenError::ChannelLayout`), the one reader's
+  refusal of a written layout among every audited container's.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
