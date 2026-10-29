@@ -66,14 +66,14 @@
 //!
 //! **A field's pair may be in the next packet.** FFmpeg's decoder joins
 //! the two fields of a frame across packets, holding the first, its frame
-//! and its SEI until the second arrives (`h264_slice.c` 1397–1500), so
-//! dropping one field of a pair costs the other its frame. A packet is
-//! therefore disposable only where every sequence parameter set the
-//! decoder may read codes frames only (`frame_mbs_only_flag` 1,
-//! 7.4.2.1.1): before one has been read, and from the first that lets a
-//! picture be a field for good, nothing is
-//! ([`KeptReason::MaybeField`]). Proving each slice a frame from its own
-//! header, which would mark interlaced streams too, is not done.
+//! and its SEI until the second arrives (`h264_slice.c` 1455–1611), so
+//! dropping one field of a pair costs the other its frame, and the next
+//! frame its pairing. Where a sequence parameter set lets a picture be a
+//! field (`frame_mbs_only_flag` 0, 7.4.2.1.1), each slice is therefore
+//! read for its field, and a packet is disposable only where it holds a
+//! frame, or both fields of a pair FFmpeg joins, and no field waits at it
+//! ([Fields](#fields)). Before a sequence parameter set has been read,
+//! nothing is ([`KeptReason::MaybeField`]).
 //!
 //! Beside the slices, only access unit delimiters (9), filler data
 //! (12) and an SEI unit whose every message its own picture alone takes up
@@ -86,6 +86,72 @@
 //! used for inter-view prediction by other view components in the current
 //! access unit" (G.7.4.1.1). This decides for the whole packet, the unit a
 //! consumer drops.
+//!
+//! # Fields
+//!
+//! Where a sequence parameter set lets a picture be a field, each slice is
+//! read as FFmpeg reads it before it starts or joins a picture
+//! (`h264_slice_header_parse`, `h264_slice.c` 1696–1775): by the picture
+//! parameter set it names, the sequence parameter set that one was read
+//! on, which FFmpeg 9.0.1 keeps however that sequence parameter set's id is
+//! read again (`pps->sps`, `h264_ps.c` 738; `remove_sps`, 92–104, its
+//! removal of such picture parameter sets compiled out); its `frame_num` in
+//! that one's bits; and, where it does not code frames only,
+//! `field_pic_flag` and `bottom_field_flag`. A packet's pictures start
+//! where FFmpeg starts one: at its first slice, and after a first field at
+//! a slice of `first_mb_in_slice` 0 (`h264_slice.c` 2094–2133). What FFmpeg
+//! refuses past those fields, and of the units that ride beside them, it
+//! refuses only where the stream breaks the standard (7.4.3, D.1); what it
+//! refuses of a conforming stream — another
+//! picture parameter set within a picture, reference and non-reference
+//! fields together — the reading takes as refused, and past a refusal,
+//! under `AV_EF_EXPLODE` FFmpeg reads no more of the packet (`h264dec.c`
+//! 741–745).
+//!
+//! What FFmpeg 9.0.1 does with each case, the packet dropped, or every unit
+//! of `nal_ref_idc` 0 but SEI skipped (`skip_frame` at `noref` and above,
+//! `h264dec.c` 626–628) — measured too, on the laws' PAFF stream of I_PCM
+//! and P_Skip macroblocks, 25 frames, where skipping at `noref` decodes
+//! exactly what dropping every non-reference packet does:
+//!
+//! | case | FFmpeg, every packet read | dropped, or skipped | a later picture changes | verdict |
+//! |---|---|---|---|---|
+//! | both fields of `nal_ref_idc` 0 of a pair, in one packet, no field waiting | the first starts a frame and waits (`h264_slice.c` 1610–1611); the second, of the other parity and the same `frame_num`, joins it (2111–2114, 1604–1606), and the frame is chosen for output there (1683–1690) | no field waits after it, as none did before it; skipped, both fields go | no: measured, the pair's frame alone lost | disposable |
+//! | a field alone in a packet, the pair's other in the next: the first | it waits, and the next packet's field joins it | the second starts a frame of its own and waits; the next frame's first field — the other parity, the same `frame_num`, a non-reference picture's being the next one's (7.4.3) — joins it (1604–1606), or is refused where one is a reference (1494–1501) | yes: measured, 8 frames of the 25 lost and 12 others made | kept: [`KeptReason::UnpairedField`] |
+//! | the same, the second | — | the first waits on: the next picture finds it unmatched, a frame or a field of its parity (1583–1587), or joins it, a field of the other, where the field order turns | yes, where the order turns: measured, 8 lost and 10 made; and `missing_fields` stays raised | kept: [`KeptReason::UnpairedField`]: no packet tells what follows it |
+//! | a reference first field, a non-reference second | the second refused, "Found reference and non-reference fields in the same frame" (1494–1501), and the first waits on | the second dropped or skipped: the first waits on, as when refused | — | kept: [`KeptReason::Referenced`] in one packet; the second alone, [`KeptReason::UnpairedField`] |
+//! | a non-reference first field, a reference second | the reference field refused the same way, and lost to the pictures after it | the first dropped: the reference field starts a frame of its own, and is decoded | yes | kept: [`KeptReason::UnpairedField`], [`KeptReason::Referenced`] |
+//! | a field whose complementary field is missing | it waits, and the next picture finds it unmatched (1583–1587): `missing_fields` rises; from two on a first field is output at once (1683), its frame queued (`DELAYED_PIC_REF`, 1342–1343), so that its second field starts a frame of its own (1598–1603) | dropped, `missing_fields` stays where it was; and a pair dropped after it, which resets it (1589), leaves it raised | yes | kept: [`KeptReason::UnpairedField`]; every pair after it, for good: [`KeptReason::UnmatchedFields`] |
+//! | the second field of a pair referencing the first | only a reference field is referenced (3.104), so only a reference pair's second field references its first | — | — | kept: [`KeptReason::Referenced`] |
+//! | an MBAFF frame (`field_pic_flag` 0, `mb_adaptive_frame_field_flag` 1), or a frame under a sequence parameter set that lets fields in | a frame (`h264_slice.c` 577, 1611): no field waits after it | as a progressive frame | no, where no field waits at it | disposable, as a progressive frame |
+//! | PicAFF: frames and pairs across pictures | a frame after a waiting field finds it unmatched (1583–1587) | — | — | each packet by its own pictures; one where a field may wait, kept: [`KeptReason::PendingField`] |
+//! | two fields of one parity in one packet, or of two `frame_num`s | the second finds the first unmatched (1583–1587), or is refused, "Frame num change" (1750–1756) | — | yes | kept: [`KeptReason::UnpairedField`] |
+//! | a pair whose fields name two picture parameter sets | FFmpeg may refuse the second, "PPS changed between slices" (2150–2163) | — | — | kept: [`KeptReason::MaybeField`] |
+//! | a slice whose picture parameter set FFmpeg does not hold | refused, "non-existing PPS" (1740–1746): no picture starts | as read | no | as the packet's other units say |
+//!
+//! FFmpeg's parser splits a raw stream's, and an MPEG-TS stream's, pairs
+//! one field to a packet (`h264_parser.c` 147–152), and its MP4 muxer
+//! writes each packet as a sample: those pairs are kept whole. A pair in
+//! one sample, as some writers make, is marked.
+//!
+//! The state the reading carries for it:
+//!
+//! | state | FFmpeg's | moved by | read by |
+//! |---|---|---|---|
+//! | the sequence parameter set list | `sps_list` (`h264_ps.c` 581–587) | a sequence parameter set FFmpeg reads whole, by its RBSP's strict reading, for certain; one it may read otherwise, by any reading it may adopt, or none, joined with what the entry held | a picture parameter set read after it |
+//! | the picture parameter set list, each entry with the sequence parameter set it was read on | `pps_list`, `pps->sps` (731–738, 839–840) | a picture parameter set FFmpeg accepts; what it refuses — no sequence parameter set, one of 11 or 13 bits, slice groups, more than 32 references, an offset past ±12, a scaling delta past −128 to 127 — leaves the entry as it was (698–847) | each slice (`h264_slice.c` 1735–1775) |
+//! | the field waiting | `first_field`, `cur_pic_ptr`, `picture_structure`, `droppable` (1455–1611) | each picture start; none after a seek (`h264dec.c` 469) | a packet: [`KeptReason::PendingField`] |
+//! | fields gone unmatched: none, at most one, or more | `missing_fields` (`h264_slice.c` 1585, 1589, 1683), each frame thread's own, never copied between them (338–466) | each start that may find a field unmatched; it never falls | a pair: [`KeptReason::UnmatchedFields`]; from two, whether a first field may be queued at once |
+//!
+//! And the roads that move it:
+//!
+//! | road | the lists | the field waiting |
+//! |---|---|---|
+//! | the record the decoder opens with, and one mid-stream ([`NalStream::reconfigure`]) | each parameter set in order, for certain where FFmpeg reads each without failing; only maybe after one that may fail, and an `avcC` entry it escapes and reads again where its first reading fails, unless under `AV_EF_EXPLODE` (`h264_parse.c` 466–524, 421–464, 367–413) | not moved: a record holds no picture |
+//! | a packet the reading reads whole | each parameter set as the decoder reads it, in the packet's order, so that a slice after it is read by it; only maybe after a unit FFmpeg may refuse (`h264dec.c` 717–727, 741–745) | each picture start, as `h264_field_start` makes it |
+//! | a packet it does not read whole | every parameter set FFmpeg's splitter may read there, maybe | unknown where it may hold a slice, and a field may have gone unmatched, more than one |
+//! | a seek ([`NalStream::seeked`]) | where an entry may hold other than the opening record left, every entry unknown: a decoder opened afresh holds that record's alone | none waits |
+//! | a packet of no bytes | — | none, or what waited: a decoder that takes it takes it for the stream's end (`h264dec.c` 984–985, 1034–1035) |
 //!
 //! # HEVC
 //!
@@ -138,6 +204,7 @@
 //! | codec | `payloadType` (`libavcodec/sei.h`) | in a packet | why |
 //! |---|---|---|---|
 //! | H.264 | 1, picture timing | rides beside | FFmpeg clears it before every access unit (`h264dec.c` 593–598, `h264_sei.c` 48–61) and applies it to its own picture (`h264_slice.c` 1185–1235) |
+//! | H.264 | 1, picture timing, while a first field waits | rides beside | FFmpeg keeps it into the next packet (`h264dec.c` 594–599), which the reading keeps ([`KeptReason::PendingField`]); it moves a frame's flags, not its pixels |
 //! | H.264, HEVC | 3, filler payload | rides beside | no decoder reads it: it falls to `ff_h2645_sei_message_decode`, which has no case for it (`h2645_sei.c` 286–317; `h264_sei.c` 282–286, `hevc/sei.c` 242–248, 251–262) |
 //! | HEVC | 132, decoded picture hash | keeps the packet | FFmpeg clears it only when a frame ends (`hevc/hevcdec.c` 3505–3512), and its decoder skips decodable pictures too — every SLNR picture under `skip_frame = AVDISCARD_NONREF` (3766–3767), a RASL picture after the CRA it starts at — as well as the reserved types: beside a picture skipped so, the hash carries over to the next picture's check |
 //!
@@ -213,7 +280,12 @@
 //! | codec | `nal_unit_type` | in a packet | why (clause) |
 //! |---|---|---|---|
 //! | H.264 | 1–4, `nal_ref_idc` 0, every SPS coding frames only | a picture nothing references | 3.104, 7.4.1, 7.4.2.1.1 |
-//! | H.264 | 1–4, `nal_ref_idc` 0, before any SPS or after one that lets fields in | kept: [`KeptReason::MaybeField`] | 7.4.2.1.1; `h264_slice.c` 1397–1500 |
+//! | H.264 | 1, `nal_ref_idc` 0, after an SPS that lets fields in: a frame, or both fields of a pair FFmpeg joins in the packet, no field waiting at it | a picture nothing references | 3.104, 7.4.1, 7.4.3; [Fields](#fields) |
+//! | H.264 | 2–4, `nal_ref_idc` 0, after one: slice data partitions alone | a picture nothing references: FFmpeg decodes no partition, and starts no picture at one | `h264dec.c` 682–686 |
+//! | H.264 | 1, `nal_ref_idc` 0, after one: a field without its pair in the packet | kept: [`KeptReason::UnpairedField`] | [Fields](#fields) |
+//! | H.264 | 1, `nal_ref_idc` 0, after one: a first field may wait at the packet | kept: [`KeptReason::PendingField`] | [Fields](#fields) |
+//! | H.264 | 1, `nal_ref_idc` 0, after one: a pair, after a field may have gone unmatched | kept: [`KeptReason::UnmatchedFields`] | [Fields](#fields) |
+//! | H.264 | 1–4, `nal_ref_idc` 0, before any SPS; or 1, after one that lets fields in, a slice the reading cannot read for its field | kept: [`KeptReason::MaybeField`] | 7.4.2.1.1; [Fields](#fields) |
 //! | H.264 | 1–4, `nal_ref_idc` above 0 | kept: [`KeptReason::Referenced`] | 7.4.1 |
 //! | H.264 | 5, IDR | kept: [`KeptReason::RandomAccess`] | 7.4.1 |
 //! | H.264 | 6, SEI of picture timing and filler payload alone | rides beside | [SEI](#sei) |
@@ -262,6 +334,12 @@
 //! only raises what later packets are held to, so reading more can only
 //! fail to mark.
 //!
+//! H.264's parameter-set lists are read otherwise, since FFmpeg replaces an
+//! entry: an entry moves for certain only where FFmpeg reads the unit for
+//! certain and the reading can tell what it makes of it, and else may hold
+//! what it held or what the unit would put there — and a slice read by an
+//! entry that may hold either is not read ([`KeptReason::MaybeField`]).
+//!
 //! # What a non-reference picture writes
 //!
 //! A packet is disposable only where dropping it changes no later
@@ -282,7 +360,11 @@
 //! | H.264 `mmco_reset`, which the picture after an MMCO 5 picture or a flush takes as an output barrier | `h264_slice.c` 1302–1303 | no: the barrier falls on the next picture decoded, whichever it is, and the output on either side of it stays in picture order | — |
 //! | H.264 `non_gray` | any intra slice, `h264_slice.c` 2032–2034; cleared by a flush, `h264dec.c` 492 | whether a later picture that references a gray frame filling a gap uses another, `h264_refs.c` 410–419 | where a slice may be intra, an intra slice in a packet kept since the opening or the last seek ([`KeptReason::AwaitingIntraSlice`]) |
 //! | H.264 `frame_recovered`, `recovery_frame` | `h264_slice.c` 1645–1677, 1374–1376 | no: only a reference picture or IDR moves them, and a recovery point SEI keeps its packet | — |
-//! | H.264 field pairing: `first_field`, `droppable`, `picture_structure` | `h264_slice.c` 1397–1520 | the second field's frame | every SPS: frames only ([`KeptReason::MaybeField`]) |
+//! | H.264 field pairing: `first_field`, `cur_pic_ptr`, `droppable`, `picture_structure` | each picture start, `h264_slice.c` 1455–1611 | which field the next one joins, and the frame of both | a frame, or both fields of a pair FFmpeg joins in the packet, and no field waiting at it ([`KeptReason::UnpairedField`], [`KeptReason::PendingField`]; [Fields](#fields)) |
+//! | H.264 `missing_fields`, each frame thread's own | a field found unmatched raises it, `h264_slice.c` 1583–1587, and a field joining one resets it, 1589 | from two on a later first field is output at once, its pair refused its frame, 1683, 1598–1603 | a pair only while no field may have gone unmatched ([`KeptReason::UnmatchedFields`]) |
+//! | H.264 SEI state while a first field waits | not reset at the next packet, `h264dec.c` 594–599 | that packet's frame's flags and side data, not its pixels | no: the next packet is kept ([`KeptReason::PendingField`]) |
+//! | H.264 parameter-set lists | parameter sets alone, which keep their packets; a picture parameter set keeps the sequence parameter set it was read on, `h264_ps.c` 738, 92–104 | which bits a slice's `field_pic_flag` is | — |
+//! | H.264 `prev_frame_num`, `prev_poc_*`, `recovery_frame`, `non_gray`, `poc_offset`, and the output, at a field | each field, `h264_picture.c` 197–203, `h264_slice.c` 1645–1677, 2032–2034, 1427–1430; the gap fill at a frame or a first field alone, 1507; the output at a frame or a pair's second field, 1683–1690 | as at a frame: a pair of non-reference fields is a non-reference frame to each | the frame's rules: [`KeptReason::FrameNumGaps`], [`KeptReason::AwaitingReference`], [`KeptReason::AwaitingIntraSlice`], [`KeptReason::IntraOnly`], [`KeptReason::ReorderUnfixed`] — a reference slice or an intra one counted only where FFmpeg decodes it |
 //! | H.264 `prev_interlaced_frame` | `h264_slice.c` 1196–1235 | a later frame's interlaced flag, not its pixels | — |
 //! | H.264 SEI state | reset per access unit, `h264dec.c` 593–598 | no: a riding SEI is one the picture alone takes up ([SEI](#sei)) | — |
 //! | HEVC `poc_tid0` | TemporalId-0 pictures but SLNR, RASL, RADL, `hevc/hevcdec.c` 3297–3306 | no | — |
@@ -307,6 +389,7 @@
 //! | the record the decoder opens with ([`NalStream::new`]); again at a seek, where a decoder opened afresh reads it ([`NalStream::seeked`]) | every unit its splitter may read in the record | H.264: the parameter sets alone (`h264_parse.c` 380–409). HEVC: the parameter sets, and the SEI units, prefix and suffix, of any layer, which wait for the first picture it decodes (`hevc/parse.c` 39–67, `hevc/hevcdec.c` 4161–4174) |
 //! | a record mid-stream ([`NalStream::reconfigure`]): a packet's `AV_PKT_DATA_NEW_EXTRADATA` ([`NalStream::read_with_record`]), an H.264 packet that is an `avcC` | the same | the same, before the packet that carries it (`h264dec.c` 1038–1050, `hevc/hevcdec.c` 3855–3860) |
 //! | a packet the reading reads whole | its units, in order | each as its type says |
+//! | the same, H.264, after a sequence parameter set that lets fields in | its slices, each read for its field as FFmpeg reads it, in order ([Fields](#fields)) | a reference picture and an intra slice only where FFmpeg starts or joins a picture at it |
 //! | a packet it does not: one that does not parse, that switches the framing, or that comes while the framing is unknown, unset or lost | every unit a decoder's splitter may read in it, in each framing one may read it in | anything: SEI state, an end of sequence or a recovery point may be left behind, and nothing the packet would take up or prove counts |
 //!
 //! An HEVC record mid-stream that fails — an array that runs past the
@@ -329,13 +412,17 @@
 //! - some slice is not intra, as FFmpeg reads a slice's type, or none is of
 //!   a type the decoder decodes (1, 5), so that it starts no picture;
 //! - a sequence parameter set has been read, and every one the decoder may
-//!   read codes frames only, lets `frame_num` jump nowhere and fixes the
-//!   reorder depth at 15 or less, under every reading of it FFmpeg may
-//!   adopt;
-//! - a slice of a reference picture, of NAL unit type 1 or 5, has been
-//!   read since the reading opened or was sought;
+//!   read lets `frame_num` jump nowhere and fixes the reorder depth at 15 or
+//!   less, under every reading of it FFmpeg may adopt;
+//! - every one codes frames only, or the packet's pictures, each slice read
+//!   by the sequence parameter set its picture parameter set was read on,
+//!   are a frame, or both fields of a pair FFmpeg joins, or none FFmpeg
+//!   starts; no first field may wait at the packet; and for a pair, no
+//!   field may have gone unmatched ([Fields](#fields));
+//! - a slice of a reference picture the decoder decodes, of NAL unit type 1
+//!   or 5, has been read since the reading opened or was sought;
 //! - where some slice may be intra, a packet kept since then has held an
-//!   intra slice.
+//!   intra slice the decoder decodes.
 //!
 //! An HEVC packet is marked only where all of these hold:
 //!
@@ -510,10 +597,28 @@ pub enum KeptReason {
   /// decode.
   FramingUnknown,
   /// An H.264 picture of `nal_ref_idc` 0 that may be one field of a pair,
-  /// which FFmpeg's decoder joins with its other field across packets: no
-  /// sequence parameter set has been read, or one lets a picture be a field
-  /// (`frame_mbs_only_flag` 0).
+  /// which FFmpeg's decoder joins with its other field across packets,
+  /// where the reading cannot tell: no sequence parameter set has been
+  /// read, or, where one lets a picture be a field (`frame_mbs_only_flag`
+  /// 0), a slice's header does not read as FFmpeg reads it — the picture
+  /// parameter set it names, or the sequence parameter set that one was
+  /// read with, not known for certain ([Fields](self#fields)).
   MaybeField,
+  /// An H.264 field of `nal_ref_idc` 0 whose packet does not hold it
+  /// together with its complementary field, as one pair FFmpeg's decoder
+  /// joins: dropping one field of a pair moves the other's pairing, and
+  /// the next frame's with it (`h264_slice.c` 1455–1611; [Fields](self#fields)).
+  UnpairedField,
+  /// An H.264 picture that comes while a first field may be waiting in
+  /// FFmpeg's decoder for its pair, which the picture would join, or find
+  /// unmatched (`h264_slice.c` 1576–1611).
+  PendingField,
+  /// An H.264 field pair after FFmpeg's decoder may have met a field
+  /// without its pair: it counts such fields, a pair resets the count, and
+  /// from two on it outputs a first field at once (`missing_fields`,
+  /// `h264_slice.c` 1576–1590, 1683), so a pair dropped leaves the count
+  /// where a later field reads it.
+  UnmatchedFields,
   /// An H.264 picture of `nal_ref_idc` 0 whose every slice is intra, which
   /// FFmpeg's decoder under frame threading reads as `picture_intra_only`
   /// and lets reset the `poc_offset` later pictures' film grain is seeded
@@ -582,6 +687,9 @@ impl fmt::Display for KeptReason {
       Self::FramingChange => f.write_str("a packet that switches the framing"),
       Self::FramingUnknown => f.write_str("a framing a decoder may read otherwise"),
       Self::MaybeField => f.write_str("a picture that may be one field of a pair"),
+      Self::UnpairedField => f.write_str("a field without its pair in its packet"),
+      Self::PendingField => f.write_str("a picture while a first field may wait for its pair"),
+      Self::UnmatchedFields => f.write_str("a field pair after a field may have gone unmatched"),
       Self::IntraOnly => f.write_str("a picture of intra slices alone"),
       Self::FrameNumGaps => f.write_str("a picture where frame_num may jump"),
       Self::ReorderUnfixed => f.write_str("a picture where the reorder depth is not fixed"),
@@ -595,8 +703,10 @@ impl fmt::Display for KeptReason {
 }
 
 /// One track's reading of its H.264 or HEVC bitstream: its codec, the
-/// framing FFmpeg's decoder reads it in, and for HEVC the highest temporal
-/// sub-layer any parameter set has declared so far.
+/// framing FFmpeg's decoder reads it in, for H.264 FFmpeg's parameter-set
+/// lists and the field its decoder may hold waiting for its pair, and for
+/// HEVC the highest temporal sub-layer any parameter set has declared so
+/// far.
 ///
 /// The framing is FFmpeg's own state, held as its decoder holds it: whether
 /// each NAL unit follows a length (`is_avc` in `libavcodec/h264dec.h`,
@@ -661,6 +771,20 @@ pub struct NalStream {
   /// leaves the reorder depth to FFmpeg's guess (no
   /// `bitstream_restriction_flag`, or not read so). It never clears.
   reorder_unfixed: bool,
+  /// For H.264: FFmpeg's parameter-set lists, as far as the reading knows
+  /// what each entry holds ([`ParameterSets`]).
+  sets: ParameterSets,
+  /// For H.264: whether an entry of the lists may hold other than the
+  /// record the stream opened with left in it, which is all a decoder
+  /// opened afresh at a seek holds.
+  sets_moved: bool,
+  /// For H.264: the first field FFmpeg's decoder may hold waiting for its
+  /// pair ([Fields](self#fields)).
+  pairing: Pairing,
+  /// For H.264: how many fields may have gone unmatched in a decoder, each
+  /// raising its `missing_fields` ([`KeptReason::UnmatchedFields`]): 0, at
+  /// most 1, or more. It never falls.
+  unmatched: u8,
   /// What is pending for later pictures, as the census of every NAL unit
   /// read so far leaves it ([`Census`]).
   pending: Pending,
@@ -690,6 +814,10 @@ impl NalStream {
       fields_possible: false,
       gaps_possible: false,
       reorder_unfixed: false,
+      sets: ParameterSets::EMPTY,
+      sets_moved: false,
+      pairing: Pairing::Settled,
+      unmatched: 0,
       pending: Pending::OPENING,
       opened_carried: false,
       record_may_fail: false,
@@ -697,6 +825,7 @@ impl NalStream {
     stream.record(extradata, true);
     stream.opened = (stream.lengths, stream.length_size);
     stream.opened_carried = stream.pending.carried;
+    stream.sets_moved = false;
     stream
   }
 
@@ -753,6 +882,14 @@ impl NalStream {
     self.pending.carried |= self.opened_carried;
     if (self.lengths, self.length_size) != self.opened {
       self.lost = true;
+    }
+    // H.264's flush, and its opening, hold no first field (`h264dec.c` 469).
+    // A flushed decoder keeps its parameter-set lists, and one opened
+    // afresh holds the opening record's alone: where the two may differ,
+    // the reading knows neither.
+    self.pairing = Pairing::Settled;
+    if self.sets_moved {
+      self.sets.forget();
     }
   }
 
@@ -837,6 +974,7 @@ impl NalStream {
         None => {
           self.unread(packet, None);
           self.learn_unframed(packet);
+          self.fields_unread(packet, None);
           return Verdict::Kept(KeptReason::FramingUnknown);
         }
         // With four-byte lengths a packet's first bytes may switch the
@@ -853,6 +991,7 @@ impl NalStream {
             if let Some(framing) = framing {
               self.learn(packet, framing);
             }
+            self.fields_unread(packet, framing);
             return Verdict::Kept(KeptReason::FramingChange);
           }
         }
@@ -862,11 +1001,18 @@ impl NalStream {
     let Some(framing) = self.framing() else {
       self.unread(packet, None);
       self.learn_unframed(packet);
+      self.fields_unread(packet, None);
       return Verdict::Kept(KeptReason::Unframed);
     };
+    let before = self.pending;
     let judged = self.judge(packet, framing);
     self.pending = judged.pending;
     self.learn(packet, framing);
+    if judged.whole {
+      self.fields_walk(packet, framing, before, !judged.verdict.is_disposable());
+    } else {
+      self.fields_unread(packet, Some(framing));
+    }
     judged.verdict
   }
 
@@ -885,10 +1031,17 @@ impl NalStream {
     let malformed = |census: Census| Judged {
       verdict: Verdict::Kept(KeptReason::Malformed),
       pending: census.unread(packet, Some(framing)),
+      whole: false,
     };
     let mut census = Census::new(self.codec, Road::Packet, self.pending);
     let mut kept = None;
     let mut pictures = 0_usize;
+    // H.264: what the packet's pictures are, field by field, against the
+    // field the decoder may hold waiting ([Fields](self#fields)).
+    let fields = match self.codec {
+      NalCodec::H264 => self.fields_verdict(packet, framing),
+      NalCodec::Hevc => None,
+    };
     // H.264: FFmpeg's `picture_intra_only`, every slice NAL unit (1, 2, 5)
     // intra; whether the packet holds a slice the decoder decodes (1, 5),
     // the only kind it starts a picture at; and whether such a slice may
@@ -914,7 +1067,7 @@ impl NalStream {
                   some_intra |= nal_unit_type == 1 && parsed.is_none_or(is_intra);
                 }
               }
-              self.h264_unit(nal)
+              self.h264_unit(nal, fields)
             }
             NalCodec::Hevc => self.hevc_unit(nal),
           };
@@ -948,6 +1101,7 @@ impl NalStream {
       verdict,
       // A packet marked may not reach the decoder.
       pending: census.close(packet.is_empty(), !verdict.is_disposable()),
+      whole: true,
     }
   }
 
@@ -970,7 +1124,10 @@ impl NalStream {
   fn record(&mut self, extradata: &[u8], opening: bool) {
     let mut census = Census::new(self.codec, Road::Record, self.pending);
     match self.codec {
-      NalCodec::H264 => self.h264_record(extradata, &mut census),
+      NalCodec::H264 => {
+        self.h264_record(extradata, &mut census);
+        self.record_sets(extradata);
+      }
       NalCodec::Hevc => self.hevc_record(extradata, opening, &mut census),
     }
     self.pending = census.pending;
@@ -1232,20 +1389,28 @@ impl NalStream {
     }
   }
 
-  /// One H.264 NAL unit, read against what earlier packets taught.
-  fn h264_unit(&self, nal: &[u8]) -> Read {
-    match h264_unit(nal) {
-      // A picture of `nal_ref_idc` 0 may be one field of a pair, which
-      // FFmpeg's decoder joins with its other field across packets
-      // (`h264_slice.c` 1397–1500): it is disposable only where every
-      // sequence parameter set the decoder may read codes frames only.
-      Read::Picture if !self.sps_seen || self.fields_possible => {
-        Read::Keeps(KeptReason::MaybeField)
-      }
-      Read::Picture if self.gaps_possible => Read::Keeps(KeptReason::FrameNumGaps),
-      Read::Picture if self.reorder_unfixed => Read::Keeps(KeptReason::ReorderUnfixed),
-      Read::Picture if !self.pending.reference_seen => Read::Keeps(KeptReason::AwaitingReference),
-      read => read,
+  /// One H.264 NAL unit, read against what earlier packets taught, and
+  /// `fields`, what keeps its packet's pictures for their fields, if
+  /// anything does ([`Self::fields_verdict`]).
+  fn h264_unit(&self, nal: &[u8], fields: Option<KeptReason>) -> Read {
+    let read = h264_unit(nal);
+    if read != Read::Picture {
+      return read;
+    }
+    // A picture of `nal_ref_idc` 0 may be one field of a pair, which
+    // FFmpeg's decoder joins with its other field across packets
+    // (`h264_slice.c` 1397–1611): it is disposable only where its packet
+    // holds a frame, or a whole pair, and no field waits for it.
+    if let Some(reason) = fields {
+      Read::Keeps(reason)
+    } else if self.gaps_possible {
+      Read::Keeps(KeptReason::FrameNumGaps)
+    } else if self.reorder_unfixed {
+      Read::Keeps(KeptReason::ReorderUnfixed)
+    } else if !self.pending.reference_seen {
+      Read::Keeps(KeptReason::AwaitingReference)
+    } else {
+      read
     }
   }
 
@@ -1278,6 +1443,345 @@ impl NalStream {
       if nal_unit_type == 33 {
         self.sps_seen = true;
       }
+    }
+  }
+}
+
+/// H.264's fields: the parameter-set lists each slice is read by, the
+/// field FFmpeg's decoder may hold waiting for its pair, and what a
+/// packet's pictures are against them ([Fields](self#fields)).
+impl NalStream {
+  /// What keeps an H.264 `packet`, read in `framing` against what earlier
+  /// packets taught, for its pictures' fields, if anything does:
+  /// [`KeptReason::MaybeField`] before any sequence parameter set, or where
+  /// a slice's header does not read as FFmpeg reads it;
+  /// [`KeptReason::UnpairedField`] where the packet holds a field FFmpeg
+  /// does not join with its complementary field in the packet;
+  /// [`KeptReason::PendingField`] where a first field may wait at the
+  /// packet; [`KeptReason::UnmatchedFields`] for a pair after a field may
+  /// have gone unmatched. While every sequence parameter set the decoder
+  /// may read codes frames only, every picture is a frame and no field ever
+  /// waits. A packet holding a parameter set is kept for it, so the lists
+  /// its slices are read by here are the ones before it.
+  fn fields_verdict(&self, packet: &[u8], framing: Framing) -> Option<KeptReason> {
+    if !self.sps_seen {
+      return Some(KeptReason::MaybeField);
+    }
+    if !self.fields_possible {
+      return None;
+    }
+    // The packet's pictures as FFmpeg's decoder takes them where no field
+    // waits and none has gone unmatched: a frame, or a pair it joins.
+    let mut walk = Walk::new(Pairing::Settled, 0);
+    let mut units = Units::new(packet, framing);
+    while let Unit::Nal(nal) = units.next() {
+      if nal
+        .first()
+        .is_some_and(|&header| matches!(header & 0x1F, 1 | 5))
+      {
+        walk.slice(slice_head(nal, &self.sets));
+      }
+    }
+    if walk.lost {
+      return Some(KeptReason::MaybeField);
+    }
+    let pair = match (walk.starts, walk.first) {
+      // No picture starts: the pairing moves not at all.
+      (0, _) => return None,
+      (1, Some(first)) if first.structure == Structure::Frame => false,
+      // Two fields FFmpeg joins, finding none unmatched.
+      (2, Some(first))
+        if first.structure != Structure::Frame
+          && walk.pairing == Pairing::Settled
+          && walk.unmatched == 0 =>
+      {
+        true
+      }
+      _ => return Some(KeptReason::UnpairedField),
+    };
+    if self.pairing != Pairing::Settled {
+      Some(KeptReason::PendingField)
+    } else if pair && self.unmatched > 0 {
+      Some(KeptReason::UnmatchedFields)
+    } else {
+      None
+    }
+  }
+
+  /// Moves FFmpeg's lists and its field pairing through an H.264 `packet`
+  /// the reading read whole in `framing`, unit by unit as the decoder takes
+  /// them (`decode_nal_units`, `h264dec.c` 583–787): each parameter set
+  /// into its list, and each slice read by the lists as they stand at it.
+  /// Where a field may be possible, the census's reference picture and
+  /// intra slice are the ones FFmpeg decodes, after `before`, what was seen
+  /// before the packet; an intra slice counts in a packet `kept` alone.
+  fn fields_walk(&mut self, packet: &[u8], framing: Framing, before: Pending, kept: bool) {
+    if self.codec != NalCodec::H264 {
+      return;
+    }
+    let mut walk = Walk::new(self.pairing, self.unmatched);
+    let mut units = Units::new(packet, framing);
+    while let Unit::Nal(nal) = units.next() {
+      let Some(&header) = nal.first() else {
+        continue;
+      };
+      // Past a unit FFmpeg may refuse, under `AV_EF_EXPLODE` it reads no
+      // more of the packet (`h264dec.c` 717–727, 740–745).
+      let certain = !walk.may_stop;
+      match header & 0x1F {
+        7 => {
+          self.sps_into_lists(&nal[1..], certain);
+        }
+        8 => {
+          if !self.pps_into_lists(&nal[1..], certain, false) {
+            walk.may_stop = true;
+          }
+        }
+        1 | 5 => walk.slice(slice_head(nal, &self.sets)),
+        _ => {}
+      }
+    }
+    // While every sequence parameter set codes frames only, every picture is
+    // a frame: no field ever waits, and every slice FFmpeg reads it decodes.
+    if self.fields_possible {
+      if walk.lost {
+        self.pairing = Pairing::Unknown;
+        self.unmatched = UNMATCHED_MANY;
+      } else {
+        self.pairing = walk.pairing;
+        self.unmatched = walk.unmatched;
+      }
+      self.pending.reference_seen = before.reference_seen || walk.reference;
+      self.pending.intra_seen = before.intra_seen || (walk.intra && kept);
+    }
+    if packet.is_empty() {
+      self.ended();
+    }
+  }
+
+  /// Moves FFmpeg's lists and its field pairing through an H.264 `packet`
+  /// the reading does not read whole — framed by `framing`, or for `None` by
+  /// any framing a decoder may read it in: each parameter set FFmpeg's
+  /// splitter may read there may be in its list, and where the packet may
+  /// hold a slice, which field waits after it is unknown, and one may have
+  /// gone unmatched.
+  fn fields_unread(&mut self, packet: &[u8], framing: Option<Framing>) {
+    if self.codec != NalCodec::H264 {
+      return;
+    }
+    let mut slice = false;
+    let mut visit = |nal: &[u8]| match nal.first().map(|&header| header & 0x1F) {
+      Some(7) => {
+        self.sps_into_lists(&nal[1..], false);
+      }
+      Some(8) => {
+        self.pps_into_lists(&nal[1..], false, false);
+      }
+      Some(1 | 5) => slice = true,
+      _ => {}
+    };
+    match framing {
+      Some(framing) => each_unit(packet, framing, &mut visit),
+      None => each_unit_in_any_framing(packet, &mut visit),
+    }
+    if packet.is_empty() {
+      self.ended();
+    }
+    if slice && self.fields_possible {
+      self.pairing = Pairing::Unknown;
+      self.unmatched = UNMATCHED_MANY;
+    }
+  }
+
+  /// A packet of no bytes, which FFmpeg's H.264 decoder that takes it takes
+  /// for the stream's end, outputting what it holds and leaving no field
+  /// waiting (`h264dec.c` 1034–1036, 983–985).
+  fn ended(&mut self) {
+    self.pairing = self.pairing.or(Pairing::Settled);
+  }
+
+  /// The parameter sets of an H.264 record, into FFmpeg's lists as
+  /// `ff_h264_decode_extradata` reads them (`h264_parse.c` 466–524): an
+  /// `avcC`'s entries in order, each read as `decode_extradata_ps_mp4`
+  /// reads it — and escaped and read again where it does not decode, unless
+  /// under `AV_EF_EXPLODE` (421–464) — up to the first that does not fit, or
+  /// one past which `ERANGE` may end the record; any other record split as
+  /// Annex B, a parameter set that does not decode ending it (367–413).
+  fn record_sets(&mut self, record: &[u8]) {
+    let Some(&first) = record.first() else {
+      return;
+    };
+    if first != 1 {
+      // Read for certain only where FFmpeg's splitter reads exactly the
+      // units the reading does.
+      let mut certain = reads_whole(record, Framing::AnnexB);
+      for nal in AfterStartCodes::new(record) {
+        certain &= self.set_into_lists(nal, certain, false);
+      }
+      return;
+    }
+    // "avcC %d too short" (480–483).
+    if record.len() < 7 {
+      return;
+    }
+    let mut certain = true;
+    let mut at = 6;
+    for array in 0..2 {
+      // A count FFmpeg reads past the record's end reads as 0, the zero
+      // padding every FFmpeg buffer carries.
+      let count = if array == 0 {
+        record[5] & 0x1F
+      } else {
+        at += 1;
+        record.get(at - 1).copied().unwrap_or(0)
+      };
+      for _ in 0..count {
+        let (Some(&high), Some(&low)) = (record.get(at), record.get(at + 1)) else {
+          return;
+        };
+        let size = usize::from(u16::from_be_bytes([high, low])) + 2;
+        let Some(entry) = record.get(at..at + size) else {
+          return;
+        };
+        let payload = &entry[2..];
+        // An entry of one unit is read as that unit; one holding a start
+        // code FFmpeg splits otherwise than the reading can tell.
+        let read = if find_start_code(payload).is_none() {
+          self.set_into_lists(trim_trailing_zeros(payload), certain, true)
+        } else {
+          each_after_lengths(entry, 2, &mut |nal| {
+            self.set_into_lists(nal, false, true);
+          });
+          false
+        };
+        // An entry that may not decode, of `ESCAPED_LIMIT` bytes or more, may
+        // end the record with `ERANGE` (436–437).
+        if !read && size >= ESCAPED_LIMIT {
+          certain = false;
+        }
+        at += size;
+      }
+    }
+  }
+
+  /// One unit of an H.264 record into FFmpeg's lists, read for certain or
+  /// only maybe, the unit of an `avcC` entry FFmpeg escapes and reads again
+  /// where it does not decode (`retry`); whether FFmpeg reads it, for
+  /// certain, without failing. A unit of another type FFmpeg passes over
+  /// ("Ignoring NAL type", `h264_parse.c` 400–404), as it passes over one
+  /// whose forbidden bit is set (`h2645_parse.c` 646–660).
+  fn set_into_lists(&mut self, nal: &[u8], certain: bool, retry: bool) -> bool {
+    let Some(&header) = nal.first() else {
+      return true;
+    };
+    if header & 0x80 != 0 {
+      return true;
+    }
+    match header & 0x1F {
+      7 => self.sps_into_lists(&nal[1..], certain) && certain,
+      8 => self.pps_into_lists(&nal[1..], certain, retry),
+      _ => true,
+    }
+  }
+
+  /// An H.264 sequence parameter set — `payload`, its bytes after the
+  /// header — that FFmpeg's decoder reads, for certain or only maybe, into
+  /// its list as FFmpeg moves it: by the reading it adopts, where its
+  /// strict reading of the RBSP succeeds (`h264dec.c` 699–716, `h264_ps.c`
+  /// 581–587), and else by any it may adopt, or none ([`sps_proof`]'s
+  /// readings); whether FFmpeg stores it for certain. FFmpeg 9.0.1 keeps
+  /// every picture parameter set read before on the sequence parameter set
+  /// it was read with (`remove_sps`, `h264_ps.c` 92–104, its removal of
+  /// them compiled out).
+  fn sps_into_lists(&mut self, payload: &[u8], certain: bool) -> bool {
+    let unit = up_to_start_code(payload);
+    let rbsp = sps_facts(BitReader::new(unit, Reading::Rbsp));
+    if rbsp.whole
+      && let (Some(id), Some(header)) = (rbsp.id, rbsp.header)
+    {
+      let id = usize::from(id);
+      let held = if certain {
+        Slot::Holds(header)
+      } else {
+        self.sets.sps[id].or(Slot::Holds(header))
+      };
+      self.store_sps(id, held);
+      return certain;
+    }
+    for reading in [Reading::Rbsp, Reading::Bytes, Reading::Reescaped] {
+      let facts = sps_facts(BitReader::new(unit, reading));
+      let held = facts.header.map_or(Slot::Unknown, Slot::Holds);
+      match facts.id {
+        Some(id) => {
+          let id = usize::from(id);
+          self.store_sps(id, self.sets.sps[id].or(held));
+        }
+        // A reading that does not reach its id may store under any.
+        None => {
+          for id in 0..self.sets.sps.len() {
+            self.store_sps(id, Slot::Unknown);
+          }
+        }
+      }
+    }
+    false
+  }
+
+  /// An H.264 picture parameter set — `payload`, its bytes after the
+  /// header — that FFmpeg's decoder reads, for certain or only maybe, into
+  /// its list on the sequence parameter set it names as the list holds it
+  /// now (`h264_ps.c` 731–738, 839–840), where FFmpeg accepts it, and the
+  /// list left as it was where FFmpeg refuses it ([`pps_read`]); the unit of
+  /// an `avcC` entry that does not decode read again as its bytes stand
+  /// (`retry`, `h264_parse.c` 421–464). Whether FFmpeg stores it for
+  /// certain.
+  fn pps_into_lists(&mut self, payload: &[u8], certain: bool, retry: bool) -> bool {
+    let read = pps_read(payload, Reading::Rbsp, &self.sets.sps);
+    let stored = matches!(read, PpsRead::Stored(..));
+    self.store_pps(read, certain);
+    if retry && !stored {
+      // Unless under `AV_EF_EXPLODE`.
+      let again = pps_read(payload, Reading::Bytes, &self.sets.sps);
+      self.store_pps(again, false);
+    }
+    stored && certain
+  }
+
+  /// What FFmpeg makes of a picture parameter set it reads so, into its
+  /// list, for certain or only maybe.
+  fn store_pps(&mut self, read: PpsRead, certain: bool) {
+    match read {
+      PpsRead::Stored(id, header) => {
+        let id = usize::from(id);
+        let held = if certain {
+          Slot::Holds(header)
+        } else {
+          self.sets.pps[id].or(Slot::Holds(header))
+        };
+        self.put_pps(id, held);
+      }
+      PpsRead::Refused => {}
+      PpsRead::Undecided(Some(id)) => self.put_pps(usize::from(id), Slot::Unknown),
+      // A reading that does not reach its id may store under any.
+      PpsRead::Undecided(None) => {
+        for id in 0..self.sets.pps.len() {
+          self.put_pps(id, Slot::Unknown);
+        }
+      }
+    }
+  }
+
+  fn store_sps(&mut self, id: usize, held: Slot<SpsHeader>) {
+    if self.sets.sps[id] != held {
+      self.sets.sps[id] = held;
+      self.sets_moved = true;
+    }
+  }
+
+  fn put_pps(&mut self, id: usize, held: Slot<PpsHeader>) {
+    if self.sets.pps[id] != held {
+      self.sets.pps[id] = held;
+      self.sets_moved = true;
     }
   }
 }
@@ -1340,11 +1844,7 @@ struct SpsProof {
 /// — a value outside the range it accepts, separate colour planes, a
 /// picture or cropping it rejects — proves nothing.
 fn sps_proof(payload: &[u8]) -> SpsProof {
-  let end = payload
-    .windows(3)
-    .position(|window| window[0] == 0 && window[1] == 0 && window[2] <= 2)
-    .unwrap_or(payload.len());
-  let unit = &payload[..end];
+  let unit = up_to_start_code(payload);
   let proves = |facts: &SpsFacts| SpsProof {
     frames_only: facts.frames_only == Some(true),
     no_gaps: facts.gaps == Some(false),
@@ -1364,6 +1864,17 @@ fn sps_proof(payload: &[u8]) -> SpsProof {
   proof
 }
 
+/// `payload`, a NAL unit's bytes, up to its first `00 00 00`, `00 00 01` or
+/// `00 00 02`: at or before where FFmpeg's splitter ends the unit
+/// (`h2645_parse.c` 44–52, 101–132).
+fn up_to_start_code(payload: &[u8]) -> &[u8] {
+  let end = payload
+    .windows(3)
+    .position(|window| window[0] == 0 && window[1] == 0 && window[2] <= 2)
+    .unwrap_or(payload.len());
+  &payload[..end]
+}
+
 /// What one reading of a sequence parameter set says: `None` where it does
 /// not reach the fact, or FFmpeg refuses it first.
 #[derive(Default)]
@@ -1375,6 +1886,12 @@ struct SpsFacts {
   /// FFmpeg accepts and nothing past its end: FFmpeg's strict reading of
   /// it succeeds.
   whole: bool,
+  /// `seq_parameter_set_id`, as FFmpeg reads it: the list entry the
+  /// parameter set goes to.
+  id: Option<u8>,
+  /// What slices and picture parameter sets are read by, once read through
+  /// `direct_8x8_inference_flag`.
+  header: Option<SpsHeader>,
 }
 
 /// A sequence parameter set read as FFmpeg reads it (`h264_ps.c` 284–590,
@@ -1393,10 +1910,13 @@ fn sps_read(bits: &mut BitReader<'_>, facts: &mut SpsFacts) -> Option<()> {
   }
   let profile_idc = bits.bits(8)?;
   // The constraint flags and `reserved_zero_2bits`, then `level_idc`.
-  bits.bits(16)?;
-  // `seq_parameter_set_id`, below `MAX_SPS_COUNT` (32).
-  ue30(bits)?;
+  let constraints = bits.bits(8)?;
+  bits.bits(8)?;
+  // `seq_parameter_set_id`, by `get_ue_golomb_31`, below `MAX_SPS_COUNT`
+  // (32; `h264_ps.c` 317–322).
+  facts.id = Some(bits.ue_31().filter(|&id| id < 32)? as u8);
   let mut chroma_format_idc = 1;
+  let mut luma = 0;
   // FFmpeg's own list of the profiles that code chroma format, bit depths
   // and scaling matrices (`h264_ps.c` 343–354).
   if matches!(
@@ -1408,7 +1928,7 @@ fn sps_read(bits: &mut BitReader<'_>, facts: &mut SpsFacts) -> Option<()> {
     if chroma_format_idc == 3 && bits.bits(1)? != 0 {
       return None;
     }
-    let luma = ue30(bits)?;
+    luma = ue30(bits)?;
     let chroma = ue30(bits)?;
     // Equal depths, of 8 to 14 bits.
     if luma != chroma || luma > 6 {
@@ -1428,7 +1948,7 @@ fn sps_read(bits: &mut BitReader<'_>, facts: &mut SpsFacts) -> Option<()> {
     }
   }
   // `log2_max_frame_num_minus4`, 0 to 12.
-  ue30(bits).filter(|&value| value <= 12)?;
+  let frame_num_bits = ue30(bits).filter(|&value| value <= 12)? + 4;
   match ue30(bits)? {
     // `log2_max_pic_order_cnt_lsb_minus4`, to 12.
     0 => {
@@ -1475,7 +1995,18 @@ fn sps_read(bits: &mut BitReader<'_>, facts: &mut SpsFacts) -> Option<()> {
   // `direct_8x8_inference_flag`, then the cropping offsets, read by
   // `get_ue_golomb` and refused where they leave no picture (`h264_ps.c`
   // 474–512).
-  bits.bits(1)?;
+  let direct_8x8 = bits.bits(1)? == 1;
+  facts.header = Some(SpsHeader {
+    frame_num_bits: frame_num_bits as u8,
+    frames_only,
+    direct_8x8,
+    // `more_rbsp_data_in_pps` (`h264_ps.c` 677–689): `constraint_set_flags
+    // & 7`, its first three flags.
+    pps_tail: !(matches!(profile_idc, 66 | 77 | 88) && constraints & 0xE0 != 0),
+    chroma_444: chroma_format_idc == 3,
+    // 11 and 13 bits (`h264_ps.c` 741–750).
+    refuses_pps: matches!(luma, 3 | 5),
+  });
   if bits.bits(1)? == 1 {
     let mut crop = [0_u64; 4];
     for offset in &mut crop {
@@ -1590,6 +2121,632 @@ fn hrd_parameters(bits: &mut BitReader<'_>) -> Option<()> {
   // The three delay lengths and `time_offset_length`.
   bits.bits(20)?;
   Some(())
+}
+
+/// What an H.264 sequence parameter set in FFmpeg's list says, as far as a
+/// slice's header and a picture parameter set read on it need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SpsHeader {
+  /// `log2_max_frame_num`, 4 to 16: the bits of a slice's `frame_num`.
+  frame_num_bits: u8,
+  /// `frame_mbs_only_flag`: no slice reads `field_pic_flag`, and every
+  /// picture is a frame.
+  frames_only: bool,
+  /// `direct_8x8_inference_flag`, without which FFmpeg refuses a B slice
+  /// that may be a field (`h264_slice.c` 1762–1766).
+  direct_8x8: bool,
+  /// Whether FFmpeg reads a picture parameter set past its
+  /// `redundant_pic_cnt_present_flag` (`more_rbsp_data_in_pps`,
+  /// `h264_ps.c` 677–689).
+  pps_tail: bool,
+  /// `chroma_format_idc` 3: six 8x8 scaling lists in a picture parameter
+  /// set, not two (`h264_ps.c` 256–263).
+  chroma_444: bool,
+  /// A bit depth of 11 or 13, on which FFmpeg refuses every picture
+  /// parameter set (`h264_ps.c` 741–750).
+  refuses_pps: bool,
+}
+
+/// What an H.264 picture parameter set in FFmpeg's list says, as far as a
+/// slice's header needs: the sequence parameter set it was read on, which
+/// every slice that names it is read by (`pps->sps`, `h264_ps.c` 738;
+/// `h264_slice.c` 1747–1749), and whether its slices carry a
+/// `redundant_pic_cnt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PpsHeader {
+  sps: SpsHeader,
+  /// `redundant_pic_cnt_present_flag`: FFmpeg discards a slice whose count
+  /// is above 0 before it starts or joins a picture (`h264_slice.c`
+  /// 2081–2085).
+  redundant: bool,
+}
+
+/// One entry of FFmpeg's parameter-set lists, as far as the reading knows
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Slot<T> {
+  /// Nothing, for certain.
+  Empty,
+  /// This, for certain.
+  Holds(T),
+  /// Anything, nothing among it.
+  Unknown,
+}
+
+impl<T: PartialEq> Slot<T> {
+  /// What the entry holds where it may hold `self` or `other`.
+  fn or(self, other: Self) -> Self {
+    if self == other { self } else { Self::Unknown }
+  }
+}
+
+/// FFmpeg's H.264 parameter-set lists, `sps_list` and `pps_list`
+/// (`h264_ps.h`): 32 sequence parameter sets and 256 picture parameter sets
+/// by id, each entry as far as the reading knows it. An entry once filled
+/// is never emptied: FFmpeg replaces one, and removes none (`h264_ps.c`
+/// 87–104).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ParameterSets {
+  sps: [Slot<SpsHeader>; 32],
+  pps: [Slot<PpsHeader>; 256],
+}
+
+impl ParameterSets {
+  /// Before any parameter set.
+  const EMPTY: Self = Self {
+    sps: [Slot::Empty; 32],
+    pps: [Slot::Empty; 256],
+  };
+
+  /// What the lists hold where every filled entry may hold anything. An
+  /// empty one stays empty: it was empty at the opening too.
+  fn forget(&mut self) {
+    for slot in &mut self.sps {
+      if *slot != Slot::Empty {
+        *slot = Slot::Unknown;
+      }
+    }
+    for slot in &mut self.pps {
+      if *slot != Slot::Empty {
+        *slot = Slot::Unknown;
+      }
+    }
+  }
+}
+
+/// The count of fields gone unmatched from which a decoder's
+/// `missing_fields` may be above 1 ([`NalStream`]'s `unmatched`).
+const UNMATCHED_MANY: u8 = 2;
+
+/// The first field FFmpeg's H.264 decoder may hold waiting for its pair:
+/// `first_field`, with the `picture_structure`, `droppable` and
+/// `cur_pic_ptr->frame_num` it was started with (`h264_slice.c` 1455–1611).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Pairing {
+  /// No field waits, for certain.
+  Settled,
+  /// This field waits, for certain.
+  Waiting(Waiting),
+  /// A field may wait, or one waits the reading cannot describe.
+  Unknown,
+}
+
+/// A first field FFmpeg's H.264 decoder holds waiting for its pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Waiting {
+  bottom: bool,
+  frame_num: u32,
+  reference: bool,
+  /// Whether its frame may be in the output queue already: a first field
+  /// started while `missing_fields` may be above 1 is output at once
+  /// (`h264_slice.c` 1683–1690), and one of `nal_ref_idc` 0 marked
+  /// `DELAYED_PIC_REF` (1342–1343), which turns its pair into a first
+  /// field of its own (1598–1603).
+  queued: bool,
+}
+
+/// What `h264_field_start` makes of the slice that starts a picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Started {
+  /// A frame: no field waits after it.
+  Frame,
+  /// A first field, which waits.
+  First,
+  /// The second field of a pair.
+  Second,
+  /// Refused: no picture starts, and the slice after it tries again.
+  Refused,
+  /// The reading cannot tell.
+  Maybe,
+}
+
+impl Pairing {
+  /// What FFmpeg's `h264_field_start` (`h264_slice.c` 1455–1611) makes of
+  /// `picture` where `self` waits; `unmatched` counting each field it may
+  /// find unmatched, raising `missing_fields` (1583–1587).
+  fn start(self, picture: Picture, unmatched: &mut u8) -> (Self, Started) {
+    let raise = |unmatched: &mut u8| *unmatched = (*unmatched + 1).min(UNMATCHED_MANY);
+    let bottom = match picture.structure {
+      // A frame finds a waiting field unmatched (1583–1587), and no field
+      // waits after it (1611).
+      Structure::Frame => {
+        if self != Self::Settled {
+          raise(unmatched);
+        }
+        return (Self::Settled, Started::Frame);
+      }
+      Structure::Top => false,
+      Structure::Bottom => true,
+    };
+    let waiting = |queued| {
+      Self::Waiting(Waiting {
+        bottom,
+        frame_num: picture.frame_num,
+        reference: picture.reference,
+        queued,
+      })
+    };
+    // `missing_fields` may be above 1 only after two fields unmatched, in any
+    // frame thread's context, none of which shares its count (it is not
+    // among what `ff_h264_update_thread_context` copies, 338–466).
+    let queued = |unmatched: u8| unmatched >= UNMATCHED_MANY && !picture.reference;
+    match self {
+      // A first field (1610–1611), output at once while `missing_fields`
+      // may be above 1.
+      Self::Settled => (waiting(queued(*unmatched)), Started::First),
+      // A field of the waiting one's parity finds it unmatched, and waits
+      // in its stead (1583–1587).
+      Self::Waiting(held) if held.bottom == bottom => {
+        raise(unmatched);
+        (waiting(queued(*unmatched)), Started::First)
+      }
+      // Another `frame_num`: the waiting field is passed over, and this one
+      // waits, `missing_fields` reset (1589–1597).
+      Self::Waiting(held) if held.frame_num != picture.frame_num => {
+        (waiting(false), Started::First)
+      }
+      // "Found reference and non-reference fields in the same frame"
+      // (1494–1501): refused, and the waiting field waits on.
+      Self::Waiting(held) if held.reference != picture.reference => (self, Started::Refused),
+      // Its frame queued, the second field starts one of its own (1598–1603)
+      // where it has not been output already, and joins it where it has.
+      Self::Waiting(held) if held.queued => (Self::Unknown, Started::Maybe),
+      // The second field of a complementary pair (1604–1606).
+      Self::Waiting(_) => (Self::Settled, Started::Second),
+      Self::Unknown => {
+        raise(unmatched);
+        (Self::Unknown, Started::Maybe)
+      }
+    }
+  }
+
+  /// What the decoder holds where it may hold `self` or `other`.
+  fn or(self, other: Self) -> Self {
+    if self == other { self } else { Self::Unknown }
+  }
+}
+
+/// An H.264 picture's structure: `field_pic_flag` and `bottom_field_flag`,
+/// as FFmpeg reads them (`h264_slice.c` 1760–1775).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Structure {
+  /// A frame: `field_pic_flag` 0, or a sequence parameter set coding frames
+  /// only. An MBAFF frame is one.
+  Frame,
+  Top,
+  Bottom,
+}
+
+/// What FFmpeg's H.264 decoder starts or joins at a slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Picture {
+  structure: Structure,
+  frame_num: u32,
+  /// `nal_ref_idc` above 0: FFmpeg's `droppable` is its negation.
+  reference: bool,
+}
+
+/// What FFmpeg's H.264 decoder reads of a slice before it starts or joins
+/// a picture ([`slice_head`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Head {
+  /// Read as FFmpeg reads it.
+  Read {
+    /// `first_mb_in_slice` 0, which starts a new picture (`h264_slice.c`
+    /// 2094–2133).
+    starts: bool,
+    pps_id: u8,
+    picture: Picture,
+    /// An IDR slice.
+    idr: bool,
+    /// An intra slice, as FFmpeg reads `slice_type`.
+    intra: bool,
+  },
+  /// FFmpeg refuses the slice before it starts or joins a picture.
+  Refused,
+  /// The reading cannot read it as FFmpeg does.
+  Unreadable,
+}
+
+/// What FFmpeg's H.264 decoder reads of a slice — `nal`, its header byte
+/// first — before it starts or joins a picture, against the lists
+/// (`h264_slice_header_parse`, `h264_slice.c` 1696–1775): `first_mb_in_slice`
+/// by `get_ue_golomb_long`, `slice_type` by `get_ue_golomb_31`, refused past
+/// 9 and, in an IDR unit, other than intra; `pic_parameter_set_id` by
+/// `get_ue_golomb`, refused past 255 and where the list holds no picture
+/// parameter set; then `frame_num` in the bits of the sequence parameter
+/// set that picture parameter set was read on, and, where that one does not
+/// code frames only, `field_pic_flag` and `bottom_field_flag` — a B slice
+/// refused without `direct_8x8_inference_flag`. What FFmpeg reads after
+/// them it refuses only where the stream breaks the standard (7.4.3); a
+/// conforming slice FFmpeg refuses for itself — of another picture
+/// parameter set than its picture's, or of reference and non-reference
+/// fields — the walk takes as refused ([`Walk`]).
+fn slice_head(nal: &[u8], sets: &ParameterSets) -> Head {
+  let Some((&header, payload)) = nal.split_first() else {
+    return Head::Unreadable;
+  };
+  let nal_unit_type = header & 0x1F;
+  let mut bits = BitReader::new(up_to_start_code(payload), Reading::Rbsp);
+  let Some(first_mb) = bits.ue() else {
+    return Head::Unreadable;
+  };
+  let Some(slice_type) = bits.ue_31() else {
+    return Head::Unreadable;
+  };
+  let intra = is_intra(slice_type);
+  if slice_type > 9 || (nal_unit_type == 5 && !intra) {
+    return Head::Refused;
+  }
+  // Read alike to 8190 by `get_ue_golomb`, an error past it, which FFmpeg
+  // takes for an id past 255.
+  let Some(pps_id) = bits.ue() else {
+    return Head::Unreadable;
+  };
+  let Some(pps) = usize::try_from(pps_id).ok().and_then(|id| sets.pps.get(id)) else {
+    return Head::Refused;
+  };
+  let pps = match *pps {
+    Slot::Empty => return Head::Refused,
+    Slot::Unknown => return Head::Unreadable,
+    Slot::Holds(pps) => pps,
+  };
+  // A slice of `redundant_pic_cnt` above 0 is discarded; the reading reads
+  // no count.
+  if pps.redundant {
+    return Head::Unreadable;
+  }
+  let Some(frame_num) = bits.bits(u32::from(pps.sps.frame_num_bits)) else {
+    return Head::Unreadable;
+  };
+  let structure = if pps.sps.frames_only {
+    Structure::Frame
+  } else if slice_type % 5 == 1 && !pps.sps.direct_8x8 {
+    return Head::Refused;
+  } else {
+    match bits.bits(1) {
+      None => return Head::Unreadable,
+      Some(0) => Structure::Frame,
+      Some(_) => match bits.bits(1) {
+        None => return Head::Unreadable,
+        Some(0) => Structure::Top,
+        Some(_) => Structure::Bottom,
+      },
+    }
+  };
+  Head::Read {
+    starts: first_mb == 0,
+    pps_id: pps_id as u8,
+    picture: Picture {
+      structure,
+      frame_num,
+      reference: header & 0x60 != 0,
+    },
+    idr: nal_unit_type == 5,
+    intra,
+  }
+}
+
+/// FFmpeg's H.264 decoder over the slices of one packet, in order
+/// (`ff_h264_queue_decode_slice`, `h264_slice.c` 2069–2193): which slice
+/// starts a picture — the packet's first, and after a first field one of
+/// `first_mb_in_slice` 0 — which joins the picture, and which is refused;
+/// the field pairing the pictures leave ([`Pairing::start`]); and of the
+/// slices it decodes, whether one is a reference picture's or intra.
+struct Walk {
+  pairing: Pairing,
+  /// How many fields may have gone unmatched, as [`NalStream`] counts them.
+  unmatched: u8,
+  /// The picture the slices go to, `current_slice` above 0.
+  current: Option<Current>,
+  /// A unit FFmpeg may refuse has been met: under `AV_EF_EXPLODE` it reads
+  /// nothing after it (`h264dec.c` 717–727, 740–745).
+  may_stop: bool,
+  /// Where pictures start is no longer known: a slice the reading cannot
+  /// read, or a start FFmpeg may not make.
+  lost: bool,
+  /// The pictures started, and the first of them.
+  starts: u8,
+  first: Option<Picture>,
+  /// A slice of a reference picture decoded.
+  reference: bool,
+  /// An intra slice decoded.
+  intra: bool,
+}
+
+/// The picture a packet's slices go to.
+#[derive(Debug, Clone, Copy)]
+struct Current {
+  picture: Picture,
+  pps_id: u8,
+  /// A first field, which a slice of `first_mb_in_slice` 0 ends.
+  first_field: bool,
+}
+
+impl Walk {
+  const fn new(pairing: Pairing, unmatched: u8) -> Self {
+    Self {
+      pairing,
+      unmatched,
+      current: None,
+      may_stop: false,
+      lost: false,
+      starts: 0,
+      first: None,
+      reference: false,
+      intra: false,
+    }
+  }
+
+  /// One slice of the packet, `head` as FFmpeg reads it.
+  fn slice(&mut self, head: Head) {
+    if self.lost {
+      return;
+    }
+    let (starts, pps_id, picture, idr, intra) = match head {
+      Head::Unreadable => {
+        self.lost = true;
+        return;
+      }
+      Head::Refused => {
+        self.may_stop = true;
+        return;
+      }
+      Head::Read {
+        starts,
+        pps_id,
+        picture,
+        idr,
+        intra,
+      } => (starts, pps_id, picture, idr, intra),
+    };
+    let Some(current) = self.current else {
+      self.start(picture, pps_id, idr, intra);
+      return;
+    };
+    // A slice after the picture's first is read against it: "Frame num
+    // change" (`h264_slice.c` 1752–1758).
+    if picture.frame_num != current.picture.frame_num {
+      self.may_stop = true;
+    } else if starts {
+      // A new picture, after a first field (2111–2114), or, after a frame,
+      // an IDR one ("Broken frame packetizing", 2115–2123) — once its
+      // picture parameter set passes against the picture's (2150–2163):
+      // the same one does. Else refused (2124–2125).
+      if !current.first_field && !(idr && current.picture.structure == Structure::Frame) {
+        self.may_stop = true;
+      } else if pps_id != current.pps_id {
+        self.lost = true;
+      } else {
+        self.current = None;
+        self.start(picture, pps_id, idr, intra);
+      }
+    } else if picture == current.picture && pps_id == current.pps_id {
+      // A slice of the picture (2167–2181).
+      self.intra |= intra;
+    } else {
+      // Of another structure or `nal_ref_idc`, refused (2169–2176); of
+      // another picture parameter set, perhaps refused (2150–2163).
+      self.may_stop = true;
+    }
+  }
+
+  /// A slice that starts a picture (`h264_field_start`).
+  fn start(&mut self, picture: Picture, pps_id: u8, idr: bool, intra: bool) {
+    if self.may_stop {
+      self.lost = true;
+      return;
+    }
+    let (pairing, started) = self.pairing.start(picture, &mut self.unmatched);
+    self.pairing = pairing;
+    let first_field = match started {
+      Started::Refused => {
+        self.may_stop = true;
+        return;
+      }
+      Started::Maybe => {
+        self.lost = true;
+        return;
+      }
+      Started::First => true,
+      Started::Frame | Started::Second => false,
+    };
+    self.current = Some(Current {
+      picture,
+      pps_id,
+      first_field,
+    });
+    self.first.get_or_insert(picture);
+    self.starts = self.starts.saturating_add(1);
+    self.reference |= idr || picture.reference;
+    self.intra |= intra;
+  }
+}
+
+/// Whether `packet` reads whole in `framing`, every byte a NAL unit's.
+fn reads_whole(packet: &[u8], framing: Framing) -> bool {
+  let mut units = Units::new(packet, framing);
+  loop {
+    match units.next() {
+      Unit::Nal(_) => {}
+      Unit::End => return true,
+      Unit::Broken => return false,
+    }
+  }
+}
+
+/// How FFmpeg's H.264 decoder takes a picture parameter set into its list
+/// ([`pps_read`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PpsRead {
+  /// Stored, for certain, under this id.
+  Stored(u8, PpsHeader),
+  /// Refused, for certain: the list is left as it was.
+  Refused,
+  /// The reading cannot tell: under this id, where it reached one,
+  /// something or nothing is stored.
+  Undecided(Option<u8>),
+}
+
+/// Where the reading of a picture parameter set stops short of its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+  /// At a value FFmpeg refuses.
+  Refused,
+  /// Where it cannot read on as FFmpeg reads: past its last bit, or a code
+  /// FFmpeg's reader reads otherwise.
+  Ran,
+}
+
+/// How FFmpeg's H.264 decoder reads a picture parameter set — `payload`,
+/// its bytes after the header, in `reading` — against its sequence
+/// parameter set list (`ff_h264_decode_picture_parameter_set`, `h264_ps.c`
+/// 698–847): `pic_parameter_set_id` by `get_ue_golomb`, refused past 255,
+/// then the rest ([`pps_body`]). A unit holding `00 00 00`, `00 00 01` or
+/// `00 00 02` FFmpeg's splitter may end there (`h2645_parse.c` 101–132),
+/// which leaves the reading undecided.
+fn pps_read(payload: &[u8], reading: Reading, sps: &[Slot<SpsHeader>; 32]) -> PpsRead {
+  let unit = match reading {
+    Reading::Rbsp => up_to_start_code(payload),
+    Reading::Bytes | Reading::Reescaped => payload,
+  };
+  let mut bits = BitReader::new(unit, reading);
+  let Some(id) = bits.ue() else {
+    return PpsRead::Undecided(None);
+  };
+  let Ok(id) = u8::try_from(id) else {
+    return PpsRead::Refused;
+  };
+  if unit.len() < payload.len() {
+    return PpsRead::Undecided(Some(id));
+  }
+  match pps_body(&mut bits, sps) {
+    Ok(header) => PpsRead::Stored(id, header),
+    Err(Stop::Refused) => PpsRead::Refused,
+    Err(Stop::Ran) => PpsRead::Undecided(Some(id)),
+  }
+}
+
+/// A picture parameter set after its id, as FFmpeg reads it (`h264_ps.c`
+/// 731–817): the sequence parameter set it names, by `get_ue_golomb_31`,
+/// refused where the list holds none or one of 11 or 13 bits; one slice
+/// group, FFmpeg reading no other (FMO, 757–762); default reference counts
+/// to 32; `chroma_qp_index_offset` in −12 to 12; and, where bits are left
+/// and the sequence parameter set's profile allows (794–810),
+/// `transform_8x8_mode_flag`, the scaling matrices (`decode_scaling_list`,
+/// 201–229: deltas in −128 to 127) and a second offset in −12 to 12.
+fn pps_body(bits: &mut BitReader<'_>, sps: &[Slot<SpsHeader>; 32]) -> Result<PpsHeader, Stop> {
+  fn read<T>(value: Option<T>) -> Result<T, Stop> {
+    value.ok_or(Stop::Ran)
+  }
+  /// An offset FFmpeg refuses outside −12 to 12.
+  fn offset(bits: &mut BitReader<'_>) -> Result<(), Stop> {
+    if (-12..=12).contains(&read(bits.se_short())?) {
+      Ok(())
+    } else {
+      Err(Stop::Refused)
+    }
+  }
+  let sps_id = read(bits.ue_31())?;
+  let sps = match sps.get(sps_id as usize) {
+    None | Some(Slot::Empty) => return Err(Stop::Refused),
+    Some(Slot::Unknown) => return Err(Stop::Ran),
+    Some(Slot::Holds(sps)) => *sps,
+  };
+  if sps.refuses_pps {
+    return Err(Stop::Refused);
+  }
+  // `entropy_coding_mode_flag`, `bottom_field_pic_order_in_frame_present_flag`.
+  read(bits.bits(2))?;
+  // `num_slice_groups_minus1`: past 8190 `get_ue_golomb` errs, and FFmpeg
+  // reads on from elsewhere.
+  match read(bits.ue())? {
+    0 => {}
+    1..=8190 => return Err(Stop::Refused),
+    _ => return Err(Stop::Ran),
+  }
+  // `num_ref_idx_l0_default_active_minus1`, `..._l1_...`; an error past 8190
+  // FFmpeg takes for a count past 32.
+  for _ in 0..2 {
+    if read(bits.ue())? > 31 {
+      return Err(Stop::Refused);
+    }
+  }
+  // `weighted_pred_flag`, `weighted_bipred_idc`.
+  read(bits.bits(3))?;
+  // `pic_init_qp_minus26`, `pic_init_qs_minus26`, unchecked here.
+  read(bits.se_short())?;
+  read(bits.se_short())?;
+  offset(bits)?;
+  // `deblocking_filter_control_present_flag`, `constrained_intra_pred_flag`,
+  // `redundant_pic_cnt_present_flag`.
+  let flags = read(bits.bits(3))?;
+  if bits.left() > 0 && sps.pps_tail {
+    let transform_8x8 = read(bits.bits(1))? == 1;
+    if read(bits.bits(1))? == 1 {
+      let lists_8x8 = match (transform_8x8, sps.chroma_444) {
+        (false, _) => 0,
+        (true, false) => 2,
+        (true, true) => 6,
+      };
+      for size in [16; 6]
+        .into_iter()
+        .chain(core::iter::repeat_n(64, lists_8x8))
+      {
+        if read(bits.bits(1))? == 1 {
+          scaling_deltas(bits, size)?;
+        }
+      }
+    }
+    offset(bits)?;
+  }
+  Ok(PpsHeader {
+    sps,
+    redundant: flags & 1 == 1,
+  })
+}
+
+/// One scaling list's deltas, `size` of them, as `decode_scaling_list`
+/// reads them (`h264_ps.c` 201–229): each refused outside −128 to 127, and
+/// none after a first that leaves the list unwritten.
+fn scaling_deltas(bits: &mut BitReader<'_>, size: usize) -> Result<(), Stop> {
+  let (mut last, mut next) = (8_i64, 8_i64);
+  for index in 0..size {
+    if next != 0 {
+      let delta = bits.se_short().ok_or(Stop::Ran)?;
+      if !(-128..=127).contains(&delta) {
+        return Err(Stop::Refused);
+      }
+      next = (last + delta) & 0xFF;
+      if index == 0 && next == 0 {
+        return Ok(());
+      }
+    }
+    if next != 0 {
+      last = next;
+    }
+  }
+  Ok(())
 }
 
 /// The `slice_type` FFmpeg reads of an H.264 slice NAL unit — `payload`,
@@ -1758,15 +2915,29 @@ impl<'a> BitReader<'a> {
   /// An unsigned Exp-Golomb value, `ue(v)` (9.1): at most 31 leading zero
   /// bits, as FFmpeg's longest reader takes.
   fn ue(&mut self) -> Option<u32> {
+    self.ue_up_to(31)
+  }
+
+  /// An unsigned Exp-Golomb value of at most `max_zeros` leading zero bits;
+  /// `None` for a longer code.
+  fn ue_up_to(&mut self, max_zeros: u32) -> Option<u32> {
     let mut zeros = 0;
     while self.bit()? == 0 {
       zeros += 1;
-      if zeros > 31 {
+      if zeros > max_zeros {
         return None;
       }
     }
     let rest = self.bits(zeros)?;
     Some(((1_u64 << zeros) - 1 + u64::from(rest)) as u32)
+  }
+
+  /// A signed Exp-Golomb value as `get_se_golomb` reads it (`golomb.h`
+  /// 239–290): exactly, for a code of up to 15 leading zero bits; past
+  /// them its 32-bit cache reads another value, and so `None`.
+  fn se_short(&mut self) -> Option<i64> {
+    let k = i64::from(self.ue_up_to(15)?);
+    Some(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) })
   }
 
   /// A signed Exp-Golomb value, `se(v)` (9.1.1).
@@ -2132,6 +3303,8 @@ struct Judged {
   verdict: Verdict,
   /// The census of the packet's units ([`Census::close`]).
   pending: Pending,
+  /// Whether the packet read whole as its framing frames it.
+  whole: bool,
 }
 
 /// What FFmpeg's decoder holds for later pictures that the packets and
