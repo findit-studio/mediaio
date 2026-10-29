@@ -1248,6 +1248,8 @@ fn eac3_track(frame_size: i32) -> TrackState {
     adts: None,
     bytes: 0,
     place: 0,
+    mp4_place: None,
+    mp4_samples: 0,
     key_times: None,
     mxf: MxfMirror::default(),
     buffered: 0,

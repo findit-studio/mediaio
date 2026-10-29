@@ -397,6 +397,13 @@ crate moves only when it changes.
   its widths and height shifted left 16 in an `int`, past 32767
   (`MuxOpenError::Dimensions`): every MOV video codec, H.264, HEVC and
   MPEG-4 among them.
+- **MP4's PCM, by its sample table (R11).** MP4 counts every PCM sample
+  one tick from the track's first, so that a packet's time is the samples
+  before it: a gap or an overlap moves the packet and every later one,
+  now reported as the timeline it moves (`Rewrite::Timeline`) where it was
+  reported as `Rewrite::Durations`; a packet's duration not its samples is
+  still `Durations`. Its samples, summed in an `int`, refused past
+  `INT_MAX` (`PayloadRule::SampleCount`, new): 12.4 hours at 48 kHz.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

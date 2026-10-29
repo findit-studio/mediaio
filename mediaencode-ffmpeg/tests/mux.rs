@@ -16056,3 +16056,134 @@ fn l137_a_streams_aspect_ratio_reaches_the_ticket_and_round_trips() {
     assert_eq!(ratio(&target), stated, "{name}: read back");
   }
 }
+
+/// `packet` on track 0 at `samples` of a 48 kHz clock, both times.
+fn audio_at_sample(packet: &Audio, samples: i64) -> AudioTrackPacket<Ffmpeg, FfmpegBytes> {
+  let clock = Timebase::new(1, NonZeroI32::new(48_000).expect("non-zero"));
+  AudioTrackPacket::new(
+    TrackIndex::new(0),
+    packet
+      .clone()
+      .with_pts(Some(Timestamp::new(samples, clock)))
+      .with_dts(Some(Timestamp::new(samples, clock))),
+  )
+}
+
+/// **L138 — MP4 keeps a PCM packet's time as its place, and reports the
+/// timeline it moves** (R11, Q869 L7; `mov_write_stts_tag`, `movenc.c`
+/// 3241–3256; `mov_build_index`, `mov.c` 5015–5100): MP4's sample table
+/// counts every PCM sample one tick from the track's first, so that a
+/// packet's time is the samples before it — a second's gap after the
+/// second packet is gone, the third packet and every later one read back
+/// at their places, a second early. Reported at that packet, once, as the
+/// timeline it moves (`Rewrite::Timeline`), not as the durations: each
+/// packet's duration, its samples, is kept. The packets that abut report
+/// nothing; the samples read back whole.
+///
+/// PLANT: the place unjudged, the line missing; the durations judged by
+/// the packets' abutting, `Durations` reported instead.
+#[test]
+fn l138_mp4_keeps_a_pcm_packets_time_as_its_place() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = pcm_mov(&corpus);
+  let (table, audio) = first_track(&source, TrackKind::Audio, 4);
+  let audio: Vec<Audio> = audio.iter().map(audio_of).collect();
+  // Stereo 16-bit PCM: four bytes a sample.
+  let samples = |packet: &Audio| packet.data().as_ref().len() as i64 / 4;
+  let target = output(&corpus, "l138.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::new("mp4"), table);
+  let timeline = |report: &mediaencode_ffmpeg::MuxReport| {
+    lines(report, |line| {
+      matches!(
+        line,
+        Uncarried::Rewritten {
+          rewrite: Rewrite::Timeline | Rewrite::Durations,
+          ..
+        }
+      )
+    })
+  };
+  let mut place = 0;
+  for (index, packet) in audio.iter().enumerate() {
+    let at = if index >= 2 { place + 48_000 } else { place };
+    muxer
+      .write_audio(audio_at_sample(packet, at))
+      .map_err(|error| error.map_packet(drop))
+      .unwrap_or_else(|error| panic!("packet {index}: {error:?}"));
+    if index == 1 {
+      assert!(timeline(muxer.report()).is_empty(), "abutting: nothing");
+    }
+    place += samples(packet);
+  }
+  assert_eq!(
+    timeline(muxer.report()),
+    vec![Uncarried::Rewritten {
+      track: TrackIndex::new(0),
+      rewrite: Rewrite::Timeline,
+    }]
+  );
+  muxer.finish().expect("finished");
+  let back = &packets(&target)[0];
+  let offered: Vec<u8> = audio
+    .iter()
+    .flat_map(|packet| packet.data().as_ref().to_vec())
+    .collect();
+  let read: Vec<u8> = back.iter().flat_map(|seen| seen.bytes.clone()).collect();
+  assert!(read == offered, "the samples whole");
+  let end = back.last().and_then(|seen| seen.pts).expect("a time");
+  let last_samples = back.last().map_or(0, |seen| seen.bytes.len() as i64 / 4);
+  assert_eq!(
+    end
+      .checked_rescale_with(
+        Timebase::new(1, NonZeroI32::new(48_000).expect("non-zero")),
+        Rounding::Nearest
+      )
+      .map(|time| time.pts() + last_samples),
+    Some(place),
+    "the gap gone: the last sample at the place, not a second later"
+  );
+}
+
+/// **L139 — MP4 refuses the PCM packet that would take its samples past
+/// what it counts them in** (R11, Q869 L7; `mov_write_stsz_tag`,
+/// `movenc.c` 228–241): MP4 sums a PCM track's samples in an `int`, a
+/// signed overflow past `INT_MAX` — 12.4 hours at 48 kHz. With the bound
+/// lowered to the first two packets' samples, the third is refused by name
+/// (`PayloadRule::SampleCount`), untouched, and the file finishes with the
+/// two.
+///
+/// PLANT: the count unjudged, the third taken.
+#[test]
+fn l139_mp4_refuses_pcm_samples_past_what_it_counts_them_in() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = pcm_mov(&corpus);
+  let (table, audio) = first_track(&source, TrackKind::Audio, 3);
+  let audio: Vec<Audio> = audio.iter().map(audio_of).collect();
+  let samples = |packet: &Audio| packet.data().as_ref().len() as u64 / 4;
+  let bound = samples(&audio[0]) + samples(&audio[1]);
+  let target = output(&corpus, "l139.mp4");
+  let mut muxer = muxer_with(
+    &target,
+    ContainerName::new("mp4"),
+    table,
+    MuxOptions::new().with_lowered_sample_bound(bound),
+  );
+  let mut place = 0;
+  for packet in &audio[..2] {
+    muxer
+      .write_audio(audio_at_sample(packet, place))
+      .map_err(|error| error.map_packet(drop))
+      .expect("within the bound");
+    place += samples(packet) as i64;
+  }
+  let offered = audio_at_sample(&audio[2], place);
+  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  assert_eq!(refusal, payload(PayloadRule::SampleCount));
+  untouched!(offered, back);
+  muxer.finish().expect("finished");
+  let read: usize = packets(&target)[0]
+    .iter()
+    .map(|seen| seen.bytes.len())
+    .sum();
+  assert_eq!(read as u64, bound * 4, "the two packets' samples");
+}
