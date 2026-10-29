@@ -167,7 +167,7 @@
 //!
 //! | kind | MP4 (`movenc.c`) | Matroska, WebM (`matroskaenc.c`) |
 //! |---|---|---|
-//! | new extradata | kept: a sample description from the packet on, or the configuration of a track that had none (7044–7074, 7412–7429); dropped where the codec's sample entry reads none of it (grep G19): AC-3's and E-AC-3's, whose configuration is MP4's own parse of the frames (418–462, 612–666), APV's, its parse of the packets (1725–1738), PCM's, TTML's and GoPro metadata's, whose entries hold no configuration (1520–1528, 2259–2278, 3153–3163) | AAC, FLAC (Matroska): possibly dropped — it rewrites the track's one configuration, which a later packet's replaces (3065–3097); any other: dropped, unless it is the track's own (3098–3115) |
+//! | new extradata | kept: a sample description from the packet on, or the configuration of a track that had none (7044–7074, 7412–7428); on a configuration's packet of no payload — MPEG-4 ALS's, AAC's, AV1's, FLAC's — the current description's configuration rewritten, the samples before it too, which a later one's replaces: possibly dropped, the packet's other side data dropped with it (7412–7441); dropped where the codec's sample entry reads none of it (grep G19): AC-3's and E-AC-3's, whose configuration is MP4's own parse of the frames (418–462, 612–666), APV's, its parse of the packets (1725–1738), PCM's, TTML's and GoPro metadata's, whose entries hold no configuration (1520–1528, 2259–2278, 3153–3163) | AAC, FLAC (Matroska): possibly dropped — it rewrites the track's one configuration, which a later packet's replaces (3065–3097), AAC's refused where the header reserved no output sampling frequency ([`PayloadRule::NewExtradata`]); a configuration's packet of no payload taken so, no block written (3266–3268); any other: dropped, unless it is the track's own (3098–3115) |
 //! | skip samples | possibly dropped: the end skip trims the track's end in the edit list from the last packet alone, the start skip and the reasons are not read; dropped where the codec fixes no frame's samples (7311–7319, 7333–7342) | an audio track's end skip, as the block's discard padding (2922–2934), and its first packet's start skip where it is the stream's initial padding, written as the codec delay (2089–2104), which the reader puts back (`matroskadec.c` 2896–2901): kept; else dropped |
 //! | producer reference time | dropped: written only into fragments, with `write_prft` set (6034–6102, 7365–7369) | dropped |
 //! | WebVTT identifier, settings | dropped | a WebVTT cue's: kept, on lines of their own (2828–2855, 3591–3593); else dropped |
@@ -347,7 +347,7 @@
 //! | APV's packets read for `apvC` | 7198–7203 | written as given |
 //! | skip samples that leave less than nothing | 7311–7320 | [`PayloadRule::SkipSamples`] — a joined E-AC-3 sample's at its last packet, table C″ |
 //! | VC-1's and TrueHD's sync read from the bitstream | 7344–7348 | reported ([`Rewrite::SyncFromBitstream`]) |
-//! | an empty packet, dropped | 7431–7441 | [`PayloadRule::Empty`] |
+//! | an empty packet, dropped | 7431–7441 | [`PayloadRule::Empty`]; but a configuration's packet — no payload, new extradata — of MPEG-4 ALS, AAC, AV1 or FLAC, whose extradata MP4 takes first as the current sample description's configuration (7412–7428), its duration alone judged (`check_pkt` at 7396): taken, its new extradata reported possibly dropped, no sample counted (L72) |
 //! | a cover's one picture, a second ignored | 7606–7618 | the cover road writes one |
 //! | `mov_text`'s cue ends | 7625–7656 | [`FfmpegMuxRefusal::CueOrder`]; the samples MP4 makes around the cues, tables C′ and C″; reported ([`Rewrite::CueEnds`]) |
 //! | libavcodec's TTML paragraphs, held for one document | 7658–7684 | the one sample MP4 joins them into, table C′; its size, table B; reported ([`Rewrite::ParagraphsJoined`]) |
@@ -412,7 +412,7 @@
 //! | `mov_text`'s empty samples | `mov_write_packet` (7646–7653): before a packet of any track whose decode time, in its own ticks, passes the cue track's `track_duration`, where the track's last sample is a cue or it has none; the trailer's after the last (9025–9031) | an empty sample at `track_duration` — the last cue's end counted from the track's first sample, read as a decode time — the one at zero first; none before a cue at or before it, so that the last cue is shortened to it ([`Cues::take`]) | each cue's gap counted from the sample before it, the empty one where MP4 writes it first ([`FfmpegMuxRefusal::DtsGap`]); a cue's duration within `INT_MAX` of its empty sample's ([`FfmpegMuxRefusal::DurationTooLong`]); a cue before the end MP4 marks taken as MP4 writes it, the last cue's shortening reported ([`Rewrite::Durations`]) — but where another track's packet can make MP4 mark the end first, one counted in finer ticks or one handed more than libavformat's 10 s of interleaving past the end; and a first cue before zero, which MP4's reader drops, counting the samples after it from the edit list's start (`mov_fix_index`, `mov.c` 4374–4682): refused ([`FfmpegMuxRefusal::CueOrder`]) | L15, L53, L65, L66; the unit law |
 //! | TTML's paragraphs | `mov_write_packet` (7658–7684): queued by `ff_packet_list_put`, joined at the trailer | table C′ | table C′ | L54 |
 //! | the cover's picture | `mov_write_packet` (7606–7619): held by `av_packet_ref`, a second ignored | its one picture, at the trailer (4815–4839) | the cover road writes one | L10 |
-//! | an empty packet | `mov_write_single_packet` (7431–7441) | dropped | refused ([`PayloadRule::Empty`]) | L17 |
+//! | an empty packet | `mov_write_single_packet` (7431–7441) | dropped — a configuration's, of MPEG-4 ALS, AAC, AV1 or FLAC, after its new extradata is taken (7412–7428) | refused ([`PayloadRule::Empty`]); a configuration's taken, no sample counted, so no reference moved | L17, L72 |
 //! | a timed ID3 packet | `mov_write_packet` (7586–7589) | an `emsg` box, no sample | not reached: MP4's tag tables hold no timed ID3, refused at open ([`MuxOpenError::CodecNotCarried`]) | — |
 //! | IAMF's packets; a fragment's | `mov_build_iamf_packet` (7594–7603); `mov_flush_fragment` | — | not reached: no stream group, no fragmenting flag | — |
 //! | Matroska's audio packet | `mkv_write_packet` (3254–3271): held by `av_packet_ref` until the next packet, or the trailer (3300–3306) | the packet as taken, one packet later, its cluster's checks made then (3122–3200) | the rules its own write met, its block's bound counting the block before it (table B) | L1, L49 |
@@ -436,7 +436,7 @@
 //!
 //! | check | source | here |
 //! |---|---|---|
-//! | new extradata: AAC's an AudioSpecificConfig libavcodec parses, within the space reserved for it — the configuration's length, or `MAX_PCE_SIZE` where there was none | `mkv_check_new_extra_data` 3065–3082; `mkv_update_codecprivate` 1334–1365 | [`PayloadRule::NewExtradata`] — on the first frame AAC's filter converts, the configuration the filter makes in its place, held to the same space |
+//! | new extradata: AAC's an AudioSpecificConfig libavcodec parses, within the space reserved for it — the configuration's length, or `MAX_PCE_SIZE` where there was none — and none where the header reserved no output sampling frequency, which every update rewrites after the sampling frequency, the header writing it only where the stated configuration has an extension sample rate or none is stated | `mkv_check_new_extra_data` 3065–3082; `mkv_update_codecprivate` 1334–1365; `get_aac_sample_rates` 1116–1150; 2129–2135 | [`PayloadRule::NewExtradata`] — on the first frame AAC's filter converts, the configuration the filter makes in its place, held to the same space and the same reservation ([`aac_output_rate_reserved`]) |
 //! | new extradata: FLAC's of the configuration's length | 3084–3097 | [`PayloadRule::FlacStreamInfo`] |
 //! | AV1 or AAC with no configuration: every packet refused | 3080–3083, 3098–3109 | refused at open ([`MuxOpenError::ConfigurationMissing`]), AAC's only with the filters off |
 //! | a packet with no timestamp | 3140–3143 | a reordering stream's refused ([`FfmpegMuxRefusal::MissingPts`]); libavformat fills it otherwise |
@@ -446,7 +446,7 @@
 //! | ProRes's atom | 3584–3587 | [`PayloadRule::ProResAtom`] |
 //! | AV1's OBUs | 3589–3590 | [`PayloadRule::Obus`] |
 //! | WebVTT's lines | 2828–2853 | [`PayloadRule::WebVttCue`]; their size within the cluster's |
-//! | an empty audio packet, dropped | 3262–3268 | [`PayloadRule::Empty`] |
+//! | an empty audio packet, dropped | 3266–3268 | [`PayloadRule::Empty`]; but a configuration's packet of AAC or FLAC, whose new extradata Matroska takes first (3065–3097): taken, no block (L72) |
 //! | a subtitle's negative duration, written as zero | 3134 | reported ([`Rewrite::Durations`]) |
 //! | the block's side data | 2864–3010 | table A |
 //! | the cluster's buffer | 2746–2749, 3213–3271 | table B |
@@ -535,10 +535,11 @@
 //! | [`PayloadRule::Superframe`] | `vp9_superframe` refuses after taking, dropped unsaid; a seventh hidden frame refuses every packet after it, and the seven are dropped at the end (`vp9_superframe.c` 111–161, 198–207) | loses |
 //! | [`PayloadRule::PgsSegments`] | `pgs_frame_merge` writes a set without its presentation segment, or of segments it cannot parse, marked corrupt (`pgs_frame_merge.c` 59–68, 93–130) | corrupts |
 //! | [`PayloadRule::Empty`], a PGS packet's | `pgs_frame_merge` drops an empty packet unsaid, and with it the time it marks (`pgs_frame_merge.c` 87–90) | loses |
+//! | [`PayloadRule::Empty`], not a configuration's packet (R8, Codex R7 2) | MP4 takes an MPEG-4 ALS, AAC, AV1 or FLAC configuration of no payload as the current sample description's configuration, `check_pkt` judging its duration alone, and writes no sample (`movenc.c` 7396, 7412–7441); Matroska an AAC or FLAC one as the track's CodecPrivate, and writes no block (`matroskaenc.c` 3065–3097, 3266–3268): taken, its new extradata reported possibly dropped, its other side data dropped, no sample counted and no reference moved — L72; PLANT: the road closed, L72's FLAC configuration refused as empty; the road counting a sample, L72's frame after it taken. An empty packet of another codec, or with no new extradata, MP4 and Matroska's audio drop: refused, as before | nothing refused where FFmpeg takes it |
 //! | [`MuxOpenError::ConfigurationMissing`], AAC's with the filters off | MP4 refuses an ADTS first packet after taking it (`movenc.c` 7076–7086) and writes raw AAC with no configuration to read it by; Matroska refuses every packet after taking it (`matroskaenc.c` 3098–3109) | refuses after taking, or loses |
 //! | [`PayloadRule::SuperframeSize`], [`PayloadRule::DisplaySetSize`], [`PayloadRule::Ac3SampleSize`], [`PayloadRule::RewrittenSize`], [`PayloadRule::ClusterSize`], [`PayloadRule::DocumentSize`], [`PayloadRule::PayloadTooLarge`] | a size past what libavcodec allocates or a buffer holds: the sum wraps and the copy runs past its allocation (`vp9_superframe.c` 52–98), `av_new_packet` or `av_grow_packet` refuses after taking the packets (`packet.c` 83–127), the rewriter counts in an `int` (`nal.c` 74–111), the cluster is written cut (`matroskaenc.c` 2746–2749), the trailer fails (`movenc_ttml.c` 236–317) | memory, loses, or refuses after taking |
 //! | [`PayloadRule::DynamicHdrPlus`], [`PayloadRule::DynamicHdrApp5`] | Matroska casts the entry and serializes it trusting every count and divisor (`matroskaenc.c` 2947–2990; `hdr_dynamic_metadata.c` 237–706) | memory |
-//! | [`PayloadRule::NewExtradata`] | MP4's trailer refuses an Opus configuration `dOps` cannot write (`movenc.c` 877–910); an H.264, HEVC, VVC or LCEVC one of the other form turns the length-prefix rewrite on or off for the packets after it (7087–7158); Matroska refuses an AAC one it cannot parse or fit after taking the packet — the caller's, or the one AAC's filter makes (`matroskaenc.c` 3065–3082, 1334–1365) | refuses after taking, or corrupts |
+//! | [`PayloadRule::NewExtradata`] | MP4's trailer refuses an Opus configuration `dOps` cannot write (`movenc.c` 877–910); an H.264, HEVC, VVC or LCEVC one of the other form turns the length-prefix rewrite on or off for the packets after it (7087–7158); Matroska refuses an AAC one it cannot parse or fit after taking the packet — the caller's, or the one AAC's filter makes (`matroskaenc.c` 3065–3082, 1334–1365); and rewrites the sampling frequency and the output one with any AAC one, over bytes its header reserved for the second only where the stated configuration has an extension sample rate (3076–3081, 2129–2135, 1116–1150): elsewhere 11 bytes run over the track entry's next elements, and the file reads back corrupt — ffprobe reads its track entry broken (R8) — L67, L72; PLANT: the reservation held, L72's AAC LC configuration taken | refuses after taking, or corrupts |
 //! | [`PayloadRule::SideDataRepeated`] | libavcodec keeps one entry a kind, the earlier one's bytes replaced (`packet.c` 197–227): the copy road cannot carry both | loses |
 //! | [`PayloadRule::Trusted`], [`PayloadRule::SideDataBudget`], [`PayloadRule::SideDataUnnamed`] | the base's packet builder refuses them (`mediaio_ffmpeg::boundary::check_packet_build`): the write would fail with the packet taken | refuses after taking |
 //! | [`PayloadRule::Ac3BitStreamId`], [`FfmpegMuxRefusal::NoFrame`] | MP4's trailer fails without `dac3`'s or `dec3`'s frame, or over a bit stream id past 8 (`movenc.c` 424–445, 619–623) | refuses after taking: the file |
@@ -1555,9 +1556,12 @@ pub enum FfmpegMuxRefusal {
 #[non_exhaustive]
 pub enum PayloadRule {
   /// No bytes: MP4 drops an empty packet (`movenc.c` 7431–7441), Matroska
-  /// and WebM an empty audio packet (`matroskaenc.c` 3262–3268), and, with
+  /// and WebM an empty audio packet (`matroskaenc.c` 3266–3268), and, with
   /// the automatic filters on, Matroska's PGS filter an empty PGS packet
-  /// (`pgs_frame_merge.c` 87–90).
+  /// (`pgs_frame_merge.c` 87–90). Not a configuration's packet, of no
+  /// payload, whose new extradata the container takes first — MP4's MPEG-4
+  /// ALS, AAC, AV1 and FLAC's (7412–7428), Matroska's AAC and FLAC's
+  /// (3065–3097): taken, of no sample.
   #[error("the packet is empty, and the container drops it")]
   Empty,
   /// AAC framed in an ADTS header on a track whose configuration is
@@ -1677,7 +1681,10 @@ pub enum PayloadRule {
   /// for the track's configuration (`mkv_check_new_extra_data`,
   /// `matroskaenc.c` 3065–3082; `mkv_update_codecprivate`, 1334–1365) —
   /// the caller's, or the one AAC's filter makes of the first frame it
-  /// converts — each refused after taking the packet.
+  /// converts — each refused after taking the packet; and any Matroska AAC
+  /// configuration where the header reserved no output sampling frequency,
+  /// which the update writes over the elements after the sampling
+  /// frequency, corrupting the track entry (3076–3081, 2129–2135).
   #[error(
     "the packet's new extradata is a configuration the container would refuse or write otherwise"
   )]
@@ -2471,6 +2478,13 @@ struct PacketRules {
   negative_duration: bool,
   /// An empty packet is dropped.
   no_empty: bool,
+  /// A packet of no payload carrying new extradata is a configuration the
+  /// container takes ([`Learned::writes`]): MP4's MPEG-4 ALS, AAC, AV1 and
+  /// FLAC rewrite the current sample description's configuration with it
+  /// (`movenc.c` 7412–7428), Matroska's AAC and FLAC the track's
+  /// CodecPrivate (`matroskaenc.c` 3065–3097), and neither writes a sample
+  /// or a block of it (7431–7441; 3266–3268).
+  takes_config: bool,
   /// The stream reorders, and the container makes up or refuses a
   /// missing presentation time.
   needs_pts: bool,
@@ -2590,8 +2604,14 @@ enum ExtradataRule {
   /// the packets after it are rewritten from, or not.
   Form { codec: CodecId, annex_b: bool },
   /// Matroska AAC: an AudioSpecificConfig libavcodec parses, within the
-  /// space Matroska's header reserved.
-  AudioSpecificConfig { reserved: usize },
+  /// space Matroska's header reserved — and none at all where the header
+  /// reserved no output sampling frequency, which every new configuration
+  /// rewrites over the bytes after the sampling frequency
+  /// ([`aac_output_rate_reserved`]).
+  AudioSpecificConfig {
+    reserved: usize,
+    output_reserved: bool,
+  },
 }
 
 /// MP4 AC-3 and E-AC-3: how MP4's handling takes a track's packets
@@ -2701,6 +2721,8 @@ impl PacketRules {
       before_zero: None,
       negative_duration: kind == TrackKind::Subtitle && !either_matroska,
       no_empty: mp4 || (either_matroska && kind == TrackKind::Audio),
+      takes_config: (mp4 && [MP4ALS, CodecId::AAC, CodecId::AV1, CodecId::FLAC].contains(&id))
+        || (matroska && kind == TrackKind::Audio && [CodecId::AAC, CodecId::FLAC].contains(&id)),
       needs_pts: family != Family::Other && codec.video_delay() > 0,
       raw_aac: (mp4 || matroska) && id == CodecId::AAC && !codec.extradata().is_empty(),
       marks_key: id.intra_only(),
@@ -2743,6 +2765,7 @@ impl PacketRules {
           } else {
             codec.extradata().len()
           },
+          output_reserved: aac_output_rate_reserved(codec.extradata()),
         }
       } else {
         ExtradataRule::Any
@@ -4545,6 +4568,9 @@ struct Learned {
   /// MP4: the sample MP4 writes with the packet, where it writes one —
   /// not where it holds the packet (table C″ of the census).
   sample: Option<Sample>,
+  /// Whether the container writes a sample or a block of the packet: not
+  /// of a configuration's packet ([`PacketRules::takes_config`]).
+  writes: bool,
   /// MP4 `mov_text`: the samples MP4 has written of the track after the
   /// cue.
   cues: Option<Cues>,
@@ -5322,8 +5348,10 @@ where
     if let Some(last) = plan.outputs.last() {
       state.last_ticks = Some(last.dts_ticks);
       state.handed = Some(last.dts);
-      state.written = true;
-      state.keyed |= plan.key;
+      if plan.learned.writes {
+        state.written = true;
+        state.keyed |= plan.key;
+      }
     }
     if let Some(sample) = plan.learned.sample {
       state.sample = Some(sample);
@@ -5406,7 +5434,12 @@ fn learned_losses(
       lines.push(line);
     }
   };
-  if owns && !learned.joined && !payload.key && (state.rules.marks_key || state.rules.all_sync) {
+  if owns
+    && learned.writes
+    && !learned.joined
+    && !payload.key
+    && (state.rules.marks_key || state.rules.all_sync)
+  {
     push(Uncarried::Rewritten {
       track,
       rewrite: Rewrite::KeyFramesMarked,
@@ -5424,7 +5457,18 @@ fn learned_losses(
   for entry in side_data {
     let new_extradata = entry.kind() == AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
     let replaced = first_conversion(state.filter, payload_bytes) && new_extradata;
-    let fate = if !owns || replaced || (learned.joined && !new_extradata) {
+    let fate = if !learned.writes {
+      // A configuration's packet: its new extradata rewrites the track's
+      // configuration — the samples or blocks before it too — which a
+      // later one's replaces in turn; the rest goes with the packet,
+      // which writes nothing (`movenc.c` 7412–7441; `matroskaenc.c`
+      // 3065–3097, 3266–3268).
+      Some(if new_extradata && !entry.data().is_empty() {
+        SideDataFate::PossiblyDropped
+      } else {
+        SideDataFate::Dropped
+      })
+    } else if !owns || replaced || (learned.joined && !new_extradata) {
       Some(SideDataFate::Dropped)
     } else {
       state.sides.fate(entry, !state.written)
@@ -5467,6 +5511,13 @@ struct Timed {
 struct Mp4Times {
   last: Option<i128>,
   longest: i128,
+  /// Whether MP4 writes a sample of the packet: not a configuration's
+  /// packet of no payload, which `check_pkt` judges for its duration alone
+  /// before MP4 drops it (`mov_write_single_packet`, `movenc.c` 7396,
+  /// 7431–7441) — the decode time `check_pkt` would move is a packet's MP4
+  /// then discards, and `ff_mov_write_packet`'s pairing of the times is
+  /// never reached (6954–6958).
+  sampled: bool,
 }
 
 /// Holds a packet's times to the rows of the packet-rule table that judge
@@ -5513,12 +5564,14 @@ fn check_times(rules: &PacketRules, mp4: Mp4Times, timed: Timed) -> Result<(), F
     {
       return Err(FfmpegMuxRefusal::DurationTooLong { track, duration });
     }
-    if let Some(last) = mp4.last
+    if mp4.sampled
+      && let Some(last) = mp4.last
       && i128::from(dts_ticks) - last >= limit
     {
       return Err(FfmpegMuxRefusal::DtsGap { track, dts });
     }
-    if let (Some(pts), Some(pts_ticks)) = (pts, pts_ticks)
+    if mp4.sampled
+      && let (Some(pts), Some(pts_ticks)) = (pts, pts_ticks)
       && i128::from(pts_ticks) - i128::from(dts_ticks) > limit
     {
       return Err(FfmpegMuxRefusal::PresentationOffset { track, pts, dts });
@@ -5577,6 +5630,16 @@ fn check_packet_rules(
     ..
   } = own;
   let limit = i128::from(i32::MAX);
+  // A configuration's packet: of no payload, carrying new extradata the
+  // container takes as the track's configuration, of which it writes no
+  // sample or block ([`PacketRules::takes_config`]).
+  let config_only = rules.takes_config
+    && payload.bytes.is_empty()
+    && side_data(
+      payload.side_data,
+      AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+    )
+    .is_some_and(|new| !new.is_empty());
   // MP4 `mov_text`: the samples MP4 writes around the cue (table C″).
   let cues = rules
     .mov_text
@@ -5596,10 +5659,12 @@ fn check_packet_rules(
         // The empty sample after the cue lies its duration after it, and the
         // track's first sample's distance before zero (7321, 7652, 9029).
         longest: limit - 1 + i128::from(cue.next.start.unwrap_or(0)),
+        sampled: true,
       },
       None => Mp4Times {
         last: last_sample,
         longest: limit,
+        sampled: !config_only,
       },
     };
     check_times(rules, mp4, *output)?;
@@ -5616,7 +5681,7 @@ fn check_packet_rules(
     return Err(FfmpegMuxRefusal::CueOrder { track, pts: dts });
   }
   let refused = |rule| Err(FfmpegMuxRefusal::Payload { track, rule });
-  if rules.no_empty && payload.bytes.is_empty() {
+  if rules.no_empty && payload.bytes.is_empty() && !config_only {
     return refused(PayloadRule::Empty);
   }
   // AAC's filter converts the packet where it is inserted — at the track's
@@ -5631,7 +5696,7 @@ fn check_packet_rules(
   {
     return refused(PayloadRule::PartialSample);
   }
-  if rules.obus && !obus_parse(payload.bytes) {
+  if rules.obus && !config_only && !obus_parse(payload.bytes) {
     return refused(PayloadRule::Obus);
   }
   if rules.wavpack && !wavpack_parse(payload.bytes) {
@@ -5658,7 +5723,7 @@ fn check_packet_rules(
     }
     None => None,
   };
-  if let Some(skip) = rules.skip_samples {
+  if let Some(skip) = rules.skip_samples.filter(|_| !config_only) {
     let below = match ac3 {
       // A joined sample carries its first packet's skip samples, judged at
       // the packet that completes it against that packet's own duration
@@ -5699,8 +5764,12 @@ fn check_packet_rules(
       ExtradataRule::Any => true,
       ExtradataRule::OpusHead => opus_head_written(new),
       ExtradataRule::Form { codec, annex_b } => length_prefixed(Family::Mp4, codec, new) == annex_b,
-      ExtradataRule::AudioSpecificConfig { reserved } => {
-        replaced || (new.len() <= reserved && audio_specific_config_parses(new))
+      ExtradataRule::AudioSpecificConfig {
+        reserved,
+        output_reserved,
+      } => {
+        output_reserved
+          && (replaced || (new.len() <= reserved && audio_specific_config_parses(new)))
       }
     };
     if !taken {
@@ -5712,10 +5781,15 @@ fn check_packet_rules(
   // header reserved — the configuration's own length, or `MAX_PCE_SIZE`
   // where there was none — and refuses one past it after taking the packet
   // (`mkv_check_new_extra_data`, `matroskaenc.c` 3065–3082;
-  // `mkv_update_codecprivate`, 1334–1365).
-  if let ExtradataRule::AudioSpecificConfig { reserved } = rules.new_extradata
+  // `mkv_update_codecprivate`, 1334–1365); and its sampling frequencies
+  // with it, over an output one its header reserved only where the stated
+  // configuration has an extension sample rate ([`aac_output_rate_reserved`]).
+  if let ExtradataRule::AudioSpecificConfig {
+    reserved,
+    output_reserved,
+  } = rules.new_extradata
     && first_conversion(state.filter, payload.bytes)
-    && made_configuration(payload.bytes).is_some_and(|made| made > reserved)
+    && made_configuration(payload.bytes).is_some_and(|made| made > reserved || !output_reserved)
   {
     return refused(PayloadRule::NewExtradata);
   }
@@ -5745,7 +5819,7 @@ fn check_packet_rules(
   } else {
     len
   };
-  if rules.matroska_block {
+  if rules.matroska_block && !config_only {
     // Every block the container writes of the packet — the packet as
     // written, or each packet the track's filter puts out with it — and
     // what the filter holds, at the least it can come to (table B).
@@ -5784,7 +5858,7 @@ fn check_packet_rules(
   // six E-AC-3 blocks — and a joined sample at the packet that completes
   // it, with its first packet's decode time (table C″). `mov_text`'s and
   // TTML's samples are their own.
-  let sample = if !rules.mp4 || rules.mov_text || rules.ttml_document.is_some() {
+  let sample = if !rules.mp4 || rules.mov_text || rules.ttml_document.is_some() || config_only {
     None
   } else {
     match ac3 {
@@ -5812,6 +5886,7 @@ fn check_packet_rules(
     });
   Ok(Learned {
     sample,
+    writes: !config_only,
     cues: cues.map(|cue| cue.next),
     ac3: ac3.map(|(learned, _, _)| learned),
     joined: matches!(ac3, Some((_, Ac3Step::Joins | Ac3Step::Completes(_), _))),
@@ -6320,26 +6395,58 @@ fn crop_leaves_no_picture(crop: Option<&[u8]>, width: i32, height: i32) -> bool 
   left + right >= width as u64 || top + bottom >= height as u64
 }
 
+/// Whether Matroska's header reserved an AAC track's output sampling
+/// frequency, whose configuration it states as `stated`: Matroska rewrites
+/// the sampling frequency and the output one at its offset at every new
+/// configuration, the output one its sampling frequency where the new
+/// configuration states no other (`mkv_check_new_extra_data`,
+/// `matroskaenc.c` 3065–3083 in FFmpeg 9.0.1) — but its header writes the
+/// output one only where the stated configuration's parse gives an
+/// extension sample rate, or where none is stated, which reserves it as
+/// the track's sampling frequency, never zero (`get_aac_sample_rates`,
+/// 1116–1150; 2129–2135; `mux.c` 238–241): elsewhere the rewrite runs 11
+/// bytes over the elements after it, and the file reads back corrupt. A
+/// stated configuration libavcodec does not parse fails the header
+/// (1128–1132), and never reaches a packet.
+fn aac_output_rate_reserved(stated: &[u8]) -> bool {
+  stated.is_empty() || aac_extension_rate(stated).is_some_and(|rate| rate != 0)
+}
+
 /// Whether `config` is an MPEG-4 AudioSpecificConfig libavcodec parses
-/// (`ff_mpeg4audio_get_config_gb`, `mpeg4audio.c` 92–209; its entry
-/// point, 212–226, in FFmpeg 9.0.1): it fails only on no bytes, on a
-/// channel configuration past its table of 15, or on an ALS configuration
-/// short of 112 bits, without `ALS\0`, or of no sample rate (32–57); any
-/// other it reads to the end, zeros past it.
+/// ([`aac_extension_rate`]).
 fn audio_specific_config_parses(config: &[u8]) -> bool {
+  aac_extension_rate(config).is_some()
+}
+
+/// An MPEG-4 AudioSpecificConfig's extension sample rate, as libavcodec
+/// parses it with its sync extension read (`ff_mpeg4audio_get_config_gb`,
+/// `mpeg4audio.c` 92–209; its entry point, 212–226, in FFmpeg 9.0.1) —
+/// SBR's or PS's own (108–118), or a sync extension's of SBR whose flag is
+/// set, scanned for bit by bit after the object type's own bits (184–200);
+/// zero where neither is — or `None` where the parse fails: on no bytes,
+/// on a channel configuration past its table of 15, or on an ALS
+/// configuration short of 112 bits, without `ALS\0`, or of no sample rate
+/// (32–57). Any other it reads to the end, zeros past it.
+fn aac_extension_rate(config: &[u8]) -> Option<u32> {
+  /// `ff_mpeg4audio_sample_rates`, its last three zero
+  /// (`mpeg4audio_sample_rates.h` 30–33).
+  const RATES: [u32; 16] = [
+    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350, 0, 0,
+    0,
+  ];
   if config.is_empty() {
-    return false;
+    return None;
   }
   let object_type = |bits: &mut Bits<'_>| match bits.read(5) {
     31 => 32 + bits.read(6),
     other => other,
   };
-  let sample_rate = |bits: &mut Bits<'_>| {
-    if bits.read(4) == 15 {
-      bits.skip(24);
-    }
+  let sample_rate = |bits: &mut Bits<'_>| match bits.read(4) {
+    15 => bits.read(24),
+    index => RATES[index as usize],
   };
   let show = |at: usize, count: u32| Bits { bytes: config, at }.read(count);
+  let total = config.len() * 8;
   let mut bits = Bits {
     bytes: config,
     at: 0,
@@ -6347,33 +6454,60 @@ fn audio_specific_config_parses(config: &[u8]) -> bool {
   let mut object = object_type(&mut bits);
   sample_rate(&mut bits);
   if bits.read(4) >= 15 {
-    return false;
+    return None;
   }
   // SBR, or PS but for the MP3onMP4 draft's signature (108–110).
-  if object == 5
-    || (object == 29 && !(show(bits.at, 3) & 0x03 != 0 && show(bits.at, 9) & 0x3F == 0))
-  {
-    sample_rate(&mut bits);
-    object = object_type(&mut bits);
-    if object == 22 {
-      bits.skip(4);
-    }
-  }
+  let explicit = (object == 5
+    || (object == 29 && !(show(bits.at, 3) & 0x03 != 0 && show(bits.at, 9) & 0x3F == 0)))
+    .then(|| {
+      let rate = sample_rate(&mut bits);
+      object = object_type(&mut bits);
+      if object == 22 {
+        bits.skip(4);
+      }
+      rate
+    });
   if object == 36 {
     bits.skip(5);
     if show(bits.at, 24) != 0x0041_4C53 {
       bits.skip(24);
     }
-    let left = (config.len() * 8) as i64 - bits.at as i64;
+    let left = total as i64 - bits.at as i64;
     if left < 112 || bits.read(32) != 0x414C_5300 {
-      return false;
+      return None;
     }
-    // The sample rate, as the `int` it is stored in.
+    // The sample rate, as the `int` it is stored in; the samples, then the
+    // channels.
     if bits.read(32) as i32 <= 0 {
-      return false;
+      return None;
     }
+    bits.skip(48);
   }
-  true
+  if let Some(rate) = explicit {
+    return Some(rate);
+  }
+  match object {
+    1..=4 | 17 | 23 | 39 => bits.skip(1),
+    42 => {
+      if bits.read(5) == 0x1F {
+        bits.skip(24);
+      }
+      bits.skip(3);
+    }
+    _ => {}
+  }
+  while total.saturating_sub(bits.at) > 15 {
+    if show(bits.at, 11) == 0x2B7 {
+      bits.skip(11);
+      return Some(if object_type(&mut bits) == 5 && bits.read(1) == 1 {
+        sample_rate(&mut bits)
+      } else {
+        0
+      });
+    }
+    bits.skip(1);
+  }
+  Some(0)
 }
 
 /// Whether `family`'s header refuses `codec`, though the muxer's query

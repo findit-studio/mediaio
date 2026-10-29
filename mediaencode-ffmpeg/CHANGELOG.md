@@ -47,7 +47,9 @@ crate moves only when it changes.
   last cue's end where another track's packet can make MP4 mark that end
   first; and a
   packet's bytes or side data the container would refuse or write
-  otherwise — an empty packet it drops, AAC in an ADTS header on a
+  otherwise — an empty packet it drops (a configuration's packet — no
+  payload, new extradata — MP4 takes for MPEG-4 ALS, AAC, AV1 and FLAC,
+  Matroska for AAC and FLAC: taken, no sample counted), AAC in an ADTS header on a
   configured track no filter converts, partial PCM,
   AV1 OBUs or WavPack blocks that do not parse, MP4 skip-samples below
   nothing, Matroska's new FLAC STREAMINFO of another length, a ProRes
@@ -138,8 +140,9 @@ crate moves only when it changes.
   (`PayloadRule::NewExtradata`; FLAC's of another length,
   `PayloadRule::FlacStreamInfo`); an E-AC-3 first packet of more than 15
   dependent frames. Into Matroska: AAC's new extradata that libavcodec
-  does not parse, or larger than the space its header reserved
-  (`PayloadRule::NewExtradata`).
+  does not parse, or larger than the space its header reserved, or any
+  where the header reserved no output sampling frequency, which the
+  update would write over the track entry (`PayloadRule::NewExtradata`).
 - **What a container adds, reinterprets or drops of the table is
   reported** (table E). The flags a track reads back with that it did not
   declare (`Uncarried::DispositionAdded`): the default MP4 sets on the

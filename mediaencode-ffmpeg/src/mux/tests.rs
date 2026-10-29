@@ -2843,3 +2843,29 @@ fn mp4s_sync_table_is_decided_by_the_streams_profile() {
   );
   assert!(!mp4_syncs(TrackKind::Subtitle, CodecId::MOV_TEXT, -99));
 }
+
+/// **Matroska's header reserves an AAC track's output sampling frequency
+/// only where its configuration states an extension sample rate, or none
+/// is stated** (`get_aac_sample_rates`, `matroskaenc.c` 1116–1150;
+/// 2129–2135): explicit SBR, a sync extension whose SBR flag is set; not
+/// AAC LC, nor libavcodec's encoder's sync extension whose flag is clear.
+#[test]
+fn matroska_reserves_aacs_output_rate_as_its_header_writes_it() {
+  assert!(aac_output_rate_reserved(&[]), "none stated");
+  assert!(
+    !aac_output_rate_reserved(&[0x11, 0x90]),
+    "AAC LC, 48 kHz, stereo"
+  );
+  assert!(
+    !aac_output_rate_reserved(&[0x11, 0x90, 0x56, 0xE5, 0x00]),
+    "libavcodec's: a sync extension of SBR, its flag clear"
+  );
+  assert!(
+    aac_output_rate_reserved(&[0x13, 0x10, 0x56, 0xE5, 0x98]),
+    "a sync extension of SBR at 48 kHz, its flag set"
+  );
+  assert!(
+    aac_output_rate_reserved(&[0x2B, 0x11, 0x88, 0x00]),
+    "explicit SBR: 24 kHz, its extension 48 kHz"
+  );
+}

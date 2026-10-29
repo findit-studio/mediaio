@@ -3845,8 +3845,10 @@ fn l42_a_configuration_mp4s_trailer_refuses_is_refused_at_open() {
 /// untouched** (table C of the census): into MP4, Opus's that is no
 /// OpusHead `dOps` takes, H.264's Annex B on a track configured by an
 /// `avcC`, FLAC's of another length than 34; into Matroska, AAC's that
-/// libavcodec does not parse, or that is larger than the space Matroska's
-/// header reserved. Each container takes what it writes whole.
+/// libavcodec does not parse, that is larger than the space Matroska's
+/// header reserved, or any where the header reserved no output sampling
+/// frequency (L72). Each container takes what it writes whole: an HE-AAC
+/// track's configuration within its space reads back.
 ///
 /// PLANT: without the check of new extradata, the Annex B on an `avcC`
 /// track is taken and MP4 rewrites the packets after it.
@@ -3855,7 +3857,7 @@ fn l43_new_extradata_a_container_would_refuse_is_refused() {
   use ffmpeg_next::ffi::AVPacketSideDataType as T;
   let Some(corpus) = Corpus::new() else { return };
   let new_extradata = |bytes: &[u8]| vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, bytes)];
-  let audio_with = |packet: &Audio, at: i64, entries: Vec<SideDataEntry>| {
+  let carrying = |packet: &Audio, at: i64, entries: Vec<SideDataEntry>| {
     let mut inner = packet.clone().with_pts(Some(ms(at))).with_dts(Some(ms(at)));
     inner.extra_mut().set_side_data(entries);
     AudioTrackPacket::new(TrackIndex::new(0), inner)
@@ -3865,12 +3867,12 @@ fn l43_new_extradata_a_container_would_refuse_is_refused() {
   let (table, frames) = first_track(&opus, TrackKind::Audio, 2);
   let own = table[0].side_data().extradata().to_vec();
   let mut muxer = muxer_into(&output(&corpus, "l43-opus.mp4"), ContainerName::MP4, table);
-  let offered = audio_with(&audio_of(&frames[0]), 0, new_extradata(b"OpusHead"));
+  let offered = carrying(&audio_of(&frames[0]), 0, new_extradata(b"OpusHead"));
   let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
   assert_eq!(refusal, payload(PayloadRule::NewExtradata));
   untouched!(offered, back);
   muxer
-    .write_audio(audio_with(&audio_of(&frames[0]), 0, new_extradata(&own)))
+    .write_audio(carrying(&audio_of(&frames[0]), 0, new_extradata(&own)))
     .map_err(|error| error.map_packet(drop))
     .expect("an OpusHead dOps takes");
   muxer.finish().expect("finished");
@@ -3900,45 +3902,66 @@ fn l43_new_extradata_a_container_would_refuse_is_refused() {
   let flac = audio_file(&corpus, "flac.flac", "flac");
   let (table, frames) = first_track(&flac, TrackKind::Audio, 1);
   let mut muxer = muxer_into(&output(&corpus, "l43-flac.mp4"), ContainerName::MP4, table);
-  let offered = audio_with(&audio_of(&frames[0]), 0, new_extradata(&[0; 33]));
+  let offered = carrying(&audio_of(&frames[0]), 0, new_extradata(&[0; 33]));
   let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
   assert_eq!(refusal, payload(PayloadRule::FlacStreamInfo));
   untouched!(offered, back);
 
   let (table, frames) = first_track(&source, TrackKind::Audio, 2);
-  let reserved = table[0].side_data().extradata().len();
-  assert!(
-    reserved >= 2,
-    "the premise: the track's AudioSpecificConfig"
-  );
+  let stated = table[0].side_data().extradata().len();
+  assert!(stated >= 2, "the premise: the track's AudioSpecificConfig");
   // AAC LC at 48 kHz, stereo, its bytes after the first two read as zeros.
   let config = |len: usize| {
     let mut bytes = vec![0x11, 0x90];
     bytes.resize(len, 0);
     bytes
   };
+  // HE-AAC's explicit SBR — 24 kHz, its extension 48 kHz, stereo — whose
+  // header reserved the output sampling frequency every update rewrites
+  // (L72), in a space of its four bytes.
+  const HE: i32 = 4;
+  let he = [0x2B, 0x11, 0x88, 0x00];
+  let target = output(&corpus, "l43-aac.mkv");
   let mut muxer = muxer_into(
-    &output(&corpus, "l43-aac.mkv"),
+    &target,
     ContainerName::MATROSKA,
-    table,
+    audio_with(&source, HE, Some(&he)),
   );
   // Channel configuration 15, past libavcodec's table; and a valid one
   // longer than the space Matroska's header reserved, the track's own.
-  for bytes in [vec![0x11, 0xF8], config(reserved + 1)] {
-    let offered = audio_with(&audio_of(&frames[0]), 0, new_extradata(&bytes));
+  for bytes in [vec![0x11, 0xF8], config(he.len() + 1)] {
+    let offered = carrying(&audio_of(&frames[0]), 0, new_extradata(&bytes));
     let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
     assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{bytes:?}");
     untouched!(offered, back);
   }
   muxer
-    .write_audio(audio_with(
+    .write_audio(carrying(
       &audio_of(&frames[0]),
       0,
-      new_extradata(&config(reserved)),
+      new_extradata(&config(he.len())),
     ))
     .map_err(|error| error.map_packet(drop))
     .expect("an AudioSpecificConfig within the space");
   muxer.finish().expect("finished");
+  let (written, _) = first_track(&target, TrackKind::Audio, 0);
+  assert_eq!(
+    written[0].side_data().extradata(),
+    &config(he.len())[..],
+    "read back"
+  );
+  // The track's own AAC LC configuration, libavcodec's encoder's, has the
+  // header reserve no output sampling frequency: one within the space is
+  // refused all the same, the update running over the track entry.
+  let mut muxer = muxer_into(
+    &output(&corpus, "l43-lc.mkv"),
+    ContainerName::MATROSKA,
+    table,
+  );
+  let offered = carrying(&audio_of(&frames[0]), 0, new_extradata(&config(stated)));
+  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  assert_eq!(refusal, payload(PayloadRule::NewExtradata), "AAC LC's");
+  untouched!(offered, back);
 }
 
 /// A chapter of `id` from `start` to `end` milliseconds, titled where
@@ -5670,18 +5693,23 @@ fn adts_frame_of(payload: &[u8], channels: u64) -> Vec<u8> {
 /// a first packet that opens with an ADTS header, whatever the
 /// configuration (`movenc.c` 9143–9145; `matroskaenc.c` 3635–3637), which
 /// then converts each ADTS frame and passes raw AAC (`aac_adtstoasc.c`
-/// 51–52). An ADTS first frame is taken, the filter named at its write, and
-/// reads back as its raw payload; raw and ADTS packets after it are taken.
-/// Matroska rewrites the track's configuration with the one the filter
-/// makes of the first frame, within the space its header reserved — the
-/// stated configuration's length — and refuses one past it after taking
-/// the packet (`matroskaenc.c` 3065–3082, 1334–1365): a first frame whose
-/// channels its program config element gives makes one of eight bytes,
-/// refused, by name, untouched; MP4 makes it a sample description, and
-/// takes it.
+/// 51–52). Into MP4, an ADTS first frame is taken, the filter named at its
+/// write, and reads back as its raw payload; raw and ADTS packets after it
+/// are taken. Matroska rewrites the track's configuration with the one the
+/// filter makes of the first frame, within the space its header reserved —
+/// the stated configuration's length — and refuses one past it after
+/// taking the packet (`matroskaenc.c` 3065–3082, 1334–1365); but it
+/// rewrites the sampling frequencies with it too, over bytes its header
+/// reserved only where the stated configuration had an extension sample
+/// rate (3076–3081, 2129–2135), which libavcodec's AAC encoder's has not:
+/// the track entry would read back corrupt, so the ADTS first frame is
+/// refused, by name, untouched, and a raw one taken with no filter. A first
+/// frame whose channels its program config element gives makes one of
+/// eight bytes, refused; MP4 makes it a sample description, and takes it.
 ///
-/// PLANT: a configured track taking raw AAC alone, as before: the ADTS
-/// first frame is refused.
+/// PLANT: a configured track taking raw AAC alone, as before: MP4's ADTS
+/// first frame is refused; the output sampling frequency held reserved:
+/// Matroska's is taken.
 #[test]
 fn l67_a_configured_aac_tracks_first_packet_decides_its_filter() {
   let Some(corpus) = Corpus::new() else { return };
@@ -5709,6 +5737,23 @@ fn l67_a_configured_aac_tracks_first_packet_decides_its_filter() {
       vec![],
       "{name}: undecided at open"
     );
+    if container == ContainerName::MATROSKA {
+      // The configuration the filter makes of the first frame Matroska
+      // writes over its header's sampling frequencies, which reserved no
+      // output one for this configuration's: the track entry would read
+      // back corrupt (`matroskaenc.c` 3076–3081, 2129–2135).
+      let first = audio_at(&audio_holding(&raw, &framed), 0);
+      let (refusal, back) = by_container(muxer.write_audio(first.clone()));
+      assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{name}");
+      untouched!(first, back);
+      muxer
+        .write_audio(audio_at(&raw, 0))
+        .map_err(|error| error.map_packet(drop))
+        .expect("a raw first frame, no filter");
+      assert_eq!(filtered(muxer.report()), vec![], "{name}: none inserted");
+      muxer.finish().expect("finished");
+      continue;
+    }
     for (index, bytes) in [&framed, raw.data().as_ref(), &framed]
       .into_iter()
       .enumerate()
@@ -6205,4 +6250,205 @@ fn l71_mp4_marks_by_its_sync_table_as_movenc_decides_it() {
       "{name}: the sync-sample table"
     );
   }
+}
+
+/// **L72 — a configuration's packet, of no payload and carrying new
+/// extradata, is taken where the container takes the configuration, and
+/// refused as empty where it drops it** (Codex R7 2; tables C and C″): MP4
+/// rewrites an MPEG-4 ALS, AAC, AV1 or FLAC track's current sample
+/// description with it and writes no sample (`movenc.c` 7412–7441);
+/// Matroska an AAC or FLAC track's CodecPrivate, and writes no block
+/// (`matroskaenc.c` 3065–3097, 3266–3268). Into MP4, FLAC's 34-byte
+/// STREAMINFO is taken, reported possibly dropped — a later one would
+/// replace it — and read back as the track's configuration; one of another
+/// length is refused (`dfLa`, 857–876). No sample is counted of it, so a
+/// packet more than `i32::MAX` ticks after the last sample is still
+/// refused, the configuration's packet just before it notwithstanding
+/// (`check_pkt` counts from the last sample written). MP4's H.264 takes no
+/// such packet: refused, as the empty packet MP4 drops. Into Matroska,
+/// AAC's configuration is taken where the header reserved the output
+/// sampling frequency its update rewrites — an HE-AAC track's, whose
+/// configuration states an extension sample rate — and refused on an AAC
+/// LC track's, whose update would run over the track entry
+/// (`matroskaenc.c` 2129–2135, 3076–3081); AC-3's, which Matroska
+/// ignores, refused as empty.
+///
+/// PLANT: the road closed refuses the FLAC configuration's packet as
+/// empty; the road counting a sample takes the packet after it; the
+/// output sampling frequency held reserved takes AAC LC's.
+#[test]
+fn l72_a_configurations_packet_is_taken_where_the_container_takes_it() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let configuration = |packet: &Audio, track: usize, at: i64, new: &[u8]| {
+    let mut empty = audio_holding(packet, &[])
+      .with_pts(Some(ms(at)))
+      .with_dts(Some(ms(at)));
+    empty
+      .extra_mut()
+      .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, new)]);
+    AudioTrackPacket::new(TrackIndex::new(track), empty)
+  };
+  let new_extradata = |report: &mediaencode_ffmpeg::MuxReport| {
+    lines(report, |line| {
+      matches!(line, Uncarried::SideData { kind, .. }
+        if *kind == T::AV_PKT_DATA_NEW_EXTRADATA as i32)
+    })
+  };
+
+  let flac = audio_file(&corpus, "l72.flac", "flac");
+  let (table, frames) = first_track(&flac, TrackKind::Audio, 1);
+  let mut streaminfo = table[0].side_data().extradata().to_vec();
+  assert_eq!(streaminfo.len(), 34, "the premise: a STREAMINFO");
+  *streaminfo.last_mut().expect("bytes") ^= 0xFF;
+  let target = output(&corpus, "l72.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  let frame = audio_of(&frames[0]);
+  muxer
+    .write_audio(audio_at(&frame, 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  let short = configuration(&frame, 0, 10, &streaminfo[..33]);
+  let (refusal, back) = by_container(muxer.write_audio(short.clone()));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::FlacStreamInfo),
+    "dfLa's 34 bytes"
+  );
+  untouched!(short, back);
+  // 2^31 ticks of 48 kHz are 44 739 242.7 ms: the configuration's packet
+  // lies past them, the frame after it too.
+  muxer
+    .write_audio(configuration(&frame, 0, 44_739_300, &streaminfo))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the track's configuration, of no sample");
+  assert_eq!(
+    new_extradata(muxer.report()),
+    vec![Uncarried::SideData {
+      track: TrackIndex::new(0),
+      kind: T::AV_PKT_DATA_NEW_EXTRADATA as i32,
+      name: Some("New Extradata"),
+      fate: SideDataFate::PossiblyDropped,
+    }]
+  );
+  let late = audio_at(&frame, 44_739_301);
+  let (refusal, back) = by_container(muxer.write_audio(late.clone()));
+  assert!(
+    matches!(refusal, FfmpegMuxRefusal::DtsGap { .. }),
+    "counted from the last sample, not the configuration's packet: {refusal:?}"
+  );
+  untouched!(late, back);
+  muxer.finish().expect("finished");
+  let (written, _) = first_track(&target, TrackKind::Audio, 0);
+  assert_eq!(
+    written[0].side_data().extradata(),
+    &streaminfo[..],
+    "the configuration read back"
+  );
+  assert_eq!(packet_count(&target), 1, "no sample of it");
+
+  let source = corpus.multi_track_mkv();
+  let (_, video) = first_track(&source, TrackKind::Video, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l72-h264.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Video),
+  );
+  muxer
+    .write_video(video_at(&video_of(&video[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  let mut empty = video_holding(&video_of(&video[0]), &[])
+    .with_pts(Some(ms(40)))
+    .with_dts(Some(ms(40)));
+  empty
+    .extra_mut()
+    .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &[1, 2, 3, 4])]);
+  let empty = VideoTrackPacket::new(TrackIndex::new(0), empty);
+  let (refusal, back) = by_container(muxer.write_video(empty.clone()));
+  assert_eq!(refusal, payload(PayloadRule::Empty), "MP4's H.264 drops it");
+  untouched!(empty, back);
+  muxer.finish().expect("finished");
+
+  let (table, audio) = first_track(&source, TrackKind::Audio, 1);
+  let stated = table[0].side_data().extradata().to_vec();
+  assert_eq!(
+    &stated[..2],
+    &[0x11, 0x90],
+    "the premise: AAC LC at 48 kHz, stereo"
+  );
+  let frame = audio_of(&audio[0]);
+  // HE-AAC's explicit SBR — 24 kHz, its extension 48 kHz, stereo — whose
+  // extension sample rate Matroska's header writes as the output sampling
+  // frequency, reserving the bytes every update rewrites (`matroskaenc.c`
+  // 2129–2135, 3076–3081); the same, mono — its channel configuration,
+  // bits 9 to 12, 1 — of its length, within the space reserved.
+  const HE: i32 = 4;
+  let he = [0x2B, 0x11, 0x88, 0x00];
+  let mono = [0x2B, 0x09, 0x88, 0x00];
+  let target = output(&corpus, "l72.mkv");
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::MATROSKA,
+    audio_with(&source, HE, Some(&he)),
+  );
+  muxer
+    .write_audio(audio_at(&frame, 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  muxer
+    .write_audio(configuration(&frame, 0, 21, &mono))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the track's CodecPrivate, of no block");
+  assert_eq!(
+    new_extradata(muxer.report()).len(),
+    1,
+    "possibly dropped, as Matroska's AAC's"
+  );
+  muxer.finish().expect("finished");
+  let (written, _) = first_track(&target, TrackKind::Audio, 0);
+  assert_eq!(written[0].side_data().extradata(), &mono[..], "read back");
+  assert_eq!(packet_count(&target), 1, "no block of it");
+  // AAC LC's stated configuration, libavcodec's encoder's, states no
+  // extension sample rate, and its header reserved no output sampling
+  // frequency: the update would run over the track entry. Refused, by
+  // name, untouched.
+  let mut lc_mono = stated.clone();
+  lc_mono[1] = 0x88;
+  let mut muxer = muxer_into(
+    &output(&corpus, "l72-lc.mkv"),
+    ContainerName::MATROSKA,
+    table,
+  );
+  muxer
+    .write_audio(audio_at(&frame, 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  let unreserved = configuration(&frame, 0, 21, &lc_mono);
+  let (refusal, back) = by_container(muxer.write_audio(unreserved.clone()));
+  assert_eq!(refusal, payload(PayloadRule::NewExtradata), "AAC LC's");
+  untouched!(unreserved, back);
+  muxer.finish().expect("finished");
+
+  let ac3 = audio_file(&corpus, "ac3.mkv", "ac3");
+  let (table, frames) = first_track(&ac3, TrackKind::Audio, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l72-ac3.mkv"),
+    ContainerName::MATROSKA,
+    table,
+  );
+  let frame = audio_of(&frames[0]);
+  muxer
+    .write_audio(audio_at(&frame, 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  let ignored = configuration(&frame, 0, 32, &[1, 2, 3]);
+  let (refusal, back) = by_container(muxer.write_audio(ignored.clone()));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::Empty),
+    "Matroska ignores AC-3's"
+  );
+  untouched!(ignored, back);
+  muxer.finish().expect("finished");
 }
