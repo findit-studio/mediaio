@@ -7,6 +7,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with the rest of the family's.
 
+## [0.1.3] - unreleased
+
+### Added
+
+- **`nal`: interlaced H.264, read field by field.** Where a sequence
+  parameter set lets a picture be a field (`frame_mbs_only_flag` 0),
+  `NalStream` no longer keeps every packet. It reads each slice's
+  `field_pic_flag` and `bottom_field_flag` as FFmpeg's decoder does: by the
+  sequence parameter set the slice's picture parameter set was read on,
+  from FFmpeg's parameter-set lists, each entry as far as the reading
+  knows it. It marks a packet that holds a frame — an MBAFF frame among
+  them — or both fields of a pair FFmpeg joins, while no first field may
+  wait at it, and a pair only while no field may have gone unmatched. A
+  pair split across packets, as FFmpeg's parser splits a raw or MPEG-TS
+  stream's, is kept whole, both halves: dropping one moves the other's
+  pairing, and the next frame's.
+- `KeptReason::UnpairedField`, `KeptReason::PendingField` and
+  `KeptReason::UnmatchedFields`: an interlaced packet kept for its fields.
+
+### Changed
+
+- `KeptReason::MaybeField` names, after a sequence parameter set that lets
+  fields in, a slice the reading cannot read for its field, where it named
+  every picture of `nal_ref_idc` 0.
+- After such a sequence parameter set, the reference picture and the intra
+  slice an H.264 reading awaits are counted only where FFmpeg decodes
+  them.
+- An H.264 sequence parameter set's id is read as FFmpeg's
+  `get_ue_golomb_31` reads it, 31 among the ids FFmpeg takes.
+
 ## [0.1.1] - 2026-10-23
 
 ### Added
