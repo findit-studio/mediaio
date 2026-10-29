@@ -620,6 +620,7 @@
 //! | AVI (`avienc.c` 744–913) | as each packet's place: video's frame, in its stream's ticks, a gap filled with empty frames; PCM's samples ([`Rewrite::Timeline`] where a time is not its place) — no presentation time | none | in the index | a PAL8 picture's palette | none | none |
 //! | FLV (`flvenc.c` 1209–1486) | the decode time, 32 bits of milliseconds; a composition time for H.264, MPEG-4 Part 2, HEVC and VVC alone, 24 bits | none | a video tag's; every audio tag reads back a key frame ([`Rewrite::KeyFramesMarked`]) | new extradata of AAC, H.264, MPEG-4, HEVC, VVC, AV1, VP9, Opus and FLAC, a new sequence header | none | none |
 //! | NUT (`nutenc.c` 545–612, 963–1184) | the presentation time, in its stream's time base — an audio stream's sample rate's, any other's made at least 1/48 000 fine — and no decode time: its reader makes one of the presentation times and the decode delay ([`Rewrite::DecodeTimes`]) | none | each frame's | none | the language; the default, dub, original, comment, lyrics and karaoke flags | a start and a length in the chapter's own time base, exact, numbered by position from 1 |
+//! | Ogg (`oggenc.c` 497–765) | none a packet keeps of its own: each page the granule of the last packet it ends, its end, a reader counting the others' times from the samples or frames ([`Rewrite::Timeline`]) — VP8's first frame read back at its end | none | none: Theora's and VP8's key frames in their granules, which the reader sets by the bitstream ([`Rewrite::SyncFromBitstream`]) | a lone Vorbis, FLAC or Opus stream's later strings metadata, as a chained stream's tags; Opus's first start skip, its pre-skip | the language; no flag | in an Opus stream's tags alone: the first 1000, by position from 0, a start of rounded whole seconds and its rounded milliseconds, no end |
 //! | ASF, its streaming form (`asfenc.c` 862–1050) | the decode time, as each payload's presentation time, 32 bits of milliseconds with the preroll's 3100 added — no presentation time | none | a video payload's; every audio packet reads back a key frame ([`Rewrite::KeyFramesMarked`]) | none | a language through its ISO 639-1 code, read back as ISO 639-2/B — a tag of none not handed, so that the stream has none; no flag | markers: a start in 100 ns, numbered by position, each ended where the next starts; the streaming form none |
 //!
 //! **What each refuses**:
@@ -641,6 +642,8 @@
 //! | ASF, at open | a video configuration past its format data's 16-bit size; a marker's title past its entry's 16-bit length; a chapter at 2^32 ms or later; the streaming form's header past its chunk's 16-bit length | each written, its length or send time cut (`asfenc.c` 645, 337, 297–308, 708–716) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSpan`], [`MuxOpenError::HeaderTooLong`] — L87 |
 //! | AVI, ASF, at open | a picture whose bytes pass an `int` | the bitmap header's count a signed overflow (`riffenc.c` 265) | [`MuxOpenError::Dimensions`] — L87 |
 //! | NUT | a reordering stream's packet with no presentation time; a key frame presented before its stream's last, or at it but decoded at another time; a presentation time past its 64-bit count of time bases; after the first write, a frame decoded before zero | refused after taking it; the trailer's index asserts (`av_assert0`, 653), ending the process; written wrapped; a syncpoint's count of it unsigned (`nutenc.c` 329–333, 615–667, 979–985, 1041, 1071–1073) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::KeyFrameOrder`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::BeforeZero`] — L90 |
+//! | Ogg | an empty packet; a VP8 frame ending before zero or at 2^31 ticks, a Theora one at 2^(63 − its key-frame shift); a packet whose granule is −1; a lone Vorbis, FLAC or Opus stream's later metadata update that does not unpack | an empty Ogg packet its reader drops, moving the next; a signed shift's overflow; a page read back with no time; the file ended and every later packet refused (`oggenc.c` 660–765) | [`PayloadRule::Empty`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::UnsetGranule`], [`PayloadRule::MetadataUpdate`] — L92 |
+//! | Ogg, at open | a codec but Vorbis, Theora, Speex, FLAC, Opus and VP8; no configuration but VP8's; one Ogg's start refuses — FLAC's short of its STREAMINFO, Speex's of its 80 bytes, Opus's of its 19, Vorbis's or Theora's not three headers, Theora's first short of 42; an audio stream of no sample rate; VP8 past 16 bits of width or height, or 24 of an aspect ratio's term | refused at the start; Theora's header read past its end; granules of no clock; written cut (`oggenc.c` 319–616) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationMissing`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Dimensions`] — L92 |
 //! | NUT, at open | raw video of a tag its tables do not hold; a video stream of no width or height, an audio one of no sample rate or channels, a configuration of 2^30 bytes or more; a chapter starting past its count; a time base not in lowest terms | written under the tables' first raw tag, RGB 5:5:5's, read back as that; a stream header its reader refuses; wrapped; a main header its reader refuses (`nut.c` 50; `nutdec.c` 233–240, 447–470; `nutenc.c` 601) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ChapterSpan`]; the time base handed reduced — L90 |
 
 use core::{fmt, marker::PhantomData};
@@ -944,6 +947,13 @@ impl Audited {
         key: true,
         ..NOTHING
       }),
+      // `ogg_write_packet_internal` (`oggenc.c` 704–765): no time a packet
+      // keeps of its own — a page holds the granule of the last packet it
+      // ends, a reader counting the others' times from the stream's
+      // samples or frames — no duration, no key flag: a Theora or VP8
+      // frame's is in its granule, which the reader sets by the bitstream
+      // (`ogg_validate_keyframe`, `oggdec.c` 810–830).
+      Self::Ogg(_) => Some(NOTHING),
       // `nut_write_packet` (`nutenc.c` 963–1184): the presentation time
       // and the key flag of each frame; no duration, and no decode time —
       // the reader makes one of the presentation times and the stream's
@@ -996,6 +1006,15 @@ impl Audited {
         language: LanguageRule::ThroughIso639_1,
         flags: TrackDisposition::empty(),
       }),
+      // Ogg writes a stream's tags, the language among them, as its Vorbis
+      // comments (`ogg_write_vorbiscomment`, `oggenc.c` 291–317), which its
+      // reader takes back; no disposition.
+      Self::Ogg(_) => Some(Kept {
+        filename: false,
+        mime_type: false,
+        language: LanguageRule::AsGiven,
+        flags: TrackDisposition::empty(),
+      }),
       // NUT writes a stream's tags as its info, the language among them as
       // `X-Language`, and six disposition flags by name, which its reader
       // takes back (`write_streaminfo`, `nutenc.c` 545–585; `nut.c`
@@ -1030,6 +1049,7 @@ impl Audited {
         | Self::Avi
         | Self::Asf { .. }
         | Self::Nut
+        | Self::Ogg(_)
     )
   }
 
@@ -1639,7 +1659,10 @@ pub enum Rewrite {
   /// whose time is not its place moves, and a stream's start with it
   /// (`avienc.c` 744–766, 868–913): reported at the first such packet; a
   /// stream of another codec whose block alignment its reader counts by,
-  /// at open.
+  /// at open. And Ogg, which writes each page's granule — the end of the
+  /// last packet it ends — alone, a reader counting the others' times from
+  /// the samples or frames (`oggenc.c` 704–765; `oggdec.c` 790–810):
+  /// reported at open.
   Timeline,
   /// The container writes a packet's presentation time and not its decode
   /// time, which a reader takes to be the presentation time: IVF
@@ -1957,6 +1980,18 @@ pub enum FfmpegMuxRefusal {
     /// The decode time offered.
     dts: Timestamp,
   },
+  /// Ogg: a packet whose granule — its end, its presentation time with its
+  /// duration as libavformat hands it, a missing one its guess (`mux.c`
+  /// 605–633), Opus's initial padding added — is −1, the granule Ogg
+  /// writes for a page no packet ends on (`oggdec.c` 567, 799), so that the
+  /// packets of the page it ends read back with no time.
+  #[error("track {}: a packet ending at {}, Ogg's granule of no packet", .track.get(), .end.pts())]
+  UnsetGranule {
+    /// The track.
+    track: TrackIndex,
+    /// The packet's end, in the stream's time base.
+    end: Timestamp,
+  },
   /// NUT: a key frame presented before its stream's last key frame, or at
   /// its presentation but decoded at another time. NUT's index keeps the
   /// first key frame of each stream after each syncpoint, and its trailer
@@ -2105,6 +2140,15 @@ pub enum PayloadRule {
   /// (3065–3097): taken, of no sample.
   #[error("the packet is empty, and the container drops it")]
   Empty,
+  /// Ogg: strings-metadata side data on a later packet of a lone Vorbis,
+  /// FLAC or Opus stream, which Ogg writes as a new chained stream's tags —
+  /// its trailer, then its start and header again — that does not unpack
+  /// as libavformat's dictionary: keys and values each terminated, no key
+  /// empty (`av_packet_unpack_dictionary`, `libavcodec/packet.c`
+  /// 349–371). Ogg would end the file there and refuse every packet after
+  /// (`ogg_check_new_metadata`, `oggenc.c` 660–702, 714–715).
+  #[error("the packet's metadata update does not unpack, which fails the Ogg muxer")]
+  MetadataUpdate,
   /// AAC framed in an ADTS header on a track whose configuration is
   /// stated, into MP4 or Matroska, which take raw AAC, where no automatic
   /// filter converts it: MP4 refuses the first such packet after taking it
@@ -2428,7 +2472,9 @@ pub enum MuxOpenError {
   /// bitmap header AVI and ASF write count in an `int`
   /// (`ff_put_bmp_header`, `riffenc.c` 265), a signed overflow past it; or
   /// NUT's of no width or height, whose stream header NUT's reader refuses
-  /// (`decode_stream_header`, `nutdec.c` 456–457).
+  /// (`decode_stream_header`, `nutdec.c` 456–457); or VP8's in Ogg, whose
+  /// header holds the width and height in 16 bits and the aspect ratio's
+  /// terms in 24 (`ogg_build_vp8_headers`, `oggenc.c` 431–434).
   #[error("track {}'s dimensions do not fit the container's header", .track.get())]
   Dimensions {
     /// The track.
@@ -2569,7 +2615,12 @@ pub enum MuxOpenError {
   /// NUT's raw video of a tag its tables do not hold, written under their
   /// first, RGB 5:5:5's (`nut.c` 50), and a stream header its reader
   /// refuses — an audio stream of no sample rate or channels, a
-  /// configuration of 2^30 bytes or more (`nutdec.c` 447–470).
+  /// configuration of 2^30 bytes or more (`nutdec.c` 447–470); and one
+  /// Ogg's start refuses — FLAC's short of its 34-byte STREAMINFO,
+  /// Speex's of its 80-byte header, Opus's of its 19-byte OpusHead,
+  /// Vorbis's and Theora's not three headers, Theora's first short of its
+  /// 42 bytes, whose fields Ogg reads — or an audio stream of no sample
+  /// rate, its granules' clock (`ogg_init`, `oggenc.c` 497–616).
   #[error("track {}'s configuration is not one {codec:?} in this container writes", .track.get())]
   ConfigurationInvalid {
     /// The track.
@@ -3260,6 +3311,41 @@ struct PacketRules {
   /// NUT: how it counts a time ([`NutTimes`]), and its key frames' order
   /// ([`FfmpegMuxRefusal::KeyFrameOrder`]).
   nut: Option<NutTimes>,
+  /// Ogg: the granule it writes of a packet ([`OggGranule`]).
+  ogg: Option<OggGranule>,
+  /// The duration libavformat hands a packet that states none — a video
+  /// frame's at the stream's frame rate, or a tick where its time base is
+  /// a millisecond or coarser; an audio packet's frame size where its
+  /// codec packs one — in the stream's ticks (`guess_pkt_duration`,
+  /// `mux.c` 605–633). Ogg's granule counts it.
+  guessed: Option<(TrackKind, i64)>,
+  /// Ogg: a lone Vorbis, FLAC or Opus stream, whose later packets'
+  /// strings metadata Ogg writes as a chained stream's tags.
+  ogg_metadata: bool,
+}
+
+/// How Ogg counts a packet's granule (`ogg_write_packet_internal`,
+/// `oggenc.c` 704–765).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OggGranule {
+  /// Theora: the key frame's presentation time, or its end where the
+  /// header's version is 3.2.1 or later, shifted by the header's key-frame
+  /// shift — a signed 64-bit shift (722–733).
+  Theora {
+    /// The key-frame shift.
+    shift: u32,
+    /// Whether the end is counted.
+    end: bool,
+  },
+  /// VP8: the end, shifted into the granule's upper 32 bits, signed
+  /// (739–748).
+  Vp8,
+  /// Every other codec: the end, Opus's initial padding added in its
+  /// ticks (734–736, 749–750).
+  End {
+    /// Opus's initial padding, in the stream's ticks.
+    padding: i128,
+  },
 }
 
 /// How NUT counts a stream's times (`put_tt`, `nutenc.c` 329–333; 1071–1073).
@@ -3601,6 +3687,7 @@ impl PacketRules {
         || (either_matroska && kind == TrackKind::Audio)
         || raw
         || asf
+        || matches!(audited, Audited::Ogg(_))
         || matches!(
           audited,
           Audited::Adts | Audited::Flac | Audited::Mp3 | Audited::Wav { .. } | Audited::Ivf
@@ -3725,6 +3812,9 @@ impl PacketRules {
       }),
       asf,
       nut: None,
+      ogg: matches!(audited, Audited::Ogg(_)).then(|| ogg_granule(codec, time_base)),
+      guessed: None,
+      ogg_metadata: false,
     }
   }
 }
@@ -5363,6 +5453,10 @@ struct SideRules {
   format: i32,
   /// The stream's configuration: new extradata equal to it changes nothing.
   extradata: Vec<u8>,
+  /// Whether the stream is the file's only one: Ogg writes a lone Vorbis,
+  /// FLAC or Opus stream's later strings metadata as a chained stream's
+  /// tags.
+  alone: bool,
 }
 
 impl SideRules {
@@ -5379,6 +5473,7 @@ impl SideRules {
       initial_padding: 0,
       format: -1,
       extradata: Vec::new(),
+      alone: false,
     }
   }
 
@@ -5395,6 +5490,7 @@ impl SideRules {
       initial_padding: codec.initial_padding(),
       format: codec.format(),
       extradata: codec.extradata().to_vec(),
+      alone: false,
     }
   }
 
@@ -5410,7 +5506,7 @@ impl SideRules {
     if self.family == Family::Other {
       self
         .audited
-        .and_then(|audited| self.audited_fate(audited, entry))
+        .and_then(|audited| self.audited_fate(audited, entry, first))
     } else if is(T::AV_PKT_DATA_NEW_EXTRADATA) {
       // MP4 writes new extradata as a sample description from the packet
       // on, or as the configuration of a track that had none (`movenc.c`
@@ -5485,7 +5581,12 @@ impl SideRules {
   /// is kept, or possibly; the rest is dropped. An entry that says nothing
   /// — empty new extradata or new extradata equal to the stream's, skip
   /// samples of none — is no loss.
-  fn audited_fate(&self, audited: Audited, entry: &SideDataEntry) -> Option<SideDataFate> {
+  fn audited_fate(
+    &self,
+    audited: Audited,
+    entry: &SideDataEntry,
+    first: bool,
+  ) -> Option<SideDataFate> {
     use AVPacketSideDataType as T;
     use SideDataFate::{Dropped, PossiblyDropped};
     let is = |kind: T| entry.kind() == kind as i32;
@@ -5535,8 +5636,37 @@ impl SideRules {
     {
       return None;
     }
+    // Ogg writes a lone Vorbis, FLAC or Opus stream's strings metadata on
+    // a packet after its first as a chained stream's tags: its trailer,
+    // then its start and header again (`ogg_check_new_metadata`,
+    // `oggenc.c` 660–702).
+    if is(T::AV_PKT_DATA_STRINGS_METADATA)
+      && matches!(audited, Audited::Ogg(_))
+      && self.alone
+      && !first
+      && [CodecId::VORBIS, CodecId::FLAC, CodecId::OPUS].contains(&self.codec)
+    {
+      return None;
+    }
     if is(T::AV_PKT_DATA_SKIP_SAMPLES) {
       if data.iter().all(|&byte| byte == 0) {
+        return None;
+      }
+      // Ogg Opus: the first packet's start skip that is the stream's
+      // initial padding, its pre-skip, which its OpusHead carries and its
+      // granules count (`oggenc.c` 734–736); an end skip Ogg writes not —
+      // a packet's end is its duration's.
+      let skips = |at: usize| {
+        data
+          .get(at..at + 4)
+          .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+      };
+      if matches!(audited, Audited::Ogg(_))
+        && self.codec == CodecId::OPUS
+        && first
+        && i64::from(skips(0).unwrap_or(0)) == i64::from(self.initial_padding)
+        && skips(4) == Some(0)
+      {
         return None;
       }
       // MP3's LAME tag: the first start skip and the last end skip, each
@@ -5818,6 +5948,12 @@ where
     }
     // MP4's default selection, which needs the whole table (table E).
     let defaults_added = mp4_defaults_added(family, &tracks, &roads);
+    // Ogg writes chapters into an Opus stream's tags alone.
+    let ogg_opus = matches!(audited, Audited::Ogg(_))
+      && tracks
+        .iter()
+        .zip(&roads)
+        .any(|(description, road)| *road == Road::Timed && description.codec() == CodecId::OPUS);
 
     let strict = output.strict_decode_times();
     let mut states = Vec::with_capacity(tracks.len());
@@ -5969,7 +6105,7 @@ where
       (family, audited),
       chapters,
       &spans,
-      movie_timescale,
+      (movie_timescale, ogg_opus),
     ));
     for (index, (chapter, (start, end))) in chapters.iter().zip(spans).enumerate() {
       output
@@ -6014,6 +6150,10 @@ where
     };
 
     let shifts = output.shifts_early_times();
+    let ogg_streams = states
+      .iter()
+      .filter(|(_, stream, _, _)| stream.is_some())
+      .count();
     let mut track_states = Vec::with_capacity(states.len());
     for (index, (kind, stream, road, filter)) in states.into_iter().enumerate() {
       let track = TrackIndex::new(index);
@@ -6037,6 +6177,18 @@ where
             (time_base, shifts),
             (header, bounds.file),
           );
+          // Ogg counts the duration libavformat hands into its granule, and
+          // writes a lone Vorbis, FLAC or Opus stream's later metadata as a
+          // chained stream's tags (table H).
+          if matches!(audited, Audited::Ogg(_)) {
+            let frame_rate = match tracks[index].params() {
+              TrackParams::Video(params) => params.frame_rate(),
+              _ => None,
+            };
+            rules.guessed = Some((kind, guessed_duration(kind, &codec, frame_rate, time_base)));
+            rules.ogg_metadata = ogg_streams == 1
+              && [CodecId::VORBIS, CodecId::FLAC, CodecId::OPUS].contains(&codec.codec());
+          }
           if audited == Audited::Nut {
             rules.nut = Some(NutTimes {
               count: nut_count.max(1),
@@ -6069,6 +6221,7 @@ where
               Some((codec.extradata().len() + language) as u64 + TTML_DOCUMENT_OVERHEAD);
           }
           sides = SideRules::of((family, audited), kind, &codec);
+          sides.alone = ogg_streams == 1;
           Some((stream, time_base))
         }
         // An attachment stream takes no packet; a cover takes its one,
@@ -7009,6 +7162,51 @@ fn check_packet_rules(
         });
       }
     }
+    // Ogg's granule (`ogg_write_packet_internal`, `oggenc.c` 718–750), of
+    // the presentation time and the duration libavformat hands — a
+    // negative one zero, a missing one its guess (`mux.c` 605–633). Ogg
+    // writes negative times as they are (`AVFMT_TS_NEGATIVE`).
+    if let Some(granule) = rules.ogg {
+      let pts = i128::from(output.pts_ticks.unwrap_or(output.dts_ticks)) + lift;
+      let stated = output.duration_ticks;
+      let guess = match rules.guessed {
+        Some((TrackKind::Audio, _)) if payload.bytes.is_empty() => 0,
+        Some((_, guess)) => guess,
+        None => 0,
+      };
+      let duration = i128::from(if stated > 0 { stated } else { guess });
+      let wraps = || {
+        Err(FfmpegMuxRefusal::TimeWraps {
+          track,
+          timestamp: output.pts.unwrap_or(output.dts),
+        })
+      };
+      match granule {
+        OggGranule::Theora { shift, end } => {
+          let counted = if end { pts + duration } else { pts };
+          if !(0..1_i128 << (63 - shift)).contains(&counted) {
+            return wraps();
+          }
+        }
+        OggGranule::Vp8 => {
+          if !(0..1_i128 << 31).contains(&(pts + duration)) {
+            return wraps();
+          }
+        }
+        OggGranule::End { padding } => {
+          let end = pts + duration + padding;
+          if end > i128::from(i64::MAX) || end < i128::from(i64::MIN) {
+            return wraps();
+          }
+          if end == -1 {
+            return Err(FfmpegMuxRefusal::UnsetGranule {
+              track,
+              end: Timestamp::new(-1, time_base),
+            });
+          }
+        }
+      }
+    }
   }
   // A cue before the end MP4 marks the last one with, which MP4 takes as
   // it is — the last cue shortened to it — unless another track's packet
@@ -7023,6 +7221,18 @@ fn check_packet_rules(
   let refused = |rule| Err(FfmpegMuxRefusal::Payload { track, rule });
   if rules.no_empty && payload.bytes.is_empty() && !config_only {
     return refused(PayloadRule::Empty);
+  }
+  // Ogg's metadata update, on a later packet of a lone Vorbis, FLAC or Opus
+  // stream (`ogg_check_new_metadata`, `oggenc.c` 660–702).
+  if rules.ogg_metadata
+    && state.written
+    && side_data(
+      payload.side_data,
+      AVPacketSideDataType::AV_PKT_DATA_STRINGS_METADATA,
+    )
+    .is_some_and(|data| !dictionary_unpacks(data))
+  {
+    return refused(PayloadRule::MetadataUpdate);
   }
   // AAC's filter converts the packet where it is inserted — at the track's
   // first packet, or at this one.
@@ -8050,6 +8260,50 @@ where
     }
     Audited::Ivf
       if ticket.width() > i32::from(u16::MAX) || ticket.height() > i32::from(u16::MAX) =>
+    {
+      Some(MuxOpenError::Dimensions { track })
+    }
+    // Ogg's start takes Vorbis, Theora, Speex, FLAC, Opus and VP8 alone, a
+    // configuration for each but VP8 — FLAC's STREAMINFO of 34 bytes,
+    // Speex's header of 80, Opus's OpusHead of 19, Vorbis's and Theora's
+    // three headers, Theora's first of its 42 bytes — and an audio
+    // stream's sample rate, its granules' clock (`ogg_init`, `oggenc.c`
+    // 497–616; `ogg_build_*_headers`, 319–470); VP8's header counts the
+    // width and height in 16 bits, the aspect ratio's terms in 24
+    // (431–436).
+    Audited::Ogg(_)
+      if ![
+        CodecId::VORBIS,
+        THEORA,
+        SPEEX,
+        CodecId::FLAC,
+        CodecId::OPUS,
+        CodecId::VP8,
+      ]
+      .contains(&codec) =>
+    {
+      Some(MuxOpenError::CodecNotCarried { track, codec })
+    }
+    Audited::Ogg(_) if extradata.is_empty() && codec != CodecId::VP8 => {
+      Some(MuxOpenError::ConfigurationMissing { track, codec })
+    }
+    Audited::Ogg(_)
+      if (codec == CodecId::FLAC && extradata.len() < FLAC_STREAMINFO_BYTES)
+        || (codec == SPEEX && extradata.len() < 80)
+        || (codec == CodecId::OPUS && extradata.len() < 19)
+        || (codec == CodecId::VORBIS && xiph_headers(extradata, 30).is_none())
+        || (codec == THEORA
+          && xiph_headers(extradata, 42).is_none_or(|headers| headers[0].len() < 42))
+        || (description.kind() == TrackKind::Audio && ticket.sample_rate() <= 0) =>
+    {
+      Some(MuxOpenError::ConfigurationInvalid { track, codec })
+    }
+    Audited::Ogg(_)
+      if codec == CodecId::VP8
+        && (!(0..=i32::from(u16::MAX)).contains(&ticket.width())
+          || !(0..=i32::from(u16::MAX)).contains(&ticket.height())
+          || !(0..1 << 24).contains(&ticket.sample_aspect_ratio().num())
+          || !(0..1 << 24).contains(&ticket.sample_aspect_ratio().den())) =>
     {
       Some(MuxOpenError::Dimensions { track })
     }
@@ -9473,6 +9727,146 @@ fn nut_time_base(kind: TrackKind, sample_rate: i32, (num, den): (i32, i32)) -> (
   (num as i32, den as i32)
 }
 
+/// How Ogg counts `codec`'s granule, in `time_base` — the stream's as its
+/// start set it (`ogg_init`, `oggenc.c` 497–616).
+fn ogg_granule(codec: &StreamCodec, time_base: Timebase) -> OggGranule {
+  match codec.codec() {
+    THEORA => {
+      // The key-frame shift and the version of the identification header
+      // (`oggenc.c` 606–619), which the open holds 42 bytes at least.
+      let header = xiph_headers(codec.extradata(), 42).map_or(&[][..], |headers| headers[0]);
+      let byte = |at: usize| header.get(at).copied().unwrap_or(0);
+      OggGranule::Theora {
+        shift: (u32::from(byte(40) & 3) << 3) | u32::from(byte(41) >> 5),
+        end: byte(9) >= 1,
+      }
+    }
+    CodecId::VP8 => OggGranule::Vp8,
+    id => OggGranule::End {
+      padding: if id == CodecId::OPUS && codec.sample_rate() > 0 {
+        rescale_nearest(
+          i128::from(codec.initial_padding()) * i128::from(time_base.den().get()),
+          1,
+          i128::from(codec.sample_rate()) * i128::from(time_base.num()),
+        )
+        .into()
+      } else {
+        0
+      },
+    },
+  }
+}
+
+/// The duration libavformat hands a packet of `kind` that states none, in
+/// ticks of `time_base` (`guess_pkt_duration`, `mux.c` 605–633): a video
+/// frame's at `frame_rate`, or a tick where the time base is a millisecond
+/// or coarser; an audio packet's frame size where the codec packs one
+/// (`av_get_audio_frame_duration2`, `libavcodec/utils.c` 797–821), at the
+/// stream's sample rate. Each rescale rounds to the nearest.
+fn guessed_duration(
+  kind: TrackKind,
+  codec: &StreamCodec,
+  frame_rate: Option<Timebase>,
+  time_base: Timebase,
+) -> i64 {
+  let (num, den) = (
+    i128::from(time_base.num()),
+    i128::from(time_base.den().get()),
+  );
+  match kind {
+    TrackKind::Video => match frame_rate {
+      Some(rate) if rate.num() > 0 => rescale_nearest(
+        den * i128::from(rate.den().get()),
+        1,
+        i128::from(rate.num()) * num,
+      ),
+      _ if num * 1000 > den => 1,
+      _ => 0,
+    },
+    TrackKind::Audio if codec.frame_size() > 1 && codec.sample_rate() > 0 => rescale_nearest(
+      i128::from(codec.frame_size()) * den,
+      1,
+      i128::from(codec.sample_rate()) * num,
+    ),
+    _ => 0,
+  }
+}
+
+/// Whether `data` unpacks as libavformat's dictionary: empty, or
+/// key-value pairs, each terminated, no key empty
+/// (`av_packet_unpack_dictionary`, `libavcodec/packet.c` 349–371).
+fn dictionary_unpacks(data: &[u8]) -> bool {
+  if data.is_empty() {
+    return true;
+  }
+  if data.last() != Some(&0) {
+    return false;
+  }
+  let mut at = 0;
+  while at < data.len() {
+    let key = data[at..].iter().position(|&byte| byte == 0).unwrap_or(0);
+    let value = at + key + 1;
+    if key == 0 || value >= data.len() {
+      return false;
+    }
+    let length = data[value..]
+      .iter()
+      .position(|&byte| byte == 0)
+      .unwrap_or(0);
+    at = value + length + 1;
+  }
+  true
+}
+
+/// The three headers of a Vorbis or Theora configuration, as
+/// `avpriv_split_xiph_headers` splits it (`libavcodec/xiph.c` 25–66): three
+/// lengths of 16 bits, the first `first`, each before its header; or 2,
+/// then two lengths in Xiph lacing — runs of 255 and a last byte — the
+/// third header the rest. A byte read past the end is the padding's, 0.
+fn xiph_headers(extradata: &[u8], first: usize) -> Option<[&[u8]; 3]> {
+  let size = extradata.len();
+  let byte = |at: usize| extradata.get(at).copied().unwrap_or(0);
+  let mut lengths = [0usize; 3];
+  let mut starts = [0usize; 3];
+  if size >= 6 && usize::from(u16::from_be_bytes([byte(0), byte(1)])) == first {
+    let (mut at, mut overall) = (0, 6);
+    for index in 0..3 {
+      lengths[index] = usize::from(u16::from_be_bytes([byte(at), byte(at + 1)]));
+      starts[index] = at + 2;
+      at += 2 + lengths[index];
+      if size < lengths[index] || overall > size - lengths[index] {
+        return None;
+      }
+      overall += lengths[index];
+    }
+  } else if size >= 3 && size < i32::MAX as usize - 0x1ff && byte(0) == 2 {
+    let (mut at, mut overall) = (1, 3);
+    for length in lengths.iter_mut().take(2) {
+      while overall < size && byte(at) == 0xff {
+        *length += 0xff;
+        overall += 0xff + 1;
+        at += 1;
+      }
+      *length += usize::from(byte(at));
+      overall += usize::from(byte(at));
+      if overall > size {
+        return None;
+      }
+      at += 1;
+    }
+    lengths[2] = size - overall;
+    starts = [at, at + lengths[0], at + lengths[0] + lengths[1]];
+  } else {
+    return None;
+  }
+  let header = |index: usize| extradata.get(starts[index]..starts[index] + lengths[index]);
+  Some([header(0)?, header(1)?, header(2)?])
+}
+
+/// Theora and Speex, which the base names no constants for.
+const THEORA: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_THEORA as i32);
+const SPEEX: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_SPEEX as i32);
+
 /// The time bases NUT's header will count: its streams', as
 /// [`nut_time_base`] sets them, and its chapters', each once.
 fn nut_time_base_count<D: AsRef<[u8]>>(
@@ -9733,7 +10127,7 @@ fn chapter_losses(
   (family, audited): (Family, Audited),
   chapters: &[Chapter<Ffmpeg>],
   spans: &[(i64, i64)],
-  movie_timescale: i64,
+  (movie_timescale, ogg_opus): (i64, bool),
 ) -> Vec<Uncarried> {
   let mut lost = Vec::new();
   match family {
@@ -9747,9 +10141,12 @@ fn chapter_losses(
           });
         }
         let base = chapter.timebase();
+        // Where the next starts as written: a start the timescale does not
+        // count moves this chapter's end with it.
         let ends_where_the_next_starts = match (chapters.get(index + 1), spans.get(index + 1)) {
           (Some(next), Some(&(next_start, _))) => {
             same_instant(end, base, next_start, next.timebase())
+              && counts_exactly(next_start, next.timebase(), movie_units)
           }
           _ => counts_exactly(end, base, movie_units),
         };
@@ -9813,6 +10210,55 @@ fn chapter_losses(
       // and ends each where the next starts, the last at the file's end
       // (`asf_write_markers`, `asfenc.c` 311–347; `asf_read_marker`,
       // `asfdec_f.c` 661–697; `compute_chapters_end`, `demux.c` 2250–2285).
+      // Ogg's, in each Opus stream's tags alone, as Vorbis comments — the
+      // first 1000, numbered by position from 0, a start of whole seconds
+      // rounded to the nearest and its milliseconds, rounded apart, and no
+      // end (`ff_vorbiscomment_write`, `vorbiscomment.c` 62–115); its
+      // reader takes a start of two-digit hours alone and ends each where
+      // the next starts, the last at the file's end (`ogm_chapter`,
+      // `oggparsevorbis.c` 43–72; `compute_chapters_end`, `demux.c`
+      // 2250–2285). Without an Opus stream none is written.
+      Audited::Ogg(_) if ogg_opus => {
+        // Each start as written, in milliseconds — none for a chapter past
+        // the thousandth, or at a hundred hours or later, which the reader
+        // drops.
+        let written: Vec<Option<i128>> = chapters
+          .iter()
+          .zip(spans)
+          .enumerate()
+          .map(|(index, (chapter, &(start, _)))| {
+            let base = chapter.timebase();
+            let (num, den) = (i128::from(base.num()), i128::from(base.den().get()));
+            let seconds = rescale_nearest(i128::from(start) * num, 1, den);
+            (index < 1000 && seconds < 100 * 3600).then(|| {
+              i128::from(seconds) * 1000
+                + i128::from(rescale_nearest(i128::from(start) * num * 1000, 1, den)) % 1000
+            })
+          })
+          .collect();
+        for (index, (chapter, &(start, end))) in chapters.iter().zip(spans).enumerate() {
+          let Some(written_start) = written[index] else {
+            lost.push(Uncarried::Chapter { chapter: index });
+            continue;
+          };
+          if chapter.id() != index as i64 {
+            lost.push(Uncarried::ChapterId {
+              chapter: index,
+              id: chapter.id(),
+            });
+          }
+          let base = chapter.timebase();
+          let at_ms = |count: i64, ms: i128| {
+            i128::from(count) * i128::from(base.num()) * 1000 == ms * i128::from(base.den().get())
+          };
+          // The reader ends it where the next chapter it reads starts.
+          let next_start = written.iter().skip(index + 1).flatten().next();
+          let ends_there = next_start.is_some_and(|&next| at_ms(end, next));
+          if !at_ms(start, written_start) || !ends_there {
+            lost.push(Uncarried::ChapterSpan { chapter: index });
+          }
+        }
+      }
       // NUT's: a start and a length in the chapter's own time base, exact;
       // numbered by position from 1 (`write_chapter`, `nutenc.c` 587–612;
       // `nutdec.c` 525–534).
@@ -9840,6 +10286,7 @@ fn chapter_losses(
           let ends_where_the_next_starts = match (chapters.get(index + 1), spans.get(index + 1)) {
             (Some(next), Some(&(next_start, _))) => {
               same_instant(end, base, next_start, next.timebase())
+                && counts_exactly(next_start, next.timebase(), HUNDRED_NANOSECONDS)
             }
             _ => false,
           };

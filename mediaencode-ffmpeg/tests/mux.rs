@@ -8867,6 +8867,584 @@ fn l90_nut_refuses_what_its_frames_and_index_cannot_hold() {
   assert_eq!(titles, [(Some("half".to_owned()), (0, 250))]);
 }
 
+/// `row` as `codec`, its configuration `extradata`: its ticket's codec id
+/// and its parameters' rewritten, everything else kept.
+fn recoded(
+  row: TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>,
+  codec: ffmpeg_next::ffi::AVCodecID,
+  extradata: &[u8],
+) -> TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket> {
+  use mediaencode::mediaspine::demuxer::{AudioTrackParams, VideoTrackParams};
+  let index = row.side_data().stream_index();
+  let mut parameters = row.side_data().rebuild().expect("the parameters");
+  // SAFETY: `parameters` owns its `AVCodecParameters`, live for the
+  // write; `codec_id` is a plain field, written a value of its own enum.
+  unsafe {
+    (*parameters.as_mut_ptr()).codec_id = codec;
+  }
+  let ticket = CodecTicket::mirror(&parameters, index, usize::MAX).expect("the ticket");
+  let id = CodecId::from_raw(codec as i32);
+  let (timebase, params, _, _, language, disposition, _) = row.into_parts_with_disposition();
+  let params = match params {
+    TrackParams::Video(params) => TrackParams::Video(VideoTrackParams::new(
+      id,
+      params.width(),
+      params.height(),
+      params.pixel_format().clone(),
+      params.frame_rate(),
+    )),
+    TrackParams::Audio(params) => TrackParams::Audio(AudioTrackParams::new(
+      id,
+      params.sample_rate(),
+      params.channel_count(),
+      params.sample_format(),
+      params.channel_layout().clone(),
+    )),
+    other => other,
+  };
+  TrackDescription::new(timebase, params, ticket)
+    .expect("a timed track")
+    .with_extradata(Some(bytes_of(extradata)))
+    .with_language(language)
+    .with_disposition(disposition)
+}
+
+/// Every packet of `path` written into a muxer of `container` over `table`
+/// at `target`, each as it is; the report.
+fn remuxed(
+  path: &Path,
+  target: &Path,
+  container: &str,
+  table: Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>>,
+  chapters: &[Chapter<Ffmpeg>],
+) -> mediaencode_ffmpeg::MuxReport {
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(target).expect("create"),
+    ContainerName::new(container),
+    table,
+    chapters,
+    PacketLimits::default(),
+  )
+  .expect("open");
+  let mut demuxer = FfmpegOwnedDemuxer::open(path).expect("open");
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    match packet {
+      DemuxedPacket::Video(p) => muxer
+        .write_video(VideoTrackPacket::new(p.track(), p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      DemuxedPacket::Audio(p) => muxer
+        .write_audio(AudioTrackPacket::new(p.track(), p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      other => panic!("{other:?}"),
+    }
+    .expect("a packet");
+  }
+  let report = muxer.report().clone();
+  muxer.finish().expect("finished");
+  report
+}
+
+/// Every packet of `target` reads back as `source`'s: its bytes, its key
+/// flag, and — on a track `timed` names — its presentation time within a
+/// millisecond of it, a reader counting it from the samples its source's
+/// milliseconds rounded.
+fn read_back_as(source: &Path, target: &Path, timed: &[usize]) {
+  let offered = packets(source);
+  let back = packets(target);
+  assert_eq!(back.len(), offered.len());
+  for (track, (seen, sent)) in back.iter().zip(&offered).enumerate() {
+    assert_eq!(seen.len(), sent.len(), "track {track}: a packet a packet");
+    for (index, (seen, sent)) in seen.iter().zip(sent).enumerate() {
+      assert!(seen.bytes == sent.bytes, "track {track}/{index}: the bytes");
+      assert_eq!(seen.key, sent.key, "track {track}/{index}: the key flag");
+      let (seen_ms, sent_ms) = (in_ms(seen.pts), in_ms(sent.pts));
+      assert!(
+        !timed.contains(&track)
+          || matches!((seen_ms, sent_ms), (Some(a), Some(b)) if (a - b).abs() <= 1),
+        "track {track}/{index}: presented at {seen_ms:?}, offered at {sent_ms:?}"
+      );
+    }
+  }
+}
+
+/// **L91 — VP8 and Vorbis, Opus, and FLAC round-trip through Ogg, and the
+/// report says what Ogg keeps** (table H; `oggenc.c` 497–765): every
+/// packet reads back with its bytes and its key flag, and each contiguous
+/// stream with its times — Ogg writes no time a packet keeps of its own, a
+/// page the granule of its last, a reader counting the others' times from
+/// the samples or frames ([`Rewrite::Timeline`], at open), and VP8's key
+/// frames by the bitstream ([`Rewrite::SyncFromBitstream`]); a stream's
+/// language is kept. Chapters Ogg writes into an Opus stream's tags alone,
+/// numbered from 0 — a start's whole seconds rounded to the nearest and
+/// its milliseconds rounded apart, so that one at 1.6 s is written at 2.6
+/// s, and the chapter before it ends there ([`Uncarried::ChapterSpan`]) —
+/// and without an Opus stream none ([`Uncarried::Chapter`]). A lone Opus
+/// stream's later strings metadata Ogg writes as a chained stream's tags,
+/// not reported; the first packet's start skip, its pre-skip, its
+/// OpusHead carries; the file reads back whole.
+///
+/// PLANT: the written times not reported; the chapters' rule off, or the
+/// next chapter's start taken as declared, chapter 1's end unreported; the
+/// metadata update reported dropped.
+#[test]
+fn l91_streams_round_trip_through_ogg() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let rewritten = |track: usize, rewrite| Uncarried::Rewritten {
+    track: TrackIndex::new(track),
+    rewrite,
+  };
+  let chapter_lines = |report: &mediaencode_ffmpeg::MuxReport| {
+    lines(report, |line| {
+      matches!(
+        line,
+        Uncarried::Chapter { .. } | Uncarried::ChapterSpan { .. } | Uncarried::ChapterId { .. }
+      )
+    })
+  };
+
+  let source = picture_and_sound(
+    &corpus,
+    "vp8-vorbis.webm",
+    &["-c:v", "libvpx"],
+    &["-c:a", "vorbis", "-strict", "-2", "-ac", "2"],
+  );
+  let mut table = whole_table(&source);
+  table[0].set_language(Some("eng".into()));
+  table[1].set_language(Some("fra".into()));
+  let target = output(&corpus, "l91.ogg");
+  let report = remuxed(
+    &source,
+    &target,
+    "ogg",
+    table,
+    &[chapter_of(0, 0, 500, Some("one"))],
+  );
+  assert_eq!(
+    field_rows(&report),
+    vec![
+      rewritten(0, Rewrite::Timeline),
+      rewritten(0, Rewrite::SyncFromBitstream),
+      rewritten(1, Rewrite::Timeline),
+    ]
+  );
+  assert_eq!(
+    lines(&report, |line| matches!(line, Uncarried::Language { .. })),
+    vec![]
+  );
+  assert_eq!(
+    chapter_lines(&report),
+    vec![Uncarried::Chapter { chapter: 0 }]
+  );
+  // VP8's granule counts a frame's end (`oggenc.c` 739–748): the first
+  // frame, alone on its page as a key frame, Ogg's reader presents at its
+  // end less a tick (`vp8_gptopts`, `oggparsevp8.c`), each after it as it
+  // was offered — times the report's line says are not kept as given.
+  read_back_as(&source, &target, &[1]);
+  let late: Vec<_> = packets(&target)[0]
+    .iter()
+    .zip(&packets(&source)[0])
+    .map(|(seen, sent)| in_ms(seen.pts).zip(in_ms(sent.pts)).map(|(a, b)| a - b))
+    .collect();
+  assert_eq!(late[0], Some(39), "the first frame, at its end less a tick");
+  assert!(late[1..].iter().all(|late| *late == Some(0)), "{late:?}");
+  let read = FfmpegOwnedDemuxer::open(&target).expect("open");
+  let languages: Vec<_> = read
+    .tracks()
+    .iter()
+    .map(|row| row.language().map(|tag| tag.as_str().to_owned()))
+    .collect();
+  assert_eq!(languages, [Some("eng".to_owned()), Some("fra".to_owned())]);
+  assert!(read.chapters().is_empty());
+
+  let opus = opus_mkv(&corpus);
+  let chapters = [
+    chapter_of(0, 0, 1400, Some("one")),
+    chapter_of(1, 1400, 1600, Some("two")),
+    chapter_of(2, 1600, 2000, Some("three")),
+  ];
+  let target = output(&corpus, "l91.opus");
+  let (mut muxer, report) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::new("opus"),
+    table_of(&opus, TrackKind::Audio),
+    &chapters,
+    PacketLimits::default(),
+  )
+  .expect("open");
+  assert_eq!(
+    chapter_lines(&report),
+    vec![
+      Uncarried::ChapterSpan { chapter: 1 },
+      Uncarried::ChapterSpan { chapter: 2 },
+    ]
+  );
+  let (_, frames) = whole_track(&opus, TrackKind::Audio);
+  let skips = |packet: &DemuxedPacket<Ffmpeg, FfmpegBytes>| {
+    audio_of(packet)
+      .extra()
+      .side_data()
+      .iter()
+      .any(|entry| entry.kind() == T::AV_PKT_DATA_SKIP_SAMPLES as i32)
+  };
+  assert!(
+    skips(&frames[0]),
+    "the premise: the first packet's pre-skip"
+  );
+  let skipped = |report: &mediaencode_ffmpeg::MuxReport| {
+    lines(report, |line| {
+      matches!(
+        line,
+        Uncarried::SideData { kind, .. } if *kind == T::AV_PKT_DATA_SKIP_SAMPLES as i32
+      )
+    })
+  };
+  for (index, frame) in frames.iter().enumerate() {
+    if index == 1 {
+      assert_eq!(
+        skipped(muxer.report()),
+        vec![],
+        "the first packet's start skip, Opus's pre-skip, kept"
+      );
+    }
+    let mut packet = audio_of(frame);
+    if index == 3 {
+      packet.extra_mut().set_side_data(vec![side(
+        T::AV_PKT_DATA_STRINGS_METADATA,
+        b"title\0later\0",
+      )]);
+    }
+    muxer
+      .write_audio(AudioTrackPacket::new(TrackIndex::new(0), packet))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  assert!(
+    lines(muxer.report(), |line| matches!(
+      line,
+      Uncarried::SideData { kind, .. } if *kind == T::AV_PKT_DATA_STRINGS_METADATA as i32
+    ))
+    .is_empty(),
+    "written as a chained stream's tags"
+  );
+  muxer.finish().expect("finished");
+  read_back_as(&opus, &target, &[0]);
+  let read = FfmpegOwnedDemuxer::open(&target).expect("open");
+  let read_chapters: Vec<_> = read
+    .chapters()
+    .iter()
+    .map(|chapter| {
+      (
+        chapter.id(),
+        chapter.title().map(|title| title.as_str().to_owned()),
+        span_ms(chapter).0,
+      )
+    })
+    .collect();
+  assert_eq!(
+    read_chapters,
+    [
+      (0, Some("one".to_owned()), 0),
+      (1, Some("two".to_owned()), 1400),
+      (2, Some("three".to_owned()), 2600),
+    ]
+  );
+
+  let flac = audio_file(&corpus, "flac.mkv", "flac");
+  let target = output(&corpus, "l91.oga");
+  let report = remuxed(
+    &flac,
+    &target,
+    "oga",
+    table_of(&flac, TrackKind::Audio),
+    &[],
+  );
+  assert_eq!(field_rows(&report), vec![rewritten(0, Rewrite::Timeline)]);
+  read_back_as(&flac, &target, &[0]);
+}
+
+/// **L92 — Ogg's refusals** (table H; `oggenc.c` 319–765): at open, a
+/// codec Ogg's start does not take ([`MuxOpenError::CodecNotCarried`]);
+/// Opus with no configuration ([`MuxOpenError::ConfigurationMissing`]); a
+/// configuration Ogg's start refuses — Opus's shorter than its 19-byte
+/// OpusHead, FLAC's than its STREAMINFO, Speex's than its 80-byte header,
+/// Vorbis's that does not split into three headers, Theora's whose first
+/// is shorter than its 42 bytes — and an audio stream of no sample rate
+/// ([`MuxOpenError::ConfigurationInvalid`]), each a byte longer opening;
+/// VP8 of a width past 16 bits or an aspect ratio's term past 24
+/// ([`MuxOpenError::Dimensions`]). In packets: an empty packet, which its
+/// reader drops, moving the next ([`PayloadRule::Empty`]); a VP8 frame
+/// ending at 2^31 ticks or before zero — of no duration, at the frame rate
+/// libavformat guesses it — and a Theora frame ending at 2^57, past their
+/// granules' signed shifts ([`FfmpegMuxRefusal::TimeWraps`]), a tick
+/// earlier taken; an Opus packet whose granule, its pre-skip added, is
+/// −1 ([`FfmpegMuxRefusal::UnsetGranule`]); a lone Opus stream's later
+/// metadata update that does not unpack ([`PayloadRule::MetadataUpdate`])
+/// — on its first packet ignored, and taken.
+///
+/// PLANT: each check removed takes its packet, or opens.
+#[test]
+fn l92_ogg_refuses_what_its_start_and_granules_cannot_hold() {
+  use ffmpeg_next::ffi::{AVCodecID as Id, AVPacketSideDataType as T};
+  let Some(corpus) = Corpus::new() else { return };
+  let open = |name: &str, container: &str, table| {
+    let target = output(&corpus, name);
+    let result = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new(container),
+      table,
+      &[],
+      PacketLimits::default(),
+    );
+    match result {
+      Ok((muxer, _)) => {
+        muxer.finish().expect("finished");
+        Ok(())
+      }
+      Err(error) => {
+        assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+        Err(error)
+      }
+    }
+  };
+  let opus = opus_mkv(&corpus);
+  let vp8 = picture_and_sound(
+    &corpus,
+    "vp8-vorbis.webm",
+    &["-c:v", "libvpx"],
+    &["-c:a", "vorbis", "-strict", "-2", "-ac", "2"],
+  );
+  let opus_row = || table_of(&opus, TrackKind::Audio).remove(0);
+  let video_row = || table_of(&vp8, TrackKind::Video).remove(0);
+
+  assert!(matches!(
+    open(
+      "l92-aac.ogg",
+      "ogg",
+      table_of(&corpus.multi_track_mkv(), TrackKind::Audio)
+    ),
+    Err(MuxOpenError::CodecNotCarried { .. })
+  ));
+  assert!(matches!(
+    open(
+      "l92-bare.opus",
+      "opus",
+      vec![opus_row().with_extradata(Some(bytes_of(&[])))]
+    ),
+    Err(MuxOpenError::ConfigurationMissing { .. })
+  ));
+  let head = opus_row().side_data().extradata_ref().as_ref().to_vec();
+  assert!(head.len() >= 19, "the premise");
+  assert!(matches!(
+    open(
+      "l92-opus.opus",
+      "opus",
+      vec![opus_row().with_extradata(Some(bytes_of(&head[..18])))]
+    ),
+    Err(MuxOpenError::ConfigurationInvalid { .. })
+  ));
+  open(
+    "l92-opus.opus",
+    "opus",
+    vec![opus_row().with_extradata(Some(bytes_of(&head[..19])))],
+  )
+  .expect("an OpusHead of its 19 bytes");
+  for (name, codec, short, long) in [
+    (
+      "l92-flac.oga",
+      Id::AV_CODEC_ID_FLAC,
+      vec![0; 33],
+      vec![0; 34],
+    ),
+    (
+      "l92-speex.spx",
+      Id::AV_CODEC_ID_SPEEX,
+      vec![0; 79],
+      vec![0; 80],
+    ),
+  ] {
+    assert!(
+      matches!(
+        open(name, "ogg", vec![recoded(opus_row(), codec, &short)]),
+        Err(MuxOpenError::ConfigurationInvalid { .. })
+      ),
+      "{name}"
+    );
+    open(name, "ogg", vec![recoded(opus_row(), codec, &long)])
+      .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+  }
+  assert!(matches!(
+    open(
+      "l92-vorbis.ogg",
+      "ogg",
+      vec![recoded(opus_row(), Id::AV_CODEC_ID_VORBIS, &[3, 0, 0])]
+    ),
+    Err(MuxOpenError::ConfigurationInvalid { .. })
+  ));
+  // Theora's headers, laced: an identification header of `first` bytes,
+  // a comment header of one, a setup header of one.
+  let theora = |first: usize| {
+    let mut extradata = vec![2, u8::try_from(first).expect("a byte"), 1];
+    let mut identification = vec![0; first];
+    if first >= 42 {
+      identification[..7].copy_from_slice(b"\x80theora");
+      identification[7..10].copy_from_slice(&[3, 2, 1]);
+      identification[22..26].copy_from_slice(&25_u32.to_be_bytes());
+      identification[26..30].copy_from_slice(&1_u32.to_be_bytes());
+      identification[41] = 6 << 5;
+    }
+    extradata.extend(identification);
+    extradata.extend([0x81, 0x82]);
+    extradata
+  };
+  assert!(matches!(
+    open(
+      "l92-theora.ogg",
+      "ogg",
+      vec![recoded(video_row(), Id::AV_CODEC_ID_THEORA, &theora(41))]
+    ),
+    Err(MuxOpenError::ConfigurationInvalid { .. })
+  ));
+  assert!(matches!(
+    open("l92-rate.opus", "opus", audio_rated(&opus, 0)),
+    Err(MuxOpenError::ConfigurationInvalid { .. })
+  ));
+  assert!(matches!(
+    open("l92-wide.ogg", "ogg", video_sized(&vp8, 65_536, 48)),
+    Err(MuxOpenError::Dimensions { .. })
+  ));
+  open("l92-wide.ogg", "ogg", video_sized(&vp8, 65_535, 48)).expect("16 bits");
+
+  // An empty packet, and VP8's granule: the end in its upper 32 bits.
+  let (table, frames) = first_track(&vp8, TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  let track = TrackIndex::new(0);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l92-vp8.ogg"),
+    ContainerName::new("ogg"),
+    table,
+  );
+  let empty = VideoTrackPacket::new(track, video_holding(&frame, &[]));
+  let (refusal, back) = by_container(muxer.write_video(empty.clone()));
+  assert_eq!(refusal, payload(PayloadRule::Empty));
+  untouched!(empty, back);
+  let lasting = |pts: i64, duration: i64| {
+    VideoTrackPacket::new(
+      track,
+      frame
+        .clone()
+        .with_pts(Some(ms(pts)))
+        .with_dts(Some(ms(pts)))
+        .with_duration(Some(ms(duration))),
+    )
+  };
+  let wrap = 1_i64 << 31;
+  for (offered, pts) in [
+    (lasting(-40, 39), -40),
+    (lasting(wrap - 40, 40), wrap - 40),
+    (lasting(wrap - 40, 0), wrap - 40),
+  ] {
+    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    assert_eq!(
+      refusal,
+      FfmpegMuxRefusal::TimeWraps {
+        track,
+        timestamp: ms(pts),
+      },
+      "presented at {pts}"
+    );
+    untouched!(offered, back);
+  }
+  muxer
+    .write_video(lasting(wrap - 41, 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("ending a tick before 2^31, at the guessed frame");
+  muxer.finish().expect("finished");
+
+  // Theora's: the end shifted by the header's six bits.
+  let mut muxer = muxer_into(
+    &output(&corpus, "l92-theora.ogg"),
+    ContainerName::new("ogg"),
+    vec![recoded(video_row(), Id::AV_CODEC_ID_THEORA, &theora(42))],
+  );
+  let frame_rate = Timebase::new(1, NonZeroI32::new(25).expect("non-zero"));
+  let theora_frame = |pts: i64| {
+    VideoTrackPacket::new(
+      track,
+      video_holding(&frame, &[0x40, 1, 2])
+        .with_pts(Some(Timestamp::new(pts, frame_rate)))
+        .with_dts(Some(Timestamp::new(pts, frame_rate)))
+        .with_duration(Some(Timestamp::new(1, frame_rate)))
+        .with_flags(PacketFlags::KEY),
+    )
+  };
+  let past = theora_frame((1 << 57) - 1);
+  let (refusal, back) = by_container(muxer.write_video(past.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track,
+      timestamp: Timestamp::new((1 << 57) - 1, frame_rate),
+    }
+  );
+  untouched!(past, back);
+  muxer
+    .write_video(theora_frame((1 << 57) - 2))
+    .map_err(|error| error.map_packet(drop))
+    .expect("ending a frame before 2^57");
+  muxer.finish().expect("finished");
+
+  // Opus's granule, its pre-skip added; a lone stream's metadata update.
+  let (table, frames) = first_track(&opus, TrackKind::Audio, 3);
+  let skip = table[0].side_data().initial_padding();
+  assert!(skip > 0, "the premise: a pre-skip");
+  let at_48k = Timebase::new(1, NonZeroI32::new(48_000).expect("non-zero"));
+  let mut muxer = muxer_into(
+    &output(&corpus, "l92-granule.opus"),
+    ContainerName::new("opus"),
+    table,
+  );
+  let ending = |pts: i64, frame: &DemuxedPacket<Ffmpeg, FfmpegBytes>, metadata: Option<&[u8]>| {
+    let mut packet = audio_of(frame)
+      .with_pts(Some(Timestamp::new(pts, at_48k)))
+      .with_dts(Some(Timestamp::new(pts, at_48k)))
+      .with_duration(Some(Timestamp::new(960, at_48k)));
+    if let Some(metadata) = metadata {
+      packet
+        .extra_mut()
+        .set_side_data(vec![side(T::AV_PKT_DATA_STRINGS_METADATA, metadata)]);
+    }
+    AudioTrackPacket::new(track, packet)
+  };
+  let unset = ending(-961 - i64::from(skip), &frames[0], None);
+  let (refusal, back) = by_container(muxer.write_audio(unset.clone()));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::UnsetGranule {
+      track,
+      end: Timestamp::new(-1, at_48k),
+    }
+  );
+  untouched!(unset, back);
+  muxer
+    .write_audio(ending(-960 - i64::from(skip), &frames[0], Some(b"title")))
+    .map_err(|error| error.map_packet(drop))
+    .expect("ending at zero; the first packet's metadata ignored");
+  let malformed = ending(-i64::from(skip), &frames[1], Some(b"title\0later"));
+  let (refusal, back) = by_container(muxer.write_audio(malformed.clone()));
+  assert_eq!(refusal, payload(PayloadRule::MetadataUpdate));
+  untouched!(malformed, back);
+  muxer
+    .write_audio(ending(
+      -i64::from(skip),
+      &frames[1],
+      Some(b"title\0later\0"),
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a metadata update that unpacks");
+  muxer.finish().expect("finished");
+}
+
 /// **L87 — what ASF, and the RIFF formats' audio header, cannot count is
 /// refused at open, nothing written** (table H): a chapter title whose
 /// marker entry passes 16 bits — 12 bytes and the title in UTF-16 with its

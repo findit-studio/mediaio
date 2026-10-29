@@ -1161,6 +1161,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
       initial_padding: 0,
       format: -1,
       extradata: Vec::new(),
+      alone: false,
     },
     written: false,
     cues: Cues::default(),
@@ -1881,6 +1882,7 @@ fn each_container_keeps_the_side_data_it_has_a_place_for() {
     initial_padding: 1024,
     format: -1,
     extradata: vec![0x11, 0x90],
+    alone: false,
   };
   let skip = |start: u32, end: u32| {
     let mut bytes = start.to_le_bytes().to_vec();
@@ -2999,4 +3001,47 @@ fn nuts_time_base_is_the_one_its_header_chooses() {
     (1, 64_000),
     "an audio stream of no sample rate as any other"
   );
+}
+
+/// **The Xiph headers, as `avpriv_split_xiph_headers` splits them**
+/// (`libavcodec/xiph.c` 25–66): three lengths of 16 bits, the first the
+/// identification header's; or Xiph lacing, its lengths runs of 255 and a
+/// last byte, the third header the rest; any other refused.
+#[test]
+fn xiph_headers_split_as_libavcodec_splits_them() {
+  let mut sized = vec![0, 30];
+  sized.extend([1; 30]);
+  sized.extend([0, 2, 7, 8, 0, 1, 9]);
+  let headers = xiph_headers(&sized, 30).expect("three sized headers");
+  assert_eq!(headers.map(<[u8]>::len), [30, 2, 1]);
+  assert_eq!(headers[1], [7, 8]);
+  assert!(
+    xiph_headers(&sized, 42).is_none(),
+    "the first length is the header's"
+  );
+  assert!(
+    xiph_headers(&sized[..sized.len() - 1], 30).is_none(),
+    "short"
+  );
+  let mut laced = vec![2, 0xff, 1, 3];
+  laced.extend([5; 256]);
+  laced.extend([6; 3]);
+  laced.extend([7; 4]);
+  let headers = xiph_headers(&laced, 30).expect("laced headers");
+  assert_eq!(headers.map(<[u8]>::len), [256, 3, 4]);
+  assert_eq!(headers[2], [7; 4]);
+  assert!(xiph_headers(&[3, 0, 0], 30).is_none(), "neither form");
+}
+
+/// **libavformat's dictionary, as `av_packet_unpack_dictionary` unpacks
+/// it** (`libavcodec/packet.c` 349–371): empty, or terminated pairs with
+/// no empty key.
+#[test]
+fn a_dictionary_unpacks_as_libavformat_unpacks_it() {
+  assert!(dictionary_unpacks(b""));
+  assert!(dictionary_unpacks(b"title\0hello\0"));
+  assert!(dictionary_unpacks(b"a\0\0b\0c\0"), "an empty value");
+  assert!(!dictionary_unpacks(b"title\0hello"), "unterminated");
+  assert!(!dictionary_unpacks(b"\0hello\0"), "an empty key");
+  assert!(!dictionary_unpacks(b"title\0"), "a key with no value");
 }

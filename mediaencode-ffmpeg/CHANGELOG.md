@@ -173,7 +173,18 @@ crate moves only when it changes.
   and key flag kept, the decode time made by its reader
   (`Rewrite::DecodeTimes`), the language and six flags kept, chapters
   numbered from 1. A subtitle's negative duration is refused only where
-  the container writes a duration.
+  the container writes a duration. Ogg: no time a packet keeps of its own
+  (`Rewrite::Timeline`), VP8's and Theora's key frames by the bitstream;
+  refused at open a codec but Vorbis, Theora, Speex, FLAC, Opus and VP8,
+  a configuration its start needs or refuses, an audio stream of no sample
+  rate, VP8 past its header's fields; refused in packets an empty packet,
+  which its reader drops, a VP8 or Theora granule past its signed shift,
+  a granule of −1 (`FfmpegMuxRefusal::UnsetGranule`, new), a metadata
+  update that does not unpack (`PayloadRule::MetadataUpdate`, new); a lone
+  stream's later metadata written as a chained stream's tags; chapters in
+  an Opus stream's tags, their starts as its writer rounds them; the
+  language kept. A chapter's end is judged where the next chapter starts
+  as written, in MP4 and ASF too.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
