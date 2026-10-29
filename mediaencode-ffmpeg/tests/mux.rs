@@ -16847,3 +16847,62 @@ fn l144_a_coded_side_data_value_past_its_field_is_refused() {
     with_coded(mp3_row(), rg, &gain(5_119_999, 51_199_999)),
   );
 }
+
+/// **L145 — WebM refuses a stereo mode it defines not** (R11, Q868;
+/// `mkv_write_stereo_mode`, `matroskaenc.c` 1640–1731; `matroska.h`
+/// 402–424): WebM's check of a track's Matroska stereo mode wants its bit
+/// mask, so that checkerboard, lines and columns are written into WebM,
+/// which defines none of them — a false claim — and frame sequence fails
+/// the header; each refused by name (`MuxOpenError::StereoMode`) before
+/// anything is written. Side by side opens, and Matroska takes
+/// checkerboard.
+///
+/// PLANT: the stereo mode unjudged, WebM's checkerboard opened.
+#[test]
+fn l145_webm_refuses_a_stereo_mode_it_defines_not() {
+  use ffmpeg_next::ffi::{AVPacketSideDataType as T, AVStereo3DType as S};
+  let Some(corpus) = Corpus::new() else { return };
+  #[rustfmt::skip]
+  let vp9 = generated(&corpus, "vp9-sar.webm", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25", "-frames:v", "3",
+    "-c:v", "libvpx-vp9", "-aspect", "16:9",
+  ]);
+  let stereo = |kind: S, inverted: bool| {
+    with_coded(
+      table_of(&vp9, TrackKind::Video).remove(0),
+      T::AV_PKT_DATA_STEREO3D,
+      &words(&[kind as i32, i32::from(inverted), 0, 0, 0, 0, 1, 0, 1]),
+    )
+  };
+  for (name, kind, inverted) in [
+    ("checkerboard", S::AV_STEREO3D_CHECKERBOARD, false),
+    ("lines", S::AV_STEREO3D_LINES, true),
+    ("columns", S::AV_STEREO3D_COLUMNS, false),
+    ("frames", S::AV_STEREO3D_FRAMESEQUENCE, false),
+  ] {
+    let opened = opened_in(
+      &corpus,
+      &format!("l145-{name}.webm"),
+      "webm",
+      vec![stereo(kind, inverted)],
+    );
+    assert!(
+      matches!(opened, Err(MuxOpenError::StereoMode { track }) if track.get() == 0),
+      "{name}: {opened:?}"
+    );
+  }
+  opened_in(
+    &corpus,
+    "l145-side.webm",
+    "webm",
+    vec![stereo(S::AV_STEREO3D_SIDEBYSIDE, false)],
+  )
+  .expect("side by side");
+  opened_in(
+    &corpus,
+    "l145-checkerboard.mkv",
+    "matroska",
+    vec![stereo(S::AV_STEREO3D_CHECKERBOARD, false)],
+  )
+  .expect("Matroska's checkerboard");
+}

@@ -432,6 +432,9 @@ crate moves only when it changes.
   ten-thousandths, read back negative; MOV's stereo field of view and
   disparity; FLV's light level past 65 535; MXF's luminance; MP3's
   ReplayGain of a gain past ±51.1 dB or a peak past 512.
+  WebM's stereo 3D of checkerboard, lines or columns, which its check,
+  wanting its mask, writes as modes WebM defines not, and of frame
+  sequence, which fails its header (`MuxOpenError::StereoMode`, new).
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

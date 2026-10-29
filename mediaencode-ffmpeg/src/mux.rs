@@ -757,6 +757,7 @@
 //! | FLV, at open (R11, ruling 4: every refusal of its start, by grep `return AVERROR\|unsupported_codec\|goto error` over `get_audio_flags` and `flv_init`, 141–240 and 971–1081; its allocation and the keyframe index's flag, never set, aside) | MPEG-4 Part 2 and H.263; an audio codec at a rate its flags' table names no code for — MP3 but at 48, 44.1, 22.05 and 11.025 kHz, its other codecs of no extended header but at 44.1, 22.05, 11.025, 16, 8 and 5.512 kHz, Speex but at 16 kHz — and Speex of more than one channel; a native layout of no channel its multichannel configuration keeps, which its reader refuses (R11, Codex R10 1; table E); a video track past the first of another codec than VP9, AV1, H.264, HEVC and VVC, an audio track past the first of another than AAC, MP3, Opus, FLAC, AC-3 and E-AC-3; a codec of none of its tables, a data or subtitle stream but text — refused by `avformat_query_codec`, its tables naming neither | refused at its start, the header unwritten, as no part of the official specification, "FLV does not support sample rate", "FLV only supports mono Speex audio", "Unsupported multi-track video codec" / "audio codec" (`flv_init`, `flvenc.c` 985–1066; `get_audio_flags`, 141–240); the layout written as a mask of zero, which its reader refuses, the stream read back of no channels (739–744; `flvdec.c` 1733–1742) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::TrackLayout`] — L133, L134, L135 |
 //! | FLV, at open (R11, Q868) | an HEVC, AV1, VP9 or VVC track of no matrix coefficients, or of one past its table | its metadata packet states the matrix where it is specified, and its reader, its colour information in a zeroed context, reads an absent one back as RGB — a false claim (`flvenc.c` 555–608; `flvdec.c` 1261–1262) | [`MuxOpenError::ColourDescription`] — L143 |
 //! | MP4, MOV, FLV, the MXF muxers, MP3, at open (R11, Q868) | a coded side data value past its field: MP4's and MOV's content light level past 65 535, mastering display chromaticity past 65 535 fifty-thousandths and luminance past `INT_MAX` ten-thousandths, ambient illuminance past `INT_MAX` ten-thousandths and light past 65 535 fifty-thousandths; MOV's stereo field of view past `INT_MAX` thousandths of a degree and disparity past an `int`'s ten-thousandths; FLV's light level past 65 535; MXF's luminance past `INT_MAX` ten-thousandths; MP3's ReplayGain of a gain past ±51.1 dB or a peak past 512 | written cut into its field, or read back into an `int` or 16 bits: another value, negative past `INT_MAX` (`movenc.c` 2384–2393, 2466–2476, 2659–2735; `mov.c` 6684–6814, 7286–7296, 7396–7423; `flvdec.c` 63–68, 785–787; `mxfenc.c` 1222–1225, 1484–1489; `mxfdec.c` 1482–1490; `mp3enc.c` 425–446) | [`MuxOpenError::CodedSideData`] — L144 |
+//! | WebM, at open (R11, Q868) | a video track's stereo 3D type of checkerboard, lines, columns or frame sequence | the first three written as Matroska stereo modes 4 to 9, which WebM defines not, its check wanting its bit mask; frame sequence's 13 and 14 failing the header (`matroskaenc.c` 1640–1731; `matroska.h` 402–424) | [`MuxOpenError::StereoMode`] — L145 |
 //! | WAV, Wave64, AVI, ASF | a configured AAC track's ADTS packet; at open, an audio configuration past the WAVEFORMATEX's 16-bit `cbSize` | written as it comes into a stream whose format declares raw AAC; written, its size cut (`riffenc.c` 193–223) | [`PayloadRule::AdtsHeader`], [`MuxOpenError::ConfigurationInvalid`] — L87, L88 |
 //! | ASF | a decode time past its 32-bit presentation time, the preroll added; a presentation time past what its index counts in an `int` of seconds; a play duration past `i64` in 100 ns; an empty packet | written cut; refused after taking it; a signed overflow; no payload written (`asfenc.c` 886–1038) | [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::Empty`] — L86 |
 //! | ASF, at open | a video configuration past its format data's 16-bit size; a marker's title past its entry's 16-bit length; a chapter at 2^32 ms or later; the streaming form's header past its chunk's 16-bit length | each written, its length or send time cut (`asfenc.c` 645, 337, 297–308, 708–716) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSpan`], [`MuxOpenError::HeaderTooLong`] — L87 |
@@ -3198,6 +3199,16 @@ pub enum MuxOpenError {
     track: TrackIndex,
     /// The side data's kind: FFmpeg's `AV_PKT_DATA_*` value.
     kind: i32,
+  },
+  /// WebM: a video track's stereo 3D type of a Matroska stereo mode WebM
+  /// defines not — checkerboard, lines and columns, which WebM's check, its
+  /// bit mask missing, writes all the same, a false claim; frame sequence,
+  /// which it refuses at its header (`mkv_write_stereo_mode`,
+  /// `matroskaenc.c` 1640–1731; `matroska.h` 402–424; R11, Q868).
+  #[error("track {}'s stereo mode is not one WebM defines", .track.get())]
+  StereoMode {
+    /// The track.
+    track: TrackIndex,
   },
   /// An audio track of a muxer that rechunks PCM at its start — DAUD, GXF
   /// and the MXF muxers insert `pcm_rechunk` (table B of the census, see
@@ -10520,6 +10531,9 @@ fn judge<W, D: AsRef<[u8]>>(
       if let Some(kind) = coded_side_data_wraps(audited, description) {
         return Err(MuxOpenError::CodedSideData { track, kind });
       }
+      if audited == Audited::WebM && webm_stereo_mode_refused(description.side_data()) {
+        return Err(MuxOpenError::StereoMode { track });
+      }
       if family == Family::Mp4
         && description.kind() == TrackKind::Video
         && crops_away(description.side_data())
@@ -11743,6 +11757,37 @@ where
     }
   }
   None
+}
+
+/// Whether WebM writes a track's stereo 3D coded side data as a Matroska
+/// stereo mode it defines not ([`MuxOpenError::StereoMode`]): the type and
+/// its inversion map to a mode by `STEREOMODE_STEREO3D_MAPPING`
+/// (`matroska.h` 402–424) — checkerboard to 4 and 5, lines to 6 and 7,
+/// columns to 8 and 9, frame sequence to 13 and 14 — of which WebM's bit
+/// field names 0 to 3 and 11 alone; its test, `!(webm_bitfield >>
+/// format)`, wants its mask, so that 4 to 10 pass it and are written, and
+/// 12 to 14 fail it, the header with them (`mkv_write_stereo_mode`,
+/// `matroskaenc.c` 1640–1731). Another type, or 2D inverted, maps to none
+/// and is not written.
+fn webm_stereo_mode_refused(ticket: &CodecTicket) -> bool {
+  use ffmpeg_next::ffi::AVStereo3DType as Type;
+  ticket
+    .coded_side_data()
+    .iter()
+    .filter(|entry| entry.kind() == AVPacketSideDataType::AV_PKT_DATA_STEREO3D as i32)
+    .any(|entry| {
+      entry.data().get(..4).is_some_and(|word| {
+        let kind = i32::from_ne_bytes([word[0], word[1], word[2], word[3]]);
+        [
+          Type::AV_STEREO3D_CHECKERBOARD,
+          Type::AV_STEREO3D_LINES,
+          Type::AV_STEREO3D_COLUMNS,
+          Type::AV_STEREO3D_FRAMESEQUENCE,
+        ]
+        .iter()
+        .any(|&refused| kind == refused as i32)
+      })
+    })
 }
 
 /// Whether the container's writer refuses `codec`'s configuration
