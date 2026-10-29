@@ -110,15 +110,16 @@
 //!
 //! What FFmpeg 9.0.1 does with each case, the packet dropped, or every unit
 //! of `nal_ref_idc` 0 but SEI skipped (`skip_frame` at `noref` and above,
-//! `h264dec.c` 626–628) — measured too, on the laws' PAFF stream of I_PCM
-//! and P_Skip macroblocks, 25 frames, where skipping at `noref` decodes
-//! exactly what dropping every non-reference packet does:
+//! `h264dec.c` 626–628) — observed too, FFmpeg 9.0.1's CLI decoding the
+//! laws' PAFF stream of I_PCM and P_Skip macroblocks, 25 frames, where
+//! skipping at `noref` decodes exactly what dropping every non-reference
+//! packet does:
 //!
 //! | case | FFmpeg, every packet read | dropped, or skipped | a later picture changes | verdict |
 //! |---|---|---|---|---|
-//! | both fields of `nal_ref_idc` 0 of a pair, in one packet, no field waiting | the first starts a frame and waits (`h264_slice.c` 1610–1611); the second, of the other parity and the same `frame_num`, joins it (2111–2114, 1604–1606), and the frame is chosen for output there (1683–1690) | no field waits after it, as none did before it; skipped, both fields go | no: measured, the pair's frame alone lost | disposable |
-//! | a field alone in a packet, the pair's other in the next: the first | it waits, and the next packet's field joins it | the second starts a frame of its own and waits; the next frame's first field — the other parity, the same `frame_num`, a non-reference picture's being the next one's (7.4.3) — joins it (1604–1606), or is refused where one is a reference (1494–1501) | yes: measured, 8 frames of the 25 lost and 12 others made | kept: [`KeptReason::UnpairedField`] |
-//! | the same, the second | — | the first waits on: the next picture finds it unmatched, a frame or a field of its parity (1583–1587), or joins it, a field of the other, where the field order turns | yes, where the order turns: measured, 8 lost and 10 made; and `missing_fields` stays raised | kept: [`KeptReason::UnpairedField`]: no packet tells what follows it |
+//! | both fields of `nal_ref_idc` 0 of a pair, in one packet, no field waiting | the first starts a frame and waits (`h264_slice.c` 1610–1611); the second, of the other parity and the same `frame_num`, joins it (2111–2114, 1604–1606), and the frame is chosen for output there (1683–1690) | no field waits after it, as none did before it; skipped, both fields go | no: observed, the pair's frame alone lost | disposable |
+//! | a field alone in a packet, the pair's other in the next: the first | it waits, and the next packet's field joins it | the second starts a frame of its own and waits; the next frame's first field — the other parity, the same `frame_num`, a non-reference picture's being the next one's (7.4.3) — joins it (1604–1606), or is refused where one is a reference (1494–1501) | yes: observed, 8 frames of the 25 lost and 12 others made | kept: [`KeptReason::UnpairedField`] |
+//! | the same, the second | — | the first waits on: the next picture finds it unmatched, a frame or a field of its parity (1583–1587), or joins it, a field of the other, where the field order turns | yes, where the order turns: observed, 8 lost and 10 made; and `missing_fields` stays raised | kept: [`KeptReason::UnpairedField`]: no packet tells what follows it |
 //! | a reference first field, a non-reference second | the second refused, "Found reference and non-reference fields in the same frame" (1494–1501), and the first waits on | the second dropped or skipped: the first waits on, as when refused | — | kept: [`KeptReason::Referenced`] in one packet; the second alone, [`KeptReason::UnpairedField`] |
 //! | a non-reference first field, a reference second | the reference field refused the same way, and lost to the pictures after it | the first dropped: the reference field starts a frame of its own, and is decoded | yes | kept: [`KeptReason::UnpairedField`], [`KeptReason::Referenced`] |
 //! | a field whose complementary field is missing | it waits, and the next picture finds it unmatched (1583–1587): `missing_fields` rises; from two on a first field is output at once (1683), its frame queued (`DELAYED_PIC_REF`, 1342–1343), so that its second field starts a frame of its own (1598–1603) | dropped, `missing_fields` stays where it was; and a pair dropped after it, which resets it (1589), leaves it raised | yes | kept: [`KeptReason::UnpairedField`]; every pair after it, for good: [`KeptReason::UnmatchedFields`] |
