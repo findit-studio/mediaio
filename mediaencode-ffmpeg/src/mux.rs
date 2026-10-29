@@ -755,6 +755,7 @@
 //! | FLV, at open | Opus or FLAC with no configuration; H.264, HEVC, VVC, AV1, MPEG-4 or AAC with none and the filters off; AV1's configuration `ff_isom_write_av1c` fails on | the header's `av_assert0` ends the process; written behind an empty sequence header; an empty sequence header (`flvenc.c` 853, 1491–1503, 892–893) | [`MuxOpenError::ConfigurationMissing`], [`MuxOpenError::ConfigurationInvalid`] — L82, L109 |
 //! | FLV, at open | big-endian PCM; an audio codec of no extended header — PCM, Swiff ADPCM, Nellymoser, G.711, Speex — of a layout not exactly mono or stereo; PCM's and Swiff ADPCM's 8 and 16 kHz, G.711's every rate but 8 kHz | its code the host's own order, read back little-endian; the multichannel header names the codec's fourcc, which it has none of, and `av_assert0` ends the process; written as the 5.5 kHz code, and G.711 read back at 8 kHz, with no metadata read before the stream exists (`flvenc.c` 140–240, 910–913, 497–540; `flvdec.c` 314–360, 1657–1670) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`] — L105 |
 //! | FLV, at open (R11, ruling 4: every refusal of its start, by grep `return AVERROR\|unsupported_codec\|goto error` over `get_audio_flags` and `flv_init`, 141–240 and 971–1081; its allocation and the keyframe index's flag, never set, aside) | MPEG-4 Part 2 and H.263; an audio codec at a rate its flags' table names no code for — MP3 but at 48, 44.1, 22.05 and 11.025 kHz, its other codecs of no extended header but at 44.1, 22.05, 11.025, 16, 8 and 5.512 kHz, Speex but at 16 kHz — and Speex of more than one channel; a native layout of no channel its multichannel configuration keeps, which its reader refuses (R11, Codex R10 1; table E); a video track past the first of another codec than VP9, AV1, H.264, HEVC and VVC, an audio track past the first of another than AAC, MP3, Opus, FLAC, AC-3 and E-AC-3; a codec of none of its tables, a data or subtitle stream but text — refused by `avformat_query_codec`, its tables naming neither | refused at its start, the header unwritten, as no part of the official specification, "FLV does not support sample rate", "FLV only supports mono Speex audio", "Unsupported multi-track video codec" / "audio codec" (`flv_init`, `flvenc.c` 985–1066; `get_audio_flags`, 141–240); the layout written as a mask of zero, which its reader refuses, the stream read back of no channels (739–744; `flvdec.c` 1733–1742) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::TrackLayout`] — L133, L134, L135 |
+//! | FLV, at open (R11, Q868) | an HEVC, AV1, VP9 or VVC track of no matrix coefficients, or of one past its table | its metadata packet states the matrix where it is specified, and its reader, its colour information in a zeroed context, reads an absent one back as RGB — a false claim (`flvenc.c` 555–608; `flvdec.c` 1261–1262) | [`MuxOpenError::ColourDescription`] — L143 |
 //! | WAV, Wave64, AVI, ASF | a configured AAC track's ADTS packet; at open, an audio configuration past the WAVEFORMATEX's 16-bit `cbSize` | written as it comes into a stream whose format declares raw AAC; written, its size cut (`riffenc.c` 193–223) | [`PayloadRule::AdtsHeader`], [`MuxOpenError::ConfigurationInvalid`] — L87, L88 |
 //! | ASF | a decode time past its 32-bit presentation time, the preroll added; a presentation time past what its index counts in an `int` of seconds; a play duration past `i64` in 100 ns; an empty packet | written cut; refused after taking it; a signed overflow; no payload written (`asfenc.c` 886–1038) | [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::Empty`] — L86 |
 //! | ASF, at open | a video configuration past its format data's 16-bit size; a marker's title past its entry's 16-bit length; a chapter at 2^32 ms or later; the streaming form's header past its chunk's 16-bit length | each written, its length or send time cut (`asfenc.c` 645, 337, 297–308, 708–716) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSpan`], [`MuxOpenError::HeaderTooLong`] — L87 |
@@ -3164,6 +3165,17 @@ pub enum MuxOpenError {
     /// The track.
     track: TrackIndex,
   },
+  /// A video track whose colour description the container writes so that
+  /// its reader reads back another, a false claim: FLV's HEVC, AV1, VP9 and
+  /// VVC of no matrix coefficients — or of one past the table — which its
+  /// metadata packet states not, and which its reader takes as zero, RGB
+  /// (`flv_write_metadata_packet`, `flvenc.c` 594–608;
+  /// `flv_update_video_color_info`, `flvdec.c` 1261–1262; R11, Q868).
+  #[error("track {}'s colour description would read back as another", .track.get())]
+  ColourDescription {
+    /// The track.
+    track: TrackIndex,
+  },
   /// An audio track of a muxer that rechunks PCM at its start — DAUD, GXF
   /// and the MXF muxers insert `pcm_rechunk` (table B of the census, see
   /// [the module](self)) — whose channels times its codec's bits per sample
@@ -4470,6 +4482,17 @@ fn flv_rate_uncoded(codec: CodecId, rate: i32) -> bool {
       _ => true,
     }
   }
+}
+
+/// Whether FLV's metadata packet leaves a track's matrix coefficients
+/// `space` unstated — unspecified, or past the table — which its reader,
+/// keeping the colour information in a zeroed context, reads back as zero,
+/// `AVCOL_SPC_RGB` (`flv_write_metadata_packet`, `flvenc.c` 594–608, for
+/// HEVC, AV1, VP9 and VVC alone, 555–556; `flv_update_video_color_info`,
+/// `flvdec.c` 1261–1262).
+fn flv_matrix_unwritten(space: i32) -> bool {
+  space == ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_UNSPECIFIED as i32
+    || space >= ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_NB as i32
 }
 
 /// The first track FLV's start has no place for where it lies in the table
@@ -10673,6 +10696,16 @@ where
       }) =>
     {
       Some(MuxOpenError::ConfigurationInvalid { track, codec })
+    }
+    // FLV's metadata packet states an HEVC, AV1, VP9 or VVC track's matrix
+    // where it is specified and of its table, and its reader takes an
+    // absent one as RGB ([`flv_matrix_unwritten`]).
+    Audited::Flv
+      if description.kind() == TrackKind::Video
+        && [CodecId::HEVC, CodecId::AV1, CodecId::VP9, CodecId::VVC].contains(&codec)
+        && flv_matrix_unwritten(ticket.color_space()) =>
+    {
+      Some(MuxOpenError::ColourDescription { track })
     }
     // FLV's start refuses Speex of more than one channel (`get_audio_flags`,
     // `flvenc.c` 156–159).

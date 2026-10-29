@@ -420,6 +420,10 @@ crate moves only when it changes.
   every condition mirrored; an `lhvC` of no such unit, which FFmpeg's
   reader refuses with the whole file, refused; the flag reported lost
   where `lhvC` is not written.
+- **What a reader would read back falsely, refused (R11).** FLV's HEVC,
+  AV1, VP9 and VVC track of no matrix coefficients, which FLV's metadata
+  packet states not and its reader reads back as RGB
+  (`MuxOpenError::ColourDescription`, new).
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

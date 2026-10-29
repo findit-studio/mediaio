@@ -12655,10 +12655,17 @@ fn l109_av1s_configuration_is_refused_where_ff_isom_write_av1c_would_fail() {
     obu
   };
   let flv = || ContainerName::new("flv");
+  // Its matrix stated, which FLV's reader would take as RGB were it absent
+  // (L143).
   let configured = |config: &[u8]| {
     table_of(&av1, TrackKind::Video)
       .into_iter()
-      .map(|row| row.with_extradata(Some(bytes_of(config))))
+      .map(|row| {
+        reticketed(row, |par| {
+          par.color_space = ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_BT709;
+        })
+        .with_extradata(Some(bytes_of(config)))
+      })
       .collect::<Vec<_>>()
   };
   for (container, extension) in [(ContainerName::MP4, "mp4"), (flv(), "flv")] {
@@ -13022,6 +13029,17 @@ fn restated_profile(
     }
     if let Some(profile) = profile {
       (*par).profile = profile;
+    }
+    // An HEVC, AV1, VP9 or VVC track states its matrix coefficients, BT.709,
+    // where it states none: FLV's reader takes an absent one as RGB, which
+    // FLV is refused for (L143).
+    use ffmpeg_next::ffi::{AVCodecID as Id, AVColorSpace as Space};
+    if matches!(
+      codec,
+      Id::AV_CODEC_ID_HEVC | Id::AV_CODEC_ID_AV1 | Id::AV_CODEC_ID_VP9 | Id::AV_CODEC_ID_VVC
+    ) && (*par).color_space == Space::AVCOL_SPC_UNSPECIFIED
+    {
+      (*par).color_space = Space::AVCOL_SPC_BT709;
     }
   }
   let ticket = CodecTicket::mirror(&parameters, index, usize::MAX).expect("the ticket");
@@ -16571,4 +16589,65 @@ fn l142_matroskas_acm_road_is_not_reached() {
     opened > 10,
     "the premise: Matroska's own audio codecs open, {opened}"
   );
+}
+
+/// **L143 — FLV refuses an HEVC, AV1, VP9 or VVC track of no matrix
+/// coefficients, which its reader would read back as RGB** (R11, Q868;
+/// `flv_write_metadata_packet`, `flvenc.c` 555–608;
+/// `flv_update_video_color_info`, `flvdec.c` 1261–1262): FLV's metadata
+/// packet states a track's matrix where it is specified, and its reader
+/// keeps the colour information in a zeroed context, so that an absent one
+/// reads back as zero, `AVCOL_SPC_RGB` — a false claim, refused by name
+/// (`MuxOpenError::ColourDescription`) before anything is written. HEVC
+/// and VP9 of BT.709, and of RGB stated, open; H.264, whose metadata packet
+/// FLV writes not, opens of none.
+///
+/// PLANT: the matrix unjudged, the first table opened.
+#[test]
+fn l143_flv_refuses_a_track_whose_matrix_would_read_back_rgb() {
+  use ffmpeg_next::ffi::AVColorSpace as Space;
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, _) = recoded_fixture(&corpus, &[]);
+  let hevc = |space: Space| {
+    reticketed(
+      restated(
+        &row,
+        ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        &hevc_base(),
+        None,
+        None,
+      ),
+      |par| par.color_space = space,
+    )
+  };
+  #[rustfmt::skip]
+  let vp9_file = generated(&corpus, "vp9-sar.webm", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25", "-frames:v", "3",
+    "-c:v", "libvpx-vp9", "-aspect", "16:9",
+  ]);
+  let vp9 = |space: Space| {
+    reticketed(table_of(&vp9_file, TrackKind::Video).remove(0), |par| {
+      par.color_space = space;
+    })
+  };
+  for (name, row) in [
+    ("l143-hevc.flv", hevc(Space::AVCOL_SPC_UNSPECIFIED)),
+    ("l143-vp9.flv", vp9(Space::AVCOL_SPC_UNSPECIFIED)),
+  ] {
+    let opened = opened_flv(&corpus, name, vec![row]);
+    assert!(
+      matches!(opened, Err(MuxOpenError::ColourDescription { track }) if track.get() == 0),
+      "{name}: {opened:?}"
+    );
+  }
+  let (h264, _) = recoded_fixture(&corpus, &[]);
+  let h264 = reticketed(h264, |par| par.color_space = Space::AVCOL_SPC_UNSPECIFIED);
+  for (name, row) in [
+    ("l143-hevc-709.flv", hevc(Space::AVCOL_SPC_BT709)),
+    ("l143-hevc-rgb.flv", hevc(Space::AVCOL_SPC_RGB)),
+    ("l143-vp9-709.flv", vp9(Space::AVCOL_SPC_BT709)),
+    ("l143-h264.flv", h264),
+  ] {
+    opened_flv(&corpus, name, vec![row]).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+  }
 }
