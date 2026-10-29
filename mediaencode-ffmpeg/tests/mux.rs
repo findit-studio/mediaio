@@ -15668,3 +15668,189 @@ fn l132_ismv_of_a_second_video_track_is_refused_at_open() {
   let (_, result) = open("l132-one.ismv", vec![sound(), video()]);
   result.expect("one video track");
 }
+
+/// `table` opened into FLV at `name`, the file empty where it is refused.
+fn opened_flv(
+  corpus: &Corpus,
+  name: &str,
+  table: Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>>,
+) -> Result<(), MuxOpenError> {
+  let target = output(corpus, name);
+  let opened = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::new("flv"),
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .map(drop);
+  assert_eq!(
+    std::fs::metadata(&target).expect("the file").len() == 0,
+    opened.is_err(),
+    "{name}: nothing written where refused"
+  );
+  opened
+}
+
+/// **L133 — FLV refuses at open, by name, the audio its start refuses**
+/// (R11, ruling 4; `get_audio_flags`, `flvenc.c` 141–240; `flv_init`,
+/// 1050–1051): a rate its flags' table names no code for — PCM at 48 and
+/// 32 kHz, MP3 at 32 and 16 kHz, Nellymoser at 48 kHz, Speex at 8 kHz
+/// (`MuxOpenError::ConfigurationInvalid`) — and Speex of two channels
+/// (`MuxOpenError::ChannelLayout`), each before anything is written, where
+/// the header would fail opaquely. MP3 at 48 kHz, under 44.1's code,
+/// Nellymoser at 16 kHz, its own, and Speex mono at 16 kHz open.
+///
+/// PLANT: MP3's 48 kHz refused, its file refused; a rate past the table
+/// taken, PCM's 32 kHz header failing; Speex's rate or channels unjudged,
+/// the header failing.
+#[test]
+fn l133_flv_refuses_at_open_the_audio_its_start_refuses() {
+  let Some(corpus) = Corpus::new() else { return };
+  #[rustfmt::skip]
+  let pcm_at = |name: &str, rate: &str, channels: &str| generated(&corpus, name, &[
+    "-f", "lavfi", "-i", &format!("sine=frequency=440:sample_rate={rate}:duration=0.3"),
+    "-ac", channels, "-c:a", "pcm_s16le",
+  ]);
+  #[rustfmt::skip]
+  let mp3_at = |name: &str, rate: &str| generated(&corpus, name, &[
+    "-f", "lavfi", "-i", &format!("sine=frequency=440:sample_rate={rate}:duration=0.3"),
+    "-ac", "1", "-c:a", "libmp3lame",
+  ]);
+  let audio =
+    |path: &Path, channels: i32| relaid(table_of(path, TrackKind::Audio).remove(0), channels);
+  let as_codec = |path: &Path, channels: i32, codec| recoded(audio(path, channels), codec, &[]);
+  use ffmpeg_next::ffi::AVCodecID::{
+    AV_CODEC_ID_NELLYMOSER as NELLYMOSER, AV_CODEC_ID_SPEEX as SPEEX,
+  };
+  let invalid = |name: &str, row| {
+    let opened = opened_flv(&corpus, name, vec![row]);
+    assert!(
+      matches!(opened, Err(MuxOpenError::ConfigurationInvalid { track, .. }) if track.get() == 0),
+      "{name}: {opened:?}"
+    );
+  };
+  invalid(
+    "l133-pcm-48k.flv",
+    audio(&pcm_at("pcm-48k.mkv", "48000", "2"), 2),
+  );
+  invalid(
+    "l133-pcm-32k.flv",
+    audio(&pcm_at("pcm-32k.mkv", "32000", "2"), 2),
+  );
+  invalid(
+    "l133-mp3-32k.flv",
+    audio(&mp3_at("mp3-32k.mp3", "32000"), 1),
+  );
+  invalid(
+    "l133-mp3-16k.flv",
+    audio(&mp3_at("mp3-16k.mp3", "16000"), 1),
+  );
+  invalid(
+    "l133-nelly-48k.flv",
+    as_codec(&pcm_at("pcm-48k-1.mkv", "48000", "1"), 1, NELLYMOSER),
+  );
+  invalid(
+    "l133-speex-8k.flv",
+    as_codec(&pcm_at("pcm-8k.mkv", "8000", "1"), 1, SPEEX),
+  );
+  let stereo_speex = opened_flv(
+    &corpus,
+    "l133-speex-stereo.flv",
+    vec![as_codec(&pcm_at("pcm-16k-2.mkv", "16000", "2"), 2, SPEEX)],
+  );
+  assert!(
+    matches!(stereo_speex, Err(MuxOpenError::ChannelLayout { track }) if track.get() == 0),
+    "{stereo_speex:?}"
+  );
+  for (name, row) in [
+    (
+      "l133-mp3-48k.flv",
+      audio(&mp3_at("mp3-48k.mp3", "48000"), 1),
+    ),
+    (
+      "l133-nelly-16k.flv",
+      as_codec(&pcm_at("pcm-16k-1.mkv", "16000", "1"), 1, NELLYMOSER),
+    ),
+    (
+      "l133-speex-16k.flv",
+      as_codec(&pcm_at("pcm-16k-1.mkv", "16000", "1"), 1, SPEEX),
+    ),
+  ] {
+    opened_flv(&corpus, name, vec![row]).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+  }
+}
+
+/// **L134 — FLV refuses at open, by name, the video and the tables its
+/// start refuses** (R11, ruling 4; `flv_init`, `flvenc.c` 985–1046):
+/// MPEG-4 Part 2 and H.263, no part of FLV's specification, at the normal
+/// compliance (`MuxOpenError::CodecNotCarried`); a video track past the
+/// first of a codec its multitrack tags carry not — Sorenson H.263 after
+/// H.264 — and an audio track past the first of a codec of no extended
+/// header — PCM after PCM (`MuxOpenError::TrackLayout`), each by name
+/// before anything is written. Sorenson H.263 opens, and before H.264; PCM
+/// before AAC.
+///
+/// PLANT: MPEG-4 and H.263 unjudged, the header failing; the table
+/// unjudged, the header failing; the first of a kind judged as a later one,
+/// Sorenson H.263 before H.264 refused.
+#[test]
+fn l134_flv_refuses_at_open_the_video_and_the_tables_its_start_refuses() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mpeg4 = picture_and_sound(
+    &corpus,
+    "mpeg4-pcm.mkv",
+    &["-c:v", "mpeg4"],
+    &["-c:a", "pcm_s16le", "-ac", "2"],
+  );
+  #[rustfmt::skip]
+  let h263 = generated(&corpus, "h263.mkv", &[
+    "-f", "lavfi", "-i", "testsrc2=size=352x288:rate=25:duration=0.2", "-c:v", "h263",
+  ]);
+  #[rustfmt::skip]
+  let sorenson = generated(&corpus, "flv1.flv", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=0.2", "-c:v", "flv",
+  ]);
+  #[rustfmt::skip]
+  let pcm = generated(&corpus, "pcm-44k.mkv", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=0.3",
+    "-ac", "2", "-c:a", "pcm_s16le",
+  ]);
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let video = |path: &Path| table_of(path, TrackKind::Video).remove(0);
+  let stereo = || relaid(table_of(&pcm, TrackKind::Audio).remove(0), 2);
+  for (name, path, codec) in [
+    ("l134-mpeg4.flv", &mpeg4, CodecId::MPEG4),
+    (
+      "l134-h263.flv",
+      &h263,
+      CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H263 as i32),
+    ),
+  ] {
+    let opened = opened_flv(&corpus, name, vec![video(path)]);
+    assert!(
+      matches!(opened, Err(MuxOpenError::CodecNotCarried { track, codec: refused }) if track.get() == 0 && refused == codec),
+      "{name}: {opened:?}"
+    );
+  }
+  for (name, table) in [
+    ("l134-h264-flv1.flv", vec![video(&source), video(&sorenson)]),
+    ("l134-pcm-pcm.flv", vec![stereo(), stereo()]),
+  ] {
+    let opened = opened_flv(&corpus, name, table);
+    assert!(
+      matches!(opened, Err(MuxOpenError::TrackLayout { track }) if track.get() == 1),
+      "{name}: {opened:?}"
+    );
+  }
+  for (name, table) in [
+    ("l134-flv1.flv", vec![video(&sorenson)]),
+    ("l134-flv1-h264.flv", vec![video(&sorenson), video(&source)]),
+    (
+      "l134-pcm-aac.flv",
+      vec![stereo(), table_of(&source, TrackKind::Audio).remove(0)],
+    ),
+  ] {
+    opened_flv(&corpus, name, table).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+  }
+}

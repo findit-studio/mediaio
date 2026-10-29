@@ -376,6 +376,18 @@ crate moves only when it changes.
   video key frame, the trigger its header adds where none is set;
   `PayloadRule::FragmentSize` counts a track's samples from its first,
   stricter than FFmpeg.
+- **What a container's start refuses, by name before anything is written
+  (R11).** FLV, every refusal of its start (`flv_init`,
+  `get_audio_flags`): an audio track at a rate its flags' table names no
+  code for — MP3 but at 48, 44.1, 22.05 and 11.025 kHz, its other codecs
+  of no extended header but at 44.1, 22.05, 11.025, 16, 8 and 5.512 kHz,
+  Speex but at 16 kHz (`MuxOpenError::ConfigurationInvalid`) — and Speex
+  of more than one channel (`MuxOpenError::ChannelLayout`); MPEG-4 Part 2
+  and H.263, no part of FLV's specification at the normal compliance
+  (`MuxOpenError::CodecNotCarried`); a video track past the first of
+  another codec than VP9, AV1, H.264, HEVC and VVC, and an audio track
+  past the first of another than AAC, MP3, Opus, FLAC, AC-3 and E-AC-3
+  (`MuxOpenError::TrackLayout`).
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

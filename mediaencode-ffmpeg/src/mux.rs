@@ -748,6 +748,7 @@
 //! | AVI | a frame more than 60 000 frames after the stream's place, but XSUB's, whose gaps it fills not; H.264 it tags `H264` not opening on a start code; at open, raw video of no tag of another pixel format than its bits name | refused after taking it; the first refused after taking it, the rest written as they are; written, "unreadable" (`avienc.c` 744–778, 446–461) | [`FfmpegMuxRefusal::FrameGap`], [`PayloadRule::StartCode`], [`MuxOpenError::ConfigurationInvalid`] — L84 |
 //! | FLV, at open | Opus or FLAC with no configuration; H.264, HEVC, VVC, AV1, MPEG-4 or AAC with none and the filters off; AV1's configuration `ff_isom_write_av1c` fails on | the header's `av_assert0` ends the process; written behind an empty sequence header; an empty sequence header (`flvenc.c` 853, 1491–1503, 892–893) | [`MuxOpenError::ConfigurationMissing`], [`MuxOpenError::ConfigurationInvalid`] — L82, L109 |
 //! | FLV, at open | big-endian PCM; an audio codec of no extended header — PCM, Swiff ADPCM, Nellymoser, G.711, Speex — of a layout not exactly mono or stereo; PCM's and Swiff ADPCM's 8 and 16 kHz, G.711's every rate but 8 kHz | its code the host's own order, read back little-endian; the multichannel header names the codec's fourcc, which it has none of, and `av_assert0` ends the process; written as the 5.5 kHz code, and G.711 read back at 8 kHz, with no metadata read before the stream exists (`flvenc.c` 140–240, 910–913, 497–540; `flvdec.c` 314–360, 1657–1670) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`] — L105 |
+//! | FLV, at open (R11, ruling 4: every refusal of its start, by grep `return AVERROR\|unsupported_codec\|goto error` over `get_audio_flags` and `flv_init`, 141–240 and 971–1081; its allocation and the keyframe index's flag, never set, aside) | MPEG-4 Part 2 and H.263; an audio codec at a rate its flags' table names no code for — MP3 but at 48, 44.1, 22.05 and 11.025 kHz, its other codecs of no extended header but at 44.1, 22.05, 11.025, 16, 8 and 5.512 kHz, Speex but at 16 kHz — and Speex of more than one channel; a video track past the first of another codec than VP9, AV1, H.264, HEVC and VVC, an audio track past the first of another than AAC, MP3, Opus, FLAC, AC-3 and E-AC-3; a codec of none of its tables, a data or subtitle stream but text — refused by `avformat_query_codec`, its tables naming neither | refused at its start, the header unwritten, as no part of the official specification, "FLV does not support sample rate", "FLV only supports mono Speex audio", "Unsupported multi-track video codec" / "audio codec" (`flv_init`, `flvenc.c` 985–1066; `get_audio_flags`, 141–240) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::TrackLayout`] — L133, L134 |
 //! | WAV, Wave64, AVI, ASF | a configured AAC track's ADTS packet; at open, an audio configuration past the WAVEFORMATEX's 16-bit `cbSize` | written as it comes into a stream whose format declares raw AAC; written, its size cut (`riffenc.c` 193–223) | [`PayloadRule::AdtsHeader`], [`MuxOpenError::ConfigurationInvalid`] — L87, L88 |
 //! | ASF | a decode time past its 32-bit presentation time, the preroll added; a presentation time past what its index counts in an `int` of seconds; a play duration past `i64` in 100 ns; an empty packet | written cut; refused after taking it; a signed overflow; no payload written (`asfenc.c` 886–1038) | [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::Empty`] — L86 |
 //! | ASF, at open | a video configuration past its format data's 16-bit size; a marker's title past its entry's 16-bit length; a chapter at 2^32 ms or later; the streaming form's header past its chunk's 16-bit length | each written, its length or send time cut (`asfenc.c` 645, 337, 297–308, 708–716) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSpan`], [`MuxOpenError::HeaderTooLong`] — L87 |
@@ -3075,7 +3076,9 @@ pub enum MuxOpenError {
   /// MP4, experimental there (`mov_init`, `movenc.c` 8580–8587 in FFmpeg
   /// 9.0.1), and ATRAC3, Cook, RealAudio 2.0, SIPR and RealVideo 1.0, 2.0
   /// and 3.0 in Matroska, which it does not yet write (`mkv_init`,
-  /// `matroskaenc.c` 3518–3530). Of table H, a codec the container's start
+  /// `matroskaenc.c` 3518–3530), and MPEG-4 Part 2 and H.263 in FLV, which
+  /// its start refuses at the normal compliance (`flv_init`, `flvenc.c`
+  /// 1017–1028; R11, ruling 4). Of table H, a codec the container's start
   /// or its reader takes not, and in the MXF muxers H.264, DV, FFV1 and
   /// JPEG 2000 video and the data and caption tracks, whose frame parsers
   /// and essence this release has not audited — each booked to be
@@ -3097,7 +3100,9 @@ pub enum MuxOpenError {
   /// layout is not exactly mono or stereo, for which FLV writes a
   /// multichannel header naming the codec's fourcc, which such a codec has
   /// none of: `av_assert0` ends the process (`flv_write_codec_header`,
-  /// `flvenc.c` 910–913; `write_codec_fourcc`, 497–540).
+  /// `flvenc.c` 910–913; `write_codec_fourcc`, 497–540); and FLV's Speex of
+  /// more than one channel, which its start refuses (`get_audio_flags`,
+  /// 156–159).
   #[error("track {}'s channel layout is not one the container writes", .track.get())]
   ChannelLayout {
     /// The track.
@@ -3175,7 +3180,13 @@ pub enum MuxOpenError {
   /// the trailer's joined document is written by), and MP4 AV1's one
   /// `ff_isom_write_av1c` fails on, the `av1C` left empty (`av1.c`
   /// 399–502; R9: ruling 4c). Of table H: FLV AV1's that function fails on,
-  /// its sequence header left empty (`flvenc.c` 892–893); one ADTS
+  /// its sequence header left empty (`flvenc.c` 892–893); FLV's audio at a
+  /// sample rate its flags name no code for, which its start refuses — MP3
+  /// at another than 48, 44.1, 22.05 and 11.025 kHz, PCM, Swiff ADPCM,
+  /// Nellymoser and G.711 at another than 44.1, 22.05, 11.025, 16, 8 and
+  /// 5.512 kHz, Speex at another than 16 kHz (`get_audio_flags`, 141–200;
+  /// `flv_init`, 1050–1051; R11, ruling 4) — or under a code it reads back
+  /// otherwise; one ADTS
   /// cannot write in its headers, FLAC's opening with its `fLaC` marker,
   /// AVI's raw video of no tag of another pixel format than its bits name,
   /// and one past the 16-bit size its header counts it in — the `cbSize`
@@ -3236,7 +3247,11 @@ pub enum MuxOpenError {
   /// OP-Atom's second track (`mxf_init`, `mxfenc.c` 2946–2966, 3043–3047);
   /// PSP's of other than one video and one audio track, named at the first
   /// track where one is missing (`mov_write_header`, `movenc.c` 6431–6448);
-  /// AVIF's second track, its alpha plane's booked (8250–8270); ISMV's
+  /// AVIF's second track, its alpha plane's booked (8250–8270); FLV's video
+  /// track past the first of another codec than VP9, AV1, H.264, HEVC and
+  /// VVC, and its audio track past the first of another than AAC, MP3,
+  /// Opus, FLAC, AC-3 and E-AC-3, which its start refuses (`flv_init`,
+  /// `flvenc.c` 985–998, 1036–1046; R11, ruling 4); ISMV's
   /// second video track, booked to Q870: whether its key frames flush
   /// before `check_pkt`'s second count rests on libavformat's interleaving
   /// (7445–7471).
@@ -4293,7 +4308,7 @@ fn mono_or_stereo(layout: LayoutView<'_>) -> bool {
 /// reader takes G.711 at — no metadata being read before the stream exists
 /// (`get_audio_flags`, `flvenc.c` 177–186, 203–231; `flv_set_audio_codec`,
 /// `flvdec.c` 354–360; 1657–1670). Nellymoser's 8 and 16 kHz have codes of
-/// their own (218–225), and MP3's are refused at the header (186–195).
+/// their own (218–225), and a rate of no code is [`flv_rate_uncoded`]'s.
 fn flv_rate_read_otherwise(codec: CodecId, rate: i32) -> bool {
   if [PCM_U8, CodecId::PCM_S16LE, CodecId::PCM_S16BE, ADPCM_SWF].contains(&codec) {
     matches!(rate, 8_000 | 16_000)
@@ -4302,6 +4317,81 @@ fn flv_rate_read_otherwise(codec: CodecId, rate: i32) -> bool {
   } else {
     false
   }
+}
+
+/// Whether FLV's start refuses an audio track of `codec` at `rate`, its
+/// flags naming no code for it (`get_audio_flags`, `flvenc.c` 141–200;
+/// `flv_init`, 1050–1051): AAC's state 44.1 kHz whatever its rate, and
+/// Opus's, FLAC's, AC-3's and E-AC-3's are their extended header's; Speex
+/// is wideband alone, 16 kHz; MP3 takes 48, 44.1, 22.05 and 11.025 kHz —
+/// 48 under 44.1's code, its decoder reading each frame's own back — and
+/// every other codec of FLV's table 44.1, 22.05 and 11.025 kHz, and 16, 8
+/// and 5.512 under the 5.5 kHz code ([`flv_rate_read_otherwise`]).
+fn flv_rate_uncoded(codec: CodecId, rate: i32) -> bool {
+  if [
+    CodecId::AAC,
+    CodecId::OPUS,
+    CodecId::FLAC,
+    CodecId::AC3,
+    CodecId::EAC3,
+  ]
+  .contains(&codec)
+  {
+    false
+  } else if codec == SPEEX {
+    rate != 16_000
+  } else {
+    match rate {
+      48_000 => codec != CodecId::MP3,
+      44_100 | 22_050 | 11_025 => false,
+      16_000 | 8_000 | 5_512 => codec == CodecId::MP3,
+      _ => true,
+    }
+  }
+}
+
+/// The first track FLV's start has no place for where it lies in the table
+/// (`flv_init`, `flvenc.c` 985–998, 1036–1046): a video track past the
+/// first of another codec than VP8 — which its tag table names not — VP9,
+/// AV1, H.264, HEVC and VVC, which its multitrack tags carry; an audio
+/// track past the first of another than AAC, MP3, Opus, FLAC, AC-3 and
+/// E-AC-3.
+fn flv_misplaced<D, S>(
+  tracks: &[TrackDescription<Ffmpeg, D, S>],
+  roads: &[Road],
+) -> Option<TrackIndex> {
+  const VIDEO: [CodecId; 6] = [
+    CodecId::VP8,
+    CodecId::VP9,
+    CodecId::AV1,
+    CodecId::H264,
+    CodecId::HEVC,
+    CodecId::VVC,
+  ];
+  const AUDIO: [CodecId; 6] = [
+    CodecId::AAC,
+    CodecId::MP3,
+    CodecId::OPUS,
+    CodecId::FLAC,
+    CodecId::AC3,
+    CodecId::EAC3,
+  ];
+  let (mut video, mut audio) = (0_usize, 0_usize);
+  for (index, (description, road)) in tracks.iter().zip(roads).enumerate() {
+    if *road != Road::Timed {
+      continue;
+    }
+    let (count, multitrack) = match description.kind() {
+      TrackKind::Video => (&mut video, &VIDEO),
+      TrackKind::Audio => (&mut audio, &AUDIO),
+      _ => continue,
+    };
+    if *count > 0 && !multitrack.contains(&description.codec()) {
+      return Some(TrackIndex::new(index));
+    }
+    *count += 1;
+  }
+  None
 }
 
 /// Whether FLV rewrites an H.264, HEVC or VVC track's packets from Annex B
@@ -7558,6 +7648,11 @@ where
     {
       return Err(MuxOpenError::TrackLayout { track });
     }
+    if audited == Audited::Flv
+      && let Some(track) = flv_misplaced(&tracks, &roads)
+    {
+      return Err(MuxOpenError::TrackLayout { track });
+    }
     // The MXF muxers cut PCM into the edit units of the video's frame rate,
     // OP-Atom's of its audio edit rate, 25 (`mxf_init`, `mxfenc.c`
     // 3036–3083; `opatom_options`).
@@ -10281,6 +10376,12 @@ where
   let extradata = stream_extradata(description);
   let ticket = description.side_data();
   match audited {
+    // FLV's start refuses MPEG-4 Part 2 and H.263 at the normal
+    // compliance, as no part of FLV's specification (`flv_init`,
+    // `flvenc.c` 1017–1028).
+    Audited::Flv if codec == CodecId::MPEG4 || codec == H263 => {
+      Some(MuxOpenError::CodecNotCarried { track, codec })
+    }
     // FLV asserts an Opus or FLAC track's configuration at its header
     // (`av_assert0`, `flvenc.c` 853); writes H.264's, HEVC's, VVC's, AV1's,
     // MPEG-4's and AAC's only from it, or from what the filter makes of the
@@ -10329,14 +10430,21 @@ where
     {
       Some(MuxOpenError::ConfigurationInvalid { track, codec })
     }
+    // FLV's start refuses Speex of more than one channel (`get_audio_flags`,
+    // `flvenc.c` 156–159).
     Audited::Flv
       if description.kind() == TrackKind::Audio
         && flv_legacy_audio(codec)
-        && !mono_or_stereo(LayoutView::of(ticket.ch_layout())) =>
+        && (!mono_or_stereo(LayoutView::of(ticket.ch_layout()))
+          || (codec == SPEEX && ticket.ch_layout().channels() != 1)) =>
     {
       Some(MuxOpenError::ChannelLayout { track })
     }
-    Audited::Flv if flv_rate_read_otherwise(codec, ticket.sample_rate()) => {
+    Audited::Flv
+      if description.kind() == TrackKind::Audio
+        && (flv_rate_uncoded(codec, ticket.sample_rate())
+          || flv_rate_read_otherwise(codec, ticket.sample_rate())) =>
+    {
       Some(MuxOpenError::ConfigurationInvalid { track, codec })
     }
     Audited::Flac | Audited::Mp3 if description.kind() != TrackKind::Audio => {
@@ -13144,9 +13252,10 @@ const MPEG1VIDEO: CodecId =
   CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO as i32);
 const CAVS: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_CAVS as i32);
 
-/// Theora and Speex, which the base names no constants for.
+/// Theora, Speex and H.263, which the base names no constants for.
 const THEORA: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_THEORA as i32);
 const SPEEX: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_SPEEX as i32);
+const H263: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H263 as i32);
 
 /// The time bases NUT's header will count: its streams', as
 /// [`nut_time_base`] sets them, and its chapters', each once.
