@@ -353,7 +353,7 @@
 //! | AV1's OBUs | 7159–7174 | [`PayloadRule::Obus`]; reported ([`Rewrite::ObusFiltered`]) |
 //! | AC-3 and E-AC-3: a frame header that parses, dependent frames that tile a first packet, blocks joined into samples of six | 7175–7181; `handle_eac3` 464–610 | [`PayloadRule::Ac3Header`], [`Ac3Substreams`](PayloadRule::Ac3Substreams) (at most 15, `dec3`'s four bits), [`Ac3Blocks`](PayloadRule::Ac3Blocks), [`Ac3SampleSize`](PayloadRule::Ac3SampleSize); the joined samples, table C″; reported ([`Rewrite::Ac3Parsed`]) |
 //! | EIA-608's pairs into `cdat` | 7182–7197 | not reached: not in MP4's tag table |
-//! | APV's packets read for `apvC` | 7198–7203 | written as given |
+//! | APV's packets read for `apvC` | 7198–7203 | written as given; each frame's information recorded, a PBU type's 256th refused ([`PayloadRule::ApvFrameInfo`]; R11, ruling 2 — L140) |
 //! | skip samples that leave less than nothing | 7311–7320 | [`PayloadRule::SkipSamples`] — a joined E-AC-3 sample's at its last packet, table C″ |
 //! | VC-1's and TrueHD's sync read from the bitstream | 7344–7348 | reported ([`Rewrite::SyncFromBitstream`]) |
 //! | an empty packet, dropped | 7431–7441 | [`PayloadRule::Empty`]; but a configuration's packet — no payload, new extradata — of MPEG-4 ALS, AAC, AV1 or FLAC, whose extradata MP4 takes first as the current sample description's configuration (7412–7428), its duration alone judged (`check_pkt` at 7396): taken, its new extradata reported possibly dropped, no sample counted (L72) |
@@ -461,7 +461,11 @@
 //! | | | a sequence header, of no record's version, past 65 535 bytes, its 16-bit length cut | a | refused — L120b |
 //! | `mov_write_dvc1_tag` (`movenc.c` 1102–1201) | MP4's `dvc1` (2915–2916), of a configuration | no sequence header — VC-1's simple and main profiles' `STRUCT_C` among them | a | refused — L120c |
 //! | | | a sequence header of another profile than the advanced one | b | not refused |
-//! | `ff_isom_write_apvc` (`apv.c` 80–205) | MP4's `apvC` (1725–1738) | no answer: it returns none | — | none; its record is MP4's parse of the packets (`ff_isom_parse_apvc`, 7199), whose answer MP4 ignores: a letter of R10 |
+//! | `ff_isom_write_apvc` (`apv.c` 80–205) | MP4's `apvC` (1725–1738) | no answer: it returns none | — | none; its record is MP4's parse of the packets (`ff_isom_parse_apvc`, 253–318; `movenc.c` 7199), whose answer MP4 ignores |
+//! | `ff_isom_parse_apvc` (`apv.c` 253–318), of each packet | MP4's `apvC` | a frame's information past a PBU type's 255, its 8-bit count (`apv_add_frameinfo`, 233–250): the parse failed there, the record written without it | a | refused at the packet ([`PayloadRule::ApvFrameInfo`]; R11, ruling 2) — L140 |
+//! | | | a packet of fewer than 8 bytes or of no signature; a PBU that does not split; a frame header of a reserved field set, of 4:2:0 or a chroma format past 4, of a bit depth below 10 or past 16, or its tiles not parsing (`cbs_apv.c` 162–244; `cbs_apv_syntax_template.c` 19–330): nothing of the packet recorded | b | not refused |
+//! | | | a frame of an odd bit depth, which no profile allows: the parse stops there | b | not refused, mirrored ([`records::apv_frame_infos`]) |
+//! | | | a sixth PBU type's entry (`av_assert0`, 214) | — | never reached: five types are recorded |
 //! | FLV's `extract_extradata` (`extract_extradata.c` 166–275) | FLV, a track of no configuration (1495–1501) | a packet of no unit `ff_h2645_packet_split` splits off: the filter refuses it, and libavformat drops it | a | refused ([`PayloadRule::NalUnits`]) — L121 |
 //! | | | the configuration it makes of a packet's parameter sets, which the writer writes | a | judged as the writer's, above — L121 |
 //! | each writer | — | an allocation | — | outside the trust model |
@@ -2821,6 +2825,14 @@ pub enum PayloadRule {
   /// 3241–3256): 12.4 hours at 48 kHz (R11, Q869 L7).
   #[error("the packet would take the track's samples past what MP4 counts them in")]
   SampleCount,
+  /// MP4's APV: a packet whose frame brings a 256th frame information of
+  /// its PBU type to the track's `apvC`, which MP4 makes of its parse of
+  /// every packet and counts them in 8 bits (`apv_add_frameinfo`, `apv.c`
+  /// 233–250; `ff_isom_parse_apvc`, 253–318): the parse fails there, its
+  /// answer ignored (`movenc.c` 7199), the record written without the
+  /// frame's information (R11, ruling 2).
+  #[error("the packet's frame would be one too many for the APV configuration record")]
+  ApvFrameInfo,
   /// MP4 PCM: not a whole number of frames — channels times bytes per
   /// sample. MP4 refuses a packet holding none after taking it, and counts
   /// only the whole frames of another, losing the rest (`movenc.c`
@@ -3450,6 +3462,10 @@ struct TrackState {
   mp4_place: Option<i128>,
   /// The MOV family's constant-size audio: the samples MP4 has counted.
   mp4_samples: u64,
+  /// The MOV family's APV: the frame informations its `apvC` records so
+  /// far, by PBU type, in the order the types came
+  /// ([`records::apv_frame_infos`]).
+  apv: Vec<(u8, Vec<records::ApvFrameInfo>)>,
   /// NUT: the last key frame's presentation and decode times, in ticks.
   key_times: Option<(i128, i128)>,
   /// The MXF muxers: what they have learned of the track's frames.
@@ -4044,6 +4060,9 @@ struct PacketRules {
   /// packet — its place on the track's timeline, and the count
   /// [`PayloadRule::SampleCount`] judges.
   mp4_constant: Option<u64>,
+  /// The MOV family's APV: the frame informations of each packet recorded
+  /// into its `apvC` ([`PayloadRule::ApvFrameInfo`]).
+  apv: bool,
   /// ASF: a presentation time within what its index counts, and the
   /// file's play duration within 64 bits of 100 ns ticks
   /// ([`FfmpegMuxRefusal::PresentationOffset`],
@@ -4934,6 +4953,7 @@ impl PacketRules {
       mp4_constant: (mp4 && kind == TrackKind::Audio && audited != Audited::Mov(MovMode::Ism))
         .then(|| mp4_sample_size(codec))
         .flatten(),
+      apv: mp4 && id == CodecId::APV,
       asf,
       nut: None,
       ogg: matches!(audited, Audited::Ogg(_)).then(|| ogg_granule(codec, time_base)),
@@ -7514,7 +7534,7 @@ struct Plan {
 
 /// What a container learns of a track from a packet it writes, for the
 /// next one's judgment.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct Learned {
   /// MP4: the sample MP4 writes with the packet, where it writes one —
   /// not where it holds the packet (table C″ of the census).
@@ -7549,6 +7569,9 @@ struct Learned {
   /// The MOV family's constant-size audio: what MP4 counts of the packet
   /// ([`Mp4Place`]).
   mp4_place: Option<Mp4Place>,
+  /// The MOV family's APV: the frame informations the packet adds to the
+  /// track's `apvC`, by PBU type.
+  apv: Vec<(u8, records::ApvFrameInfo)>,
   /// NUT: the key frame's presentation and decode times, in ticks.
   key_times: Option<(i128, i128)>,
   /// The MXF muxers: what they know of the track's frames after it.
@@ -8183,6 +8206,7 @@ where
         place: 0,
         mp4_place: None,
         mp4_samples: 0,
+        apv: Vec::new(),
         key_times: None,
         mxf: MxfMirror {
           profile_level: (
@@ -8829,6 +8853,12 @@ where
     if let Some(mp4) = plan.learned.mp4_place {
       state.mp4_place = Some(mp4.next);
       state.mp4_samples = mp4.samples;
+    }
+    for &(kind, info) in &plan.learned.apv {
+      match state.apv.iter_mut().find(|(entry, _)| *entry == kind) {
+        Some((_, infos)) => infos.push(info),
+        None => state.apv.push((kind, vec![info])),
+      }
     }
     if let Some(key_times) = plan.learned.key_times {
       state.key_times = Some(key_times);
@@ -9620,6 +9650,27 @@ fn check_packet_rules(
     }
     _ => None,
   };
+  // The MOV family's APV: each frame's information MP4's parse of the
+  // packet records into `apvC`, a type's 256th past its 8-bit count
+  // (`ff_isom_parse_apvc`, `apv.c` 253–318; [`PayloadRule::ApvFrameInfo`]).
+  let mut apv: Vec<(u8, records::ApvFrameInfo)> = Vec::new();
+  if rules.apv && !config_only {
+    for (kind, info) in records::apv_frame_infos(payload.bytes) {
+      let recorded = state
+        .apv
+        .iter()
+        .find(|(entry, _)| *entry == kind)
+        .map_or(&[][..], |(_, infos)| infos.as_slice());
+      let added = apv.iter().filter(|(entry, _)| *entry == kind);
+      if recorded.contains(&info) || added.clone().any(|(_, seen)| *seen == info) {
+        continue;
+      }
+      if recorded.len() + added.count() >= usize::from(u8::MAX) {
+        return refused(PayloadRule::ApvFrameInfo);
+      }
+      apv.push((kind, info));
+    }
+  }
   // NUT's index (`write_index`, `nutenc.c` 615–667): a key frame — one
   // libavformat marks so for a codec that counts every frame one among
   // them (`mux.c` 820–821) — presented before the last, or at it but
@@ -9893,6 +9944,7 @@ fn check_packet_rules(
     bytes: payload.bytes.len() as u64,
     place,
     mp4_place,
+    apv,
     key_times,
     mxf,
     written,

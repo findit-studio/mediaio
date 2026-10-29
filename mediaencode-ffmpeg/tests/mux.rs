@@ -16187,3 +16187,119 @@ fn l139_mp4_refuses_pcm_samples_past_what_it_counts_them_in() {
     .sum();
   assert_eq!(read as u64, bound * 4, "the two packets' samples");
 }
+
+/// An APV access unit of one primary frame, 16 by 16 pixels of 4:2:2 at
+/// 10 bits, its capture time distance `distance`: the signature, and one
+/// PBU — its header, the frame header with its frame information, one
+/// tile of 16 by 8 macroblocks, its header and a byte a component — as
+/// `cbs_apv_syntax_template.c` reads them (19–330).
+fn apv_au(distance: u8) -> Vec<u8> {
+  let mut bits: Vec<bool> = Vec::new();
+  let mut put = |value: u64, count: u32| {
+    for bit in (0..count).rev() {
+      bits.push((value >> bit) & 1 == 1);
+    }
+  };
+  // The frame information.
+  put(33, 8); // profile_idc
+  put(30, 8); // level_idc
+  put(0, 3); // band_idc
+  put(0, 5); // reserved_zero_5bits
+  put(16, 24); // frame_width
+  put(16, 24); // frame_height
+  put(2, 4); // chroma_format_idc: 4:2:2
+  put(2, 4); // bit_depth_minus8: 10 bits
+  put(u64::from(distance), 8); // capture_time_distance
+  put(0, 8); // reserved_zero_8bits
+  // The rest of the frame header.
+  put(0, 8); // reserved_zero_8bits
+  put(0, 1); // color_description_present_flag
+  put(0, 1); // use_q_matrix
+  put(16, 20); // tile_width_in_mbs
+  put(8, 20); // tile_height_in_mbs
+  put(0, 1); // tile_size_present_in_fh_flag
+  put(0, 8); // reserved_zero_8bits_2
+  while bits.len() % 8 != 0 {
+    bits.push(false);
+  }
+  let header: Vec<u8> = bits
+    .chunks(8)
+    .map(|byte| byte.iter().fold(0_u8, |acc, &bit| acc << 1 | u8::from(bit)))
+    .collect();
+  // One tile: its size, its header for three components, a byte each.
+  let mut tile = Vec::new();
+  tile.extend_from_slice(&20_u16.to_be_bytes()); // tile_header_size
+  tile.extend_from_slice(&0_u16.to_be_bytes()); // tile_index
+  for _ in 0..3 {
+    tile.extend_from_slice(&1_u32.to_be_bytes()); // tile_data_size
+  }
+  tile.extend_from_slice(&[22, 22, 22, 0]); // tile_qp, reserved_zero_8bits
+  tile.extend_from_slice(&[0, 0, 0]);
+  let mut pbu = vec![1, 0, 1, 0]; // pbu_type 1, group_id 1, reserved
+  pbu.extend_from_slice(&header);
+  pbu.extend_from_slice(&(tile.len() as u32).to_be_bytes());
+  pbu.extend_from_slice(&tile);
+  let mut au = b"aPv1".to_vec();
+  au.extend_from_slice(&(pbu.len() as u32).to_be_bytes());
+  au.extend_from_slice(&pbu);
+  au
+}
+
+/// **L140 — MP4 refuses the APV packet whose frame would bring a 256th
+/// frame information to its `apvC`** (R11, ruling 2; `ff_isom_parse_apvc`,
+/// `apv.c` 233–318; `movenc.c` 7199, 1725–1738): MP4 records each distinct
+/// frame information of a PBU type it parses out of the packets, and
+/// counts them in 8 bits, its parse failing at the 256th, its answer
+/// ignored, the record written without it. 255 frames of 255 capture time
+/// distances are taken, and a repeated one; the frame of the 256th
+/// distance is refused by name (`PayloadRule::ApvFrameInfo`), untouched;
+/// the file's `apvC` reads back of one entry of 255 — FFmpeg's own parse
+/// of each frame.
+///
+/// PLANT: the count unjudged, the 256th taken; the capture time distance
+/// left out of the frame information, every frame one, the 256th taken.
+#[test]
+fn l140_mp4_refuses_an_apv_frame_past_its_configurations_count() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let (table, video) = first_track(&source, TrackKind::Video, 1);
+  let table: Vec<_> = table
+    .into_iter()
+    .map(|row| recoded(row, ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_APV, &[]))
+    .collect();
+  let carrier = video_of(&video[0]);
+  let target = output(&corpus, "l140.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::new("mp4"), table);
+  let frame = |at: i64, distance: u8| {
+    VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_holding(&carrier, &apv_au(distance))
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at)))
+        .with_flags(PacketFlags::KEY),
+    )
+  };
+  for distance in 0..=254_u8 {
+    muxer
+      .write_video(frame(i64::from(distance) * 40, distance))
+      .map_err(|error| error.map_packet(drop))
+      .unwrap_or_else(|error| panic!("distance {distance}: {error:?}"));
+  }
+  muxer
+    .write_video(frame(255 * 40, 7))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame information recorded already");
+  let offered = frame(256 * 40, 255);
+  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  assert_eq!(refusal, payload(PayloadRule::ApvFrameInfo));
+  untouched!(offered, back);
+  muxer.finish().expect("finished");
+  let back = table_of(&target, TrackKind::Video).remove(0);
+  let record = back.side_data().extradata().to_vec();
+  // The box's version and flags, its configuration version, its one entry:
+  // the primary frame's type and its count of frame informations.
+  assert_eq!(&record[..4], &[0, 0, 0, 0], "{record:?}");
+  assert_eq!(record[4], 1, "configurationVersion");
+  assert_eq!(record[5], 1, "one entry");
+  assert_eq!((record[6], record[7]), (1, 255), "the primary frame's 255");
+}

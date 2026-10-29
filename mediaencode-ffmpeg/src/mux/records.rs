@@ -22,7 +22,15 @@
 //! size past `INT_MAX`, or running to its unit's end, and its global
 //! configuration of a reserved resolution type or of no dimensions
 //! (`lcevc.c` 64–74, 147–148); VC-1's sequence header of another profile
-//! than the advanced one (`movenc.c` 1137–1141).
+//! than the advanced one (`movenc.c` 1137–1141); APV's access unit of no
+//! signature, of a PBU that does not split, or of a frame header or tiles
+//! that do not parse, and its frame of an odd bit depth (`apv.c` 257–281;
+//! `cbs_apv.c` 162–244).
+//!
+//! APV's `apvC` is MP4's parse of the packets, not of a configuration
+//! (`ff_isom_parse_apvc`, `apv.c` 253–318): each frame's information,
+//! recorded by its PBU type, its 256th distinct one past the record's
+//! 8-bit count ([`apv_frame_infos`]).
 
 use std::borrow::Cow;
 
@@ -1459,6 +1467,141 @@ pub(super) fn dvc1(config: &[u8]) -> Wrote {
     start = next;
   }
   if found { Wrote::Whole } else { Wrote::Failed }
+}
+
+/// The PBU types of a frame, each its own entry of APV's `apvC`
+/// (`decompose_unit_types`, `apv.c` 208–211): primary, non-primary,
+/// preview, depth and alpha.
+const APV_FRAMES: [u8; 5] = [1, 2, 25, 26, 27];
+
+/// One frame's information as MP4's parse of an APV access unit records it
+/// in `apvC`, and compares it with those recorded, field by field
+/// (`APVDecoderFrameInfo`, `apv.c` 34–62; `ff_isom_parse_apvc`, 253–318):
+/// the frame information's fields, the colour description's where the
+/// frame header states one — zeros where it does not — and
+/// `capture_time_distance_ignored` set, which every record shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ApvFrameInfo {
+  profile: u8,
+  level: u8,
+  band: u8,
+  width: u32,
+  height: u32,
+  chroma: u8,
+  depth_minus8: u8,
+  distance: u8,
+  /// The colour primaries, transfer characteristics, matrix coefficients
+  /// and full range flag, where the frame header states them.
+  color: Option<[u8; 4]>,
+}
+
+/// The frame informations MP4's parse of the APV access unit `au` records,
+/// each with its PBU type, in order (`ff_isom_parse_apvc`, `apv.c`
+/// 253–318): none where the parse fails — a packet of fewer than 8 bytes
+/// or of no signature, or a split `cbs_apv_split_fragment` refuses, a PBU
+/// shorter than 8 bytes or past what is left, a PBU header's reserved
+/// byte set (`cbs_apv.c` 162–244; `cbs_apv_syntax_template.c` 19–29) — and
+/// none past a frame of a bit depth past 16 or odd, where the parse stops.
+/// A frame's header is read for its frame information and its colour
+/// description (`cbs_apv_syntax_template.c` 63–91, 142–163), each range the
+/// syntax checks there checked — a frame of a reserved field set, of
+/// 4:2:0 or a chroma format past 4, of a bit depth below 10 or past 16, or
+/// too short for them, failing the parse; its tiles, which the parse reads
+/// too, rest on the trust model: a stream the standards allow, they parse.
+pub(super) fn apv_frame_infos(au: &[u8]) -> Vec<(u8, ApvFrameInfo)> {
+  const SIGNATURE: &[u8; 4] = b"aPv1";
+  if au.len() < 8 || &au[..4] != SIGNATURE {
+    return Vec::new();
+  }
+  let mut units = Vec::new();
+  let mut rest = &au[4..];
+  while !rest.is_empty() {
+    if rest.len() < 8 {
+      return Vec::new();
+    }
+    let size = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    rest = &rest[4..];
+    if size < 8 || size > rest.len() {
+      return Vec::new();
+    }
+    let unit = &rest[..size];
+    if unit[3] != 0 {
+      return Vec::new();
+    }
+    units.push(unit);
+    rest = &rest[size..];
+  }
+  let mut infos = Vec::new();
+  let mut read = Vec::new();
+  for unit in &units {
+    if APV_FRAMES.contains(&unit[0]) {
+      match apv_frame_info(&unit[4..]) {
+        Some(info) => read.push((unit[0], info)),
+        None => return Vec::new(),
+      }
+    }
+  }
+  for (kind, info) in read {
+    let depth = info.depth_minus8 + 8;
+    if !(8..=16).contains(&depth) || depth % 2 != 0 {
+      break;
+    }
+    infos.push((kind, info));
+  }
+  infos
+}
+
+/// A frame header's frame information and colour description, its ranges
+/// checked as the syntax checks them, or `None` where it does not parse.
+fn apv_frame_info(header: &[u8]) -> Option<ApvFrameInfo> {
+  if header.len() < 14 {
+    return None;
+  }
+  let mut bits = Reader::new(header);
+  let profile = bits.read(8) as u8;
+  let level = bits.read(8) as u8;
+  let band = bits.read(3) as u8;
+  let reserved = bits.read(5);
+  let width = bits.read(24);
+  let height = bits.read(24);
+  let chroma = bits.read(4) as u8;
+  let depth_minus8 = bits.read(4) as u8;
+  let distance = bits.read(8) as u8;
+  let reserved_8 = bits.read(8);
+  let reserved_header = bits.read(8);
+  if reserved != 0
+    || reserved_8 != 0
+    || reserved_header != 0
+    || chroma > 4
+    || chroma == 1
+    || !(2..=8).contains(&depth_minus8)
+  {
+    return None;
+  }
+  let color = if bits.read1() == 1 {
+    if header.len() < 18 {
+      return None;
+    }
+    Some([
+      bits.read(8) as u8,
+      bits.read(8) as u8,
+      bits.read(8) as u8,
+      bits.read1() as u8,
+    ])
+  } else {
+    None
+  };
+  Some(ApvFrameInfo {
+    profile,
+    level,
+    band,
+    width,
+    height,
+    chroma,
+    depth_minus8,
+    distance,
+    color,
+  })
 }
 
 /// A configuration writer the MOV family or FLV calls and ignores the

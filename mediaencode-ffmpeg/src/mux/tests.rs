@@ -1250,6 +1250,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     place: 0,
     mp4_place: None,
     mp4_samples: 0,
+    apv: Vec::new(),
     key_times: None,
     mxf: MxfMirror::default(),
     buffered: 0,
@@ -4611,4 +4612,99 @@ fn channel_layouts_read_back_as_each_container_and_decoder_reads_them() {
       "{what}: kept"
     );
   }
+}
+
+/// An APV PBU of type `kind`: its header, a frame header of a 16 by 16
+/// picture of 4:2:2, `depth_minus8`, the capture time distance `distance`,
+/// its reserved bits `reserved`, and one tile (`cbs_apv_syntax_template.c`
+/// 19–330).
+fn apv_pbu(kind: u8, depth_minus8: u8, distance: u8, reserved: u8) -> Vec<u8> {
+  let mut header = vec![33, 30, reserved & 0x1F];
+  header.extend_from_slice(&[0, 0, 16, 0, 0, 16]);
+  header.extend_from_slice(&[0x20 | depth_minus8, distance, 0, 0]);
+  // Colour description and quantization matrix absent, then the tile info,
+  // 16 by 8 macroblocks, and the last reserved byte, aligned.
+  header.extend_from_slice(&[0x00, 0x00, 0x40, 0x00, 0x02, 0x00, 0x00]);
+  let mut tile = Vec::new();
+  tile.extend_from_slice(&20_u16.to_be_bytes());
+  tile.extend_from_slice(&0_u16.to_be_bytes());
+  for _ in 0..3 {
+    tile.extend_from_slice(&1_u32.to_be_bytes());
+  }
+  tile.extend_from_slice(&[22, 22, 22, 0, 0, 0, 0]);
+  let mut pbu = vec![kind, 0, 1, 0];
+  pbu.extend_from_slice(&header);
+  pbu.extend_from_slice(&(tile.len() as u32).to_be_bytes());
+  pbu.extend_from_slice(&tile);
+  pbu
+}
+
+/// An APV access unit of `pbus`, each behind its size.
+fn apv_access_unit(pbus: &[Vec<u8>]) -> Vec<u8> {
+  let mut au = b"aPv1".to_vec();
+  for pbu in pbus {
+    au.extend_from_slice(&(pbu.len() as u32).to_be_bytes());
+    au.extend_from_slice(pbu);
+  }
+  au
+}
+
+/// R11, ruling 2: MP4's parse of an APV access unit for `apvC`
+/// (`ff_isom_parse_apvc`, `apv.c` 253–318) — each frame's information with
+/// its PBU type, in order; none of a packet of no signature, of a PBU
+/// that does not split or of a reserved field set, which its parse
+/// refuses; none past a frame of an odd bit depth, where it stops; a
+/// metadata PBU's none.
+#[test]
+fn apv_frame_infos_follow_mp4s_parse_of_the_access_unit() {
+  let infos = |au: &[u8]| -> Vec<(u8, u8)> {
+    records::apv_frame_infos(au)
+      .into_iter()
+      .map(|(kind, info)| (kind, format!("{info:?}").len() as u8))
+      .collect()
+  };
+  let kinds = |au: &[u8]| -> Vec<u8> {
+    records::apv_frame_infos(au)
+      .into_iter()
+      .map(|(kind, _)| kind)
+      .collect()
+  };
+  let primary = apv_pbu(1, 2, 3, 0);
+  let alpha = apv_pbu(27, 2, 3, 0);
+  let metadata = vec![66, 0, 1, 0, 0, 0, 0, 0];
+  assert_eq!(kinds(&apv_access_unit(&[primary.clone()])), [1]);
+  assert_eq!(
+    kinds(&apv_access_unit(&[
+      primary.clone(),
+      metadata.clone(),
+      alpha.clone()
+    ])),
+    [1, 27]
+  );
+  // No signature, a PBU short of 8 bytes, a PBU past what is left.
+  let mut unsigned = apv_access_unit(&[primary.clone()]);
+  unsigned[0] = b'b';
+  assert!(infos(&unsigned).is_empty());
+  assert!(kinds(&apv_access_unit(&[primary.clone(), vec![1, 0, 1]])).is_empty());
+  let mut long = apv_access_unit(&[primary.clone()]);
+  long[7] = long[7].wrapping_add(1);
+  assert!(kinds(&long).is_empty());
+  // A reserved field set, or 8 bits a sample, fails the parse of the unit.
+  assert!(kinds(&apv_access_unit(&[primary.clone(), apv_pbu(2, 2, 3, 1)])).is_empty());
+  assert!(kinds(&apv_access_unit(&[apv_pbu(1, 0, 3, 0)])).is_empty());
+  // An odd bit depth stops the parse: the frames after it unrecorded.
+  assert_eq!(
+    kinds(&apv_access_unit(&[
+      primary.clone(),
+      apv_pbu(2, 3, 3, 0),
+      alpha.clone()
+    ])),
+    [1]
+  );
+  // Two distances, two informations; the same twice, equal.
+  let a = records::apv_frame_infos(&apv_access_unit(&[apv_pbu(1, 2, 3, 0)]));
+  let b = records::apv_frame_infos(&apv_access_unit(&[apv_pbu(1, 2, 4, 0)]));
+  let c = records::apv_frame_infos(&apv_access_unit(&[apv_pbu(1, 2, 3, 0)]));
+  assert_ne!(a, b);
+  assert_eq!(a, c);
 }
