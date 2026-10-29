@@ -11155,6 +11155,17 @@ fn l99_mxf_refuses_what_its_frame_parsers_and_interleaving_lose() {
   );
 }
 
+/// AAC with a PNG cover attached, in MP4.
+#[rustfmt::skip]
+fn aac_cover_mp4(corpus: &Corpus) -> PathBuf {
+  let mp3 = corpus.cover_art_mp3();
+  generated(corpus, "aac-cover.mp4", &[
+    "-i", mp3.to_str().expect("utf-8 path"),
+    "-map", "0:a", "-map", "0:v", "-c:a", "aac", "-c:v", "copy",
+    "-disposition:v", "attached_pic",
+  ])
+}
+
 /// Each chapter of `path` as its id, its title and its span in
 /// milliseconds.
 fn chapter_rows(path: &Path) -> Vec<(i64, Option<String>, (i64, i64))> {
@@ -11181,10 +11192,12 @@ fn chapter_rows(path: &Path) -> Vec<(i64, Option<String>, (i64, i64))> {
 /// chapters MOV's and iPod's chapter track keeps as MP4's does, 3GP's,
 /// 3G2's and F4V's Nero list from their starts, its last ended at the
 /// file's end ([`Uncarried::ChapterSpan`]), PSP's none
-/// ([`Uncarried::Chapter`]).
+/// ([`Uncarried::Chapter`]); a cover iPod's and F4V's iTunes metadata
+/// write, MOV's, 3GP's and ISMV's none ([`Uncarried::Attachment`]).
 ///
-/// PLANT: MOV's language taken packed; the roles taken as MP4's; the
-/// chapters taken as MP4's in every mode; F4V's move unmirrored.
+/// PLANT: the modes out of MP4's family; MOV's language taken packed; the
+/// roles taken as MP4's; the chapters taken as MP4's in every mode; F4V's
+/// move unmirrored; every mode taken to write a cover.
 #[test]
 fn l100_streams_round_trip_through_the_mov_familys_modes() {
   let Some(corpus) = Corpus::new() else { return };
@@ -11305,6 +11318,32 @@ fn l100_streams_round_trip_through_the_mov_familys_modes() {
       .collect();
     assert_eq!(rows[1].as_deref(), Some("fra"), "{container}: the language");
   }
+  // A cover: MP4's, iPod's and F4V's iTunes metadata write it; MOV's,
+  // 3GP's, 3G2's and ISMV's none, its track not written.
+  let covered = aac_cover_mp4(&corpus);
+  let cover = FfmpegOwnedDemuxer::open(&covered)
+    .expect("open")
+    .tracks()
+    .iter()
+    .position(|row| row.kind() == TrackKind::Attachment)
+    .expect("the premise: a cover track");
+  for (container, written) in [
+    ("ipod", true),
+    ("f4v", true),
+    ("mov", false),
+    ("3gp", false),
+    ("ismv", false),
+  ] {
+    let target = output(&corpus, &format!("l100-cover.{container}"));
+    let report = remux_through_ffmpeg(&covered, ContainerName::new(container), &target);
+    assert_eq!(
+      report.uncarried().contains(&Uncarried::Attachment {
+        track: TrackIndex::new(cover)
+      }),
+      !written,
+      "{container}: {report:?}"
+    );
+  }
 }
 
 /// **L101 — H.264 and AAC round-trip through ISMV, and AV1 through AVIF,
@@ -11314,13 +11353,14 @@ fn l100_streams_round_trip_through_the_mov_familys_modes() {
 /// counted from its first decode time, moved by its first composition
 /// offset, its reader moving the presentation times past the largest
 /// negative one, so that each track's times are its own
-/// ([`Rewrite::Timeline`]), a start skip dropped ([`Uncarried::SideData`])
-/// — every packet's bytes and key flag kept; AVIF writes its one AV1
+/// ([`Rewrite::Timeline`]), AAC's start skip, its priming, dropped
+/// ([`Uncarried::SideData`]) — every packet's bytes and key flag kept;
+/// AVIF writes its one AV1
 /// track's OBUs filtered ([`Rewrite::ObusFiltered`]), every frame read
 /// back from its sequence, the first also as the file's still picture,
 /// which its reader reads as a track of its own.
 ///
-/// PLANT: ISMV's times reported kept; its filters taken as MOV's.
+/// PLANT: ISMV's times reported kept; its start skip taken as MP4's.
 #[test]
 fn l101_streams_round_trip_through_ismv_and_avif() {
   let Some(corpus) = Corpus::new() else { return };
@@ -11339,6 +11379,19 @@ fn l101_streams_round_trip_through_ismv_and_avif() {
       // MP4's own: the AAC packets' durations, the distance to the next.
       rewritten(1, Rewrite::Durations),
     ]
+  );
+  // AAC's first packet's start skip, its priming, which ISMV's missing
+  // edit list drops.
+  assert!(
+    lines(&report, |line| matches!(line, Uncarried::SideData { .. })).contains(
+      &Uncarried::SideData {
+        track: TrackIndex::new(1),
+        kind: ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES as i32,
+        name: Some("Skip Samples".into()),
+        fate: SideDataFate::Dropped,
+      }
+    ),
+    "{report:?}"
   );
   let offered = packets(&source);
   let back = packets(&target);
@@ -11379,8 +11432,11 @@ fn l101_streams_round_trip_through_ismv_and_avif() {
 /// other than one video and one audio track, AVIF's of more than one
 /// ([`MuxOpenError::TrackLayout`]); the Nero list's untitled chapter and
 /// title past 255 bytes ([`MuxOpenError::ChapterWithoutTitle`],
-/// [`MuxOpenError::ChapterTitleTooLong`]) — each beside a table that
-/// opens.
+/// [`MuxOpenError::ChapterTitleTooLong`]); ISMV's AAC of no configuration,
+/// its start clearing the filter MP4's makes one with
+/// ([`MuxOpenError::ConfigurationMissing`]); MP4's TTML of ISMV's `dfxp`
+/// tag ([`MuxOpenError::ConfigurationInvalid`]) — each beside a table
+/// that opens.
 ///
 /// PLANT: each judgment off, its case opening or failing in FFmpeg.
 #[test]
@@ -11518,6 +11574,36 @@ fn l102_the_mov_familys_modes_refuse_at_open_what_they_write_otherwise() {
     Err(MuxOpenError::ChapterTitleTooLong { chapter: 0 })
   ));
   open("l102-title.3gp", "3gp", vec![video()], &titled(255)).expect("255 bytes");
+  // ISMV clears the automatic filters: AAC with no configuration has no
+  // filter to make one.
+  assert!(matches!(
+    open(
+      "l102-bare.ismv",
+      "ismv",
+      vec![sound().with_extradata(Some(bytes_of(&[])))],
+      &[]
+    ),
+    Err(MuxOpenError::ConfigurationMissing { .. })
+  ));
+  open(
+    "l102-bare.mp4",
+    "mp4",
+    vec![sound().with_extradata(Some(bytes_of(&[])))],
+    &[],
+  )
+  .expect("MP4's filter makes it of the first frame");
+  // TTML of ISMV's `dfxp` tag outside ISMV.
+  let ttml = || table_of(&ttml_mp4(&corpus), TrackKind::Subtitle).remove(0);
+  assert!(matches!(
+    open(
+      "l102-dfxp.mp4",
+      "mp4",
+      vec![reticketed(ttml(), |par| par.codec_tag = u32::from_le_bytes(*b"dfxp"))],
+      &[]
+    ),
+    Err(MuxOpenError::ConfigurationInvalid { .. })
+  ));
+  open("l102-ttml.mp4", "mp4", vec![ttml()], &[]).expect("TTML of its own tag");
   // PSP writes no chapter at all: none refused, each reported.
   open(
     "l102-untitled.psp",
