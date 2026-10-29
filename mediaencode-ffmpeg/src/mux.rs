@@ -124,14 +124,16 @@
 //! track (`check_bitstream`, `mux.c` 1056–1073; table B's greps): VP9's and
 //! PGS's always, AAC's only where that packet opens with an ADTS header
 //! (`movenc.c` 9138–9151; `matroskaenc.c` 3630–3646), the Annex B
-//! conversions only where it is length-prefixed. This muxer admits on an
-//! AAC track with no configuration in MP4 and Matroska only what the filter
-//! converts, one ADTS frame a packet ([`PayloadRule::AdtsFrame`]), so the
-//! report at open stays true; on a configured one, and in another
-//! container, the first packet decides as it does for libavformat — an
-//! ADTS first packet inserts the filter, a raw one none, after which MP4
-//! and Matroska refuse an ADTS packet ([`PayloadRule::AdtsHeader`]) — and
-//! the filter it inserts is named at its write, once. What a
+//! conversions only where it is length-prefixed. On an AAC track the first
+//! packet decides as it does for libavformat — an ADTS first packet
+//! inserts the filter, which MP4 and Matroska take one ADTS frame a packet
+//! of ([`PayloadRule::AdtsFrame`]); a raw one none, after which MP4 and
+//! Matroska refuse an ADTS packet ([`PayloadRule::AdtsHeader`]) — on a
+//! track with no configuration in MP4 and Matroska too, whose first packet
+//! must then bring one: an ADTS frame, or a configuration's packet of new
+//! extradata, which inserts no filter (R9: the coordinator's ruling 4a;
+//! [`PayloadRule::ConfigurationAbsent`]) — and the filter it inserts is
+//! named at its write, once. What a
 //! filter would refuse after taking it is refused first, by name
 //! ([`PayloadRule::Superframe`], [`PayloadRule::PgsSegments`],
 //! [`PayloadRule::AdtsFrame`]), every packet it puts out is sized before any
@@ -148,8 +150,11 @@
 //!
 //! A caller turns them off ([`MuxOptions::set_automatic_filters`]), and no
 //! filter is then inserted at a first packet: AAC with no configuration is
-//! refused at open ([`MuxOpenError::ConfigurationMissing`]), an ADTS packet
-//! anywhere ([`PayloadRule::AdtsHeader`]). A filter a muxer inserts at its
+//! taken in MP4 and Matroska where its first packet brings its
+//! configuration as new extradata ([`PayloadRule::ConfigurationAbsent`]
+//! where it does not) and refused at open elsewhere
+//! ([`MuxOpenError::ConfigurationMissing`]), an ADTS packet anywhere
+//! ([`PayloadRule::AdtsHeader`]). A filter a muxer inserts at its
 //! start runs either way — IVF's VP9 superframes (`ivf_init`, `ivfenc.c`
 //! 42) — and is mirrored and reported either way.
 //!
@@ -263,7 +268,7 @@
 //! |---|---|---|---|---|
 //! | `vp9_superframe` | IVF (`ivf_init`, `ivfenc.c` 42) | its start, whatever the option; VP9 | a superframe of the frames it holds — at most six hidden and the one shown — and its index of their sizes, summed in `unsigned` and allocated by the sum (`vp9_superframe.c` 34–98, 151–155): past 4 GiB the sum wraps and the copy runs past the allocation, below it `av_new_packet` refuses after taking the frames | mirrored with the filters on or off: the run counted wide, a hidden frame refused where no frame shown after it could join the run within the bound, a frame shown where its superframe passes it ([`PayloadRule::SuperframeSize`]); the filter's own refusals ([`PayloadRule::Superframe`]); reported ([`AutomaticFilter::Vp9Superframe`]) |
 //! | `vp9_superframe` | Matroska, WebM, the MOV family — MOV, 3GP, MP4, PSP, 3G2, iPod, ISMV, F4V, every muxer whose `check_bitstream` is MOV's (`mkv_check_bitstream`, `matroskaenc.c` 3639; `mov_check_bitstream`, `movenc.c` 9147) | the first packet, `AUTO_BSF`; VP9 | as above | as above, with the filters on |
-//! | `aac_adtstoasc` | Matroska's video muxer, the MOV family, FLV, LATM (`matroskaenc.c` 3634–3637; `movenc.c` 9144–9145; `flvenc.c` 1491–1493; `latmenc.c` 255–257) | the first packet, `AUTO_BSF`, where it opens with an ADTS header of more than two bytes; AAC | each frame less its header and CRC; the first converted, of channel configuration 0, less the program config element opening its payload too, consumed with no check that it fits, so that a packet the element runs past is put out at a negative size (`aac_adtstoasc.c` 54–96); raw packets passed on a configured track (51–52); its start refuses a configuration libavcodec does not parse (130–144) | MP4 and Matroska: ADTS frames alone, whole, on a track with no configuration (table F), named at open; on a configured one the first packet decides, the frames converted whole, and Matroska's configuration the filter makes within the space its header reserved ([`PayloadRule::NewExtradata`]); another container: the first packet decides; each filter named at its write, its refusals and its output's size held to ([`PayloadRule::AdtsFrame`]) |
+//! | `aac_adtstoasc` | Matroska's video muxer, the MOV family, FLV, LATM (`matroskaenc.c` 3634–3637; `movenc.c` 9144–9145; `flvenc.c` 1491–1493; `latmenc.c` 255–257) | the first packet, `AUTO_BSF`, where it opens with an ADTS header of more than two bytes; AAC | each frame less its header and CRC; the first converted, of channel configuration 0, less the program config element opening its payload too, consumed with no check that it fits, so that a packet the element runs past is put out at a negative size (`aac_adtstoasc.c` 54–96); raw packets passed on a configured track (51–52); its start refuses a configuration libavcodec does not parse (130–144) | MP4 and Matroska: the first packet decides, on a track with no configuration too — ADTS frames alone after an ADTS first one, whole, a configuration's packet of new extradata inserting none (R9: ruling 4a); on a configured one the first packet decides, the frames converted whole, and Matroska's configuration the filter makes within the space its header reserved ([`PayloadRule::NewExtradata`]); another container: the first packet decides; each filter named at its write, its refusals and its output's size held to ([`PayloadRule::AdtsFrame`]) |
 //! | `pgs_frame_merge` | Matroska's video muxer (`matroskaenc.c` 3640–3642) | the first packet, `AUTO_BSF`; PGS | display sets — the segments it holds and the packet's, several from one packet — grown by `av_grow_packet`, which refuses past the bound after taking them; each put out at the packet that ends it, in the times of the packet that held its presentation segment; what it holds at the end, written marked corrupt (`pgs_frame_merge.c` 77–83, 93–157) | mirrored: each set counted, with room for its end segment, refused at the packet past which none fits ([`PayloadRule::DisplaySetSize`]); an open set held by this muxer, not FFmpeg's filter, and handed to libavformat whole at the packet that completes it, judged then in the times it is put out in; one no packet completes, handed back on asking ([`CarrierMuxer::take_held`]), else not written, reported ([`Uncarried::Held`]) |
 //! | `pcm_rechunk` | DAUD (`daud_init`, `daudenc.c` 44), GXF (`gxf_write_header`, `gxfenc.c` 724), MXF, MXF D-10, MXF OP-Atom (`mxf_init`, `mxfenc.c` 3081) | the start; an audio track — of PCM alone, which libavcodec admits to it (`av_bsf_init`, `libavcodec/bsf.c` 154–170) | packets of a fixed count of samples (`pcm_rechunk.c` 123–186); its start multiplies the channels by the bits per sample in `int`, and refuses a size past `INT_MAX` over it (49–58) | the product held at open ([`MuxOpenError::SampleSize`]); its packets are its options'; named at open ([`AutomaticFilter::PcmRechunk`]) |
 //! | `av1_metadata`, `td=insert` | IVF (`ivfenc.c` 46); OBU (`rawenc.c` 572) | IVF's start, whatever the option; OBU's first packet, `AUTO_BSF`; AV1 | the OBUs read and written back by CBS, each unit's write buffer at most `INT_MAX / 8` (`cbs.c` 342–372), the fragment summed in `size_t` (`cbs_av1.c` 1245–1265) and handed on as an `int` (`cbs.c` 472–474), which only shrinks it | nothing to hold; its refusals are the container's own; named at open ([`AutomaticFilter::Av1Metadata`]) |
@@ -339,7 +344,7 @@
 //! | AMR-NB: one frame a packet; ADPCM MS and IMA WAV: a frame size | 6983–7002 | not reached: MP4's tag table holds neither (`codec_mp4_tags`, 9230–9290), refused at open ([`MuxOpenError::CodecNotCarried`]); MOV's mode reaches it, its AMR and ADPCM booked (table H) |
 //! | no samples: less than a frame of a sized codec | 7006–7010 | [`PayloadRule::PartialSample`], [`PayloadRule::Empty`] |
 //! | the first packet taken as the configuration of H.264, HEVC, VVC, EVC, LCEVC, VP9, TrueHD or DNxHD where none is stated | 7024–7041 | H.264, HEVC, VVC, LCEVC and EVC refused at open ([`MuxOpenError::ConfigurationMissing`]); TrueHD refused at open; VP9's and DNxHD's boxes made from it, written |
-//! | new extradata: a sample description from the packet on, each written by its codec's writer at the trailer — AC-3's and E-AC-3's, `dac3` and `dec3`, from MP4's parse of the frames, APV's `apvC` from its packets', PCM's, TTML's and GoPro metadata's entries of no configuration, none of its bytes; MPEG-4 ALS, AAC, AV1 and FLAC's overwriting a configuration stated as none | 7044–7074, 7406–7420; grep G19 | where none of its bytes is written, reported dropped (the side-data table); FLAC's of 34 bytes ([`PayloadRule::FlacStreamInfo`]); Opus's an OpusHead `dOps` takes, H.264's, HEVC's, VVC's and LCEVC's of the track's form — Annex B or not — as the rewrite reads it ([`PayloadRule::NewExtradata`]); a configuration stated as none refused at open, so none is overwritten |
+//! | new extradata: a sample description from the packet on, each written by its codec's writer at the trailer — AC-3's and E-AC-3's, `dac3` and `dec3`, from MP4's parse of the frames, APV's `apvC` from its packets', PCM's, TTML's and GoPro metadata's entries of no configuration, none of its bytes; MPEG-4 ALS, AAC, AV1 and FLAC's overwriting a configuration stated as none | 7044–7074, 7406–7420; grep G19 | where none of its bytes is written, reported dropped (the side-data table); FLAC's of 34 bytes ([`PayloadRule::FlacStreamInfo`]); Opus's an OpusHead `dOps` takes, H.264's, HEVC's, VVC's and LCEVC's of the track's form — Annex B or not — as the rewrite reads it ([`PayloadRule::NewExtradata`]); a track of MPEG-4 ALS, AAC, AV1 or FLAC that states none taken where its first packet brings one, which the trailer writes its sample entry of, and refused where it does not ([`PayloadRule::ConfigurationAbsent`]; R9: ruling 4a — L108) — not ISMV's, which writes its `moov` at its header, nor AVIF's |
 //! | AAC framed in ADTS | 7076–7086 | [`PayloadRule::AdtsHeader`], [`PayloadRule::AdtsFrame`] |
 //! | the Annex B rewrite | 7087–7158 | reported ([`Rewrite::LengthPrefixed`]); its size, table B |
 //! | AV1's OBUs | 7159–7174 | [`PayloadRule::Obus`]; reported ([`Rewrite::ObusFiltered`]) |
@@ -360,12 +365,12 @@
 //! |---|---|---|
 //! | `dac3`: a frame parsed; a bit stream id of 8 or less; a bit rate code | `mov_write_ac3_tag` 424–445 | a track that took no frame refused at `finish` ([`FfmpegMuxRefusal::NoFrame`]); a first frame past 8 refused there ([`PayloadRule::Ac3BitStreamId`]); every AC-3 frame's code is its frame size code's (`ac3_parser.c` 324) |
 //! | `dec3`: a frame parsed | 619–623 | [`FfmpegMuxRefusal::NoFrame`] |
-//! | `dfLa`: one 34-byte STREAMINFO | 857–876 | none: [`MuxOpenError::ConfigurationMissing`]; another: [`MuxOpenError::ConfigurationInvalid`]; new extradata: [`PayloadRule::FlacStreamInfo`] |
+//! | `dfLa`: one 34-byte STREAMINFO | 857–876 | none: the first packet's ([`PayloadRule::ConfigurationAbsent`]; R9: ruling 4a); another: [`MuxOpenError::ConfigurationInvalid`]; new extradata: [`PayloadRule::FlacStreamInfo`] |
 //! | `dOps`: an OpusHead, its mapping table where its family names one | 877–910 | [`MuxOpenError::ConfigurationMissing`], [`ConfigurationInvalid`](MuxOpenError::ConfigurationInvalid), [`PayloadRule::NewExtradata`] |
 //! | `dmlp`, TrueHD | 911–939 | refused at open: MP4 writes TrueHD only as an experiment ([`MuxOpenError::CodecNotCarried`]) |
 //! | `chnl`, PCM's layout | 1299–1340 | [`MuxOpenError::ChannelLayout`] |
 //! | `SA3D` | 940–997 | not reached: read from stream metadata the context never sets |
-//! | the video configuration boxes — `avcC`, `hvcC`, `lhvC`, `vvcC`, `evcC`, `lvcC`, `apvC`, `vpcC`, `av1C`, `dvc1` | 2880–2930 | their writers' failures are ignored, the box left as far as it was written: AV1's absence refused at open ([`MuxOpenError::ConfigurationMissing`]), ALAC's and MPEG-4 ALS's likewise (672–676, 765–816); the rest is the configuration's own |
+//! | the video configuration boxes — `avcC`, `hvcC`, `lhvC`, `vvcC`, `evcC`, `lvcC`, `apvC`, `vpcC`, `av1C`, `dvc1` | 2880–2930 | their writers' failures are ignored, the box left as far as it was written: AV1's and MPEG-4 ALS's absence taken where the first packet brings the configuration ([`PayloadRule::ConfigurationAbsent`] where it does not; R9: ruling 4a), ALAC's refused at open ([`MuxOpenError::ConfigurationMissing`]; 672–676, 765–816); the rest is the configuration's own |
 //! | frame cropping that leaves no picture | 3024–3036 | [`MuxOpenError::Cropping`] |
 //! | TTML's codec tag | 2259–2280 | not reached: the header refuses `dfxp` outside ISMV first (8603–8609), a fault at open |
 //! | libavcodec's TTML joined into one document: its header strings, its size | `movenc_ttml.c` 236–317; `ttmlenc.c` 82–122 | [`MuxOpenError::ConfigurationInvalid`]; [`PayloadRule::DocumentSize`] |
@@ -441,7 +446,7 @@
 //! |---|---|---|
 //! | new extradata: AAC's an AudioSpecificConfig libavcodec parses, within the space reserved for it — the configuration's length, or `MAX_PCE_SIZE` where there was none — and none where the header reserved no output sampling frequency, which every update rewrites after the sampling frequency, the header writing it only where the stated configuration has an extension sample rate or none is stated | `mkv_check_new_extra_data` 3065–3082; `mkv_update_codecprivate` 1334–1365; `get_aac_sample_rates` 1116–1150; 2129–2135 | [`PayloadRule::NewExtradata`] — on the first frame AAC's filter converts, the configuration the filter makes in its place, held to the same space and the same reservation ([`aac_output_rate_reserved`]) |
 //! | new extradata: FLAC's of the configuration's length | 3084–3097 | [`PayloadRule::FlacStreamInfo`] |
-//! | AV1 or AAC with no configuration: every packet refused | 3080–3083, 3098–3109 | refused at open ([`MuxOpenError::ConfigurationMissing`]), AAC's only with the filters off |
+//! | AV1 or AAC with no configuration: every packet refused but one bringing new extradata, which configures the track (3065–3087, 3098–3115) | AV1's refused at open ([`MuxOpenError::ConfigurationMissing`]); AAC's taken where its first packet brings one, an ADTS frame or new extradata ([`PayloadRule::ConfigurationAbsent`] where it does not; R9: ruling 4a — L108) |
 //! | a packet with no timestamp | 3140–3143 | a reordering stream's refused ([`FfmpegMuxRefusal::MissingPts`]); libavformat fills it otherwise |
 //! | a time before the earliest written, which libavformat's first write moves every stream's times past (`mux.c` 636–717) | 2089–2104, 3538–3541 | mirrored, reported ([`Uncarried::TimesShifted`]); a packet after that write the move leaves before it refused ([`FfmpegMuxRefusal::BeforeZero`]) — every one where a video track of no native id makes the times judged uncertain (2025–2081) |
 //! | the Annex B rewrite | 3574–3582 | reported ([`Rewrite::LengthPrefixed`]); its size, table B |
@@ -540,7 +545,7 @@
 //! | [`PayloadRule::PgsSegments`] | `pgs_frame_merge` writes a set without its presentation segment, or of segments it cannot parse, marked corrupt (`pgs_frame_merge.c` 59–68, 93–130) | corrupts |
 //! | [`PayloadRule::Empty`], a PGS packet's | `pgs_frame_merge` drops an empty packet unsaid, and with it the time it marks (`pgs_frame_merge.c` 87–90) | loses |
 //! | [`PayloadRule::Empty`], not a configuration's packet (R8, Codex R7 2) | MP4 takes an MPEG-4 ALS, AAC, AV1 or FLAC configuration of no payload as the current sample description's configuration, `check_pkt` judging its duration alone, and writes no sample (`movenc.c` 7396, 7412–7441); Matroska an AAC or FLAC one as the track's CodecPrivate, and writes no block (`matroskaenc.c` 3065–3097, 3266–3268): taken, its new extradata reported possibly dropped, its other side data dropped, no sample counted and no reference moved — L72; PLANT: the road closed, L72's FLAC configuration refused as empty; the road counting a sample, L72's frame after it taken. An empty packet of another codec, or with no new extradata, MP4 and Matroska's audio drop: refused, as before | nothing refused where FFmpeg takes it |
-//! | [`MuxOpenError::ConfigurationMissing`], AAC's with the filters off | MP4 refuses an ADTS first packet after taking it (`movenc.c` 7076–7086) and writes raw AAC with no configuration to read it by; Matroska refuses every packet after taking it (`matroskaenc.c` 3098–3109) | refuses after taking, or loses |
+//! | [`PayloadRule::ConfigurationAbsent`], a track of no configuration MP4 or Matroska takes its first packet's for, the packet bringing none (R9: ruling 4a) | MP4 writes raw AAC with no configuration to read it by, and an empty `av1C`, `dfLa` or `esds`; Matroska refuses every packet after taking it (`matroskaenc.c` 3083–3087, 3108–3109) | refuses after taking, or loses |
 //! | [`PayloadRule::SuperframeSize`], [`PayloadRule::DisplaySetSize`], [`PayloadRule::Ac3SampleSize`], [`PayloadRule::RewrittenSize`], [`PayloadRule::ClusterSize`], [`PayloadRule::DocumentSize`], [`PayloadRule::PayloadTooLarge`] | a size past what libavcodec allocates or a buffer holds: the sum wraps and the copy runs past its allocation (`vp9_superframe.c` 52–98), `av_new_packet` or `av_grow_packet` refuses after taking the packets (`packet.c` 83–127), the rewriter counts in an `int` (`nal.c` 74–111), the cluster is written cut (`matroskaenc.c` 2746–2749), the trailer fails (`movenc_ttml.c` 236–317) | memory, loses, or refuses after taking |
 //! | [`PayloadRule::DynamicHdrPlus`], [`PayloadRule::DynamicHdrApp5`] | Matroska casts the entry and serializes it trusting every count and divisor (`matroskaenc.c` 2947–2990; `hdr_dynamic_metadata.c` 237–706) | memory |
 //! | [`PayloadRule::NewExtradata`] | MP4's trailer refuses an Opus configuration `dOps` cannot write (`movenc.c` 877–910); an H.264, HEVC, VVC or LCEVC one of the other form turns the length-prefix rewrite on or off for the packets after it (7087–7158); Matroska refuses an AAC one it cannot parse or fit after taking the packet — the caller's, or the one AAC's filter makes (`matroskaenc.c` 3065–3082, 1334–1365); and rewrites the sampling frequency and the output one with any AAC one, over bytes its header reserved for the second only where the stated configuration has an extension sample rate (3076–3081, 2129–2135, 1116–1150): elsewhere 11 bytes run over the track entry's next elements, and the file reads back corrupt — ffprobe reads its track entry broken (R8) — L67, L72; PLANT: the reservation held, L72's AAC LC configuration taken | refuses after taking, or corrupts |
@@ -2518,7 +2523,15 @@ pub enum PayloadRule {
   /// header for the automatic filter to make one of nor new extradata,
   /// which FLV writes behind an empty sequence header, unreadable
   /// (`flv_write_codec_header`, `flvenc.c` 807–860; `flv_write_packet`,
-  /// 1252–1263).
+  /// 1252–1263); and the tracks MP4 and Matroska take their first packet's
+  /// new extradata as the configuration of (R9: the coordinator's ruling
+  /// 4a) — MP4's AAC, AV1, FLAC and MPEG-4 ALS, which MP4 writes its sample
+  /// description of at the trailer (`movenc.c` 7412–7428), Matroska's AAC,
+  /// whose CodecPrivate its header reserved room for (`matroskaenc.c`
+  /// 3065–3082) — whose first packet, of no such side data, nor an ADTS
+  /// header AAC's filter converts, leaves MP4 writing raw AAC of no
+  /// configuration and an empty `av1C`, `dfLa` or `esds`, and Matroska
+  /// refusing the packet after taking it (3083–3087).
   #[error("the track states no configuration, and its first packet brings none")]
   ConfigurationAbsent,
   /// WAV: a packet after which the file would pass the 4 GiB its RIFF
@@ -3132,6 +3145,11 @@ struct TrackState {
   /// WAV's fact chunk: the earliest and latest presentation time written,
   /// in ticks ([`PacketRules::fact_samples`]).
   presented: Option<(i128, i128)>,
+  /// Whether a packet has brought the track's configuration — new
+  /// extradata, or an ADTS header AAC's filter makes one of — where its
+  /// first must ([`PayloadRule::ConfigurationAbsent`]): a configuration's
+  /// packet, of which no sample is written, among them.
+  configured: bool,
 }
 
 /// What the ADTS muxer knows of an AAC track's configuration
@@ -4327,15 +4345,16 @@ impl PacketRules {
       // and writes the rest with their headers in (`flvenc.c` 1331–1337);
       // WAV, Wave64, AVI and ASF write a configured track's as they come,
       // its format declaring raw AAC (`riffenc.c` 193–223).
-      raw_aac: ((mp4
+      // MP4's and Matroska's AAC whose first packet brings its
+      // configuration is raw after it as one stated (R9: ruling 4a).
+      raw_aac: ((matches!(
+        audited,
+        Audited::Wav { .. } | Audited::Avi | Audited::Asf { .. }
+      ) && !codec.extradata().is_empty())
+        || mp4
         || matroska
-        || matches!(
-          audited,
-          Audited::Wav { .. } | Audited::Avi | Audited::Asf { .. }
-        ))
-        && id == CodecId::AAC
-        && !codec.extradata().is_empty())
-        || (flv && id == CodecId::AAC),
+        || flv)
+        && id == CodecId::AAC,
       marks_key: id.intra_only(),
       all_sync: (mp4 && !mp4_syncs(kind, id, codec.profile()))
         || (either_matroska && kind == TrackKind::Subtitle)
@@ -4351,7 +4370,14 @@ impl PacketRules {
       mov_text: mp4 && id == CodecId::MOV_TEXT,
       skip_samples: (mp4 && codec.frame_size() != 0 && codec.sample_rate() > 0)
         .then(|| (codec.frame_size(), codec.sample_rate())),
-      streaminfo_len: ((matroska || mp4) && id == CodecId::FLAC).then(|| codec.extradata().len()),
+      // MP4's `dfLa` writes one 34-byte STREAMINFO — a track's that states
+      // none, from its first packet's (R9: ruling 4a) — and Matroska takes
+      // one of the configuration's own length (`matroskaenc.c` 3088–3098).
+      streaminfo_len: if mp4 && id == CodecId::FLAC {
+        Some(FLAC_STREAMINFO_BYTES)
+      } else {
+        (matroska && id == CodecId::FLAC).then(|| codec.extradata().len())
+      },
       prores: matroska && id == CodecId::PRORES,
       webvtt: either_matroska && id == CodecId::WEBVTT,
       ac3: (mp4 && (id == CodecId::AC3 || id == CodecId::EAC3))
@@ -5289,12 +5315,12 @@ impl Emits {
 impl Filter {
   /// The filter the muxer libavformat resolved inserts for a timed track
   /// of `kind` and `codec` whose stream holds `extradata`, the automatic
-  /// filters `on`, by `sites`, the muxer's (table B of the census). MP4 and
-  /// Matroska take ADTS frames alone on an AAC track with no configuration,
-  /// one a packet, so its filter is inserted at its first
-  /// ([`PayloadRule::AdtsFrame`]), and raw AAC alone on one with it
-  /// ([`PayloadRule::AdtsHeader`]), so it never is; another container's
-  /// first packet decides.
+  /// filters `on`, by `sites`, the muxer's (table B of the census). AAC's
+  /// first packet decides: an ADTS one inserts the filter — MP4 and
+  /// Matroska taking its frames one a packet, whole — and any other none,
+  /// a configuration's packet of new extradata configuring a track that
+  /// states none (R9: ruling 4a); raw AAC alone after it
+  /// ([`PayloadRule::AdtsHeader`]).
   fn settle(
     sites: Sites,
     family: Family,
@@ -5312,17 +5338,13 @@ impl Filter {
         largest: 0,
       }
     } else if codec == CodecId::AAC && sites.aac && on {
-      match (family, extradata.is_empty()) {
-        (Family::Mp4 | Family::Matroska, true) => Self::Adts {
-          converted: false,
-          configured: false,
-          whole: true,
-        },
-        (family, empty) => Self::AdtsUndecided {
-          configured: !empty,
-          parses: audio_specific_config_parses(extradata),
-          whole: matches!(family, Family::Mp4 | Family::Matroska),
-        },
+      // The first packet decides, a track of no configuration's too: an
+      // ADTS one inserts the filter, a configuration's packet of new
+      // extradata configures the track and inserts none (R9: ruling 4a).
+      Self::AdtsUndecided {
+        configured: !extradata.is_empty(),
+        parses: audio_specific_config_parses(extradata),
+        whole: matches!(family, Family::Mp4 | Family::Matroska),
       }
     } else if codec == CodecId::HDMV_PGS_SUBTITLE && sites.pgs && on {
       Self::Pgs(PgsState::default())
@@ -6427,6 +6449,9 @@ struct Learned {
   /// WAV's fact chunk: the earliest and latest presentation times after the
   /// packet.
   presented: Option<(i128, i128)>,
+  /// Whether the packet brings the track's configuration
+  /// ([`TrackState::configured`]).
+  configured: bool,
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
@@ -6942,6 +6967,12 @@ where
               },
             });
           }
+          // MP4's and Matroska's tracks of no configuration their first
+          // packet configures (R9: ruling 4a).
+          if codec.extradata().is_empty() && first_packet_configures(family, audited, codec.codec())
+          {
+            rules.configuration_absent = true;
+          }
           if audited == Audited::Avi && codec.codec() == XSUB {
             rules.avi = Some(AviPlace::Packets { reader: avi_reader });
           }
@@ -7023,6 +7054,7 @@ where
         buffered: 0,
         flv_rewrites: rules.flv_tag.is_some_and(|tag| tag.rewritten),
         presented: None,
+        configured: false,
       });
     }
 
@@ -7634,6 +7666,7 @@ where
     if let Some(presented) = plan.learned.presented {
       state.presented = Some(presented);
     }
+    state.configured |= plan.learned.configured;
     if let Some(sample) = plan.learned.sample {
       state.sample = Some(sample);
     }
@@ -8253,10 +8286,13 @@ fn check_packet_rules(
       return refused(PayloadRule::TagSize);
     }
   }
-  // FLV AAC with no configuration: the first packet must bring one — an
-  // ADTS header the filter it inserts makes one of, or new extradata.
+  // FLV AAC with no configuration, and the tracks MP4 and Matroska take
+  // their first packet's configuration for: the first packet must bring
+  // one — an ADTS header the filter it inserts makes one of, or new
+  // extradata.
   if rules.configuration_absent
     && !state.written
+    && !state.configured
     && step.inserted != Some(AutomaticFilter::AacAdtsToAsc)
     && side_data(
       payload.side_data,
@@ -8566,6 +8602,12 @@ fn check_packet_rules(
     written,
     flv_rewrites,
     presented,
+    configured: step.inserted == Some(AutomaticFilter::AacAdtsToAsc)
+      || side_data(
+        payload.side_data,
+        AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+      )
+      .is_some_and(|new| !new.is_empty()),
   })
 }
 
@@ -9056,7 +9098,10 @@ fn judge<W, D: AsRef<[u8]>>(
         family,
         codec,
         stream_extradata(description),
-        sites.aac && filters,
+        (
+          sites.aac && filters,
+          first_packet_configures(family, audited, codec),
+        ),
       ) {
         return Err(MuxOpenError::ConfigurationMissing { track, codec });
       }
@@ -9924,14 +9969,15 @@ fn stream_extradata<D: AsRef<[u8]>>(
 /// Whether `family` needs a configuration `codec`'s track does not carry
 /// ([`MuxOpenError::ConfigurationMissing`]): AAC's only where its automatic
 /// filter is not inserted (`aac_filtered`), as where it is its first ADTS
-/// header makes one.
+/// header makes one; none where the track's first packet can bring it
+/// (`by_first_packet`, [`first_packet_configures`]).
 fn configuration_missing(
   family: Family,
   codec: CodecId,
   extradata: &[u8],
-  aac_filtered: bool,
+  (aac_filtered, by_first_packet): (bool, bool),
 ) -> bool {
-  if !extradata.is_empty() {
+  if !extradata.is_empty() || by_first_packet {
     return false;
   }
   let aac = codec == CodecId::AAC && !aac_filtered;
@@ -9961,6 +10007,30 @@ fn configuration_missing(
     Family::Matroska => aac || codec == CodecId::AV1,
     Family::WebM => codec == CodecId::AV1,
     Family::Other => false,
+  }
+}
+
+/// Whether `audited`, of `family`, takes a track of `codec` that states no
+/// configuration and has its first packet bring one, new extradata (R9: the
+/// coordinator's ruling 4a, judged by the round trip): MP4's AAC, AV1, FLAC
+/// and MPEG-4 ALS in every mode that writes its `moov` at the trailer —
+/// `mov_write_single_packet` takes a packet's new extradata as the
+/// description's configuration where the description has none (`movenc.c`
+/// 7412–7428), and the trailer writes the sample entry of it, so that the
+/// track reads back configured; not ISMV's, which writes its `moov` at its
+/// header, nor AVIF's, each as R8 left it (the owner's word, Q870) — and
+/// Matroska's AAC, whose CodecPrivate and sampling frequencies the first
+/// packet's new extradata rewrites in the room the header reserved
+/// (`mkv_check_new_extra_data`, `matroskaenc.c` 3065–3082). Matroska's and
+/// WebM's AV1 of no configuration stays refused at open.
+fn first_packet_configures(family: Family, audited: Audited, codec: CodecId) -> bool {
+  match family {
+    Family::Mp4 => {
+      !matches!(audited, Audited::Mov(MovMode::Ism | MovMode::Avif))
+        && [CodecId::AAC, CodecId::AV1, CodecId::FLAC, MP4ALS].contains(&codec)
+    }
+    Family::Matroska => codec == CodecId::AAC,
+    Family::WebM | Family::Other => false,
   }
 }
 

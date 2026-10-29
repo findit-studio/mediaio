@@ -301,7 +301,14 @@ crate moves only when it changes.
   its preload before zero, which it writes whole, and F4V and AVIF a time
   before zero, as MP4 takes negative times. The Nero list's untitled
   chapter stays refused, as it reads back titled empty, and big-endian PCM
-  in the program stream, as it reads back as DVD PCM.
+  in the program stream, as it reads back as DVD PCM. A track of no
+  configuration MP4 or Matroska takes its first packet's new extradata for
+  — MP4's AAC, AV1, FLAC and MPEG-4 ALS, ISMV's and AVIF's excepted, and
+  Matroska's AAC — opens, its first packet to bring the configuration, a
+  configuration's packet among them, or an ADTS frame AAC's filter makes
+  one of, the track reading back configured; a first packet bringing none
+  refused (`PayloadRule::ConfigurationAbsent`, now these tracks' too), and
+  AAC's filter on such a track named at the packet that inserts it.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

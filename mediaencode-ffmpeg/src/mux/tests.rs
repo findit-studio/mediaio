@@ -407,40 +407,99 @@ fn a_configuration_is_judged_and_its_rewrite_reported() {
     )
     .collect::<Vec<_>>()
   };
-  assert!(configuration_missing(Family::Mp4, CodecId::H264, &[], true));
-  assert!(configuration_missing(Family::Mp4, CodecId::HEVC, &[], true));
+  assert!(configuration_missing(
+    Family::Mp4,
+    CodecId::H264,
+    &[],
+    (true, false)
+  ));
+  assert!(configuration_missing(
+    Family::Mp4,
+    CodecId::HEVC,
+    &[],
+    (true, false)
+  ));
   assert!(!configuration_missing(
     Family::Mp4,
     CodecId::H264,
     &[1, 2],
-    true
+    (true, false)
   ));
   assert!(configuration_missing(
     Family::Matroska,
     CodecId::AV1,
     &[],
-    true
+    (true, false)
   ));
-  assert!(configuration_missing(Family::WebM, CodecId::AV1, &[], true));
+  assert!(configuration_missing(
+    Family::WebM,
+    CodecId::AV1,
+    &[],
+    (true, false)
+  ));
   assert!(!configuration_missing(
     Family::Other,
     CodecId::H264,
     &[],
-    true
+    (true, false)
   ));
+  // MP4's AAC, AV1, FLAC and MPEG-4 ALS, and Matroska's AAC, take their
+  // first packet's new extradata as their configuration (R9: ruling 4a);
+  // not ISMV's nor AVIF's, nor WebM's.
+  for (family, audited, codec, takes) in [
+    (Family::Mp4, Audited::Mov(MovMode::Mp4), CodecId::AAC, true),
+    (Family::Mp4, Audited::Mov(MovMode::Mp4), CodecId::AV1, true),
+    (Family::Mp4, Audited::Mov(MovMode::Mp4), CodecId::FLAC, true),
+    (Family::Mp4, Audited::Mov(MovMode::Mp4), MP4ALS, true),
+    (Family::Mp4, Audited::Mov(MovMode::Mov), CodecId::AAC, true),
+    (
+      Family::Mp4,
+      Audited::Mov(MovMode::Mp4),
+      CodecId::H264,
+      false,
+    ),
+    (
+      Family::Mp4,
+      Audited::Mov(MovMode::Mp4),
+      CodecId::OPUS,
+      false,
+    ),
+    (Family::Mp4, Audited::Mov(MovMode::Ism), CodecId::AAC, false),
+    (
+      Family::Mp4,
+      Audited::Mov(MovMode::Avif),
+      CodecId::AV1,
+      false,
+    ),
+    (Family::Matroska, Audited::Matroska, CodecId::AAC, true),
+    (Family::Matroska, Audited::Matroska, CodecId::AV1, false),
+    (Family::WebM, Audited::WebM, CodecId::AV1, false),
+  ] {
+    assert_eq!(
+      first_packet_configures(family, audited, codec),
+      takes,
+      "{audited:?} {codec:?}"
+    );
+    assert_eq!(
+      configuration_missing(family, codec, &[], (false, takes)),
+      !takes,
+      "{audited:?} {codec:?}"
+    );
+  }
   // AAC's comes from its first ADTS header with the automatic filters on;
-  // with them off MP4 and Matroska need it stated.
+  // with them off MP4 and Matroska need it stated, or brought by the first
+  // packet.
   for family in [Family::Mp4, Family::Matroska] {
     assert!(
-      configuration_missing(family, CodecId::AAC, &[], false),
+      configuration_missing(family, CodecId::AAC, &[], (false, false)),
       "{family:?}"
     );
     assert!(
-      !configuration_missing(family, CodecId::AAC, &[], true),
+      !configuration_missing(family, CodecId::AAC, &[], (true, false)),
       "{family:?}"
     );
     assert!(
-      !configuration_missing(family, CodecId::AAC, &[0x11, 0x90], false),
+      !configuration_missing(family, CodecId::AAC, &[0x11, 0x90], (false, false)),
       "{family:?}"
     );
   }
@@ -587,8 +646,18 @@ fn a_duration_the_container_does_not_keep_is_reported() {
     rewrites_of(Family::Mp4, TrackKind::Video, CodecId::APV, true),
     vec![]
   );
-  assert!(configuration_missing(Family::Mp4, CodecId::EVC, &[], true));
-  assert!(!configuration_missing(Family::Mp4, CodecId::VP9, &[], true));
+  assert!(configuration_missing(
+    Family::Mp4,
+    CodecId::EVC,
+    &[],
+    (true, false)
+  ));
+  assert!(!configuration_missing(
+    Family::Mp4,
+    CodecId::VP9,
+    &[],
+    (true, false)
+  ));
 }
 
 /// A ProRes frame of `len` bytes, opening on its atom.
@@ -1184,6 +1253,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     buffered: 0,
     flv_rewrites: false,
     presented: None,
+    configured: false,
   }
 }
 
@@ -2071,8 +2141,17 @@ fn the_filters_are_those_each_muxer_inserts() {
     );
   }
   for muxer in ["mp4", "matroska", "mov", "ipod"] {
-    let filter = settle(muxer, None, CodecId::AAC, &[], true);
-    assert_eq!(filter.named(), Some(A::AacAdtsToAsc), "{muxer}");
+    // A track of no configuration's first packet decides too: an ADTS one
+    // inserts the filter, a configuration's packet none (R9: ruling 4a).
+    assert_eq!(
+      settle(muxer, None, CodecId::AAC, &[], true),
+      Filter::AdtsUndecided {
+        configured: false,
+        parses: false,
+        whole: true,
+      },
+      "{muxer}: no configuration, the first packet decides"
+    );
     assert_eq!(
       settle(muxer, None, CodecId::AAC, &[0x11, 0x90], true),
       Filter::AdtsUndecided {
@@ -2160,13 +2239,13 @@ fn the_filters_are_those_each_muxer_inserts() {
     Family::Matroska,
     CodecId::AAC,
     &[],
-    true
+    (true, false)
   ));
   assert!(configuration_missing(
     Family::Matroska,
     CodecId::AAC,
     &[],
-    false
+    (false, false)
   ));
 }
 
@@ -2544,7 +2623,7 @@ fn the_configurations_mp4s_trailer_refuses_are_known_at_open() {
   // No configuration where MP4 needs one.
   for codec in [CodecId::AV1, CodecId::FLAC, CodecId::OPUS, CodecId::ALAC] {
     assert!(
-      configuration_missing(Family::Mp4, codec, &[], true),
+      configuration_missing(Family::Mp4, codec, &[], (true, false)),
       "{codec:?}"
     );
   }
