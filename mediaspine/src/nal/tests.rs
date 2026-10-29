@@ -24,6 +24,28 @@ fn p_slice() -> Vec<u8> {
   avc(2, 1, &[0x9A, 0x02, 0x10])
 }
 
+/// An H.264 IDR slice of PPS 0, `slice_type` 7, I, its header read to its
+/// `frame_num`: one FFmpeg starts a picture at.
+fn idr_slice() -> Vec<u8> {
+  avc(3, 5, &[0x88, 0x84, 0x21])
+}
+
+/// A non-reference H.264 slice of PPS 0, B, its header read to its
+/// `frame_num`, under an SPS of frames only: [`b_slice`] names PPS 3, which
+/// the laws' records do not hold, and FFmpeg refuses.
+fn b_slice_0() -> Vec<u8> {
+  slice_of(0, 0, 0, 0, None)
+}
+
+/// PPS 0 on SPS 0 of two slice groups, FMO, which FFmpeg refuses
+/// (`h264_ps.c` 757–762): under `AV_EF_EXPLODE` it reads no more of the
+/// packet after it (`h264dec.c` 741–745).
+fn refused_pps() -> Vec<u8> {
+  let mut fmo = Bits::new();
+  fmo.ue(0).ue(0).bit(0).bit(0).ue(1).ue(0);
+  avc(3, 8, &fmo.finish())
+}
+
 /// An H.264 picture parameter set, `pps_id` on `sps_id`: CAVLC, one slice
 /// group, one reference by default, no weights, QP 26, offsets 0, the
 /// deblocking control present, no redundant counts, and nothing after.
@@ -1844,7 +1866,10 @@ fn an_h264_reading_awaits_a_reference_picture_after_its_opening_and_every_seek()
     kept(KeptReason::Referenced)
   );
   assert_eq!(read(&mut stream, &[b_slice()]), Verdict::Disposable);
-  // A seek starts the wait again, and an IDR slice ends it.
+  // A seek starts the wait again, and an IDR slice ends it. One FFmpeg
+  // refuses ends nothing: a unit of one byte past its header, whose
+  // `pic_parameter_set_id` FFmpeg reads past its end and refuses
+  // (`h264_slice.c` 1735–1739).
   stream.seeked();
   assert_eq!(
     read(&mut stream, &[b_slice()]),
@@ -1852,6 +1877,14 @@ fn an_h264_reading_awaits_a_reference_picture_after_its_opening_and_every_seek()
   );
   assert_eq!(
     read(&mut stream, &[avc(3, 5, &[0x88])]),
+    kept(KeptReason::RandomAccess)
+  );
+  assert_eq!(
+    read(&mut stream, &[b_slice()]),
+    kept(KeptReason::AwaitingReference)
+  );
+  assert_eq!(
+    read(&mut stream, &[idr_slice()]),
     kept(KeptReason::RandomAccess)
   );
   assert_eq!(read(&mut stream, &[b_slice()]), Verdict::Disposable);
@@ -1906,13 +1939,112 @@ fn an_intra_slice_waits_for_one_in_a_packet_kept_since_the_opening_or_a_seek() {
   // An IDR picture's slices are intra.
   stream.seeked();
   assert_eq!(
-    read(&mut stream, &[avc(3, 5, &[0x88])]),
+    read(&mut stream, &[idr_slice()]),
     kept(KeptReason::RandomAccess)
   );
   assert_eq!(
     read(&mut stream, &[i_slice(), b_slice()]),
     Verdict::Disposable
   );
+}
+
+#[test]
+fn an_intra_slice_past_a_unit_ffmpeg_may_stop_at_ends_no_wait() {
+  // A PPS FFmpeg refuses, then an intra slice: under `AV_EF_EXPLODE` FFmpeg
+  // reads nothing of the packet past the refusal (`h264dec.c` 741–745), and
+  // the slice may go undecoded, `non_gray` unset (`h264_slice.c` 2032–2034).
+  // Predicted, before this law: the census counted the slice, and the next
+  // intra slice was marked; planted, a start past a possible stop followed,
+  // red.
+  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  assert_eq!(
+    read(&mut stream, &[p_slice()]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read(&mut stream, &[refused_pps(), i_slice()]),
+    kept(KeptReason::Companion(8))
+  );
+  assert_eq!(
+    read(&mut stream, &[i_slice(), b_slice_0()]),
+    kept(KeptReason::AwaitingIntraSlice)
+  );
+  assert_eq!(
+    read(&mut stream, &[i_slice(), b_slice_0()]),
+    Verdict::Disposable
+  );
+}
+
+#[test]
+fn a_reference_picture_past_a_possible_stop_or_refused_ends_no_wait() {
+  // The same for the reference picture a reading awaits after its opening
+  // or a seek (`h264_parse.c` 293–294): one past a PPS FFmpeg refuses may go
+  // undecoded. Predicted, before this law: counted, and the next
+  // non-reference picture marked; planted, a start past a possible stop
+  // followed, red.
+  let mut stream = NalStream::new(NalCodec::H264, &avcc(3));
+  stream.pending.intra_seen = true;
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  assert_eq!(
+    read(&mut stream, &[refused_pps(), p_slice()]),
+    kept(KeptReason::Companion(8))
+  );
+  assert_eq!(
+    read(&mut stream, &[b_slice_0()]),
+    kept(KeptReason::AwaitingReference)
+  );
+  // And a reference slice FFmpeg refuses for a PPS it does not hold
+  // (`h264_slice.c` 1740–1746) is none it decodes. Planted, a refused
+  // slice counted a reference picture: red.
+  assert_eq!(
+    read(&mut stream, &[slice_of(2, 0, 3, 1, None)]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(
+    read(&mut stream, &[b_slice_0()]),
+    kept(KeptReason::AwaitingReference)
+  );
+  assert_eq!(
+    read(&mut stream, &[p_slice()]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(read(&mut stream, &[b_slice_0()]), Verdict::Disposable);
+}
+
+#[test]
+fn a_frame_at_which_the_context_is_set_up_again_awaits_a_reference() {
+  // Every SPS of frames only, SPS 0 read again of another width, and PPS 0
+  // on it: at the next picture FFmpeg sets its context up again
+  // (`h264_slice.c` 1066–1092, 1136–1165), flushing it — its picture order
+  // count and `frame_num` taken up afresh from that picture (`h264dec.c`
+  // 438–474), so that dropping it moves them to the next. Predicted, before
+  // this law: marked; planted, no set-up again, red.
+  let mut stream = h264(&avcc(3));
+  let read = |stream: &mut NalStream, nals: &[Vec<u8>]| stream.read(&lengths(4, nals));
+  assert_eq!(read(&mut stream, &[b_slice_0()]), Verdict::Disposable);
+  let narrow = Sps {
+    width_in_mbs_minus1: 79,
+    ..Sps::BASELINE
+  };
+  let _ = read(&mut stream, &[narrow.unit(), pps(0, 0)]);
+  assert_eq!(stream.frames_only(), Some(true));
+  assert_eq!(
+    read(&mut stream, &[b_slice_0()]),
+    kept(KeptReason::AwaitingReference)
+  );
+  assert_eq!(
+    read(&mut stream, &[b_slice_0()]),
+    kept(KeptReason::AwaitingReference)
+  );
+  assert_eq!(
+    read(&mut stream, &[p_slice()]),
+    kept(KeptReason::Referenced)
+  );
+  assert_eq!(read(&mut stream, &[b_slice_0()]), Verdict::Disposable);
+  // SPS 0 read again byte for byte, and PPS 0 on it, set nothing up.
+  let _ = read(&mut stream, &[narrow.unit(), pps(0, 0)]);
+  assert_eq!(read(&mut stream, &[b_slice_0()]), Verdict::Disposable);
 }
 
 #[test]

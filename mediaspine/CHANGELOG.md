@@ -38,11 +38,12 @@ Its versions are its own: they do not move with the rest of the family's.
 - `KeptReason::MaybeField` names, after a sequence parameter set that lets
   fields in, a slice the reading cannot read for its field, where it named
   every picture of `nal_ref_idc` 0.
-- After such a sequence parameter set, the reference picture and the intra
-  slice an H.264 reading awaits are counted only where FFmpeg decodes
-  them, and the reference picture is awaited again after a picture at
-  which the decoder may set its context up again, which flushes it
-  (`KeptReason::AwaitingReference`).
+- The reference picture and the intra slice an H.264 reading awaits are
+  counted only where FFmpeg decodes them — a picture it starts or joins at
+  a slice before any unit it may stop at under `AV_EF_EXPLODE`, a slice it
+  refuses none — under every sequence parameter set, and the reference
+  picture is awaited again after a picture at which the decoder may set its
+  context up again, which flushes it (`KeptReason::AwaitingReference`).
 - An H.264 sequence parameter set's id is read as FFmpeg's
   `get_ue_golomb_31` reads it, 31 among the ids FFmpeg takes.
 
