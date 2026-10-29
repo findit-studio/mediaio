@@ -102,11 +102,13 @@
 //! a slice of `first_mb_in_slice` 0 (`h264_slice.c` 2094–2133). What FFmpeg
 //! refuses past those fields, and of the units that ride beside them, it
 //! refuses only where the stream breaks the standard (7.4.3, D.1); what it
-//! refuses of a conforming stream — another
-//! picture parameter set within a picture, reference and non-reference
+//! refuses of a conforming stream — a picture parameter set it tells apart
+//! from the active one within a picture, reference and non-reference
 //! fields together — the reading takes as refused, and past a refusal,
 //! under `AV_EF_EXPLODE` FFmpeg reads no more of the packet (`h264dec.c`
-//! 741–745).
+//! 741–745). Two parameter sets are held to each other as FFmpeg holds them,
+//! by what it compares, never by their ids ([the
+//! census](#every-comparison-of-parameter-sets)).
 //!
 //! What FFmpeg 9.0.1 does with each case, the packet dropped, or every unit
 //! of `nal_ref_idc` 0 but SEI skipped (`skip_frame` at `noref` and above,
@@ -127,7 +129,9 @@
 //! | an MBAFF frame (`field_pic_flag` 0, `mb_adaptive_frame_field_flag` 1), or a frame under a sequence parameter set that lets fields in | a frame (`h264_slice.c` 577, 1611): no field waits after it | as a progressive frame | no, where no field waits at it | disposable, as a progressive frame |
 //! | PicAFF: frames and pairs across pictures | a frame after a waiting field finds it unmatched (1583–1587) | — | — | each packet by its own pictures; one where a field may wait, kept: [`KeptReason::PendingField`] |
 //! | two fields of one parity in one packet, or of two `frame_num`s | the second finds the first unmatched (1583–1587), or is refused, "Frame num change" (1750–1756) | — | yes | kept: [`KeptReason::UnpairedField`] |
-//! | a pair whose fields name two picture parameter sets | FFmpeg may refuse the second, "PPS changed between slices" (2150–2163) | — | — | kept: [`KeptReason::MaybeField`] |
+//! | a second field in its first's packet whose picture parameter set FFmpeg tells apart from the active one: another `sps_id` or `transform_8x8_mode`, or another SPS object — a parameter set read again between the fields among them | refused, "PPS changed between slices", "SPS changed in the middle of the frame" (2150–2163): the first field waits on | — | yes: observed, the next pair, its bottom field first, joining the waiting top field, its own top field refused (2124–2125); that pair dropped, the waiting field's frame is lost too | kept, for the parameter set; the next packet, [`KeptReason::PendingField`] |
+//! | the same, a picture parameter set FFmpeg compares alike: another of the same three, or one read again on an SPS read again byte for byte, whose object FFmpeg keeps (`h264_ps.c` 581–584) | joined | — | no: observed | a pair: disposable |
+//! | a picture whose SPS sets the decoder's context up again: another size, bit depth, chroma format, sample aspect ratio or colour matrix (`h264_slice.c` 1058–1170) | flushed (`h264dec.c` 451–474): `first_field` 0, a waiting field dropped, found unmatched by none; the picture order count and the gap in `frame_num` taken up afresh from this picture | the next picture sets the context up, and takes them up | yes: observed, the waiting top field dropped and the bottom one waiting, where an SPS of the same content, its object another, sets nothing up | kept: [`KeptReason::AwaitingReference`], until a reference picture |
 //! | a slice whose picture parameter set FFmpeg does not hold | refused, "non-existing PPS" (1740–1746): no picture starts | as read | no | as the packet's other units say |
 //!
 //! FFmpeg's parser splits a raw stream's, and an MPEG-TS stream's, pairs
@@ -135,13 +139,43 @@
 //! writes each packet as a sample: those pairs are kept whole. A pair in
 //! one sample, as some writers make, is marked.
 //!
+//! ## Every comparison of parameter sets
+//!
+//! Where FFmpeg 9.0.1 holds the parameter sets of two slices, fields or
+//! pictures to each other, this is what it compares, and what the reading
+//! compares: never an id where FFmpeg compares content or an object. A
+//! *first slice* is one `ff_h264_queue_decode_slice` begins at with
+//! `current_slice` 0 (`h264_slice.c` 2072): a packet's first (`h264dec.c`
+//! 595), and the one after a slice refused before it started a picture,
+//! a second field refused among them; a second field in its first's packet
+//! is none, the first ending only after the test (2111–2114,
+//! `h264_picture.c` 231).
+//!
+//! | comparison | FFmpeg compares | when | refused, or set up again | the reading |
+//! |---|---|---|---|---|
+//! | the slice's picture parameter set | that `pps_list[pps_id]` holds one (`h264_slice.c` 1740–1746) | every slice | refused: no picture starts, nothing moves | refused |
+//! | the bits of the slice's header | by `pps->sps`, the SPS object its PPS was read on (1747–1749; `h264_ps.c` 738) | every slice | — | each PPS entry holds what that SPS says |
+//! | `frame_num` | the picture's, `h->poc.frame_num`, against the slice's, by value (`h264_slice.c` 1750–1756) | each slice not a first slice: a later slice of the picture, a second field in the packet | refused before the first field ends: the picture goes on | the same |
+//! | the active PPS against the slice's | `h->ps.pps->sps_id` and `->transform_8x8_mode` against `pps_list[pps_id]`'s, by value (2150–2158) | each slice not a first slice | refused, "PPS changed between slices": a slice of the picture refused, the picture goes on; a second field refused, the first waits, the next slice a first slice, which starts a picture on its own PPS | each entry's `seq_parameter_set_id` and `transform_8x8_mode_flag` — 0 where FFmpeg reads no tail (`h264_ps.c` 788) — held to the active entry's; a slice naming the active entry, no unit since that may have replaced it, the active object itself; else unknown, and the walk lost |
+//! | the active SPS against the slice's | `h->ps.sps != pps->sps`, the objects' addresses (`h264_slice.c` 2159–2163), both held alive by their PPSs | the same | refused, "SPS changed in the middle of the frame", as above | each SPS object numbered as FFmpeg makes it, below, each PPS entry with the number of the one it was read on: one number, one object; a later object certainly new, another |
+//! | an SPS read again | the new object against the entry's, `memcmp` of the whole, its copy of the unit's RBSP, `data`, among it (`h264_ps.c` 297–306, 581–587) | every SPS FFmpeg reads | equal: the entry's object kept, and with it every PPS's tie to it; else a new one, each PPS read before keeping the old (92–104) | FFmpeg's copy, the unit's header and RBSP to its last byte not zero, up to 128 bytes: equal, the object kept; another, or past 128 bytes against one within, a new one; where the reading cannot tell — a longer one again, a unit FFmpeg's splitter may cut otherwise, one read only perhaps — a new number that may be the old object |
+//! | a PPS read again | nothing: always a new object (698–847, 839–840), of the SPS object `sps_list[sps_id]` holds then (738) | — | — | the entry's three facts above, and where the walk cannot tell whether a unit replaced it, those alone |
+//! | the active PPS made | `h->ps.pps := pps_list[pps_id]` (`h264_slice.c` 1063–1064), before the picture's pairing, and kept where that refuses it | each first slice | — | the walk's active entry, set at each first slice |
+//! | the context against the new active SPS | where `h->ps.sps != h->ps.pps->sps`, the size in macroblocks, bit depth and chroma format against the context's (`needs_reinit`, 1066–1079); against the codec context's coded size and the context's depth and format (`must_reinit`, 1082–1088); the pixel format (1089–1092); at a first slice the SAR against `avctx->sample_aspect_ratio` (1094); `matrix_coeffs` against `avctx->colorspace` (1117–1123) | each picture start, but a second field in the packet the same SPS and no first slice | set up again (1136–1165): `ff_h264_flush_change` where the context was set up — `first_field` 0, the waiting frame taken from the output, the references and the picture order count reset (`h264dec.c` 438–474) — and `h264_slice_header_init`, `first_field` 0 again (`h264_slice.c` 989); `missing_fields` not moved: the waiting field dropped, found unmatched by none | the context's geometry, SAR and colour space by value: another, set up again — the field waiting none before the start, a reference picture awaited again; the same, not; where the reading cannot tell, both, joined |
+//! | the SAR at the set-up | `ff_set_sar` keeps the SPS's where `av_image_check_sar` passes it at the picture's size, and else puts 0:1 in its place (975; `utils.c` 106–119; `imgutils.c` 323–342), so that every first slice finds the two apart and sets up again | each set-up | as above, at every first slice | the check at every size the decoder may make it at — cropped, a container's within the same 16, coded: passed, the SPS's SAR; else not known, each first slice perhaps set up again |
+//! | a frame thread's context | its SPS's size, depth, format and matrix against the thread's before it (`ff_h264_update_thread_context`, `h264_slice.c` 338–401), copying the lists and the active PPS and SPS (368–374) | each packet a thread takes | set up again, `first_field` then taken from the thread before it (399): the field waiting carries over; `missing_fields`, each thread's own, is not copied | one thread's reading |
+//! | the flush of a seek | `h264_decode_flush` (`h264dec.c` 476–499): `ff_h264_flush_change`, and `context_initialized` 0 | a seek | the next start sets the context up without a flush (`h264_slice.c` 1137, 1151–1152) | [`NalStream::seeked`]: no field waiting, the context not set up |
+//! | every PPS of the list | the largest default reference count of any (`h264_refs.c` 807–812), by value | a reference picture's marking | — (a recovery point guessed) | nothing: no slice holds it to another, and only parameter sets move it, which keep their packets |
+//!
 //! The state the reading carries for it:
 //!
 //! | state | FFmpeg's | moved by | read by |
 //! |---|---|---|---|
-//! | the sequence parameter set list | `sps_list` (`h264_ps.c` 581–587) | a sequence parameter set FFmpeg reads whole, by its RBSP's strict reading, for certain; one it may read otherwise, by any reading it may adopt, or none, joined with what the entry held | a picture parameter set read after it |
-//! | the picture parameter set list, each entry with the sequence parameter set it was read on | `pps_list`, `pps->sps` (731–738, 839–840) | a picture parameter set FFmpeg accepts; what it refuses — no sequence parameter set, one of 11 or 13 bits, slice groups, more than 32 references, an offset past ±12, a scaling delta past −128 to 127 — leaves the entry as it was (698–847) | each slice (`h264_slice.c` 1735–1775) |
-//! | the field waiting | `first_field`, `cur_pic_ptr`, `picture_structure`, `droppable` (1455–1611) | each picture start; none after a seek (`h264dec.c` 469) | a packet: [`KeptReason::PendingField`] |
+//! | the sequence parameter set list, each entry with its object and that object's copy of its unit | `sps_list` (`h264_ps.c` 581–587) | a sequence parameter set FFmpeg reads whole, by its RBSP's strict reading, for certain; one it may read otherwise, by any reading it may adopt, or none, joined with what the entry held | a picture parameter set read after it |
+//! | the picture parameter set list, each entry with what the sequence parameter set it was read on says, that one's object, and its own `sps_id` and `transform_8x8_mode` | `pps_list`, `pps->sps` (731–738, 788–796, 839–840) | a picture parameter set FFmpeg accepts; what it refuses — no sequence parameter set, one of 11 or 13 bits, slice groups, more than 32 references, an offset past ±12, a scaling delta past −128 to 127 — leaves the entry as it was (698–847) | each slice (`h264_slice.c` 1735–1775, 2150–2163) |
+//! | the active picture parameter set, within a packet | `h->ps.pps` (`h264_slice.c` 1063–1064) | each first slice | each slice after it that is no first slice (2150–2163) |
+//! | the context | `context_initialized`; the geometry of `h->ps.sps`; `avctx->sample_aspect_ratio`, `avctx->colorspace` (1058–1170) | each picture start; not set up after a seek (`h264dec.c` 495); after a packet not read whole that may hold a slice, set up on any SPS a PPS of the list may be read on | each first slice: whether it is set up again |
+//! | the field waiting | `first_field`, `cur_pic_ptr`, `picture_structure`, `droppable` (1455–1611) | each picture start, and a context set up again (989); none after a seek (`h264dec.c` 469) | a packet: [`KeptReason::PendingField`] |
 //! | fields gone unmatched: none, at most one, or more | `missing_fields` (`h264_slice.c` 1585, 1589, 1683), each frame thread's own, never copied between them (338–466) | each start that may find a field unmatched; it never falls | a pair: [`KeptReason::UnmatchedFields`]; from two, whether a first field may be queued at once |
 //!
 //! And the roads that move it:
@@ -149,9 +183,9 @@
 //! | road | the lists | the field waiting |
 //! |---|---|---|
 //! | the record the decoder opens with, and one mid-stream ([`NalStream::reconfigure`]) | each parameter set in order, for certain where FFmpeg reads each without failing; only maybe after one that may fail, and an `avcC` entry it escapes and reads again where its first reading fails, unless under `AV_EF_EXPLODE` (`h264_parse.c` 466–524, 421–464, 367–413) | not moved: a record holds no picture |
-//! | a packet the reading reads whole | each parameter set as the decoder reads it, in the packet's order, so that a slice after it is read by it; only maybe after a unit FFmpeg may refuse (`h264dec.c` 717–727, 741–745) | each picture start, as `h264_field_start` makes it |
+//! | a packet the reading reads whole | each parameter set as the decoder reads it, in the packet's order, so that a slice after it is read by it; only maybe after a unit FFmpeg may refuse (`h264dec.c` 717–727, 741–745) | each picture start, as `h264_init_ps` and `h264_field_start` make it |
 //! | a packet it does not read whole | every parameter set FFmpeg's splitter may read there, maybe | unknown where it may hold a slice, and a field may have gone unmatched, more than one |
-//! | a seek ([`NalStream::seeked`]) | where an entry may hold other than the opening record left, every entry unknown: a decoder opened afresh holds that record's alone | none waits |
+//! | a seek ([`NalStream::seeked`]) | where an entry may hold other than the opening record left, every entry unknown: a decoder opened afresh holds that record's alone | none waits, and the context is set up afresh |
 //! | a packet of no bytes | — | none, or what waited: a decoder that takes it takes it for the stream's end (`h264dec.c` 984–985, 1034–1035) |
 //!
 //! # HEVC
@@ -353,7 +387,7 @@
 //! | state | written at | dropping the picture changes a later picture | the rule |
 //! |---|---|---|---|
 //! | H.264 `prev_frame_num`, `prev_frame_num_offset` | every picture, `h264_picture.c` 202–203 | through the frame-number offset (POC types 1, 2) and the gap fill, `h264_slice.c` 1432–1530: not where `frame_num` cannot jump, a non-reference picture's then being the next picture's (7.4.3) | every SPS: no gaps ([`KeptReason::FrameNumGaps`]) |
-//! | H.264 `prev_poc_lsb`, where a flush left it unset | the first picture after the decoder opens or is flushed, `h264_parse.c` 293–294 | the picture order count of every later picture, the film grain seed among its uses | a slice of a reference picture the decoder decodes, NAL unit type 1 or 5, read since the opening or the last seek: it passes over slice data partitions, `h264dec.c` 682–686 ([`KeptReason::AwaitingReference`]) |
+//! | H.264 `prev_poc_lsb`, where a flush left it unset | the first picture after the decoder opens or is flushed, `h264_parse.c` 293–294 | the picture order count of every later picture, the film grain seed among its uses | a slice of a reference picture the decoder decodes, NAL unit type 1 or 5, read since the opening or the last seek, and, where a picture may be a field, since the last picture that may set the decoder's context up again, which flushes it ([Fields](#fields)): it passes over slice data partitions, `h264dec.c` 682–686 ([`KeptReason::AwaitingReference`]) |
 //! | H.264 `prev_poc_msb` / `prev_poc_lsb` otherwise | reference pictures only, `h264_picture.c` 197–201 | no | — |
 //! | H.264 `poc_offset` | an intra-only picture under frame threading, `h264_slice.c` 1427–1430 (`picture_intra_only`, `h264dec.c` 501–551) | the H.274 film grain seed, `h264_slice.c` 1258–1260 | not intra only ([`KeptReason::IntraOnly`]) |
 //! | H.264 `has_b_frames`, `last_pocs` | every picture, `h264_slice.c` 1305–1333 | output order: with no `bitstream_restriction_flag` FFmpeg grows the reorder depth from the pictures it sees, and a later picture can be output too late and dropped; and a picture that follows 16 it precedes in output order resets the record (1310–1328), which a `max_num_reorder_frames` of 16 allows | every SPS: `bitstream_restriction_flag` with a `max_num_reorder_frames` of 15 at most ([`KeptReason::ReorderUnfixed`]); the depth is then the SPS's (1305–1307, 1411–1414) and the output stays in picture order |
@@ -361,7 +395,7 @@
 //! | H.264 `mmco_reset`, which the picture after an MMCO 5 picture or a flush takes as an output barrier | `h264_slice.c` 1302–1303 | no: the barrier falls on the next picture decoded, whichever it is, and the output on either side of it stays in picture order | — |
 //! | H.264 `non_gray` | any intra slice, `h264_slice.c` 2032–2034; cleared by a flush, `h264dec.c` 492 | whether a later picture that references a gray frame filling a gap uses another, `h264_refs.c` 410–419 | where a slice may be intra, an intra slice in a packet kept since the opening or the last seek ([`KeptReason::AwaitingIntraSlice`]) |
 //! | H.264 `frame_recovered`, `recovery_frame` | `h264_slice.c` 1645–1677, 1374–1376 | no: only a reference picture or IDR moves them, and a recovery point SEI keeps its packet | — |
-//! | H.264 field pairing: `first_field`, `cur_pic_ptr`, `droppable`, `picture_structure` | each picture start, `h264_slice.c` 1455–1611 | which field the next one joins, and the frame of both | a frame, or both fields of a pair FFmpeg joins in the packet, and no field waiting at it ([`KeptReason::UnpairedField`], [`KeptReason::PendingField`]; [Fields](#fields)) |
+//! | H.264 field pairing: `first_field`, `cur_pic_ptr`, `droppable`, `picture_structure` | each picture start, `h264_slice.c` 1455–1611; a context set up again, 989, `h264dec.c` 469 | which field the next one joins, and the frame of both | a frame, or both fields of a pair FFmpeg joins in the packet, and no field waiting at it ([`KeptReason::UnpairedField`], [`KeptReason::PendingField`]; [Fields](#fields)) |
 //! | H.264 `missing_fields`, each frame thread's own | a field found unmatched raises it, `h264_slice.c` 1583–1587, and a field joining one resets it, 1589 | from two on a later first field is output at once, its pair refused its frame, 1683, 1598–1603 | a pair only while no field may have gone unmatched ([`KeptReason::UnmatchedFields`]) |
 //! | H.264 SEI state while a first field waits | not reset at the next packet, `h264dec.c` 594–599 | that packet's frame's flags and side data, not its pixels | no: the next packet is kept ([`KeptReason::PendingField`]) |
 //! | H.264 parameter-set lists | parameter sets alone, which keep their packets; a picture parameter set keeps the sequence parameter set it was read on, `h264_ps.c` 738, 92–104 | which bits a slice's `field_pic_flag` is | — |
@@ -421,7 +455,9 @@
 //!   starts; no first field may wait at the packet; and for a pair, no
 //!   field may have gone unmatched ([Fields](#fields));
 //! - a slice of a reference picture the decoder decodes, of NAL unit type 1
-//!   or 5, has been read since the reading opened or was sought;
+//!   or 5, has been read since the reading opened or was sought, and, where
+//!   a picture may be a field, since the last picture at which the decoder
+//!   may have set its context up again ([Fields](#fields));
 //! - where some slice may be intra, a packet kept since then has held an
 //!   intra slice the decoder decodes.
 //!
