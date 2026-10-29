@@ -9473,7 +9473,8 @@ fn l92_ogg_refuses_what_its_start_and_granules_cannot_hold() {
 /// counting the others' ([`Rewrite::Timeline`]), and no key flag
 /// ([`Rewrite::SyncFromBitstream`] for the video). DVD writes its
 /// navigation packets beside them, which its reader takes for a data
-/// stream of their own.
+/// stream of their own. A picture decoded from zero, which no time before
+/// it moves, is moved by the preload alone, and reported so.
 ///
 /// PLANT: the preload unreported.
 #[test]
@@ -9557,6 +9558,29 @@ fn l93_streams_round_trip_through_mpeg_ps() {
       }
     }
   }
+  // A picture alone, decoded from zero: no time before it to move, the
+  // preload's move alone reported.
+  let (table, frames) = first_track(&intra_mpeg2_mkv(&corpus), TrackKind::Video, 3);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l93-picture.mpg"),
+    ContainerName::new("mpeg"),
+    table,
+  );
+  for (index, frame) in frames.iter().enumerate() {
+    let at = 40 * index as i64;
+    muxer
+      .write_video(video_at(&video_of(frame), Some(at), at))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a picture");
+  }
+  assert!(
+    muxer
+      .report()
+      .uncarried()
+      .contains(&Uncarried::TimesShifted),
+    "the preload alone"
+  );
+  muxer.finish().expect("finished");
 }
 
 /// **L94 — the MPEG program stream's refusals** (table H; `mpegenc.c`
