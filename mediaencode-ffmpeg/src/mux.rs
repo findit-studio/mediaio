@@ -7132,7 +7132,8 @@ fn default_layout(channels: i32) -> LayoutReadBack {
 /// 2881–2887), but FLAC's comment ([`flac_comment_layout`]) — a codec
 /// Matroska names not, which it would write as `A_MS/ACM` in RIFF's format,
 /// its query refuses at the normal compliance (`mkv_query_codec`,
-/// 3699–3713), the road unreached; raw FLAC's comment; MP4's PCM of two
+/// 3699–3713), the road unreached, every audio codec's open pinning it
+/// (L142); raw FLAC's comment; MP4's PCM of two
 /// channels or more its `chnl` box, a configuration or each channel's
 /// position, read back as written (`mov_write_chnl_tag`, `movenc.c`
 /// 1299–1339, 1524–1525; `ff_mov_read_chnl`, `mov_chan.c` 768–859) — a

@@ -16516,3 +16516,59 @@ fn l141_hevcs_layers_hvcc_drops_are_refused_but_where_lhvc_takes_them() {
     "{opened:?}"
   );
 }
+
+/// **L142 — Matroska's `A_MS/ACM` road is not reached** (R11; `mkv_query_codec`,
+/// `matroskaenc.c` 3699–3713; `mkv_write_track`, 2025–2035, 2125–2127):
+/// Matroska writes an audio codec it names not behind `A_MS/ACM`, in
+/// RIFF's format, and its query admits such a codec only below the normal
+/// compliance, which the context keeps. Every audio codec libavcodec
+/// describes, its ticket a PCM track's recoded, is opened into Matroska:
+/// refused, or its header written under a codec id of Matroska's own —
+/// none behind `A_MS/ACM`. A release whose query admits one turns it red,
+/// for the road's audit.
+///
+/// PLANT: the codec query's answer unread, a codec Matroska names not
+/// admitted.
+#[test]
+fn l142_matroskas_acm_road_is_not_reached() {
+  let Some(corpus) = Corpus::new() else { return };
+  let pcm = pcm_mkv(&corpus);
+  let mut opened = 0;
+  let mut descriptor = core::ptr::null();
+  loop {
+    // SAFETY: `avcodec_descriptor_next` walks libavcodec's static table,
+    // each entry live for the program; its `id` and `type_` are the
+    // table's own values.
+    let (id, kind) = unsafe {
+      descriptor = ffmpeg_next::ffi::avcodec_descriptor_next(descriptor);
+      if descriptor.is_null() {
+        break;
+      }
+      ((*descriptor).id, (*descriptor).type_)
+    };
+    if kind != ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO {
+      continue;
+    }
+    let target = output(&corpus, &format!("l142-{}.mkv", id as i32));
+    let result = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::MATROSKA,
+      vec![recoded(table_of(&pcm, TrackKind::Audio).remove(0), id, &[])],
+      &[],
+      PacketLimits::default(),
+    );
+    if let Ok((muxer, _)) = result {
+      drop(muxer);
+      opened += 1;
+      let header = std::fs::read(&target).expect("the header");
+      assert!(
+        !header.windows(8).any(|window| window == b"A_MS/ACM"),
+        "{id:?}: written behind A_MS/ACM"
+      );
+    }
+  }
+  assert!(
+    opened > 10,
+    "the premise: Matroska's own audio codecs open, {opened}"
+  );
+}
