@@ -764,7 +764,7 @@
 //! | MXF, MXF D-10, MXF OP-Atom | an MPEG-2 picture of coding type 0, or of a profile and level MXF labels no codec for; a P or B picture, whose index offsets this release does not mirror; DNxHD's first frame short of its compression id, or of an id MXF labels none for; a frame of another size than a constant-bit-rate index counts — MXF D-10's of its bit rate, DNxHD's of its first; an empty packet; at the end, a track no packet reached | refused after taking it; its index written at the next segment, the whole file lost at an offset past a byte; refused after taking it; refused after taking it; an essence element of none; nothing written, the trailer failing (`mxfenc.c` 2361–2397, 2793–2858, 3325–3458, 3487–3606) | [`PayloadRule::FrameHeader`], [`PayloadRule::PredictedPicture`], [`PayloadRule::FrameSize`], [`PayloadRule::Empty`], [`FfmpegMuxRefusal::NoFrame`] — L99 |
 //! | MXF, MXF D-10, MXF OP-Atom, at open | a codec but MPEG-2, DNxHD and ProRes video — MXF D-10's MPEG-2 alone — and 16- and 24-bit PCM: H.264, DV, FFV1 and JPEG 2000, whose frame parsers this release has not audited, and the data and caption tracks, booked; a first track not the one video track, OP-Atom's second track, MXF D-10's audio track not its second; a frame rate MXF names no content package for, or none; no pixel format; ProRes of no profile its labels name; sound but at 48 kHz, OP-Atom's but mono; MXF D-10's video at a bit rate it names not, or at a rate but 25 and 30000/1001; its sound past eight channels, or of a block alignment not its channels' samples | refused at its start; or its label another standard's; or its writer dividing by the alignment (`mxfenc.c` 2941–3165, 3222–3248) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ConfigurationInvalid`] — L98 |
 //! | the MOV family's modes | MP4's packet rules; ISMV's and AVIF's samples past the dynamic buffer they are written into — AVIF's held until its trailer, ISMV's until its next fragment's flush, counted here from the track's first sample, stricter than FFmpeg and losing nothing; ISMV's decode gap of `i32::MAX` less the track's first composition offset, but before a key frame of its one video track | as MP4's; the buffer refusing the write, the sample tables counting bytes the file lacks (`movenc.c` 6961–6981; `aviobuf.c` 1281–1311); the decode time rewritten that offset back, the next flush's `av_assert0` ending the process (6897–6923, 7396–7410, 1248–1256) | as MP4's; [`PayloadRule::FragmentSize`], [`FfmpegMuxRefusal::DtsGap`] — L103, L123 |
-//! | the MOV family's modes, at open | a codec this release admits not beside MP4's — MOV's raw video, DV, MPEG-2, H.263, DNxHD, ProRes, PCM, MP3, AMR, ADPCM, QDM2, G.726, iLBC, and H.264 of an intra profile or AVC-Intra tag; 3GP's and 3G2's H.263 and AMR; F4V's VP6; ISMV's WMA Pro and TTML; PSP's every codec but H.264, MPEG-4 Part 2 and AAC; AVIF's alpha plane — booked; a picture past 65535; MPEG audio layer III below 16 kHz outside MOV; TTML's `dfxp` tag outside ISMV; PSP's table of other than one video and one audio track, AVIF's of more than one; ISMV's second video track, whose key frames' flushes before `check_pkt`'s second count rest on libavformat's interleaving, which this release does not mirror — booked to Q870 (R11, Codex R10 2); the Nero list's untitled chapter, which reads back titled empty, no longer untitled (R9: Fable R2, judged by the ruled rule), a title past 255 bytes, cut | refused at the start, written with no configuration box, or so that it reads back otherwise (`movenc.c` 1380–2140, 5040–5064, 6431–6448, 8129–8650) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`] — L102, L132 |
+//! | the MOV family's modes, at open | a codec this release admits not beside MP4's — MOV's raw video, DV, MPEG-2, H.263, DNxHD, ProRes, PCM, MP3, AMR, ADPCM, QDM2, G.726, iLBC, and H.264 of an intra profile or AVC-Intra tag; 3GP's and 3G2's H.263 and AMR; F4V's VP6; ISMV's WMA Pro and TTML; PSP's every codec but H.264, MPEG-4 Part 2 and AAC; AVIF's alpha plane — booked; a picture past 65535, and in MOV's mode one of an aspect ratio stated and not 1 whose track aperture — its width, height and display width shifted left 16 in an `int` — passes 32767, every MOV video codec, H.264, HEVC and MPEG-4 among them (`mov_write_tapt_tag`, `movenc.c` 4098–4126, 4430–4436; R11, Q869 L6 — L136); MPEG audio layer III below 16 kHz outside MOV; TTML's `dfxp` tag outside ISMV; PSP's table of other than one video and one audio track, AVIF's of more than one; ISMV's second video track, whose key frames' flushes before `check_pkt`'s second count rest on libavformat's interleaving, which this release does not mirror — booked to Q870 (R11, Codex R10 2); the Nero list's untitled chapter, which reads back titled empty, no longer untitled (R9: Fable R2, judged by the ruled rule), a title past 255 bytes, cut | refused at the start, written with no configuration box, or so that it reads back otherwise (`movenc.c` 1380–2140, 5040–5064, 6431–6448, 8129–8650) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`] — L102, L132 |
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -3033,7 +3033,9 @@ pub enum MuxOpenError {
   /// header holds the width and height in 16 bits and the aspect ratio's
   /// terms in 24 (`ogg_build_vp8_headers`, `oggenc.c` 431–434); or the MOV
   /// family's past 65535, which its start refuses (`mov_init`, `movenc.c`
-  /// 8494–8497).
+  /// 8494–8497), and MOV's past 32767 of a video whose aspect ratio is
+  /// stated and not 1, its track aperture's widths and height shifted left
+  /// 16 in an `int` (`mov_write_tapt_tag`, 4098–4126; R11, Q869 L6).
   #[error("track {}'s dimensions do not fit the container's header", .track.get())]
   Dimensions {
     /// The track.
@@ -10731,10 +10733,41 @@ const fn mov_admitted(mode: MovMode) -> &'static [CodecId] {
   }
 }
 
+/// Whether MOV's track aperture overflows (`mov_write_tapt_tag`,
+/// `movenc.c` 4098–4126), which MOV's mode writes for a video track whose
+/// aspect ratio — the stream's, which the context sets to the ticket's —
+/// is stated and not 1 (4430–4436): the coded width, the height, and the
+/// display width — `av_rescale` of the ratio's numerator, the width and its
+/// denominator, rounded to the nearest, `INT64_MIN` for a denominator of
+/// none, into an `int32_t` — each shifted left 16 in an `int`, past 32767
+/// a signed overflow, past 65535 the 16.16 field wrapped (R11, Q869 L6).
+/// FFmpeg's reader reads no `tapt`; QuickTime's does.
+fn mov_aperture_overflows(ticket: &CodecTicket) -> bool {
+  let ratio = ticket.sample_aspect_ratio();
+  let (num, den) = (i128::from(ratio.num()), i128::from(ratio.den()));
+  if num == 0 || num == den {
+    return false;
+  }
+  let width = i128::from(ticket.width());
+  let rescaled = if den <= 0 || width < 0 {
+    i128::from(i64::MIN)
+  } else if num < 0 {
+    -((-num * width + den / 2) / den)
+  } else {
+    (num * width + den / 2) / den
+  };
+  // The `int64_t` into an `int32_t`: its low 32 bits.
+  let display = i128::from(rescaled as i64 as i32);
+  let shifts = |value: i128| (0..=0x7FFF).contains(&value);
+  !shifts(display) || !shifts(width) || !shifts(i128::from(ticket.height()))
+}
+
 /// What the MOV family's start refuses of a timed track, by mode
 /// (`mov_init`, `movenc.c` 8448–8650), and the codecs a mode beside MP4
 /// admits ([`mov_admitted`]): in every mode a picture wider or taller
-/// than 65535 (8494–8497, [`MuxOpenError::Dimensions`]); MPEG audio layer
+/// than 65535 (8494–8497, [`MuxOpenError::Dimensions`]), and in MOV's a
+/// video of an aspect ratio not 1 whose track aperture overflows
+/// ([`mov_aperture_overflows`]); MPEG audio layer
 /// III below 16 kHz outside MOV (8562–8574); TTML of ISMV's `dfxp` tag
 /// outside ISMV (8597–8611); MOV's H.264 of an intra profile, or an
 /// AVC-Intra tag, written with no `avcC` (1970–2030, 2899–2903) —
@@ -10753,6 +10786,12 @@ fn mov_refusal<D: AsRef<[u8]>>(
   let ticket = description.side_data();
   if description.kind() == TrackKind::Video
     && (ticket.width() > i32::from(u16::MAX) || ticket.height() > i32::from(u16::MAX))
+  {
+    return Some(MuxOpenError::Dimensions { track });
+  }
+  if mode == MovMode::Mov
+    && description.kind() == TrackKind::Video
+    && mov_aperture_overflows(ticket)
   {
     return Some(MuxOpenError::Dimensions { track });
   }

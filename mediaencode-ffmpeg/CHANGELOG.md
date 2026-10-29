@@ -393,6 +393,10 @@ crate moves only when it changes.
   written as a mask of zero, which its reader refuses, the stream read
   back of no channels (`MuxOpenError::ChannelLayout`), the one reader's
   refusal of a written layout among every audited container's.
+  MOV's track aperture of a video whose aspect ratio is stated and not 1,
+  its widths and height shifted left 16 in an `int`, past 32767
+  (`MuxOpenError::Dimensions`): every MOV video codec, H.264, HEVC and
+  MPEG-4 among them.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

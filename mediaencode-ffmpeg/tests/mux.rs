@@ -15943,3 +15943,74 @@ fn l135_flv_refuses_a_native_layout_its_reader_cannot_take() {
   let (_, back) = whole_track(&target, TrackKind::Audio);
   assert_eq!(back.len(), packets.len(), "every packet read back");
 }
+
+/// `table` opened into `container` at `name`, the file empty where it is
+/// refused.
+fn opened_in(
+  corpus: &Corpus,
+  name: &str,
+  container: &str,
+  table: Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>>,
+) -> Result<(), MuxOpenError> {
+  let target = output(corpus, name);
+  let opened = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::new(container),
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .map(drop);
+  assert_eq!(
+    std::fs::metadata(&target).expect("the file").len() == 0,
+    opened.is_err(),
+    "{name}: nothing written where refused"
+  );
+  opened
+}
+
+/// **L136 — MOV refuses at open a video whose track aperture overflows**
+/// (R11, Q869 L6; `mov_write_tapt_tag`, `movenc.c` 4098–4126, 4430–4436):
+/// MOV writes a `tapt` for a video track whose aspect ratio is stated and
+/// not 1, its coded width, height and display width each shifted left 16
+/// in an `int` — H.264 at 20 000 pixels of an aspect ratio of 2, its
+/// display width 40 000, and at a height of 40 000 of 4/3, refused by name
+/// (`MuxOpenError::Dimensions`) before anything is written. At an aspect
+/// ratio of 1 MOV writes none, and 40 000 pixels open; at a display width
+/// of 32 000, and in MP4, which writes no `tapt`, 20 000 of 2 open.
+///
+/// PLANT: the aperture unjudged, the first table opened; the ratio of 1
+/// judged too, the square 40 000 refused.
+#[test]
+fn l136_mov_refuses_a_video_whose_track_aperture_overflows() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let video = |width: i32, height: i32, (num, den): (i32, i32)| {
+    vec![reticketed(
+      table_of(&source, TrackKind::Video).remove(0),
+      |par| {
+        par.width = width;
+        par.height = height;
+        par.sample_aspect_ratio.num = num;
+        par.sample_aspect_ratio.den = den;
+      },
+    )]
+  };
+  for (name, table) in [
+    ("l136-wide.mov", video(20_000, 64, (2, 1))),
+    ("l136-tall.mov", video(64, 40_000, (4, 3))),
+  ] {
+    let opened = opened_in(&corpus, name, "mov", table);
+    assert!(
+      matches!(opened, Err(MuxOpenError::Dimensions { track }) if track.get() == 0),
+      "{name}: {opened:?}"
+    );
+  }
+  for (name, container, table) in [
+    ("l136-square.mov", "mov", video(40_000, 64, (1, 1))),
+    ("l136-display.mov", "mov", video(16_000, 64, (2, 1))),
+    ("l136-wide.mp4", "mp4", video(20_000, 64, (2, 1))),
+  ] {
+    opened_in(&corpus, name, container, table).unwrap_or_else(|error| panic!("{name}: {error:?}"));
+  }
+}
