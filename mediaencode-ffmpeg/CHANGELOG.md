@@ -132,7 +132,15 @@ crate moves only when it changes.
   `PayloadRule::AdtsHeader`, `AdtsFrameLength`, `AdtsFrame`); FLAC's and
   MP3's video tracks, FLAC's missing or `fLaC`-marked configuration; IVF's
   dimensions past 16 bits (`MuxOpenError::Dimensions`); a WAV file past
-  4 GiB (`PayloadRule::FileSize`).
+  4 GiB (`PayloadRule::FileSize`). FLV: a reordering packet with no
+  presentation time (`FfmpegMuxRefusal::MissingPts`), a decode time past
+  its 32 bits of milliseconds (`FfmpegMuxRefusal::TimeWraps`), a
+  composition time past its 24 (`PresentationOffset`), a tag past its
+  24-bit size (`PayloadRule::TagSize`), ADTS AAC no filter converts
+  (`AdtsHeader`), AAC with no configuration whose first packet brings none
+  (`PayloadRule::ConfigurationAbsent`), and at open Opus or FLAC with no
+  configuration, which its header asserts, and H.264, HEVC, VVC, AV1,
+  MPEG-4 or AAC with none and the filters off.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first

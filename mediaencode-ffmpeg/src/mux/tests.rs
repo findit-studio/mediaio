@@ -390,7 +390,13 @@ fn a_rescale_rounds_as_av_rescale_q_does() {
 #[test]
 fn a_configuration_is_judged_and_its_rewrite_reported() {
   let rewrites_of = |family, _kind: TrackKind, codec, extradata: &[u8]| {
-    rewrites((family, audited_for(family)), codec, extradata, true).collect::<Vec<_>>()
+    rewrites(
+      (family, audited_for(family), TrackKind::Video),
+      codec,
+      extradata,
+      true,
+    )
+    .collect::<Vec<_>>()
   };
   assert!(configuration_missing(Family::Mp4, CodecId::H264, &[], true));
   assert!(configuration_missing(Family::Mp4, CodecId::HEVC, &[], true));
@@ -489,8 +495,9 @@ fn a_configuration_is_judged_and_its_rewrite_reported() {
   // Table H's field rows: a raw stream writes no time and no key flag;
   // IVF the presentation time alone; WAV's PCM, whose every frame is a key
   // frame, loses no flag.
-  let field_rows =
-    |audited, codec| rewrites((Family::Other, audited), codec, &[], true).collect::<Vec<_>>();
+  let field_rows = |audited, codec| {
+    rewrites((Family::Other, audited, TrackKind::Video), codec, &[], true).collect::<Vec<_>>()
+  };
   assert_eq!(
     field_rows(Audited::Raw(CodecId::H264), CodecId::H264),
     vec![Rewrite::Timeline, Rewrite::SyncFromBitstream]
@@ -523,7 +530,13 @@ fn audited_for(family: Family) -> Audited {
 #[test]
 fn a_duration_the_container_does_not_keep_is_reported() {
   let rewrites_of = |family, _kind: TrackKind, codec, default_duration| {
-    rewrites((family, audited_for(family)), codec, &[], default_duration).collect::<Vec<_>>()
+    rewrites(
+      (family, audited_for(family), TrackKind::Video),
+      codec,
+      &[],
+      default_duration,
+    )
+    .collect::<Vec<_>>()
   };
   for family in [Family::Matroska, Family::WebM] {
     assert_eq!(
@@ -1186,7 +1199,7 @@ fn admit_eac3(
     state,
     time_base,
     Neighbours::default(),
-    (timed, &[timed]),
+    (timed, &[timed], 0),
     payload,
     step,
     Bounds::REAL,
