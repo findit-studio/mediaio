@@ -17397,3 +17397,137 @@ fn l149_mp4_refuses_a_sample_past_its_sample_table() {
   )
   .expect("two chapters");
 }
+
+/// **L150 — MP4 counts a track's sample descriptions as movenc makes them,
+/// refusing the 1025th; ISMV refuses a configuration update** (R13, Codex
+/// R12 1 and the ruled letter; `ff_mov_write_packet`, `movenc.c`
+/// 7044–7074; `mov_write_single_packet`, 7412–7429; `mov_read_stsd`,
+/// `mov.c` 3338; `mov_write_header`, `movenc.c` 8893–8899;
+/// `mov_write_tfhd_tag`, 5612–5640): movenc makes a sample description of
+/// each configuration a packet brings that none of the track's holds, byte
+/// for byte, and FFmpeg's reader refuses the whole file past 1024. A FLAC
+/// track, its STREAMINFO the first description: 1022 packets each of a
+/// STREAMINFO of its own make 1023; one of the first's, and one of the
+/// tenth's, make none; a configuration's packet rewrites the one in use in
+/// place, making none, so that the configuration it replaced, brought
+/// again, is the 1024th, taken; another, the 1025th, refused by name
+/// (`PayloadRule::SampleDescriptions`), handed back untouched; the file
+/// read back. ISMV writes its `moov` at its start, and its fragments name
+/// no description: an AAC packet of the stream's own configuration taken,
+/// one of another refused (`PayloadRule::ConfigurationUpdate`), untouched.
+///
+/// PLANT: the descriptions uncounted, the 1025th taken; the rewrite in
+/// place not mirrored, the 1025th taken as the 1024th; ISMV's update
+/// unjudged, taken.
+#[test]
+fn l150_mp4_counts_sample_descriptions_and_ismv_refuses_an_update() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  macro_rules! taken {
+    ($result:expr, $what:expr) => {
+      $result
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{}: {error:?}", $what))
+    };
+  }
+  #[rustfmt::skip]
+  let source = generated(&corpus, "l150.flac", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.2",
+    "-ac", "2", "-c:a", "flac",
+  ]);
+  let (table, frames) = first_track(&source, TrackKind::Audio, 1);
+  let first = table[0].side_data().extradata().to_vec();
+  assert_eq!(first.len(), 34, "the premise: one STREAMINFO");
+  let frame = audio_of(&frames[0]);
+  // A STREAMINFO of its own: the first's, its MD5 signature `k`.
+  let streaminfo = |k: u128| {
+    let mut info = first.clone();
+    info[18..34].copy_from_slice(&k.to_le_bytes());
+    assert_ne!(info, first, "the premise: another configuration");
+    info
+  };
+  let target = output(&corpus, "l150.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  let mut at = 0;
+  let mut bringing = |configuration: &[u8], payload: bool| {
+    let mut packet = if payload {
+      frame.clone()
+    } else {
+      audio_holding(&frame, &[])
+    };
+    packet
+      .extra_mut()
+      .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, configuration)]);
+    at += 4608;
+    audio_ticks(&packet, at, if payload { 4608 } else { 0 })
+  };
+  for k in 1..=1022 {
+    taken!(
+      muxer.write_audio(bringing(&streaminfo(k), true)),
+      format!("description {}", k + 1)
+    );
+  }
+  taken!(
+    muxer.write_audio(bringing(&first, true)),
+    "the first's again, no new one"
+  );
+  taken!(
+    muxer.write_audio(bringing(&streaminfo(9), true)),
+    "the tenth's again, no new one"
+  );
+  taken!(
+    muxer.write_audio(bringing(&streaminfo(5000), false)),
+    "a configuration's packet, the tenth rewritten in place"
+  );
+  taken!(
+    muxer.write_audio(bringing(&streaminfo(9), true)),
+    "the tenth's replaced configuration, the 1024th"
+  );
+  let past = bringing(&streaminfo(6000), true);
+  let (refusal, back) = by_container(muxer.write_audio(past.clone()));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::SampleDescriptions),
+    "the 1025th"
+  );
+  untouched!(past, back);
+  muxer.finish().expect("finished");
+  assert_eq!(
+    packets(&target)[0].len(),
+    1025,
+    "read back, its 1024 descriptions: every sample written, the configuration's packet none"
+  );
+
+  // ISMV.
+  let source = audio_file(&corpus, "l150-aac.mp4", "aac");
+  let (table, frames) = first_track(&source, TrackKind::Audio, 2);
+  let own = table[0].side_data().extradata().to_vec();
+  assert!(!own.is_empty(), "the premise: AAC's configuration");
+  let mut other = own.clone();
+  other[0] ^= 0x08;
+  let mut muxer = muxer_into(
+    &output(&corpus, "l150.ismv"),
+    ContainerName::new("ismv"),
+    table,
+  );
+  let with = |packet: &Audio, configuration: &[u8], at: i64| {
+    let mut packet = packet.clone();
+    packet
+      .extra_mut()
+      .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, configuration)]);
+    audio_ticks(&packet, at, 1024)
+  };
+  taken!(
+    muxer.write_audio(with(&audio_of(&frames[0]), &own, 0)),
+    "the stream's own configuration"
+  );
+  let update = with(&audio_of(&frames[1]), &other, 1024);
+  let (refusal, back) = by_container(muxer.write_audio(update.clone()));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::ConfigurationUpdate),
+    "another"
+  );
+  untouched!(update, back);
+  muxer.finish().expect("finished");
+}

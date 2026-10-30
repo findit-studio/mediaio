@@ -417,6 +417,14 @@ crate moves only when it changes.
   chapter track writes a sample a chapter, refused at open
   (`MuxOpenError::ChapterCount`). The chunk offsets and the `mdat` widen
   past 32 bits.
+- **MP4's sample descriptions, counted as movenc makes them (R13).** One
+  of each configuration a packet brings that none of the track's holds,
+  byte for byte — the stream's the first, MPEG-4 ALS's, AAC's, AV1's and
+  FLAC's rewritten in place by a configuration's packet — and the 1025th,
+  which FFmpeg's reader refuses with the whole file, refused
+  (`PayloadRule::SampleDescriptions`, new). ISMV, which writes its `moov`
+  at its start and names no description in its fragments, refuses every
+  configuration update (`PayloadRule::ConfigurationUpdate`, new).
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer

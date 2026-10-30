@@ -348,7 +348,7 @@
 //! | AMR-NB: one frame a packet; ADPCM MS and IMA WAV: a frame size | 6983–7002 | not reached: MP4's tag table holds neither (`codec_mp4_tags`, 9230–9290), refused at open ([`MuxOpenError::CodecNotCarried`]); MOV's mode reaches it, its AMR and ADPCM booked (table H) |
 //! | no samples: less than a frame of a sized codec | 7006–7010 | [`PayloadRule::PartialSample`], [`PayloadRule::Empty`] |
 //! | the first packet taken as the configuration of H.264, HEVC, VVC, EVC, LCEVC, VP9, TrueHD or DNxHD where none is stated | 7024–7041 | H.264, HEVC, VVC, LCEVC and EVC refused at open ([`MuxOpenError::ConfigurationMissing`]); TrueHD refused at open; VP9's and DNxHD's boxes made from it, written |
-//! | new extradata: a sample description from the packet on, each written by its codec's writer at the trailer — AC-3's and E-AC-3's, `dac3` and `dec3`, from MP4's parse of the frames, APV's `apvC` from its packets', PCM's, TTML's and GoPro metadata's entries of no configuration, none of its bytes; MPEG-4 ALS, AAC, AV1 and FLAC's overwriting a configuration stated as none | 7044–7074, 7406–7420; grep G19 | where none of its bytes is written, reported dropped (the side-data table); FLAC's of 34 bytes ([`PayloadRule::FlacStreamInfo`]); Opus's an OpusHead `dOps` takes, H.264's, HEVC's, VVC's and LCEVC's of the track's form — Annex B or not — as the rewrite reads it, AV1's one `ff_isom_write_av1c` writes (R9: ruling 4c — L109) ([`PayloadRule::NewExtradata`]); a track of MPEG-4 ALS, AAC, AV1 or FLAC that states none taken where its first packet brings one, which the trailer writes its sample entry of, and refused where it does not ([`PayloadRule::ConfigurationAbsent`]; R9: ruling 4a — L108) — not ISMV's, which writes its `moov` at its header, nor AVIF's |
+//! | new extradata: a sample description from the packet on, each written by its codec's writer at the trailer — AC-3's and E-AC-3's, `dac3` and `dec3`, from MP4's parse of the frames, APV's `apvC` from its packets', PCM's, TTML's and GoPro metadata's entries of no configuration, none of its bytes; MPEG-4 ALS, AAC, AV1 and FLAC's overwriting a configuration stated as none | 7044–7074, 7406–7420; grep G19 | where none of its bytes is written, reported dropped (the side-data table); FLAC's of 34 bytes ([`PayloadRule::FlacStreamInfo`]); Opus's an OpusHead `dOps` takes, H.264's, HEVC's, VVC's and LCEVC's of the track's form — Annex B or not — as the rewrite reads it, AV1's one `ff_isom_write_av1c` writes (R9: ruling 4c — L109) ([`PayloadRule::NewExtradata`]); a track of MPEG-4 ALS, AAC, AV1 or FLAC that states none taken where its first packet brings one, which the trailer writes its sample entry of, and refused where it does not ([`PayloadRule::ConfigurationAbsent`]; R9: ruling 4a — L108) — not ISMV's, which writes its `moov` at its header, nor AVIF's; each description counted as movenc makes it — one a configuration none of the track's holds, byte for byte, the stream's the first, copied at the header (8745–8765), MPEG-4 ALS's, AAC's, AV1's and FLAC's rewritten in place by a configuration's packet, or by a packet's where the one in use holds none (7412–7429), VP9's of none its first sample (7024–7041) — and the 1025th refused, which FFmpeg's reader refuses with the whole file past 1024 (`mov_read_stsd`, `mov.c` 3338) ([`PayloadRule::SampleDescriptions`]; R13, Codex R12 1 — L150); ISMV's every configuration update refused, its `moov` written at its header and its fragments naming no description (8893–8899; `mov_write_tfhd_tag`, 5612–5640) ([`PayloadRule::ConfigurationUpdate`]; R13 — L150) |
 //! | AAC framed in ADTS | 7076–7086 | [`PayloadRule::AdtsHeader`], [`PayloadRule::AdtsFrame`] |
 //! | the Annex B rewrite | 7087–7158 | reported ([`Rewrite::LengthPrefixed`]); its size, table B |
 //! | AV1's OBUs | 7159–7174 | [`PayloadRule::Obus`]; reported ([`Rewrite::ObusFiltered`]) |
@@ -398,7 +398,7 @@
 //! | `stss`, `stps` | 16 and 4 a sync, or partial sync, sample (292–314) | 119 304 208 | — |
 //! | `sdtp` | 12 and 1 a sample (316–336) | 29 826 060 | — |
 //! | `sgpd`, `sbgp`, AAC's and Opus's | an `int` of 24 and 2 a group, and of 20 and 8 a run of roll distances (3305–3400) | 59 652 120; 238 608 404, within `INT_MAX` | — |
-//! | `stsd` | a sample entry a description, a distinct new extradata each (3165–3198; 7044–7074) | not bounded by the table: a description a configuration | not mirrored — FFmpeg's reader refuses more than 1024 with the whole file (`mov_read_stsd`, `mov.c` 3338; 11290–11295; R12, letter) |
+//! | `stsd` | a sample entry a description, a distinct new extradata each (3165–3198; 7044–7074) | not bounded by the table: a description a configuration | refused at the 1025th, which FFmpeg's reader refuses with the whole file (`mov_read_stsd`, `mov.c` 3338; 11290–11295; [`PayloadRule::SampleDescriptions`]; R13) |
 //! | `stbl`, `minf`, `mdia`, `trak` | one track's boxes, their sum (3402–3439, 3821–3856, 3957–3970, 4391–4445) | 1 342 172 272 at most — a video track's every table — beside its descriptions | — |
 //! | `moov`, and ISMV's `mfra` | every track's boxes, their sum — the `mfra` in a dynamic buffer of `INT_MAX` bytes, 19 bytes a fragment (5339–5453; 6118–6178) | past 4 GiB, past `INT_MAX`, only of several tracks near the table's bound | not mirrored: the chunks of a track the interleaving's order makes, and every other box the `moov` holds (R12, letter) |
 //! | `mdat` | a `wide` box before it, which the trailer turns into a 64-bit size past `UINT32_MAX` (6180–6189, 8990–9012); ISMV's of one track's buffer ([`PayloadRule::FragmentSize`]; 6855–6858) | widened; within | — |
@@ -1645,6 +1645,10 @@ struct ProducerReferenceTime {
 /// 217–223) — the largest multiple of 1024 entries within it: 29 826 048,
 /// or 33 553 408 of 64-byte entries. The trust model holds the limit
 /// libavutil's own, which the base never changes.
+/// The most sample descriptions FFmpeg's reader reads a track of, refusing
+/// the whole file past it (`mov_read_stsd`, `mov.c` 3338).
+const MOV_DESCRIPTIONS_MAX: usize = 1024;
+
 pub(crate) const MOV_SAMPLES_MAX: u64 = {
   let step = 1024 * core::mem::size_of::<MovEntry>() as u64;
   (i32::MAX as u64 / step) * 1024
@@ -2990,6 +2994,28 @@ pub enum PayloadRule {
   /// counts their sizes in (R12; table C′′′ of the census).
   #[error("the packet's sample would take the track's sample table past what MP4 holds")]
   SampleTable,
+  /// The MOV family but ISMV: a packet whose new extradata would make the
+  /// track's 1025th sample description. movenc makes a description of each
+  /// configuration a packet brings that none of the track's holds, byte for
+  /// byte (`ff_mov_write_packet`, `movenc.c` 7044–7074), and FFmpeg's
+  /// reader refuses more than 1024 with the whole file (`mov_read_stsd`,
+  /// `mov.c` 3338; `mov_read_header`, 11290–11295). Counted as movenc makes
+  /// them: the stream's configuration the first, copied at its header
+  /// (8745–8765); MPEG-4 ALS's, AAC's, AV1's and FLAC's rewritten in place
+  /// by a configuration's packet, or by a packet's where it holds none
+  /// (7412–7429); VP9's of no configuration its first sample (7024–7041)
+  /// (R13, Codex R12 1 and the ruled letter).
+  #[error("the packet's configuration would be the track's 1025th sample description")]
+  SampleDescriptions,
+  /// ISMV: a packet whose new extradata would change the track's
+  /// configuration — a sample description of another, or the one in use
+  /// rewritten: ISMV writes its `moov`, and every description in it, at its
+  /// start (`mov_write_header`, `movenc.c` 8893–8899; 8177–8179), and its
+  /// fragments name no description (`mov_write_tfhd_tag`, 5612–5640), so
+  /// that the samples after it are read by the configuration the `moov`
+  /// holds (R13, Codex R12 1). One the track holds already changes nothing.
+  #[error("ISMV's configuration would change after its moov is written")]
+  ConfigurationUpdate,
   /// MP4's APV: a packet whose frame brings a 256th frame information of
   /// its PBU type to the track's `apvC`, which MP4 makes of its parse of
   /// every packet and counts them in 8 bits (`apv_add_frameinfo`, `apv.c`
@@ -3677,6 +3703,8 @@ struct TrackState {
   /// The MOV family: the entries MP4 has made in the track's table of
   /// samples ([`PayloadRule::SampleTable`]).
   mp4_entries: u64,
+  /// The MOV family: its sample descriptions ([`Descriptions`]).
+  descriptions: Descriptions,
   /// The MOV family's APV: the frame informations its `apvC` records so
   /// far, by PBU type, in the order the types came
   /// ([`records::apv_frame_infos`]).
@@ -4470,6 +4498,111 @@ struct Mp4Place {
   /// Whether the packet's duration, offered, is not its samples
   /// ([`Rewrite::Durations`]).
   durations: bool,
+}
+
+/// MP4's sample descriptions of a track, as movenc keeps them
+/// (`MOVTrack.extradata`, `stsd_count`, `last_stsd_index`; `movenc.c`
+/// 7024–7074, 7412–7429, 8745–8765), for [`PayloadRule::SampleDescriptions`]
+/// and [`PayloadRule::ConfigurationUpdate`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Descriptions {
+  /// Each description's configuration, the bytes movenc compares a
+  /// packet's new extradata with — `None` of one whose bytes this muxer
+  /// does not hold: DVD subtitles' first, which movenc makes of their
+  /// palette (8750–8752), and VP9's first sample where its filter joins
+  /// frames into it — a configuration no packet's equals, stricter by that
+  /// one at most.
+  entries: Vec<Option<Vec<u8>>>,
+  /// The description in use, the last made or matched.
+  current: usize,
+}
+
+impl Descriptions {
+  /// A track's one description at its start: the stream's configuration,
+  /// which the header copies (8745–8765) — none of DNxHD's — and DVD
+  /// subtitles' made of their palette. AVC-Intra's tags, which it copies
+  /// none of either, are refused at open.
+  fn of(codec: &StreamCodec) -> Self {
+    let id = codec.codec();
+    let first = if id == CodecId::DVD_SUBTITLE && !codec.extradata().is_empty() {
+      None
+    } else if id == CodecId::DNXHD {
+      Some(Vec::new())
+    } else {
+      Some(codec.extradata().to_vec())
+    };
+    Self {
+      entries: vec![first],
+      current: 0,
+    }
+  }
+}
+
+/// The configuration AAC's filter makes of the first frame it converts,
+/// `bytes` its ADTS frame, as `aac_adtstoasc` writes it
+/// (`aac_adtstoasc.c` 80–119): the object type, sampling index and channel
+/// configuration of its header, then — of channel configuration 0 — the
+/// program config element `ff_copy_pce_data` copies
+/// (`mpeg4audio_copy_pce.h` 38–67); `None` where the frame converts not.
+fn made_configuration_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+  made_configuration(bytes)?;
+  let mut header = Bits { bytes, at: 15 };
+  let crc_absent = header.read(1) == 1;
+  let object_type = header.read(2) + 1;
+  let sampling = header.read(4);
+  header.skip(1);
+  let channels = header.read(3);
+  let mut made = vec![
+    ((object_type << 3) | (sampling >> 1)) as u8,
+    (((sampling & 1) << 7) | (channels << 3)) as u8,
+  ];
+  if channels == 0 {
+    let payload = &bytes[if crc_absent { 7 } else { 9 }..];
+    let mut bits = Bits {
+      bytes: payload,
+      at: 0,
+    };
+    if bits.read(3) != 5 {
+      return None;
+    }
+    // The element's fields, copied bit for bit from its tag, then aligned
+    // from their own start (`align_put_bits`), as `pce_read` reads them.
+    let start = bits.at;
+    bits.skip(10);
+    let mut five_bit = bits.read(4) + bits.read(4) + bits.read(4);
+    let four_bit = bits.read(2) + bits.read(3);
+    five_bit += bits.read(4);
+    for width in [4, 4, 3] {
+      if bits.read(1) == 1 {
+        bits.skip(width);
+      }
+    }
+    bits.skip(usize::try_from(five_bit * 5 + four_bit * 4).ok()?);
+    let mut fields = Bits {
+      bytes: payload,
+      at: start,
+    };
+    let (mut byte, mut filled) = (0_u8, 0);
+    for _ in start..bits.at {
+      byte = (byte << 1) | fields.read(1) as u8;
+      filled += 1;
+      if filled == 8 {
+        made.push(byte);
+        (byte, filled) = (0, 0);
+      }
+    }
+    if filled > 0 {
+      made.push(byte << (8 - filled));
+    }
+    // `align_get_bits`, then the comment's size and its bytes.
+    bits.at = bits.at.div_ceil(8) * 8;
+    let comment = bits.read(8);
+    made.push(comment as u8);
+    for _ in 0..comment {
+      made.push(bits.read(8) as u8);
+    }
+  }
+  Some(made)
 }
 
 /// How AVI keeps a stream's packets' times, as their places
@@ -7809,6 +7942,9 @@ struct Learned {
   /// The MOV family: the entries MP4 has made in the track's table of
   /// samples after the packet ([`PayloadRule::SampleTable`]).
   mp4_entries: Option<u64>,
+  /// The MOV family: its sample descriptions after the packet, where it
+  /// changes them ([`Descriptions`]).
+  descriptions: Option<Descriptions>,
   /// The MOV family's APV: the frame informations the packet adds to the
   /// track's `apvC`, by PBU type.
   apv: Vec<(u8, records::ApvFrameInfo)>,
@@ -8306,6 +8442,7 @@ where
       let track = TrackIndex::new(index);
       let mut rules = PacketRules::default();
       let mut sides = SideRules::unclaimed();
+      let mut descriptions = Descriptions::default();
       let stream = match (stream, road) {
         (Some((stream, _)), Road::Timed) => {
           let time_base = output
@@ -8411,6 +8548,9 @@ where
           }
           sides = SideRules::of((family, audited), kind, &codec);
           sides.alone = ogg_streams == 1;
+          if family == Family::Mp4 {
+            descriptions = Descriptions::of(&codec);
+          }
           Some((stream, time_base))
         }
         // An attachment stream takes no packet; a cover takes its one,
@@ -8454,6 +8594,7 @@ where
         mp4_place: None,
         mp4_samples: 0,
         mp4_entries: 0,
+        descriptions,
         apv: Vec::new(),
         key_times: None,
         mxf: MxfMirror {
@@ -9104,6 +9245,9 @@ where
     }
     if let Some(entries) = plan.learned.mp4_entries {
       state.mp4_entries = entries;
+    }
+    if let Some(descriptions) = plan.learned.descriptions {
+      state.descriptions = descriptions;
     }
     for &(kind, info) in &plan.learned.apv {
       match state.apv.iter_mut().find(|(entry, _)| *entry == kind) {
@@ -10082,6 +10226,98 @@ fn check_packet_rules(
   {
     return refused(PayloadRule::NewExtradata);
   }
+  // The MOV family's sample descriptions (R13, Codex R12 1): what reaches
+  // movenc of the packet's configuration — the one AAC's filter makes of
+  // the first frame it converts, which replaces the packet's own, else the
+  // packet's own new extradata, where it reaches the container — taken as
+  // movenc takes it ([`Descriptions`]).
+  let descriptions = if rules.mp4
+    && rules.ttml_document.is_none()
+    && state.descriptions.current < state.descriptions.entries.len()
+  {
+    let codec = state.sides.codec;
+    let reaching: Option<Vec<u8>> = if first_conversion(state.filter, payload.bytes) {
+      made_configuration_bytes(payload.bytes)
+    } else if owns {
+      side_data(
+        payload.side_data,
+        AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+      )
+      .filter(|new| !new.is_empty())
+      .map(<[u8]>::to_vec)
+    } else {
+      None
+    };
+    let writes = !config_only && !outputs.is_empty();
+    let mut after = state.descriptions.clone();
+    let mut overwritten = false;
+    // `mov_write_single_packet`: MPEG-4 ALS's, AAC's, AV1's and FLAC's
+    // configuration rewritten in place, by a configuration's packet or by a
+    // packet's where the description holds none (7412–7429).
+    if let Some(new) = &reaching
+      && [MP4ALS, CodecId::AAC, CodecId::AV1, CodecId::FLAC].contains(&codec)
+      && (config_only
+        || after.entries[after.current]
+          .as_ref()
+          .is_some_and(Vec::is_empty))
+    {
+      overwritten = after.entries[after.current].as_ref() != Some(new);
+      after.entries[after.current] = Some(new.clone());
+    }
+    if writes {
+      // `ff_mov_write_packet`: the first sample as the configuration of a
+      // codec of none (7024–7041) — VP9's alone, the others refused at open
+      // ([`MuxOpenError::ConfigurationMissing`]) — its bytes the packet's
+      // where its filter puts it out as it is, else not held here.
+      if after.entries[0].as_ref().is_some_and(Vec::is_empty)
+        && [
+          CodecId::DNXHD,
+          CodecId::H264,
+          CodecId::HEVC,
+          CodecId::VVC,
+          CodecId::VP9,
+          CodecId::EVC,
+          CodecId::LCEVC,
+          CodecId::TRUEHD,
+        ]
+        .contains(&codec)
+      {
+        let side: u64 = payload
+          .side_data
+          .iter()
+          .map(|entry| entry.data().len() as u64)
+          .sum();
+        after.entries[0] = (step.largest.map(|largest| largest.saturating_sub(side))
+          == Some(payload.bytes.len() as u64))
+        .then(|| payload.bytes.to_vec());
+      }
+      // The description of the packet's configuration: one the track holds,
+      // byte for byte, from the first, else a new one (7044–7074).
+      if let Some(new) = &reaching {
+        match after
+          .entries
+          .iter()
+          .position(|entry| entry.as_ref() == Some(new))
+        {
+          Some(index) => after.current = index,
+          None => {
+            after.entries.push(Some(new.clone()));
+            after.current = after.entries.len() - 1;
+          }
+        }
+      }
+    }
+    let grown = after.entries.len() > state.descriptions.entries.len();
+    if rules.ism.is_some() && reaching.is_some() && (overwritten || grown) {
+      return refused(PayloadRule::ConfigurationUpdate);
+    }
+    if after.entries.len() > MOV_DESCRIPTIONS_MAX {
+      return refused(PayloadRule::SampleDescriptions);
+    }
+    (after != state.descriptions).then_some(after)
+  } else {
+    None
+  };
   if rules.prores && !prores_atom(payload.bytes) {
     return refused(PayloadRule::ProResAtom);
   }
@@ -10218,6 +10454,7 @@ fn check_packet_rules(
     place,
     mp4_place,
     mp4_entries,
+    descriptions,
     apv,
     key_times,
     mxf,
