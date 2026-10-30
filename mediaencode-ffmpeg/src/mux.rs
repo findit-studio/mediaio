@@ -461,7 +461,9 @@
 //!
 //! ISMV's `mfra`: 24 bytes and each track's `tfra` of 24 and 19 a fragment,
 //! a track's fragments at most its samples and at most one more than its
-//! one video track's key frames, which cut them (7450–7472, 8817–8821;
+//! one video track's key frames as movenc reads them — an intra-only
+//! codec's every packet, which libavformat marks one (`mux.c` 820–821) —
+//! which cut them (7450–7472, 8817–8821;
 //! `mov_add_tfra_entries`, 5803–5840), the packet after which it would pass
 //! its dynamic buffer refused ([`PayloadRule::FragmentIndex`]). A track's
 //! index of fragments grows within `INT_MAX` bytes too — 53 687 040
@@ -3358,7 +3360,9 @@ pub enum PayloadRule {
   /// bytes and 19 a fragment (`mov_write_tfra_tag`, `movenc.c` 6118–6140;
   /// `mov_write_mfra_tag`, 6142–6178), judged by an upper bound, as ruled
   /// (R14): a track's fragments at most its samples, and at most one more
-  /// than its one video track's key frames, which cut them (7450–7472).
+  /// than its one video track's key frames, which cut them (7450–7472) — a
+  /// frame movenc reads as one: marked so, or of an intra-only codec, whose
+  /// every packet libavformat marks (`mux.c` 820–821).
   #[error("the packet could take the mfra the trailer makes past its buffer")]
   FragmentIndex,
   /// MP4's APV: a packet whose frame brings a 256th frame information of
@@ -8394,6 +8398,13 @@ struct Learned {
   /// The MOV family: the bound of the track's `stsd` after the packet,
   /// where its descriptions grow ([`TrackState::stsd`]).
   stsd: Option<u64>,
+  /// ISMV: the packet writes a sample of its video track that movenc reads
+  /// as a key frame, a fragment's cut ([`CarrierMuxer::keys`]) — of the
+  /// packet's own flag, or of libavformat's marking of an intra-only
+  /// codec's every packet (`prepare_input_packet`, `mux.c` 820–821), the
+  /// whole predicate, though ISMV admits H.264 alone of video here (table
+  /// H), which has none.
+  fragment_cut: bool,
   /// The MOV family's APV: the frame informations the packet adds to the
   /// track's `apvC`, by PBU type.
   apv: Vec<(u8, records::ApvFrameInfo)>,
@@ -8436,8 +8447,10 @@ pub struct CarrierMuxer<W, C: FfmpegCarrier> {
   /// The MOV family, of no fragments: the samples of the chapter track its
   /// mode makes of the chapters, one a chapter; `None` where it makes none.
   chapter_samples: Option<u64>,
-  /// ISMV: the key frames its one video track has written, each a
-  /// fragment's start ([`PayloadRule::FragmentIndex`]); `None` of another.
+  /// ISMV: the key frames its one video track has written as movenc reads
+  /// their flags — libavformat's marking of an intra-only codec's every
+  /// packet among them — each a fragment's cut
+  /// ([`PayloadRule::FragmentIndex`]); `None` of another container.
   keys: Option<u64>,
   _carrier: PhantomData<fn() -> C>,
 }
@@ -9729,7 +9742,7 @@ where
       Neighbours::default()
     };
     let lift = shift.as_ref().map_or(0, |shift| shift.lift(time_base));
-    let learned = check_packet_rules(
+    let mut learned = check_packet_rules(
       state,
       time_base,
       neighbours,
@@ -9739,6 +9752,10 @@ where
       self.bounds,
     )
     .map_err(Refusal::Container)?;
+    learned.fragment_cut = self.keys.is_some()
+      && state.kind == TrackKind::Video
+      && (payload.key || state.rules.marks_key)
+      && learned.writes;
     // The `moov`'s and ISMV's `mfra`'s bounds after the packet (R14).
     let entries = learned.mp4_entries.unwrap_or(state.mp4_entries);
     if self
@@ -9755,7 +9772,7 @@ where
       }));
     }
     if let Some(keys) = self.keys {
-      let keys = keys + u64::from(state.kind == TrackKind::Video && payload.key && learned.writes);
+      let keys = keys + u64::from(learned.fragment_cut);
       if self.index_bound(Some((track.get(), entries)), keys) > self.bounds.index {
         return Err(Refusal::Container(FfmpegMuxRefusal::Payload {
           track,
@@ -9954,10 +9971,8 @@ where
     if let Some(stsd) = plan.learned.stsd {
       state.stsd = stsd;
     }
-    // ISMV: its video track's key frames, each a fragment's start (R14).
-    if state.kind == TrackKind::Video
-      && plan.key
-      && plan.learned.writes
+    // ISMV: its video track's key frames, each a fragment's cut (R14).
+    if plan.learned.fragment_cut
       && let Some(keys) = &mut self.keys
     {
       *keys += 1;
@@ -11207,6 +11222,7 @@ fn check_packet_rules(
     descriptions,
     first_held,
     stsd,
+    fragment_cut: false,
     apv,
     key_times,
     mxf,
