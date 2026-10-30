@@ -4885,3 +4885,77 @@ fn the_mp3_id3v2_tag_holds_two_to_the_28_less_one() {
     "a tag of no chapter, the encoder's alone"
   );
 }
+
+/// An Ogg stream's comment header packet holds `INT_MAX` bytes, its codec's
+/// own beside the comments, and FLAC's comments `2^24 - 1` (R19, Codex R18
+/// 2; [`super::ogg_comment_refused`]): libavformat measures the comments in
+/// a null buffer of `INT_MAX` bytes and refuses the packet past `INT_MAX`,
+/// each refusal returned as `ENOMEM` (`ogg_write_vorbiscomment`, `oggenc.c`
+/// 291–319), and writes FLAC's comments' length in 24 bits (352) — so
+/// each codec's packet is taken at the bound and refused a byte past it,
+/// FLAC's at its 24 bits; and each chapter's start is the width `snprintf`
+/// writes, hours of three digits and C's `int` of seconds among them.
+#[test]
+fn an_ogg_comment_header_holds_int_max() {
+  let bound = super::Bounds::REAL.comment;
+  assert_eq!(bound, i32::MAX as u64, "the int libavformat builds it in");
+  for (codec, own) in [
+    (CodecId::OPUS, 8),
+    (CodecId::VORBIS, 8),
+    (super::THEORA, 7),
+    (CodecId::VP8, 7),
+    (super::SPEEX, 0),
+  ] {
+    assert!(
+      !super::ogg_comment_refused(codec, bound - own, bound),
+      "{codec:?}: a packet of INT_MAX bytes taken"
+    );
+    assert!(
+      super::ogg_comment_refused(codec, bound - own + 1, bound),
+      "{codec:?}: a byte more refused"
+    );
+  }
+  assert!(!super::ogg_comment_refused(CodecId::FLAC, 0xFF_FFFF, bound));
+  assert!(
+    super::ogg_comment_refused(CodecId::FLAC, 0x100_0000, bound),
+    "FLAC's comments past their 24 bits"
+  );
+  let ms = Timebase::new(1, NonZeroI32::new(1000).expect("a denominator"));
+  let seconds = Timebase::new(1, NonZeroI32::new(1).expect("a denominator"));
+  for (index, base, start, written) in [
+    (0, ms, 0, "CHAPTER000=00:00:00.000"),
+    // The seconds rounded to the nearest apart from the milliseconds:
+    // 3725.5 s written 01:02:06.500.
+    (7, ms, 3_725_500, "CHAPTER007=01:02:06.500"),
+    (999, ms, 360_000_000, "CHAPTER999=100:00:00.000"),
+    // Rounded to the nearest, each apart: 0.9995 s is a second and 1000
+    // milliseconds' remainder of none.
+    (
+      1,
+      Timebase::new(1, NonZeroI32::new(10_000).expect("a denominator")),
+      9_995,
+      "CHAPTER001=00:00:01.000",
+    ),
+    // Seconds past `INT_MAX`, held in C's `int`: its low 32 bits.
+    (2, seconds, 1 << 31, "CHAPTER002=-596523:-14:-8.000"),
+  ] {
+    assert_eq!(super::ogg_chapter_time(index, base, start), written);
+  }
+}
+
+/// AVIF's `moov` is bounded at `INT_MAX`, the null buffer its trailer
+/// measures it in (R19; [`super::avif_movie_bound`]): the real bound, the
+/// `UINT32_MAX` of the box's size, lowered to it; a lower one kept.
+#[test]
+fn avifs_movie_box_holds_int_max() {
+  assert_eq!(super::Bounds::REAL.movie, u64::from(u32::MAX));
+  assert_eq!(
+    super::avif_movie_bound(super::Bounds::REAL.movie),
+    i32::MAX as u64
+  );
+  assert_eq!(
+    super::avif_movie_bound(i32::MAX as u64 + 1),
+    i32::MAX as u64
+  );
+  assert_eq!(super::avif_movie_bound(4096), 4096);
+}

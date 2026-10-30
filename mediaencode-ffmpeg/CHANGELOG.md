@@ -435,8 +435,8 @@ crate moves only when it changes.
   does not mirror: each track's per-sample tables are counted at their
   worst for the samples taken — a chunk a sample, its offset in 64 bits,
   a run of every table a sample — beside its sample descriptions, the
-  chapter track, the covers, the chapters, the streams' `pssh` boxes and a
-  derived slack, and the packet after which the bound would pass
+  chapter track, the covers, the chapters and a derived slack, and the
+  packet after which the bound would pass
   `UINT32_MAX` is refused (`PayloadRule::MovieBox`, new): stricter than
   FFmpeg past the bound alone, until an exact mirror replaces it. ISMV's
   `mfra`, made in a dynamic buffer of `INT_MAX` bytes, is bounded by each
@@ -456,8 +456,8 @@ crate moves only when it changes.
   (`MuxOpenError::CoversTooLarge`, new; the laws' seam
   `MuxOptions::with_lowered_user_data_bound`, hidden).
 - **MP4's `moov` of no sample, and before its trailer (R15).** A table
-  whose `moov` would pass its 32 bits before any sample — covers, `pssh`
-  boxes, sample descriptions — is refused at open
+  whose `moov` would pass its 32 bits before any sample — covers, sample
+  descriptions — is refused at open
   (`MuxOpenError::MovieBoxTooLarge`, new), ISMV's written at its header
   among them; and the bound is checked once more before the trailer
   runs (`FfmpegMuxRefusal::MovieBox`, new). A description rewritten in
@@ -500,6 +500,20 @@ crate moves only when it changes.
   fault — and a packet's HDR side data is judged against them, so that
   the judgment of a packet calls into no library and allocates nothing,
   and no allocation's failure is taken for a malformed entry.
+- **What FFmpeg's writers do with an allocation's failure, censused (R19).**
+  The MOV family refuses at open a track carrying an encryption
+  initialization, which movenc parses again at the `moov` and drops unsaid
+  where an allocation fails (`MuxOpenError::EncryptionInitialization`,
+  new). Ogg counts each stream's comment header exactly at open — an Opus
+  stream's chapters among them — and refuses one past the `int`
+  libavformat builds it in, which it would report as a failed allocation
+  (`MuxOpenError::CommentHeaderTooLarge`, new; the laws' seam
+  `MuxOptions::with_lowered_comment_bound`, hidden). AVIF's `moov` is
+  bounded at `INT_MAX`, the null buffer its trailer measures it in
+  (`MovieBoxBound::limit`, new, hidden). MP4 and FLV refuse a VP9 track
+  of an unknown level whose picture's samples pass an `int`
+  (`MuxOpenError::Dimensions`). The module's census names every other
+  allocation failure FFmpeg swallows, by mechanism.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer

@@ -445,8 +445,9 @@
 //! beside its bytes, an empty one skipped (4815–4839); the Nero list, 17
 //! and, of the first 255 chapters, 9 and a title of at most 255 bytes
 //! (5040–5064) — both counted as the `udta`'s own bound counts them
-//! (below); each stream's
-//! `pssh` boxes, of its encryption initialization's parse (5175–5210); and
+//! (below); no stream's `pssh` boxes, an encryption initialization refused
+//! at open (R19, Codex R18 1, ruled;
+//! [`MuxOpenError::EncryptionInitialization`]); and
 //! the chapter track, a sample a chapter, its entry the text stub's
 //! (7727–7811). No timecode track is made (table E), and the Dolby Vision
 //! and `hvcE` boxes are written only at a strictness below normal, which
@@ -493,7 +494,7 @@
 //! **What a trailer writes whatever the packets** (R15, Codex R14 2): of
 //! every bound judged at a packet, the MOV family's `moov` alone holds a
 //! part no packet brings — the movie's own boxes, the covers, the
-//! chapters and the chapter track, every stream's `pssh` boxes, each
+//! chapters and the chapter track, each
 //! track's descriptions and the tables its trailer may add — which a table
 //! of no sample, or of no timed track, writes all the same: judged at open,
 //! before the header, by the same bound ([`MuxOpenError::MovieBoxTooLarge`];
@@ -566,7 +567,7 @@
 //! | MP3: ID3v2 (`id3v2enc.c` 292–329; `id3v2.c` 336–374, 1225–1248) | refused: read back titled `chN` | refused: its `TIT2` of no text skipped, read back titled `chN` (R17) | kept | the tag's 28 bits ([`MuxOpenError::TagTooLarge`]) |
 //! | ASF, its markers (`asfenc.c` 311–347; `asfdec_f.c` 660–697) | refused: read back titled empty (R17) | kept: a name of its terminator alone | kept | past its entry's 16-bit length, or 1023 bytes of UTF-8 read back cut, refused (R17) |
 //! | NUT, its info packets (`nutenc.c` 509–515, 587–612; `nutdec.c` 44–66, 505–626) | kept: no `title` | kept: a value of no bytes | kept | of 1024 bytes or more read back untitled, reported ([`Uncarried::ChapterTitle`], R17) |
-//! | Ogg's Opus tags (`vorbiscomment.c` 62–115; `oggparsevorbis.c` 43–72, 100–145) | kept: no `NAME` | read back untitled, a comment of no value skipped: reported ([`Uncarried::ChapterTitle`], R17) | kept | each comment's 32-bit length |
+//! | Ogg's Opus tags (`vorbiscomment.c` 62–125; `oggparsevorbis.c` 43–72, 100–145) | kept: no `NAME` | read back untitled, a comment of no value skipped: reported ([`Uncarried::ChapterTitle`], R17) | kept | each comment's 32-bit length |
 //! | ASF's streaming form, AVI, the MXF muxers, the MPEG muxers, the raw streams and the rest | — | — | — | no chapter written, each reported ([`Uncarried::Chapter`]) |
 //!
 //! **What a write allocates, and when** (R15, Codex R14 3: decide first,
@@ -618,10 +619,87 @@
 //! offers no hook to count its allocations — `av_malloc`, `av_mallocz` and
 //! `av_realloc` call the system's (`mem.c` 98–153, 155–171, 256) — and
 //! interposing the system's allocator would count every library's; its
-//! one knob, `av_max_alloc`, caps every allocation of the process (74–78,
+//! one control, `av_max_alloc`, caps every allocation of the process (74–78,
 //! 102). L164 holds the judgment to it in a process of its own, the cap
 //! zero so that libavutil refuses every allocation: each refusal it makes
 //! is the refusal made without the cap.
+//!
+//! **What FFmpeg's writers do with an allocation's failure, and a size past
+//! their `int`** (R19, Codex R18; the class's third finding, closed by
+//! mechanism) — every function the admitted muxers' callbacks reach, by
+//! four greps over their sources and the helpers they call (#82's R19
+//! comments): **R16** every dynamic and null buffer, each open and how its
+//! failure is met, each size taken of one and how its error is met;
+//! **R17** every allocation and every parse that allocates, each failure's
+//! road; **R18** every length held or summed in an `int`; **R19** every
+//! call whose result its caller discards — the road by which a failure a
+//! callee does return is still swallowed. Each of the 1066 lines they
+//! print is classified (405 pass, 140 reported, 138 unreachable, 126
+//! bounded, 120 the sink's, 137 a finding below), none left out. Two
+//! mechanisms carry most findings. A dynamic buffer holds its first 1024
+//! bytes in the context its open allocates, and grows past them by
+//! `av_reallocp`, whose failure — or a write past `INT_MAX` — sets the
+//! buffer's own error and drops every later write; that error reaches no
+//! caller but one that reads it, and `avio_get_dyn_buf` answers 0 bytes
+//! and a null pointer after a failed growth, `avio_close_dyn_buf` `-64`
+//! (`aviobuf.c` 1281–1311, 1377–1436). A null buffer allocates nothing
+//! past its open, but measures within `INT_MAX`, its refusal answered as
+//! the size (1450–1483). Matroska reads every buffer's error and returns
+//! it; movenc, NUT, ASF, ID3v2, MPEG-TS's nested ADTS muxer and the
+//! helpers read none. And movenc discards what most of its `moov`'s
+//! writers return — 265 of R19's lines — so that a failure a writer does
+//! report leaves its box out, the file written all the same.
+//!
+//! Each finding, and its disposition — refused at open by name, bounded
+//! exactly at open, judged at every packet, or reported — each with its
+//! law; the rest are R19's letter 1, a ruling asked:
+//!
+//! | | where | what is lost, and how | disposition |
+//! |---|---|---|---|
+//! | A1 | the MOV family's `pssh` boxes (`mov_write_pssh_tag`, `movenc.c` 5175–5210; 5449–5451) | the encryption initialization parsed again at the `moov`, its allocation's failure answered as none, 0 returned and discarded besides: the file written without its DRM initialization | refused at open ([`MuxOpenError::EncryptionInitialization`]; ruled) — L165 |
+//! | A2 | the MOV family's `stts` (`mov_write_stts_tag`, 3241–3288; discarded at 3411) | its 8 bytes a sample, their allocation's failure returned and discarded: the track written without its time-to-sample table — every track but constant-size audio's, whose one entry's allocation the same | letter 1 |
+//! | A3 | AAC's and Opus's roll groups (`mov_preroll_write_stbl_atoms`, 3305–3400; 3436) | `sgpd` and `sbgp` left out | letter 1 |
+//! | A4 | the MOV family's configuration records, FLV's beside them (A22) | the helpers' allocations — `hvcC`'s every configuration parsed again, `av1C`'s OBU buffer, `avcC`'s, `vvcC`'s, `evcC`'s and `lvcC`'s of an Annex B configuration, `dvc1`'s unescaped copy — their failures returned to `mov_write_*_tag`, which answers its box's size whatever (1573–1738), and `mov_write_video_tag` discards that besides (2880–2930): the box written empty or cut, the track undecodable; Matroska returns them, its fault at the header — `avcC`'s growth there named a malformed configuration — but for `av1C`'s OBU buffer's growth, its record written cut | letter 1 |
+//! | A5 | APV's `apvC` entries (`ff_isom_parse_apvc`, `apv.c` 217–245; discarded at `movenc.c` 7199) | an entry's allocation at a packet: the record written without it | letter 1 |
+//! | A6 | MP4's track `udta` (4358–4389; discarded at 4441) | its buffer's open: the DASH roles left out, the dispositions read back without them | letter 1 |
+//! | A7 | the movie `udta` (5066–5122; discarded at 5448) | its buffer's open, its growth past 1024 bytes read as none (5114): the covers, the Nero list and the iTunes metadata left out; its `INT_MAX` bounded exactly at open ([`MuxOpenError::CoversTooLarge`]) | letter 1 |
+//! | A8 | MOV's `wave` (1059–1100) | E-AC-3's `dec3`, its allocation discarded (1087) | letter 1 |
+//! | A9 | the chapter track's samples (`mov_create_chapter_track`, 7727–7815) | each sample's write discarded (7807): the track of fewer samples than chapters | letter 1 |
+//! | A10 | `mov_text`'s end sample (9025–9031) | its write discarded: the last cue's end lost | letter 1 |
+//! | A11 | DVD subtitles' palette (8000–8048; discarded at 8752) | the `esds` written of no palette | letter 1 |
+//! | A12 | ISMV's fragments (6084–6116, 6673–6881, 6142–6178) | the `moof`'s null buffer, its `tfra` entries, the last fragment's flush, each discarded; a track's fragment buffer, its growth failed, read as none and its `mdat` written for the bytes it lacks; the `mfra`'s buffer's growth read as none; the manifest's `CodecPrivateData`, its Annex B copy's allocation failing, left out (5544–5550) | letter 1 |
+//! | A13 | AVIF (9154–9213) | its sample buffer's growth read as none, an `mdat` of no sample written; its `moov`'s null buffer's open answered as the size, every chunk's offset moved by it | letter 1 |
+//! | A14 | Ogg's pages (`ogg_buffer_page`, `oggenc.c` 189–212) | a page's list node, its failure discarded at every call: the page left full and the next segment count, less one, handed to `memset` as `SIZE_MAX` (247–253) — a memory fault | letter 1 |
+//! | A15 | the metadata conversion every Vorbis-comment, ID3v2, NUT and Matroska writer runs (`ff_metadata_conv`, `metadata.c` 26–57) | a tag dropped where its `av_dict_set` fails: Ogg's language, NUT's language and chapter titles, MP3's and Matroska's chapter titles | letter 1 |
+//! | A16 | MPEG-TS's raw AAC, through its nested ADTS muxer (`mpegtsenc.c` 1980–2003) | the nested buffer closed unchecked: a null buffer and `-64` bytes copied into the PES payload (2232) — a memory fault | letter 1 |
+//! | A17 | MP3's Xing frame (`mp3enc.c` 145–286; discarded at 632) | its buffer's open discarded after the frame's offset is set, its close unchecked: the trailer writing into a null frame (400–469) — a memory fault | letter 1 |
+//! | A18 | MP3's ID3v2 frames (`id3v2enc.c` 66–98, 259–329) | each frame made in a dynamic buffer, its growth read as none: a title's frame, a chapter, the table of contents written empty while the tag's size, the writers' own sum, counts them — the reader taking the first audio frames as the tag's; a text frame's open failure written again as a `TXXX` frame | letter 1 |
+//! | A19 | NUT's headers (`nutenc.c` 351–717, 1186–1207) | a header packet's buffer's growth read as none, each info packet's buffer closed unchecked — its count written, its tags not — the global info's, the repeated headers' and the index's failures discarded, an index entry's (1164): a stream's language and dispositions, a chapter's title, the index lost | letter 1 |
+//! | A20 | ASF's markers and its header's rewrite (`asfenc.c` 311–347, 1095) | a title's UTF-16 past 1024 bytes read as none, the marker written untitled; the trailer's header rewrite discarded, the file's sizes and duration those of none | letter 1 |
+//! | A21 | Matroska's FLAC channel mask (`matroskaenc.c` 1077–1114) | `av_dict_set` discarded: the comment block of no count and no mask, the layout read back otherwise | letter 1 |
+//! | A22 | FLV's configuration records (`flv_write_codec_header`, `flvenc.c` 807–914) | as A4's, the record written empty | letter 1 |
+//! | A23 | raw FLAC's channel mask (`flacenc.c` 244–259) | as A21 | letter 1 |
+//! | A24 | AVI's gap frames (`write_skip_frames`, `avienc.c` 745–766) | an empty frame's index entry, its allocation discarded: the frame unwritten yet counted, every place after it moved | letter 1 |
+//! | A25 | MP4's joined TTML (`movenc_ttml.c` 289–317) | its buffer closed unchecked: a packet of a null payload and `-64` bytes written as the sample; its writes' failures, `avio_printf`'s, the buffer's error unread — the document cut | letter 1 |
+//! | A26 | FLV's Annex B packets (`flvenc.c` 1318–1327; `nal.c` 133–144) | the rewrite's buffer closed unchecked, `-64` bytes and a null buffer answered: a tag of a 24-bit size of `-59` (1348–1355, 1454) | letter 1 |
+//! | A27 | MP4's HEVC of the `hvc1` tag and an Annex B configuration (`ff_hevc_annexb2mp4`, `hevc.c` 1203–1250) | each packet parsed into a dynamic buffer first, closed unchecked: the frame written as a sample of no bytes (`movenc.c` 7126) | letter 1 |
+//! | S1 | Ogg's comment header (`ogg_write_vorbiscomment`, `oggenc.c` 291–319; `ff_vorbiscomment_length`, `vorbiscomment.c` 44–60) | measured in a null buffer of `INT_MAX`, its packet past `INT_MAX` refused — each reported as a failed allocation; FLAC's comments' 24 bits (352) | bounded exactly at open ([`MuxOpenError::CommentHeaderTooLarge`], [`ogg_comment_bytes`]) — L166, `an_ogg_comment_header_holds_int_max` |
+//! | S2 | AVIF's `moov` (`get_moov_size`, `movenc.c` 8905–8916; 9179–9181) | measured in a null buffer of `INT_MAX`, its refusal taken as the size | judged at every packet and at open, bounded at `INT_MAX` ([`avif_movie_bound`]) — L167, `avifs_movie_box_holds_int_max` |
+//! | S3 | VP9's `vpcC`, MP4's and FLV's (`get_vp9_level`, `vpcc.c` 77–122) | a level of the width times the height in an `int`, where the ticket's is unknown | refused at open ([`MuxOpenError::Dimensions`]; [`vp9_picture_overflows`]) — L168 |
+//! | — | every failure FFmpeg returns through a callback: an open's, a header's, a packet's, a trailer's | — | reported, the muxer's fault ([`MuxFault`]) — L164 (the open), L169 (a cluster's growth, at the trailer) |
+//!
+//! **Letter 1 (R19, asked).** A2–A27 are FFmpeg's — a failure it never
+//! returns, or returns to a caller that drops it — and a refusal at open,
+//! as A1's ruling makes, would refuse the MOV family's every non-fragmented
+//! file (A2), every HEVC and AV1 track of MP4, AVIF and FLV (A4, A22), ISMV
+//! and AVIF themselves (A12, A13), Ogg, NUT and MP3 whole (A14, A19, A17)
+//! and MPEG-TS's raw AAC (A16). The muxer cannot see a dynamic buffer's own
+//! error, nor a result movenc drops; the writer guard sees every byte, and
+//! a check of the structure written — the `moov`'s boxes against what the
+//! mirrors expect of them, ISMV's boxes tiling the file, Ogg's pages, the
+//! ID3v2 tag's size — would detect the omissions after the fact, the
+//! memory faults not. The letter asks which: each refused as A1, the
+//! detection built, or FFmpeg patched upstream, the census its evidence.
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -712,7 +790,7 @@
 //! | | | a sixth PBU type's entry (`av_assert0`, 214) | — | never reached: five types are recorded |
 //! | FLV's `extract_extradata` (`extract_extradata.c` 166–275) | FLV, a track of no configuration (1495–1501) | a packet of no unit `ff_h2645_packet_split` splits off: the filter refuses it, and libavformat drops it | a | refused ([`PayloadRule::NalUnits`]) — L121 |
 //! | | | the configuration it makes of a packet's parameter sets, which the writer writes | a | judged as the writer's, above — L121 |
-//! | each writer | — | an allocation | — | outside the trust model |
+//! | each writer | — | an allocation (R19: no longer outside the trust model) | — | MP4's and FLV's callers discard the answer, the record written empty or cut — R19's census, A4 and A22, letter 1; Matroska's returns it, its fault at the header |
 //!
 //! **MP4, the packets it makes itself** (table C′) — every place MP4's
 //! writer makes or hands on a packet of its own, by grep (#82's R5 lists
@@ -1026,6 +1104,10 @@
 //! | MXF, MXF D-10, MXF OP-Atom, at open | a codec but MPEG-2, DNxHD and ProRes video — MXF D-10's MPEG-2 alone — and 16- and 24-bit PCM: H.264, DV, FFV1 and JPEG 2000, whose frame parsers this release has not audited, and the data and caption tracks, booked; a first track not the one video track, OP-Atom's second track, MXF D-10's audio track not its second; a frame rate MXF names no content package for, or none; no pixel format; ProRes of no profile its labels name; sound but at 48 kHz, OP-Atom's but mono; MXF D-10's video at a bit rate it names not, or at a rate but 25 and 30000/1001; its sound past eight channels, or of a block alignment not its channels' samples | refused at its start; or its label another standard's; or its writer dividing by the alignment (`mxfenc.c` 2941–3165, 3222–3248) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ConfigurationInvalid`] — L98 |
 //! | the MOV family's modes | MP4's packet rules; ISMV's and AVIF's samples past the dynamic buffer they are written into — AVIF's held until its trailer, ISMV's until its next fragment's flush, counted here from the track's first sample, stricter than FFmpeg and losing nothing; ISMV's decode gap of `i32::MAX` less the track's first composition offset, but before a key frame of its one video track | as MP4's; the buffer refusing the write, the sample tables counting bytes the file lacks (`movenc.c` 6961–6981; `aviobuf.c` 1281–1311); the decode time rewritten that offset back, the next flush's `av_assert0` ending the process (6897–6923, 7396–7410, 1248–1256) | as MP4's — each mode's table of a track's samples, ISMV's counted from its first sample, never reset at a flush ([`PayloadRule::SampleTable`]; R12); [`PayloadRule::FragmentSize`], [`FfmpegMuxRefusal::DtsGap`] — L103, L123 |
 //! | the MOV family's modes, at open | a codec this release admits not beside MP4's — MOV's raw video, DV, MPEG-2, H.263, DNxHD, ProRes, PCM, MP3, AMR, ADPCM, QDM2, G.726, iLBC, and H.264 of an intra profile or AVC-Intra tag; 3GP's and 3G2's H.263 and AMR; F4V's VP6; ISMV's WMA Pro and TTML; PSP's every codec but H.264, MPEG-4 Part 2 and AAC; AVIF's alpha plane — booked; a picture past 65535, and in MOV's mode one of an aspect ratio stated and not 1 whose track aperture — its width, height and display width shifted left 16 in an `int` — passes 32767, every MOV video codec, H.264, HEVC and MPEG-4 among them (`mov_write_tapt_tag`, `movenc.c` 4098–4126, 4430–4436; R11, Q869 L6 — L136); MPEG audio layer III below 16 kHz outside MOV; TTML's `dfxp` tag outside ISMV; PSP's table of other than one video and one audio track, AVIF's of more than one; ISMV's second video track, whose key frames' flushes before `check_pkt`'s second count rest on libavformat's interleaving, which this release does not mirror — booked to Q870 (R11, Codex R10 2); the Nero list's untitled chapter, which reads back titled empty, no longer untitled (R9: Fable R2, judged by the ruled rule), a title past 255 bytes, cut; MP4's, iPod's and F4V's covers whose movie `udta` would pass its dynamic buffer of `INT_MAX` bytes, its size counted exactly (R14b, ruled) | refused at the start, written with no configuration box, or so that it reads back otherwise, or the `covr` written cut (`movenc.c` 1380–2140, 5040–5064, 5066–5122, 6431–6448, 8129–8650) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::CoversTooLarge`] — L102, L132, L155 |
+//! | the MOV family's modes, at open (R19, Codex R18 1, ruled) | a track whose coded side data holds an encryption initialization — a cover's among them; a track not written, MP4's font, taken | its `pssh` boxes parsed again wherever the `moov` is written, a failed allocation answered as none, the file written without them and success returned (`mov_write_pssh_tag`, `movenc.c` 5175–5210, 5449–5451; `encryption_info.c` 231–290) | [`MuxOpenError::EncryptionInitialization`] — L165 |
+//! | Ogg, at open (R19, Codex R18 2) | a stream whose comment header — its codec's own bytes, the vendor, its language, libavformat's `encoder`, an Opus stream's first 1000 chapters' starts and titles, counted exactly — passes `INT_MAX` bytes; FLAC's comments past their 24 bits | refused at its start as a failed allocation; FLAC's length written cut (`oggenc.c` 291–319, 352; `vorbiscomment.c` 44–125) | [`MuxOpenError::CommentHeaderTooLarge`] — L166 |
+//! | MP4 and FLV, at open (R19) | VP9 of a level the ticket leaves unknown, whose width times its height passes `INT_MAX` | the record's level found of an `int`'s signed overflow (`vpcc.c` 77–122) | [`MuxOpenError::Dimensions`] — L168 |
+//! | AVIF (R19) | the packet after which its `moov` would pass `INT_MAX`, and a table whose `moov` would at open | measured at the trailer in a null buffer of `INT_MAX` bytes, the refusal taken as the size, every chunk's offset moved by it (`movenc.c` 8905–8916, 9179–9181) | [`PayloadRule::MovieBox`], [`MuxOpenError::MovieBoxTooLarge`], at `INT_MAX` — L167 |
 
 use core::{fmt, marker::PhantomData};
 use std::{
@@ -1691,6 +1773,10 @@ struct Bounds {
   /// The most bytes MP3's ID3v2 tag holds beside its header
   /// ([`MuxOpenError::TagTooLarge`], [`ID3V2_BYTES_MAX`]).
   tag: u64,
+  /// The most bytes an Ogg stream's comment header packet holds, its
+  /// codec's own beside the comments: the `int` libavformat builds it in
+  /// ([`MuxOpenError::CommentHeaderTooLarge`]).
+  comment: u64,
 }
 
 impl Bounds {
@@ -1706,6 +1792,7 @@ impl Bounds {
     index: FRAGMENT_BYTES_MAX,
     user_data: UDTA_BYTES_MAX,
     tag: ID3V2_BYTES_MAX,
+    comment: i32::MAX as u64,
   };
 }
 
@@ -1717,6 +1804,22 @@ impl Bounds {
 /// sum of the box's sizes is `update_size`'s, of 64 bits (155–163), but a
 /// cover's `16 + size` in an `int` (4831), its picture smaller still.
 pub(crate) const UDTA_BYTES_MAX: u64 = i32::MAX as u64 - 8;
+
+/// AVIF's bound of its `moov`, of `bound` the movie's otherwise (R19, by
+/// the class): its trailer measures the `moov` in a null buffer, which
+/// refuses past `INT_MAX` (`get_moov_size`, `movenc.c` 8905–8916;
+/// `null_buf_write`, `aviobuf.c` 1450–1460), and offsets every chunk by the
+/// measure, a refusal's negative code among them (`avif_write_trailer`,
+/// 9179–9181) — so at most `INT_MAX`, below the `UINT32_MAX` of the box's
+/// size. A still picture's trailer writes no `moov`, but measures it all
+/// the same; which the file is, its packets decide.
+const fn avif_movie_bound(bound: u64) -> u64 {
+  if bound < i32::MAX as u64 {
+    bound
+  } else {
+    i32::MAX as u64
+  }
+}
 
 /// The most bytes MP3's ID3v2 tag holds beside its 10-byte header (R15b,
 /// ruled: a length that wraps is refused): `ff_id3v2_finish` writes the
@@ -1833,6 +1936,7 @@ impl MuxOptions {
       index: self.bounds.index,
       user_data: self.bounds.user_data,
       tag: self.bounds.tag,
+      comment: self.bounds.comment,
     };
     self
   }
@@ -1936,6 +2040,19 @@ impl MuxOptions {
   pub const fn with_lowered_tag_bound(mut self, bytes: u64) -> Self {
     if bytes < self.bounds.tag {
       self.bounds.tag = bytes;
+    }
+    self
+  }
+
+  /// Lowers the bytes an Ogg stream's comment header packet may hold —
+  /// the `INT_MAX` libavformat builds it in — to `bytes`, never raising it:
+  /// the laws' seam, which shows the bound without two gibibytes of
+  /// chapter titles ([`MuxOpenError::CommentHeaderTooLarge`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_comment_bound(mut self, bytes: u64) -> Self {
+    if bytes < self.bounds.comment {
+      self.bounds.comment = bytes;
     }
     self
   }
@@ -2176,41 +2293,15 @@ const CHAPTER_SHAPE: MoovShape = MoovShape {
   always: true,
 };
 
-/// The `pssh` boxes movenc writes into the `moov` of a stream's encryption
-/// initialization side data, at most (R14): each initialization the side
-/// data's parse reads — a count, then each of 16 bytes and its system id,
-/// key ids and data (`av_encryption_init_info_get_side_data`,
-/// `libavutil/encryption_info.c` 231–290) — one of neither key ids nor
-/// data skipped, another written in 20 bytes and the same
-/// (`mov_write_pssh_tag`, `movenc.c` 5175–5210), for every stream
-/// (5450–5451). A parse that fails midway writes none, counted as far as
-/// it read.
-fn pssh_bytes(bytes: &[u8]) -> u64 {
-  let word = |at: usize| {
-    bytes
-      .get(at..at + 4)
-      .map(|word| u64::from(u32::from_be_bytes([word[0], word[1], word[2], word[3]])))
-  };
-  let Some(count) = word(0) else { return 0 };
-  let mut at = 4_usize;
-  let mut total = 0_u64;
-  for _ in 0..count {
-    let (Some(system), Some(keys), Some(key), Some(data)) =
-      (word(at), word(at + 4), word(at + 8), word(at + 12))
-    else {
-      break;
-    };
-    // At most `UINT64_MAX`, as libavutil's comment says.
-    let payload = system + data + keys * key;
-    if ((bytes.len() - at - 16) as u64) < payload {
-      break;
-    }
-    if keys != 0 || data != 0 {
-      total += 20 + payload;
-    }
-    at += 16 + payload as usize;
-  }
-  total
+/// Whether `ticket`'s coded side data holds an encryption initialization
+/// (`AV_PKT_DATA_ENCRYPTION_INIT_INFO`), which the MOV family refuses
+/// (R19, Codex R18 1, ruled; [`MuxOpenError::EncryptionInitialization`]):
+/// no `moov` the muxer opens holds a `pssh` box.
+fn encryption_initialization(ticket: &CodecTicket) -> bool {
+  ticket
+    .coded_side_data()
+    .iter()
+    .any(|entry| entry.kind() == AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO as i32)
 }
 
 /// The bytes the MOV family's movie `udta` holds in the dynamic buffer
@@ -2274,6 +2365,127 @@ fn id3v2_too_large(
     }
   }
   None
+}
+
+/// The comments of an Ogg stream's comment header, exactly (R19, Codex R18
+/// 2; `ff_vorbiscomment_write`, `vorbiscomment.c` 62–125): the vendor,
+/// libavformat's name and version ([`libavformat_ident_bytes`]; no
+/// bit-exact flag set here), and the count, each in 4 bytes; then each of
+/// the stream's tags in 4 bytes of length, its key, `=` and its value — its
+/// `language` of `language` bytes where it states one, and the `encoder`
+/// the header copies from the context's metadata, libavformat's name
+/// (`ogg_init`, `oggenc.c` 549; `mux.c` 352–356), the conversion of keys
+/// renaming neither (`ff_vorbiscomment_metadata_conv`, 33–41) — and
+/// `chapters`, an Opus stream's chapter comments
+/// ([`ogg_chapter_comments`]). The stream holds no other tag: the muxer sets
+/// a stream's language alone, beside an attachment's name and type, which
+/// Ogg writes not.
+fn ogg_comment_bytes(language: Option<u64>, chapters: u64) -> u64 {
+  let ident = libavformat_ident_bytes();
+  let tag = |key: u64, value: u64| 4 + key + 1 + value;
+  4 + ident + 4 + language.map_or(0, |bytes| tag(8, bytes)) + tag(7, ident) + chapters
+}
+
+/// An Opus stream's chapter comments in its comment header, exactly, of
+/// `chapters` — each started at its `spans`' start in its own time base,
+/// as the muxer hands it — of the first 1000 alone: each chapter's start,
+/// `CHAPTERnnn=hh:mm:ss.mmm` as [`ogg_chapter_time`] writes it, and of a
+/// title its `CHAPTERnnnNAME=` and the title — an empty one's too — each
+/// in 4 bytes of length; the title is the only key a chapter holds
+/// (`ff_vorbiscomment_write`, `vorbiscomment.c` 92–122).
+fn ogg_chapter_comments(chapters: &[Chapter<Ffmpeg>], spans: &[(i64, i64)]) -> u64 {
+  chapters
+    .iter()
+    .zip(spans)
+    .take(1000)
+    .enumerate()
+    .map(|(index, (chapter, &(start, _)))| {
+      4 + ogg_chapter_time(index, chapter.timebase(), start).len() as u64
+        + chapter
+          .title()
+          .map_or(0, |title| 4 + 10 + 4 + 1 + title.as_str().len() as u64)
+    })
+    .sum()
+}
+
+/// The start Ogg writes of the `index`th chapter, `start` ticks of `base`,
+/// as `snprintf` writes `CHAPTER%03d=%02d:%02d:%02d.%03d` of it
+/// (`ff_vorbiscomment_write`, `vorbiscomment.c` 94–104): its seconds,
+/// rounded to the nearest, held in an `int` — the low 32 bits of the 64 —
+/// and its hours, minutes and seconds of those by C's truncating division
+/// and remainder; its milliseconds, rounded to the nearest, their
+/// remainder by 1000 — each rescale `av_rescale_rnd`'s of a start of none
+/// below zero ([`chapter_span`]) and a time base of a numerator of none
+/// below zero and a denominator above it, as a [`Timebase`] holds: the
+/// product and half the denominator, divided by it, `INT64_MIN` past
+/// `INT64_MAX` (`libavutil/mathematics.c` 58–127).
+fn ogg_chapter_time(index: usize, base: Timebase, start: i64) -> String {
+  let rescale = |factor: i64| -> i64 {
+    let den = i128::from(base.den().get());
+    i64::try_from((i128::from(start) * i128::from(factor) + den / 2) / den).unwrap_or(i64::MIN)
+  };
+  let num = i64::from(base.num());
+  // C's conversion of the 64-bit count into an `int`: its low 32 bits.
+  let seconds = rescale(num) as i32;
+  let milliseconds = (rescale(num * 1000) % 1000) as i32;
+  format!(
+    "CHAPTER{index:03}={:02}:{:02}:{:02}.{milliseconds:03}",
+    seconds / 3600,
+    (seconds / 60) % 60,
+    seconds % 60,
+  )
+}
+
+/// Whether an Ogg stream of `codec` whose comments come to `comments` bytes
+/// ([`ogg_comment_bytes`]) is refused (R19, Codex R18 2): its comment
+/// header packet — the codec's own bytes before the comments and after,
+/// Opus's `OpusTags` of 8, Vorbis's packet type and name of 7 and its
+/// framing bit, Theora's and VP8's 7, FLAC's metadata block header of 4,
+/// Speex's none (`oggenc.c` 321–465, 596–606) — past `bound`, the `int`
+/// libavformat builds it in; or FLAC's comments past the 24 bits its block
+/// counts them in (`ogg_build_flac_headers`, 352).
+fn ogg_comment_refused(codec: CodecId, comments: u64, bound: u64) -> bool {
+  let (before, after) = if codec == CodecId::OPUS {
+    (8, 0)
+  } else if codec == CodecId::VORBIS {
+    (7, 1)
+  } else if codec == THEORA || codec == CodecId::VP8 {
+    (7, 0)
+  } else if codec == CodecId::FLAC {
+    (4, 0)
+  } else {
+    (0, 0)
+  };
+  before + comments + after > bound || (codec == CodecId::FLAC && comments > 0xFF_FFFF)
+}
+
+/// The first of `tracks` — each on its road — whose Ogg comment header is
+/// refused ([`ogg_comment_refused`]), or `None`: every stream's of its
+/// language and the `encoder`, an Opus stream's of the chapters too, each
+/// counted exactly ([`ogg_comment_bytes`]). VP8 writes its comment header
+/// where its stream holds a tag, which the `encoder` always is
+/// (`ogg_build_vp8_headers`, `oggenc.c` 451–460).
+fn ogg_comment_too_large<D, S>(
+  tracks: &[TrackDescription<Ffmpeg, D, S>],
+  roads: &[Road],
+  (chapters, spans): (&[Chapter<Ffmpeg>], &[(i64, i64)]),
+  bound: u64,
+) -> Option<usize> {
+  let chapter_comments = ogg_chapter_comments(chapters, spans);
+  tracks.iter().zip(roads).position(|(description, road)| {
+    let codec = description.codec();
+    let comments = ogg_comment_bytes(
+      description
+        .language()
+        .map(|language| language.as_str().len() as u64),
+      if codec == CodecId::OPUS {
+        chapter_comments
+      } else {
+        0
+      },
+    );
+    *road == Road::Timed && ogg_comment_refused(codec, comments, bound)
+  })
 }
 
 /// The first of `covers` — each a cover's track and its picture's bytes, in
@@ -2401,11 +2613,11 @@ fn chapter_part(samples: u64) -> ([([u8; 4], u64); 10], u64) {
   )
 }
 
-/// The `moov`'s own boxes, its covers', its chapters' and its streams'
-/// `pssh` boxes, at most (R14; [`PayloadRule::MovieBox`]): `covr`
-/// ([`covr_bytes`]), the Nero list ([`chpl_bytes`]), and each stream's
-/// encryption initialization's `pssh` boxes ([`pssh_bytes`]; `movenc.c`
-/// 5175–5210, 5450–5451), beside [`MOOV_SLACK`]. The chapter track is its
+/// The `moov`'s own boxes, its covers' and its chapters', at most (R14;
+/// [`PayloadRule::MovieBox`]): `covr` ([`covr_bytes`]) and the Nero list
+/// ([`chpl_bytes`]), beside [`MOOV_SLACK`]. No stream's `pssh` boxes: an
+/// encryption initialization is refused at open (R19, Codex R18 1, ruled;
+/// [`MuxOpenError::EncryptionInitialization`]). The chapter track is its
 /// own ([`chapter_part`]).
 fn movie_fixed<D, S>(
   roads: &[Road],
@@ -2414,7 +2626,6 @@ fn movie_fixed<D, S>(
 ) -> u64
 where
   D: AsRef<[u8]>,
-  S: core::borrow::Borrow<CodecTicket>,
 {
   let covers = covr_bytes(
     roads
@@ -2424,18 +2635,7 @@ where
       .filter_map(|(_, description)| description.file())
       .map(|file| file.payload().data().as_ref().len() as u64),
   );
-  let pssh = tracks
-    .iter()
-    .map(|description| {
-      let ticket: &CodecTicket = description.side_data().borrow();
-      ticket
-        .coded_side_data()
-        .iter()
-        .find(|entry| entry.kind() == AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO as i32)
-        .map_or(0, |entry| pssh_bytes(entry.data()))
-    })
-    .sum::<u64>();
-  MOOV_SLACK + covers + chpl_bytes(chapters) + pssh
+  MOOV_SLACK + covers + chpl_bytes(chapters)
 }
 
 /// The `moov`'s bound: its own boxes `fixed`, and each track's — its own
@@ -3857,7 +4057,7 @@ pub enum PayloadRule {
   /// time-to-sample, composition offset, sync and dependency entry a sample
   /// — its sample descriptions each bounded by its configuration, the
   /// chapter track's tables, and every other box of the `moov` by what the
-  /// open knows — covers, chapters, `pssh` boxes — with slacks derived from
+  /// open knows — covers, chapters — with slacks derived from
   /// movenc's source (the bound's table in the census). Where the chunks a
   /// track's samples make rest on libavformat's interleaving, which this
   /// release does not mirror, the bound refuses a file FFmpeg could have
@@ -4135,7 +4335,11 @@ pub enum MuxOpenError {
   /// family's past 65535, which its start refuses (`mov_init`, `movenc.c`
   /// 8494–8497), and MOV's past 32767 of a video whose aspect ratio is
   /// stated and not 1, its track aperture's widths and height shifted left
-  /// 16 in an `int` (`mov_write_tapt_tag`, 4098–4126; R11, Q869 L6).
+  /// 16 in an `int` (`mov_write_tapt_tag`, 4098–4126; R11, Q869 L6); or
+  /// MP4's and FLV's VP9 of a level the ticket leaves unknown, whose
+  /// configuration record finds one of the width times the height in an
+  /// `int`, past `INT_MAX` a signed overflow (`get_vp9_level`, `vpcc.c`
+  /// 77–122; R19, by the class).
   #[error("track {}'s dimensions do not fit the container's header", .track.get())]
   Dimensions {
     /// The track.
@@ -4302,11 +4506,50 @@ pub enum MuxOpenError {
     /// The chapter's position in the table.
     chapter: usize,
   },
+  /// The MOV family: a track whose coded side data holds an encryption
+  /// initialization (`AV_PKT_DATA_ENCRYPTION_INIT_INFO`), which movenc
+  /// parses again wherever it writes the `moov` — at the trailer, ISMV's
+  /// at its header, an AVIF sequence's at its trailer — for every stream,
+  /// a cover's among them, and writes as `pssh` boxes what that parse
+  /// returns (`mov_write_pssh_tag`, `movenc.c` 5175–5210; 5449–5451): the
+  /// parse returns nothing where an allocation fails, as where the entry
+  /// is malformed (`av_encryption_init_info_get_side_data`,
+  /// `libavutil/encryption_info.c` 231–290), the writer then writes no box
+  /// and returns success, and its caller discards what it returns besides
+  /// — the file written whole without them, no error anywhere (R19, Codex
+  /// R18 1, ruled: refused until FFmpeg can propagate the failure there).
+  /// No other admitted muxer reads the kind.
+  #[error(
+    "track {}'s encryption initialization is one the MOV family's writer drops unsaid where an allocation fails",
+    .track.get()
+  )]
+  EncryptionInitialization {
+    /// The track.
+    track: TrackIndex,
+  },
+  /// Ogg: a stream whose comment header would pass what libavformat builds
+  /// it in (R19, Codex R18 2, and by the class): its comments measured in
+  /// a null buffer of `INT_MAX` bytes, then summed with the codec's own
+  /// bytes in an `int64_t` refused past `INT_MAX`, either refusal returned
+  /// as `ENOMEM` (`ogg_write_vorbiscomment`, `oggenc.c` 291–319;
+  /// `ff_vorbiscomment_length`, `vorbiscomment.c` 44–60; `null_buf_write`,
+  /// `aviobuf.c` 1450–1460) — a size's refusal reported as a failed
+  /// allocation; FLAC's comments written in the 24 bits of its metadata
+  /// block's length, cut past them (`ogg_build_flac_headers`, `oggenc.c`
+  /// 321–355). Counted exactly: an Opus stream's of its language,
+  /// libavformat's `encoder` and the first 1000 chapters' starts and
+  /// titles, another's of its language and the `encoder`
+  /// ([`ogg_comment_bytes`]).
+  #[error("track {}'s Ogg comment header would pass what libavformat builds it in", .track.get())]
+  CommentHeaderTooLarge {
+    /// The track.
+    track: TrackIndex,
+  },
   /// The MOV family's `moov` before any sample would pass the 32 bits its
   /// size is written in (`update_size`, `movenc.c` 155–163; R15, Codex R14
   /// 2): what its trailer writes whatever the packets — ISMV's at its
-  /// header — the movie's own boxes, its covers, its chapters, every
-  /// stream's `pssh` boxes, each timed track's sample descriptions and its
+  /// header — the movie's own boxes, its covers, its chapters, each timed
+  /// track's sample descriptions and its
   /// tables at no sample but the two a trailer may add, and the chapter
   /// track, by the bound the packets are judged by
   /// ([`PayloadRule::MovieBox`]).
@@ -9316,8 +9559,8 @@ pub struct CarrierMuxer<W, C: FfmpegCarrier> {
   /// which no packet has completed ([`Self::take_held`]).
   held: Vec<HeldPacket<C::Buffer>>,
   /// The MOV family, of no fragments: the bound of the `moov`'s own boxes,
-  /// its covers', its chapters' and its streams' `pssh` boxes
-  /// ([`PayloadRule::MovieBox`]); `None` of another container or ISMV.
+  /// its covers' and its chapters' ([`PayloadRule::MovieBox`]); `None` of
+  /// another container or ISMV.
   movie: Option<u64>,
   /// The MOV family, of no fragments: the samples of the chapter track its
   /// mode makes of the chapters, one a chapter; `None` where it makes none.
@@ -9343,6 +9586,10 @@ pub struct MovieBoxBound {
   pub tables: Vec<Vec<([u8; 4], u64)>>,
   /// Each such track's `stsd` bound, in the same order.
   pub stsd: Vec<u64>,
+  /// The most bytes the `moov` may come to: the `UINT32_MAX` of its size,
+  /// AVIF's `INT_MAX` ([`avif_movie_bound`]; R19), or lower where a seam
+  /// lowered it.
+  pub limit: u64,
 }
 
 /// The FFmpeg muxer over the **view** lane's packets — what
@@ -9432,6 +9679,21 @@ where
       });
     };
     let family = audited.family();
+    // AVIF measures its `moov` in a null buffer of `INT_MAX` bytes at its
+    // trailer, to place its samples after it (`get_moov_size`, `movenc.c`
+    // 8905–8916; `avif_write_trailer`, 9179–9181): past `INT_MAX`, the
+    // buffer's refusal is taken as the size and every chunk's offset moved
+    // by it. So AVIF's `moov` is bounded at `INT_MAX`, not the `UINT32_MAX`
+    // of its 32-bit size, at open and at every packet (R19, by the class;
+    // [`avif_movie_bound`]).
+    let bounds = if audited == Audited::Mov(MovMode::Avif) {
+      Bounds {
+        movie: avif_movie_bound(bounds.movie),
+        ..bounds
+      }
+    } else {
+      bounds
+    };
     // The filters that muxer inserts (table B).
     let sites = Sites::of(output.container(), output.container_mime_type());
     let mut report = MuxReport::default();
@@ -9459,6 +9721,18 @@ where
         filters,
         limits,
       )?;
+      // The MOV family parses a stream's encryption initialization again
+      // wherever it writes the `moov`, and writes as `pssh` boxes what the
+      // parse returns: none where it fails to allocate, the file written
+      // all the same, its success returned (R19, Codex R18 1, ruled;
+      // [`MuxOpenError::EncryptionInitialization`]) — every stream's, a
+      // cover's among them. A track not written reaches FFmpeg not.
+      if family == Family::Mp4
+        && road != Road::NotWritten
+        && encryption_initialization(description.side_data())
+      {
+        return Err(MuxOpenError::EncryptionInitialization { track });
+      }
       roads.push(road);
       lost.push(losses);
     }
@@ -9650,6 +9924,19 @@ where
         .iter()
         .zip(&roads)
         .any(|(description, road)| *road == Road::Timed && description.codec() == CodecId::OPUS);
+    // Each Ogg stream's comment header, counted exactly, within the `int`
+    // libavformat builds it in and FLAC's within its 24 bits: refused by
+    // its track before anything is built, where libavformat would report
+    // a size's refusal as a failed allocation (R19, Codex R18 2;
+    // [`ogg_comment_too_large`]).
+    if matches!(audited, Audited::Ogg(_))
+      && let Some(index) =
+        ogg_comment_too_large(&tracks, &roads, (chapters, &spans), bounds.comment)
+    {
+      return Err(MuxOpenError::CommentHeaderTooLarge {
+        track: TrackIndex::new(index),
+      });
+    }
 
     let strict = output.strict_decode_times();
     let mut states = Vec::with_capacity(tracks.len());
@@ -9785,7 +10072,7 @@ where
     }
     // The MOV family's `moov` before any sample (R15, Codex R14 2): what its
     // trailer writes whatever the packets — ISMV's at its header — the
-    // movie's own boxes, the covers', the chapters', every stream's `pssh`,
+    // movie's own boxes, the covers', the chapters',
     // each timed track's `stsd` and its tables of no sample but the two a
     // trailer may add, and the chapter track: past the 32 bits of its size,
     // the table refused, nothing written ([`MuxOpenError::MovieBoxTooLarge`]).
@@ -10099,13 +10386,12 @@ where
         .map(|state| (state.kind, state.sides.codec, state.stream.is_some()))
         .collect::<Vec<_>>(),
     );
-    // The `moov`'s own boxes, its covers', its chapters' and its streams'
-    // `pssh` boxes, at most (R14; [`PayloadRule::MovieBox`]): `covr`, 8
-    // bytes and 16 a picture beside its bytes (4815–4839); `chpl`, 17 and,
-    // of the first 255 chapters, 9 and a title of at most 255 bytes each
-    // (5040–5064); each stream's encryption initialization's `pssh` boxes
-    // ([`pssh_bytes`]; 5175–5210, 5450–5451). The chapter track is its own
-    // ([`CarrierMuxer::chapter_samples`]).
+    // The `moov`'s own boxes, its covers' and its chapters', at most (R14;
+    // [`PayloadRule::MovieBox`]): `covr`, 8 bytes and 16 a picture beside
+    // its bytes (4815–4839); `chpl`, 17 and, of the first 255 chapters, 9
+    // and a title of at most 255 bytes each (5040–5064); no `pssh` box, an
+    // encryption initialization refused at open (R19). The chapter track
+    // is its own ([`CarrierMuxer::chapter_samples`]).
     let movie = (family == Family::Mp4 && audited != Audited::Mov(MovMode::Ism))
       .then(|| movie_fixed(&roads, &tracks, chapters));
     // The chapter track movenc makes of the chapters, a sample a chapter
@@ -10220,6 +10506,7 @@ where
       total,
       tables,
       stsd,
+      limit: self.bounds.movie,
     })
   }
 
@@ -13127,6 +13414,13 @@ where
     Audited::Flac | Audited::Mp3 if description.kind() != TrackKind::Audio => {
       Some(MuxOpenError::CodecNotCarried { track, codec })
     }
+    // FLV writes VP9's configuration record as MP4 does, its level of the
+    // picture's samples counted in an `int` ([`vp9_picture_overflows`]).
+    Audited::Flv
+      if description.kind() == TrackKind::Video && vp9_picture_overflows(codec, ticket) =>
+    {
+      Some(MuxOpenError::Dimensions { track })
+    }
     Audited::Ivf
       if ticket.width() > i32::from(u16::MAX) || ticket.height() > i32::from(u16::MAX) =>
     {
@@ -13394,6 +13688,21 @@ fn mov_aperture_overflows(ticket: &CodecTicket) -> bool {
   !shifts(display) || !shifts(width) || !shifts(i128::from(ticket.height()))
 }
 
+/// Whether VP9's configuration record, which MP4 and FLV write, would count
+/// the picture's samples past C's `int` (R19, by the class): of a level
+/// the ticket leaves unknown, the record's is found of the width times the
+/// height, multiplied in an `int` — a signed overflow past `INT_MAX`, the
+/// level then of a wrapped count (`get_vp9_level`, `vpcc.c` 77–122;
+/// `ff_isom_get_vpcc_features`, 158–163; `ff_isom_write_vpcc`, 204–230;
+/// `mov_write_vpcc_tag`, `movenc.c` 1628–1636; `flv_write_codec_header`,
+/// `flvenc.c` 895). VP9's width and height each reach 65536, so the product
+/// passes it from 46341 square.
+fn vp9_picture_overflows(codec: CodecId, ticket: &CodecTicket) -> bool {
+  codec == CodecId::VP9
+    && ticket.level() == ffmpeg_next::ffi::AV_LEVEL_UNKNOWN
+    && i64::from(ticket.width()) * i64::from(ticket.height()) > i64::from(i32::MAX)
+}
+
 /// What the MOV family's start refuses of a timed track, by mode
 /// (`mov_init`, `movenc.c` 8448–8650), and the codecs a mode beside MP4
 /// admits ([`mov_admitted`]): in every mode a picture wider or taller
@@ -13417,7 +13726,9 @@ fn mov_refusal<D: AsRef<[u8]>>(
   let codec = description.codec();
   let ticket = description.side_data();
   if description.kind() == TrackKind::Video
-    && (ticket.width() > i32::from(u16::MAX) || ticket.height() > i32::from(u16::MAX))
+    && (ticket.width() > i32::from(u16::MAX)
+      || ticket.height() > i32::from(u16::MAX)
+      || vp9_picture_overflows(codec, ticket))
   {
     return Some(MuxOpenError::Dimensions { track });
   }
@@ -16668,7 +16979,7 @@ fn chapter_losses(
       // Ogg's, in each Opus stream's tags alone, as Vorbis comments — the
       // first 1000, numbered by position from 0, a start of whole seconds
       // rounded to the nearest and its milliseconds, rounded apart, and no
-      // end (`ff_vorbiscomment_write`, `vorbiscomment.c` 62–115); its
+      // end (`ff_vorbiscomment_write`, `vorbiscomment.c` 62–125); its
       // reader takes a start of two-digit hours alone and ends each where
       // the next starts, the last at the file's end (`ogm_chapter`,
       // `oggparsevorbis.c` 43–72; `compute_chapters_end`, `demux.c`

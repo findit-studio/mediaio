@@ -18041,17 +18041,18 @@ fn encryption_init_info(infos: &[(usize, usize, usize, usize)]) -> Vec<u8> {
 /// chapters, covers and codecs — H.264 and AAC into MP4 and MOV, of one key
 /// frame and of five, VP9 alone, a video and four audio tracks
 /// interleaved, three chapters and the chapter track made of them, an MP3's
-/// cover, `mov_text` cues, PCM, E-AC-3 joined, FLAC of 80 descriptions, a
-/// stream's encryption initialization written as `pssh` boxes — each read
+/// cover, `mov_text` cues, PCM, E-AC-3 joined, FLAC of 80 descriptions —
+/// each read
 /// back: every `trak` one the bound holds, in order, its every sample
 /// table no larger than its bound and its `stsd` no larger than its, and
 /// the `moov` no larger than the whole; ISMV's `mfra`, of three tracks and
 /// five fragments, no larger than its — of the first video frame dropped,
-/// a fragment before the first key frame, met exactly.
+/// a fragment before the first key frame, met exactly. A stream's
+/// encryption initialization, whose `pssh` boxes R14 counted, is refused
+/// at open since R19 (L165).
 ///
 /// PLANT: the sample-size table's term dropped, its `stsz` larger than its
-/// bound; the chunk offsets' term dropped, `stco` larger; the `pssh` boxes
-/// dropped, the `moov` larger than its bound; the trailer's two samples
+/// bound; the chunk offsets' term dropped, `stco` larger; the trailer's two samples
 /// dropped, the cue track's `stsz` larger; the chapter track dropped, a
 /// `trak` the bound holds not; a description's growth dropped, FLAC's
 /// `stsd` larger; ISMV's key frames uncounted, or the fragment before the
@@ -18159,31 +18160,6 @@ fn l153_the_moov_and_mfra_bounds_are_true_upper_bounds() {
     let (bound, _) = bounded_mux((&source, ContainerName::MP4, &target), &[], &[], &same);
     judge(name, bound, &target);
   }
-  // A stream's encryption initialization, two of them its `pssh` boxes and
-  // one of neither key ids nor data skipped: 50 088 bytes.
-  let init = encryption_init_info(&[(16, 1, 16, 20_000), (16, 0, 16, 0), (16, 0, 16, 30_000)]);
-  let target = output(&corpus, "l153-pssh.mp4");
-  let (bound, _) = bounded_mux(
-    (&h264, ContainerName::MP4, &target),
-    &[],
-    &[],
-    &|index, row| {
-      if index == 0 {
-        with_coded(row, T::AV_PKT_DATA_ENCRYPTION_INIT_INFO, &init)
-      } else {
-        row
-      }
-    },
-  );
-  let bytes = std::fs::read(&target).expect("the file");
-  let (body, end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("a moov");
-  let pssh: Vec<u64> = boxes_of(&bytes, body, end)
-    .into_iter()
-    .filter(|(kind, _, _)| kind == b"pssh")
-    .map(|(_, _, size)| size)
-    .collect();
-  assert_eq!(pssh, [20_052, 30_036], "the pssh boxes FFmpeg writes");
-  judge("l153-pssh.mp4", bound, &target);
   // FLAC of 80 descriptions, a new configuration each frame.
   #[rustfmt::skip]
   let flac = generated(&corpus, "l153.flac", &[
@@ -18212,7 +18188,7 @@ fn l153_the_moov_and_mfra_bounds_are_true_upper_bounds() {
   let bound = muxer.movie_box_bound();
   muxer.finish().expect("finished");
   judge("l153-flac.mp4", bound, &target);
-  assert_eq!(judged, 13, "every file judged");
+  assert_eq!(judged, 12, "every file judged");
   // ISMV's `mfra`: three tracks, five fragments — five key frames; and of
   // the first video frame dropped, four key frames and a fragment before
   // the first, its bound met exactly.
@@ -18538,18 +18514,18 @@ fn l157_rewritten_descriptions_leave_their_exact_sum() {
 /// **L158 — a table of no sample meets the `moov`'s bound at open, and the
 /// trailer meets it again** (R15, Codex R14 2; `mov_write_moov_tag`,
 /// `movenc.c` 5339–5453): an MP3's cover alone, whose trailer writes the
-/// `udta` it holds, and an H.264 track of no packet whose stream carries
-/// 50 088 bytes of `pssh` — each taken at its bound before any sample,
-/// lowered to it, and refused a byte below, nothing written
+/// `udta` it holds — taken at its bound before any sample, lowered to it,
+/// and refused a byte below, nothing written
 /// ([`MuxOpenError::MovieBoxTooLarge`]); and a file whose bound is lowered
 /// after its packets, refused before its trailer, which writes no `moov`
-/// ([`FfmpegMuxRefusal::MovieBox`]).
+/// ([`FfmpegMuxRefusal::MovieBox`]). R15's second table, an H.264 track of
+/// no packet carrying 50 088 bytes of `pssh`, is refused at open since R19
+/// (L165).
 ///
 /// PLANT: the open's check dropped, the table a byte past taken; the
 /// trailer's dropped, the `moov` written.
 #[test]
 fn l158_a_table_of_no_sample_meets_the_movie_bound_at_open_and_the_trailer_again() {
-  use ffmpeg_next::ffi::AVPacketSideDataType as T;
   let Some(corpus) = Corpus::new() else { return };
   let same = |_: usize, row: Described| row;
   let cover_only = |_: usize| -> Vec<Described> {
@@ -18560,17 +18536,7 @@ fn l158_a_table_of_no_sample_meets_the_movie_bound_at_open_and_the_trailer_again
       .collect()
   };
   let h264 = h264_aac(&corpus, "h264-aac.mp4");
-  let init = encryption_init_info(&[(16, 1, 16, 20_000), (16, 0, 16, 30_000)]);
-  let pssh_only = |_: usize| -> Vec<Described> {
-    table_of(&h264, TrackKind::Video)
-      .into_iter()
-      .map(|row| with_coded(row, T::AV_PKT_DATA_ENCRYPTION_INIT_INFO, &init))
-      .collect()
-  };
-  let tables: [(&str, &dyn Fn(usize) -> Vec<Described>); 2] = [
-    ("l158-cover.mp4", &cover_only),
-    ("l158-pssh.mp4", &pssh_only),
-  ];
+  let tables: [(&str, &dyn Fn(usize) -> Vec<Described>); 1] = [("l158-cover.mp4", &cover_only)];
   for (name, table) in tables {
     // Its bound before any sample, as the open judges it.
     let target = output(&corpus, name);
@@ -19806,5 +19772,507 @@ fn l164_in_a_process_of_its_own() {
     std::fs::metadata(&target).expect("the sink").len(),
     0,
     "nothing written"
+  );
+}
+
+/// **L165 — the MOV family refuses a table carrying an encryption
+/// initialization at open, nothing written** (R19, Codex R18 1, ruled:
+/// refused until FFmpeg can propagate the failure there): movenc parses a
+/// stream's `AV_PKT_DATA_ENCRYPTION_INIT_INFO` again wherever it writes the
+/// `moov`, every stream's (`mov_write_pssh_tag`, `movenc.c` 5175–5210;
+/// 5449–5451), and writes no `pssh` box where the parse fails to allocate
+/// (`av_encryption_init_info_get_side_data`, `libavutil/encryption_info.c`
+/// 231–290), returning success to a caller that discards it besides. An
+/// H.264 track's, the AAC track's beside it, an MP4 cover's — in every mode
+/// of the family, MP4, MOV, 3GP, 3G2, PSP, iPod, F4V and ISMV, and AVIF's
+/// of an AV1 track — each refused by the track that carries it, the sink
+/// empty. A track the family does not write, MP4's font, reaches FFmpeg
+/// not: its table taken. Matroska, whose writer reads the kind nowhere,
+/// takes the H.264 table and finishes it.
+///
+/// PLANT: the refusal dropped, the MP4 table taken; the cover's road
+/// exempted with the unwritten one's, the cover's table taken.
+#[test]
+fn l165_the_mov_family_refuses_an_encryption_initialization_at_open() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let init = encryption_init_info(&[(16, 1, 16, 64), (16, 0, 16, 32)]);
+  let carrying = |at: usize, table: Vec<Described>| -> Vec<Described> {
+    table
+      .into_iter()
+      .enumerate()
+      .map(|(index, row)| {
+        if index == at {
+          with_coded(row, T::AV_PKT_DATA_ENCRYPTION_INIT_INFO, &init)
+        } else {
+          row
+        }
+      })
+      .collect()
+  };
+  let open = |name: &str, container: &str, table: Vec<Described>| {
+    let target = output(&corpus, name);
+    let opened = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new(container),
+      table,
+      &[],
+      PacketLimits::default(),
+    );
+    (target, opened)
+  };
+  let refused = |name: &str, container: &str, table: Vec<Described>, track: usize| {
+    let (target, opened) = open(name, container, table);
+    match opened {
+      Err(MuxOpenError::EncryptionInitialization { track: named }) => {
+        assert_eq!(
+          named,
+          TrackIndex::new(track),
+          "{name}: the track carrying it"
+        );
+      }
+      other => panic!(
+        "{name}: expected EncryptionInitialization, got {:?}",
+        other.map(|_| ())
+      ),
+    }
+    assert_eq!(
+      std::fs::metadata(&target).expect("the sink").len(),
+      0,
+      "{name}: nothing written"
+    );
+  };
+  let h264 = h264_aac(&corpus, "h264-aac.mp4");
+  for container in ["mp4", "mov", "3gp", "3g2", "psp", "ipod", "f4v", "ismv"] {
+    refused(
+      &format!("l165-video.{container}"),
+      container,
+      carrying(0, whole_table(&h264)),
+      0,
+    );
+    refused(
+      &format!("l165-audio.{container}"),
+      container,
+      carrying(1, whole_table(&h264)),
+      1,
+    );
+  }
+  let av1 = av1_mkv(&corpus);
+  refused("l165.avif", "avif", carrying(0, whole_table(&av1)), 0);
+  // An MP4 cover's.
+  let same = |_: usize, row: Described| row;
+  let (table, _) = copied_source(&corpus.cover_art_mp3(), &[], &same);
+  let covers: Vec<Described> = table
+    .into_iter()
+    .filter(|row| row.file().is_some())
+    .collect();
+  assert_eq!(covers.len(), 1, "the MP3's cover");
+  refused("l165-cover.mp4", "mp4", carrying(0, covers), 0);
+  // A track MP4 does not write: taken, its report naming it not written.
+  let mkv = corpus.multi_track_mkv();
+  let font_ticket = {
+    let demuxer = FfmpegOwnedDemuxer::open(&mkv).expect("open");
+    ticket(
+      demuxer
+        .tracks()
+        .iter()
+        .find(|row| row.kind() == TrackKind::Attachment)
+        .expect("the font"),
+    )
+  };
+  let font = TrackDescription::attachment(
+    millis(),
+    AttachmentTrackParams::new(CodecId::TTF),
+    AttachedFile::new(AttachmentPacket::new(
+      FfmpegBytes::try_copy_from_slice(support::FONT_PAYLOAD).expect("a payload"),
+      AttachmentPacketExtra::new(0),
+    ))
+    .with_filename(Some("font.ttf".into()))
+    .with_mime_type(Some("application/x-truetype-font".into())),
+    font_ticket,
+  );
+  let mut table = table_of(&mkv, TrackKind::Video);
+  table.extend(carrying(0, vec![font]));
+  let (_, opened) = open("l165-font.mp4", "mp4", table);
+  let (muxer, report) = opened.unwrap_or_else(|error| panic!("the font's table: {error:?}"));
+  assert!(
+    report.uncarried().contains(&Uncarried::Attachment {
+      track: TrackIndex::new(1)
+    }),
+    "the font not written: {report:?}"
+  );
+  muxer.finish().expect("finished");
+  // Matroska reads the kind nowhere: taken, and finished.
+  let (target, frames) = (
+    output(&corpus, "l165.mkv"),
+    whole_track(&h264, TrackKind::Video).1,
+  );
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::MATROSKA,
+    carrying(0, table_of(&h264, TrackKind::Video)),
+  );
+  for frame in &frames {
+    muxer
+      .write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(frame)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  muxer.finish().expect("finished");
+  assert_eq!(
+    packets(&target)[0].len(),
+    frames.len(),
+    "Matroska's every frame"
+  );
+}
+
+/// The packets of the first logical stream of the Ogg file at `path`,
+/// each its bytes, joined across its pages by their lacing values — a
+/// value below 255 ends a packet (RFC 3533 6).
+fn ogg_packets(path: &Path) -> Vec<Vec<u8>> {
+  let bytes = std::fs::read(path).expect("the file");
+  let (mut packets, mut packet, mut serial) = (Vec::new(), Vec::new(), None);
+  let mut at = 0;
+  while at + 27 <= bytes.len() {
+    assert_eq!(&bytes[at..at + 4], b"OggS", "a page at {at}");
+    let page = u32::from_le_bytes([
+      bytes[at + 14],
+      bytes[at + 15],
+      bytes[at + 16],
+      bytes[at + 17],
+    ]);
+    let count = usize::from(bytes[at + 26]);
+    let mine = *serial.get_or_insert(page) == page;
+    let mut body = at + 27 + count;
+    for &value in &bytes[at + 27..at + 27 + count] {
+      let value = usize::from(value);
+      if mine {
+        packet.extend_from_slice(&bytes[body..body + value]);
+        if value < 255 {
+          packets.push(core::mem::take(&mut packet));
+        }
+      }
+      body += value;
+    }
+    at = body;
+  }
+  packets
+}
+
+/// **L166 — an Ogg stream's comment header is counted exactly, and refused
+/// past what libavformat builds it in** (R19, Codex R18 2: its size
+/// measured in a null buffer of `INT_MAX` bytes and its packet summed past
+/// `INT_MAX`, each refusal reported as a failed allocation —
+/// `ogg_write_vorbiscomment`, `oggenc.c` 291–319): an Opus stream stating a
+/// language, of four chapters — titled, untitled, of an empty title, and
+/// one at a hundred hours, whose start's hours take three digits and which
+/// the reader drops — and an Opus stream of 1001 chapters, the last of
+/// which no comment holds (`ff_vorbiscomment_write`, `vorbiscomment.c`
+/// 70–71): each `OpusTags` FFmpeg writes measured; the bound lowered a
+/// byte below it, the table refused by its stream, nothing written;
+/// lowered to it, the table taken and the same header written. The bound
+/// is therefore the header to the byte. The real bound, `INT_MAX`, and
+/// FLAC's 24 bits are the unit law `an_ogg_comment_header_holds_int_max`.
+///
+/// PLANT: the `encoder` uncounted, the table a byte below taken; the
+/// thousand chapters' cap dropped, the 1001st counted, the table at its
+/// header refused; the check dropped, the table a byte below taken.
+#[test]
+fn l166_an_ogg_comment_header_is_counted_exactly_and_refused_past_its_int() {
+  let Some(corpus) = Corpus::new() else { return };
+  let opus = opus_mkv(&corpus);
+  let (_, frames) = whole_track(&opus, TrackKind::Audio);
+  let table = || {
+    let mut table = table_of(&opus, TrackKind::Audio);
+    table[0].set_language(Some("fra".into()));
+    table
+  };
+  let hundred_hours = 100 * 3600 * 1000;
+  let four = [
+    chapter_of(0, 0, 200, Some("first")),
+    chapter_of(1, 200, 400, None),
+    chapter_of(2, 400, hundred_hours, Some("")),
+    chapter_of(3, hundred_hours, hundred_hours + 200, Some("late")),
+  ];
+  let many: Vec<Chapter<Ffmpeg>> = (0..1001)
+    .map(|index| chapter_of(index, index * 10, index * 10 + 10, Some("a chapter")))
+    .collect();
+  for (name, chapters) in [("l166.opus", &four[..]), ("l166-many.opus", &many[..])] {
+    let open = |name: &str, bound: Option<u64>| {
+      let target = output(&corpus, name);
+      let options = bound.map_or_else(MuxOptions::new, |bytes| {
+        MuxOptions::new().with_lowered_comment_bound(bytes)
+      });
+      let opened = FfmpegOwnedMuxer::open_with(
+        File::create(&target).expect("create"),
+        ContainerName::new("opus"),
+        table(),
+        chapters,
+        options,
+      );
+      (target, opened)
+    };
+    let write = |name: &str,
+                 opened: Result<
+      (FfmpegOwnedMuxer<File>, mediaencode_ffmpeg::MuxReport),
+      MuxOpenError,
+    >| {
+      let (mut muxer, _) = opened.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+      for frame in &frames {
+        muxer
+          .write_audio(audio_on_zero(audio_of(frame)))
+          .map_err(|error| error.map_packet(drop))
+          .expect("a frame");
+      }
+      muxer.finish().expect("finished");
+    };
+    // What FFmpeg writes.
+    let (target, opened) = open(name, None);
+    write(name, opened);
+    let tags = ogg_packets(&target).swap_remove(1);
+    assert!(tags.starts_with(b"OpusTags"), "{name}: the comment header");
+    let header = tags.len() as u64;
+    // A byte below: refused by its stream, nothing written.
+    let below = format!("below-{name}");
+    let (refused, opened) = open(&below, Some(header - 1));
+    match opened {
+      Err(MuxOpenError::CommentHeaderTooLarge { track }) => {
+        assert_eq!(track, TrackIndex::new(0), "{name}: the Opus stream")
+      }
+      other => panic!(
+        "{name}: expected CommentHeaderTooLarge, got {:?}",
+        other.map(|_| ())
+      ),
+    }
+    assert_eq!(
+      std::fs::metadata(&refused).expect("the sink").len(),
+      0,
+      "{name}: nothing written"
+    );
+    // At it: taken, the same header.
+    let at = format!("at-{name}");
+    let (taken, opened) = open(&at, Some(header));
+    write(&at, opened);
+    assert_eq!(
+      ogg_packets(&taken).swap_remove(1),
+      tags,
+      "{name}: the same header"
+    );
+  }
+}
+
+/// **L167 — AVIF's `moov` is bounded at `INT_MAX`, the null buffer its
+/// trailer measures it in** (R19, by the class: `get_moov_size`,
+/// `movenc.c` 8905–8916, refuses past `INT_MAX`, and `avif_write_trailer`
+/// takes the refusal's code as the size every chunk's offset is moved by,
+/// 9179–9181): an AV1 track into AVIF, the bound's limit `INT_MAX`; the
+/// same into MP4, and H.264 and AAC into MOV, the `UINT32_MAX` of the
+/// box's size; a seam lowering AVIF's below `INT_MAX`, the lower kept.
+///
+/// PLANT: AVIF's bound left at `UINT32_MAX`, its limit past `INT_MAX`.
+#[test]
+fn l167_avifs_moov_is_bounded_by_the_null_buffer_it_is_measured_in() {
+  let Some(corpus) = Corpus::new() else { return };
+  let av1 = av1_mkv(&corpus);
+  let h264 = h264_aac(&corpus, "h264-aac.mp4");
+  let limit = |name: &str, container: &str, table: Vec<Described>, options: MuxOptions| {
+    let muxer = muxer_with(
+      &output(&corpus, name),
+      ContainerName::new(container),
+      table,
+      options,
+    );
+    let limit = muxer.movie_box_bound().expect("a bound").limit;
+    drop(muxer);
+    limit
+  };
+  assert_eq!(
+    limit("l167.avif", "avif", whole_table(&av1), MuxOptions::new()),
+    i32::MAX as u64,
+    "AVIF's, the null buffer's"
+  );
+  assert_eq!(
+    limit("l167.mp4", "mp4", whole_table(&av1), MuxOptions::new()),
+    u64::from(u32::MAX),
+    "MP4's, the box's 32 bits"
+  );
+  assert_eq!(
+    limit("l167.mov", "mov", whole_table(&h264), MuxOptions::new()),
+    u64::from(u32::MAX),
+    "MOV's, the box's 32 bits"
+  );
+  assert_eq!(
+    limit(
+      "l167-lowered.avif",
+      "avif",
+      whole_table(&av1),
+      MuxOptions::new().with_lowered_movie_bound(1 << 30)
+    ),
+    1 << 30,
+    "a lower bound kept"
+  );
+}
+
+/// **L168 — MP4 and FLV refuse a VP9 picture whose samples pass the `int`
+/// its configuration record counts them in** (R19, by the class:
+/// `get_vp9_level`, `vpcc.c` 77–80, multiplies the width by the height in
+/// C's `int` where the ticket leaves the level unknown, a signed overflow
+/// past `INT_MAX`): 46341 square of no level, refused at open by its
+/// track, nothing written, in MP4 and FLV; 46340 by 46341, within the
+/// `int`, taken; 46341 square of a stated level, which the record copies,
+/// taken; Matroska, whose writer makes no such record, takes 46341 square
+/// of no level.
+///
+/// PLANT: the check dropped, MP4's and FLV's 46341 square taken.
+#[test]
+fn l168_vp9s_configuration_record_counts_no_picture_past_an_int() {
+  let Some(corpus) = Corpus::new() else { return };
+  let vp9 = vp9_webm(&corpus);
+  let sized = |width: i32, height: i32, level: i32| -> Vec<Described> {
+    table_of(&vp9, TrackKind::Video)
+      .into_iter()
+      .map(|row| {
+        reticketed(row, |par| {
+          par.width = width;
+          par.height = height;
+          par.level = level;
+          // The matrix stated, which FLV requires of VP9 (L143).
+          par.color_space = ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_BT709;
+        })
+      })
+      .collect()
+  };
+  let unknown = ffmpeg_next::ffi::AV_LEVEL_UNKNOWN;
+  let open = |name: &str, container: ContainerName, table: Vec<Described>| {
+    let target = output(&corpus, name);
+    let opened = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      container,
+      table,
+      &[],
+      PacketLimits::default(),
+    );
+    (target, opened)
+  };
+  for (name, container) in [
+    ("l168.mp4", ContainerName::MP4),
+    ("l168.flv", ContainerName::new("flv")),
+  ] {
+    let (target, opened) = open(name, container.clone(), sized(46341, 46341, unknown));
+    assert!(
+      matches!(opened, Err(MuxOpenError::Dimensions { track }) if track.get() == 0),
+      "{name}: refused, got {:?}",
+      opened.map(drop)
+    );
+    assert_eq!(
+      std::fs::metadata(&target).expect("the sink").len(),
+      0,
+      "{name}: nothing written"
+    );
+    let (_, opened) = open(
+      &format!("within-{name}"),
+      container.clone(),
+      sized(46340, 46341, unknown),
+    );
+    drop(opened.unwrap_or_else(|error| panic!("{name}: within the int: {error:?}")));
+    let (_, opened) = open(
+      &format!("stated-{name}"),
+      container,
+      sized(46341, 46341, 62),
+    );
+    drop(opened.unwrap_or_else(|error| panic!("{name}: a stated level: {error:?}")));
+  }
+  let (_, opened) = open(
+    "l168.mkv",
+    ContainerName::MATROSKA,
+    sized(46341, 46341, unknown),
+  );
+  drop(opened.unwrap_or_else(|error| panic!("Matroska: {error:?}")));
+}
+
+/// The variable that tells L169's body it runs in its own process.
+const L169_CHILD: &str = "MEDIAENCODE_FFMPEG_L169_CHILD";
+
+/// **L169 — an allocation's failure a writer's callback reports fails the
+/// muxer, the file never taken for written** (R19, by the class: the
+/// census's "reported", every failure FFmpeg returns through a muxer's
+/// callback; L164 the open's): in a process of its own, libavutil's cap of
+/// one allocation (`av_max_alloc`, `mem.c` 74–78) lowered after the open to
+/// 8 KiB above the largest frame, the multi-track source's first second of
+/// video — 25 frames, one cluster — into Matroska: every frame's own
+/// allocation within the cap, the cluster they fill not, so the cluster's
+/// dynamic buffer refuses to grow (`dyn_buf_write`, `aviobuf.c` 1281–1311),
+/// and its error, read where the cluster ends (`end_ebml_master_crc32`,
+/// `matroskaenc.c` 813–841), fails the trailer: the finish answers the
+/// trailer's fault, `ENOMEM`, no refusal of the muxer's own.
+///
+/// PLANT: the trailer's failure discarded, the finish answering the sink.
+#[test]
+fn l169_an_allocation_a_writer_reports_fails_the_muxer() {
+  if std::env::var_os(L169_CHILD).is_some() {
+    return;
+  }
+  let status = std::process::Command::new(std::env::current_exe().expect("the lane"))
+    .args([
+      "--exact",
+      "l169_in_a_process_of_its_own",
+      "--test-threads=1",
+      "--nocapture",
+    ])
+    .env(L169_CHILD, "1")
+    .status()
+    .expect("the process of its own");
+  assert!(
+    status.success(),
+    "the cluster's refused growth, the trailer's fault: {status}"
+  );
+}
+
+/// L169's body, in a process of its own (its caller sets [`L169_CHILD`]);
+/// elsewhere nothing.
+#[test]
+fn l169_in_a_process_of_its_own() {
+  if std::env::var_os(L169_CHILD).is_none() {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let mkv = corpus.multi_track_mkv();
+  let (table, frames) = first_track(&mkv, TrackKind::Video, 25);
+  let sizes: Vec<usize> = packets(&mkv)[0]
+    .iter()
+    .take(25)
+    .map(|seen| seen.bytes.len())
+    .collect();
+  let cap = sizes.iter().copied().max().expect("a frame") + 8192;
+  let total: usize = sizes.iter().sum();
+  assert!(
+    total > 2 * cap,
+    "the frames' sum, {total}, well past the cap, {cap}"
+  );
+  let target = output(&corpus, "l169.mkv");
+  let mut muxer = muxer_into(&target, ContainerName::MATROSKA, table);
+  // SAFETY: a store of the process's cap, which libavutil reads
+  // atomically at every allocation; this process runs this law alone.
+  unsafe { ffmpeg_next::ffi::av_max_alloc(cap) };
+  for frame in &frames {
+    muxer
+      .write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(frame)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame, its own allocation within the cap");
+  }
+  let finished = muxer.finish();
+  // SAFETY: as above: the cap back at libavutil's own, `INT_MAX`.
+  unsafe { ffmpeg_next::ffi::av_max_alloc(i32::MAX as usize) };
+  let fault = finished.expect_err("the cluster's refused growth reported");
+  assert_eq!(fault.stage(), MuxStage::Trailer, "the trailer's fault");
+  assert_eq!(fault.refusal(), None, "no refusal of the muxer's own");
+  assert!(
+    matches!(
+      fault.error(),
+      Some(OutputError::Ffmpeg(ffmpeg_next::Error::Other { errno }))
+        if *errno == ffmpeg_next::error::ENOMEM
+    ),
+    "ENOMEM, got {:?}",
+    fault.error()
   );
 }
