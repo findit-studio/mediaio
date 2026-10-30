@@ -5501,7 +5501,10 @@ fn apv_added<'a>(
 
 /// The configuration of a packet that reaches movenc, read in place: its
 /// own new extradata, or the one AAC's filter makes of its first frame,
-/// held on the stack ([`made_configuration_into`]).
+/// held on the stack ([`made_configuration_into`]). Its made variant is
+/// large by design: boxing it would allocate in the judgment, which
+/// allocates nothing (R15), and the value lives one write.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy)]
 enum Reaching<'p> {
   Side(&'p [u8]),
