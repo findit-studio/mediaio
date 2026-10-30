@@ -5459,6 +5459,57 @@ fn flvs_filter_split_is_held_to_what_libavcodec_allocates() {
   assert_eq!(av1_split(&unparsed, 3), Err(PayloadRule::SplitSize));
 }
 
+/// FLV's sequence header of the configuration `extract_extradata` makes of
+/// an AV1 unit is counted as FLV writes it (R20, part 2b-i, item 4): its
+/// extended header — five bytes, seven past the first track — then the
+/// `av1C`'s four bytes and the unit's global OBUs, each one its split
+/// keeps: its sequence header, and each metadata OBU `metadata_is_global`
+/// takes, its type read as `get_leb` reads one through the checked reader
+/// of its bits — an HDR content light level's or mastering display's.
+#[test]
+fn flvs_av1_sequence_header_is_counted_as_its_filter_makes_it() {
+  use super::{av1_extracted_record, av1_metadata_global, flv_sequence_header};
+  assert_eq!(
+    flv_sequence_header(TrackKind::Video, CodecId::AV1, 0),
+    Some(5)
+  );
+  assert_eq!(
+    flv_sequence_header(TrackKind::Video, CodecId::AV1, 1),
+    Some(7)
+  );
+  // The HDR types taken, ITU-T T.35's not.
+  assert!(av1_metadata_global(
+    &[0x01, 0x03, 0xE8, 0x01, 0x90, 0x80],
+    40
+  ));
+  assert!(av1_metadata_global(&[0x02, 0x80], 8));
+  assert!(!av1_metadata_global(&[0x04, 0x80], 8));
+  // A type of two bytes, 1 and none beside.
+  assert!(av1_metadata_global(&[0x81, 0x00, 0x80], 16));
+  // Of seven bits, the reader stands at bit 15 after its second byte and
+  // reads from there, again and again: 0x00, a type of 1. Read on bytewise,
+  // its third byte would add `1 << 14`.
+  assert!(av1_metadata_global(&[0x81, 0x80, 0x01], 7));
+  // A reader `init_get_bits` refuses takes none.
+  assert!(!av1_metadata_global(&[0x01], i32::MAX as usize - 512));
+  let td: &[u8] = &[0x12, 0x00];
+  let sequence: &[u8] = &[
+    0x0A, 0x0B, 0x02, 0x00, 0x00, 0x05, 0x15, 0x7F, 0xFC, 0x4A, 0xF9, 0x00, 0x40,
+  ];
+  let light: &[u8] = &[0x2A, 0x06, 0x01, 0x03, 0xE8, 0x01, 0x90, 0x80];
+  let t35: &[u8] = &[0x2A, 0x02, 0x04, 0x80];
+  let unkept: &[u8] = &[0x2A, 0x01, 0x00];
+  let frame: &[u8] = &[
+    0x32, 0x0C, 0x10, 0x00, 0xF3, 0x82, 0x3F, 0xFE, 0x69, 0x83, 0x00, 0x00, 0x05, 0x80,
+  ];
+  assert_eq!(
+    av1_extracted_record(&[td, sequence, light, t35, unkept, frame].concat()),
+    4 + 13 + 8,
+    "the sequence header and the light level, whole"
+  );
+  assert_eq!(av1_extracted_record(&[sequence, frame].concat()), 4 + 13);
+}
+
 /// MPEG-TS reads a unit's type as its start code search leaves it, and
 /// adds a delimiter and the configuration as it reads them (R20, r2):
 /// `avpriv_find_start_code` past the byte after each start code, its state

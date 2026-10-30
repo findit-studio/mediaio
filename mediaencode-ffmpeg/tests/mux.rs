@@ -22314,3 +22314,145 @@ fn l183_flvs_filter_split_is_held_to_what_libavcodec_allocates() {
     "a slot later, refused as unparsed"
   );
 }
+
+/// The shortest LEB128 of `value`.
+fn leb128_of(mut value: usize) -> Vec<u8> {
+  let mut bytes = Vec::new();
+  loop {
+    let byte = (value & 0x7F) as u8;
+    value >>= 7;
+    if value == 0 {
+      bytes.push(byte);
+      return bytes;
+    }
+    bytes.push(byte | 0x80);
+  }
+}
+
+/// **L184 — FLV's sequence header is held to its 24 bits at the packet
+/// too** (R20, part 2b-i, item 4, ruled: a length that wraps is refused):
+/// on an AV1 track of no configuration, FLV writes the configuration
+/// `extract_extradata` makes of a unit — its sequence header and global
+/// metadata OBUs — as a new sequence header, its size in the tag's 24 bits,
+/// before it judges the packet's own tag (`flvenc.c` 1250–1263, 807–914,
+/// 1346): its extended header's five bytes and the `av1C`'s four, four
+/// more than the packet's tag holds beside the same OBUs. A unit of only
+/// those OBUs, its tag within 4 bytes below 2^24 — the header's size
+/// 2^24 — is refused by name and handed back untouched, and so are the
+/// units to its tag's last byte and one past it, FLV's order; one byte
+/// smaller is written whole — in the file, its sequence header's size
+/// 2^24 − 1 and the `av1C` of the unit behind it, and the unit as it was.
+///
+/// PLANT: the packet's sequence header unjudged; its metadata uncounted;
+/// its header's own bytes uncounted; judged after the tag.
+#[test]
+fn l184_flvs_sequence_header_is_held_to_its_24_bits_at_the_packet() {
+  let Some(corpus) = Corpus::new() else { return };
+  let av1 = av1_mkv(&corpus);
+  let (_, units) = first_track(&av1, TrackKind::Video, 1);
+  let unit = video_of(&units[0]);
+  let sequence = unit.data().as_ref()[..13].to_vec();
+  assert_eq!(
+    (sequence[0], sequence[1]),
+    (0x0A, 11),
+    "the premise: the unit opens on its sequence header"
+  );
+  // The sequence header and an HDR content light level metadata OBU,
+  // padded with zeros after its trailing bit, `bytes` in all.
+  let made = |bytes: usize| -> Vec<u8> {
+    let payload = bytes - sequence.len() - 1 - 4;
+    let size = leb128_of(payload);
+    assert_eq!(size.len(), 4, "the premise: a size of four bytes");
+    let mut made = sequence.clone();
+    made.push(0x2A);
+    made.extend_from_slice(&size);
+    made.extend_from_slice(&[0x01, 0x03, 0xE8, 0x01, 0x90, 0x80]);
+    made.resize(bytes, 0);
+    made
+  };
+  let configured = || {
+    reticketed(table_of(&av1, TrackKind::Video).remove(0), |par| {
+      par.color_space = ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_BT709;
+    })
+    .with_extradata(Some(bytes_of(&[])))
+  };
+  let written = |name: &str, bytes: &[u8]| -> Result<PathBuf, FfmpegMuxRefusal> {
+    let target = output(&corpus, &format!("l184-{name}.flv"));
+    let mut muxer = muxer_with(
+      &target,
+      ContainerName::new("flv"),
+      vec![configured()],
+      filters(true),
+    );
+    let offered = VideoTrackPacket::new(TrackIndex::new(0), video_holding(&unit, bytes));
+    match refusing!(muxer.write_video(offered.clone())) {
+      Ok(()) => {}
+      Err(MuxError::Backend { refusal, packet }) => {
+        untouched!(offered, packet);
+        return Err(refusal);
+      }
+      Err(other) => panic!("{name}: {other:?}"),
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    Ok(target)
+  };
+  // The extended header's five bytes and the av1C's four: the header's
+  // size 2^24 - 1 at most.
+  let largest = (1 << 24) - 1 - 5 - 4;
+  for (name, bytes) in [
+    ("first", largest + 1),
+    ("last", largest + 4),
+    ("past", largest + 5),
+  ] {
+    assert_eq!(
+      written(name, &made(bytes)).map(drop),
+      Err(payload(PayloadRule::NewExtradata)),
+      "{name}: the tag's size {}",
+      5 + bytes
+    );
+  }
+  // Read in the file — its video tags, each its 24-bit size and where its
+  // data starts — as no reader of a 16 MiB configuration reads it.
+  let whole = made(largest);
+  let target = written("whole", &whole).expect("written whole");
+  let bytes = std::fs::read(&target).expect("the file");
+  let mut tags = Vec::new();
+  let mut at = 13;
+  while at + 11 <= bytes.len() {
+    let size = u32::from_be_bytes([0, bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+    if bytes[at] & 0x1F == 9 {
+      tags.push((size, at + 11));
+    }
+    at += 11 + size + 4;
+  }
+  assert_eq!(at, bytes.len(), "the tags, each whole");
+  // Each video tag's packet type, its first byte's low four bits
+  // (`flvenc.c` 868–875, 1394–1407): the header's sequence header, of no
+  // configuration, then the unit's; the unit, coded frames.
+  let kind = |data: usize| bytes[data] & 0x0F;
+  let starts: Vec<_> = tags.iter().filter(|&&(_, data)| kind(data) == 0).collect();
+  assert_eq!(starts.len(), 2, "two sequence headers");
+  assert_eq!(starts[0].0, 5, "the header's, of no configuration");
+  let &(size, data) = starts[1];
+  assert_eq!(
+    size,
+    (1 << 24) - 1,
+    "the unit's sequence header, its size whole"
+  );
+  assert_eq!(bytes[data + 5], 0x81, "an av1C of version 1");
+  assert!(
+    bytes[data + 9..data + size] == whole[..],
+    "the unit's OBUs behind the record's four bytes"
+  );
+  let &(size, data) = tags
+    .iter()
+    .find(|&&(_, data)| kind(data) == 1)
+    .expect("the unit's tag");
+  assert_eq!(size, 5 + largest);
+  assert!(
+    bytes[data + 5..data + size] == whole[..],
+    "the unit as it was"
+  );
+}
