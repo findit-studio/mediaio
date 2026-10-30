@@ -16914,7 +16914,10 @@ fn l145_webm_refuses_a_stereo_mode_it_defines_not() {
 /// back to — so that `avformat_query_codec` answers it not carried, and
 /// the open refuses it by name (`MuxOpenError::CodecNotCarried`), nothing
 /// written: MP4's `hev1`, which FFmpeg's tool copies into ASF unread, and
-/// `HEVC`, which the reader would take.
+/// `HEVC`, which the reader would take. Kept refused as ruled (R12): the
+/// muxer asks the library's own question, never a looser one; HEVC in ASF
+/// is booked (Q860), to be admitted under the tags its reader takes after
+/// its own audit.
 ///
 /// PLANT: the codec query's answer unread, MP4's `hev1` opened.
 #[test]
