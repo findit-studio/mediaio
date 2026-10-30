@@ -10400,8 +10400,10 @@ fn l96_mpeg_ts_refuses_what_its_pmt_and_pes_cannot_hold() {
 /// refused at open, nothing written** (table H): a chapter title whose
 /// marker entry passes 16 bits — 12 bytes and the title in UTF-16 with its
 /// terminator (`asfenc.c` 337) — refused
-/// ([`MuxOpenError::ChapterTitleTooLong`]), one a character shorter
-/// opening, and opening in the streaming form, which writes no marker; a
+/// ([`MuxOpenError::ChapterTitleTooLong`]), and opening in the streaming
+/// form, which writes no marker; one a character shorter refused too, since
+/// R17: past the 1023 bytes ASF's reader takes, which bind first (L163) —
+/// a title of 1023 opening; a
 /// chapter starting at 2^32 ms, whose marker's send time could pass its
 /// DWORD (297–308, 338), refused ([`MuxOpenError::ChapterSpan`]), one a
 /// millisecond earlier opening; a video configuration past the 16-bit
@@ -10485,13 +10487,24 @@ fn l87_asf_and_riff_refuse_at_open_what_their_fields_cannot_count() {
     ),
     Err(MuxOpenError::ChapterTitleTooLong { chapter: 0 })
   ));
+  // 12 bytes and 32 761 characters of UTF-16, 65 534, within the entry,
+  // past the 1023 bytes ASF's reader takes (R17); 1023, opening.
+  assert!(matches!(
+    open(
+      "l87-title.asf",
+      "asf",
+      table(&both, None, None),
+      &titled(32_760)
+    ),
+    Err(MuxOpenError::ChapterTitleTooLong { chapter: 0 })
+  ));
   open(
     "l87-title.asf",
     "asf",
     table(&both, None, None),
-    &titled(32_760),
+    &titled(1023),
   )
-  .expect("12 bytes and 32 761 characters of UTF-16: 65 534");
+  .expect("the 1023 bytes ASF's reader takes");
   let report = open(
     "l87-title.asf_stream",
     "asf_stream",
@@ -19366,4 +19379,187 @@ fn l162_the_movie_bound_charges_no_track_ffmpeg_leaves_out() {
     "{name}: none at open, of no sample"
   );
   moov_within(name, &before, &moov);
+}
+
+/// L163's file: `titles`, each a chapter's in turn, 500 ms apart, beside
+/// `source`'s audio track and its packets, into `container` — the titles
+/// its reader reads back and the report's lines of chapter titles, or the
+/// open's refusal.
+fn titles_through(
+  corpus: &Corpus,
+  name: &str,
+  (container, source): (&str, &Path),
+  titles: &[Option<&str>],
+) -> Result<(Vec<Option<String>>, Vec<Uncarried>), MuxOpenError> {
+  let chapters: Vec<Chapter<Ffmpeg>> = titles
+    .iter()
+    .enumerate()
+    .map(|(index, title)| {
+      let at = 500 * index as i64;
+      chapter_of(index as i64, at, at + 500, *title)
+    })
+    .collect();
+  let (table, frames) = whole_track(source, TrackKind::Audio);
+  let target = output(corpus, name);
+  let (mut muxer, report) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::new(container),
+    table,
+    &chapters,
+    PacketLimits::default(),
+  )?;
+  for frame in &frames {
+    muxer
+      .write_audio(audio_on_zero(audio_of(frame)))
+      .map_err(|error| error.map_packet(drop))
+      .unwrap_or_else(|error| panic!("{name}: a frame: {error:?}"));
+  }
+  muxer.finish().expect("finished");
+  let read = FfmpegOwnedDemuxer::open(&target)
+    .expect("open")
+    .chapters()
+    .iter()
+    .map(|chapter| chapter.title().map(|title| title.as_str().to_owned()))
+    .collect();
+  Ok((
+    read,
+    lines(&report, |line| {
+      matches!(line, Uncarried::ChapterTitle { .. })
+    }),
+  ))
+}
+
+/// **L163 — every container's chapter title reads back as given, or is
+/// refused, or reported** (R17, Codex R16, by the class: a title the
+/// chapter never had refused, a title lost reported; the module's census
+/// of chapter titles): untitled, empty, whitespace-only and long titles
+/// through every admitted muxer that writes chapters, each read back by
+/// FFmpeg's reader. MP4, MOV and 3GP keep an empty and a whitespace title,
+/// an untitled chapter refused; Matroska and WebM keep all three; MP3
+/// refuses an empty title as an untitled one — its reader skips a `TIT2`
+/// of no text and titles the chapter `ch0`; ASF refuses an untitled
+/// marker, which reads back titled empty, and a title past the 1023 bytes
+/// its reader takes, cut, keeping one of 1023; NUT keeps a title of 1023
+/// bytes and reports one of 1024, which reads back untitled; Ogg's Opus
+/// tags report an empty title, which reads back untitled.
+///
+/// PLANT: MP3's empty title taken, read back `ch0`; ASF's untitled marker
+/// taken, read back empty; ASF's reader's bound dropped, the long title
+/// read back cut; NUT's long title unreported; Ogg's empty title
+/// unreported.
+#[test]
+fn l163_every_containers_chapter_title_reads_back_as_given() {
+  let Some(corpus) = Corpus::new() else { return };
+  let aac = h264_aac(&corpus, "h264-aac.mp4");
+  let mp3 = audio_file(&corpus, "mp3.mkv", "libmp3lame");
+  let wma = picture_and_sound(
+    &corpus,
+    "wmv2-wma2.mkv",
+    &["-c:v", "wmv2"],
+    &["-c:a", "wmav2", "-ac", "2"],
+  );
+  let opus = opus_mkv(&corpus);
+  let (at_1023, at_1024) = ("a".repeat(1023), "a".repeat(1024));
+  let kept = |titles: &[Option<&str>]| -> Vec<Option<String>> {
+    titles
+      .iter()
+      .map(|title| title.map(str::to_owned))
+      .collect()
+  };
+  let untitled = || MuxOpenError::ChapterWithoutTitle { chapter: 0 };
+  let cases: Vec<(
+    &str,
+    (&str, &Path),
+    Vec<Option<&str>>,
+    Result<(Vec<Option<String>>, Vec<Uncarried>), MuxOpenError>,
+  )> = vec![
+    (
+      "mp4",
+      ("mp4", &aac),
+      vec![Some(""), Some(" "), Some("a title")],
+      Ok((kept(&[Some(""), Some(" "), Some("a title")]), vec![])),
+    ),
+    ("mp4-untitled", ("mp4", &aac), vec![None], Err(untitled())),
+    (
+      "mov",
+      ("mov", &aac),
+      vec![Some(""), Some(" "), Some("a title")],
+      Ok((kept(&[Some(""), Some(" "), Some("a title")]), vec![])),
+    ),
+    ("mov-untitled", ("mov", &aac), vec![None], Err(untitled())),
+    (
+      "3gp",
+      ("3gp", &aac),
+      vec![Some(""), Some(" "), Some("a title")],
+      Ok((kept(&[Some(""), Some(" "), Some("a title")]), vec![])),
+    ),
+    ("3gp-untitled", ("3gp", &aac), vec![None], Err(untitled())),
+    (
+      "mkv",
+      ("matroska", &aac),
+      vec![None, Some(""), Some(" ")],
+      Ok((kept(&[None, Some(""), Some(" ")]), vec![])),
+    ),
+    (
+      "webm",
+      ("webm", &opus),
+      vec![None, Some(""), Some(" ")],
+      Ok((kept(&[None, Some(""), Some(" ")]), vec![])),
+    ),
+    (
+      "mp3",
+      ("mp3", &mp3),
+      vec![Some(" "), Some("a title")],
+      Ok((kept(&[Some(" "), Some("a title")]), vec![])),
+    ),
+    ("mp3-empty", ("mp3", &mp3), vec![Some("")], Err(untitled())),
+    (
+      "mp3-untitled",
+      ("mp3", &mp3),
+      vec![Some("a title"), None],
+      Err(MuxOpenError::ChapterWithoutTitle { chapter: 1 }),
+    ),
+    (
+      "asf",
+      ("asf", &wma),
+      vec![Some(""), Some(" "), Some(&at_1023)],
+      Ok((kept(&[Some(""), Some(" "), Some(&at_1023)]), vec![])),
+    ),
+    ("asf-untitled", ("asf", &wma), vec![None], Err(untitled())),
+    (
+      "asf-long",
+      ("asf", &wma),
+      vec![Some(&at_1024)],
+      Err(MuxOpenError::ChapterTitleTooLong { chapter: 0 }),
+    ),
+    (
+      "nut",
+      ("nut", &aac),
+      vec![None, Some(""), Some(" "), Some(&at_1023)],
+      Ok((kept(&[None, Some(""), Some(" "), Some(&at_1023)]), vec![])),
+    ),
+    (
+      "nut-long",
+      ("nut", &aac),
+      vec![Some(&at_1024)],
+      Ok((vec![None], vec![Uncarried::ChapterTitle { chapter: 0 }])),
+    ),
+    (
+      "opus",
+      ("opus", &opus),
+      vec![None, Some(" ")],
+      Ok((kept(&[None, Some(" ")]), vec![])),
+    ),
+    (
+      "opus-empty",
+      ("opus", &opus),
+      vec![Some("")],
+      Ok((vec![None], vec![Uncarried::ChapterTitle { chapter: 0 }])),
+    ),
+  ];
+  for (name, through, titles, expected) in cases {
+    let got = titles_through(&corpus, &format!("l163-{name}"), through, &titles);
+    // The open's refusal holds no equality of its own: compared as shown.
+    assert_eq!(format!("{got:?}"), format!("{expected:?}"), "{name}");
+  }
 }

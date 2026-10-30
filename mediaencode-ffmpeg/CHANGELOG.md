@@ -486,6 +486,14 @@ crate moves only when it changes.
   laws' seam `MuxOptions::with_lowered_tag_bound`, hidden). An untitled
   chapter, which MP3's reader reads back titled with its element id, is
   refused as the MOV family's is (`MuxOpenError::ChapterWithoutTitle`).
+- **Every chapter title read back as given, or refused, or reported
+  (R17).** By the census of every muxer that writes chapters: MP3's empty
+  title, whose `TIT2` of no text its reader skips, and ASF's untitled
+  marker, which reads back titled empty, are refused
+  (`MuxOpenError::ChapterWithoutTitle`), and ASF's title past the 1023
+  bytes its reader takes (`MuxOpenError::ChapterTitleTooLong`); Ogg's
+  empty title in Opus tags and NUT's of 1024 bytes or more, each read
+  back untitled, are reported (`Uncarried::ChapterTitle`, new).
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer

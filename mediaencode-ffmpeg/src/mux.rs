@@ -552,6 +552,23 @@
 //! | a chapter's start and end | an `int` of milliseconds in 32 bits (300–310) | a time, not a length: one past it reported ([`Uncarried::ChapterSpan`]) |
 //! | a picture's frame, a private frame, a user text frame | 28 or 32 bits (405–411, 142–144) | none written: no picture, and no metadata but the `encoder` |
 //!
+//! **Chapter titles, by mechanism** (R17, Codex R16; the class: a title
+//! the chapter never had refused, a title lost reported). Every admitted
+//! muxer that writes chapters, by grep `nb_chapters` over its writer, and
+//! its reader, of a chapter untitled, titled empty, titled of whitespace
+//! alone, and titled long — no reader trims a title:
+//!
+//! | container | untitled | empty | whitespace | long |
+//! |---|---|---|---|---|
+//! | MP4, MOV, iPod: the chapter track over the Nero list (`movenc.c` 7727–7815, 5040–5064; `mov.c` 10091–10188, 614–650) | refused: the track holds titled chapters alone ([`MuxOpenError::ChapterWithoutTitle`]) | kept: a sample of no title, read back empty (10164–10165) | kept | past 65535 bytes refused ([`MuxOpenError::ChapterTitleTooLong`]) |
+//! | 3GP, 3G2, F4V, ISMV: the Nero list | refused: read back titled empty | kept | kept | past 255 bytes refused, cut |
+//! | Matroska, WebM (`matroskaenc.c` 2411–2494; `matroskadec.c` 666, 1056–1078, 3548–3562) | kept: no `ChapterDisplay` | kept: a `ChapString` of no bytes, read back empty | kept | kept |
+//! | MP3: ID3v2 (`id3v2enc.c` 292–329; `id3v2.c` 336–374, 1225–1248) | refused: read back titled `chN` | refused: its `TIT2` of no text skipped, read back titled `chN` (R17) | kept | the tag's 28 bits ([`MuxOpenError::TagTooLarge`]) |
+//! | ASF, its markers (`asfenc.c` 311–347; `asfdec_f.c` 660–697) | refused: read back titled empty (R17) | kept: a name of its terminator alone | kept | past its entry's 16-bit length, or 1023 bytes of UTF-8 read back cut, refused (R17) |
+//! | NUT, its info packets (`nutenc.c` 509–515, 587–612; `nutdec.c` 44–66, 505–626) | kept: no `title` | kept: a value of no bytes | kept | of 1024 bytes or more read back untitled, reported ([`Uncarried::ChapterTitle`], R17) |
+//! | Ogg's Opus tags (`vorbiscomment.c` 62–115; `oggparsevorbis.c` 43–72, 100–145) | kept: no `NAME` | read back untitled, a comment of no value skipped: reported ([`Uncarried::ChapterTitle`], R17) | kept | each comment's 32-bit length |
+//! | ASF's streaming form, AVI, the MXF muxers, the MPEG muxers, the raw streams and the rest | — | — | — | no chapter written, each reported ([`Uncarried::Chapter`]) |
+//!
 //! **What a write allocates, and when** (R15, Codex R14 3: decide first,
 //! pay after): a packet is judged before anything is allocated for it —
 //! every rule of the face, of libavformat and of the container, over the
@@ -800,6 +817,7 @@
 //! | a chapter's id | MP4 keeps none: its reader numbers chapters by position (`mov.c`'s `chpl` and chapter track); Matroska renumbers every chapter from 1 where one's id is 0 or repeats (`matroskaenc.c` 2399–2442) | reported at open ([`Uncarried::ChapterId`]) |
 //! | a chapter's span | MP4 counts it in its movie timescale (table C′) and its reader ends each chapter where the next starts (`movenc.c` 7727–7815); Matroska counts it in nanoseconds (2439–2440), each rounded to the nearest | reported at open where an instant moves ([`Uncarried::ChapterSpan`]) |
 //! | a chapter without a title, a title past 65535 bytes | MP4 writes every chapter into its Nero list but a titled one alone into its chapter track, which its reader lays over the list by position; a title with a 16-bit length (`movenc.c` 7791–7807) | refused at open ([`MuxOpenError::ChapterWithoutTitle`], [`ChapterTitleTooLong`](MuxOpenError::ChapterTitleTooLong)) |
+//! | a chapter's title, read back otherwise (R17, Codex R16; the census of chapter titles below) | MP3's of no text and ASF's untitled read back with a title the chapter never had; ASF's past 1023 bytes read back cut; Ogg's Opus tags of no text and NUT's of 1024 bytes or more read back untitled | a title the chapter never had refused at open ([`MuxOpenError::ChapterWithoutTitle`], [`ChapterTitleTooLong`](MuxOpenError::ChapterTitleTooLong)); a title lost reported at open ([`Uncarried::ChapterTitle`]) |
 //! | VP9's hidden frames, still held at the stream's end | dropped by the filter, which no later frame shows (`vp9_superframe.c` 198–207) | reported at `finish` ([`Uncarried::Held`], with the report [`CarrierMuxer::finish_into_sink`] hands back): the muxer cannot know at a held frame that none will follow, and does not refuse the file for it |
 //! | PGS segments, still held at the stream's end | written as one packet marked corrupt (`pgs_frame_merge.c` 77–83) | held by this muxer, not FFmpeg's filter: handed back on asking ([`CarrierMuxer::take_held`]), else not written, reported at `finish` ([`Uncarried::Held`]) |
 //! | MP4's durations, where packets do not abut | kept only as the distance to the next decode time (`movenc.c` 1241–1259), counted between the samples MP4 writes (table C″); a constant-size audio track's, PCM's, as its samples, its sample table counting each sample one tick from the track's first, so that a packet's time is its place, the samples before it (`mov_write_stts_tag`, 3241–3256; `mov_build_index`, `mov.c` 5015–5100) | reported as learned ([`Rewrite::Durations`]); PCM's moved packet as the timeline it moves ([`Rewrite::Timeline`]; R11, Q869 L7 — L138), its duration where it is not its samples |
@@ -957,7 +975,7 @@
 //! | FLAC, MP3 | a video track; FLAC with no configuration, or with one opening with its `fLaC` marker | a video stream taken for an attached picture, one packet of it, the rest ignored, which this muxer makes none of there; refused at the header, or the marker written as the STREAMINFO (`flacenc.c` 203–270; `mp3enc.c` 572–615; `flacenc_header.c` 28–45) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationMissing`], [`MuxOpenError::ConfigurationInvalid`] — L76 |
 //! | MP3, at open | a table of more than 255 chapters | its ID3v2 table of contents counts them in 8 bits, wrapped (`write_ctoc`, `id3v2enc.c` 274) | [`MuxOpenError::ChapterCount`] — L80 |
 //! | MP3, at open (R15b, ruled) | chapters whose ID3v2 tag — libavformat's `encoder` and the chapters, counted exactly — passes `2^28 - 1` bytes beside its header | its size written cut into its 28 syncsafe bits, the reader skipping into the tag (`ff_id3v2_finish`, `id3v2enc.c` 421–443) | [`MuxOpenError::TagTooLarge`] — L161 |
-//! | MP3, at open (R15b, ruled) | a chapter without a title | written with no `TIT2`, read back titled with its element id, `ch` and its position (`write_chapter`, `id3v2enc.c` 292–329; `ff_id3v2_parse_chapters`, `id3v2.c` 1238–1243; `avpriv_new_chapter`, `demux_utils.c` 75), as the MOV family's untitled chapter is refused | [`MuxOpenError::ChapterWithoutTitle`] — L161 |
+//! | MP3, at open (R15b, ruled; R17) | a chapter without a title, or of an empty one | written with no `TIT2`, or one of no text its reader skips (`read_ttag`, `id3v2.c` 370–374), read back titled with its element id, `ch` and its position (`write_chapter`, `id3v2enc.c` 292–329; `ff_id3v2_parse_chapters`, `id3v2.c` 1238–1243; `avpriv_new_chapter`, `demux_utils.c` 75), as the MOV family's untitled chapter is refused | [`MuxOpenError::ChapterWithoutTitle`] — L161, L163 |
 //! | IVF | a dimension past 65535 | written cut into its 16-bit field (`ivfenc.c` 65–66) | [`MuxOpenError::Dimensions`] — L77 |
 //! | WAV | a packet past 4 GiB of file; of every codec tag but integer PCM's, a packet past 2^32 samples of presentation span, its duration counted | the sizes left at their placeholders, the file broken; the fact chunk's count cut, read back as the stream's length (`wavenc.c` 409–495) | [`PayloadRule::FileSize`] — L78, L104 |
 //! | FLV | a reordering H.264, MPEG-4, HEVC, AV1, VP9 or VVC packet with no presentation time; a decode time past 32 bits of milliseconds; a composition time past 24 bits; a tag past 24 bits of size; ADTS AAC no filter converts; AAC with no configuration whose first packet brings none; AV1's new configuration — the packet's, or the one `extract_extradata` makes of its sequence headers — `ff_isom_write_av1c` fails on, and under that filter a unit whose OBUs do not parse | refused after taking the packet; written cut; written cut; refused after taking the packet; refused after taking the first, the rest written with their headers in; an empty sequence header, unreadable; an empty sequence header; refused by the filter (`flvenc.c` 1252–1352, 807–860, 892–893; `av1_parse.c` 56–97) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`PayloadRule::TagSize`], [`PayloadRule::AdtsHeader`], [`PayloadRule::ConfigurationAbsent`], [`PayloadRule::NewExtradata`], [`PayloadRule::Obus`] — L50, L82, L109 |
@@ -972,6 +990,7 @@
 //! | WAV, Wave64, AVI, ASF | a configured AAC track's ADTS packet; at open, an audio configuration past the WAVEFORMATEX's 16-bit `cbSize` | written as it comes into a stream whose format declares raw AAC; written, its size cut (`riffenc.c` 193–223) | [`PayloadRule::AdtsHeader`], [`MuxOpenError::ConfigurationInvalid`] — L87, L88 |
 //! | ASF | a decode time past its 32-bit presentation time, the preroll added; a presentation time past what its index counts in an `int` of seconds; a play duration past `i64` in 100 ns; an empty packet | written cut; refused after taking it; a signed overflow; no payload written (`asfenc.c` 886–1038) | [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::Empty`] — L86 |
 //! | ASF, at open | a video configuration past its format data's 16-bit size; a marker's title past its entry's 16-bit length; a chapter at 2^32 ms or later; the streaming form's header past its chunk's 16-bit length | each written, its length or send time cut (`asfenc.c` 645, 337, 297–308, 708–716) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSpan`], [`MuxOpenError::HeaderTooLong`] — L87 |
+//! | ASF, at open (R17) | an untitled chapter; a title past 1023 bytes | its marker written of no name, read back titled empty; its name read back cut into its reader's buffer (`asf_read_marker`, `asfdec_f.c` 660–697) | [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`] — L163 |
 //! | AVI, ASF, at open | a picture whose bytes pass an `int` | the bitmap header's count a signed overflow (`riffenc.c` 265) | [`MuxOpenError::Dimensions`] — L87 |
 //! | NUT | a reordering stream's packet with no presentation time; a key frame presented before its stream's last, or at it but decoded at another time; a presentation time past its 64-bit count of time bases; after the first write, a frame decoded before zero | refused after taking it; the trailer's index asserts (`av_assert0`, 653), ending the process; written wrapped; a syncpoint's count of it unsigned (`nutenc.c` 329–333, 615–667, 979–985, 1041, 1071–1073) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::KeyFrameOrder`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::BeforeZero`] — L90 |
 //! | Ogg | an empty packet; a VP8 frame ending before zero or at 2^31 ticks, a Theora one at 2^(63 − its key-frame shift); a packet whose granule is −1; a lone Vorbis, FLAC or Opus stream's later metadata update that does not unpack | an empty Ogg packet its reader drops, moving the next; a signed shift's overflow; a page read back with no time; the file ended and every later packet refused (`oggenc.c` 660–765) | [`PayloadRule::Empty`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::UnsetGranule`], [`PayloadRule::MetadataUpdate`] — L92 |
@@ -1690,6 +1709,18 @@ pub(crate) const UDTA_BYTES_MAX: u64 = i32::MAX as u64 - 8;
 /// buffer of `INT_MAX` bytes; and the `int` the frames are summed in
 /// (`id3->len`, 97, 280, 308, 318).
 pub(crate) const ID3V2_BYTES_MAX: u64 = (1 << 28) - 1;
+
+/// The most bytes of UTF-8 ASF's reader reads of a marker's name: its
+/// buffer's 1024 less the terminator, a longer name cut (`asf_read_marker`,
+/// `asfdec_f.c` 665, 690–692; `avio_get_str16le`, `aviobuf.c` 887–906) —
+/// R17, Codex R16, by the class.
+const ASF_TITLE_BYTES_MAX: usize = 1023;
+
+/// The most bytes NUT's reader reads of an info value: its buffer's 1024
+/// less the terminator, a value of 1024 bytes or more failing the info
+/// packet's read, left unset (`get_str`, `nutdec.c` 44–66; 513, 559–590) —
+/// R17, Codex R16, by the class.
+const NUT_TITLE_BYTES_MAX: usize = 1023;
 
 impl Default for MuxOptions {
   fn default() -> Self {
@@ -2645,6 +2676,17 @@ pub enum Uncarried {
   /// last at the file's end (table H). Each rescale rounds to the nearest
   /// (`av_rescale_q`).
   ChapterSpan {
+    /// The chapter's position in the table.
+    chapter: usize,
+  },
+  /// A chapter's title the container does not keep: it reads back without
+  /// one — table E of the census (R17, Codex R16, by the class: a title
+  /// lost reported, a title the chapter never had refused). Ogg's of no
+  /// text, written as a comment of no value, which its reader skips
+  /// (`ff_vorbis_comment`, `oggparsevorbis.c` 106–107); NUT's of 1024 bytes
+  /// or more, which its reader's buffer fails to take, the info value left
+  /// unset (`get_str`, `nutdec.c` 44–66; 559–590).
+  ChapterTitle {
     /// The chapter's position in the table.
     chapter: usize,
   },
@@ -4404,7 +4446,11 @@ pub enum MuxOpenError {
   /// MP3 writes an untitled chapter's frame with no `TIT2`, which its reader
   /// reads back titled with the element id, `ch` and its position
   /// (`write_chapter`, `id3v2enc.c` 292–329; `ff_id3v2_parse_chapters`,
-  /// `id3v2.c` 1238–1243; R15b, ruled).
+  /// `id3v2.c` 1238–1243; R15b, ruled) — and an empty title's `TIT2` of no
+  /// text, which its reader skips (`read_ttag`, 370–374; R17, Codex R16).
+  /// ASF writes an untitled marker of no name, which its reader reads back
+  /// titled empty (`asf_write_markers`, `asfenc.c` 311–347;
+  /// `asf_read_marker`, `asfdec_f.c` 660–697; R17).
   #[error("chapter {chapter} has no title, which the container writes none of untitled")]
   ChapterWithoutTitle {
     /// The chapter's position in the table.
@@ -4415,7 +4461,9 @@ pub enum MuxOpenError {
   /// 7797–7801), the Nero list's 8 of 3GP, 3G2, F4V and ISMV (5052–5055),
   /// each read back cut; ASF's marker entry's, which counts its 12 bytes and the title in
   /// UTF-16 with its terminator (`asf_write_markers`, `asfenc.c` 337), so
-  /// that a reader stepping by it misreads the markers after.
+  /// that a reader stepping by it misreads the markers after, and ASF's
+  /// reader's 1023 bytes of UTF-8, a longer title read back cut
+  /// (`asf_read_marker`, `asfdec_f.c` 665, 690–692; R17).
   #[error("chapter {chapter}'s title is longer than the container writes")]
   ChapterTitleTooLong {
     /// The chapter's position in the table.
@@ -9414,16 +9462,26 @@ where
       // MP3's reader titles a chapter of no `TIT2` with its element id, `ch`
       // and its position (`ff_id3v2_parse_chapters`, `id3v2.c` 1238–1243;
       // `avpriv_new_chapter`, `demux_utils.c` 75): a title it never had,
-      // refused as the MOV family's untitled chapter is (R15b, ruled). Its
-      // titles' lengths are the ID3v2 tag's to bound ([`id3v2_too_large`]).
-      if audited == Audited::Mp3 && chapter.title().is_none() {
+      // refused as the MOV family's untitled chapter is (R15b, ruled) — and
+      // so is an empty title's, whose `TIT2` of no text its reader skips
+      // (`read_ttag`, 370–374; R17, Codex R16). Its titles' lengths are the
+      // ID3v2 tag's to bound ([`id3v2_too_large`]).
+      if audited == Audited::Mp3
+        && chapter
+          .title()
+          .is_none_or(|title| title.as_str().is_empty())
+      {
         return Err(MuxOpenError::ChapterWithoutTitle { chapter: index });
       }
       // ASF's marker (`asf_write_markers`, `asfenc.c` 311–347): its entry's
       // 16-bit length counts 12 bytes and the title in UTF-16 with its
       // terminator; its send time, the index's second before the start in
       // a DWORD of milliseconds (297–308, 338), can pass it only for a
-      // start at 2^32 ms or later.
+      // start at 2^32 ms or later. Its reader titles every marker — one of
+      // no name empty, a title the chapter never had — and reads a name
+      // into a buffer of 1024 bytes of UTF-8, cutting a longer one
+      // (`asf_read_marker`, `asfdec_f.c` 660–697; `avio_get_str16le`,
+      // `aviobuf.c` 887–906): both refused (R17, Codex R16, by the class).
       // NUT's chapter start, the count of time bases times it and its
       // base's place, unsigned in 64 bits (`write_chapter`, `nutenc.c` 601).
       if audited == Audited::Nut {
@@ -9433,8 +9491,12 @@ where
         }
       }
       if audited == (Audited::Asf { stream: false }) {
+        if chapter.title().is_none() {
+          return Err(MuxOpenError::ChapterWithoutTitle { chapter: index });
+        }
         if chapter.title().is_some_and(|title| {
-          12 + 2 * (title.as_str().encode_utf16().count() + 1) > usize::from(u16::MAX)
+          title.as_str().len() > ASF_TITLE_BYTES_MAX
+            || 12 + 2 * (title.as_str().encode_utf16().count() + 1) > usize::from(u16::MAX)
         }) {
           return Err(MuxOpenError::ChapterTitleTooLong { chapter: index });
         }
@@ -16591,6 +16653,15 @@ fn chapter_losses(
             lost.push(Uncarried::Chapter { chapter: index });
             continue;
           };
+          // A title of no text written as a comment of no value, which the
+          // reader skips (`ff_vorbis_comment`, `oggparsevorbis.c` 106–107):
+          // the chapter read back untitled.
+          if chapter
+            .title()
+            .is_some_and(|title| title.as_str().is_empty())
+          {
+            lost.push(Uncarried::ChapterTitle { chapter: index });
+          }
           if chapter.id() != index as i64 {
             lost.push(Uncarried::ChapterId {
               chapter: index,
@@ -16619,6 +16690,14 @@ fn chapter_losses(
               chapter: index,
               id: chapter.id(),
             });
+          }
+          // A title past what its reader's buffer takes, left unread: the
+          // chapter read back untitled ([`NUT_TITLE_BYTES_MAX`]).
+          if chapter
+            .title()
+            .is_some_and(|title| title.as_str().len() > NUT_TITLE_BYTES_MAX)
+          {
+            lost.push(Uncarried::ChapterTitle { chapter: index });
           }
         }
       }
