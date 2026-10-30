@@ -16937,3 +16937,173 @@ fn l146_asf_refuses_hevc_whatever_its_tag() {
     );
   }
 }
+
+/// An `AVMasteringDisplayMetadata` of BT.709's primaries and D65's white
+/// point in fifty-thousandths, but `white`, of luminances `min` and `max`
+/// in ten-thousandths of a candela, both parts stated.
+fn display(white: (i32, i32), min: i32, max: i32) -> Vec<u8> {
+  let mut fields = Vec::new();
+  for (x, y) in [(32_000, 16_500), (15_000, 30_000), (7_500, 3_000)] {
+    fields.extend([x, 50_000, y, 50_000]);
+  }
+  fields.extend([white.0, 50_000, white.1, 50_000]);
+  fields.extend([min, 10_000, max, 10_000, 1, 1]);
+  words(&fields)
+}
+
+/// **L147 — FLV reports a coded side data entry its reader rebuilds
+/// otherwise** (R12, Codex R11; `flv_write_metadata_packet`, `flvenc.c`
+/// 611–662; `flv_update_video_color_info`, `flvdec.c` 1246–1321): FLV's
+/// metadata packet writes a VP9 track's content light level whole, and its
+/// reader rebuilds it only of MaxCLL and MaxFALL both nonzero — a MaxCLL
+/// alone, and a MaxFALL alone, read back of no entry, each reported at open
+/// as lost (`Uncarried::CodedSideData`, `CodedSideDataReadBack::Lost`), the
+/// file's packets those written; both nonzero read back as stated, of no
+/// line. Its reader rebuilds a mastering display's primaries only of every
+/// coordinate above zero and its luminance only of both bounds above zero:
+/// a display of a zero minimum luminance reads back of its primaries alone,
+/// one of a zero white point of its luminance alone, each reported as what
+/// reads back; one of every value above zero reads back whole, of no line.
+///
+/// PLANT: MaxFALL unjudged, the MaxCLL alone unreported; MaxCLL unjudged,
+/// the MaxFALL alone unreported; the line pushed where both are nonzero
+/// too; the minimum luminance unjudged; the white point unjudged.
+#[test]
+fn l147_flv_reports_a_coded_side_data_entry_its_reader_rebuilds_otherwise() {
+  use ffmpeg_next::ffi::{AVColorSpace as Space, AVPacketSideDataType as T};
+  use mediaencode_ffmpeg::CodedSideDataReadBack as Back;
+  let Some(corpus) = Corpus::new() else { return };
+  let source = vp9_webm(&corpus);
+  let (_, frames) = first_track(&source, TrackKind::Video, 3);
+  let frames: Vec<Video> = frames.iter().map(video_of).collect();
+  let cll = T::AV_PKT_DATA_CONTENT_LIGHT_LEVEL;
+  let mdcv = T::AV_PKT_DATA_MASTERING_DISPLAY_METADATA;
+  let white = (15_635, 16_450);
+  for (name, kind, bytes, read_back) in [
+    (
+      "l147-cll-only.flv",
+      cll,
+      words(&[1000, 0]),
+      Some(Back::Lost),
+    ),
+    (
+      "l147-fall-only.flv",
+      cll,
+      words(&[0, 400]),
+      Some(Back::Lost),
+    ),
+    ("l147-both.flv", cll, words(&[1000, 400]), None),
+    (
+      "l147-minimum-zero.flv",
+      mdcv,
+      display(white, 0, 10_000_000),
+      Some(Back::MasteringDisplay {
+        primaries: true,
+        luminance: false,
+      }),
+    ),
+    (
+      "l147-white-zero.flv",
+      mdcv,
+      display((0, 16_450), 50, 10_000_000),
+      Some(Back::MasteringDisplay {
+        primaries: false,
+        luminance: true,
+      }),
+    ),
+    (
+      "l147-display.flv",
+      mdcv,
+      display(white, 50, 10_000_000),
+      None,
+    ),
+  ] {
+    let row = with_coded(
+      reticketed(table_of(&source, TrackKind::Video).remove(0), |par| {
+        par.color_space = Space::AVCOL_SPC_BT709;
+      }),
+      kind,
+      &bytes,
+    );
+    let target = output(&corpus, name);
+    let (mut muxer, report) = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new("flv"),
+      vec![row],
+      &[],
+      PacketLimits::default(),
+    )
+    .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    let expected: Vec<Uncarried> = read_back
+      .into_iter()
+      .map(|read_back| Uncarried::CodedSideData {
+        track: TrackIndex::new(0),
+        kind: kind as i32,
+        name: mediaio_ffmpeg::extras::packet_side_data_name(kind as i32),
+        read_back,
+      })
+      .collect();
+    assert_eq!(
+      lines(&report, |line| matches!(
+        line,
+        Uncarried::CodedSideData { .. }
+      )),
+      expected,
+      "{name}: the report"
+    );
+    for (index, frame) in frames.iter().enumerate() {
+      let at = 40 * index as i64;
+      muxer
+        .write_video(video_at(frame, Some(at), at))
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    }
+    muxer.finish().expect("finished");
+    // What FLV's reader rebuilds: the light level, as stated, or none; the
+    // display, of the parts the report names.
+    let back = table_of(&target, TrackKind::Video).remove(0);
+    let entry = back
+      .side_data()
+      .coded_side_data()
+      .iter()
+      .find(|entry| entry.kind() == kind as i32)
+      .map(|entry| entry.data().to_vec());
+    let flags = |bytes: &[u8]| {
+      [80, 84]
+        .map(|at| i32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]))
+    };
+    match (kind, read_back) {
+      (_, Some(Back::Lost)) => assert_eq!(entry, None, "{name}: read back of no entry"),
+      (T::AV_PKT_DATA_CONTENT_LIGHT_LEVEL, None) => {
+        assert_eq!(entry, Some(bytes.clone()), "{name}: read back as stated");
+      }
+      (
+        _,
+        Some(Back::MasteringDisplay {
+          primaries,
+          luminance,
+        }),
+      ) => assert_eq!(
+        entry.as_deref().map(flags),
+        Some([i32::from(primaries), i32::from(luminance)]),
+        "{name}: read back of the parts reported"
+      ),
+      _ => assert_eq!(
+        entry.as_deref().map(flags),
+        Some([1, 1]),
+        "{name}: read back whole"
+      ),
+    }
+    assert_eq!(
+      packets(&target)[0]
+        .iter()
+        .map(|seen| seen.bytes.clone())
+        .collect::<Vec<_>>(),
+      frames
+        .iter()
+        .map(|frame| frame.data().as_ref().to_vec())
+        .collect::<Vec<_>>(),
+      "{name}: the packets as written"
+    );
+  }
+}

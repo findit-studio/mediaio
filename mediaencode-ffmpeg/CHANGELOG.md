@@ -435,6 +435,16 @@ crate moves only when it changes.
   WebM's stereo 3D of checkerboard, lines or columns, which its check,
   wanting its mask, writes as modes WebM defines not, and of frame
   sequence, which fails its header (`MuxOpenError::StereoMode`, new).
+- **A coded side data entry FLV's reader rebuilds otherwise, reported
+  (R12, Codex R11).** FLV writes an HEVC, AV1, VP9 or VVC track's content
+  light level and mastering display into its metadata packet whole, and
+  its reader rebuilds the light level only of MaxCLL and MaxFALL both
+  nonzero, the display's primaries only of every coordinate above zero and
+  its luminance only of both bounds above zero: the entry, or the part of
+  it, the file reads back without is reported at open
+  (`Uncarried::CodedSideData` and `CodedSideDataReadBack`, new) — the file
+  true, the packets as written. The report's first line of a track's coded
+  side data.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
   for, or keeps only in part, is reported for its track by name the first
