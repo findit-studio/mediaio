@@ -473,6 +473,15 @@ crate moves only when it changes.
   the allocator refuses refuses the packet by name, handed back with
   nothing recorded (`FfmpegMuxRefusal::OutOfMemory`, new). What
   libavformat allocates as it writes the packet is its own.
+- **MP3's ID3v2 tag, within its 28-bit size (R15b).** The mp3 muxer writes
+  the whole tag at its header — this muxer writes no picture into it — and
+  its size, of its frames and their padding, in 28 syncsafe bits, cut past
+  `2^28 - 1`. The tag is counted exactly at open — libavformat's encoder
+  and each chapter's frames — and a table whose chapters would take it
+  past refused, nothing written (`MuxOpenError::TagTooLarge`, new; the
+  laws' seam `MuxOptions::with_lowered_tag_bound`, hidden). An untitled
+  chapter, which MP3's reader reads back titled with its element id, is
+  refused as the MOV family's is (`MuxOpenError::ChapterWithoutTitle`).
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer

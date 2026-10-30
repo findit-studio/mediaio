@@ -18980,3 +18980,124 @@ fn l160_every_allocation_a_commit_makes_refused_hands_the_packet_back() {
     write_subtitle
   );
 }
+
+/// The size MP3's ID3v2 tag at the start of `path` states, beside its
+/// 10-byte header: its frames and their padding, in 28 syncsafe bits.
+fn id3v2_size(path: &Path) -> u64 {
+  let bytes = std::fs::read(path).expect("the file");
+  assert_eq!(&bytes[..3], b"ID3", "an ID3v2 tag");
+  bytes[6..10]
+    .iter()
+    .fold(0, |size, &byte| size << 7 | u64::from(byte & 0x7F))
+}
+
+/// **L161 — MP3's ID3v2 tag is counted exactly, and refused past the 28
+/// bits its size is written in** (R15b, R15's letter 1 ruled: a length
+/// that wraps is refused; `ff_id3v2_finish`, `id3v2enc.c` 421–443): three
+/// titled chapters — the tag FFmpeg writes measured, its size its frames
+/// and the 10 bytes of padding `ff_id3v2_finish` adds; the bound lowered a
+/// byte below the frames, the table refused by name at its last chapter,
+/// nothing written; lowered to the frames, the table taken and the same
+/// tag written, its chapters read back titled as given. The bound is
+/// therefore the tag's frames to the byte. The real bound, `2^28 - 1`, is
+/// the unit law `the_mp3_id3v2_tag_holds_two_to_the_28_less_one`. An
+/// untitled chapter, which MP3's reader reads back titled with its element
+/// id (`ch1`, as this law first found), is refused by name, nothing written
+/// (R15b, ruled: as the MOV family's).
+///
+/// PLANT: each title's frame counted without its header, the table a byte
+/// past taken; the check dropped, the same; the untitled chapter's rule
+/// dropped, the table taken.
+#[test]
+fn l161_mp3s_id3v2_tag_is_counted_exactly_and_refused_past_its_28_bits() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mp3 = audio_file(&corpus, "mp3.mkv", "libmp3lame");
+  let titled = [
+    chapter_of(0, 0, 200, Some("first")),
+    chapter_of(1, 200, 400, Some("2")),
+    chapter_of(2, 400, 600, Some("the third, its title the longer")),
+  ];
+  let open_of = |name: &str, chapters: &[Chapter<Ffmpeg>], bound: Option<u64>| {
+    let target = output(&corpus, name);
+    let options = bound.map_or_else(MuxOptions::new, |bytes| {
+      MuxOptions::new().with_lowered_tag_bound(bytes)
+    });
+    let opened = FfmpegOwnedMuxer::open_with(
+      File::create(&target).expect("create"),
+      ContainerName::new("mp3"),
+      table_of(&mp3, TrackKind::Audio),
+      chapters,
+      options,
+    );
+    (target, opened)
+  };
+  let open = |name: &str, bound: Option<u64>| open_of(name, &titled, bound);
+  let (_, frames) = whole_track(&mp3, TrackKind::Audio);
+  let write =
+    |name: &str,
+     opened: Result<(FfmpegOwnedMuxer<File>, mediaencode_ffmpeg::MuxReport), MuxOpenError>| {
+      let (mut muxer, _) = opened.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+      for frame in &frames {
+        muxer
+          .write_audio(audio_on_zero(audio_of(frame)))
+          .map_err(|error| error.map_packet(drop))
+          .expect("a frame");
+      }
+      muxer.finish().expect("finished");
+    };
+  // What FFmpeg writes.
+  let (target, opened) = open("l161.mp3", None);
+  write("l161.mp3", opened);
+  let size = id3v2_size(&target);
+  let held = size - 10;
+  // A byte below its frames: refused at the last chapter, nothing written.
+  let (refused, opened) = open("l161-refused.mp3", Some(held - 1));
+  match opened {
+    Err(MuxOpenError::TagTooLarge { chapter }) => {
+      assert_eq!(chapter, 2, "the chapter at which it passes")
+    }
+    other => panic!("expected TagTooLarge, got {:?}", other.map(|_| ())),
+  }
+  assert_eq!(
+    std::fs::metadata(&refused).expect("the sink").len(),
+    0,
+    "nothing written"
+  );
+  // Its frames: taken, the same tag, the chapters read back as given.
+  let (taken, opened) = open("l161-taken.mp3", Some(held));
+  write("l161-taken.mp3", opened);
+  assert_eq!(id3v2_size(&taken), size, "the same tag");
+  let demuxer = FfmpegOwnedDemuxer::open(&taken).expect("open");
+  let titles: Vec<_> = demuxer
+    .chapters()
+    .iter()
+    .map(|chapter| chapter.title().map(|title| title.as_str().to_owned()))
+    .collect();
+  assert_eq!(
+    titles,
+    [
+      Some("first".to_owned()),
+      Some("2".to_owned()),
+      Some("the third, its title the longer".to_owned())
+    ],
+    "the chapters read back"
+  );
+  // An untitled chapter, read back titled `ch1`: refused by name, nothing
+  // written.
+  let untitled = [
+    chapter_of(0, 0, 200, Some("first")),
+    chapter_of(1, 200, 400, None),
+  ];
+  let (refused, opened) = open_of("l161-untitled.mp3", &untitled, None);
+  match opened {
+    Err(MuxOpenError::ChapterWithoutTitle { chapter }) => {
+      assert_eq!(chapter, 1, "the untitled chapter")
+    }
+    other => panic!("expected ChapterWithoutTitle, got {:?}", other.map(|_| ())),
+  }
+  assert_eq!(
+    std::fs::metadata(&refused).expect("the sink").len(),
+    0,
+    "nothing written"
+  );
+}

@@ -4845,3 +4845,43 @@ fn the_movie_udta_holds_int_max_less_its_header() {
     "two gibibyte covers refused at the second"
   );
 }
+
+/// MP3's ID3v2 tag holds `2^28 - 1` bytes beside its header (R15b, ruled:
+/// a length that wraps is refused; [`super::ID3V2_BYTES_MAX`]):
+/// `ff_id3v2_finish` writes the size of its frames and their padding in 28
+/// syncsafe bits (`id3v2enc.c` 421–443), so a tag of `2^28 - 1` bytes of
+/// frames is taken and one a byte more refused, at the chapter that brings
+/// it, by the bound the muxer holds — each frame counted as `id3v2enc`
+/// writes it: the `encoder`'s `TSSE`, the table of contents of the
+/// chapters' element ids, each chapter's frame and its title's `TIT2`.
+#[test]
+fn the_mp3_id3v2_tag_holds_two_to_the_28_less_one() {
+  let bound = super::Bounds::REAL.tag;
+  assert_eq!(bound, (1 << 28) - 1, "the tag's 28 syncsafe bits");
+  let ident = super::libavformat_ident_bytes();
+  // The `TSSE`; the table of contents of `ch0` and `ch1`; the untitled
+  // chapter; the titled one, and its `TIT2` but the title.
+  let around =
+    (10 + 1 + ident + 1) + (10 + 4 + 1 + 1 + 4 + 4) + (10 + 4 + 16) + (10 + 4 + 16 + 10 + 1 + 1);
+  let filling = bound - around;
+  assert_eq!(
+    super::id3v2_too_large([None, Some(filling)].into_iter(), bound),
+    None,
+    "a tag of 2^28 - 1 bytes taken"
+  );
+  assert_eq!(
+    super::id3v2_too_large([None, Some(filling + 1)].into_iter(), bound),
+    Some(1),
+    "one byte more refused at its chapter"
+  );
+  assert_eq!(
+    super::id3v2_too_large([Some(bound), None].into_iter(), bound),
+    Some(0),
+    "refused at the first chapter that passes"
+  );
+  assert_eq!(
+    super::id3v2_too_large(core::iter::empty(), bound),
+    None,
+    "a tag of no chapter, the encoder's alone"
+  );
+}

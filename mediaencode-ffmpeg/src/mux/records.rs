@@ -36,7 +36,14 @@
 //! muxer's judgment of a packet, before any of its refusals, so each reads
 //! its configuration in place — a unit's RBSP through [`Bytes`], its units
 //! through iterators, the configuration FLV's `extract_extradata` makes of
-//! a packet through [`Extracted`] — and holds no buffer of its own.
+//! a packet through [`Extracted`] — and holds no buffer of its own. The
+//! cost, accepted (R15b): a byte of an RBSP view of a unit that holds an
+//! emulation prevention byte is found by a walk from the unit's start, so
+//! that a reader of such a unit runs in time quadratic in its length.
+//! Only the configuration writers read a unit through a reader, the
+//! parameter sets alone, which the standards keep small; FLV's split
+//! reads every unit of a packet, slices among them, once, linearly — its
+//! RBSP's length, its trailing bits and its header's first bytes.
 
 use mediaio_ffmpeg::ffi::pix_fmt_sampling;
 

@@ -508,10 +508,31 @@
 //! judged at open; WAV's sizes and fact count, TTML's document — its
 //! header strings judged at open — and the indexes, cues and index tables
 //! of Matroska, AVI, ASF and NUT are of their packets alone. MP3's ID3v2
-//! tag, of its covers, is the one size written whatever the packets that
-//! no bound here judges — its frames' sizes in 28 syncsafe bits
-//! (`ff_id3v2_write_apic`, `id3v2enc.c` 352–420) — sent to the coordinator (R15,
-//! letter 1).
+//! tag, written whole at its header, is judged at open by its exact size
+//! (R15b, below).
+//!
+//! **MP3's ID3v2 tag** (R15b; R15's letter 1, ruled: a length that wraps
+//! is refused). The mp3 muxer writes it whole at its header where no
+//! picture is to come (`mp3_write_header`, `mp3enc.c` 617–636): this muxer
+//! writes no picture into it — an attachment is not written, reported, and
+//! a video track refused — so the tag holds the context's metadata,
+//! libavformat's `encoder` alone (`mux.c` 352–356), and the chapters, each
+//! titled (an untitled one, which the reader titles with its element id,
+//! refused: [`MuxOpenError::ChapterWithoutTitle`]). The bound that matters
+//! is therefore the tag's 28-bit total, which only the chapters' titles
+//! can push past. Every length the writer derives (`id3v2enc.c`), and which
+//! binds:
+//!
+//! | length | written in | here |
+//! |---|---|---|
+//! | the tag's: its frames and their padding | 28 syncsafe bits, the padding of 10 clipped to what is left below `2^28 - 1` (`ff_id3v2_finish`, 421–443) | **binding**: frames past `2^28 - 1` written with the size cut, the reader skipping into the tag — refused at open, the tag counted exactly ([`MuxOpenError::TagTooLarge`], [`ID3V2_BYTES_MAX`]) |
+//! | a text frame's — the `encoder`'s `TSSE`, a chapter's `TIT2` | 28 syncsafe bits at ID3v2.4, the default this muxer keeps (`mp3enc.c` 511–512), 32 at ID3v2.3 (88–92) | within the tag's |
+//! | the table of contents' and each chapter's | 32 bits (283, 321) | within the tag's |
+//! | the table of contents' count | 8 bits (274) | more than 255 chapters refused ([`MuxOpenError::ChapterCount`]) |
+//! | each frame's payload | a dynamic buffer of `INT_MAX` bytes (`aviobuf.c` 1281–1311) | within the tag's |
+//! | the frames' sum | an `int` (`id3->len`, 97, 280, 308, 318) | within the tag's |
+//! | a chapter's start and end | an `int` of milliseconds in 32 bits (300–310) | a time, not a length: one past it reported ([`Uncarried::ChapterSpan`]) |
+//! | a picture's frame, a private frame, a user text frame | 28 or 32 bits (405–411, 142–144) | none written: no picture, and no metadata but the `encoder` |
 //!
 //! **What a write allocates, and when** (R15, Codex R14 3: decide first,
 //! pay after): a packet is judged before anything is allocated for it —
@@ -917,6 +938,8 @@
 //! | ADTS | a configuration ADTS cannot write in its headers; on a configured track an ADTS frame, and a frame past 13 bits of length; on one with no configuration a frame without a header, and new extradata the writer refuses | refused at the header; a second header written; the length refused past 16383 after taking the packet, and below it cut into the field; the frame written headless; refused after taking the packet (`adtsenc.c` 52–190) | [`MuxOpenError::ConfigurationInvalid`], [`PayloadRule::AdtsHeader`], [`PayloadRule::AdtsFrameLength`], [`PayloadRule::AdtsFrame`], [`PayloadRule::NewExtradata`] — L75 |
 //! | FLAC, MP3 | a video track; FLAC with no configuration, or with one opening with its `fLaC` marker | a video stream taken for an attached picture, one packet of it, the rest ignored, which this muxer makes none of there; refused at the header, or the marker written as the STREAMINFO (`flacenc.c` 203–270; `mp3enc.c` 572–615; `flacenc_header.c` 28–45) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationMissing`], [`MuxOpenError::ConfigurationInvalid`] — L76 |
 //! | MP3, at open | a table of more than 255 chapters | its ID3v2 table of contents counts them in 8 bits, wrapped (`write_ctoc`, `id3v2enc.c` 274) | [`MuxOpenError::ChapterCount`] — L80 |
+//! | MP3, at open (R15b, ruled) | chapters whose ID3v2 tag — libavformat's `encoder` and the chapters, counted exactly — passes `2^28 - 1` bytes beside its header | its size written cut into its 28 syncsafe bits, the reader skipping into the tag (`ff_id3v2_finish`, `id3v2enc.c` 421–443) | [`MuxOpenError::TagTooLarge`] — L161 |
+//! | MP3, at open (R15b, ruled) | a chapter without a title | written with no `TIT2`, read back titled with its element id, `ch` and its position (`write_chapter`, `id3v2enc.c` 292–329; `ff_id3v2_parse_chapters`, `id3v2.c` 1238–1243; `avpriv_new_chapter`, `demux_utils.c` 75), as the MOV family's untitled chapter is refused | [`MuxOpenError::ChapterWithoutTitle`] — L161 |
 //! | IVF | a dimension past 65535 | written cut into its 16-bit field (`ivfenc.c` 65–66) | [`MuxOpenError::Dimensions`] — L77 |
 //! | WAV | a packet past 4 GiB of file; of every codec tag but integer PCM's, a packet past 2^32 samples of presentation span, its duration counted | the sizes left at their placeholders, the file broken; the fact chunk's count cut, read back as the stream's length (`wavenc.c` 409–495) | [`PayloadRule::FileSize`] — L78, L104 |
 //! | FLV | a reordering H.264, MPEG-4, HEVC, AV1, VP9 or VVC packet with no presentation time; a decode time past 32 bits of milliseconds; a composition time past 24 bits; a tag past 24 bits of size; ADTS AAC no filter converts; AAC with no configuration whose first packet brings none; AV1's new configuration — the packet's, or the one `extract_extradata` makes of its sequence headers — `ff_isom_write_av1c` fails on, and under that filter a unit whose OBUs do not parse | refused after taking the packet; written cut; written cut; refused after taking the packet; refused after taking the first, the rest written with their headers in; an empty sequence header, unreadable; an empty sequence header; refused by the filter (`flvenc.c` 1252–1352, 807–860, 892–893; `av1_parse.c` 56–97) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`PayloadRule::TagSize`], [`PayloadRule::AdtsHeader`], [`PayloadRule::ConfigurationAbsent`], [`PayloadRule::NewExtradata`], [`PayloadRule::Obus`] — L50, L82, L109 |
@@ -1606,6 +1629,9 @@ struct Bounds {
   /// The most bytes the MOV family's movie `udta` holds beside its header
   /// ([`MuxOpenError::CoversTooLarge`], [`UDTA_BYTES_MAX`]).
   user_data: u64,
+  /// The most bytes MP3's ID3v2 tag holds beside its header
+  /// ([`MuxOpenError::TagTooLarge`], [`ID3V2_BYTES_MAX`]).
+  tag: u64,
 }
 
 impl Bounds {
@@ -1620,6 +1646,7 @@ impl Bounds {
     movie: u32::MAX as u64,
     index: FRAGMENT_BYTES_MAX,
     user_data: UDTA_BYTES_MAX,
+    tag: ID3V2_BYTES_MAX,
   };
 }
 
@@ -1631,6 +1658,20 @@ impl Bounds {
 /// sum of the box's sizes is `update_size`'s, of 64 bits (155–163), but a
 /// cover's `16 + size` in an `int` (4831), its picture smaller still.
 pub(crate) const UDTA_BYTES_MAX: u64 = i32::MAX as u64 - 8;
+
+/// The most bytes MP3's ID3v2 tag holds beside its 10-byte header (R15b,
+/// ruled: a length that wraps is refused): `ff_id3v2_finish` writes the
+/// size of its frames and their padding in 28 syncsafe bits (`id3v2_put_size`,
+/// `id3v2enc.c` 33–39; 421–443), the padding clipped to what is left below
+/// `2^28 - 1` — frames of up to `2^28 - 1` bytes written whole, their size
+/// exact, and past it the size written cut, the reader skipping into the
+/// tag. Every other length the writer derives lies within it: each frame's
+/// size, in 28 syncsafe bits at ID3v2.4 — the mp3 muxer's default, which
+/// this muxer keeps (`mp3enc.c` 511–512) — and in 32 for the table of
+/// contents and each chapter (283, 321); each frame made in a dynamic
+/// buffer of `INT_MAX` bytes; and the `int` the frames are summed in
+/// (`id3->len`, 97, 280, 308, 318).
+pub(crate) const ID3V2_BYTES_MAX: u64 = (1 << 28) - 1;
 
 impl Default for MuxOptions {
   fn default() -> Self {
@@ -1720,6 +1761,7 @@ impl MuxOptions {
       movie: self.bounds.movie,
       index: self.bounds.index,
       user_data: self.bounds.user_data,
+      tag: self.bounds.tag,
     };
     self
   }
@@ -1810,6 +1852,19 @@ impl MuxOptions {
   pub const fn with_lowered_user_data_bound(mut self, bytes: u64) -> Self {
     if bytes < self.bounds.user_data {
       self.bounds.user_data = bytes;
+    }
+    self
+  }
+
+  /// Lowers the bytes MP3's ID3v2 tag may hold beside its header — the
+  /// `2^28 - 1` its size is written in — to `bytes`, never raising it: the
+  /// laws' seam, which shows the bound without a quarter gibibyte of
+  /// chapter titles ([`MuxOpenError::TagTooLarge`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_tag_bound(mut self, bytes: u64) -> Self {
+    if bytes < self.bounds.tag {
+      self.bounds.tag = bytes;
     }
     self
   }
@@ -2092,11 +2147,54 @@ fn pssh_bytes(bytes: &[u8]) -> u64 {
 /// libavformat's `encoder` alone (`mux.c` 352–356), read by none of them
 /// (4848–4880): its `loci`, of a location, none (4710–4758, 5108).
 fn udta_bytes(covers: u64, chapters: &[Chapter<Ffmpeg>]) -> u64 {
+  12 + 33 + 8 + 24 + libavformat_ident_bytes() + covers + chpl_bytes(chapters)
+}
+
+/// The bytes of `LIBAVFORMAT_IDENT` (`version.h` 45): `Lavf` and the linked
+/// library's `major.minor.micro`, the context's `encoder`, which
+/// libavformat sets where no bit-exact flag is set, as here (`mux.c`
+/// 352–356).
+fn libavformat_ident_bytes() -> u64 {
   let version = ffmpeg_next::format::version();
   let digits = |value: u32| u64::from(value.checked_ilog10().map_or(1, |log| log + 1));
-  let name =
-    4 + digits(version >> 16) + 1 + digits((version >> 8) & 0xFF) + 1 + digits(version & 0xFF);
-  12 + 33 + 8 + 24 + name + covers + chpl_bytes(chapters)
+  4 + digits(version >> 16) + 1 + digits((version >> 8) & 0xFF) + 1 + digits(version & 0xFF)
+}
+
+/// The first chapter — of `titles`, each chapter's title's bytes in the
+/// table's order, `None` untitled — at which MP3's ID3v2 tag would pass
+/// `bound` beside its 10-byte header and its padding ([`ID3V2_BYTES_MAX`]),
+/// or `None` (R15b, ruled). The mp3 muxer writes the whole tag at its
+/// header where no picture is to come (`mp3_write_header`, `mp3enc.c`
+/// 617–636), as here, which writes no picture into it — an attachment not
+/// written, a video track refused; counted exactly, each frame its 10-byte
+/// header and its payload (`id3v2enc.c`): the context's metadata, which
+/// holds libavformat's `encoder` alone ([`libavformat_ident_bytes`]), a
+/// `TSSE` of UTF-8 — its encoding's byte, the string and its NUL
+/// (`id3v2_put_ttag`, 66–98; `write_metadata`, 220–257); of a table of
+/// chapters, the table of contents — `toc` and its NUL, its flags, its
+/// 8-bit count and each chapter's element id, `ch`, its position and a NUL
+/// (`write_ctoc`, 259–290); and each chapter — its element id, its times'
+/// and offsets' 16 bytes, and of a title its `TIT2` as the `encoder`'s
+/// (`write_chapter`, 292–329; `ff_id3v2_34_metadata_conv`), the title's only
+/// key the chapter holds.
+fn id3v2_too_large(
+  titles: impl ExactSizeIterator<Item = Option<u64>>,
+  bound: u64,
+) -> Option<usize> {
+  let text = |bytes: u64| 10 + 1 + bytes + 1;
+  let element = |index: usize| 2 + u64::from(index.checked_ilog10().map_or(1, |log| log + 1)) + 1;
+  let count = titles.len();
+  let mut total = text(libavformat_ident_bytes());
+  if count > 0 {
+    total += 10 + 4 + 1 + 1 + (0..count).map(element).sum::<u64>();
+  }
+  for (index, title) in titles.enumerate() {
+    total += 10 + element(index) + 16 + title.map_or(0, text);
+    if total > bound {
+      return Some(index);
+    }
+  }
+  None
 }
 
 /// The first of `covers` — each a cover's track and its picture's bytes, in
@@ -4098,6 +4196,17 @@ pub enum MuxOpenError {
     /// The track.
     track: TrackIndex,
   },
+  /// MP3: chapters whose ID3v2 tag would pass the 28 syncsafe bits its
+  /// size is written in (R15b, ruled: a length that wraps is refused):
+  /// `ff_id3v2_finish` writes the size of its frames and their padding cut
+  /// past `2^28 - 1`, the reader skipping into the tag (`id3v2enc.c`
+  /// 421–443) — the tag counted exactly ([`ID3V2_BYTES_MAX`]), the chapter
+  /// named the first of the table's at which it passes.
+  #[error("chapter {chapter} takes the ID3v2 tag past the 28 bits its size is written in")]
+  TagTooLarge {
+    /// The chapter's position in the table.
+    chapter: usize,
+  },
   /// The MOV family's `moov` before any sample would pass the 32 bits its
   /// size is written in (`update_size`, `movenc.c` 155–163; R15, Codex R14
   /// 2): what its trailer writes whatever the packets — ISMV's at its
@@ -4261,6 +4370,10 @@ pub enum MuxOpenError {
   /// and iPod likewise. 3GP, 3G2, F4V and ISMV write the Nero list alone,
   /// an untitled chapter there titled empty, which reads back so
   /// (`mov_write_chpl_tag`, 5040–5064; `mov_read_chpl`, `mov.c` 614–650).
+  /// MP3 writes an untitled chapter's frame with no `TIT2`, which its reader
+  /// reads back titled with the element id, `ch` and its position
+  /// (`write_chapter`, `id3v2enc.c` 292–329; `ff_id3v2_parse_chapters`,
+  /// `id3v2.c` 1238–1243; R15b, ruled).
   #[error("chapter {chapter} has no title, which the container writes none of untitled")]
   ChapterWithoutTitle {
     /// The chapter's position in the table.
@@ -9245,6 +9358,14 @@ where
           Some(_) => {}
         }
       }
+      // MP3's reader titles a chapter of no `TIT2` with its element id, `ch`
+      // and its position (`ff_id3v2_parse_chapters`, `id3v2.c` 1238–1243;
+      // `avpriv_new_chapter`, `demux_utils.c` 75): a title it never had,
+      // refused as the MOV family's untitled chapter is (R15b, ruled). Its
+      // titles' lengths are the ID3v2 tag's to bound ([`id3v2_too_large`]).
+      if audited == Audited::Mp3 && chapter.title().is_none() {
+        return Err(MuxOpenError::ChapterWithoutTitle { chapter: index });
+      }
       // ASF's marker (`asf_write_markers`, `asfenc.c` 311–347): its entry's
       // 16-bit length counts 12 bytes and the title in UTF-16 with its
       // terminator; its send time, the index's second before the start in
@@ -9272,6 +9393,19 @@ where
           return Err(MuxOpenError::ChapterSpan { chapter: index });
         }
       }
+    }
+    // MP3's ID3v2 tag, which its header writes whole — libavformat's
+    // `encoder` and the chapters — its size in 28 syncsafe bits (R15b,
+    // ruled; [`id3v2_too_large`]).
+    if audited == Audited::Mp3
+      && let Some(chapter) = id3v2_too_large(
+        chapters
+          .iter()
+          .map(|chapter| chapter.title().map(|title| title.as_str().len() as u64)),
+        bounds.tag,
+      )
+    {
+      return Err(MuxOpenError::TagTooLarge { chapter });
     }
     // MP4's chapter track, whose samples MP4 makes at its header from the
     // chapters, counted in the movie timescale its streams' time bases make
