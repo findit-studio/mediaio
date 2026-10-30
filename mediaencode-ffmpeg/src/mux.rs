@@ -626,7 +626,7 @@
 //! | an E-AC-3 track's last sample, joined | the edit list ends it at its last packet's duration (`movenc.c` 6940, 7329–7342), short of the frames it joins | reported at `finish` ([`Rewrite::Durations`]) |
 //! | an E-AC-3 track's frames short of a sample at its end | freed unwritten, the run MP4 joins them in (`mov_free`, `movenc.c` 7951–7955) | reported at `finish` ([`Uncarried::Unjoined`]), the packets counted, as VP9's held frames are (the Fable delta gate's R3); the joining reported at open ([`Rewrite::Ac3Parsed`]) |
 //! | an audio track's channel layout (R10, L1; grep L1) | RIFF's formats — WAV, Wave64, AVI, ASF — write a channel mask in their extensible form alone, for a native layout but mono and stereo, above 48 kHz, for E-AC-3 and DFPWM, and above 16 bits a sample but IEEE float's, and that mask only below `0x40000` (`riffenc.c` 79–84, 188–197), read back as its layout where it names the stream's channels, else as the count (`riffdec.c` 62–92, 141–275); Matroska and WebM, NUT, MXF and MP4 of no layout box write the count alone (`matroskaenc.c` 2130; `nutenc.c` 487; `mxfenc.c` 1714–1728; `movenc.c` 1438–1449), MP4's PCM of two channels and more its `chnl` box, read back as written (1299–1339, 1524–1525; `mov_chan.c` 768–859); raw FLAC and Matroska write FLAC's mask comment for a native layout within `0x3FFFF` its own order does not name, Ogg none (`flacenc.c` 244–259; `matroskaenc.c` 1077–1114); FLV a legacy codec's mono or stereo flag, read back as `av_channel_layout_default`'s, and an extended codec's multichannel configuration, of its first 18 mask bits and six from `AV_CHAN_LOW_FREQUENCY_2`, a custom map's channels of those, `AV_CHAN_UNKNOWN` for any other, and the default for another order (`flvenc.c` 722–761, 910–913; `flvdec.c` 1657–1669, 1706–1745); the decoder `avformat_find_stream_info` opens on the first packets keeps that or sets its own — every PCM, ADPCM and DPCM decoder but DVD PCM's, Blu-ray PCM's, SMPTE 302M's, G.722's, G.726's and VIMA's keeps it, as do 34 others and a codec of no decoder in the build, and FLAC's fills its own order in where the container states none of the stream's count (`libavcodec/flac.c` 173–185) — and a codec's own reads back as it is, which the trust model holds the declared layout to be — a decoder's convention for a count, DVD PCM's `av_channel_layout_default`, Speex's and SBC's of no order, the speech codecs' mono, among them (`libavcodec/pcm-dvd.c` 96–97, `speexdec.c` 1503–1505, `sbcdec.c` 349–351; [`LayoutDecoder::Own`]): the decoder's, not a change the muxer makes, accepted under the trust model and not reported (R11, ruling 3); no container writes a custom channel's name | reported at open, once the header has settled the stream's codec tag, where it reads back otherwise ([`Uncarried::ChannelLayout`], [`LayoutReadBack`]) — L125–L131 and the unit law `channel_layouts_read_back_as_each_container_and_decoder_reads_them`; refused at open where the reader refuses what the writer writes, before any decoder could set a layout its own: FLV's native mask of no channel its configuration keeps, written as zero, which its reader refuses at the first audio tag, the stream read back of no channels, which no decoder takes (`flvdec.c` 1733–1742; [`MuxOpenError::ChannelLayout`]; R11, Codex R10 1 — L135) — the one reader's refusal a written layout reaches, by grep of every reader's layout calls that can refuse (R11): RIFF's mask, its answer ignored (`riffdec.c` 73); FLAC's comment, checked and warned (`flacdec.c` 210–216, `matroskadec.c` 2189–2194); NUT's count of none (`nutdec.c` 470), refused at open already; MP4's and MOV's boxes, their readers' refusals ignored (`mov.c` 1236, 1261; 897, 1160, 1211, 8826, 9018–9100 the same); MXF's labels, which MXF writes none of (`mxfdec.c` 2618, 2680); FLV's custom count of none (`flvdec.c` 1715), past 255 channels, which no codec FLV takes reaches; FLV's legacy codec of a layout but mono and stereo, whose multichannel header asserts, stays refused (L105), MP4's PCM of a layout its `chnl` box cannot write too ([`MuxOpenError::ChannelLayout`]), and every other container writes a count it holds whole |
-//! | FLV's coded side data (R12, Codex R11) | FLV writes an HEVC, AV1, VP9 or VVC track's content light level and mastering display into its metadata packet at the track's first packet, whole — the light level's two counts, the display's primaries and luminance each as its flag states, a rational as `av_q2d`'s double (`flv_write_metadata_packet`, `flvenc.c` 611–662); its reader keeps the counts in 16 bits and the display's values in floats, and rebuilds the light level only of both counts nonzero, the display's primaries only of all eight coordinates above zero, and its luminance only of both bounds above zero (`flvdec.c` 49–68, 776–806, 1246–1321): a light level of a zero count, and a display of a zero coordinate or bound, or of neither part, read back without it — the file true, the packets as written; a value FLV keeps in fewer bits is refused first ([`MuxOpenError::CodedSideData`]); the colour description's fields, which its reader takes but a reserved value no stream the standards allow states (1261–1268), read back as written, an unspecified matrix refused ([`MuxOpenError::ColourDescription`]) | reported at open ([`Uncarried::CodedSideData`], [`CodedSideDataReadBack`]) — L147 |
+//! | FLV's coded side data (R12, Codex R11) | FLV writes an HEVC, AV1, VP9 or VVC track's content light level and mastering display into its metadata packet at the track's first packet, whole — the light level's two counts, the display's primaries and luminance each as its flag states, a rational as `av_q2d`'s double (`flv_write_metadata_packet`, `flvenc.c` 611–662); its reader keeps the counts in 16 bits and the display's values in floats, and rebuilds the light level only of both counts nonzero, the display's primaries only of all eight coordinates above zero, and its luminance only of both bounds above zero (`flvdec.c` 49–68, 776–806, 1246–1321): a light level of a zero count, and a display of a zero coordinate or bound, or of neither part, read back without it — the file true, the packets as written; and each value its reader keeps in a float, made a rational again by `av_d2q`, reads back as that rational — 17/25 as 11408507/16777216 — reported as read back where not the one declared, however near (R13, Codex R12 3 and the ruled letter); a value FLV keeps in fewer bits is refused first ([`MuxOpenError::CodedSideData`]); the colour description's fields, which its reader takes but a reserved value no stream the standards allow states (1261–1268), read back as written, an unspecified matrix refused ([`MuxOpenError::ColourDescription`]) | reported at open ([`Uncarried::CodedSideData`], [`CodedSideDataReadBack`]) — L147 |
 //!
 //! The report covers these fields and those of the tables above; a codec's
 //! parameters beyond its configuration — its color properties, its field
@@ -822,7 +822,7 @@ use mediaencode::{
 };
 use mediaio_ffmpeg::{
   CarrierOps, ChannelLayoutTicket, CodecId, CodecTicket, CustomChannel, Ffmpeg, FfmpegCarrier,
-  Owned, PacketLimits, PacketRefusal, View,
+  Owned, PacketLimits, PacketRefusal, Ratio, View,
   boundary::check_packet_build,
   extras::{SideDataEntry, packet_side_data_name},
   hdr_metadata::{check_hdr10_plus, check_smpte2094_app5},
@@ -2007,11 +2007,14 @@ pub enum Uncarried {
   /// rebuilds each only of what it takes as stated: the content light
   /// level only of both MaxCLL and MaxFALL nonzero, the mastering
   /// display's primaries only of each of the eight coordinates above zero
-  /// and its luminance only of both bounds above zero
+  /// and its luminance only of both bounds above zero, each value read into
+  /// a float and made a rational again by `av_d2q`, so that a value reads
+  /// back as another rational of it to a float's precision
   /// (`flv_write_metadata_packet`, `flvenc.c` 611–662;
-  /// `flv_update_video_color_info`, `flvdec.c` 1246–1321 in FFmpeg 9.0.1).
-  /// The file stays true: it lacks what reads back lost, and the packets
-  /// are written as they are. Reported at open.
+  /// `flv_update_video_color_info`, `flvdec.c` 1246–1321 in FFmpeg 9.0.1;
+  /// R13, ruled: the report says what reads back). The file stays true: it
+  /// lacks what reads back lost, and the packets are written as they are.
+  /// Reported at open.
   CodedSideData {
     /// The track.
     track: TrackIndex,
@@ -2122,15 +2125,18 @@ impl LayoutReadBack {
 pub enum CodedSideDataReadBack {
   /// No entry of the kind: the reader rebuilds none.
   Lost,
-  /// A mastering display's entry of part of what it states:
-  /// `AVMasteringDisplayMetadata`'s `has_primaries` and `has_luminance` as
-  /// the reader sets them — one of them at least — the values of the part
-  /// it does not set lost.
+  /// A mastering display's entry as the reader rebuilds it, where it is not
+  /// the one declared — a part it does not set, or a value it reads back as
+  /// another rational, however near: each part it sets, of the values it
+  /// rebuilds, `None` of a part it does not set, one part at least set.
   MasteringDisplay {
-    /// Whether its display primaries and white point read back.
-    primaries: bool,
-    /// Whether its luminance range reads back.
-    luminance: bool,
+    /// The display's primaries — red, green and blue, each its x and y —
+    /// and its white point's x and y, in `AVMasteringDisplayMetadata`'s
+    /// order, as read back; `None` where `has_primaries` is not set.
+    primaries: Option<[Ratio; 8]>,
+    /// The display's minimum and maximum luminance, as read back; `None`
+    /// where `has_luminance` is not set.
+    luminance: Option<[Ratio; 2]>,
   },
 }
 
@@ -11853,52 +11859,77 @@ fn rescale_near(a: i64, b: i64, c: i64) -> i64 {
 /// What FLV's reader rebuilds of a coded side data entry of `kind`, the
 /// libavutil struct `bytes`, of an HEVC, AV1, VP9 or VVC track, where it
 /// is not the entry declared ([`Uncarried::CodedSideData`]; R12, Codex
-/// R11). FLV's metadata packet writes the content light level whole and the
-/// mastering display's primaries and luminance each as its flag states, a
-/// rational as `av_q2d`'s double (`flv_write_metadata_packet`, `flvenc.c`
-/// 611–662); its reader keeps each value in a 16-bit count or a float and
-/// rebuilds the content light level only of both counts nonzero, the
-/// display's primaries only of all eight coordinates above zero and its
-/// luminance only of both bounds above zero (`flvdec.c` 49–68, 776–806,
-/// 1246–1321). A value FLV keeps in fewer bits is refused at open first
+/// R11; R13). FLV's metadata packet writes the content light level whole
+/// and the mastering display's primaries and luminance each as its flag
+/// states, a rational as `av_q2d`'s double (`flv_write_metadata_packet`,
+/// `flvenc.c` 611–662); its reader keeps each count in 16 bits and each
+/// value in a float, and rebuilds the content light level only of both
+/// counts nonzero, the display's primaries only of all eight coordinates
+/// above zero and its luminance only of both bounds above zero, each value
+/// the rational `av_d2q` makes of its float (`flvdec.c` 49–68, 776–806,
+/// 1246–1321) — asked of libavutil's own (`av_d2q`, through
+/// `ffmpeg_next::Rational::from`), each compared as a rational with the
+/// one declared. A value FLV keeps in fewer bits is refused at open first
 /// ([`MuxOpenError::CodedSideData`]); FLV writes no other kind.
 fn flv_coded_read_back(kind: i32, bytes: &[u8]) -> Option<CodedSideDataReadBack> {
   use AVPacketSideDataType as T;
   let word = |at: usize| {
     bytes
       .get(at..at + 4)
-      .map(|word| [word[0], word[1], word[2], word[3]])
+      .map(|word| i32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
   };
   if kind == T::AV_PKT_DATA_CONTENT_LIGHT_LEVEL as i32 {
-    let (cll, fall) = (u32::from_ne_bytes(word(0)?), u32::from_ne_bytes(word(4)?));
+    let (cll, fall) = (word(0)? as u32, word(4)? as u32);
     return (cll == 0 || fall == 0).then_some(CodedSideDataReadBack::Lost);
   }
   if kind != T::AV_PKT_DATA_MASTERING_DISPLAY_METADATA as i32 {
     return None;
   }
-  // A rational, written as its double and read into a float, taken above
-  // zero — NaN not, an infinity above zero above it.
-  let positive = |at: usize| -> Option<bool> {
-    let num = f64::from(i32::from_ne_bytes(word(at)?));
-    let den = f64::from(i32::from_ne_bytes(word(at + 4)?));
-    Some((num / den) as f32 > 0.0)
+  // Each value as declared, and as written: its double, `av_q2d`'s; its
+  // reader keeps it in a float, takes it where above zero — a NaN not, a
+  // positive infinity so — and makes a rational of that float by
+  // `av_d2q(…, INT_MAX)`.
+  let value = |at: usize| -> Option<(Ratio, f64)> {
+    let (num, den) = (word(at)?, word(at + 4)?);
+    Some((Ratio::new(num, den), f64::from(num) / f64::from(den)))
   };
-  let primaries = i32::from_ne_bytes(word(80)?) != 0;
-  let luminance = i32::from_ne_bytes(word(84)?) != 0;
-  let mut primaries_back = primaries;
-  for index in 0..8 {
-    primaries_back &= positive(index * 8)?;
-  }
-  let luminance_back = luminance && positive(64)? && positive(72)?;
+  let kept = |written: f64| written as f32;
+  let back = |written: f64| {
+    let ratio = ffmpeg_next::Rational::from(f64::from(kept(written)));
+    Ratio::new(ratio.numerator(), ratio.denominator())
+  };
+  let same = |a: Ratio, b: Ratio| {
+    (a.den() == 0) == (b.den() == 0)
+      && i64::from(a.num()) * i64::from(b.den()) == i64::from(b.num()) * i64::from(a.den())
+  };
+  let part = |stated: bool, at: &[usize]| -> Option<Option<(Vec<Ratio>, Vec<Ratio>)>> {
+    let values: Vec<(Ratio, f64)> = at.iter().map(|&at| value(at)).collect::<Option<_>>()?;
+    let rebuilt = stated && values.iter().all(|&(_, written)| kept(written) > 0.0);
+    Some(rebuilt.then(|| {
+      (
+        values.iter().map(|&(declared, _)| declared).collect(),
+        values.iter().map(|&(_, written)| back(written)).collect(),
+      )
+    }))
+  };
+  let primaries = part(word(80)? != 0, &[0, 8, 16, 24, 32, 40, 48, 56])?;
+  let luminance = part(word(84)? != 0, &[64, 72])?;
+  let declared = (word(80)? != 0, word(84)? != 0);
   // An entry of neither part is written as none, and lost too.
-  match (primaries_back, luminance_back) {
-    (false, false) => Some(CodedSideDataReadBack::Lost),
-    back if back == (primaries, luminance) => None,
-    (primaries, luminance) => Some(CodedSideDataReadBack::MasteringDisplay {
-      primaries,
-      luminance,
-    }),
+  if primaries.is_none() && luminance.is_none() {
+    return Some(CodedSideDataReadBack::Lost);
   }
+  let whole = |part: &Option<(Vec<Ratio>, Vec<Ratio>)>, stated: bool| match part {
+    Some((declared, back)) => declared.iter().zip(back).all(|(&a, &b)| same(a, b)),
+    None => !stated,
+  };
+  if whole(&primaries, declared.0) && whole(&luminance, declared.1) {
+    return None;
+  }
+  Some(CodedSideDataReadBack::MasteringDisplay {
+    primaries: primaries.and_then(|(_, back)| back.try_into().ok()),
+    luminance: luminance.and_then(|(_, back)| back.try_into().ok()),
+  })
 }
 
 /// The coded side data of a track the container writes in fewer bits than

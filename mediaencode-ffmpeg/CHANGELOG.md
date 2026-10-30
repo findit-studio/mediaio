@@ -456,7 +456,10 @@ crate moves only when it changes.
   its luminance only of both bounds above zero: the entry, or the part of
   it, the file reads back without is reported at open
   (`Uncarried::CodedSideData` and `CodedSideDataReadBack`, new) — the file
-  true, the packets as written. The report's first line of a track's coded
+  true, the packets as written — and so is a display whose values its
+  reader, keeping each in a float and making it a rational again with
+  `av_d2q`, reads back as other rationals, however near (R13): the line
+  carries what reads back. The report's first line of a track's coded
   side data.
 - **Packet side data, by the side-data table.** What each container
   writes of a packet's side data, from its source: a kind it has no place
