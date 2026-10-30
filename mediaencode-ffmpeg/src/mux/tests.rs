@@ -4738,8 +4738,9 @@ fn movs_sample_table_holds_what_its_allocation_does() {
 }
 
 /// The movie `udta` of two covers at the default packet budget passes the
-/// dynamic buffer movenc makes it in, and one cover filling it to the byte
-/// stays within (R14b, ruled; [`super::MuxOpenError::CoversTooLarge`]):
+/// dynamic buffer movenc makes it in, and one cover filling its bound to
+/// the byte — `INT_MAX` less its header, R15 — comes to it exactly (R14b,
+/// ruled; [`super::MuxOpenError::CoversTooLarge`]):
 /// `meta`, `hdlr`, `ilst` and `©too` of libavformat's name, 77 bytes and
 /// the name; `covr`, 8 and 16 a cover beside its picture, an empty one
 /// skipped; the Nero list, 17 and 9 a chapter beside its title.
@@ -4758,14 +4759,53 @@ fn the_movie_udta_of_two_gibibyte_covers_passes_its_buffer() {
   let two = super::udta_bytes(super::covr_bytes([budget, budget].into_iter()), &[]);
   assert_eq!(two, own + 8 + 2 * (16 + budget));
   assert!(two > i32::MAX as u64, "two gibibyte covers pass INT_MAX");
-  let filling = i32::MAX as u64 - own - 24;
+  let filling = super::UDTA_BYTES_MAX - own - 24;
   let one = super::udta_bytes(super::covr_bytes([filling].into_iter()), &[]);
-  assert_eq!(one, i32::MAX as u64, "one cover fills it to the byte");
+  assert_eq!(
+    one,
+    super::UDTA_BYTES_MAX,
+    "one cover fills the bound to the byte"
+  );
   assert_eq!(super::covr_bytes([0, 5].into_iter()), 24 + 5);
   assert_eq!(super::covr_bytes([5, 0, 7].into_iter()), 24 + 5 + 16 + 7);
   assert_eq!(
     super::covr_bytes([0, 0].into_iter()),
     0,
     "no picture, no covr"
+  );
+}
+
+/// The movie `udta`'s last byte (R15, Codex R14 1;
+/// [`super::UDTA_BYTES_MAX`]): movenc writes its size as the buffer's and 8
+/// in an `int` (`movenc.c` 5113–5115), so a `udta` of `INT_MAX - 8` bytes
+/// beside its header is taken and one of a byte more refused, at the cover
+/// that brings it, by the bound the muxer holds — and two covers of the
+/// default packet budget refused at the second.
+#[test]
+fn the_movie_udta_holds_int_max_less_its_header() {
+  let bound = super::Bounds::REAL.user_data;
+  assert_eq!(bound, i32::MAX as u64 - 8, "INT_MAX less the udta's header");
+  let own = super::udta_bytes(0, &[]);
+  let filling = bound - own - 24;
+  assert_eq!(
+    super::covers_too_large([(3, filling)].into_iter(), &[], bound),
+    None,
+    "the udta of INT_MAX - 8 bytes taken"
+  );
+  assert_eq!(
+    super::covers_too_large([(3, filling + 1)].into_iter(), &[], bound),
+    Some(3),
+    "one byte more refused at its cover"
+  );
+  assert_eq!(
+    super::covers_too_large([(1, filling - 16), (2, 0), (4, 16)].into_iter(), &[], bound),
+    Some(4),
+    "refused at the cover that passes, an empty one counting nothing"
+  );
+  let budget = mediaio_ffmpeg::DEFAULT_MAX_PACKET_BYTES as u64;
+  assert_eq!(
+    super::covers_too_large([(1, budget), (2, budget)].into_iter(), &[], bound),
+    Some(2),
+    "two gibibyte covers refused at the second"
   );
 }

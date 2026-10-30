@@ -445,14 +445,26 @@ crate moves only when it changes.
   (`PayloadRule::FragmentIndex`, new). The laws' seams, hidden:
   `MuxOptions::with_lowered_movie_bound`, `CarrierMuxer::movie_box_bound`
   (`MovieBoxBound`) and `CarrierMuxer::fragment_index_bound`.
-- **MP4's covers, within the movie metadata's buffer (R14b).** The movie's
-  `udta` holds every cover and is made in a dynamic buffer of `INT_MAX`
-  bytes, which writes the `covr` cut past it: two covers of the default
-  packet budget pass it. Its size is counted exactly at open — the iTunes
-  metadata, libavformat's name and version among it, the covers and the
-  Nero list — and the table whose covers would take it past the buffer
-  refused, nothing written (`MuxOpenError::CoversTooLarge`, new; the laws'
-  seam `MuxOptions::with_lowered_user_data_bound`, hidden).
+- **MP4's covers, within the movie metadata's buffer (R14b, R15).** The
+  movie's `udta` holds every cover and is made in a dynamic buffer of
+  `INT_MAX` bytes, which writes the `covr` cut past it — two covers of the
+  default packet budget pass it — and its size and 8-byte header are
+  summed in an `int`, which overflows past `INT_MAX - 8`. Its size is
+  counted exactly at open — the iTunes metadata, libavformat's name and
+  version among it, the covers and the Nero list — and the table whose
+  covers would take it past `INT_MAX - 8` refused, nothing written
+  (`MuxOpenError::CoversTooLarge`, new; the laws' seam
+  `MuxOptions::with_lowered_user_data_bound`, hidden).
+- **MP4's `moov` of no sample, and before its trailer (R15).** A table
+  whose `moov` would pass its 32 bits before any sample — covers, `pssh`
+  boxes, sample descriptions — is refused at open
+  (`MuxOpenError::MovieBoxTooLarge`, new), ISMV's written at its header
+  among them; and the bound is checked once more before the trailer
+  runs (`FfmpegMuxRefusal::MovieBox`, new). A description rewritten in
+  place counts its new bytes instead of its old: the bound keeps the
+  descriptions' exact sum. The laws' seams, hidden:
+  `MuxOptions::with_lowered_fragment_index_bound` (split from
+  `with_lowered_movie_bound`) and `CarrierMuxer::lower_movie_bound`.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer

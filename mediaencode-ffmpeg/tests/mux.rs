@@ -18222,7 +18222,11 @@ fn l154_the_moov_and_mfra_bounds_refuse_the_first_packet_past_them() {
       &target,
       ContainerName::new(container),
       table,
-      MuxOptions::new().with_lowered_movie_bound(after[k]),
+      if rule == PayloadRule::MovieBox {
+        MuxOptions::new().with_lowered_movie_bound(after[k])
+      } else {
+        MuxOptions::new().with_lowered_fragment_index_bound(after[k])
+      },
     );
     let mut packets = packets.into_iter();
     for packet in packets.by_ref().take(k) {
@@ -18356,4 +18360,187 @@ fn l155_mp4_refuses_covers_past_the_movie_metadatas_buffer() {
   let (taken, _, packets, opened) = open("l155-taken.mp4", Some(held));
   write("l155-taken.mp4", packets, opened);
   assert_eq!(written_udta(&taken), udta, "the same udta");
+}
+
+/// The bound's `stsd` and the `stsd` FFmpeg wrote into `path`, of its
+/// first track.
+fn first_stsd(path: &Path) -> u64 {
+  let (_, traks) = written_moov(path);
+  traks[0]
+    .iter()
+    .find(|(kind, _)| kind == b"stsd")
+    .map(|&(_, size)| size)
+    .expect("an stsd")
+}
+
+/// **L157 — the `moov`'s bound keeps its descriptions' exact sum** (R15,
+/// Codex R14 4): an AAC track's configuration rewritten in place by
+/// configuration packets, large and small in turn and small at the end
+/// (`mov_write_single_packet`, `movenc.c` 7412–7429), leaves the bound's
+/// `stsd` that of the same track never rewritten, and the `stsd` FFmpeg
+/// writes the same in both files.
+///
+/// PLANT: a rewrite's growth counted but not its shrinking, the bound left
+/// larger.
+#[test]
+fn l157_rewritten_descriptions_leave_their_exact_sum() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let (table, frames) = first_track(&source, TrackKind::Audio, 3);
+  let small = table[0].side_data().extradata().to_vec();
+  let mut large = small.clone();
+  large.extend_from_slice(&[0x56, 0xE5, 0x00, 0x00]);
+  let configuring = |bytes: &[u8], at: i64| {
+    let mut inner = audio_holding(&audio_of(&frames[0]), &[])
+      .with_pts(Some(ms(at)))
+      .with_dts(Some(ms(at)));
+    inner
+      .extra_mut()
+      .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, bytes)]);
+    AudioTrackPacket::new(TrackIndex::new(0), inner)
+  };
+  let rewritten = output(&corpus, "l157-rewritten.mp4");
+  let mut muxer = muxer_into(&rewritten, ContainerName::MP4, table);
+  muxer
+    .write_audio(audio_at(&audio_of(&frames[0]), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  for (index, bytes) in [&large, &small, &large, &small, &large, &small]
+    .into_iter()
+    .enumerate()
+  {
+    muxer
+      .write_audio(configuring(bytes, 10 + index as i64))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a configuration's packet");
+  }
+  muxer
+    .write_audio(audio_at(&audio_of(&frames[1]), 30))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  let after = muxer.movie_box_bound().expect("a bound").stsd[0];
+  muxer.finish().expect("finished");
+  let (table, _) = first_track(&source, TrackKind::Audio, 0);
+  let plain = output(&corpus, "l157-plain.mp4");
+  let mut muxer = muxer_into(&plain, ContainerName::MP4, table);
+  for (frame, at) in [(&frames[0], 0), (&frames[1], 30)] {
+    muxer
+      .write_audio(audio_at(&audio_of(frame), at))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  let never = muxer.movie_box_bound().expect("a bound").stsd[0];
+  muxer.finish().expect("finished");
+  assert_eq!(
+    after, never,
+    "the bound's stsd, rewritten to its first and never"
+  );
+  assert_eq!(
+    first_stsd(&rewritten),
+    first_stsd(&plain),
+    "the stsd as written, the same"
+  );
+  assert!(first_stsd(&rewritten) <= after, "within its bound");
+}
+
+/// **L158 — a table of no sample meets the `moov`'s bound at open, and the
+/// trailer meets it again** (R15, Codex R14 2; `mov_write_moov_tag`,
+/// `movenc.c` 5339–5453): an MP3's cover alone, whose trailer writes the
+/// `udta` it holds, and an H.264 track of no packet whose stream carries
+/// 50 088 bytes of `pssh` — each taken at its bound before any sample,
+/// lowered to it, and refused a byte below, nothing written
+/// ([`MuxOpenError::MovieBoxTooLarge`]); and a file whose bound is lowered
+/// after its packets, refused before its trailer, which writes no `moov`
+/// ([`FfmpegMuxRefusal::MovieBox`]).
+///
+/// PLANT: the open's check dropped, the table a byte past taken; the
+/// trailer's dropped, the `moov` written.
+#[test]
+fn l158_a_table_of_no_sample_meets_the_movie_bound_at_open_and_the_trailer_again() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let same = |_: usize, row: Described| row;
+  let cover_only = |_: usize| -> Vec<Described> {
+    let (table, _) = copied_source(&corpus.cover_art_mp3(), &[], &same);
+    table
+      .into_iter()
+      .filter(|row| row.file().is_some())
+      .collect()
+  };
+  let h264 = h264_aac(&corpus, "h264-aac.mp4");
+  let init = encryption_init_info(&[(16, 1, 16, 20_000), (16, 0, 16, 30_000)]);
+  let pssh_only = |_: usize| -> Vec<Described> {
+    table_of(&h264, TrackKind::Video)
+      .into_iter()
+      .map(|row| with_coded(row, T::AV_PKT_DATA_ENCRYPTION_INIT_INFO, &init))
+      .collect()
+  };
+  let tables: [(&str, &dyn Fn(usize) -> Vec<Described>); 2] = [
+    ("l158-cover.mp4", &cover_only),
+    ("l158-pssh.mp4", &pssh_only),
+  ];
+  for (name, table) in tables {
+    // Its bound before any sample, as the open judges it.
+    let target = output(&corpus, name);
+    let muxer = muxer_into(&target, ContainerName::MP4, table(0));
+    let bound = muxer.movie_box_bound().expect("a bound").total;
+    muxer.finish().expect("finished");
+    assert!(written_box(&target, b"moov").is_some_and(|moov| moov <= bound));
+    // At it, taken.
+    let at = output(&corpus, &format!("at-{name}"));
+    let muxer = muxer_with(
+      &at,
+      ContainerName::MP4,
+      table(0),
+      MuxOptions::new().with_lowered_movie_bound(bound),
+    );
+    muxer.finish().expect("finished at the bound");
+    // A byte below, refused, nothing written.
+    let past = output(&corpus, &format!("past-{name}"));
+    let opened = FfmpegOwnedMuxer::open_with(
+      File::create(&past).expect("create"),
+      ContainerName::MP4,
+      table(0),
+      &[],
+      MuxOptions::new().with_lowered_movie_bound(bound - 1),
+    );
+    assert!(
+      matches!(opened, Err(MuxOpenError::MovieBoxTooLarge)),
+      "{name}: refused at open, got {:?}",
+      opened.map(|_| ())
+    );
+    assert_eq!(
+      std::fs::metadata(&past).expect("the sink").len(),
+      0,
+      "{name}: nothing written"
+    );
+  }
+  // The trailer's check: the bound lowered after the packets.
+  let target = output(&corpus, "l158-trailer.mp4");
+  let (table, packets) = copied_source(&h264, &[], &same);
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  for packet in packets {
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  let bound = muxer.movie_box_bound().expect("a bound").total;
+  muxer.lower_movie_bound(bound - 1);
+  let fault = muxer.finish().expect_err("refused before the trailer");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(fault.refusal(), Some(FfmpegMuxRefusal::MovieBox));
+  assert_eq!(
+    written_box(&target, b"moov"),
+    None,
+    "the trailer wrote no moov"
+  );
 }

@@ -462,7 +462,12 @@
 //! `INT_MAX` bytes (`mov_write_udta_tag`, 5066–5122; `dyn_buf_write`,
 //! `aviobuf.c` 1281–1311), which refuses the writes past it, the `covr`
 //! then written cut, its sizes counting bytes the file lacks — two covers
-//! of the default packet budget's gibibyte pass it. Its size is known at
+//! of the default packet budget's gibibyte pass it — and movenc writes its
+//! size as the buffer's and 8 in an `int` (5113–5115), which overflows
+//! past `INT_MAX - 8` (R15, Codex R14 1): its every other sum of sizes is
+//! `update_size`'s, of 64 bits (155–163), but each cover's `16 + size`,
+//! smaller. So the `udta` holds at most `INT_MAX - 8` bytes beside its
+//! header ([`UDTA_BYTES_MAX`]). Its size is known at
 //! open, and counted exactly ([`udta_bytes`]): in MP4's, iPod's and F4V's
 //! modes, the iTunes `meta` — `hdlr`, `ilst` and its `©too` of
 //! libavformat's name and version — the covers' `covr` and the Nero list;
@@ -484,6 +489,29 @@
 //! which no track reaches: a fragment of a track is one of its samples at
 //! least, which [`PayloadRule::SampleTable`] bounds below it across the
 //! fragments.
+//!
+//! **What a trailer writes whatever the packets** (R15, Codex R14 2): of
+//! every bound judged at a packet, the MOV family's `moov` alone holds a
+//! part no packet brings — the movie's own boxes, the covers, the
+//! chapters and the chapter track, every stream's `pssh` boxes, each
+//! track's descriptions and the tables its trailer may add — which a table
+//! of no sample, or of no timed track, writes all the same: judged at open,
+//! before the header, by the same bound ([`MuxOpenError::MovieBoxTooLarge`];
+//! ISMV's `moov`, written at its header, its `mvex` of 28 bytes and 32 a
+//! track within the slacks, judged the same), and once more before the
+//! trailer runs ([`FfmpegMuxRefusal::MovieBox`]). The other bounds' parts
+//! of no packet are their headers', judged at open, or nothing: ISMV's
+//! `mfra` of no fragment is 24 bytes; MP4's table of samples and its
+//! descriptions hold one each a track at open; the `udta`
+//! ([`MuxOpenError::CoversTooLarge`]) and the chapter track
+//! ([`MuxOpenError::ChapterCount`], [`MuxOpenError::ChapterSample`]) are
+//! judged at open; WAV's sizes and fact count, TTML's document — its
+//! header strings judged at open — and the indexes, cues and index tables
+//! of Matroska, AVI, ASF and NUT are of their packets alone. MP3's ID3v2
+//! tag, of its covers, is the one size written whatever the packets that
+//! no bound here judges — its frames' sizes in 28 syncsafe bits
+//! (`ff_id3v2_write_apic`, `id3v2enc.c` 352–420) — sent to the coordinator (R15,
+//! letter 1).
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -1540,8 +1568,8 @@ struct Bounds {
   /// The most bytes ISMV's `mfra` holds, the dynamic buffer it is made in
   /// ([`PayloadRule::FragmentIndex`]).
   index: u64,
-  /// The most bytes the MOV family's movie `udta` holds, the dynamic
-  /// buffer it is made in ([`MuxOpenError::CoversTooLarge`]).
+  /// The most bytes the MOV family's movie `udta` holds beside its header
+  /// ([`MuxOpenError::CoversTooLarge`], [`UDTA_BYTES_MAX`]).
   user_data: u64,
 }
 
@@ -1556,9 +1584,18 @@ impl Bounds {
     table: MOV_SAMPLES_MAX,
     movie: u32::MAX as u64,
     index: FRAGMENT_BYTES_MAX,
-    user_data: i32::MAX as u64,
+    user_data: UDTA_BYTES_MAX,
   };
 }
+
+/// The most bytes the MOV family's movie `udta` holds beside its 8-byte
+/// header (R15, Codex R14 1): its dynamic buffer refuses a write past
+/// `INT_MAX` (`dyn_buf_write`, `aviobuf.c` 1281–1311), and movenc writes the
+/// box's size as `size + 8` in an `int`, the buffer's size (`movenc.c`
+/// 5113–5115), which overflows — undefined — past `INT_MAX - 8`: every other
+/// sum of the box's sizes is `update_size`'s, of 64 bits (155–163), but a
+/// cover's `16 + size` in an `int` (4831), its picture smaller still.
+pub(crate) const UDTA_BYTES_MAX: u64 = i32::MAX as u64 - 8;
 
 impl Default for MuxOptions {
   fn default() -> Self {
@@ -1705,15 +1742,24 @@ impl MuxOptions {
   }
 
   /// Lowers the bytes the MOV family's `moov` may come to — `UINT32_MAX` —
-  /// and ISMV's `mfra` — its dynamic buffer's — to `bytes`, never raising
-  /// either: the laws' seam, which shows the bounds without gigabytes of
-  /// sample tables ([`PayloadRule::MovieBox`], [`PayloadRule::FragmentIndex`]).
+  /// to `bytes`, never raising it: the laws' seam, which shows the bound
+  /// without gigabytes of sample tables ([`PayloadRule::MovieBox`],
+  /// [`MuxOpenError::MovieBoxTooLarge`]).
   #[doc(hidden)]
   #[must_use]
   pub const fn with_lowered_movie_bound(mut self, bytes: u64) -> Self {
     if bytes < self.bounds.movie {
       self.bounds.movie = bytes;
     }
+    self
+  }
+
+  /// Lowers the bytes ISMV's `mfra` may come to — its dynamic buffer's — to
+  /// `bytes`, never raising it: the laws' seam
+  /// ([`PayloadRule::FragmentIndex`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_fragment_index_bound(mut self, bytes: u64) -> Self {
     if bytes < self.bounds.index {
       self.bounds.index = bytes;
     }
@@ -2018,6 +2064,27 @@ fn udta_bytes(covers: u64, chapters: &[Chapter<Ffmpeg>]) -> u64 {
   12 + 33 + 8 + 24 + name + covers + chpl_bytes(chapters)
 }
 
+/// The first of `covers` — each a cover's track and its picture's bytes, in
+/// the table's order — at which the movie's `udta` of them and `chapters`
+/// would pass `bound` ([`udta_bytes`], [`UDTA_BYTES_MAX`]), or `None`.
+fn covers_too_large(
+  covers: impl Iterator<Item = (usize, u64)>,
+  chapters: &[Chapter<Ffmpeg>],
+  bound: u64,
+) -> Option<usize> {
+  let own = udta_bytes(0, chapters);
+  let mut covr = 0;
+  for (index, bytes) in covers {
+    if bytes > 0 {
+      covr += if covr == 0 { 24 } else { 16 } + bytes;
+    }
+    if own + covr > bound {
+      return Some(index);
+    }
+  }
+  None
+}
+
 /// The covers' `covr` in the movie's `ilst`, exactly, of each cover's
 /// bytes in the table's order (`mov_write_covr`, `movenc.c` 4815–4839): 8
 /// bytes where any holds a picture, and 16 a cover beside its picture's —
@@ -2056,6 +2123,119 @@ fn chpl_bytes(chapters: &[Chapter<Ffmpeg>]) -> u64 {
 /// (8640–8701).
 const fn moov_track_fixed(tracks: u64) -> u64 {
   TRAK_SLACK + 4 * (tracks + 1)
+}
+
+/// What the MOV family's `moov` holds of a timed track of `kind` whose
+/// stream holds `codec`, of `ticket` (R14): its tables' and its sample
+/// entries' shape ([`MoovShape`]), the same before the header — the open's
+/// bound of no sample (R15) — and after it.
+fn moov_shape(
+  audited: Audited,
+  kind: TrackKind,
+  codec: &StreamCodec,
+  ticket: &CodecTicket,
+) -> MoovShape {
+  let id = codec.codec();
+  let icc = ticket
+    .coded_side_data()
+    .iter()
+    .find(|entry| entry.kind() == AVPacketSideDataType::AV_PKT_DATA_ICC_PROFILE as i32)
+    .map_or(0, |entry| 12 + entry.data().len() as u64);
+  let channels = u64::try_from(ticket.ch_layout().channels()).unwrap_or(0);
+  MoovShape {
+    video: kind == TrackKind::Video,
+    // [`PacketRules::mp4_constant`]: ISMV's of no constant size.
+    constant: kind == TrackKind::Audio
+      && audited != Audited::Mov(MovMode::Ism)
+      && mp4_sample_size(codec).is_some_and(|size| size > 0),
+    sync: mp4_syncs(kind, id, codec.profile()),
+    partial: audited == Audited::Mov(MovMode::Mov) && kind == TrackKind::Video,
+    roll: if id == CodecId::AAC {
+      Roll::Aac
+    } else if id == CodecId::OPUS {
+      Roll::Opus
+    } else {
+      Roll::None
+    },
+    entry: ENTRY_SLACK + 24 * channels + icc + if id == CodecId::APV { APVC_MAX } else { 0 },
+    configurations: if id == CodecId::HEVC { 2 } else { 1 },
+  }
+}
+
+/// The bound of a track's `stsd` at its start, the exact sum of its
+/// descriptions' as the packets keep it ([`Descriptions`]): of DVD
+/// subtitles', which none changes, the stream's configuration's.
+fn moov_stsd(shape: MoovShape, codec: &StreamCodec) -> u64 {
+  16 + moov_entry(
+    shape,
+    Descriptions::of(codec)
+      .entries
+      .first()
+      .and_then(Option::as_ref)
+      .map_or(codec.extradata().len(), Vec::len),
+  )
+}
+
+/// The chapter track's part of the `moov`'s bound of `samples` chapters:
+/// its tables ([`CHAPTER_SHAPE`]) and its `stsd`.
+fn chapter_part(samples: u64) -> ([([u8; 4], u64); 10], u64) {
+  (
+    moov_tables(CHAPTER_SHAPE, samples),
+    16 + moov_entry(CHAPTER_SHAPE, 0),
+  )
+}
+
+/// The `moov`'s own boxes, its covers', its chapters' and its streams'
+/// `pssh` boxes, at most (R14; [`PayloadRule::MovieBox`]): `covr`
+/// ([`covr_bytes`]), the Nero list ([`chpl_bytes`]), and each stream's
+/// encryption initialization's `pssh` boxes ([`pssh_bytes`]; `movenc.c`
+/// 5175–5210, 5450–5451), beside [`MOOV_SLACK`]. The chapter track is its
+/// own ([`chapter_part`]).
+fn movie_fixed<D, S>(
+  roads: &[Road],
+  tracks: &[TrackDescription<Ffmpeg, D, S>],
+  chapters: &[Chapter<Ffmpeg>],
+) -> u64
+where
+  D: AsRef<[u8]>,
+  S: core::borrow::Borrow<CodecTicket>,
+{
+  let covers = covr_bytes(
+    roads
+      .iter()
+      .zip(tracks)
+      .filter(|(road, _)| **road == Road::Cover)
+      .filter_map(|(_, description)| description.file())
+      .map(|file| file.payload().data().as_ref().len() as u64),
+  );
+  let pssh = tracks
+    .iter()
+    .map(|description| {
+      let ticket: &CodecTicket = description.side_data().borrow();
+      ticket
+        .coded_side_data()
+        .iter()
+        .find(|entry| entry.kind() == AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO as i32)
+        .map_or(0, |entry| pssh_bytes(entry.data()))
+    })
+    .sum::<u64>();
+  MOOV_SLACK + covers + chpl_bytes(chapters) + pssh
+}
+
+/// The `moov`'s bound: its own boxes `fixed`, and each track's — its own
+/// boxes in a file of `tracks` tracks ([`moov_track_fixed`]), its `stsd`
+/// and its per-sample tables — of `parts`, the chapter track's among them.
+fn movie_total(
+  fixed: u64,
+  tracks: u64,
+  parts: impl Iterator<Item = ([([u8; 4], u64); 10], u64)>,
+) -> u64 {
+  fixed
+    + parts
+      .map(|(tables, stsd)| {
+        moov_track_fixed(tracks) + stsd + tables.iter().map(|&(_, bytes)| bytes).sum::<u64>()
+      })
+      .sum::<u64>()
 }
 
 /// One of libavformat's bitstream filters a muxer inserts for a track —
@@ -3166,6 +3346,16 @@ pub enum FfmpegMuxRefusal {
     /// The track.
     track: TrackIndex,
   },
+  /// The MOV family, of no fragments: the `moov` its trailer would write
+  /// past the 32 bits its size is written in (`update_size`, `movenc.c`
+  /// 155–163; R15, Codex R14 2), by the bound every packet is judged by
+  /// ([`PayloadRule::MovieBox`]), checked again before the trailer runs,
+  /// which then writes nothing — beside the open's check of the table
+  /// before any sample ([`MuxOpenError::MovieBoxTooLarge`]), so that
+  /// neither a table of no sample nor any packet after reaches it
+  /// unjudged ([`MuxFault::refusal`]).
+  #[error("the movie box the trailer would write passes its 32-bit size")]
+  MovieBox,
   /// MP4 E-AC-3: the track's last sample, joined from frames of fewer than
   /// six blocks, lasting more than `i32::MAX` ticks of the stream's time
   /// base. MP4 joins such frames into one sample whose duration is the sum
@@ -3848,19 +4038,31 @@ pub enum MuxOpenError {
     /// What its packet breaks.
     rule: PayloadRule,
   },
-  /// The MOV family's covers, whose movie `udta` would pass the dynamic
-  /// buffer of `INT_MAX` bytes movenc makes it in (R14b, ruled): its iTunes
-  /// metadata holds every cover (`mov_write_udta_tag`, `movenc.c`
-  /// 5066–5122; `mov_write_covr`, 4815–4839), the buffer refuses the writes
-  /// past it (`dyn_buf_write`, `aviobuf.c` 1281–1311), and the `covr` is
-  /// written cut, its sizes counting bytes the file lacks — the `udta`'s
-  /// size counted exactly ([`udta_bytes`]), the cover named the first of
-  /// the table's at which it passes.
+  /// The MOV family's covers, whose movie `udta` would pass what movenc
+  /// counts it in (R14b, ruled; R15, Codex R14 1): its iTunes metadata
+  /// holds every cover (`mov_write_udta_tag`, `movenc.c` 5066–5122;
+  /// `mov_write_covr`, 4815–4839), made in a dynamic buffer that refuses
+  /// the writes past `INT_MAX` (`dyn_buf_write`, `aviobuf.c` 1281–1311),
+  /// the `covr` then written cut, and its size and 8-byte header summed in
+  /// an `int` (5113–5115), which overflows past `INT_MAX - 8`
+  /// ([`UDTA_BYTES_MAX`]) — the `udta`'s size counted exactly
+  /// ([`udta_bytes`]), the cover named the first of the table's at which it
+  /// passes.
   #[error("cover track {} takes the covers past the movie metadata's buffer", .track.get())]
   CoversTooLarge {
     /// The track.
     track: TrackIndex,
   },
+  /// The MOV family's `moov` before any sample would pass the 32 bits its
+  /// size is written in (`update_size`, `movenc.c` 155–163; R15, Codex R14
+  /// 2): what its trailer writes whatever the packets — ISMV's at its
+  /// header — the movie's own boxes, its covers, its chapters, every
+  /// stream's `pssh` boxes, each timed track's sample descriptions and its
+  /// tables at no sample but the two a trailer may add, and the chapter
+  /// track, by the bound the packets are judged by
+  /// ([`PayloadRule::MovieBox`]).
+  #[error("the table's movie box would pass its 32-bit size before any sample")]
+  MovieBoxTooLarge,
   /// An attachment with no filename, which Matroska requires
   /// (`matroskaenc.c` 2538–2543 in FFmpeg 9.0.1).
   #[error("attachment track {} has no filename, which Matroska requires", .track.get())]
@@ -8749,20 +8951,25 @@ where
     // The movie's `udta`, every cover in it, within the dynamic buffer
     // movenc makes it in, counted exactly (R14b, letter 1, ruled): the
     // cover at which it would pass refused, nothing written.
-    if audited.writes_covers() {
-      let mut covers = Vec::new();
-      for (index, (road, description)) in roads.iter().zip(&tracks).enumerate() {
-        if *road == Road::Cover
-          && let Some(file) = description.file()
-        {
-          covers.push(file.payload().data().as_ref().len() as u64);
-          if udta_bytes(covr_bytes(covers.iter().copied()), chapters) > bounds.user_data {
-            return Err(MuxOpenError::CoversTooLarge {
-              track: TrackIndex::new(index),
-            });
-          }
-        }
-      }
+    if audited.writes_covers()
+      && let Some(index) = covers_too_large(
+        roads
+          .iter()
+          .zip(&tracks)
+          .enumerate()
+          .filter(|(_, (road, _))| **road == Road::Cover)
+          .filter_map(|(index, (_, description))| {
+            description
+              .file()
+              .map(|file| (index, file.payload().data().as_ref().len() as u64))
+          }),
+        chapters,
+        bounds.user_data,
+      )
+    {
+      return Err(MuxOpenError::CoversTooLarge {
+        track: TrackIndex::new(index),
+      });
     }
     // MP4's default selection, which needs the whole table (table E).
     let defaults_added = mp4_defaults_added(family, &tracks, &roads);
@@ -8949,6 +9156,32 @@ where
         }
       }
       states.push((kind, stream, *road, filter));
+    }
+    // The MOV family's `moov` before any sample (R15, Codex R14 2): what its
+    // trailer writes whatever the packets — ISMV's at its header — the
+    // movie's own boxes, the covers', the chapters', every stream's `pssh`,
+    // each timed track's `stsd` and its tables of no sample but the two a
+    // trailer may add, and the chapter track: past the 32 bits of its size,
+    // the table refused, nothing written ([`MuxOpenError::MovieBoxTooLarge`]).
+    if family == Family::Mp4 {
+      let parts = states
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (kind, stream, road, _))| {
+          let (_, codec) = stream.as_ref().filter(|_| *road == Road::Timed)?;
+          let shape = moov_shape(audited, *kind, codec, tracks[index].side_data());
+          Some((moov_tables(shape, 2), moov_stsd(shape, codec)))
+        });
+      let chapters_part = (audited.chapter_track() && !chapters.is_empty())
+        .then(|| chapter_part(chapters.len() as u64));
+      if movie_total(
+        movie_fixed(&roads, &tracks, chapters),
+        tracks.len() as u64,
+        parts.chain(chapters_part),
+      ) > bounds.movie
+      {
+        return Err(MuxOpenError::MovieBoxTooLarge);
+      }
     }
     // `asf_stream` writes its header in a chunk of 16-bit length
     // (`put_chunk`, `asfenc.c` 281–295, 708–716): bounded before it is
@@ -9156,34 +9389,9 @@ where
           // What the `moov` its trailer writes holds of the track (R14):
           // ISMV's written at its start, of no samples.
           if family == Family::Mp4 && audited != Audited::Mov(MovMode::Ism) {
-            let id = codec.codec();
-            let ticket = tracks[index].side_data();
-            let icc = ticket
-              .coded_side_data()
-              .iter()
-              .find(|entry| entry.kind() == AVPacketSideDataType::AV_PKT_DATA_ICC_PROFILE as i32)
-              .map_or(0, |entry| 12 + entry.data().len() as u64);
-            let channels = u64::try_from(ticket.ch_layout().channels()).unwrap_or(0);
-            let shape = MoovShape {
-              video: kind == TrackKind::Video,
-              constant: rules.mp4_constant.is_some_and(|size| size > 0),
-              sync: mp4_syncs(kind, id, codec.profile()),
-              partial: audited == Audited::Mov(MovMode::Mov) && kind == TrackKind::Video,
-              roll: if id == CodecId::AAC {
-                Roll::Aac
-              } else if id == CodecId::OPUS {
-                Roll::Opus
-              } else {
-                Roll::None
-              },
-              entry: ENTRY_SLACK
-                + 24 * channels
-                + icc
-                + if id == CodecId::APV { APVC_MAX } else { 0 },
-              configurations: if id == CodecId::HEVC { 2 } else { 1 },
-            };
+            let shape = moov_shape(audited, kind, &codec, tracks[index].side_data());
             moov = Some(shape);
-            stsd = 16 + moov_entry(shape, codec.extradata().len());
+            stsd = moov_stsd(shape, &codec);
           }
           Some((stream, time_base))
         }
@@ -9267,34 +9475,8 @@ where
     // (5040–5064); each stream's encryption initialization's `pssh` boxes
     // ([`pssh_bytes`]; 5175–5210, 5450–5451). The chapter track is its own
     // ([`CarrierMuxer::chapter_samples`]).
-    let movie = track_states
-      .iter()
-      .any(|state| state.moov.is_some())
-      .then(|| {
-        let covers = covr_bytes(
-          roads
-            .iter()
-            .zip(&tracks)
-            .filter(|(road, _)| **road == Road::Cover)
-            .filter_map(|(_, description)| description.file())
-            .map(|file| file.payload().data().as_ref().len() as u64),
-        );
-        let nero = chpl_bytes(chapters);
-        let pssh = tracks
-          .iter()
-          .map(|description| {
-            description
-              .side_data()
-              .coded_side_data()
-              .iter()
-              .find(|entry| {
-                entry.kind() == AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO as i32
-              })
-              .map_or(0, |entry| pssh_bytes(entry.data()))
-          })
-          .sum::<u64>();
-        MOOV_SLACK + covers + nero + pssh
-      });
+    let movie = (family == Family::Mp4 && audited != Audited::Mov(MovMode::Ism))
+      .then(|| movie_fixed(&roads, &tracks, chapters));
     // The chapter track movenc makes of the chapters, a sample a chapter
     // ([`CHAPTER_SHAPE`]), where its mode makes one.
     let chapter_samples = (movie.is_some() && audited.chapter_track() && !chapters.is_empty())
@@ -9358,13 +9540,7 @@ where
         };
         Some((moov_tables(shape, entries + 2), stsd))
       });
-    let chapters = self.chapter_samples.map(|samples| {
-      (
-        moov_tables(CHAPTER_SHAPE, samples),
-        16 + moov_entry(CHAPTER_SHAPE, 0),
-      )
-    });
-    tracks.chain(chapters)
+    tracks.chain(self.chapter_samples.map(chapter_part))
   }
 
   /// The `moov`'s bound, the track at `with`'s index, where given, at its
@@ -9373,16 +9549,11 @@ where
   /// tables ([`Self::movie_parts`]) (R14).
   fn movie_bound(&self, with: Option<(usize, u64, u64)>) -> Option<u64> {
     let fixed = self.movie?;
-    let tracks = self.tracks.len() as u64;
-    Some(
-      fixed
-        + self
-          .movie_parts(with)
-          .map(|(tables, stsd)| {
-            moov_track_fixed(tracks) + stsd + tables.iter().map(|&(_, bytes)| bytes).sum::<u64>()
-          })
-          .sum::<u64>(),
-    )
+    Some(movie_total(
+      fixed,
+      self.tracks.len() as u64,
+      self.movie_parts(with),
+    ))
   }
 
   /// ISMV's `mfra`'s bound, the track at `with`'s index, where given, at its
@@ -9420,6 +9591,17 @@ where
       tables,
       stsd,
     })
+  }
+
+  /// Lowers the bytes the `moov` may come to — `UINT32_MAX` — to `bytes`,
+  /// never raising it, after the open has judged the table: the laws'
+  /// seam, which shows the trailer's check without gigabytes of samples
+  /// ([`FfmpegMuxRefusal::MovieBox`]).
+  #[doc(hidden)]
+  pub const fn lower_movie_bound(&mut self, bytes: u64) {
+    if bytes < self.bounds.movie {
+      self.bounds.movie = bytes;
+    }
   }
 
   /// ISMV's `mfra`'s bound, as the samples written leave it
@@ -9597,6 +9779,17 @@ where
       {
         self.report.uncarried.push(ended_short);
       }
+    }
+    // The `moov` the trailer writes, by the bound every packet met, once
+    // more before the trailer runs (R15, Codex R14 2).
+    if self
+      .movie_bound(None)
+      .is_some_and(|bound| bound > self.bounds.movie)
+    {
+      return Err(MuxFault::refused(
+        MuxStage::Trailer,
+        FfmpegMuxRefusal::MovieBox,
+      ));
     }
     self
       .output
@@ -11159,25 +11352,23 @@ fn check_packet_rules(
       || step.overwrite.is_some()
       || step.append.is_some()
       || step.current != current;
-    // The `stsd`'s bound after it (R14): each description's growth, never
-    // its shrinking, counted.
+    // The `stsd`'s bound after it, the exact sum of its descriptions' as
+    // the packet leaves them (R15, Codex R14 4): a description rewritten in
+    // place counted at its new bytes instead of its old, the first made of
+    // the first sample instead of none, and a new one beside them.
     let stsd = state.moov.filter(|_| changes).map(|shape| {
-      let grown =
-        |old: usize, new: usize| moov_entry(shape, new).saturating_sub(moov_entry(shape, old));
-      let old = |index: usize| entries[index].as_ref().map_or(0, Vec::len);
-      state.stsd
-        + step
-          .first
-          .as_ref()
-          .map_or(0, |first| grown(old(0), first.len()))
-        + step
-          .overwrite
-          .as_ref()
-          .map_or(0, |configuration| grown(old(current), configuration.len()))
-        + step
-          .append
-          .as_ref()
-          .map_or(0, |configuration| moov_entry(shape, configuration.len()))
+      let old = |index: usize| moov_entry(shape, entries[index].as_ref().map_or(0, Vec::len));
+      let mut sum = state.stsd;
+      if let Some(first) = &step.first {
+        sum = sum - old(0) + moov_entry(shape, first.len());
+      }
+      if let Some(configuration) = &step.overwrite {
+        sum = sum - old(current) + moov_entry(shape, configuration.len());
+      }
+      if let Some(configuration) = &step.append {
+        sum += moov_entry(shape, configuration.len());
+      }
+      sum
     });
     (changes.then_some(step), held, stsd)
   } else {
