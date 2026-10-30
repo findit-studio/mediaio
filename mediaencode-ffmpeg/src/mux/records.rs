@@ -599,6 +599,54 @@ fn avcc_config(config: Config<'_>) -> Wrote {
   }
 }
 
+/// The bytes `ff_isom_write_avcc` writes of `config`, a configuration it
+/// writes whole ([`avcc`]; `avc.c` 32–143): an `avcC` as it is; of Annex
+/// B units, the record's six bytes, each SPS behind its 16-bit length, a
+/// byte of their count and each PPS so, and — of a profile, the first
+/// SPS's second byte, other than 66, 77 and 88 — four bytes and each SPS
+/// extension so (111–134).
+pub(super) fn avcc_written_len(config: &[u8]) -> u64 {
+  if config.len() <= 6 {
+    return 0;
+  }
+  if !annex_b(config) {
+    return config.len() as u64;
+  }
+  let (mut sps, mut pps, mut extensions) = (0_u64, 0_u64, 0_u64);
+  // The bytes of the SPSs' buffer up to its fourth, the profile it reads:
+  // each SPS's 16-bit length, then the SPS (80–81, 112).
+  let mut head = [0_u8; 4];
+  let mut filled = 0;
+  for (unit, [first, _]) in walked(nal_units(config)) {
+    let bytes = 2 + unit.len() as u64;
+    match first & 0x1F {
+      7 => {
+        let length = (unit.len() as u16).to_be_bytes();
+        for &byte in length.iter().chain(unit) {
+          if filled == head.len() {
+            break;
+          }
+          head[filled] = byte;
+          filled += 1;
+        }
+        sps += bytes;
+      }
+      8 => pps += bytes,
+      13 => extensions += bytes,
+      _ => {}
+    }
+  }
+  let profile = head[3];
+  6 + sps
+    + 1
+    + pps
+    + if [66, 77, 88].contains(&profile) {
+      0
+    } else {
+      4 + extensions
+    }
+}
+
 /// The HEVC NAL unit types `ff_isom_write_hvcc` keeps, in its arrays'
 /// order: VPS, SPS, PPS, prefix SEI, suffix SEI (`hevc.c` 1278–1280).
 const HEVC_ARRAYS: [u8; 5] = [32, 33, 34, 39, 40];
@@ -629,6 +677,9 @@ struct Hvcc {
   /// layer's nor the alpha layer's a VPS extension names before it — lost
   /// to the record (888–889; R11, ruling 1).
   dropped: bool,
+  /// The bytes of the units the record keeps, each written behind its
+  /// 16-bit length (`hvcc_write`, 1187–1198).
+  unit_bytes: u64,
 }
 
 /// How a parse of a parameter set ends, as far as the record needs it.
@@ -681,6 +732,16 @@ fn hvcc_config(config: Config<'_>, complete: bool) -> Wrote {
   } else {
     Wrote::Whole
   }
+}
+
+/// The bytes `ff_isom_write_hvcc` writes of `config`, a configuration it
+/// writes whole ([`hvcc`]; `hvcc_write`, `hevc.c` 964–1201): the record's
+/// 23 bytes, and each array of a unit, three and each unit behind its
+/// 16-bit length.
+pub(super) fn hvcc_written_len(config: &[u8]) -> u64 {
+  hvcc_walk(Config::Bytes(config), false).map_or(0, |record| {
+    23 + 3 * record.counts.iter().filter(|&&count| count > 0).count() as u64 + record.unit_bytes
+  })
 }
 
 /// Whether `ff_isom_write_hvcc` skips a unit of `config` for its layer, the
@@ -804,6 +865,7 @@ fn hvcc_add(record: &mut Hvcc, nal: &[u8], array: usize, (parsed, lhvc): (bool, 
   }
   record.counts[array] += 1;
   record.cut |= nal.len() > usize::from(u16::MAX);
+  record.unit_bytes += 2 + u64::from(nal.len() as u16);
   if layer > 0 {
     if record.upper[array] == 0 {
       record.upper_bytes += 3;
@@ -1202,6 +1264,43 @@ fn vvcc_config(config: Config<'_>) -> Wrote {
   } else {
     Wrote::Whole
   }
+}
+
+/// The most bytes `ff_isom_write_vvcc` writes of `config`, a configuration
+/// it writes whole ([`vvcc`]; `vvcc_write`, `vvc.c` 569–808): a `vvcC` as
+/// it is; of Annex B units, a byte, the profile, tier and level at their
+/// most — 1 049 bytes, of nine bytes of constraint information, six
+/// sub-layers' levels and 255 sub-profiles (693–776), which its VPS and SPS
+/// set and this release does not parse — a byte of the arrays' count, and
+/// each array of a unit, a byte, two of its count but an OPI array's, and
+/// each unit behind its 16-bit length (779–805).
+pub(super) fn vvcc_written_bound(config: &[u8]) -> u64 {
+  if config.len() < 6 {
+    return 0;
+  }
+  if config[0] & 0xF8 == 0xF8 {
+    return config.len() as u64;
+  }
+  if !annex_b(config) {
+    return 0;
+  }
+  let mut counts = [0_u64; 6];
+  let mut units = 0_u64;
+  for (unit, [_, second]) in walked(nal_units(config)) {
+    let Some(array) = VVC_ARRAYS.iter().position(|&kept| kept == second >> 3) else {
+      continue;
+    };
+    counts[array] += 1;
+    units += 2 + u64::from(unit.len() as u16);
+  }
+  let arrays: u64 = counts
+    .iter()
+    .zip(VVC_ARRAYS)
+    .filter(|(count, _)| **count > 0)
+    // The OPI array's, the first, holds no count (794–796).
+    .map(|(_, kind)| if kind == VVC_ARRAYS[0] { 1 } else { 3 })
+    .sum();
+  1 + 1049 + 1 + arrays + units
 }
 
 /// The EVC NAL unit types `ff_isom_write_evcc` keeps, in its arrays'

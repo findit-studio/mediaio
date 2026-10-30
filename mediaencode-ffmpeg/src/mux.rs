@@ -319,6 +319,7 @@
 //! | Matroska's cluster | written into a dynamic buffer of at most `INT_MAX`, refused past it and the cluster written cut; a new one once the last passes 5 MiB, two blocks at most written after that check (`matroskaenc.c` 2746–2749, 3213–3271) | each block — the packet as written, or each one its filter puts out, VP9's superframe and PGS's display set with the side data they take, and what the filter holds at the least it can come to — its payload and side data at most half of what is left beside 5 MiB and 64 KiB, less its own elements (`MATROSKA_BLOCK_BYTES_MAX`, [`PayloadRule::ClusterSize`]) |
 //! | WebVTT's lines | Matroska and WebM: the cue, its identifier and its settings summed, refused past `INT_MAX` (`matroskaenc.c` 2828–2853) | within the cluster's bound |
 //! | MP4's joined TTML | libavcodec's TTML encoder's paragraphs, joined at the trailer into one document in a dynamic buffer and then one packet (`movenc_ttml.c` 236–317) | the document's bytes counted — each paragraph and its element, and the header its configuration and language make — and refused at the paragraph that would pass the bound ([`PayloadRule::DocumentSize`]) |
+//! | AVI's counts (R20) | a stream's frames — its packets, and the empty frames it writes into their gaps, the trailer's to the last packet's end — an `int`, raised at every frame (`avi_write_packet_internal`, `avienc.c` 877; `write_skip_frames`, 744–766, 924), and their sum in its OpenDML header (941–953); a block-aligned audio stream's blocks, written in 32 bits (203–235) | each counted as the trailer counts it, the gap's as though the packet were the last, and refused at the packet that would pass ([`PayloadRule::FrameCount`]) |
 //! | the payload and side data copied in | the copy road's builder refuses a packet marked trusted, side data past 64 entries or 256 KiB, a payload past the muxer's budget ([`PacketLimits`]), and a side-data kind libavcodec does not name — the base's one judgment of what a packet alone decides (`mediaio_ffmpeg::boundary::check_packet_build`) — and `av_new_packet` and `av_packet_new_side_data` refuse past the bound (`libavcodec/packet.c` 83–95, 231–250) | each refused by name with the packet in hand ([`PayloadRule::Trusted`], [`PayloadRule::SideDataBudget`], [`PayloadRule::PayloadTooLarge`], [`PayloadRule::SideDataUnnamed`]); MP4's cover, built after the header, at open ([`MuxOpenError::Cover`]); what is left — an allocation's failure — a fault ([`OutputError::Build`]) |
 //!
 //! ## C. Each container's checks of each codec
@@ -634,8 +635,11 @@
 //! road; **R18** every length held or summed in an `int`; **R19** every
 //! call whose result its caller discards — the road by which a failure a
 //! callee does return is still swallowed. Each of the 1066 lines they
-//! print is classified (405 pass, 140 reported, 138 unreachable, 126
-//! bounded, 120 the sink's, 137 a finding below), none left out. Two
+//! print is classified (404 pass, 138 reported, 138 unreachable, 127
+//! bounded, 120 the sink's, 139 a finding below), none left out — R20
+//! correcting two: AVI's `packet_count` (`avienc.c` 86), which no index
+//! bounds, now bounded (S5), and NUT's key frame index (`nutenc.c` 1058),
+//! reported where its failure is returned, a finding of its own (N1). Two
 //! mechanisms carry most findings. A dynamic buffer holds its first 1024
 //! bytes in the context its open allocates, and grows past them by
 //! `av_reallocp`, whose failure — or a write past `INT_MAX` — sets the
@@ -652,41 +656,60 @@
 //!
 //! Each finding, and its disposition — refused at open by name, bounded
 //! exactly at open, judged at every packet, or reported — each with its
-//! law; the rest are R19's letter 1, a ruling asked:
+//! law; the rest are R19's letter 1, a ruling asked. R20 (Codex R19 1:
+//! A14's memory fault) classes each row by source, and gives each its
+//! sizes. A **memory fault** is an access through a null or an
+//! out-of-bounds pointer, or a length wrapped to `size_t` handed to
+//! `memset`, `memcpy` or a write; an **omission** or a **misreport** is
+//! what is left out or written otherwise, success answered — `avio_write`
+//! writes nothing of a size of zero or less (`aviobuf.c` 208–209), and a
+//! dynamic buffer whose growth failed answers 0 bytes and a null pointer
+//! (`avio_get_dyn_buf`), or a null pointer and `-64` (`avio_close_dyn_buf`;
+//! 1377–1397, 1410–1436). The sizes: every allocation of the row's road
+//! that an admitted table or packet can push past libavutil's limit
+//! (`INT_MAX`, `max_alloc_size`, `mem.c` 74, 98–102, 155–159) or past a
+//! dynamic buffer's (`INT_MAX`, `dyn_buf_write`, 1281–1311) — the same
+//! failure, deterministic — refused by name where its size becomes known,
+//! or out of reach by the arithmetic given; and with them, by the class,
+//! each length that wraps on the row's road:
 //!
-//! | | where | what is lost, and how | disposition |
-//! |---|---|---|---|
-//! | A1 | the MOV family's `pssh` boxes (`mov_write_pssh_tag`, `movenc.c` 5175–5210; 5449–5451) | the encryption initialization parsed again at the `moov`, its allocation's failure answered as none, 0 returned and discarded besides: the file written without its DRM initialization | refused at open ([`MuxOpenError::EncryptionInitialization`]; ruled) — L165 |
-//! | A2 | the MOV family's `stts` (`mov_write_stts_tag`, 3241–3288; discarded at 3411) | its 8 bytes a sample, their allocation's failure returned and discarded: the track written without its time-to-sample table — every track but constant-size audio's, whose one entry's allocation the same | letter 1 |
-//! | A3 | AAC's and Opus's roll groups (`mov_preroll_write_stbl_atoms`, 3305–3400; 3436) | `sgpd` and `sbgp` left out | letter 1 |
-//! | A4 | the MOV family's configuration records, FLV's beside them (A22) | the helpers' allocations — `hvcC`'s every configuration parsed again, `av1C`'s OBU buffer, `avcC`'s, `vvcC`'s, `evcC`'s and `lvcC`'s of an Annex B configuration, `dvc1`'s unescaped copy — their failures returned to `mov_write_*_tag`, which answers its box's size whatever (1573–1738), and `mov_write_video_tag` discards that besides (2880–2930): the box written empty or cut, the track undecodable; Matroska returns them, its fault at the header — `avcC`'s growth there named a malformed configuration — but for `av1C`'s OBU buffer's growth, its record written cut | letter 1 |
-//! | A5 | APV's `apvC` entries (`ff_isom_parse_apvc`, `apv.c` 217–245; discarded at `movenc.c` 7199) | an entry's allocation at a packet: the record written without it | letter 1 |
-//! | A6 | MP4's track `udta` (4358–4389; discarded at 4441) | its buffer's open: the DASH roles left out, the dispositions read back without them | letter 1 |
-//! | A7 | the movie `udta` (5066–5122; discarded at 5448) | its buffer's open, its growth past 1024 bytes read as none (5114): the covers, the Nero list and the iTunes metadata left out; its `INT_MAX` bounded exactly at open ([`MuxOpenError::CoversTooLarge`]) | letter 1 |
-//! | A8 | MOV's `wave` (1059–1100) | E-AC-3's `dec3`, its allocation discarded (1087) | letter 1 |
-//! | A9 | the chapter track's samples (`mov_create_chapter_track`, 7727–7815) | each sample's write discarded (7807): the track of fewer samples than chapters | letter 1 |
-//! | A10 | `mov_text`'s end sample (9025–9031) | its write discarded: the last cue's end lost | letter 1 |
-//! | A11 | DVD subtitles' palette (8000–8048; discarded at 8752) | the `esds` written of no palette | letter 1 |
-//! | A12 | ISMV's fragments (6084–6116, 6673–6881, 6142–6178) | the `moof`'s null buffer, its `tfra` entries, the last fragment's flush, each discarded; a track's fragment buffer, its growth failed, read as none and its `mdat` written for the bytes it lacks; the `mfra`'s buffer's growth read as none; the manifest's `CodecPrivateData`, its Annex B copy's allocation failing, left out (5544–5550) | letter 1 |
-//! | A13 | AVIF (9154–9213) | its sample buffer's growth read as none, an `mdat` of no sample written; its `moov`'s null buffer's open answered as the size, every chunk's offset moved by it | letter 1 |
-//! | A14 | Ogg's pages (`ogg_buffer_page`, `oggenc.c` 189–212) | a page's list node, its failure discarded at every call: the page left full and the next segment count, less one, handed to `memset` as `SIZE_MAX` (247–253) — a memory fault | letter 1 |
-//! | A15 | the metadata conversion every Vorbis-comment, ID3v2, NUT and Matroska writer runs (`ff_metadata_conv`, `metadata.c` 26–57) | a tag dropped where its `av_dict_set` fails: Ogg's language, NUT's language and chapter titles, MP3's and Matroska's chapter titles | letter 1 |
-//! | A16 | MPEG-TS's raw AAC, through its nested ADTS muxer (`mpegtsenc.c` 1980–2003) | the nested buffer closed unchecked: a null buffer and `-64` bytes copied into the PES payload (2232) — a memory fault | letter 1 |
-//! | A17 | MP3's Xing frame (`mp3enc.c` 145–286; discarded at 632) | its buffer's open discarded after the frame's offset is set, its close unchecked: the trailer writing into a null frame (400–469) — a memory fault | letter 1 |
-//! | A18 | MP3's ID3v2 frames (`id3v2enc.c` 66–98, 259–329) | each frame made in a dynamic buffer, its growth read as none: a title's frame and the table of contents written empty; a chapter written empty while the tag's size, the writers' own sum (`ff_id3v2_finish`, 421–443), counts its element id, times and title — the reader taking the first audio frames as the tag's; a text frame's open failure taken for no match and written again as a `TXXX` frame | letter 1 |
-//! | A19 | NUT's headers (`nutenc.c` 351–717, 1186–1207) | a header packet's buffer's growth read as none, each info packet's buffer closed unchecked — its count written, its tags not — the global info's, the repeated headers' and the index's failures discarded, an index entry's (1164): a stream's language and dispositions, a chapter's title, the index lost | letter 1 |
-//! | A20 | ASF's markers and its header's rewrite (`asfenc.c` 311–347, 1095) | a title's UTF-16 past 1024 bytes read as none, the marker written untitled; the trailer's header rewrite stopped at its buffer's open and discarded, past the file properties it had rewritten: the data object's size and packet count left as the start wrote them, 50 bytes and none (725–731) | letter 1 |
-//! | A21 | Matroska's FLAC channel mask (`matroskaenc.c` 1077–1114) | `av_dict_set` discarded: the comment block of no count and no mask, the layout read back otherwise | letter 1 |
-//! | A22 | FLV's configuration records (`flv_write_codec_header`, `flvenc.c` 807–914) | as A4's, the record written empty | letter 1 |
-//! | A23 | raw FLAC's channel mask (`flacenc.c` 244–259) | as A21 | letter 1 |
-//! | A24 | AVI's gap frames (`write_skip_frames`, `avienc.c` 745–766) | an empty frame's index entry, its allocation discarded: the frame unwritten yet counted, every place after it moved | letter 1 |
-//! | A25 | MP4's joined TTML (`movenc_ttml.c` 289–317) | its buffer closed unchecked: a packet of a null payload and `-64` bytes written as the sample; its writes' failures, `avio_printf`'s, the buffer's error unread — the document cut | letter 1 |
-//! | A26 | FLV's Annex B packets (`flvenc.c` 1318–1327; `nal.c` 133–144) | the rewrite's buffer closed unchecked, `-64` bytes and a null buffer answered: a tag of a 24-bit size of `-59` (1348–1355, 1454) | letter 1 |
-//! | A27 | MP4's HEVC of the `hvc1` tag and an Annex B configuration (`ff_hevc_annexb2mp4`, `hevc.c` 1203–1250) | each packet parsed into a dynamic buffer first, closed unchecked: the frame written as a sample of no bytes (`movenc.c` 7126) | letter 1 |
-//! | S1 | Ogg's comment header (`ogg_write_vorbiscomment`, `oggenc.c` 291–319; `ff_vorbiscomment_length`, `vorbiscomment.c` 44–60) | measured in a null buffer of `INT_MAX`, its packet past `INT_MAX` refused — each reported as a failed allocation; FLAC's comments' 24 bits (352) | bounded exactly at open ([`MuxOpenError::CommentHeaderTooLarge`], [`ogg_comment_bytes`]) — L166, `an_ogg_comment_header_holds_int_max` |
-//! | S2 | AVIF's `moov` (`get_moov_size`, `movenc.c` 8905–8916; 9179–9181) | measured in a null buffer of `INT_MAX`, its refusal taken as the size | judged at every packet and at open, bounded at `INT_MAX` ([`avif_movie_bound`]) — L167, `avifs_movie_box_holds_int_max` |
-//! | S3 | VP9's `vpcC`, MP4's and FLV's (`get_vp9_level`, `vpcc.c` 77–122) | a level of the width times the height in an `int`, where the ticket's is unknown | refused at open ([`MuxOpenError::Dimensions`]; [`vp9_picture_overflows`]) — L168 |
-//! | — | every failure FFmpeg returns through a callback: an open's, a header's, a packet's, a trailer's | — | reported, the muxer's fault ([`MuxFault`]) — L164 (the open), L169 (a cluster's growth, at the trailer) |
+//! | | where | what is lost, and how | class | its sizes | disposition |
+//! |---|---|---|---|---|---|
+//! | A1 | the MOV family's `pssh` boxes (`mov_write_pssh_tag`, `movenc.c` 5175–5210; 5449–5451) | the encryption initialization parsed again at the `moov`, its allocation's failure answered as none, 0 returned and discarded besides: the file written without its DRM initialization | omission: no entry, no box (5184–5206) | none: refused at open | refused at open ([`MuxOpenError::EncryptionInitialization`]; ruled) — L165 |
+//! | A2 | the MOV family's `stts` (`mov_write_stts_tag`, 3241–3288; discarded at 3411) | its 8 bytes a sample, their allocation's failure returned and discarded: the track written without its time-to-sample table — every track but constant-size audio's, whose one entry's allocation the same | omission: returned before any write (3249–3251, 3257–3259) | out of reach: the table's entries, at most [`MOV_SAMPLES_MAX`] — 29 826 048 × 8 = 238 608 384 bytes, 33 553 408 × 8 = 268 427 264 of 64-byte entries — and `ctts`'s one more (3208) | letter 1 |
+//! | A3 | AAC's and Opus's roll groups (`mov_preroll_write_stbl_atoms`, 3305–3400; 3436) | `sgpd` and `sbgp` left out | omission: returned before any write (3326–3328) | out of reach: 12 bytes an entry, 357 912 576 at the table's bound, 402 640 896 of 64-byte entries | letter 1 |
+//! | A4 | the MOV family's configuration records, FLV's beside them (A22) | the helpers' allocations — `hvcC`'s every configuration parsed again, `av1C`'s OBU buffer, `avcC`'s, `vvcC`'s, `evcC`'s and `lvcC`'s of an Annex B configuration, `dvc1`'s unescaped copy — their failures returned to `mov_write_*_tag`, which answers its box's size whatever (1573–1738), and `mov_write_video_tag` discards that besides (2880–2930): the box written empty or cut, the track undecodable; Matroska returns them, its fault at the header — `avcC`'s growth there named a malformed configuration — but for `av1C`'s OBU buffer's growth, its record written cut | omission: each helper returns before it writes, or writes what it parsed; after an Annex B buffer's failed close, `avcC`'s, `hvcC`'s and `vvcC`'s walks sum a null pointer and `-64` (`avc.c` 53–54; `hevc.c` 1377–1378; `vvc.c` 904–905) — arithmetic ISO C leaves undefined, no access: each loop's guard reads `-64` | within the ticket's default budget, out of reach: a configuration of at most 16 MiB (`DEFAULT_MAX_CODEC_PARAMETER_BYTES`), its Annex B rewrite at most a quarter more and its 64 bytes of padding; `hvcC`'s read whole within `init_get_bits8`'s 268 435 391 bytes, mirrored ([`records`]); LCEVC's units, at most 4 194 304, within the `INT_MAX` over a unit's 96 bytes its split's list holds (`h2645_parse.c` 590–606) — past a budget the caller raises (`CodecTicket::mirror_with`), reachable: R20's letter | letter 1 |
+//! | A5 | APV's `apvC` entries (`ff_isom_parse_apvc`, `apv.c` 217–245; discarded at `movenc.c` 7199) | an entry's allocation at a packet: the record written without it | omission: the array kept, returned before the write (`apv.c` 474–478, 496–500) | out of reach: five entries (473) of 255 informations (493) | letter 1 |
+//! | A6 | MP4's track `udta` (4358–4389; discarded at 4441) | its buffer's open: the DASH roles left out, the dispositions read back without them | omission: no box (4369–4371, 4381) | out of reach: the roles' fixed strings alone — the base sets a stream no title (`Output::add_stream`) | letter 1 |
+//! | A7 | the movie `udta` (5066–5122; discarded at 5448) | its buffer's open, its growth past 1024 bytes read as none (5114): the covers, the Nero list and the iTunes metadata left out; its `INT_MAX` bounded exactly at open ([`MuxOpenError::CoversTooLarge`]) | omission: no box (5114) | bounded exactly at open ([`UDTA_BYTES_MAX`]) | letter 1 |
+//! | A8 | MOV's `wave` (1059–1100) | E-AC-3's `dec3`, its allocation discarded (1087) | omission: returned before any write (627–630) | out of reach: at most 36 bytes (626) | letter 1 |
+//! | A9 | the chapter track's samples (`mov_create_chapter_track`, 7727–7815) | each sample's write discarded (7807): the track of fewer samples than chapters | omission: the sample's allocation checked (7799–7803), its write's answer dropped | out of reach: a title of at most 65 535 bytes ([`MuxOpenError::ChapterTitleTooLong`]), its sample 65 549; the samples within the table ([`MuxOpenError::ChapterCount`]) | letter 1 |
+//! | A10 | `mov_text`'s end sample (9025–9031) | its write discarded: the last cue's end lost | omission: a 2-byte sample (7484–7494) | out of reach: its entry within the table's bound, which keeps its room ([`PayloadRule::SampleTable`]) | letter 1 |
+//! | A11 | DVD subtitles' palette (8000–8048; discarded at 8752) | the `esds` written of no palette | omission: returned before any write (8035–8037) | out of reach: 128 bytes | letter 1 |
+//! | A12 | ISMV's fragments (6084–6116, 6673–6881, 6142–6178) | the `moof`'s null buffer, its `tfra` entries, the last fragment's flush, each discarded; a track's fragment buffer, its growth failed, read as none and its `mdat` written for the bytes it lacks; the `mfra`'s buffer's growth read as none; the manifest's `CodecPrivateData`, its Annex B copy's allocation failing, left out (5544–5550) | memory fault, the `tfra`: its count raised (5812) before the growth whose failure frees and nulls the index (5815–5818), the answer discarded (6850), the trailer's `mfra` reading every entry through the null index (9127–9129, 6162, 6131–6136) — or, after a later fragment grew it again from none, writing entries no one set; the rest omissions and misreports | out of reach: the index at most [`FRAGMENTS_MAX`], fragments at most the samples; the fragment buffer, the `mfra` and the `moov` bounded ([`PayloadRule::FragmentSize`], [`PayloadRule::FragmentIndex`], [`PayloadRule::MovieBox`]); the manifest's copy of two sets of 16-bit lengths | letter 1 |
+//! | A13 | AVIF (9154–9213) | its sample buffer's growth read as none, an `mdat` of no sample written; its `moov`'s null buffer's open answered as the size, every chunk's offset moved by it | omission and misreport: 0 bytes and a null buffer written as none (9189–9198); the open's code taken as the size (8911–8912, 9179–9181) | bounded: the samples ([`FRAGMENT_BYTES_MAX`]), the `moov` (S2) | letter 1 |
+//! | A14 | Ogg's pages (`ogg_buffer_page`, `oggenc.c` 189–212) | a page's list node, its failure discarded at every call: the page left full and the next segment count, less one, handed to `memset` as `SIZE_MAX` (247–253) | memory fault: `memset` of `SIZE_MAX` bytes past the page's segments (252), then `segments[255]` (256) — every page buffered through `ogg_buffer_page` (233–234, 239–242, 275–280, 285–286), a page whose buffering fails taking the next segments until it is full: no road avoids it | out of reach: the node's and the page's fixed sizes; the comment header bounded (S1) | letter 1 |
+//! | A15 | the metadata conversion every Vorbis-comment, ID3v2, NUT and Matroska writer runs (`ff_metadata_conv`, `metadata.c` 26–57) | a tag dropped where its `av_dict_set` fails: Ogg's language, NUT's language and chapter titles, MP3's and Matroska's chapter titles | omission: the tag dropped (`av_dict_set`) | out of reach: each value one the base set through `av_dict_set` with its own copy, under the same limit, refused first there, the open's fault | letter 1 |
+//! | A16 | MPEG-TS's raw AAC, through its nested ADTS muxer (`mpegtsenc.c` 1980–2003) | the nested buffer closed unchecked: a null buffer and `-64` bytes copied into the PES payload (2232) | memory fault: `memcpy` of a null buffer and `SIZE_MAX - 63` bytes (2232) — avoided where the muxer frames each packet in ADTS itself, which MPEG-TS takes as it is (1977) | out of reach: an ADTS frame of at most 8191 bytes ([`PayloadRule::AdtsFrame`]) | letter 1 |
+//! | A17 | MP3's Xing frame (`mp3enc.c` 145–286; discarded at 632) | its buffer's open discarded after the frame's offset is set, its close unchecked: the trailer writing into a null frame (400–469) | memory fault: the frame's fields written through the null frame and its offset (412–466), its CRC read through it (465) — avoided by `write_xing` off (161–162, 515–516) | out of reach: one frame of at most 1440 bytes (205–220) | letter 1 |
+//! | A18 | MP3's ID3v2 frames (`id3v2enc.c` 66–98, 259–329) | each frame made in a dynamic buffer, its growth read as none: a title's frame and the table of contents written empty; a chapter written empty while the tag's size, the writers' own sum (`ff_id3v2_finish`, 421–443), counts its element id, times and title — the reader taking the first audio frames as the tag's; a text frame's open failure taken for no match and written again as a `TXXX` frame | omission and misreport: 0 bytes and a null buffer written as none (85–94, 279–285, 317–323) | bounded exactly at open ([`ID3V2_BYTES_MAX`]) | letter 1 |
+//! | A19 | NUT's headers (`nutenc.c` 351–717, 1186–1207) | a header packet's buffer's growth read as none, each info packet's buffer closed unchecked — its count written, its tags not — the global info's, the repeated headers' and the index's failures discarded, an index entry's (1164): a stream's language and dispositions, a chapter's title, the index lost | misreport: each count written beside 0 bytes, or `-64` written as none (355, 366; 539–540, 570–580, 609–610) | the info packets: reachable, bounded exactly at open (S4); the stream headers' configuration under 2^30 bytes ([`MuxOpenError::ConfigurationInvalid`]); the key frame index: N1 | letter 1 |
+//! | A20 | ASF's markers and its header's rewrite (`asfenc.c` 311–347, 1095) | a title's UTF-16 past 1024 bytes read as none, the marker written untitled; the trailer's header rewrite stopped at its buffer's open and discarded, past the file properties it had rewritten: the data object's size and packet count left as the start wrote them, 50 bytes and none (725–731) | omission and misreport: 0 bytes and a null buffer (333, 342); the rewrite stopped (544) | out of reach: a title of at most 1023 bytes ([`MuxOpenError::ChapterTitleTooLong`]) | letter 1 |
+//! | A21 | Matroska's FLAC channel mask (`matroskaenc.c` 1077–1114) | `av_dict_set` discarded: the comment block of no count and no mask, the layout read back otherwise | misreport: a block of no comment | out of reach: a mask of 18 bits | letter 1 |
+//! | A22 | FLV's configuration records (`flv_write_codec_header`, `flvenc.c` 807–914) | as A4's, the record written empty | omission, as A4's | the helpers' as A4's; the sequence header's 24-bit size: reachable, bounded exactly at open (S6) | letter 1 |
+//! | A23 | raw FLAC's channel mask (`flacenc.c` 244–259) | as A21 | misreport, as A21's | out of reach, as A21's | letter 1 |
+//! | A24 | AVI's gap frames (`write_skip_frames`, `avienc.c` 745–766) | an empty frame's index entry, its allocation discarded: the frame unwritten yet counted, every place after it moved | misreport: the count raised before the entry (877, 898–901) | the index out of reach: its entries a RIFF's, at most a gibibyte's chunks of 8 bytes, in clusters of 16 384 (57, 112–133, 174); the count's `int`: reachable, bounded (S5) | letter 1 |
+//! | A25 | MP4's joined TTML (`movenc_ttml.c` 289–317) | its buffer closed unchecked: a packet of a null payload and `-64` bytes written as the sample; its writes' failures, `avio_printf`'s, the buffer's error unread — the document cut | misreport: `avio_write` of `-64` bytes writes none (`movenc.c` 7231), the sample counted of them | bounded: the document ([`PayloadRule::DocumentSize`]) | letter 1 |
+//! | A26 | FLV's Annex B packets (`flvenc.c` 1318–1327; `nal.c` 133–144) | the rewrite's buffer closed unchecked, `-64` bytes and a null buffer answered: a tag of a 24-bit size of `-59` (1348–1355, 1454) | misreport: the packet's own bytes handed for the null buffer and `-64` written as none (1452) | out of reach: a tag under 2^24 bytes ([`PayloadRule::TagSize`]) | letter 1 |
+//! | A27 | MP4's HEVC of the `hvc1` tag and an Annex B configuration (`ff_hevc_annexb2mp4`, `hevc.c` 1203–1250) | each packet parsed into a dynamic buffer first, closed unchecked: the frame written as a sample of no bytes (`movenc.c` 7126) | misreport: a sample of no bytes; the walk sums a null pointer and `-64` (`hevc.c` 1220–1221), as A4's, no access | bounded: the rewrite ([`PayloadRule::RewrittenSize`]) | letter 1 |
+//! | N1 | NUT's key frame index (`nut_write_packet`, `nutenc.c` 1051–1068; R20) | at each syncpoint whose count is a power of two, each stream's `keyframe_pts` grown to twice the count; a failure frees and nulls that stream's (1058), leaves the streams after it at the count, and is returned (1059–1062) — but the muxer goes on after it: a write's failure leaves the output writing | memory fault, on the next call: a later key packet writes one entry past an array the loop left short (1171–1172), and the trailer's index reads the null one (636–655) | reachable at 2^27 syncpoints, 2^28 entries of 8 bytes past `INT_MAX`, the refusal reported as `ENOMEM`; the syncpoints rest on byte positions and libavformat's interleaving, which this release does not mirror: no exact bound | R20's letter |
+//! | S1 | Ogg's comment header (`ogg_write_vorbiscomment`, `oggenc.c` 291–319; `ff_vorbiscomment_length`, `vorbiscomment.c` 44–60) | measured in a null buffer of `INT_MAX`, its packet past `INT_MAX` refused — each reported as a failed allocation; FLAC's comments' 24 bits (352) | misreport | bounded exactly | bounded exactly at open ([`MuxOpenError::CommentHeaderTooLarge`], [`ogg_comment_bytes`]) — L166, `an_ogg_comment_header_holds_int_max` |
+//! | S2 | AVIF's `moov` (`get_moov_size`, `movenc.c` 8905–8916; 9179–9181) | measured in a null buffer of `INT_MAX`, its refusal taken as the size | misreport | bounded | judged at every packet and at open, bounded at `INT_MAX` ([`avif_movie_bound`]) — L167, `avifs_movie_box_holds_int_max` |
+//! | S3 | VP9's `vpcC`, MP4's and FLV's (`get_vp9_level`, `vpcc.c` 77–122) | a level of the width times the height in an `int`, where the ticket's is unknown | misreport | bounded | refused at open ([`MuxOpenError::Dimensions`]; [`vp9_picture_overflows`]) — L168 |
+//! | S4 | NUT's info packets (`write_streaminfo`, `write_chapter`, `nutenc.c` 545–613; R20, by the class) | a stream's tags — its language, the one of a length the table sets, its dispositions and a video stream's frame rate — or a chapter's, its title, made in a dynamic buffer closed with its 64 bytes of padding unchecked: past `INT_MAX` less them, the packet written with its count and fewer bytes, success answered | misreport | counted exactly ([`nut_stream_info_bytes`], [`nut_chapter_info_bytes`], [`NUT_INFO_BYTES_MAX`]) | refused at open ([`MuxOpenError::LanguageTooLong`], [`MuxOpenError::ChapterTitleTooLong`]) — L170, `a_nut_info_packet_holds_int_max_less_its_padding` |
+//! | S5 | AVI's counts (`avienc.c` 86, 877, 744–766, 924, 203–235, 941–953; R20, by the class, the census's line 86 corrected) | a stream's frames — its packets and the empty frames written into its gaps, the trailer's to the last packet's end among them — an `int` no index bounds, its overflow undefined; the OpenDML header's sum of them, video's most and MP2's and MP3's added, an `int`; a block-aligned audio stream's blocks, 32 bits, written cut | misreport | counted exactly, the trailer's gap as though each packet were the last | refused at the packet that would pass ([`PayloadRule::FrameCount`]) — L171, `avis_counts_and_flvs_sequence_header_hold_their_bits` |
+//! | S6 | FLV's sequence header (`flv_write_codec_header`, `flvenc.c` 807–914; R20, by the class) | the header's bytes and the record its codec's writer makes, their size written in the tag's 24 bits, cut past them: within the ticket's default budget a configuration of 16 MiB passes them — an `hvcC` of large SEI arrays, an `av1C` of metadata OBUs, which the standards allow | misreport | counted exactly ([`flv_sequence_bytes`]), VVC's `vvcC` of Annex B units at its profile, tier and level's most ([`records::vvcc_written_bound`]) | refused at open ([`MuxOpenError::ConfigurationInvalid`]) — L172 |
+//! | — | every failure FFmpeg returns through a callback: an open's, a header's, a packet's, a trailer's | — | — | — | reported, the muxer's fault ([`MuxFault`]) — L164 (the open), L169 (a cluster's growth, at the trailer) |
 //!
 //! **Letter 1 (R19, asked).** A2–A27 are FFmpeg's — a failure it never
 //! returns, or returns to a caller that drops it — and a refusal at open,
@@ -700,6 +723,21 @@
 //! ID3v2 tag's size — would detect the omissions after the fact, the
 //! memory faults not. The letter asks which: each refused as A1, the
 //! detection built, or FFmpeg patched upstream, the census its evidence.
+//!
+//! **R20's letter (asked, beside letter 1).** Two findings no exact bound
+//! holds. N1, NUT's key frame index: a memory fault on the call after a
+//! failure its writer returns — avoided by NUT's `write_index` off, the
+//! index lost, or by a write's failure ending the muxer, no packet and no
+//! trailer after it. And the budgets: the census reads a configuration as
+//! within the ticket's budget — 16 MiB by default, the caller's to raise
+//! (`CodecTicket::mirror_with`) — and a packet as within the muxer's
+//! [`PacketLimits`] — a gibibyte by default, the caller's to raise to
+//! [`PACKET_BYTES_MAX`]: past them the helpers' Annex B rewrites of a
+//! configuration reach a dynamic buffer's `INT_MAX` (A4, A22), and MPEG-TS
+//! sums a packet, its access unit delimiter and the configuration it adds
+//! to an IDR picture in an `int` (`h26x_prefix_aud`, `mpegtsenc.c`
+//! 1851–1864; 1958). Each is refused past the defaults, or mirrored
+//! exactly: the ruling's.
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -985,6 +1023,7 @@
 //! | [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Cropping`] | MP4's trailer refuses the box (`movenc.c` 1299–1340, 857–910, 3024–3036; `movenc_ttml.c` 236–317) | refuses after taking: the file |
 //! | [`MuxOpenError::SampleSize`], [`MuxOpenError::Cover`] | `pcm_rechunk`'s start fails the header (`pcm_rechunk.c` 49–58); the cover's builder fails after the header (`packet.c` 83–95) | refuses: the file |
 //! | [`MuxOpenError::CoversTooLarge`] | the movie's `udta`, every cover in it, passes the dynamic buffer movenc makes it in, the `covr` written cut (`movenc.c` 5066–5122, 4815–4839; `aviobuf.c` 1281–1311; R14b) | corrupts: the file's metadata |
+//! | [`PayloadRule::FrameCount`]; NUT's [`MuxOpenError::LanguageTooLong`] and [`MuxOpenError::ChapterTitleTooLong`]; FLV's sequence header's [`MuxOpenError::ConfigurationInvalid`] (R20, by the class) | AVI counts a stream's frames and their OpenDML sum in an `int`, a signed overflow, and writes a block-aligned audio stream's blocks cut into 32 bits (`avienc.c` 877, 203–235, 941–953); NUT writes an info packet past its dynamic buffer with its count of tags and fewer bytes (`nutenc.c` 545–613); FLV writes its sequence header's size cut into 24 bits (807–914) | corrupts, success answered |
 //! | [`MuxOpenError::MediaTypeMismatch`] | a stream of one media type whose packets this muxer would judge as another's | corrupts |
 //! | [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSample`] | MP4 writes every chapter into its Nero list but a titled one alone into its chapter track, which its reader lays over the list by position, with a 16-bit title length (`movenc.c` 7791–7807); `ff_mov_write_packet`'s answer for a chapter's sample ignored, a sample past `INT_MAX` lost, one out of range moved (7807) | corrupts, or loses |
 //!
@@ -1080,10 +1119,12 @@
 //! | WAV | a packet past 4 GiB of file; of every codec tag but integer PCM's, a packet past 2^32 samples of presentation span, its duration counted | the sizes left at their placeholders, the file broken; the fact chunk's count cut, read back as the stream's length (`wavenc.c` 409–495) | [`PayloadRule::FileSize`] — L78, L104 |
 //! | FLV | a reordering H.264, MPEG-4, HEVC, AV1, VP9 or VVC packet with no presentation time; a decode time past 32 bits of milliseconds; a composition time past 24 bits; a tag past 24 bits of size; ADTS AAC no filter converts; AAC with no configuration whose first packet brings none; AV1's new configuration — the packet's, or the one `extract_extradata` makes of its sequence headers — `ff_isom_write_av1c` fails on, and under that filter a unit whose OBUs do not parse | refused after taking the packet; written cut; written cut; refused after taking the packet; refused after taking the first, the rest written with their headers in; an empty sequence header, unreadable; an empty sequence header; refused by the filter (`flvenc.c` 1252–1352, 807–860, 892–893; `av1_parse.c` 56–97) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`PayloadRule::TagSize`], [`PayloadRule::AdtsHeader`], [`PayloadRule::ConfigurationAbsent`], [`PayloadRule::NewExtradata`], [`PayloadRule::Obus`] — L50, L82, L109 |
 //! | AVI | a frame more than 60 000 frames after the stream's place, but XSUB's, whose gaps it fills not; H.264 it tags `H264` not opening on a start code; at open, raw video of no tag of another pixel format than its bits name | refused after taking it; the first refused after taking it, the rest written as they are; written, "unreadable" (`avienc.c` 744–778, 446–461) | [`FfmpegMuxRefusal::FrameGap`], [`PayloadRule::StartCode`], [`MuxOpenError::ConfigurationInvalid`] — L84 |
+//! | AVI (R20, by the class) | a packet after which a stream's frames — its packets, and its gaps' empty frames to the packet's end, as though it were the last — pass an `int`; or the OpenDML header's sum of them, its video streams' most and its MP2 and MP3 streams' added; or a block-aligned audio stream's blocks, its bytes over its block alignment, pass 32 bits | a signed overflow of the count no index bounds, the counts written wrapped; the length written cut (`avienc.c` 86, 877, 744–766, 924, 203–235, 941–953) | [`PayloadRule::FrameCount`] — L171 |
 //! | FLV, at open | Opus or FLAC with no configuration; H.264, HEVC, VVC, AV1, MPEG-4 or AAC with none and the filters off; AV1's configuration `ff_isom_write_av1c` fails on | the header's `av_assert0` ends the process; written behind an empty sequence header; an empty sequence header (`flvenc.c` 853, 1491–1503, 892–893) | [`MuxOpenError::ConfigurationMissing`], [`MuxOpenError::ConfigurationInvalid`] — L82, L109 |
 //! | FLV, at open | big-endian PCM; an audio codec of no extended header — PCM, Swiff ADPCM, Nellymoser, G.711, Speex — of a layout not exactly mono or stereo; PCM's and Swiff ADPCM's 8 and 16 kHz, G.711's every rate but 8 kHz | its code the host's own order, read back little-endian; the multichannel header names the codec's fourcc, which it has none of, and `av_assert0` ends the process; written as the 5.5 kHz code, and G.711 read back at 8 kHz, with no metadata read before the stream exists (`flvenc.c` 140–240, 910–913, 497–540; `flvdec.c` 314–360, 1657–1670) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`] — L105 |
 //! | FLV, at open (R11, ruling 4: every refusal of its start, by grep `return AVERROR\|unsupported_codec\|goto error` over `get_audio_flags` and `flv_init`, 141–240 and 971–1081; its allocation and the keyframe index's flag, never set, aside) | MPEG-4 Part 2 and H.263; an audio codec at a rate its flags' table names no code for — MP3 but at 48, 44.1, 22.05 and 11.025 kHz, its other codecs of no extended header but at 44.1, 22.05, 11.025, 16, 8 and 5.512 kHz, Speex but at 16 kHz — and Speex of more than one channel; a native layout of no channel its multichannel configuration keeps, which its reader refuses (R11, Codex R10 1; table E); a video track past the first of another codec than VP9, AV1, H.264, HEVC and VVC, an audio track past the first of another than AAC, MP3, Opus, FLAC, AC-3 and E-AC-3; a codec of none of its tables, a data or subtitle stream but text — refused by `avformat_query_codec`, its tables naming neither | refused at its start, the header unwritten, as no part of the official specification, "FLV does not support sample rate", "FLV only supports mono Speex audio", "Unsupported multi-track video codec" / "audio codec" (`flv_init`, `flvenc.c` 985–1066; `get_audio_flags`, 141–240); the layout written as a mask of zero, which its reader refuses, the stream read back of no channels (739–744; `flvdec.c` 1733–1742) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::TrackLayout`] — L133, L134, L135 |
 //! | FLV, at open (R11, Q868) | an HEVC, AV1, VP9 or VVC track of no matrix coefficients, or of one past its table | its metadata packet states the matrix where it is specified, and its reader, its colour information in a zeroed context, reads an absent one back as RGB — a false claim (`flvenc.c` 555–608; `flvdec.c` 1261–1262) | [`MuxOpenError::ColourDescription`] — L143 |
+//! | FLV, at open (R20, by the class) | a sequence header — its flags or its extended header, and the record its codec's writer makes of the configuration — past the 24 bits its tag's size is written in: within the ticket's default budget, an `hvcC` of large SEI arrays, an `av1C` of metadata OBUs | its size written cut, the reader stepping into the record (`flv_write_codec_header`, `flvenc.c` 807–914) | [`MuxOpenError::ConfigurationInvalid`] ([`flv_sequence_bytes`]) — L172 |
 //! | MP4, MOV, FLV, the MXF muxers, MP3, at open (R11, Q868) | a coded side data value past its field: MP4's and MOV's content light level past 65 535, mastering display chromaticity past 65 535 fifty-thousandths and luminance past `INT_MAX` ten-thousandths, ambient illuminance past `INT_MAX` ten-thousandths and light past 65 535 fifty-thousandths; MOV's stereo field of view past `INT_MAX` thousandths of a degree and disparity past an `int`'s ten-thousandths; FLV's light level past 65 535; MXF's luminance past `INT_MAX` ten-thousandths; MP3's ReplayGain of a gain past ±51.1 dB or a peak past 512 | written cut into its field, or read back into an `int` or 16 bits: another value, negative past `INT_MAX` (`movenc.c` 2384–2393, 2466–2476, 2659–2735; `mov.c` 6684–6814, 7286–7296, 7396–7423; `flvdec.c` 63–68, 785–787; `mxfenc.c` 1222–1225, 1484–1489; `mxfdec.c` 1482–1490; `mp3enc.c` 425–446) | [`MuxOpenError::CodedSideData`] — L144 |
 //! | WebM, at open (R11, Q868) | a video track's stereo 3D type of checkerboard, lines, columns or frame sequence | the first three written as Matroska stereo modes 4 to 9, which WebM defines not, its check wanting its bit mask; frame sequence's 13 and 14 failing the header (`matroskaenc.c` 1640–1731; `matroska.h` 402–424) | [`MuxOpenError::StereoMode`] — L145 |
 //! | ASF, at open (R11, Q868 letter 11; by the round trip) | HEVC, of any tag | its tag tables name none (`asfenc.c` 241–243), its tags `HEVC` and `H265` RIFF's unofficial ones (`riff.c` 519–521), which its reader alone falls back to (`asfdec_f.c` 449–451): `hev1` and `hvc1`, which FFmpeg's tool copies in, read back of no codec | refused by `avformat_query_codec`, which answers it not carried ([`MuxOpenError::CodecNotCarried`]) — L146; kept refused, the library's own question never answered looser (R12, ruled), and booked (Q860): HEVC in ASF may be admitted under the `HEVC` and `H265` tags its reader takes, after its own audit |
@@ -1100,6 +1141,7 @@
 //! | MPEG-TS | a reordering stream's packet with no presentation time; H.264, HEVC or VVC off a start code, or of fewer than 5 bytes, no filter converting it; AAC or Opus of fewer than 2 bytes; raw AAC on a track with no configuration, or past its ADTS header's 13 bits; an empty packet; a time past its clock reference's room | refused after taking the first, written without a time after; refused after taking the first, written as it is after; refused after taking it; written raw, unreadable, or cut; nothing of it, or a delimiter alone; an overflow (`mpegtsenc.c` 1869–2240) | [`FfmpegMuxRefusal::MissingPts`], [`PayloadRule::StartCode`], [`PayloadRule::TooShort`], [`PayloadRule::AdtsFrame`], [`PayloadRule::AdtsFrameLength`], [`PayloadRule::Empty`], [`FfmpegMuxRefusal::TimeWraps`] — L96 |
 //! | MPEG-TS, at open | a codec it writes as private data its reader may not name; AAC of a configuration ADTS cannot write; Opus of a channel mapping its PMT cannot describe; ARIB captions of another profile than A and C; a stream its PMT section has no room for, each descriptor counted at the size its loop writes — 4 bytes an ISO 639 code, 8 a DVB subtitle's, 5 a teletext's; a DVB subtitle or teletext language past its descriptor's 8-bit length, 31 codes or 51; a DVB subtitle's or teletext's configuration of another size than the entries its codes take, five bytes or two a code, or none | written unnamed; its nested ADTS muxer's start refuses it; an unknown mapping, undecodable; no descriptor; written undeclared, or no PMT at all, success answered; the length wrapped, the PMT misread; read back as a configuration of its codes' entries — the defaults' page ids where it has none (`mpegtsenc.c` 216–848, 1240–1268; `mpegts.c` 2152–2255) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::StreamIds`], [`MuxOpenError::LanguageTooLong`], [`MuxOpenError::ConfigurationMissing`] — L96, L107 |
 //! | NUT, at open | raw video of a tag its tables do not hold; a video stream of no width or height, an audio one of no sample rate or channels, a configuration of 2^30 bytes or more; a chapter starting past its count; a time base not in lowest terms | written under the tables' first raw tag, RGB 5:5:5's, read back as that; a stream header its reader refuses; wrapped; a main header its reader refuses (`nut.c` 50; `nutdec.c` 233–240, 447–470; `nutenc.c` 601) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ChapterSpan`]; the time base handed reduced — L90 |
+//! | NUT, at open (R20, by the class) | a stream's info — its language, its dispositions, a video stream's frame rate — or a chapter's, its title, past the dynamic buffer of `INT_MAX` bytes its tags are made in, less the 64 its close writes | the packet written with its count of tags and fewer bytes, success answered (`write_streaminfo`, `write_chapter`, `nutenc.c` 545–613; `aviobuf.c` 1281–1311, 1410–1436) | [`MuxOpenError::LanguageTooLong`], [`MuxOpenError::ChapterTitleTooLong`] ([`nut_stream_info_bytes`], [`nut_chapter_info_bytes`]) — L170 |
 //! | MXF, MXF D-10, MXF OP-Atom | an MPEG-2 picture of coding type 0, or of a profile and level MXF labels no codec for; a P or B picture, whose index offsets this release does not mirror; DNxHD's first frame short of its compression id, or of an id MXF labels none for; a frame of another size than a constant-bit-rate index counts — MXF D-10's of its bit rate, DNxHD's of its first; an empty packet; at the end, a track no packet reached | refused after taking it; its index written at the next segment, the whole file lost at an offset past a byte; refused after taking it; refused after taking it; an essence element of none; nothing written, the trailer failing (`mxfenc.c` 2361–2397, 2793–2858, 3325–3458, 3487–3606) | [`PayloadRule::FrameHeader`], [`PayloadRule::PredictedPicture`], [`PayloadRule::FrameSize`], [`PayloadRule::Empty`], [`FfmpegMuxRefusal::NoFrame`] — L99 |
 //! | MXF, MXF D-10, MXF OP-Atom, at open | a codec but MPEG-2, DNxHD and ProRes video — MXF D-10's MPEG-2 alone — and 16- and 24-bit PCM: H.264, DV, FFV1 and JPEG 2000, whose frame parsers this release has not audited, and the data and caption tracks, booked; a first track not the one video track, OP-Atom's second track, MXF D-10's audio track not its second; a frame rate MXF names no content package for, or none; no pixel format; ProRes of no profile its labels name; sound but at 48 kHz, OP-Atom's but mono; MXF D-10's video at a bit rate it names not, or at a rate but 25 and 30000/1001; its sound past eight channels, or of a block alignment not its channels' samples | refused at its start; or its label another standard's; or its writer dividing by the alignment (`mxfenc.c` 2941–3165, 3222–3248) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ConfigurationInvalid`] — L98 |
 //! | the MOV family's modes | MP4's packet rules; ISMV's and AVIF's samples past the dynamic buffer they are written into — AVIF's held until its trailer, ISMV's until its next fragment's flush, counted here from the track's first sample, stricter than FFmpeg and losing nothing; ISMV's decode gap of `i32::MAX` less the track's first composition offset, but before a key frame of its one video track | as MP4's; the buffer refusing the write, the sample tables counting bytes the file lacks (`movenc.c` 6961–6981; `aviobuf.c` 1281–1311); the decode time rewritten that offset back, the next flush's `av_assert0` ending the process (6897–6923, 7396–7410, 1248–1256) | as MP4's — each mode's table of a track's samples, ISMV's counted from its first sample, never reset at a flush ([`PayloadRule::SampleTable`]; R12); [`PayloadRule::FragmentSize`], [`FfmpegMuxRefusal::DtsGap`] — L103, L123 |
@@ -1777,6 +1819,19 @@ struct Bounds {
   /// codec's own beside the comments: the `int` libavformat builds it in
   /// ([`MuxOpenError::CommentHeaderTooLarge`]).
   comment: u64,
+  /// The most bytes a NUT info packet's tags come to, a stream's or a
+  /// chapter's ([`NUT_INFO_BYTES_MAX`]; [`MuxOpenError::LanguageTooLong`],
+  /// [`MuxOpenError::ChapterTitleTooLong`]).
+  info: u64,
+  /// The most frames AVI counts a stream's in, or a file's sum of them —
+  /// an `int` ([`PayloadRule::FrameCount`]).
+  frames: u64,
+  /// The most blocks AVI writes a block-aligned audio stream's length in,
+  /// 32 bits ([`PayloadRule::FrameCount`]).
+  blocks: u64,
+  /// The most bytes FLV's sequence header holds: its tag's 24-bit size
+  /// ([`FLV_SEQUENCE_BYTES_MAX`]; [`MuxOpenError::ConfigurationInvalid`]).
+  sequence: u64,
 }
 
 impl Bounds {
@@ -1793,6 +1848,10 @@ impl Bounds {
     user_data: UDTA_BYTES_MAX,
     tag: ID3V2_BYTES_MAX,
     comment: i32::MAX as u64,
+    info: NUT_INFO_BYTES_MAX,
+    frames: i32::MAX as u64,
+    blocks: u32::MAX as u64,
+    sequence: FLV_SEQUENCE_BYTES_MAX,
   };
 }
 
@@ -1846,6 +1905,26 @@ const ASF_TITLE_BYTES_MAX: usize = 1023;
 /// packet's read, left unset (`get_str`, `nutdec.c` 44–66; 513, 559–590) —
 /// R17, Codex R16, by the class.
 const NUT_TITLE_BYTES_MAX: usize = 1023;
+
+/// The most bytes a NUT info packet's tags come to (R20, by the class: a
+/// length that wraps is refused): each info packet — the global one, a
+/// stream's, a chapter's — makes its tags in a dynamic buffer, which
+/// refuses a write past `INT_MAX` and drops every later one, and closes it
+/// unchecked, its close writing 64 bytes of padding into it
+/// (`write_globalinfo`, `write_streaminfo`, `write_chapter`, `nutenc.c`
+/// 517–613; `dyn_buf_write`, `avio_close_dyn_buf`, `aviobuf.c` 1281–1311,
+/// 1410–1436): past it the packet is written with its count of tags and
+/// fewer bytes than they take — or of `-64`, none — success answered. The
+/// packet's forward pointer, its header's few bytes and the tags and 4
+/// (`put_packet`, 351–370), lies within `INT_MAX` below it.
+const NUT_INFO_BYTES_MAX: u64 = i32::MAX as u64 - 64;
+
+/// The most bytes FLV's sequence header holds (R20, by the class): the
+/// tag's size is written in 24 bits, of the bytes written after its
+/// header — the flags or the extended header, and the configuration
+/// record its writer makes — cut past them, the reader then stepping into
+/// the record (`flv_write_codec_header`, `flvenc.c` 807–914).
+const FLV_SEQUENCE_BYTES_MAX: u64 = (1 << 24) - 1;
 
 impl Default for MuxOptions {
   fn default() -> Self {
@@ -1937,6 +2016,10 @@ impl MuxOptions {
       user_data: self.bounds.user_data,
       tag: self.bounds.tag,
       comment: self.bounds.comment,
+      info: self.bounds.info,
+      frames: self.bounds.frames,
+      blocks: self.bounds.blocks,
+      sequence: self.bounds.sequence,
     };
     self
   }
@@ -2053,6 +2136,58 @@ impl MuxOptions {
   pub const fn with_lowered_comment_bound(mut self, bytes: u64) -> Self {
     if bytes < self.bounds.comment {
       self.bounds.comment = bytes;
+    }
+    self
+  }
+
+  /// Lowers the bytes a NUT info packet's tags may come to — `INT_MAX`
+  /// less the padding its dynamic buffer's close writes — to `bytes`, never
+  /// raising it: the laws' seam, which shows the bound without two
+  /// gibibytes of language or title ([`MuxOpenError::LanguageTooLong`],
+  /// [`MuxOpenError::ChapterTitleTooLong`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_info_bound(mut self, bytes: u64) -> Self {
+    if bytes < self.bounds.info {
+      self.bounds.info = bytes;
+    }
+    self
+  }
+
+  /// Lowers the frames AVI counts a stream's in, and a file's sum of them —
+  /// `INT_MAX` — to `frames`, never raising it: the laws' seam, which shows
+  /// the bound without two thousand million packets
+  /// ([`PayloadRule::FrameCount`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_frame_bound(mut self, frames: u64) -> Self {
+    if frames < self.bounds.frames {
+      self.bounds.frames = frames;
+    }
+    self
+  }
+
+  /// Lowers the blocks AVI writes a block-aligned audio stream's length in
+  /// — `UINT32_MAX` — to `blocks`, never raising it: the laws' seam, which
+  /// shows the bound without a day of PCM ([`PayloadRule::FrameCount`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_block_bound(mut self, blocks: u64) -> Self {
+    if blocks < self.bounds.blocks {
+      self.bounds.blocks = blocks;
+    }
+    self
+  }
+
+  /// Lowers the bytes FLV's sequence header may hold — its tag's 24-bit
+  /// size — to `bytes`, never raising it: the laws' seam, which shows the
+  /// bound without 16 MiB of configuration
+  /// ([`MuxOpenError::ConfigurationInvalid`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_sequence_bound(mut self, bytes: u64) -> Self {
+    if bytes < self.bounds.sequence {
+      self.bounds.sequence = bytes;
     }
     self
   }
@@ -3998,6 +4133,22 @@ pub enum PayloadRule {
   /// stream's length.
   #[error("the packet would take the file past what its header's 32-bit fields count")]
   FileSize,
+  /// AVI: a packet after which a count AVI keeps of its streams would pass
+  /// what it counts it in (R20, by the class: a length that wraps is
+  /// refused). A stream's frames, an `int`: its packets, and of a stream of
+  /// no block alignment but XSUB the empty frames AVI writes into its gaps
+  /// (`avi_write_packet_internal`, `avienc.c` 877; `write_skip_frames`,
+  /// 744–766) — the trailer's to the last packet's end among them (924),
+  /// judged as though the packet were the last, stricter than FFmpeg only
+  /// where a later packet ends before it. The file's sum its OpenDML header
+  /// writes, an `int`: its video streams' most, and its MP2 and MP3 streams'
+  /// added, each as the trailer counts it (941–953) — a file of so many
+  /// frames, each a chunk of 8 bytes or more, past the gibibyte that makes
+  /// it OpenDML. A block-aligned audio stream's blocks, its bytes over its
+  /// block alignment, which its stream header writes in 32 bits
+  /// (`avi_write_counters`, 203–235).
+  #[error("the packet would take a count AVI keeps of its streams past what it counts it in")]
+  FrameCount,
   /// The MOV family, of no fragments: a constant-size audio track's packet
   /// — PCM's — after which the track's samples, which MP4 counts by its
   /// bytes and sums in an `int` into its sample-size table, would pass
@@ -4728,7 +4879,10 @@ pub enum MuxOpenError {
   /// UTF-16 with its terminator (`asf_write_markers`, `asfenc.c` 337), so
   /// that a reader stepping by it misreads the markers after, and ASF's
   /// reader's 1023 bytes of UTF-8, a longer title read back cut
-  /// (`asf_read_marker`, `asfdec_f.c` 665, 690–692; R17).
+  /// (`asf_read_marker`, `asfdec_f.c` 665, 690–692; R17); NUT's, whose
+  /// chapter info would pass the dynamic buffer it is made in, written
+  /// short of the title its count of tags says (`write_chapter`,
+  /// `nutenc.c` 587–613; [`NUT_INFO_BYTES_MAX`]; R20).
   #[error("chapter {chapter}'s title is longer than the container writes")]
   ChapterTitleTooLong {
     /// The chapter's position in the table.
@@ -4775,12 +4929,15 @@ pub enum MuxOpenError {
     /// The chapters in the table.
     count: usize,
   },
-  /// A language of more codes than the container's descriptor counts:
-  /// MPEG-TS's DVB subtitle descriptor, eight bytes a three-byte code, and
-  /// its teletext descriptor, five, each of an 8-bit length that wraps past
-  /// 255 bytes — past 31 codes, past 51 — so that the PMT is misread
-  /// (`mpegts_write_pmt`, `mpegtsenc.c` 725–798).
-  #[error("track {}'s language holds more codes than the container's descriptor counts", .track.get())]
+  /// A language longer than the container writes: of more codes than
+  /// MPEG-TS's descriptor counts — its DVB subtitle descriptor, eight bytes
+  /// a three-byte code, and its teletext descriptor, five, each of an 8-bit
+  /// length that wraps past 255 bytes, past 31 codes, past 51 — so that the
+  /// PMT is misread (`mpegts_write_pmt`, `mpegtsenc.c` 725–798); or NUT's,
+  /// whose stream info would pass the dynamic buffer it is made in, written
+  /// short of the tags its count says (`write_streaminfo`, `nutenc.c`
+  /// 545–585; [`NUT_INFO_BYTES_MAX`]; R20).
+  #[error("track {}'s language is longer than the container writes", .track.get())]
   LanguageTooLong {
     /// The track.
     track: TrackIndex,
@@ -4842,6 +4999,9 @@ struct TrackState {
   /// AVI: the place the stream has reached — frames written, empty ones
   /// among them, or samples ([`AviPlace`]).
   place: i128,
+  /// AVI: the stream's frames as the trailer would count them, were the
+  /// file to end after its last packet ([`PayloadRule::FrameCount`]).
+  avi_frames: u64,
   /// The MOV family's constant-size audio: the place the next packet's
   /// first sample lies at, from the track's first packet's decode time, in
   /// the track's ticks, its samples ([`PacketRules::mp4_constant`]).
@@ -5564,6 +5724,9 @@ struct PacketRules {
   configuration_absent: bool,
   /// AVI: how it keeps a packet's time, as its place ([`AviPlace`]).
   avi: Option<AviPlace>,
+  /// AVI: how its OpenDML header sums the stream's frames into the file's
+  /// ([`AviTotal`]).
+  avi_total: Option<AviTotal>,
   /// The MOV family, of no fragments: a constant-size audio track's bytes
   /// a sample ([`mp4_sample_size`]), by which MP4 counts the samples of a
   /// packet — its place on the track's timeline, and the count
@@ -6090,6 +6253,17 @@ enum AviPlace {
   Packets { reader: (i64, i64) },
 }
 
+/// How AVI's OpenDML header sums a stream's frames into the file's total,
+/// an `int`, at the trailer (`avi_write_trailer`, `avienc.c` 941–953), in
+/// the streams' order: a video stream's the most of the sum so far and
+/// its own, an MP2 or MP3 stream's added to it; another stream's not
+/// counted ([`PayloadRule::FrameCount`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AviTotal {
+  Most,
+  Added,
+}
+
 /// What FLV writes before a packet's bytes in its tag, and whether it
 /// rewrites them (`flv_write_packet`, `flvenc.c` 1229–1252, 1314–1330):
 /// the flags' bytes — five for an extended codec's, two for VP6's and
@@ -6161,6 +6335,74 @@ impl FlvTag {
         .contains(&codec),
     }
   }
+}
+
+/// The bytes FLV's sequence header holds — those its tag's 24-bit size
+/// counts — of a track of `kind` and `codec`, the `index`-th of its kind,
+/// whose configuration is `extradata`; `None` of a codec FLV writes none of
+/// (`flv_write_codec_header`, `flvenc.c` 807–914). First its header: an
+/// extended one — a byte and its codec's four, and two more in a track past
+/// the first of its kind — of AAC and MP3 past the first, of Opus, FLAC,
+/// AC-3 and E-AC-3, of H.264 past the first, of HEVC, VVC, AV1 and VP9;
+/// else AAC's flags and packet type, or H.264's flags, packet type and
+/// composition time. Then the record: AAC's, Opus's and FLAC's
+/// configuration as it is; H.264's `avcC`, HEVC's `hvcC`, VVC's `vvcC` and
+/// AV1's `av1C` as their writers make them ([`records::avcc_written_len`],
+/// [`records::hvcc_written_len`], [`records::vvcc_written_bound`] — VVC's
+/// of Annex B units at its most — [`av1c_written_len`]); VP9's `vpcC`,
+/// twelve bytes (`ff_isom_write_vpcc`, `vpcc.c` 204–227); none of MP3's,
+/// AC-3's or E-AC-3's. A record its writer would not make whole is refused
+/// first, by the record's own rule.
+fn flv_sequence_bytes(
+  kind: TrackKind,
+  codec: CodecId,
+  extradata: &[u8],
+  index: usize,
+) -> Option<u64> {
+  let multitrack = index > 0;
+  let (extended, written) = match kind {
+    TrackKind::Audio => {
+      let extended = ((codec == CodecId::AAC || codec == CodecId::MP3) && multitrack)
+        || [CodecId::OPUS, CodecId::FLAC, CodecId::AC3, CodecId::EAC3].contains(&codec);
+      (extended, extended || codec == CodecId::AAC)
+    }
+    TrackKind::Video => (
+      (codec == CodecId::H264 && multitrack)
+        || [CodecId::HEVC, CodecId::VVC, CodecId::AV1, CodecId::VP9].contains(&codec),
+      [
+        CodecId::H264,
+        CodecId::MPEG4,
+        CodecId::HEVC,
+        CodecId::AV1,
+        CodecId::VP9,
+        CodecId::VVC,
+      ]
+      .contains(&codec),
+    ),
+    _ => (false, false),
+  };
+  if !written {
+    return None;
+  }
+  let header = if extended {
+    5 + if multitrack { 2 } else { 0 }
+  } else if kind == TrackKind::Audio {
+    2
+  } else {
+    5
+  };
+  let record = match codec {
+    _ if [CodecId::AAC, CodecId::OPUS, CodecId::FLAC, CodecId::MPEG4].contains(&codec) => {
+      extradata.len() as u64
+    }
+    _ if codec == CodecId::H264 => records::avcc_written_len(extradata),
+    _ if codec == CodecId::HEVC => records::hvcc_written_len(extradata),
+    _ if codec == CodecId::VVC => records::vvcc_written_bound(extradata),
+    _ if codec == CodecId::AV1 && av1c_written(extradata) => av1c_written_len(extradata) as u64,
+    _ if codec == CodecId::VP9 => 12,
+    _ => 0,
+  };
+  Some(header + record)
 }
 
 /// Audio codecs FLV writes with no extended header beside PCM's two
@@ -6793,6 +7035,12 @@ impl PacketRules {
           block: u64::try_from(block).unwrap_or(1),
         },
       }),
+      avi_total: match kind {
+        _ if audited != Audited::Avi => None,
+        TrackKind::Video => Some(AviTotal::Most),
+        _ if id == MP2 || id == CodecId::MP3 => Some(AviTotal::Added),
+        _ => None,
+      },
       mp4_constant: (mp4 && kind == TrackKind::Audio && audited != Audited::Mov(MovMode::Ism))
         .then(|| mp4_sample_size(codec))
         .flatten(),
@@ -9510,6 +9758,9 @@ struct Learned {
   /// AVI: the place after the packet, and whether its time was not its
   /// place ([`Rewrite::Timeline`]).
   place: Option<(i128, bool)>,
+  /// AVI: the stream's frames after the packet, as the trailer would count
+  /// them were it the last ([`PayloadRule::FrameCount`]).
+  avi_frames: Option<u64>,
   /// The MOV family's constant-size audio: what MP4 counts of the packet
   /// ([`Mp4Place`]).
   mp4_place: Option<Mp4Place>,
@@ -9733,6 +9984,50 @@ where
       {
         return Err(MuxOpenError::EncryptionInitialization { track });
       }
+      // FLV's sequence header, its tag's size written in 24 bits, cut past
+      // them (R20, by the class; [`FLV_SEQUENCE_BYTES_MAX`]).
+      if audited == Audited::Flv
+        && road == Road::Timed
+        && flv_sequence_bytes(
+          description.kind(),
+          description.codec(),
+          stream_extradata(description),
+          kind_index(&tracks, index),
+        )
+        .is_some_and(|bytes| bytes > bounds.sequence)
+      {
+        return Err(MuxOpenError::ConfigurationInvalid {
+          track,
+          codec: description.codec(),
+        });
+      }
+      // NUT's stream info, its tags made in a dynamic buffer closed with
+      // its padding unchecked: past it, written short of what its count
+      // says (R20, by the class; [`NUT_INFO_BYTES_MAX`]) — its language
+      // the one tag of a length the table sets.
+      if audited == Audited::Nut && road == Road::Timed {
+        let declared = description.disposition();
+        let written = declared.intersection(
+          kept(
+            (family, audited),
+            road,
+            description.kind(),
+            description.codec(),
+            declared,
+          )
+          .flags,
+        );
+        let video = match description.params() {
+          TrackParams::Video(params) if description.kind() == TrackKind::Video => {
+            Some(params.frame_rate())
+          }
+          _ => None,
+        };
+        let language = description.language().map(|tag| tag.as_str().len() as u64);
+        if nut_stream_info_bytes(language, written, video) > bounds.info {
+          return Err(MuxOpenError::LanguageTooLong { track });
+        }
+      }
       roads.push(road);
       lost.push(losses);
     }
@@ -9794,11 +10089,19 @@ where
       // (`asf_read_marker`, `asfdec_f.c` 660–697; `avio_get_str16le`,
       // `aviobuf.c` 887–906): both refused (R17, Codex R16, by the class).
       // NUT's chapter start, the count of time bases times it and its
-      // base's place, unsigned in 64 bits (`write_chapter`, `nutenc.c` 601).
+      // base's place, unsigned in 64 bits (`write_chapter`, `nutenc.c` 601);
+      // its info, the title made in a dynamic buffer closed with its
+      // padding unchecked, past it written short of what its count says
+      // (R20, by the class; [`NUT_INFO_BYTES_MAX`]).
       if audited == Audited::Nut {
         let count = i128::from(nut_time_base_count(&tracks, &roads, chapters));
         if i128::from(spans[index].0) > (i128::from(u64::MAX) - (count - 1)) / count {
           return Err(MuxOpenError::ChapterSpan { chapter: index });
+        }
+        if nut_chapter_info_bytes(chapter.title().map(|title| title.as_str().len() as u64))
+          > bounds.info
+        {
+          return Err(MuxOpenError::ChapterTitleTooLong { chapter: index });
         }
       }
       if audited == (Audited::Asf { stream: false }) {
@@ -10243,6 +10546,15 @@ where
           if rules.fact_samples.is_some() {
             rules.guessed = Some((kind, guessed_duration(kind, &codec, None, time_base)));
           }
+          // AVI's trailer fills a stream's gap to its last packet's end, of
+          // the duration libavformat hands (R20; [`PayloadRule::FrameCount`]).
+          if audited == Audited::Avi {
+            let frame_rate = match tracks[index].params() {
+              TrackParams::Video(params) => params.frame_rate(),
+              _ => None,
+            };
+            rules.guessed = Some((kind, guessed_duration(kind, &codec, frame_rate, time_base)));
+          }
           // Ogg counts the duration libavformat hands into its granule, and
           // writes a lone Vorbis, FLAC or Opus stream's later metadata as a
           // chained stream's tags (table H).
@@ -10351,6 +10663,7 @@ where
         adts: rules.adts,
         bytes: 0,
         place: 0,
+        avi_frames: 0,
         mp4_place: None,
         mp4_samples: 0,
         mp4_entries: 0,
@@ -10470,6 +10783,33 @@ where
   fn movie_bound(&self, with: Option<(usize, u64, u64)>) -> Option<u64> {
     let fixed = self.movie?;
     Some(movie_total(fixed, self.movie_parts(with)))
+  }
+
+  /// AVI's total of frames, as its OpenDML header sums them at the trailer
+  /// (`avi_write_trailer`, `avienc.c` 941–953; [`AviTotal`]) — the track at
+  /// `with`'s index, where given, at its frames there, the packet judged
+  /// taken: in the streams' order, a video stream's the most of the sum so
+  /// far and its own, an MP2 or MP3 stream's added. Every step only grows
+  /// it, so the sum is the largest it is on the way, and the `int` it is
+  /// held in passes `INT_MAX` on the way only where the sum does
+  /// ([`PayloadRule::FrameCount`]). `None` of another container.
+  fn avi_total(&self, with: Option<(usize, u64)>) -> Option<u64> {
+    let mut total = None;
+    for (index, state) in self.tracks.iter().enumerate() {
+      let Some(rule) = state.rules.avi_total else {
+        continue;
+      };
+      let frames = match with {
+        Some((at, frames)) if at == index => frames,
+        _ => state.avi_frames,
+      };
+      let sum: u64 = total.unwrap_or(0);
+      total = Some(match rule {
+        AviTotal::Most => sum.max(frames),
+        AviTotal::Added => sum + frames,
+      });
+    }
+    total
   }
 
   /// ISMV's `mfra`'s bound, the track at `with`'s index, where given, at its
@@ -11014,6 +11354,18 @@ where
         }));
       }
     }
+    // AVI's total of frames after the packet, its OpenDML header's `int`
+    // (R20, by the class).
+    if let Some(frames) = learned.avi_frames
+      && self
+        .avi_total(Some((track.get(), frames)))
+        .is_some_and(|total| total > self.bounds.frames)
+    {
+      return Err(Refusal::Container(FfmpegMuxRefusal::Payload {
+        track,
+        rule: PayloadRule::FrameCount,
+      }));
+    }
     Ok(Decided {
       track,
       stream,
@@ -11329,6 +11681,9 @@ where
     state.bytes += plan.learned.bytes;
     if let Some((place, _)) = plan.learned.place {
       state.place = place;
+    }
+    if let Some(frames) = plan.learned.avi_frames {
+      state.avi_frames = frames;
     }
     if let Some(mp4) = plan.learned.mp4_place {
       state.mp4_place = Some(mp4.next);
@@ -12157,6 +12512,44 @@ fn check_packet_rules<'p>(
     }
     None => None,
   };
+  // AVI's counts of the stream (R20, by the class;
+  // [`PayloadRule::FrameCount`]): its frames, an `int` — of no block
+  // alignment, its place, the trailer's gap to the packet's end filled as
+  // though the packet were the last (`write_skip_frames`, `avienc.c`
+  // 744–766, 924; its end the decode time and the duration libavformat
+  // hands, a missing one its guess, `mux.c` 605–633), else its packets
+  // (877) — and a block-aligned audio stream's blocks, written in 32 bits
+  // (`avi_write_counters`, 203–235). The file's sum of them, the muxer's
+  // to judge ([`CarrierMuxer::avi_total`]).
+  let avi_frames = match (rules.avi, place) {
+    (Some(AviPlace::Frames), Some((after, _))) => {
+      let duration = if duration_ticks > 0 {
+        i128::from(duration_ticks)
+      } else {
+        rules.guessed.map_or(0, |(_, guess)| i128::from(guess))
+      };
+      let end = i128::from(dts_ticks) + lift + duration;
+      Some(if end > after && end - after <= 60_000 {
+        end
+      } else {
+        after
+      })
+    }
+    (Some(AviPlace::Samples { block }), Some(_)) => {
+      if state.kind == TrackKind::Audio
+        && (state.bytes + payload.bytes.len() as u64) / block > bounds.blocks
+      {
+        return refused(PayloadRule::FrameCount);
+      }
+      Some(i128::from(state.avi_frames) + 1)
+    }
+    (Some(AviPlace::Packets { .. }), Some((after, _))) => Some(after),
+    _ => None,
+  };
+  if avi_frames.is_some_and(|frames| frames > i128::from(bounds.frames)) {
+    return refused(PayloadRule::FrameCount);
+  }
+  let avi_frames = avi_frames.map(|frames| frames as u64);
   // The MOV family's constant-size audio, PCM: the packet's samples, as MP4
   // counts them by its bytes (`ff_mov_write_packet`, `movenc.c` 7002–7005,
   // 7372) — their sum within the `int` its sample-size table counts them
@@ -12634,6 +13027,7 @@ fn check_packet_rules<'p>(
       adts,
       bytes: payload.bytes.len() as u64,
       place,
+      avi_frames,
       mp4_place,
       mp4_entries,
       stsd,
@@ -16579,6 +16973,79 @@ fn nut_time_base_count<D: AsRef<[u8]>>(
   bases.sort_unstable();
   bases.dedup();
   (bases.len() as u64).max(1)
+}
+
+/// The bytes NUT's `put_v` writes `value` in: seven bits a byte
+/// (`get_v_length`, `put_v`, `nutenc.c` 306–327).
+fn nut_v_bytes(value: u64) -> u64 {
+  let mut bytes = 1;
+  let mut rest = value >> 7;
+  while rest != 0 {
+    bytes += 1;
+    rest >>= 7;
+  }
+  bytes
+}
+
+/// The bytes NUT's `add_info` writes of a tag of a `key` and a `value` of
+/// those many bytes: each as `put_str` writes a string, its length in
+/// `put_v`'s bytes and then its bytes, and between them its type, `put_s`
+/// of `-1`, one byte (`nutenc.c` 338–349, 509–515).
+fn nut_info_tag(key: u64, value: u64) -> u64 {
+  nut_v_bytes(key) + key + 1 + nut_v_bytes(value) + value
+}
+
+/// The decimal digits C's `%d` prints `value` in, its sign among them.
+fn decimal_digits(value: i32) -> u64 {
+  let mut digits = 1;
+  let mut rest = value.unsigned_abs();
+  while rest >= 10 {
+    digits += 1;
+    rest /= 10;
+  }
+  digits + u64::from(value < 0)
+}
+
+/// The bytes of a NUT stream's info tags, exactly (R20, by the class;
+/// `write_streaminfo`, `nutenc.c` 545–585): its stream's metadata — its
+/// language alone, the one tag the muxer sets a timed stream
+/// (`Output::add_stream`), under the name the metadata conversion gives
+/// it, `X-Language` (673; `ff_nut_metadata_conv`, `nut.c` 345–357) — then
+/// each of NUT's six dispositions the stream is handed, a
+/// `Disposition` tag of its name (`ff_nut_dispositions`, 335–343), then a
+/// video stream's `r_frame_rate`, its average frame rate as `%d/%d`: the
+/// track's where it states one, else none, `0/0` (564–568).
+fn nut_stream_info_bytes(
+  language: Option<u64>,
+  disposition: TrackDisposition,
+  video: Option<Option<Timebase>>,
+) -> u64 {
+  const NAMES: [(TrackDisposition, u64); 6] = [
+    (TrackDisposition::DEFAULT, 7),
+    (TrackDisposition::DUB, 3),
+    (TrackDisposition::ORIGINAL, 8),
+    (TrackDisposition::COMMENT, 7),
+    (TrackDisposition::LYRICS, 6),
+    (TrackDisposition::KARAOKE, 7),
+  ];
+  let mut bytes = language.map_or(0, |language| nut_info_tag(10, language));
+  for (flag, name) in NAMES {
+    if disposition.contains(flag) {
+      bytes += nut_info_tag(11, name);
+    }
+  }
+  if let Some(rate) = video {
+    let (num, den) = rate.map_or((0, 0), |rate| (rate.num(), rate.den().get()));
+    bytes += nut_info_tag(12, decimal_digits(num) + 1 + decimal_digits(den));
+  }
+  bytes
+}
+
+/// The bytes of a NUT chapter's info tags, exactly (R20, by the class;
+/// `write_chapter`, `nutenc.c` 587–613): its title, the one tag the muxer
+/// sets a chapter (`Output::add_chapter`), its name the conversion's own.
+fn nut_chapter_info_bytes(title: Option<u64>) -> u64 {
+  title.map_or(0, |title| nut_info_tag(5, title))
 }
 
 /// The report table: what `road` keeps in `family` of a track of `kind`

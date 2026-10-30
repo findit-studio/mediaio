@@ -1248,6 +1248,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     adts: None,
     bytes: 0,
     place: 0,
+    avi_frames: 0,
     mp4_place: None,
     mp4_samples: 0,
     mp4_entries: 0,
@@ -4958,4 +4959,159 @@ fn avifs_movie_box_holds_int_max() {
     i32::MAX as u64
   );
   assert_eq!(super::avif_movie_bound(4096), 4096);
+}
+
+/// A NUT info packet's tags are counted exactly and held to `INT_MAX` less
+/// the 64 bytes of padding its dynamic buffer's close writes (R20, by the
+/// class; [`super::NUT_INFO_BYTES_MAX`]): `put_v`'s bytes, seven bits a
+/// byte (`nutenc.c` 306–327); a chapter's `title` tag, the longest title
+/// taken and a byte more refused; a stream's language, dispositions and
+/// frame rate, each tag as `add_info` writes it (509–515, 545–585).
+#[test]
+fn a_nut_info_packet_holds_int_max_less_its_padding() {
+  let bound = super::Bounds::REAL.info;
+  assert_eq!(
+    bound,
+    i32::MAX as u64 - 64,
+    "INT_MAX less the close's padding"
+  );
+  for (value, bytes) in [
+    (0, 1),
+    (127, 1),
+    (128, 2),
+    (16_383, 2),
+    (16_384, 3),
+    ((1 << 28) - 1, 4),
+    (1 << 28, 5),
+    (u64::from(u32::MAX), 5),
+    (1 << 35, 6),
+  ] {
+    assert_eq!(super::nut_v_bytes(value), bytes, "put_v of {value}");
+  }
+  // `title` behind its length, the type, the title behind its five bytes
+  // of length.
+  let longest = bound - (1 + 5 + 1 + 5);
+  assert_eq!(super::nut_chapter_info_bytes(Some(longest)), bound, "taken");
+  assert_eq!(
+    super::nut_chapter_info_bytes(Some(longest + 1)),
+    bound + 1,
+    "a byte more refused"
+  );
+  assert_eq!(super::nut_chapter_info_bytes(None), 0, "no tag");
+  assert_eq!(
+    super::nut_chapter_info_bytes(Some(0)),
+    8,
+    "an empty title's tag"
+  );
+  let none = TrackDisposition::empty();
+  let all = TrackDisposition::DEFAULT
+    | TrackDisposition::DUB
+    | TrackDisposition::ORIGINAL
+    | TrackDisposition::COMMENT
+    | TrackDisposition::LYRICS
+    | TrackDisposition::KARAOKE;
+  assert_eq!(super::nut_stream_info_bytes(None, none, None), 0);
+  assert_eq!(
+    super::nut_stream_info_bytes(Some(3), none, None),
+    1 + 10 + 1 + 1 + 3,
+    "X-Language and three bytes"
+  );
+  assert_eq!(
+    super::nut_stream_info_bytes(None, all, None),
+    6 * (1 + 11 + 1 + 1) + (7 + 3 + 8 + 7 + 6 + 7),
+    "six Disposition tags"
+  );
+  assert_eq!(
+    super::nut_stream_info_bytes(None, TrackDisposition::FORCED, None),
+    0,
+    "a flag NUT names not"
+  );
+  assert_eq!(
+    super::nut_stream_info_bytes(None, none, Some(None)),
+    1 + 12 + 1 + 1 + 3,
+    "a video stream of no frame rate: 0/0"
+  );
+  let ntsc = Timebase::new(30_000, NonZeroI32::new(1001).expect("a denominator"));
+  assert_eq!(
+    super::nut_stream_info_bytes(None, none, Some(Some(ntsc))),
+    1 + 12 + 1 + 1 + 10,
+    "30000/1001"
+  );
+  assert_eq!(super::decimal_digits(i32::MIN), 11, "the sign among them");
+  assert_eq!(super::decimal_digits(0), 1);
+  // The longest language taken, its tag and the rest at their least.
+  let longest = bound - (1 + 10 + 1 + 5);
+  assert_eq!(
+    super::nut_stream_info_bytes(Some(longest), none, None),
+    bound
+  );
+}
+
+/// AVI's counts hold their `int` and their 32 bits, and FLV's sequence
+/// header its 24 (R20, by the class): the real bounds; FLV's header bytes
+/// of each road of `flv_write_codec_header` (`flvenc.c` 807–914) — an
+/// extended header and two more past a kind's first, AAC's legacy two,
+/// H.264's legacy five — beside the record as its writer makes it.
+#[test]
+fn avis_counts_and_flvs_sequence_header_hold_their_bits() {
+  let real = super::Bounds::REAL;
+  assert_eq!(real.frames, i32::MAX as u64, "AVI's frames, an int");
+  assert_eq!(real.blocks, u64::from(u32::MAX), "AVI's length, 32 bits");
+  assert_eq!(real.sequence, (1 << 24) - 1, "FLV's tag size, 24 bits");
+  let aac = [0x12, 0x10];
+  assert_eq!(
+    super::flv_sequence_bytes(TrackKind::Audio, CodecId::AAC, &aac, 0),
+    Some(2 + 2),
+    "AAC's legacy header"
+  );
+  assert_eq!(
+    super::flv_sequence_bytes(TrackKind::Audio, CodecId::AAC, &aac, 1),
+    Some(7 + 2),
+    "AAC past the first: extended, multitrack"
+  );
+  assert_eq!(
+    super::flv_sequence_bytes(TrackKind::Audio, CodecId::MP3, &[], 0),
+    None,
+    "the first MP3: no sequence header"
+  );
+  assert_eq!(
+    super::flv_sequence_bytes(TrackKind::Audio, CodecId::MP3, &[], 1),
+    Some(7),
+    "MP3 past the first: its header alone"
+  );
+  assert_eq!(
+    super::flv_sequence_bytes(TrackKind::Audio, CodecId::EAC3, &[], 0),
+    Some(5),
+    "E-AC-3's extended header, no record"
+  );
+  assert_eq!(
+    super::flv_sequence_bytes(TrackKind::Video, CodecId::VP9, &[], 0),
+    Some(5 + 12),
+    "VP9's vpcC"
+  );
+  // An `avcC` written as it is, behind H.264's legacy five bytes.
+  let avcc = [
+    1, 0x64, 0, 0x1F, 0xFF, 0xE1, 0, 2, 0x67, 0x64, 1, 0, 2, 0x68, 0xEE,
+  ];
+  assert_eq!(
+    super::flv_sequence_bytes(TrackKind::Video, CodecId::H264, &avcc, 0),
+    Some(5 + avcc.len() as u64)
+  );
+  // Of Annex B units: six bytes, the SPS behind its length, the count and
+  // the PPS so — profile 66, no extension's four bytes.
+  let annex_b = [
+    0, 0, 0, 1, 0x67, 66, 0, 30, 0xAB, 0, 0, 0, 1, 0x68, 0xCE, 0x38,
+  ];
+  assert_eq!(
+    super::records::avcc_written_len(&annex_b),
+    6 + (2 + 5) + 1 + (2 + 3)
+  );
+  // Profile 100: the four bytes and the extensions' count.
+  let high = [
+    0, 0, 0, 1, 0x67, 100, 0, 30, 0xAB, 0, 0, 0, 1, 0x68, 0xCE, 0x38,
+  ];
+  assert_eq!(
+    super::records::avcc_written_len(&high),
+    6 + (2 + 5) + 1 + (2 + 3) + 4
+  );
 }

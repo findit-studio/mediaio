@@ -20276,3 +20276,591 @@ fn l169_in_a_process_of_its_own() {
     fault.error()
   );
 }
+
+/// The info packets of the NUT file at `path`: by whose they are — the
+/// stream's id plus one and the chapter's id — the bytes of their tags,
+/// the first of each, as NUT writes its headers more than once
+/// (`write_headers`, `nutenc.c` 669–717; 1002, 1193). Each found by its
+/// startcode (`INFO_STARTCODE`, `nut.h` 33), its forward pointer read as
+/// `get_v` reads it (`nutdec.c` 44–66) — the data, and the checksum's 4
+/// bytes after it, behind the header's checksum where it passes 4096
+/// (`put_packet`, `nutenc.c` 351–370) — and the tags those after the
+/// stream id, the chapter id, the start, the length and the count
+/// (545–613).
+fn nut_info_tags(path: &Path) -> Vec<((u64, i64), u64)> {
+  const INFO: [u8; 8] = 0x4E49_AB68_B596_BA78_u64.to_be_bytes();
+  let bytes = std::fs::read(path).expect("the file");
+  let v = |at: &mut usize| -> u64 {
+    let mut value = 0_u64;
+    loop {
+      let byte = bytes[*at];
+      *at += 1;
+      value = (value << 7) | u64::from(byte & 0x7F);
+      if byte & 0x80 == 0 {
+        return value;
+      }
+    }
+  };
+  let mut seen: Vec<((u64, i64), u64)> = Vec::new();
+  let mut at = 0;
+  while let Some(found) = bytes[at..].windows(8).position(|window| window == INFO) {
+    let mut cursor = at + found + 8;
+    let forward = v(&mut cursor);
+    if forward > 4096 {
+      cursor += 4;
+    }
+    let end = cursor + forward as usize - 4;
+    let stream = v(&mut cursor);
+    // `put_s`: twice the value, less one where it is positive.
+    let raw = v(&mut cursor);
+    let chapter = if raw & 1 == 1 {
+      ((raw + 1) / 2) as i64
+    } else {
+      -((raw / 2) as i64)
+    };
+    for _ in 0..3 {
+      v(&mut cursor);
+    }
+    let tags = (end - cursor) as u64;
+    if !seen.iter().any(|(whose, _)| *whose == (stream, chapter)) {
+      seen.push(((stream, chapter), tags));
+    }
+    at = end;
+  }
+  seen
+}
+
+/// **L170 — NUT's info packets are counted exactly, and refused past the
+/// dynamic buffer they are made in** (R20, by the class: a stream's or a
+/// chapter's tags made in a dynamic buffer of `INT_MAX` bytes and closed
+/// with its 64 bytes of padding unchecked, past it written with their
+/// count and fewer bytes, success answered — `write_streaminfo`,
+/// `write_chapter`, `nutenc.c` 545–613): a video track stating a language,
+/// the default and comment flags and a frame rate, beside an audio track
+/// stating none, and three chapters — titled in 300 bytes, a length of
+/// two bytes, untitled, of an empty title — each packet's tags measured in
+/// the file FFmpeg writes; the bound lowered a byte below the largest, the
+/// chapter's, the table refused by that chapter, nothing written; lowered
+/// to it, taken, the same packets written. Then a language of 400 bytes,
+/// the stream's the largest: refused by its track a byte below, taken at
+/// it. The real bound is the unit law
+/// `a_nut_info_packet_holds_int_max_less_its_padding`.
+///
+/// PLANT: a disposition's tag uncounted; the frame rate's tag uncounted; a
+/// two-byte length counted as one — each a byte below taken.
+#[test]
+fn l170_nuts_info_packets_are_counted_exactly_and_refused_past_their_buffer() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mkv");
+  let video_at_index = whole_table(&source)
+    .iter()
+    .position(|row| row.kind() == TrackKind::Video)
+    .expect("a video track");
+  let table = |language: &str| {
+    let mut table = whole_table(&source);
+    table[video_at_index].set_language(Some(language.into()));
+    table[video_at_index].set_disposition(TrackDisposition::DEFAULT | TrackDisposition::COMMENT);
+    table
+  };
+  let long_title = "t".repeat(300);
+  let chapters = [
+    chapter_of(0, 0, 200, Some(&long_title)),
+    chapter_of(1, 200, 400, None),
+    chapter_of(2, 400, 600, Some("")),
+  ];
+  let open = |name: &str, language: &str, bound: Option<u64>| {
+    let target = output(&corpus, name);
+    let options = bound.map_or_else(MuxOptions::new, |bytes| {
+      MuxOptions::new().with_lowered_info_bound(bytes)
+    });
+    let opened = FfmpegOwnedMuxer::open_with(
+      File::create(&target).expect("create"),
+      ContainerName::new("nut"),
+      table(language),
+      &chapters,
+      options,
+    );
+    (target, opened)
+  };
+  let write =
+    |name: &str,
+     opened: Result<(FfmpegOwnedMuxer<File>, mediaencode_ffmpeg::MuxReport), MuxOpenError>| {
+      // The info packets are the header's, written again at the trailer:
+      // no packet need be.
+      let (muxer, _) = opened.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+      muxer.finish().expect("finished");
+    };
+  let stream_id = video_at_index as u64 + 1;
+  for (name, language, largest) in [
+    ("l170.nut", "fra", (0, 1)),
+    ("l170-language.nut", &*"l".repeat(400), (stream_id, 0)),
+  ] {
+    // What FFmpeg writes.
+    let (target, opened) = open(name, language, None);
+    write(name, opened);
+    let tags = nut_info_tags(&target);
+    let stream = tags
+      .iter()
+      .find(|(whose, _)| *whose == (stream_id, 0))
+      .map(|(_, bytes)| *bytes)
+      .expect("the video stream's info");
+    let chapter = |id: i64| {
+      tags
+        .iter()
+        .find(|(whose, _)| *whose == (0, id))
+        .map(|(_, bytes)| *bytes)
+    };
+    assert_eq!(
+      chapter(1),
+      Some(1 + 5 + 1 + 2 + 300),
+      "{name}: the long title's tag"
+    );
+    assert_eq!(chapter(2), Some(0), "{name}: the untitled chapter's none");
+    assert_eq!(chapter(3), Some(1 + 5 + 1 + 1), "{name}: the empty title's");
+    let measured = tags
+      .iter()
+      .find(|(whose, _)| *whose == largest)
+      .map(|(_, bytes)| *bytes)
+      .expect("the largest packet");
+    assert_eq!(
+      measured,
+      stream.max(chapter(1).expect("the long title")),
+      "{name}: the premise, the largest"
+    );
+    // A byte below: refused by its owner, nothing written.
+    let below = format!("below-{name}");
+    let (refused, opened) = open(&below, language, Some(measured - 1));
+    match (largest, opened) {
+      ((0, _), Err(MuxOpenError::ChapterTitleTooLong { chapter })) => {
+        assert_eq!(chapter, 0, "{name}: the long title's chapter")
+      }
+      ((_, 0), Err(MuxOpenError::LanguageTooLong { track })) => {
+        assert_eq!(
+          track,
+          TrackIndex::new(video_at_index),
+          "{name}: the video track"
+        )
+      }
+      (_, other) => panic!(
+        "{name}: expected the largest refused, got {:?}",
+        other.map(|_| ())
+      ),
+    }
+    assert_eq!(
+      std::fs::metadata(&refused).expect("the sink").len(),
+      0,
+      "{name}: nothing written"
+    );
+    // At it: taken, the same packets.
+    let at = format!("at-{name}");
+    let (taken, opened) = open(&at, language, Some(measured));
+    write(&at, opened);
+    assert_eq!(nut_info_tags(&taken), tags, "{name}: the same info packets");
+  }
+}
+
+/// The length each stream header of the AVI file at `path` states, in the
+/// streams' order: its `strh`'s `dwLength`, 32 bytes into its data
+/// (`AVISTREAMHEADER`; `avi_write_counters`, `avienc.c` 203–235), each
+/// found before the `movi` list.
+fn avi_lengths(path: &Path) -> Vec<u32> {
+  let bytes = std::fs::read(path).expect("the file");
+  let header = bytes
+    .windows(4)
+    .position(|window| window == b"movi")
+    .expect("the movi list");
+  let mut lengths = Vec::new();
+  let mut at = 0;
+  while let Some(found) = bytes[at..header]
+    .windows(4)
+    .position(|window| window == b"strh")
+  {
+    let data = at + found + 8;
+    lengths.push(u32::from_le_bytes(
+      bytes[data + 32..data + 36].try_into().expect("four bytes"),
+    ));
+    at = data;
+  }
+  lengths
+}
+
+/// Every packet of `path`, in the order its demuxer delivers them, written
+/// into `muxer` on the track it came from; the first the muxer refuses
+/// answered, with how many were offered before it.
+fn avi_write_all(
+  path: &Path,
+  muxer: &mut FfmpegOwnedMuxer<File>,
+) -> Option<(usize, FfmpegMuxRefusal)> {
+  let mut demuxer = FfmpegOwnedDemuxer::open(path).expect("open");
+  let mut offered = 0;
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    let track = packet.track();
+    let written = match &packet {
+      DemuxedPacket::Video(p) => muxer
+        .write_video(VideoTrackPacket::new(track, p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      DemuxedPacket::Audio(p) => muxer
+        .write_audio(AudioTrackPacket::new(track, p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      other => panic!("expected video or audio, got {other:?}"),
+    };
+    match written {
+      Ok(()) => offered += 1,
+      Err(MuxError::Backend { refusal, .. }) => return Some((offered, refusal)),
+      Err(other) => panic!("expected a refusal, got {other:?}"),
+    }
+  }
+  None
+}
+
+/// **L171 — AVI's counts are held to what it counts them in** (R20, by the
+/// class, and the census's line `avienc.c` 86 corrected: a stream's
+/// `packet_count` an `int` that every frame raises, no index bounding it —
+/// `avi_write_packet_internal`, 877; `write_skip_frames`, 744–766): a
+/// video track's frames at 0, 1, 2 and 10 ms, each 40 ms long, its places
+/// a millisecond each — 3, then 7 empty, then the trailer's to the last
+/// frame's end, 50 — its stream header's length measured: the frame bound
+/// lowered a frame below it, the last frame refused, judged as though it
+/// were the last; at it, taken. A PCM track's blocks, its stream header's
+/// length its bytes over its block alignment, 32 bits: the block bound a
+/// block below the file's, its last packet refused; at it, taken; its
+/// packets, which no sum counts, the frame bound a packet below their
+/// count, the last refused; at it, taken. A video
+/// and an MP3 track, the OpenDML header's sum of their frames — the
+/// video's most and the MP3's added: the bound a frame below the sum,
+/// above either's, the last packet refused; at it, none. Two video
+/// streams: at the most of them, none, their sum not counted.
+///
+/// PLANT: the trailer's gap uncounted; the frames' check dropped; the
+/// blocks' check dropped; the MP3's frames not added; the sum's check
+/// dropped — each a frame or a block below taken; the video's frames added,
+/// two video streams at their most refused.
+#[test]
+fn l171_avis_counts_are_held_to_what_it_counts_them_in() {
+  let Some(corpus) = Corpus::new() else { return };
+  let avi = || ContainerName::new("avi");
+  let source = picture_and_sound(
+    &corpus,
+    "mpeg4-pcm.mkv",
+    &["-c:v", "mpeg4"],
+    &["-c:a", "pcm_s16le", "-ac", "2"],
+  );
+  // The video track's frames and its trailer's gap.
+  let (_, video) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&video[0]).with_duration(Some(ms(40)));
+  let video_table = || first_track(&source, TrackKind::Video, 1).0;
+  let frames = |name: &str, bound: Option<u64>| {
+    let target = output(&corpus, name);
+    let options = bound.map_or_else(MuxOptions::new, |frames| {
+      MuxOptions::new().with_lowered_frame_bound(frames)
+    });
+    let mut muxer = muxer_with(&target, avi(), video_table(), options);
+    let mut refused = None;
+    for dts in [0, 1, 2, 10] {
+      let offered = video_at(&frame, Some(dts), dts);
+      match refusing!(muxer.write_video(offered.clone())) {
+        Ok(()) => {}
+        Err(MuxError::Backend { refusal, packet }) => {
+          untouched!(offered, packet);
+          refused = Some((dts, refusal));
+        }
+        Err(other) => panic!("{name}: {other:?}"),
+      }
+    }
+    muxer.finish().expect("finished");
+    (target, refused)
+  };
+  let (target, refused) = frames("l171.avi", None);
+  assert_eq!(refused, None, "every frame taken");
+  let length = avi_lengths(&target)[0];
+  assert_eq!(
+    length, 50,
+    "three frames, seven empty, the trailer's to the end"
+  );
+  let (_, refused) = frames("l171-below.avi", Some(u64::from(length) - 1));
+  assert_eq!(
+    refused,
+    Some((10, payload(PayloadRule::FrameCount))),
+    "the last frame, as though it were the last"
+  );
+  let (taken, refused) = frames("l171-at.avi", Some(u64::from(length)));
+  assert_eq!(refused, None, "at the bound, taken");
+  assert_eq!(avi_lengths(&taken)[0], length, "the same length");
+  // PCM's blocks.
+  let pcm_table = || first_track(&source, TrackKind::Audio, 1).0;
+  let (_, audio) = whole_track(&source, TrackKind::Audio);
+  let blocks = |name: &str, bound: Option<MuxOptions>| {
+    let target = output(&corpus, name);
+    let options = bound.unwrap_or_else(MuxOptions::new);
+    let mut muxer = muxer_with(&target, avi(), pcm_table(), options);
+    let mut refused = None;
+    for (at, packet) in audio.iter().enumerate() {
+      let offered = AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet));
+      match refusing!(muxer.write_audio(offered.clone())) {
+        Ok(()) => {}
+        Err(MuxError::Backend { refusal, packet }) => {
+          untouched!(offered, packet);
+          refused = Some((at, refusal));
+          break;
+        }
+        Err(other) => panic!("{name}: {other:?}"),
+      }
+    }
+    muxer.finish().expect("finished");
+    (target, refused)
+  };
+  let (target, refused) = blocks("l171-pcm.avi", None);
+  assert_eq!(refused, None, "every packet taken");
+  let length = avi_lengths(&target)[0];
+  let bytes: usize = audio
+    .iter()
+    .map(|packet| audio_of(packet).data().as_ref().len())
+    .sum();
+  assert_eq!(
+    length as usize,
+    bytes / 4,
+    "its bytes over its block alignment"
+  );
+  let (_, refused) = blocks(
+    "l171-pcm-below.avi",
+    Some(MuxOptions::new().with_lowered_block_bound(u64::from(length) - 1)),
+  );
+  assert_eq!(
+    refused,
+    Some((audio.len() - 1, payload(PayloadRule::FrameCount))),
+    "the last packet"
+  );
+  let (taken, refused) = blocks(
+    "l171-pcm-at.avi",
+    Some(MuxOptions::new().with_lowered_block_bound(u64::from(length))),
+  );
+  assert_eq!(refused, None, "at the bound, taken");
+  assert_eq!(avi_lengths(&taken)[0], length, "the same length");
+  // Its packets, an `int` too, which no sum counts: the frame bound a
+  // packet below their count, the last refused; at it, taken.
+  let (_, refused) = blocks(
+    "l171-pcm-packets.avi",
+    Some(MuxOptions::new().with_lowered_frame_bound(audio.len() as u64 - 1)),
+  );
+  assert_eq!(
+    refused,
+    Some((audio.len() - 1, payload(PayloadRule::FrameCount))),
+    "the last packet, past the packets' count"
+  );
+  let (_, refused) = blocks(
+    "l171-pcm-packets-at.avi",
+    Some(MuxOptions::new().with_lowered_frame_bound(audio.len() as u64)),
+  );
+  assert_eq!(refused, None, "at the packets' count, taken");
+  // The OpenDML header's sum: the video's most, the MP3's added.
+  let both = picture_and_sound(
+    &corpus,
+    "mpeg4-mp3.mkv",
+    &["-c:v", "mpeg4"],
+    &["-c:a", "libmp3lame", "-ac", "2"],
+  );
+  let sum = |name: &str, bound: Option<u64>| {
+    let target = output(&corpus, name);
+    let options = bound.map_or_else(MuxOptions::new, |frames| {
+      MuxOptions::new().with_lowered_frame_bound(frames)
+    });
+    let mut muxer = muxer_with(&target, avi(), whole_table(&both), options);
+    let refused = avi_write_all(&both, &mut muxer);
+    muxer.finish().expect("finished");
+    (target, refused)
+  };
+  let (target, refused) = sum("l171-sum.avi", None);
+  assert_eq!(refused, None, "every packet taken");
+  let lengths = avi_lengths(&target);
+  assert_eq!(lengths.len(), 2, "the premise: a video and an MP3 stream");
+  let total = u64::from(lengths[0]) + u64::from(lengths[1]);
+  let packets_in = packets(&both).iter().map(Vec::len).sum::<usize>();
+  let (_, refused) = sum("l171-sum-below.avi", Some(total - 1));
+  assert_eq!(
+    refused,
+    Some((
+      packets_in - 1,
+      FfmpegMuxRefusal::Payload {
+        track: TrackIndex::new(1),
+        rule: PayloadRule::FrameCount,
+      }
+    )),
+    "the last packet, the sum's, past {}",
+    u64::from(lengths[0].max(lengths[1]))
+  );
+  let (_, refused) = sum("l171-sum-at.avi", Some(total));
+  assert_eq!(refused, None, "at the sum, taken");
+  // Two video streams: the most of them, not their sum.
+  let two = generated(
+    &corpus,
+    "two-mpeg4.mkv",
+    &[
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=64x48:rate=25:duration=1",
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=64x48:rate=25:duration=1",
+      "-map",
+      "0:v",
+      "-map",
+      "1:v",
+      "-c:v",
+      "mpeg4",
+    ],
+  );
+  let target = output(&corpus, "l171-two.avi");
+  let mut muxer = muxer_with(&target, avi(), whole_table(&two), MuxOptions::new());
+  assert_eq!(avi_write_all(&two, &mut muxer), None, "every packet taken");
+  muxer.finish().expect("finished");
+  let lengths = avi_lengths(&target);
+  assert_eq!(lengths.len(), 2, "the premise: two video streams");
+  let most = u64::from(lengths[0].max(lengths[1]));
+  let target = output(&corpus, "l171-two-at.avi");
+  let mut muxer = muxer_with(
+    &target,
+    avi(),
+    whole_table(&two),
+    MuxOptions::new().with_lowered_frame_bound(most),
+  );
+  assert_eq!(
+    avi_write_all(&two, &mut muxer),
+    None,
+    "at the most of them, taken: the sum's {} not counted",
+    u64::from(lengths[0]) + u64::from(lengths[1])
+  );
+  muxer.finish().expect("finished");
+}
+
+/// The first tag of `kind` — 8 audio, 9 video — of the FLV file at `path`:
+/// its data's 24-bit size, and its data (the file header's 9 bytes and the
+/// first previous tag size's 4; each tag 11 bytes of header, its data,
+/// then its previous tag size).
+fn flv_first_tag(path: &Path, kind: u8) -> (u32, Vec<u8>) {
+  let bytes = std::fs::read(path).expect("the file");
+  let mut at = 13;
+  while at + 11 <= bytes.len() {
+    let size = u32::from_be_bytes([0, bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+    let data = at + 11;
+    if bytes[at] & 0x1F == kind {
+      return (size, bytes[data..data + size as usize].to_vec());
+    }
+    at = data + size as usize + 4;
+  }
+  panic!("no tag of kind {kind}")
+}
+
+/// **L172 — FLV's sequence header is held to the 24 bits its tag's size is
+/// written in** (R20, by the class: `flv_write_codec_header`, `flvenc.c`
+/// 807–914, writes the bytes after the tag's header — the flags or the
+/// extended header and the record its codec's writer makes — and their
+/// size cut into 24 bits): an HEVC track's `hvcC` its writer makes again
+/// behind the extended header, an H.264 track's `avcC` as it is, a
+/// transport stream's H.264, its `avcC` made of its Annex B units, and an
+/// AAC track's configuration behind its legacy header — each tag's size
+/// measured in the file FFmpeg writes; the bound lowered a byte below it,
+/// the track refused at open, nothing written; at it, taken, the same tag.
+/// The real bound is the unit law
+/// `avis_counts_and_flvs_sequence_header_hold_their_bits`.
+///
+/// PLANT: the extended header counted as the legacy one; `hvcC`'s arrays'
+/// three bytes uncounted; the `avcC`'s profile's four bytes uncounted —
+/// each a byte below taken.
+#[test]
+fn l172_flvs_sequence_header_is_held_to_its_24_bits() {
+  let Some(corpus) = Corpus::new() else { return };
+  // FLV's metadata states HEVC's matrix, which the stream must name.
+  let hevc = generated(
+    &corpus,
+    "hevc-bt709.mkv",
+    &[
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=64x64:rate=25:duration=0.2",
+      "-c:v",
+      "libx265",
+      "-x265-params",
+      "bframes=0:log-level=none",
+      "-colorspace",
+      "bt709",
+      "-color_primaries",
+      "bt709",
+      "-color_trc",
+      "bt709",
+    ],
+  );
+  let h264 = corpus.multi_track_mkv();
+  let ts = corpus.transport_stream();
+  let aac = h264_aac(&corpus, "h264-aac.mkv");
+  for (name, source, kind, codec, header) in [
+    ("l172-hevc.flv", &hevc, TrackKind::Video, CodecId::HEVC, 5),
+    ("l172-h264.flv", &h264, TrackKind::Video, CodecId::H264, 5),
+    ("l172-annexb.flv", &ts, TrackKind::Video, CodecId::H264, 5),
+    ("l172-aac.flv", &aac, TrackKind::Audio, CodecId::AAC, 2),
+  ] {
+    let tag = if kind == TrackKind::Video { 9 } else { 8 };
+    let open = |name: &str, bound: Option<u64>| {
+      let target = output(&corpus, name);
+      let options = bound.map_or_else(MuxOptions::new, |bytes| {
+        MuxOptions::new().with_lowered_sequence_bound(bytes)
+      });
+      let opened = FfmpegOwnedMuxer::open_with(
+        File::create(&target).expect("create"),
+        ContainerName::new("flv"),
+        first_track(source, kind, 1).0,
+        &[],
+        options,
+      );
+      (target, opened)
+    };
+    let (target, opened) = open(name, None);
+    let (muxer, _) = opened.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    muxer.finish().expect("finished");
+    let (size, data) = flv_first_tag(&target, tag);
+    assert!(
+      size > header,
+      "{name}: the premise, a record behind the header"
+    );
+    if name == "l172-annexb.flv" {
+      let table = first_track(source, kind, 1).0;
+      let configuration = table[0].side_data().extradata();
+      assert!(
+        configuration.starts_with(&[0, 0, 0, 1]) || configuration.starts_with(&[0, 0, 1]),
+        "the premise: an Annex B configuration"
+      );
+      assert_eq!(data[header as usize], 1, "the avcC its writer made of it");
+    }
+    let below = format!("below-{name}");
+    let (refused, opened) = open(&below, Some(u64::from(size) - 1));
+    match opened {
+      Err(MuxOpenError::ConfigurationInvalid {
+        track,
+        codec: refused_codec,
+      }) => {
+        assert_eq!(track, TrackIndex::new(0), "{name}");
+        assert_eq!(refused_codec, codec, "{name}");
+      }
+      other => panic!(
+        "{name}: expected ConfigurationInvalid, got {:?}",
+        other.map(|_| ())
+      ),
+    }
+    assert_eq!(
+      std::fs::metadata(&refused).expect("the sink").len(),
+      0,
+      "{name}: nothing written"
+    );
+    let at = format!("at-{name}");
+    let (taken, opened) = open(&at, Some(u64::from(size)));
+    let (muxer, _) = opened.unwrap_or_else(|error| panic!("{at}: {error:?}"));
+    muxer.finish().expect("finished");
+    assert_eq!(
+      flv_first_tag(&taken, tag),
+      (size, data),
+      "{name}: the same tag"
+    );
+  }
+}
