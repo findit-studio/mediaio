@@ -10,6 +10,58 @@
 #[path = "../../mediadecode-ffmpeg/tests/support/mod.rs"]
 mod support;
 
+/// The bytes each thread of the lane allocates, counted for the laws that
+/// judge what a write allocates (L151): the system's allocator, each
+/// allocation's size added to the allocating thread's own count, so that
+/// the lane's parallel laws count apart.
+struct Counting;
+
+std::thread_local! {
+  static ALLOCATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn count(bytes: usize) {
+  let _ = ALLOCATED.try_with(|allocated| allocated.set(allocated.get() + bytes as u64));
+}
+
+// SAFETY: every call is the system allocator's, with the caller's own
+// arguments; the count touches no allocation, a thread-local of a constant
+// initializer, `try_with` answering nothing once the thread's are gone.
+unsafe impl std::alloc::GlobalAlloc for Counting {
+  unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+    count(layout.size());
+    // SAFETY: the caller's layout, as `GlobalAlloc::alloc` takes it.
+    unsafe { std::alloc::System.alloc(layout) }
+  }
+
+  unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+    count(layout.size());
+    // SAFETY: as `alloc`.
+    unsafe { std::alloc::System.alloc_zeroed(layout) }
+  }
+
+  unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+    count(new_size);
+    // SAFETY: the caller's block, layout and size, as `GlobalAlloc::realloc`
+    // takes them.
+    unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+  }
+
+  unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+    // SAFETY: the caller's block and layout, as `GlobalAlloc::dealloc`
+    // takes them.
+    unsafe { std::alloc::System.dealloc(ptr, layout) }
+  }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// The bytes this thread has allocated so far.
+fn allocated() -> u64 {
+  ALLOCATED.with(std::cell::Cell::get)
+}
+
 use std::{
   fs::File,
   io::{self, Seek, SeekFrom, Write},
@@ -17530,4 +17582,155 @@ fn l150_mp4_counts_sample_descriptions_and_ismv_refuses_an_update() {
   );
   untouched!(update, back);
   muxer.finish().expect("finished");
+}
+
+/// **L151 — a packet of no new extradata allocates nothing for its track's
+/// sample descriptions** (R14, Codex R13 1): the muxer judges a packet's
+/// configuration against the descriptions it mirrors on borrowed bytes,
+/// and owns only a configuration the packet adds or changes, applied once
+/// the packet is written. An AAC track of 65 descriptions, each of 64 KiB,
+/// writes a packet of no new extradata allocating less than 1 MiB — the
+/// descriptions it holds 4 MiB — and one bringing a 66th allocates it.
+///
+/// PLANT: the descriptions cloned at each packet, as before, 4 MiB a packet.
+#[test]
+fn l151_a_packet_of_no_new_extradata_allocates_nothing_for_descriptions() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let source = audio_file(&corpus, "l151.mp4", "aac");
+  let (table, frames) = first_track(&source, TrackKind::Audio, 1);
+  let frame = audio_of(&frames[0]);
+  let mut muxer = muxer_into(&output(&corpus, "l151.mp4"), ContainerName::MP4, table);
+  let configuration = |k: u8| {
+    let mut bytes = vec![k; 64 * 1024];
+    bytes[0] = 0x11;
+    bytes
+  };
+  let at = |index: i64, bringing: Option<&[u8]>| {
+    let mut packet = frame.clone();
+    if let Some(bytes) = bringing {
+      packet
+        .extra_mut()
+        .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, bytes)]);
+    }
+    audio_ticks(&packet, index * 1024, 1024)
+  };
+  for k in 1..=64_u8 {
+    muxer
+      .write_audio(at(i64::from(k), Some(&configuration(k))))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a description of its own");
+  }
+  let plain = at(65, None);
+  let before = allocated();
+  muxer
+    .write_audio(plain)
+    .map_err(|error| error.map_packet(drop))
+    .expect("a packet of no new extradata");
+  let spent = allocated() - before;
+  assert!(
+    spent < 1024 * 1024,
+    "a packet of no new extradata allocated {spent} bytes"
+  );
+  let bringing = at(66, Some(&configuration(65)));
+  let before = allocated();
+  muxer
+    .write_audio(bringing)
+    .map_err(|error| error.map_packet(drop))
+    .expect("a 66th description");
+  let spent = allocated() - before;
+  assert!(
+    spent >= 64 * 1024,
+    "the 66th description, owned once: {spent} bytes"
+  );
+  muxer.finish().expect("finished");
+}
+
+/// **L152 — VP9's first sample, the superframe its filter makes of the
+/// frames it held, is its first description, byte for byte** (R14, Codex
+/// R13 2; `ff_mov_write_packet`, `movenc.c` 7024–7074;
+/// `merge_superframe`, `vp9_superframe.c` 52–98): an MP4 VP9 track of no
+/// configuration takes its first sample as its configuration — two hidden
+/// frames and the frame shown after them, joined into one superframe and
+/// its index. 1023 frames of configurations of their own make 1024
+/// descriptions; a frame whose new extradata is that superframe, byte for
+/// byte, finds the first, taken; another is the 1025th, refused
+/// (`PayloadRule::SampleDescriptions`); the file read back.
+///
+/// PLANT: the joined first sample not held, as before, the superframe's
+/// configuration the 1025th.
+#[test]
+fn l152_vp9s_first_superframe_is_its_first_description() {
+  use ffmpeg_next::ffi::{AVPacketSideDataType as T, av_freep};
+  let Some(corpus) = Corpus::new() else { return };
+  let source = vp9_webm(&corpus);
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  let row = reticketed(table_of(&source, TrackKind::Video).remove(0), |par| {
+    // SAFETY: the parameters' extradata is libavutil's, freed by `av_freep`,
+    // which leaves it null; its size follows.
+    unsafe { av_freep(core::ptr::addr_of_mut!(par.extradata).cast()) };
+    par.extradata_size = 0;
+  });
+  assert!(
+    row.side_data().extradata().is_empty(),
+    "the premise: no configuration"
+  );
+  let target = output(&corpus, "l152.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, vec![row]);
+  let hidden = |tag: u8| vec![0x80, tag, tag];
+  let shown = vec![0x82, 9, 9, 9];
+  let mut at = 0;
+  let mut write = |bytes: &[u8], bringing: Option<&[u8]>, what: &str| {
+    let mut packet = video_holding(&frame, bytes);
+    if let Some(configuration) = bringing {
+      packet
+        .extra_mut()
+        .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, configuration)]);
+    }
+    let packet = video_at(&packet, Some(at), at);
+    at += 40;
+    let result = muxer.write_video(packet.clone());
+    (result, packet, what.to_owned())
+  };
+  for (bytes, what) in [
+    (hidden(1), "hidden"),
+    (hidden(2), "hidden"),
+    (shown.clone(), "shown"),
+  ] {
+    let (result, _, what) = write(&bytes, None, what);
+    result
+      .map_err(|error| error.map_packet(drop))
+      .unwrap_or_else(|error| panic!("{what}: {error:?}"));
+  }
+  // The superframe: the frames as they are, then its index — the marker,
+  // each size in a byte, the marker.
+  let mut superframe = [hidden(1), hidden(2), shown.clone()].concat();
+  superframe.extend([0xC2, 3, 3, 4, 0xC2]);
+  for k in 1..=1023_u16 {
+    let mut configuration = vec![0x82, 7, 7];
+    configuration.extend(k.to_le_bytes());
+    let (result, _, what) = write(&shown, Some(&configuration), "a description of its own");
+    result
+      .map_err(|error| error.map_packet(drop))
+      .unwrap_or_else(|error| panic!("{what} {k}: {error:?}"));
+  }
+  let (result, _, what) = write(&shown, Some(&superframe), "the first superframe's bytes");
+  result
+    .map_err(|error| error.map_packet(drop))
+    .unwrap_or_else(|error| panic!("{what}, the first description found: {error:?}"));
+  let (result, past, _) = write(&shown, Some(&[0x82, 6, 6, 6]), "another");
+  let (refusal, back) = by_container(result);
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::SampleDescriptions),
+    "the 1025th"
+  );
+  untouched!(past, back);
+  muxer.finish().expect("finished");
+  assert_eq!(
+    packets(&target)[0].len(),
+    1025,
+    "read back, its 1024 descriptions"
+  );
 }
