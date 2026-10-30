@@ -404,6 +404,19 @@ crate moves only when it changes.
   reported as `Rewrite::Durations`; a packet's duration not its samples is
   still `Durations`. Its samples, summed in an `int`, refused past
   `INT_MAX` (`PayloadRule::SampleCount`, new): 12.4 hours at 48 kHz.
+- **MP4's sample tables, by their sizes (R12).** Every 32-bit box size
+  movenc writes from a per-sample count, by mechanism: none of one track's
+  passes 32 bits within the table movenc keeps of its samples, which it
+  grows 1024 entries at a time through an allocation libavutil refuses
+  past `INT_MAX` bytes — after writing the packet's bytes, the write
+  failed. The packet whose sample would pass it is refused
+  (`PayloadRule::SampleTable`, new): 29 826 048 entries of 72 bytes, each
+  sample MP4 writes one — a packet's, an E-AC-3 sample of the frames
+  joined, a `mov_text` cue and the empty samples around it; ISMV's counted
+  from the track's first sample. A chapter table past it, which MP4's
+  chapter track writes a sample a chapter, refused at open
+  (`MuxOpenError::ChapterCount`). The chunk offsets and the `mdat` widen
+  past 32 bits.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer

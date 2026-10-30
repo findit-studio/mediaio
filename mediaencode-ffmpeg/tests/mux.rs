@@ -17225,3 +17225,141 @@ fn l148_a_tracks_aspect_ratio_is_libavformats_guess_and_round_trips() {
   }
   assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// **L149 — MP4 refuses a sample past what its table of a track's samples
+/// holds** (R12, ruled; `ff_mov_write_packet`, `movenc.c` 7228–7244;
+/// `av_realloc_array`, `libavutil/mem.c` 155–159, 217–223): movenc grows a
+/// track's table of samples 1024 entries at a time through an allocation
+/// libavutil refuses past `INT_MAX` bytes — 29 826 048 entries of 72 bytes,
+/// the unit law `movs_sample_table_holds_what_its_allocation_does` — and
+/// fails the write after its bytes are in the file. The bound lowered:
+/// three H.264 samples taken, the fourth refused by name
+/// (`PayloadRule::SampleTable`), handed back untouched, the file read back
+/// of three; six one-block E-AC-3 frames make one entry, five more are
+/// held, the twelfth, whose sample is the second, refused; a `mov_text`
+/// track keeps room for the empty sample MP4's trailer writes at the last
+/// cue's end — two cues, each of a gap before it, make four entries, the
+/// fifth kept, and a third cue at the second's end is refused; MP4's
+/// chapter track, a sample a chapter, holds no more: three chapters refused
+/// at open (`MuxOpenError::ChapterCount`), nothing written, two opened.
+///
+/// PLANT: the table unjudged, the fourth H.264 sample taken; E-AC-3 counted
+/// a packet an entry, the second frame refused; a cue's empty sample
+/// uncounted, the third cue taken; the trailer's room not kept, the third
+/// cue taken; the chapters unjudged, the three opened.
+#[test]
+fn l149_mp4_refuses_a_sample_past_its_sample_table() {
+  let Some(corpus) = Corpus::new() else { return };
+  let lowered = |entries| MuxOptions::new().with_lowered_table_bound(entries);
+  macro_rules! taken {
+    ($result:expr, $what:expr) => {
+      $result
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{}: {error:?}", $what))
+    };
+  }
+
+  // H.264: a sample a packet.
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let (table, frames) = first_track(&source, TrackKind::Video, 4);
+  let target = output(&corpus, "l149.mp4");
+  let mut muxer = muxer_with(&target, ContainerName::MP4, table, lowered(3));
+  for frame in &frames[..3] {
+    taken!(
+      muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(frame))),
+      "a sample within the table"
+    );
+  }
+  let fourth = VideoTrackPacket::new(TrackIndex::new(0), video_of(&frames[3]));
+  let (refusal, back) = by_container(muxer.write_video(fourth.clone()));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::SampleTable),
+    "the fourth sample"
+  );
+  untouched!(fourth, back);
+  muxer.finish().expect("finished");
+  assert_eq!(packets(&target)[0].len(), 3, "the file of three samples");
+
+  // E-AC-3: six one-block frames joined into a sample, an entry.
+  let (source, _, one) = eac3_frames(&corpus);
+  let mut muxer = muxer_with(
+    &output(&corpus, "l149-eac3.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Audio),
+    lowered(1),
+  );
+  for index in 0..11 {
+    taken!(
+      muxer.write_audio(audio_ticks(&one, index * 256, 256)),
+      "the first sample, then a run held"
+    );
+  }
+  let twelfth = audio_ticks(&one, 11 * 256, 256);
+  let (refusal, back) = by_container(muxer.write_audio(twelfth.clone()));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::SampleTable),
+    "the second sample"
+  );
+  untouched!(twelfth, back);
+
+  // `mov_text`: a cue and the empty sample before it, and the trailer's.
+  let source = mov_text_ms_mp4(&corpus);
+  let (table, cues) = first_track(&source, TrackKind::Subtitle, 1);
+  let base = table[0].timebase();
+  let cue = subtitle_of(&cues[0]);
+  let mut muxer = muxer_with(
+    &output(&corpus, "l149-cues.mp4"),
+    ContainerName::MP4,
+    table,
+    lowered(5),
+  );
+  taken!(
+    muxer.write_subtitle(cue_on(0, &cue, base, (1000, 1000))),
+    "the empty sample at zero and the first cue"
+  );
+  taken!(
+    muxer.write_subtitle(cue_on(0, &cue, base, (3000, 1000))),
+    "the empty sample at its end and the second cue, the trailer's room kept"
+  );
+  let third = cue_on(0, &cue, base, (4000, 1000));
+  let (refusal, back) = by_container(muxer.write_subtitle(third.clone()));
+  assert_eq!(refusal, payload(PayloadRule::SampleTable), "the third cue");
+  untouched!(third, back);
+  muxer
+    .finish()
+    .expect("finished, the trailer's empty sample in the table");
+
+  // MP4's chapter track: a sample a chapter.
+  let chapters: Vec<Chapter<Ffmpeg>> = (0..3)
+    .map(|index| chapter_of(index, index * 100, index * 100 + 100, Some("a title")))
+    .collect();
+  let video = h264_aac(&corpus, "h264-aac.mp4");
+  let refused = output(&corpus, "l149-chapters.mp4");
+  let opened = FfmpegOwnedMuxer::open_with(
+    File::create(&refused).expect("create"),
+    ContainerName::MP4,
+    table_of(&video, TrackKind::Video),
+    &chapters,
+    lowered(2),
+  );
+  assert!(
+    matches!(opened, Err(MuxOpenError::ChapterCount { count: 3 })),
+    "three chapters: {:?}",
+    opened.map(drop)
+  );
+  assert_eq!(
+    std::fs::metadata(&refused).expect("the file").len(),
+    0,
+    "nothing written"
+  );
+  FfmpegOwnedMuxer::open_with(
+    File::create(output(&corpus, "l149-chapters-two.mp4")).expect("create"),
+    ContainerName::MP4,
+    table_of(&video, TrackKind::Video),
+    &chapters[..2],
+    lowered(2),
+  )
+  .expect("two chapters");
+}

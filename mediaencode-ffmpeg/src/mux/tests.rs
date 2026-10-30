@@ -1250,6 +1250,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     place: 0,
     mp4_place: None,
     mp4_samples: 0,
+    mp4_entries: 0,
     apv: Vec::new(),
     key_times: None,
     mxf: MxfMirror::default(),
@@ -4708,4 +4709,26 @@ fn apv_frame_infos_follow_mp4s_parse_of_the_access_unit() {
   let c = records::apv_frame_infos(&apv_access_unit(&[apv_pbu(1, 2, 3, 0)]));
   assert_ne!(a, b);
   assert_eq!(a, c);
+}
+
+/// The MOV family's table of a track's samples holds what its allocation
+/// does (R12; [`super::PayloadRule::SampleTable`]): movenc grows it 1024
+/// entries of `MOVIentry` at a time, refused past `INT_MAX` bytes, so that
+/// its last growth lies within them and the next past — 29 826 048 entries
+/// of 72 bytes, or 33 553 408 of 64, as the target's C layout makes it.
+#[test]
+fn movs_sample_table_holds_what_its_allocation_does() {
+  let entry = core::mem::size_of::<super::MovEntry>() as u64;
+  assert!(
+    entry == 72 || entry == 64,
+    "MOVIentry's layout, {entry} bytes"
+  );
+  let max = super::MOV_SAMPLES_MAX;
+  assert_eq!(max % 1024, 0, "a whole growth");
+  assert!(
+    max * entry <= i32::MAX as u64,
+    "the last growth within INT_MAX"
+  );
+  assert!((max + 1024) * entry > i32::MAX as u64, "the next past it");
+  assert_eq!(max, if entry == 72 { 29_826_048 } else { 33_553_408 });
 }

@@ -344,6 +344,7 @@
 //! |---|---|---|
 //! | a duration or a decode gap past `i32::MAX` ticks — the gap from the last sample MP4 wrote on the track, none before the first; ISMV's gap `i32::MAX` less the track's first composition offset, which its negative composition offsets add to the gap `check_pkt`'s second call counts, the decode time moved by it and the reference not — the rewritten decode time lands that offset back, and the next fragment's flush asserts on it, ending the process (7396–7410, 1248–1256) — but before a key frame of its one video track, whose flush comes between the two calls (7445–7471; R10, L6), a second video track refused at open, booked to Q870 ([`MuxOpenError::TrackLayout`]; R11, Codex R10 2); a subtitle's negative duration, which libavformat hands on as it is — another track's it writes as zero, or its own guess (`mux.c` 605–633), reported ([`Rewrite::Durations`]); a composition offset past `i32` | `check_pkt` 6897–6928; 6955–6959 | [`FfmpegMuxRefusal::DurationTooLong`], [`DtsGap`](FfmpegMuxRefusal::DtsGap), [`NegativeDuration`](FfmpegMuxRefusal::NegativeDuration), [`PresentationOffset`](FfmpegMuxRefusal::PresentationOffset); the last sample written, table C″ |
 //! | a constant-size audio track's samples — PCM's, counted by its bytes, its bytes a sample by its channels — past `INT_MAX`, of no fragments: summed in an `int` into the sample-size table, and its sample table's one run counted in 32 bits | `ff_mov_write_packet` 7002–7005, 7372; `mov_write_stsz_tag` 228–241; `mov_write_stts_tag` 3241–3256 | [`PayloadRule::SampleCount`] (R11, Q869 L7 — L139); a track of samples of varying size counts one a sample MP4 writes, its packets |
+//! | a track's table of samples past what movenc's array of its entries holds — grown 1024 entries at a time through `av_realloc_array`, which libavutil refuses past `INT_MAX` bytes (`max_alloc_size`): 29 826 048 entries of 72 bytes, 33 553 408 of 64 — the write failed after the packet's bytes are in the file; each sample MP4 writes takes an entry: a packet's, an E-AC-3 sample of the frames joined, a `mov_text` cue and the empty samples MP4 makes around it | 7228–7244; `mem.c` 74, 155–159, 217–223 | [`PayloadRule::SampleTable`] (R12, ruled — L149 and the unit law `movs_sample_table_holds_what_its_allocation_does`): a cue track keeping room for its trailer's empty sample, and before a first cue at zero for one another track's packet may make, stricter by that one at most; ISMV's counted from the track's first sample, never reset at a flush, stricter than FFmpeg and losing nothing; the chapter track's, a sample a chapter, refused at open ([`MuxOpenError::ChapterCount`]); within it, no box of one track's tables passes 32 bits (the sizes' table below) |
 //! | AMR-NB: one frame a packet; ADPCM MS and IMA WAV: a frame size | 6983–7002 | not reached: MP4's tag table holds neither (`codec_mp4_tags`, 9230–9290), refused at open ([`MuxOpenError::CodecNotCarried`]); MOV's mode reaches it, its AMR and ADPCM booked (table H) |
 //! | no samples: less than a frame of a sized codec | 7006–7010 | [`PayloadRule::PartialSample`], [`PayloadRule::Empty`] |
 //! | the first packet taken as the configuration of H.264, HEVC, VVC, EVC, LCEVC, VP9, TrueHD or DNxHD where none is stated | 7024–7041 | H.264, HEVC, VVC, LCEVC and EVC refused at open ([`MuxOpenError::ConfigurationMissing`]); TrueHD refused at open; VP9's and DNxHD's boxes made from it, written |
@@ -379,6 +380,29 @@
 //! | libavcodec's TTML joined into one document: its header strings, its size | `movenc_ttml.c` 236–317; `ttmlenc.c` 82–122 | [`MuxOpenError::ConfigurationInvalid`]; [`PayloadRule::DocumentSize`] |
 //! | the cover: an empty picture skipped | 4823 | table E |
 //! | the chapters: a text track and a Nero list | 7727–7815; 5040–5064 | the track's samples, table C′; the report, table E |
+//!
+//! **MP4, its sample tables' sizes** (R12, ruled: every 32-bit box size
+//! movenc writes from a per-sample count, by mechanism) — each written by
+//! `update_size`, which writes 32 bits of a size counted in 64 (`movenc.c`
+//! 155–163), or of its own 32-bit or `int` sum; each bounded by the track's
+//! table of samples ([`PayloadRule::SampleTable`]), so that none of one
+//! track passes 32 bits and nothing is refused for its size; the offsets and
+//! the `mdat` widen; the boxes that sum every track's do not:
+//!
+//! | box | its size | at the table's 29 826 048 entries | here |
+//! |---|---|---|---|
+//! | `stsz` | 20 bytes of samples of one size, else 20 and 4 a sample, its count summed in an `int` (225–259) | 119 304 212 bytes | the count's `int`, [`PayloadRule::SampleCount`] (R11) |
+//! | `stco`, `co64` | 16 and 4 a chunk — 8 where the last chunk's offset passes `UINT32_MAX`, which widens every offset (`co64_required`, 177–182; 201–223) | 238 608 400 | widened: nothing refused |
+//! | `stsc` | 16 and 12 a run of chunks (261–290) | 357 912 592 | — |
+//! | `stts`, `ctts` | a `uint32_t` of 16 and 8 a run of durations, or of composition offsets — constant-size audio's one run (3200–3288) | 238 608 400 | — |
+//! | `stss`, `stps` | 16 and 4 a sync, or partial sync, sample (292–314) | 119 304 208 | — |
+//! | `sdtp` | 12 and 1 a sample (316–336) | 29 826 060 | — |
+//! | `sgpd`, `sbgp`, AAC's and Opus's | an `int` of 24 and 2 a group, and of 20 and 8 a run of roll distances (3305–3400) | 59 652 120; 238 608 404, within `INT_MAX` | — |
+//! | `stsd` | a sample entry a description, a distinct new extradata each (3165–3198; 7044–7074) | not bounded by the table: a description a configuration | not mirrored — FFmpeg's reader refuses more than 1024 with the whole file (`mov_read_stsd`, `mov.c` 3338; 11290–11295; R12, letter) |
+//! | `stbl`, `minf`, `mdia`, `trak` | one track's boxes, their sum (3402–3439, 3821–3856, 3957–3970, 4391–4445) | 1 342 172 272 at most — a video track's every table — beside its descriptions | — |
+//! | `moov`, and ISMV's `mfra` | every track's boxes, their sum — the `mfra` in a dynamic buffer of `INT_MAX` bytes, 19 bytes a fragment (5339–5453; 6118–6178) | past 4 GiB, past `INT_MAX`, only of several tracks near the table's bound | not mirrored: the chunks of a track the interleaving's order makes, and every other box the `moov` holds (R12, letter) |
+//! | `mdat` | a `wide` box before it, which the trailer turns into a 64-bit size past `UINT32_MAX` (6180–6189, 8990–9012); ISMV's of one track's buffer ([`PayloadRule::FragmentSize`]; 6855–6858) | widened; within | — |
+//! | ISMV's `moof`, `traf`, `trun` | a fragment's boxes, 16 bytes a sample at most (5678–5732, 5868–5933, 6084–6116) | 477 216 788 | — |
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -776,7 +800,7 @@
 //! | NUT, at open | raw video of a tag its tables do not hold; a video stream of no width or height, an audio one of no sample rate or channels, a configuration of 2^30 bytes or more; a chapter starting past its count; a time base not in lowest terms | written under the tables' first raw tag, RGB 5:5:5's, read back as that; a stream header its reader refuses; wrapped; a main header its reader refuses (`nut.c` 50; `nutdec.c` 233–240, 447–470; `nutenc.c` 601) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ChapterSpan`]; the time base handed reduced — L90 |
 //! | MXF, MXF D-10, MXF OP-Atom | an MPEG-2 picture of coding type 0, or of a profile and level MXF labels no codec for; a P or B picture, whose index offsets this release does not mirror; DNxHD's first frame short of its compression id, or of an id MXF labels none for; a frame of another size than a constant-bit-rate index counts — MXF D-10's of its bit rate, DNxHD's of its first; an empty packet; at the end, a track no packet reached | refused after taking it; its index written at the next segment, the whole file lost at an offset past a byte; refused after taking it; refused after taking it; an essence element of none; nothing written, the trailer failing (`mxfenc.c` 2361–2397, 2793–2858, 3325–3458, 3487–3606) | [`PayloadRule::FrameHeader`], [`PayloadRule::PredictedPicture`], [`PayloadRule::FrameSize`], [`PayloadRule::Empty`], [`FfmpegMuxRefusal::NoFrame`] — L99 |
 //! | MXF, MXF D-10, MXF OP-Atom, at open | a codec but MPEG-2, DNxHD and ProRes video — MXF D-10's MPEG-2 alone — and 16- and 24-bit PCM: H.264, DV, FFV1 and JPEG 2000, whose frame parsers this release has not audited, and the data and caption tracks, booked; a first track not the one video track, OP-Atom's second track, MXF D-10's audio track not its second; a frame rate MXF names no content package for, or none; no pixel format; ProRes of no profile its labels name; sound but at 48 kHz, OP-Atom's but mono; MXF D-10's video at a bit rate it names not, or at a rate but 25 and 30000/1001; its sound past eight channels, or of a block alignment not its channels' samples | refused at its start; or its label another standard's; or its writer dividing by the alignment (`mxfenc.c` 2941–3165, 3222–3248) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ConfigurationInvalid`] — L98 |
-//! | the MOV family's modes | MP4's packet rules; ISMV's and AVIF's samples past the dynamic buffer they are written into — AVIF's held until its trailer, ISMV's until its next fragment's flush, counted here from the track's first sample, stricter than FFmpeg and losing nothing; ISMV's decode gap of `i32::MAX` less the track's first composition offset, but before a key frame of its one video track | as MP4's; the buffer refusing the write, the sample tables counting bytes the file lacks (`movenc.c` 6961–6981; `aviobuf.c` 1281–1311); the decode time rewritten that offset back, the next flush's `av_assert0` ending the process (6897–6923, 7396–7410, 1248–1256) | as MP4's; [`PayloadRule::FragmentSize`], [`FfmpegMuxRefusal::DtsGap`] — L103, L123 |
+//! | the MOV family's modes | MP4's packet rules; ISMV's and AVIF's samples past the dynamic buffer they are written into — AVIF's held until its trailer, ISMV's until its next fragment's flush, counted here from the track's first sample, stricter than FFmpeg and losing nothing; ISMV's decode gap of `i32::MAX` less the track's first composition offset, but before a key frame of its one video track | as MP4's; the buffer refusing the write, the sample tables counting bytes the file lacks (`movenc.c` 6961–6981; `aviobuf.c` 1281–1311); the decode time rewritten that offset back, the next flush's `av_assert0` ending the process (6897–6923, 7396–7410, 1248–1256) | as MP4's — each mode's table of a track's samples, ISMV's counted from its first sample, never reset at a flush ([`PayloadRule::SampleTable`]; R12); [`PayloadRule::FragmentSize`], [`FfmpegMuxRefusal::DtsGap`] — L103, L123 |
 //! | the MOV family's modes, at open | a codec this release admits not beside MP4's — MOV's raw video, DV, MPEG-2, H.263, DNxHD, ProRes, PCM, MP3, AMR, ADPCM, QDM2, G.726, iLBC, and H.264 of an intra profile or AVC-Intra tag; 3GP's and 3G2's H.263 and AMR; F4V's VP6; ISMV's WMA Pro and TTML; PSP's every codec but H.264, MPEG-4 Part 2 and AAC; AVIF's alpha plane — booked; a picture past 65535, and in MOV's mode one of an aspect ratio stated and not 1 whose track aperture — its width, height and display width shifted left 16 in an `int` — passes 32767, every MOV video codec, H.264, HEVC and MPEG-4 among them (`mov_write_tapt_tag`, `movenc.c` 4098–4126, 4430–4436; R11, Q869 L6 — L136); MPEG audio layer III below 16 kHz outside MOV; TTML's `dfxp` tag outside ISMV; PSP's table of other than one video and one audio track, AVIF's of more than one; ISMV's second video track, whose key frames' flushes before `check_pkt`'s second count rest on libavformat's interleaving, which this release does not mirror — booked to Q870 (R11, Codex R10 2); the Nero list's untitled chapter, which reads back titled empty, no longer untitled (R9: Fable R2, judged by the ruled rule), a title past 255 bytes, cut | refused at the start, written with no configuration box, or so that it reads back otherwise (`movenc.c` 1380–2140, 5040–5064, 6431–6448, 8129–8650) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`] — L102, L132 |
 
 use core::{fmt, marker::PhantomData};
@@ -1425,6 +1449,9 @@ struct Bounds {
   /// The most samples the MOV family counts a constant-size audio track's
   /// in, an `int` ([`PayloadRule::SampleCount`]).
   samples: u64,
+  /// The most entries the MOV family's table of a track's samples holds
+  /// ([`MOV_SAMPLES_MAX`]; [`PayloadRule::SampleTable`]).
+  table: u64,
 }
 
 impl Bounds {
@@ -1435,6 +1462,7 @@ impl Bounds {
     file: u32::MAX as u64,
     fragment: FRAGMENT_BYTES_MAX,
     samples: i32::MAX as u64,
+    table: MOV_SAMPLES_MAX,
   };
 }
 
@@ -1522,6 +1550,7 @@ impl MuxOptions {
       file: self.bounds.file,
       fragment: self.bounds.fragment,
       samples: self.bounds.samples,
+      table: self.bounds.table,
     };
     self
   }
@@ -1564,7 +1593,62 @@ impl MuxOptions {
     }
     self
   }
+
+  /// Lowers the entries the MOV family's table of a track's samples holds
+  /// — [`MOV_SAMPLES_MAX`] — to `entries`, never raising it: the laws'
+  /// seam, which shows the bound without tens of millions of packets
+  /// ([`PayloadRule::SampleTable`], [`MuxOpenError::ChapterCount`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_table_bound(mut self, entries: u64) -> Self {
+    if entries < self.bounds.table {
+      self.bounds.table = entries;
+    }
+    self
+  }
 }
+
+/// `MOVIentry`, movenc's entry of one sample in a track's table, as
+/// `libavformat/movenc.h` 49–64 in FFmpeg 9.0.1 lays it out — mirrored for
+/// its size alone, which the target's C layout sets: 72 bytes, or 64 where
+/// an `int64_t` is aligned to four, as on 32-bit x86 Linux.
+#[repr(C)]
+#[allow(dead_code)]
+struct MovEntry {
+  pos: u64,
+  dts: i64,
+  pts: i64,
+  size: u32,
+  stsd_index: u32,
+  samples_in_chunk: u32,
+  chunk_num: u32,
+  entries: u32,
+  cts: i32,
+  flags: u32,
+  prft: ProducerReferenceTime,
+}
+
+/// `AVProducerReferenceTime` (`libavcodec/defs.h` 331–339), the last field
+/// of [`MovEntry`].
+#[repr(C)]
+#[allow(dead_code)]
+struct ProducerReferenceTime {
+  wallclock: i64,
+  flags: i32,
+}
+
+/// The most entries movenc's table of a track's samples holds: it grows the
+/// table `MOV_INDEX_CLUSTER_SIZE`, 1024 entries, at a time through
+/// `av_realloc_array` (`ff_mov_write_packet`, `movenc.c` 7235–7244), which
+/// refuses an allocation past libavutil's limit, `INT_MAX` bytes unless the
+/// process raises it (`max_alloc_size`, `libavutil/mem.c` 74, 155–159,
+/// 217–223) — the largest multiple of 1024 entries within it: 29 826 048,
+/// or 33 553 408 of 64-byte entries. The trust model holds the limit
+/// libavutil's own, which the base never changes.
+pub(crate) const MOV_SAMPLES_MAX: u64 = {
+  let step = 1024 * core::mem::size_of::<MovEntry>() as u64;
+  (i32::MAX as u64 / step) * 1024
+};
 
 /// One of libavformat's bitstream filters a muxer inserts for a track —
 /// when it writes the track's first packet, or at its start
@@ -2881,6 +2965,25 @@ pub enum PayloadRule {
   /// 3241–3256): 12.4 hours at 48 kHz (R11, Q869 L7).
   #[error("the packet would take the track's samples past what MP4 counts them in")]
   SampleCount,
+  /// The MOV family: a packet whose sample would take the track's table of
+  /// samples past what movenc's array of its entries holds
+  /// ([`MOV_SAMPLES_MAX`]: 29 826 048 entries of 72 bytes), which it grows
+  /// 1024 entries at a time through an allocation libavutil refuses past
+  /// `INT_MAX` bytes — after writing the packet's bytes, so that the file
+  /// holds bytes no sample counts, and the muxer's write fails
+  /// (`ff_mov_write_packet`, `movenc.c` 7228–7244). Each sample MP4 writes
+  /// takes an entry: a packet's, each its automatic filter puts out, an
+  /// E-AC-3 sample of the frames joined, a `mov_text` cue and the empty
+  /// sample before it, a cue track keeping room for the one MP4's trailer
+  /// writes at the last cue's end (9025–9031) — and, before a first cue at
+  /// zero, for one another track's packet may make there first, stricter
+  /// by that one at most. ISMV's are counted from the track's first sample,
+  /// never reset at its fragments' flush, as [`PayloadRule::FragmentSize`]
+  /// counts its bytes: stricter than FFmpeg, and losing nothing. Within
+  /// it, no sample table and no box of one track passes the 32 bits movenc
+  /// counts their sizes in (R12; table C′′′ of the census).
+  #[error("the packet's sample would take the track's sample table past what MP4 holds")]
+  SampleTable,
   /// MP4's APV: a packet whose frame brings a 256th frame information of
   /// its PBU type to the track's `apvC`, which MP4 makes of its parse of
   /// every packet and counts them in 8 bits (`apv_add_frameinfo`, `apv.c`
@@ -3482,7 +3585,11 @@ pub enum MuxOpenError {
   /// contents counts its elements in 8 bits, a chapter each, and wraps past
   /// 255, the frame misread by a reader that walks it (`write_ctoc`,
   /// `id3v2enc.c` 274; FFmpeg's own reader reads the chapters' frames, not
-  /// the table, `id3v2.c` 815).
+  /// the table, `id3v2.c` 815); MP4's, MOV's and iPod's chapter track,
+  /// a sample a chapter, past what movenc's table of a track's samples
+  /// holds, its writer's answer ignored, so that the chapters past it lose
+  /// their titles (`mov_create_chapter_track`, `movenc.c` 7727–7815;
+  /// [`PayloadRule::SampleTable`]; R12).
   #[error("the table's {count} chapters are more than the container counts")]
   ChapterCount {
     /// The chapters in the table.
@@ -3561,6 +3668,9 @@ struct TrackState {
   mp4_place: Option<i128>,
   /// The MOV family's constant-size audio: the samples MP4 has counted.
   mp4_samples: u64,
+  /// The MOV family: the entries MP4 has made in the track's table of
+  /// samples ([`PayloadRule::SampleTable`]).
+  mp4_entries: u64,
   /// The MOV family's APV: the frame informations its `apvC` records so
   /// far, by PBU type, in the order the types came
   /// ([`records::apv_frame_infos`]).
@@ -3649,6 +3759,9 @@ struct CueStep {
   /// sample there first, and the cue's decode time is then moved past it
   /// and its presentation time dropped (6917–6923).
   early: bool,
+  /// Whether MP4 writes the empty sample at the last cue's end — or at
+  /// zero, before the first — before the cue: a sample of its own.
+  ends: bool,
   /// The track after the cue.
   next: Cues,
 }
@@ -3661,7 +3774,8 @@ impl Cues {
   fn take(self, dts: i64, duration: i64) -> CueStep {
     let at = i128::from(dts);
     let mut track = self;
-    if track.end < at && (track.start.is_none() || !track.ended) {
+    let ends = track.end < at && (track.start.is_none() || !track.ended);
+    if ends {
       // `mov_write_subtitle_end_packet` (7479–7497): a sample of its own at
       // `end`, its duration zero, which the cue follows at once. Before any,
       // `end` is zero, and the track starts there.
@@ -3680,6 +3794,7 @@ impl Cues {
     CueStep {
       reference,
       early: at < self.end,
+      ends,
       next,
     }
   }
@@ -7685,6 +7800,9 @@ struct Learned {
   /// The MOV family's constant-size audio: what MP4 counts of the packet
   /// ([`Mp4Place`]).
   mp4_place: Option<Mp4Place>,
+  /// The MOV family: the entries MP4 has made in the track's table of
+  /// samples after the packet ([`PayloadRule::SampleTable`]).
+  mp4_entries: Option<u64>,
   /// The MOV family's APV: the frame informations the packet adds to the
   /// track's `apvC`, by PBU type.
   apv: Vec<(u8, records::ApvFrameInfo)>,
@@ -7828,8 +7946,12 @@ where
       lost.push(losses);
     }
     // MP3's ID3v2 table of contents counts its chapters in 8 bits, which
-    // wrap past 255 (`write_ctoc`, `id3v2enc.c` 274).
-    if audited == Audited::Mp3 && chapters.len() > usize::from(u8::MAX) {
+    // wrap past 255 (`write_ctoc`, `id3v2enc.c` 274); the MOV family's
+    // chapter track, a sample a chapter, holds no more than its table of
+    // samples does (R12; [`PayloadRule::SampleTable`]).
+    if (audited == Audited::Mp3 && chapters.len() > usize::from(u8::MAX))
+      || (audited.chapter_track() && chapters.len() as u64 > bounds.table)
+    {
       return Err(MuxOpenError::ChapterCount {
         count: chapters.len(),
       });
@@ -8325,6 +8447,7 @@ where
         place: 0,
         mp4_place: None,
         mp4_samples: 0,
+        mp4_entries: 0,
         apv: Vec::new(),
         key_times: None,
         mxf: MxfMirror {
@@ -8972,6 +9095,9 @@ where
     if let Some(mp4) = plan.learned.mp4_place {
       state.mp4_place = Some(mp4.next);
       state.mp4_samples = mp4.samples;
+    }
+    if let Some(entries) = plan.learned.mp4_entries {
+      state.mp4_entries = entries;
     }
     for &(kind, info) in &plan.learned.apv {
       match state.apv.iter_mut().find(|(entry, _)| *entry == kind) {
@@ -10036,6 +10162,32 @@ fn check_packet_rules(
       }),
     }
   };
+  // The MOV family: the entries MP4 makes in the track's table of samples
+  // with the packet — each sample it writes ([`PayloadRule::SampleTable`]):
+  // each packet the track's filter puts out; an E-AC-3 or AC-3 sample at
+  // the packet that writes it; a `mov_text` cue, and the empty sample MP4
+  // writes before it, the cue track keeping room for the one its trailer
+  // writes at the last cue's end and, before a first cue at zero, for one
+  // another track's packet may make there first. TTML's paragraphs MP4
+  // joins into one sample at its trailer, and a configuration's packet
+  // writes none.
+  let mp4_entries = if rules.mp4 && !config_only && rules.ttml_document.is_none() {
+    let (entries, reserved) = match (cues, ac3) {
+      (Some(cue), _) => (
+        1 + u64::from(cue.ends),
+        1 + u64::from(state.mp4_entries == 0 && dts_ticks == 0),
+      ),
+      (None, Some(_)) => (u64::from(sample.is_some()), 0),
+      (None, None) => (outputs.len() as u64, 0),
+    };
+    let after = state.mp4_entries.saturating_add(entries);
+    if entries > 0 && after.saturating_add(reserved) > bounds.table {
+      return refused(PayloadRule::SampleTable);
+    }
+    Some(after)
+  } else {
+    None
+  };
   // A negative duration libavformat or the container writes as zero, on a
   // packet put out; and `mov_text`: MP4 keeps a cue's duration as the
   // distance to the next sample — the empty one at its end, or a cue before
@@ -10059,6 +10211,7 @@ fn check_packet_rules(
     bytes: payload.bytes.len() as u64,
     place,
     mp4_place,
+    mp4_entries,
     apv,
     key_times,
     mxf,
