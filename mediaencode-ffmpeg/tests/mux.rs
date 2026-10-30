@@ -16038,10 +16038,10 @@ fn l136_mov_refuses_a_video_whose_track_aperture_overflows() {
 /// `matroskadec.c`'s display size, kept on the stream;
 /// `av_guess_sample_aspect_ratio`, `avformat.c` 784–805): ProRes's decoder
 /// states no ratio, so a MOV's `pasp` of 10/11 lives on the stream alone;
-/// the base's demuxer takes it into the ticket where the parameters state
-/// none, and the muxer writes it — into Matroska as the display size, read
-/// back 10/11. VP9, a codec MP4 admits, from WebM's display size, into
-/// MP4's `pasp`, the same.
+/// the base's demuxer takes libavformat's guess into the ticket — the
+/// stream's (L148) — and the muxer writes it: into Matroska as the display
+/// size, read back 10/11. VP9, a codec MP4 admits, from WebM's display
+/// size, into MP4's `pasp`, the same.
 ///
 /// PLANT: the stream's ratio not taken, each source's ticket of none.
 #[test]
@@ -17109,4 +17109,119 @@ fn l147_flv_reports_a_coded_side_data_entry_its_reader_rebuilds_otherwise() {
       "{name}: the packets as written"
     );
   }
+}
+
+/// A video track's sample aspect ratios as libavformat holds them for the
+/// first video stream of `path`: the stream's and its parameters'.
+fn stated_ratios(path: &Path) -> ((i32, i32), (i32, i32)) {
+  let input = ffmpeg_next::format::input(path).expect("open");
+  let stream = input
+    .streams()
+    .find(|stream| stream.parameters().medium() == ffmpeg_next::media::Type::Video)
+    .expect("a video stream");
+  // SAFETY: `stream` keeps its `AVStream`, and its parameters, live for the
+  // reads of two plain `AVRational`s.
+  unsafe {
+    let st = &*stream.as_ptr();
+    let par = &*st.codecpar;
+    (
+      (st.sample_aspect_ratio.num, st.sample_aspect_ratio.den),
+      (par.sample_aspect_ratio.num, par.sample_aspect_ratio.den),
+    )
+  }
+}
+
+/// **L148 — a track's aspect ratio is libavformat's own guess, as FFmpeg's
+/// tool takes it, and round-trips** (R12, ruled; Q869 L11;
+/// `av_guess_sample_aspect_ratio`, `avformat.c` 784–805): the stream's,
+/// where it states one, whatever the parameters state — an H.264 MP4 whose
+/// `pasp` says 3/2 and whose VUI says 10/11 takes 3/2, written into MP4's
+/// `pasp` and Matroska's display size and read back 3/2; the stream's
+/// alone — ProRes's MOV, of no ratio in its parameters, takes `pasp`'s
+/// 10/11; the parameters' alone — an H.264 transport stream, whose
+/// container states none, takes the VUI's 10/11, written into MP4's
+/// `pasp` and read back 10/11.
+///
+/// PLANT: the stream's taken only where the parameters state none (R11's
+/// rule), the first source's ticket 10/11; the parameters' alone, ProRes's
+/// ticket of none; the stream's alone, the transport stream's of none.
+#[test]
+fn l148_a_tracks_aspect_ratio_is_libavformats_guess_and_round_trips() {
+  let Some(corpus) = Corpus::new() else { return };
+  #[rustfmt::skip]
+  let vui = generated(&corpus, "l148-vui.mp4", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25", "-frames:v", "3",
+    "-c:v", "libx264", "-vf", "setsar=10/11",
+  ]);
+  let vui = vui.to_str().expect("a UTF-8 path").to_owned();
+  #[rustfmt::skip]
+  let both = generated(&corpus, "l148-both.mp4", &[
+    "-i", &vui, "-c", "copy", "-aspect", "2:1",
+  ]);
+  #[rustfmt::skip]
+  let prores = generated(&corpus, "prores-sar.mov", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25", "-frames:v", "3",
+    "-c:v", "prores_ks", "-vf", "setsar=10/11",
+  ]);
+  #[rustfmt::skip]
+  let codec = generated(&corpus, "l148-codec.ts", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25", "-frames:v", "3",
+    "-c:v", "libx264", "-vf", "setsar=10/11",
+  ]);
+  let ratio = |path: &Path| {
+    let ratio = table_of(path, TrackKind::Video)
+      .remove(0)
+      .side_data()
+      .sample_aspect_ratio();
+    (ratio.num(), ratio.den())
+  };
+  // Every case judged, its mismatches gathered, so that each shows.
+  let mut wrong = Vec::new();
+  for (source, stated, guess, targets) in [
+    (
+      &both,
+      ((3, 2), (10, 11)),
+      (3, 2),
+      &[("mp4", "l148-both-copy.mp4"), ("matroska", "l148-both.mkv")][..],
+    ),
+    (
+      &prores,
+      ((10, 11), (0, 1)),
+      (10, 11),
+      &[("matroska", "l148-prores.mkv")][..],
+    ),
+    (
+      &codec,
+      ((0, 1), (10, 11)),
+      (10, 11),
+      &[("mp4", "l148-codec.mp4")][..],
+    ),
+  ] {
+    let name = source
+      .file_name()
+      .and_then(|name| name.to_str())
+      .unwrap_or_default();
+    assert_eq!(
+      stated_ratios(source),
+      stated,
+      "{name}: the premise, the stream's and the parameters'"
+    );
+    if ratio(source) != guess {
+      wrong.push(format!(
+        "{name}: the source's ticket {:?}, not {guess:?}",
+        ratio(source)
+      ));
+    }
+    for &(container, target) in targets {
+      let target = output(&corpus, target);
+      remux_through_ffmpeg(source, ContainerName::new(container), &target);
+      if ratio(&target) != guess {
+        wrong.push(format!(
+          "{name} into {container}: read back {:?}, not {guess:?}",
+          ratio(&target)
+        ));
+      }
+    }
+  }
+  assert!(wrong.is_empty(), "{wrong:#?}");
 }

@@ -478,15 +478,23 @@ fn every_track_row_hands_back_the_parameters_the_file_declared() {
     // must agree field for field.
     let input = ffmpeg_next::format::input(&path).expect("open for reference");
     let reference: Vec<Parameters> = input.streams().map(|s| s.parameters()).collect();
-    // The stream's own sample aspect ratio, which the row takes where the
-    // parameters state none — the second documented divergence (R11, Q869
-    // L11): MOV's `pasp` and Matroska's display size live on the stream.
-    let stream_ratios: Vec<(i32, i32)> = input
+    // libavformat's own guess of each stream's sample aspect ratio, which
+    // the row takes — the second documented divergence (R12, ruled; Q869
+    // L11): the stream's where it states one, MOV's `pasp` and Matroska's
+    // display size, whatever the parameters state, else the parameters'.
+    let guesses: Vec<(i32, i32)> = input
       .streams()
       .map(|s| {
-        // SAFETY: `s` keeps its `AVStream` live for the read of a plain
-        // `AVRational`.
-        let ratio = unsafe { (*s.as_ptr()).sample_aspect_ratio };
+        // SAFETY: `input` and `s` keep the context and the stream live for
+        // the call, which reads two ratios and writes through neither
+        // pointer; a null frame asks for the parameters' ratio.
+        let ratio = unsafe {
+          ffmpeg_next::ffi::av_guess_sample_aspect_ratio(
+            input.as_ptr().cast_mut(),
+            s.as_ptr().cast_mut(),
+            std::ptr::null_mut(),
+          )
+        };
         (ratio.num, ratio.den)
       })
       .collect();
@@ -506,16 +514,15 @@ fn every_track_row_hands_back_the_parameters_the_file_declared() {
       let attachment = track.kind() == TrackKind::Attachment;
       // SAFETY: both own a live `AVCodecParameters`.
       let mut bad = unsafe { compare(reference[index].as_ptr(), rebuilt.as_ptr()) };
+      let ratio = extra.ticket().sample_aspect_ratio();
+      assert_eq!(
+        (ratio.num(), ratio.den()),
+        guesses[index],
+        "{name} track {index}: libavformat's guess of the stream's aspect ratio",
+      );
       // SAFETY: the reference owns a live `AVCodecParameters`.
-      let stated = unsafe { (*reference[index].as_ptr()).sample_aspect_ratio.num } != 0;
-      let (num, den) = stream_ratios[index];
-      if !stated && num > 0 && den > 0 {
-        let ratio = extra.ticket().sample_aspect_ratio();
-        assert_eq!(
-          (ratio.num(), ratio.den()),
-          (num, den),
-          "{name} track {index}: the stream's aspect ratio, where the parameters state none",
-        );
+      let stated = unsafe { (*reference[index].as_ptr()).sample_aspect_ratio };
+      if (stated.num, stated.den) != guesses[index] {
         bad.retain(|mismatch| !mismatch.starts_with("sample_aspect_ratio"));
       }
       if attachment {
