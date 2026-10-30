@@ -636,11 +636,14 @@
 //! road; **R18** every length held or summed in an `int`; **R19** every
 //! call whose result its caller discards — the road by which a failure a
 //! callee does return is still swallowed. Each of the 1066 lines they
-//! print is classified (404 pass, 138 reported, 138 unreachable, 127
+//! print is classified (404 pass, 137 reported, 140 unreachable, 126
 //! bounded, 120 the sink's, 139 a finding below), none left out — R20
 //! correcting two: AVI's `packet_count` (`avienc.c` 86), which no index
 //! bounds, now bounded (S5), and NUT's key frame index (`nutenc.c` 1058),
-//! reported where its failure is returned, a finding of its own (N1). Two
+//! reported where its failure is returned, a finding of its own (N1); and
+//! its part 2b-i two more: ISMV's live manifest (`movenc.c` 5544, 8891),
+//! written only under a movflag the header is never handed, unreachable
+//! (L181). Two
 //! mechanisms carry most findings. A dynamic buffer holds its first 1024
 //! bytes in the context its open allocates, and grows past them by
 //! `av_reallocp`, whose failure — or a write past `INT_MAX` — sets the
@@ -808,6 +811,16 @@
 //! byte for byte as FFmpeg's ADTS writer makes them (L179), and a frame is
 //! written whole where libavutil's allocations are held below the nested
 //! muxer's buffer (L180).
+//!
+//! **Part 2b-i, ISMV's manifest.** Part 2a reported ISMV's live manifest
+//! cutting a track's codec private data past 74 bytes (`param_write_hex`,
+//! `movenc.c` 5465–5471). movenc writes that manifest only under the
+//! `isml` movflag (8890–8891), which ISMV's mode does not set (8177–8179)
+//! and which this muxer never hands the header, whose options are null
+//! ([`Output::write_header`]): nothing is cut, and nothing is refused — the
+//! finding retracted, its census lines unreachable (L181, which a header
+//! handed the flag turns red). A12's clause of the manifest's omitted
+//! `CodecPrivateData` rests on the same road; its row is letter 1's.
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's

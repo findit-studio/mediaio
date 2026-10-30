@@ -21966,3 +21966,83 @@ fn l180_in_a_process_of_its_own() {
     "the payload after the header"
   );
 }
+
+/// The UUID of the Smooth Streaming live manifest's box
+/// (`mov_write_isml_manifest`, `movenc.c` 5477–5480).
+const ISML_MANIFEST_UUID: [u8; 16] = [
+  0xA5, 0xD4, 0x0B, 0x30, 0xE8, 0x14, 0x11, 0xDD, 0xBA, 0x2F, 0x08, 0x00, 0x20, 0x0C, 0x9A, 0x66,
+];
+
+/// **L181 — ISMV writes no manifest, and cuts nothing of it** (R20, part
+/// 2b-i: part 2a's finding of the 74-byte cut retracted): movenc writes
+/// ISMV's live manifest — each video and audio track's codec private data
+/// in hexadecimal, past 74 bytes cut (`param_write_hex`, `movenc.c`
+/// 5465–5471; 5473–5595) — only under the `isml` movflag (8890–8891),
+/// which ISMV's mode does not set (8177–8179) and this muxer never hands
+/// the header, its options null. An ISMV of an H.264 track whose private
+/// data the manifest would cut — its configuration's SPS and PPS made
+/// Annex B past 74 bytes — beside an AAC track is written, its
+/// configuration read back whole, and holds no manifest: no box of its
+/// UUID, no `CodecPrivateData`.
+///
+/// PLANT: the header handed `movflags=isml`.
+#[test]
+fn l181_ismv_writes_no_manifest_and_cuts_nothing() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let mut table = whole_table(&source);
+  let video = table.remove(0);
+  let record = stream_extradata_of(&video);
+  assert_eq!(
+    (record[0], record[5] & 0x1F),
+    (1, 1),
+    "the premise: an avcC of one SPS"
+  );
+  // Its SPS grown, so that the manifest's Annex B copy of the SPS and the
+  // PPS, behind two 4-byte start codes, passes 74 bytes.
+  let sps_len = usize::from(u16::from_be_bytes([record[6], record[7]]));
+  let mut sps = record[8..8 + sps_len].to_vec();
+  let at = 8 + sps_len;
+  let pps_len = usize::from(u16::from_be_bytes([record[at + 1], record[at + 2]]));
+  let pps = record[at + 3..at + 3 + pps_len].to_vec();
+  sps.resize(70, 0x11);
+  let mut config = record[..6].to_vec();
+  config.extend_from_slice(&u16::try_from(sps.len()).expect("16 bits").to_be_bytes());
+  config.extend_from_slice(&sps);
+  config.push(1);
+  config.extend_from_slice(&u16::try_from(pps.len()).expect("16 bits").to_be_bytes());
+  config.extend_from_slice(&pps);
+  config.extend_from_slice(&record[at + 3 + pps_len..]);
+  assert!(
+    8 + sps.len() + pps.len() > 74,
+    "the premise: past the manifest's 74 bytes"
+  );
+  table.insert(
+    0,
+    restated(
+      &video,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+      &config,
+      None,
+      None,
+    ),
+  );
+  let target = output(&corpus, "l181.ismv");
+  remuxed_to_the_end(&source, &target, "ismv", table, &[]);
+  assert_eq!(
+    record_of(&target, TrackKind::Video),
+    config,
+    "the configuration read back whole"
+  );
+  let bytes = std::fs::read(&target).expect("the file");
+  assert!(
+    !bytes.windows(16).any(|window| window == ISML_MANIFEST_UUID),
+    "no manifest box"
+  );
+  assert!(
+    !bytes
+      .windows(16)
+      .any(|window| window == b"CodecPrivateData"),
+    "no CodecPrivateData"
+  );
+}
