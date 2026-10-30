@@ -1247,7 +1247,7 @@
 //! | AVI (R20, by the class) | a packet after which a stream's frames — its packets, and its gaps' empty frames to the packet's end, as though it were the last — pass an `int`; or the OpenDML header's sum of them, its video streams' most and its MP2 and MP3 streams' added; or a block-aligned audio stream's blocks, its bytes over its block alignment, pass 32 bits | a signed overflow of the count no index bounds, the counts written wrapped; the length written cut (`avienc.c` 86, 877, 744–766, 924, 203–235, 941–953) | [`PayloadRule::FrameCount`] — L171 |
 //! | FLV, at open | Opus or FLAC with no configuration; H.264, HEVC, VVC, AV1, MPEG-4 or AAC with none and the filters off; AV1's configuration `ff_isom_write_av1c` fails on | the header's `av_assert0` ends the process; written behind an empty sequence header; an empty sequence header (`flvenc.c` 853, 1491–1503, 892–893) | [`MuxOpenError::ConfigurationMissing`], [`MuxOpenError::ConfigurationInvalid`] — L82, L109 |
 //! | FLV, at open | big-endian PCM; an audio codec of no extended header — PCM, Swiff ADPCM, Nellymoser, G.711, Speex — of a layout not exactly mono or stereo; PCM's and Swiff ADPCM's 8 and 16 kHz, G.711's every rate but 8 kHz | its code the host's own order, read back little-endian; the multichannel header names the codec's fourcc, which it has none of, and `av_assert0` ends the process; written as the 5.5 kHz code, and G.711 read back at 8 kHz, with no metadata read before the stream exists (`flvenc.c` 140–240, 910–913, 497–540; `flvdec.c` 314–360, 1657–1670) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`] — L105 |
-//! | FLV, at open (R11, ruling 4: every refusal of its start, by grep `return AVERROR\|unsupported_codec\|goto error` over `get_audio_flags` and `flv_init`, 141–240 and 971–1081; its allocation and the keyframe index's flag, never set, aside) | MPEG-4 Part 2 and H.263; an audio codec at a rate its flags' table names no code for — MP3 but at 48, 44.1, 22.05 and 11.025 kHz, its other codecs of no extended header but at 44.1, 22.05, 11.025, 16, 8 and 5.512 kHz, Speex but at 16 kHz — and Speex of more than one channel; a native layout of no channel its multichannel configuration keeps, which its reader refuses (R11, Codex R10 1; table E); a video track past the first of another codec than VP9, AV1, H.264, HEVC and VVC, an audio track past the first of another than AAC, MP3, Opus, FLAC, AC-3 and E-AC-3; a codec of none of its tables, a data or subtitle stream but text — refused by `avformat_query_codec`, its tables naming neither | refused at its start, the header unwritten, as no part of the official specification, "FLV does not support sample rate", "FLV only supports mono Speex audio", "Unsupported multi-track video codec" / "audio codec" (`flv_init`, `flvenc.c` 985–1066; `get_audio_flags`, 141–240); the layout written as a mask of zero, which its reader refuses, the stream read back of no channels (739–744; `flvdec.c` 1733–1742) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::TrackLayout`] — L133, L134, L135 |
+//! | FLV, at open (R11, ruling 4: every refusal of its start, by grep `return AVERROR\|unsupported_codec\|goto error` over `get_audio_flags` and `flv_init`, 141–240 and 971–1081; its allocation and the keyframe index's flag, never set, aside) | MPEG-4 Part 2 and H.263; an audio codec at a rate its flags' table names no code for — MP3 but at 48, 44.1, 22.05 and 11.025 kHz, its other codecs of no extended header but at 44.1, 22.05, 11.025, 16, 8 and 5.512 kHz, Speex but at 16 kHz — and Speex of more than one channel; a native layout of no channel its multichannel configuration keeps, which its reader refuses (R11, Codex R10 1; table E); a video track past the first of another codec than VP9, AV1, H.264, HEVC and VVC, an audio track past the first of another than AAC, MP3, Opus, FLAC, AC-3 and E-AC-3; a codec of none of its tables, a data or subtitle stream but text — refused by `avformat_query_codec`, its tables naming neither; a video or audio track past the 256th of its kind (R21, Codex R20 1: a length that wraps is refused) | refused at its start, the header unwritten, as no part of the official specification, "FLV does not support sample rate", "FLV only supports mono Speex audio", "Unsupported multi-track video codec" / "audio codec" (`flv_init`, `flvenc.c` 985–1066; `get_audio_flags`, 141–240); the layout written as a mask of zero, which its reader refuses, the stream read back of no channels (739–744; `flvdec.c` 1733–1742); the track's number among its kind's, an `int` (1003, 1044), written in 8 bits behind each of its headers and packets (`avio_w8`: 800, 848, 881, 1413, 1425), the 257th read back as the first, its reader finding the stream of the same type, codec and number (`flvdec.c` 1466, 1506, 1578–1590) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::ChannelLayout`], [`MuxOpenError::TrackLayout`] — L133, L134, L135, L185 |
 //! | FLV, at open (R11, Q868) | an HEVC, AV1, VP9 or VVC track of no matrix coefficients, or of one past its table | its metadata packet states the matrix where it is specified, and its reader, its colour information in a zeroed context, reads an absent one back as RGB — a false claim (`flvenc.c` 555–608; `flvdec.c` 1261–1262) | [`MuxOpenError::ColourDescription`] — L143 |
 //! | FLV, at open (R20, by the class) | a sequence header — its flags or its extended header, and the record its codec's writer makes of the configuration — past the 24 bits its tag's size is written in: within the ticket's default budget, an `hvcC` of large SEI arrays, an `av1C` of metadata OBUs | its size written cut, the reader stepping into the record (`flv_write_codec_header`, `flvenc.c` 807–914) | [`MuxOpenError::ConfigurationInvalid`] ([`flv_sequence_bytes`]) — L172 |
 //! | MP4, MOV and their modes, FLV, Matroska, at open (R20, r2) | an H.264, HEVC or VVC configuration of Annex B units whose rewrite, each unit behind a 4-byte length, passes `INT_MAX` with the padding its dynamic buffer's close writes — past a budget the caller raises | the buffer cut, the record written of the walk of what is left, success answered (`nal.c` 133–144; `avc.c` 50–101; `hevc.c` 1371–1393; `vvc.c` 898–927) | [`MuxOpenError::ConfigurationInvalid`] ([`REWRITE_BYTES_MAX`]) — L174 |
@@ -5180,7 +5180,9 @@ pub enum MuxOpenError {
   /// track past the first of another codec than VP9, AV1, H.264, HEVC and
   /// VVC, and its audio track past the first of another than AAC, MP3,
   /// Opus, FLAC, AC-3 and E-AC-3, which its start refuses (`flv_init`,
-  /// `flvenc.c` 985–998, 1036–1046; R11, ruling 4); ISMV's
+  /// `flvenc.c` 985–998, 1036–1046; R11, ruling 4), and its 257th video or
+  /// audio track, whose number among its kind's FLV writes in 8 bits,
+  /// read back as the first's (R21, Codex R20 1); ISMV's
   /// second video track, booked to Q870: whether its key frames flush
   /// before `check_pkt`'s second count rests on libavformat's interleaving
   /// (7445–7471).
@@ -7230,7 +7232,16 @@ fn flv_matrix_unwritten(space: i32) -> bool {
 /// first of another codec than VP8 — which its tag table names not — VP9,
 /// AV1, H.264, HEVC and VVC, which its multitrack tags carry; an audio
 /// track past the first of another than AAC, MP3, Opus, FLAC, AC-3 and
-/// E-AC-3.
+/// E-AC-3. And a track whose number among its kind's FLV writes cut (R21,
+/// Codex R20 1: a length that wraps is refused): FLV numbers each kind's
+/// tracks from zero in an `int` — its video streams, and its audio
+/// streams, apart (1003, 1044); a data or subtitle stream takes none — and
+/// writes a track's number past the first in 8 bits behind every header and
+/// packet of it (`avio_w8`: 800, 848, 881, 1413, 1425), which its reader
+/// reads as a `uint8_t` and finds the stream of the same type, codec and
+/// number by (`flvdec.c` 1466, 1506, 1578–1590): the 257th track of a kind
+/// written as the first, its packets read back as the first's
+/// ([`FLV_TRACK_NUMBER_MAX`]).
 fn flv_misplaced<D, S>(
   tracks: &[TrackDescription<Ffmpeg, D, S>],
   roads: &[Road],
@@ -7261,13 +7272,17 @@ fn flv_misplaced<D, S>(
       TrackKind::Audio => (&mut audio, &AUDIO),
       _ => continue,
     };
-    if *count > 0 && !multitrack.contains(&description.codec()) {
+    if (*count > 0 && !multitrack.contains(&description.codec())) || *count > FLV_TRACK_NUMBER_MAX {
       return Some(TrackIndex::new(index));
     }
     *count += 1;
   }
   None
 }
+
+/// The most a track's number among its kind's FLV writes whole: the 8 bits
+/// of `avio_w8` ([`flv_misplaced`]).
+const FLV_TRACK_NUMBER_MAX: usize = u8::MAX as usize;
 
 /// Whether FLV rewrites an H.264, HEVC or VVC track's packets from Annex B
 /// to length prefixes, as `configuration` — the track's as of the packet,

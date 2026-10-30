@@ -22456,3 +22456,83 @@ fn l184_flvs_sequence_header_is_held_to_its_24_bits_at_the_packet() {
     "the unit as it was"
   );
 }
+
+/// **L185 — FLV's 257th track of a kind is refused** (R21, Codex R20 1,
+/// ruled: a length that wraps is refused): FLV numbers each kind's tracks
+/// from zero in an `int`, its video and its audio apart (`flvenc.c` 1003,
+/// 1044), and writes a track's number past the first in 8 bits behind each
+/// of its headers and packets (`avio_w8`: 800, 848, 881, 1413, 1425); its
+/// reader reads a `uint8_t` and finds the stream of the same type, codec
+/// and number (`flvdec.c` 1466, 1506, 1578–1590), so that the 257th would
+/// be read back as the first. A video track beside 256 AAC tracks — the
+/// audio numbered 0 to 255, the video apart — is written, each track's
+/// packet read back on a track of its own; a 257th AAC track is refused at
+/// open by name, by its track, nothing written.
+///
+/// PLANT: the number unjudged.
+#[test]
+fn l185_flvs_257th_track_of_a_kind_is_refused() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "l185-source.mkv");
+  let (video_table, video) = first_track(&source, TrackKind::Video, 1);
+  let (audio_table, audio) = first_track(&source, TrackKind::Audio, 1);
+  let (h264, aac) = (
+    stream_extradata_of(&video_table[0]),
+    stream_extradata_of(&audio_table[0]),
+  );
+  let table = |audios: usize| -> Vec<Described> {
+    use ffmpeg_next::ffi::AVCodecID as Id;
+    let mut rows = vec![restated(
+      &video_table[0],
+      Id::AV_CODEC_ID_H264,
+      &h264,
+      None,
+      None,
+    )];
+    rows.extend(
+      (0..audios).map(|_| restated(&audio_table[0], Id::AV_CODEC_ID_AAC, &aac, None, None)),
+    );
+    rows
+  };
+  let target = output(&corpus, "l185-256.flv");
+  let mut muxer = muxer_into(&target, ContainerName::new("flv"), table(256));
+  muxer
+    .write_video(video_at(&video_of(&video[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the video track's packet");
+  for track in 1..=256 {
+    muxer
+      .write_audio(AudioTrackPacket::new(
+        TrackIndex::new(track),
+        audio_of(&audio[0]),
+      ))
+      .map_err(|error| error.map_packet(drop))
+      .unwrap_or_else(|error| panic!("audio track {track}: {error:?}"));
+  }
+  muxer.finish().expect("finished");
+  let seen = packets(&target);
+  assert_eq!(seen.len(), 257, "a stream a track");
+  assert!(
+    seen.iter().all(|track| track.len() == 1),
+    "each track's packet read back on a track of its own: {:?}",
+    seen.iter().map(Vec::len).collect::<Vec<_>>()
+  );
+  let target = output(&corpus, "l185-257.flv");
+  let refused = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::new("flv"),
+    table(257),
+    &[],
+    PacketLimits::default(),
+  );
+  assert!(
+    matches!(refused, Err(MuxOpenError::TrackLayout { track }) if track.get() == 257),
+    "{:?}",
+    refused.map(drop)
+  );
+  assert_eq!(
+    std::fs::metadata(&target).expect("the file").len(),
+    0,
+    "nothing written"
+  );
+}
