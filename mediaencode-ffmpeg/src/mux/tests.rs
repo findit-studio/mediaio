@@ -1253,6 +1253,8 @@ fn eac3_track(frame_size: i32) -> TrackState {
     mp4_entries: 0,
     descriptions: Descriptions::default(),
     first_held: Vec::new(),
+    moov: None,
+    stsd: 0,
     apv: Vec::new(),
     key_times: None,
     mxf: MxfMirror::default(),

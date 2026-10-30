@@ -429,6 +429,22 @@ crate moves only when it changes.
   allocated, and only the configuration it adds or changes is kept (R14);
   VP9's first description of no configuration is the superframe its
   filter makes of the frames it held, byte for byte.
+- **MP4's `moov`, and ISMV's `mfra`, by an upper bound (R14).** The `moov`
+  the trailer writes sums every track's boxes in a 32-bit size, and a
+  track's chunks rest on libavformat's interleaving, which this release
+  does not mirror: each track's per-sample tables are counted at their
+  worst for the samples taken — a chunk a sample, its offset in 64 bits,
+  a run of every table a sample — beside its sample descriptions, the
+  chapter track, the covers, the chapters, the streams' `pssh` boxes and a
+  derived slack, and the packet after which the bound would pass
+  `UINT32_MAX` is refused (`PayloadRule::MovieBox`, new): stricter than
+  FFmpeg past the bound alone, until an exact mirror replaces it. ISMV's
+  `mfra`, made in a dynamic buffer of `INT_MAX` bytes, is bounded by each
+  track's fragments — at most its samples, at most one more than its
+  video track's key frames — and the packet past it refused
+  (`PayloadRule::FragmentIndex`, new). The laws' seams, hidden:
+  `MuxOptions::with_lowered_movie_bound`, `CarrierMuxer::movie_box_bound`
+  (`MovieBoxBound`) and `CarrierMuxer::fragment_index_bound`.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer

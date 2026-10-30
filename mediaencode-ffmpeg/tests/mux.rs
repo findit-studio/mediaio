@@ -17734,3 +17734,517 @@ fn l152_vp9s_first_superframe_is_its_first_description() {
     "read back, its 1024 descriptions"
   );
 }
+
+/// The ISO BMFF boxes of `bytes[at..end]`, each its type, where its body
+/// starts and its size.
+fn boxes_of(bytes: &[u8], at: usize, end: usize) -> Vec<([u8; 4], usize, u64)> {
+  let mut found = Vec::new();
+  let mut at = at;
+  while at + 8 <= end {
+    let word =
+      |at: usize| u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+    let kind = [bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]];
+    let (size, header) = match word(at) {
+      0 => ((end - at) as u64, 8),
+      1 => (
+        u64::from_be_bytes(bytes[at + 8..at + 16].try_into().expect("eight bytes")),
+        16,
+      ),
+      size => (u64::from(size), 8),
+    };
+    if size < header as u64 || at as u64 + size > end as u64 {
+      break;
+    }
+    found.push((kind, at + header, size));
+    at += size as usize;
+  }
+  found
+}
+
+/// The first box of `kind` among `boxes`: its body's start and its end.
+fn box_in(bytes: &[u8], (at, end): (usize, usize), kind: &[u8; 4]) -> Option<(usize, usize, u64)> {
+  boxes_of(bytes, at, end)
+    .into_iter()
+    .find(|(found, _, _)| found == kind)
+    .map(|(_, body, size)| (body, body - 8 + size as usize, size))
+}
+
+/// What the `moov` FFmpeg wrote into `path` holds: its size, and each
+/// `trak`'s sample tables' sizes — every box under its `stbl` — in order.
+fn written_moov(path: &Path) -> (u64, Vec<Vec<([u8; 4], u64)>>) {
+  let bytes = std::fs::read(path).expect("the file");
+  let (body, end, size) = box_in(&bytes, (0, bytes.len()), b"moov").expect("a moov");
+  let traks = boxes_of(&bytes, body, end)
+    .into_iter()
+    .filter(|(kind, _, _)| kind == b"trak")
+    .map(|(_, body, size)| {
+      let end = body - 8 + size as usize;
+      let (mdia, mdia_end, _) = box_in(&bytes, (body, end), b"mdia").expect("mdia");
+      let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+      let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+      boxes_of(&bytes, stbl, stbl_end)
+        .into_iter()
+        .map(|(kind, _, size)| (kind, size))
+        .collect()
+    })
+    .collect();
+  (size, traks)
+}
+
+/// The size of the top-level box of `kind` FFmpeg wrote into `path`.
+fn written_box(path: &Path, kind: &[u8; 4]) -> Option<u64> {
+  let bytes = std::fs::read(path).expect("the file");
+  box_in(&bytes, (0, bytes.len()), kind).map(|(_, _, size)| size)
+}
+
+/// `source`'s table, a copy of each track `copies` names after its own
+/// tracks, each row as `edit` makes it, and its timed packets in order,
+/// each packet's copies before it.
+fn copied_source(
+  source: &Path,
+  copies: &[usize],
+  edit: &dyn Fn(usize, Described) -> Described,
+) -> (Vec<Described>, Vec<DemuxedPacket<Ffmpeg, FfmpegBytes>>) {
+  let mut demuxer = FfmpegOwnedDemuxer::open(source).expect("open");
+  let mut files: Vec<_> = demuxer.tracks().iter().map(|_| None).collect();
+  let mut timed = Vec::new();
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    match packet {
+      DemuxedPacket::Attachment(attachment) => {
+        let (track, payload) = attachment.into_parts();
+        files[track.get()] = Some(payload);
+      }
+      packet => timed.push(packet),
+    }
+  }
+  let rows: Vec<_> = demuxer.tracks().iter().cloned().collect();
+  let mut table = Vec::new();
+  for (index, file) in files.into_iter().enumerate() {
+    table.push(
+      TrackDescription::from_track_info(&*rows[index], file, ticket(&rows[index]))
+        .expect("a description"),
+    );
+  }
+  for &copy in copies {
+    table.push(
+      TrackDescription::from_track_info(&*rows[copy], None, ticket(&rows[copy]))
+        .expect("a description"),
+    );
+  }
+  let table: Vec<Described> = table
+    .into_iter()
+    .enumerate()
+    .map(|(index, row)| edit(index, row))
+    .collect();
+  let tracks = rows.len();
+  let mut packets = Vec::new();
+  for packet in timed {
+    let track = packet.track().get();
+    for (at, _) in copies
+      .iter()
+      .enumerate()
+      .filter(|&(_, &copy)| copy == track)
+    {
+      let to = TrackIndex::new(tracks + at);
+      packets.push(match &packet {
+        DemuxedPacket::Audio(audio) => {
+          DemuxedPacket::Audio(AudioTrackPacket::new(to, audio.packet().clone()))
+        }
+        DemuxedPacket::Video(video) => {
+          DemuxedPacket::Video(VideoTrackPacket::new(to, video.packet().clone()))
+        }
+        other => panic!("a copy of {other:?}"),
+      });
+    }
+    packets.push(packet);
+  }
+  (table, packets)
+}
+
+/// `source`'s timed packets in order, each written to its track and to
+/// every track `copies` names of its own ([`copied_source`]), into
+/// `container` at `target` with `chapters`, each row of the table as `edit`
+/// makes it; the muxer's `moov` and `mfra` bounds before its trailer.
+fn bounded_mux(
+  (source, container, target): (&Path, ContainerName, &Path),
+  copies: &[usize],
+  chapters: &[Chapter<Ffmpeg>],
+  edit: &dyn Fn(usize, Described) -> Described,
+) -> (Option<mediaencode_ffmpeg::mux::MovieBoxBound>, Option<u64>) {
+  let (table, packets) = copied_source(source, copies, edit);
+  mux_bounded((container, target), table, chapters, packets)
+}
+
+/// `packets` written into `container` at `target` of `table` and
+/// `chapters`; the muxer's `moov` and `mfra` bounds before its trailer.
+fn mux_bounded(
+  (container, target): (ContainerName, &Path),
+  table: Vec<Described>,
+  chapters: &[Chapter<Ffmpeg>],
+  packets: Vec<DemuxedPacket<Ffmpeg, FfmpegBytes>>,
+) -> (Option<mediaencode_ffmpeg::mux::MovieBoxBound>, Option<u64>) {
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(target).expect("create"),
+    container,
+    table,
+    chapters,
+    PacketLimits::default(),
+  )
+  .expect("open");
+  for packet in packets {
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  let bounds = (muxer.movie_box_bound(), muxer.fragment_index_bound());
+  muxer.finish().expect("finished");
+  bounds
+}
+
+/// H.264 of a key frame every five frames, and AAC: a second, five key
+/// frames — ISMV's five fragments.
+fn five_keys(corpus: &Corpus) -> PathBuf {
+  picture_and_sound(
+    corpus,
+    "five-keys.mp4",
+    &[
+      "-c:v",
+      "libx264",
+      "-preset",
+      "medium",
+      "-bf",
+      "2",
+      "-g",
+      "5",
+      "-keyint_min",
+      "5",
+      "-sc_threshold",
+      "0",
+      "-pix_fmt",
+      "yuv420p",
+    ],
+    &["-c:a", "aac", "-ac", "2"],
+  )
+}
+
+/// The serialized encryption initialization side data of `infos`, each its
+/// system id's, key ids' and data's bytes (`av_encryption_init_info_add_side_data`,
+/// `libavutil/encryption_info.c` 292–335): a count, then each of four
+/// 32-bit sizes and its bytes.
+fn encryption_init_info(infos: &[(usize, usize, usize, usize)]) -> Vec<u8> {
+  let mut bytes = (infos.len() as u32).to_be_bytes().to_vec();
+  for &(system, keys, key, data) in infos {
+    for size in [system, keys, key, data] {
+      bytes.extend((size as u32).to_be_bytes());
+    }
+    bytes.extend((0..system + keys * key + data).map(|at| at as u8));
+  }
+  bytes
+}
+
+/// **L153 — the `moov`'s bound, and ISMV's `mfra`'s, is a true upper bound
+/// of what FFmpeg writes** (R14, Codex R12 2, ruled: fail closed;
+/// `update_size`, `movenc.c` 155–163; `mov_write_moov_tag`, 5339–5453;
+/// `mov_write_mfra_tag`, 6142–6178): files varied in tracks, interleaving,
+/// chapters, covers and codecs — H.264 and AAC into MP4 and MOV, of one key
+/// frame and of five, VP9 alone, a video and four audio tracks
+/// interleaved, three chapters and the chapter track made of them, an MP3's
+/// cover, `mov_text` cues, PCM, E-AC-3 joined, FLAC of 80 descriptions, a
+/// stream's encryption initialization written as `pssh` boxes — each read
+/// back: every `trak` one the bound holds, in order, its every sample
+/// table no larger than its bound and its `stsd` no larger than its, and
+/// the `moov` no larger than the whole; ISMV's `mfra`, of three tracks and
+/// five fragments, no larger than its — of the first video frame dropped,
+/// a fragment before the first key frame, met exactly.
+///
+/// PLANT: the sample-size table's term dropped, its `stsz` larger than its
+/// bound; the chunk offsets' term dropped, `stco` larger; the `pssh` boxes
+/// dropped, the `moov` larger than its bound; the trailer's two samples
+/// dropped, the cue track's `stsz` larger; the chapter track dropped, a
+/// `trak` the bound holds not; a description's growth dropped, FLAC's
+/// `stsd` larger; ISMV's key frames uncounted, or the fragment before the
+/// first, its `mfra` larger than its bound.
+#[test]
+fn l153_the_moov_and_mfra_bounds_are_true_upper_bounds() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let h264 = h264_aac(&corpus, "h264-aac.mp4");
+  let gop = five_keys(&corpus);
+  let chapters: Vec<Chapter<Ffmpeg>> = (0..3)
+    .map(|index| {
+      chapter_of(
+        index,
+        index * 100,
+        index * 100 + 100,
+        Some("a chapter's title"),
+      )
+    })
+    .collect();
+  let same = |_: usize, row: Described| row;
+  let mut judged = 0;
+  let mut judge =
+    |name: &str, bound: Option<mediaencode_ffmpeg::mux::MovieBoxBound>, target: &Path| {
+      let bound = bound.unwrap_or_else(|| panic!("{name}: a bound"));
+      let (moov, traks) = written_moov(target);
+      let stsd: Vec<_> = traks
+        .iter()
+        .map(|trak| {
+          trak
+            .iter()
+            .find(|(kind, _)| kind == b"stsd")
+            .map(|&(_, size)| size)
+        })
+        .collect();
+      eprintln!(
+        "{name}: moov {moov} of bound {}; stsd {stsd:?} of {:?}",
+        bound.total, bound.stsd
+      );
+      assert_eq!(
+        (traks.len(), bound.stsd.len()),
+        (bound.tables.len(), bound.tables.len()),
+        "{name}: each trak one the bound holds"
+      );
+      assert!(
+        moov <= bound.total,
+        "{name}: the moov's {moov} bytes past its bound {}",
+        bound.total
+      );
+      for (index, (written, bounds)) in traks.iter().zip(&bound.tables).enumerate() {
+        for &(kind, size) in written {
+          let kind = if &kind == b"stco" { *b"co64" } else { kind };
+          if &kind == b"stsd" {
+            assert!(
+              size <= bound.stsd[index],
+              "{name} track {index}: stsd {size} past {}",
+              bound.stsd[index]
+            );
+            continue;
+          }
+          let limit = bounds
+            .iter()
+            .find(|(of, _)| *of == kind)
+            .map(|&(_, limit)| limit)
+            .unwrap_or_else(|| {
+              panic!(
+                "{name} track {index}: {} of no bound",
+                String::from_utf8_lossy(&kind)
+              )
+            });
+          assert!(
+            size <= limit,
+            "{name} track {index}: {} of {size} bytes past its bound {limit}",
+            String::from_utf8_lossy(&kind)
+          );
+        }
+      }
+      judged += 1;
+    };
+  for (name, source, container, copies, with_chapters) in [
+    ("l153-h264-aac.mp4", &h264, "mp4", &[][..], false),
+    ("l153-h264-aac.mov", &h264, "mov", &[][..], false),
+    ("l153-gop.mp4", &gop, "mp4", &[][..], false),
+    ("l153-five.mp4", &h264, "mp4", &[1, 1, 1, 1][..], false),
+    ("l153-chapters.mp4", &h264, "mp4", &[][..], true),
+    ("l153-chapters.mov", &h264, "mov", &[1][..], true),
+  ] {
+    let target = output(&corpus, name);
+    let (bound, _) = bounded_mux(
+      (source, ContainerName::new(container), &target),
+      copies,
+      if with_chapters { &chapters } else { &[] },
+      &same,
+    );
+    judge(name, bound, &target);
+  }
+  for (name, source) in [
+    ("l153-vp9.mp4", vp9_webm(&corpus)),
+    ("l153-cover.mp4", corpus.cover_art_mp3()),
+    ("l153-cues.mp4", mov_text_ms_mp4(&corpus)),
+    ("l153-pcm.mp4", pcm_mov(&corpus)),
+    ("l153-eac3.mp4", audio_file(&corpus, "eac3.mkv", "eac3")),
+  ] {
+    let target = output(&corpus, name);
+    let (bound, _) = bounded_mux((&source, ContainerName::MP4, &target), &[], &[], &same);
+    judge(name, bound, &target);
+  }
+  // A stream's encryption initialization, two of them its `pssh` boxes and
+  // one of neither key ids nor data skipped: 50 088 bytes.
+  let init = encryption_init_info(&[(16, 1, 16, 20_000), (16, 0, 16, 0), (16, 0, 16, 30_000)]);
+  let target = output(&corpus, "l153-pssh.mp4");
+  let (bound, _) = bounded_mux(
+    (&h264, ContainerName::MP4, &target),
+    &[],
+    &[],
+    &|index, row| {
+      if index == 0 {
+        with_coded(row, T::AV_PKT_DATA_ENCRYPTION_INIT_INFO, &init)
+      } else {
+        row
+      }
+    },
+  );
+  let bytes = std::fs::read(&target).expect("the file");
+  let (body, end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("a moov");
+  let pssh: Vec<u64> = boxes_of(&bytes, body, end)
+    .into_iter()
+    .filter(|(kind, _, _)| kind == b"pssh")
+    .map(|(_, _, size)| size)
+    .collect();
+  assert_eq!(pssh, [20_052, 30_036], "the pssh boxes FFmpeg writes");
+  judge("l153-pssh.mp4", bound, &target);
+  // FLAC of 80 descriptions, a new configuration each frame.
+  #[rustfmt::skip]
+  let flac = generated(&corpus, "l153.flac", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.2",
+    "-ac", "2", "-c:a", "flac",
+  ]);
+  let (table, frames) = first_track(&flac, TrackKind::Audio, 1);
+  let first = table[0].side_data().extradata().to_vec();
+  let frame = audio_of(&frames[0]);
+  let target = output(&corpus, "l153-flac.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  for k in 0..80_u128 {
+    let mut packet = frame.clone();
+    if k > 0 {
+      let mut info = first.clone();
+      info[18..34].copy_from_slice(&k.to_le_bytes());
+      packet
+        .extra_mut()
+        .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &info)]);
+    }
+    muxer
+      .write_audio(audio_ticks(&packet, k as i64 * 4608, 4608))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  let bound = muxer.movie_box_bound();
+  muxer.finish().expect("finished");
+  judge("l153-flac.mp4", bound, &target);
+  assert_eq!(judged, 13, "every file judged");
+  // ISMV's `mfra`: three tracks, five fragments — five key frames; and of
+  // the first video frame dropped, four key frames and a fragment before
+  // the first, its bound met exactly.
+  for (name, late, bound_fragments) in [("l153.ismv", false, 6), ("l153-late.ismv", true, 5)] {
+    let target = output(&corpus, name);
+    let (table, packets) = copied_source(&gop, &[1], &same);
+    let mut dropped = !late;
+    let packets = packets
+      .into_iter()
+      .filter(|packet| {
+        let first = !dropped && matches!(packet, DemuxedPacket::Video(_));
+        dropped |= first;
+        !first
+      })
+      .collect();
+    let (moov, index) = mux_bounded((ContainerName::new("ismv"), &target), table, &[], packets);
+    assert!(
+      moov.is_none(),
+      "{name}: ISMV's moov, written at its start, bounded not"
+    );
+    let index = index.expect("ISMV's mfra bound");
+    let mfra = written_box(&target, b"mfra").expect("an mfra");
+    eprintln!("{name}: mfra {mfra} of bound {index}");
+    assert_eq!(
+      (mfra, index),
+      (24 + 3 * (24 + 19 * 5), 24 + 3 * (24 + 19 * bound_fragments)),
+      "{name}: three tracks of five fragments each, and the bound"
+    );
+  }
+}
+
+/// **L154 — the `moov`'s bound, and ISMV's `mfra`'s, refuses the first
+/// packet past it** (R14, ruled: fail closed): a muxer whose bound is
+/// lowered to what another's stood at before the last packet that grows it
+/// takes every packet before that one, and refuses it by name, handed back
+/// ([`PayloadRule::MovieBox`] of MP4 and MOV, every packet growing it;
+/// [`PayloadRule::FragmentIndex`] of ISMV, a packet growing it where it may
+/// start a fragment of its track); the file written so far finishes. The
+/// bound never shrinks.
+///
+/// PLANT: the `moov`'s bound unjudged, the packet taken; the `mfra`'s
+/// unjudged, the packet taken.
+#[test]
+fn l154_the_moov_and_mfra_bounds_refuse_the_first_packet_past_them() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = five_keys(&corpus);
+  let same = |_: usize, row: Described| row;
+  for (name, container, rule) in [
+    ("l154.mp4", "mp4", PayloadRule::MovieBox),
+    ("l154.mov", "mov", PayloadRule::MovieBox),
+    ("l154.ismv", "ismv", PayloadRule::FragmentIndex),
+  ] {
+    let bound = |muxer: &FfmpegOwnedMuxer<File>| {
+      if rule == PayloadRule::MovieBox {
+        muxer.movie_box_bound().map(|bound| bound.total)
+      } else {
+        muxer.fragment_index_bound()
+      }
+      .unwrap_or_else(|| panic!("{name}: a bound"))
+    };
+    // The bound after each packet, at the container's own.
+    let (table, packets) = copied_source(&source, &[1], &same);
+    let count = packets.len();
+    let mut muxer = muxer_into(
+      &output(&corpus, &format!("full-{name}")),
+      ContainerName::new(container),
+      table,
+    );
+    let mut after = vec![bound(&muxer)];
+    for packet in packets {
+      muxer
+        .write_packet(packet)
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+      after.push(bound(&muxer));
+    }
+    muxer.finish().expect("finished");
+    assert!(
+      after.windows(2).all(|pair| pair[0] <= pair[1]),
+      "{name}: the bound never shrinks"
+    );
+    let grows = (0..count).filter(|&k| after[k + 1] > after[k]).count();
+    if rule == PayloadRule::MovieBox {
+      assert_eq!(grows, count, "{name}: every packet grows the moov's bound");
+    }
+    let k = (0..count)
+      .rev()
+      .find(|&k| after[k + 1] > after[k])
+      .expect("a packet that grows the bound");
+    assert!(
+      k > count / 2,
+      "{name}: the refusal lands late, at packet {k} of {count}"
+    );
+    // The same packets, the bound lowered to where it stood before packet k.
+    let (table, packets) = copied_source(&source, &[1], &same);
+    let target = output(&corpus, name);
+    let mut muxer = muxer_with(
+      &target,
+      ContainerName::new(container),
+      table,
+      MuxOptions::new().with_lowered_movie_bound(after[k]),
+    );
+    let mut packets = packets.into_iter();
+    for packet in packets.by_ref().take(k) {
+      muxer
+        .write_packet(packet)
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{name}: a packet within the bound: {error:?}"));
+    }
+    let past = packets.next().expect("the packet past the bound");
+    let track = past.track();
+    let (refusal, back) = by_container(muxer.write_packet(past));
+    assert_eq!(
+      refusal,
+      FfmpegMuxRefusal::Payload { track, rule },
+      "{name}: packet {k}, past the bound"
+    );
+    assert_eq!(back.track(), track, "{name}: the packet handed back");
+    muxer.finish().expect("finished");
+    assert_eq!(
+      packet_count(&target),
+      k,
+      "{name}: the file of the packets taken"
+    );
+  }
+}

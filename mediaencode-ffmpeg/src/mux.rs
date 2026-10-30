@@ -400,9 +400,61 @@
 //! | `sgpd`, `sbgp`, AAC's and Opus's | an `int` of 24 and 2 a group, and of 20 and 8 a run of roll distances (3305–3400) | 59 652 120; 238 608 404, within `INT_MAX` | — |
 //! | `stsd` | a sample entry a description, a distinct new extradata each (3165–3198; 7044–7074) | not bounded by the table: a description a configuration | refused at the 1025th, which FFmpeg's reader refuses with the whole file (`mov_read_stsd`, `mov.c` 3338; 11290–11295; [`PayloadRule::SampleDescriptions`]; R13) |
 //! | `stbl`, `minf`, `mdia`, `trak` | one track's boxes, their sum (3402–3439, 3821–3856, 3957–3970, 4391–4445) | 1 342 172 272 at most — a video track's every table — beside its descriptions | — |
-//! | `moov`, and ISMV's `mfra` | every track's boxes, their sum — the `mfra` in a dynamic buffer of `INT_MAX` bytes, 19 bytes a fragment (5339–5453; 6118–6178) | past 4 GiB, past `INT_MAX`, only of several tracks near the table's bound | not mirrored: the chunks of a track the interleaving's order makes, and every other box the `moov` holds (R12, letter) |
+//! | `moov`, and ISMV's `mfra` | every track's boxes, their sum — the `mfra` in a dynamic buffer of `INT_MAX` bytes, 24 bytes and each track's `tfra` of 24 and 19 a fragment (5339–5453; 6118–6178) | past 4 GiB, past `INT_MAX`, only of several tracks near the table's bound | judged by an upper bound, below ([`PayloadRule::MovieBox`], [`PayloadRule::FragmentIndex`]; R14, ruled) |
 //! | `mdat` | a `wide` box before it, which the trailer turns into a 64-bit size past `UINT32_MAX` (6180–6189, 8990–9012); ISMV's of one track's buffer ([`PayloadRule::FragmentSize`]; 6855–6858) | widened; within | — |
 //! | ISMV's `moof`, `traf`, `trun` | a fragment's boxes, 16 bytes a sample at most (5678–5732, 5868–5933, 6084–6116) | 477 216 788 | — |
+//!
+//! **The `moov`'s and the `mfra`'s bound** (R14, ruled: fail closed with
+//! the tightest upper bound computable without libavformat's interleaving,
+//! which this release does not mirror; Q870's exact mirror is booked to
+//! replace it). A track's chunks — and so its `stco` or `co64` and its
+//! `stsc` — are the runs of its samples that lie next to each other in the
+//! file (`build_chunks`, 5212–5234), which the interleaving's order makes
+//! (`ff_interleave_packet_per_dts`, `mux.c` 939–1019). The bound takes each
+//! per-sample table at its worst for the samples a track has taken, and two
+//! more a track, which a trailer may add — a cue track's end and the one
+//! another track's packet may make before its first cue, or TTML's
+//! document (9025–9037):
+//!
+//! | box | at its worst, of n samples | as movenc writes it |
+//! |---|---|---|
+//! | `stts` | 16 and 8 a sample; 24 of constant-size audio of a sample size past zero | a run a sample (3241–3288) |
+//! | `ctts` | 16 and 8 a sample, of video | a run a sample (3200–3238) |
+//! | `stss`, `stps` | 16 and 4 a sample, of a track that writes one — video, TrueHD, MPEG-H 3D Audio and USAC, and MOV's video | each sample a sync sample's entry (292–313; 3410–3423) |
+//! | `sdtp` | 12 and 1 a sample, of video | (316–337) |
+//! | `stsc` | 16 and 12 a sample | a chunk a sample, a run each (261–289) |
+//! | `stsz` | 20 and 4 a sample; 20 of constant-size audio of a sample size past zero, whose packets are whole samples ([`PayloadRule::PartialSample`]) | (225–258) |
+//! | `stco`, `co64` | 16 and 8 a sample | a chunk a sample, its offset in 64 bits (177–222) |
+//! | `sgpd`, `sbgp` | AAC's 26 and 28; Opus's 24 and 2, and 20 and 8, a sample | a roll distance a sample (3305–3400) |
+//! | `stsd` | 16, and each description's entry: a slack of 4096 bytes, 24 a channel, an ICC profile's `colr`, APV's `apvC` at its most, and each configuration box at twice its configuration's bytes and 256 — HEVC's two | each description counted at its growth, never its shrinking (3165–3198; 7024–7074) |
+//!
+//! Beside the tables, the boxes the open knows: each track's own, a slack
+//! of 4096 bytes and 4 a track of its references (`tref`, 4241–4255); the
+//! movie's own, a slack of 1024; the covers' `covr`, 8 and 16 a picture
+//! beside its bytes (4815–4839); the Nero list, 17 and, of the first 255
+//! chapters, 9 and a title of at most 255 bytes (5040–5064); each stream's
+//! `pssh` boxes, of its encryption initialization's parse (5175–5210); and
+//! the chapter track, a sample a chapter, its entry the text stub's
+//! (7727–7811). No timecode track is made (table E), and the Dolby Vision
+//! and `hvcE` boxes are written only at a strictness below normal, which
+//! the muxer never sets (3000–3018). Each slack is the sum its derivation
+//! comes to, rounded up — the movie's 269 bytes taken as 1024, a track's
+//! under 1.4 KB as 4096, a sample entry's under 700 as 4096 — at most
+//! 8 KiB a track against 4 GiB. The packet after which the bound would
+//! pass `UINT32_MAX` is refused before it is written
+//! ([`PayloadRule::MovieBox`]): stricter than FFmpeg past the bound alone,
+//! where a file FFmpeg could have written is refused.
+//!
+//! ISMV's `mfra`: 24 bytes and each track's `tfra` of 24 and 19 a fragment,
+//! a track's fragments at most its samples and at most one more than its
+//! one video track's key frames, which cut them (7450–7472, 8817–8821;
+//! `mov_add_tfra_entries`, 5803–5840), the packet after which it would pass
+//! its dynamic buffer refused ([`PayloadRule::FragmentIndex`]). A track's
+//! index of fragments grows within `INT_MAX` bytes too — 53 687 040
+//! fragments, past which the trailer reads it through a null pointer —
+//! which no track reaches: a fragment of a track is one of its samples at
+//! least, which [`PayloadRule::SampleTable`] bounds below it across the
+//! fragments.
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -1452,6 +1504,12 @@ struct Bounds {
   /// The most entries the MOV family's table of a track's samples holds
   /// ([`MOV_SAMPLES_MAX`]; [`PayloadRule::SampleTable`]).
   table: u64,
+  /// The most bytes the MOV family's `moov` counts its size in, 32 bits
+  /// ([`PayloadRule::MovieBox`]).
+  movie: u64,
+  /// The most bytes ISMV's `mfra` holds, the dynamic buffer it is made in
+  /// ([`PayloadRule::FragmentIndex`]).
+  index: u64,
 }
 
 impl Bounds {
@@ -1463,6 +1521,8 @@ impl Bounds {
     fragment: FRAGMENT_BYTES_MAX,
     samples: i32::MAX as u64,
     table: MOV_SAMPLES_MAX,
+    movie: u32::MAX as u64,
+    index: FRAGMENT_BYTES_MAX,
   };
 }
 
@@ -1551,6 +1611,8 @@ impl MuxOptions {
       fragment: self.bounds.fragment,
       samples: self.bounds.samples,
       table: self.bounds.table,
+      movie: self.bounds.movie,
+      index: self.bounds.index,
     };
     self
   }
@@ -1606,6 +1668,22 @@ impl MuxOptions {
     }
     self
   }
+
+  /// Lowers the bytes the MOV family's `moov` may come to — `UINT32_MAX` —
+  /// and ISMV's `mfra` — its dynamic buffer's — to `bytes`, never raising
+  /// either: the laws' seam, which shows the bounds without gigabytes of
+  /// sample tables ([`PayloadRule::MovieBox`], [`PayloadRule::FragmentIndex`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_movie_bound(mut self, bytes: u64) -> Self {
+    if bytes < self.bounds.movie {
+      self.bounds.movie = bytes;
+    }
+    if bytes < self.bounds.index {
+      self.bounds.index = bytes;
+    }
+    self
+  }
 }
 
 /// `MOVIentry`, movenc's entry of one sample in a track's table, as
@@ -1645,14 +1723,240 @@ struct ProducerReferenceTime {
 /// 217–223) — the largest multiple of 1024 entries within it: 29 826 048,
 /// or 33 553 408 of 64-byte entries. The trust model holds the limit
 /// libavutil's own, which the base never changes.
-/// The most sample descriptions FFmpeg's reader reads a track of, refusing
-/// the whole file past it (`mov_read_stsd`, `mov.c` 3338).
-const MOV_DESCRIPTIONS_MAX: usize = 1024;
-
 pub(crate) const MOV_SAMPLES_MAX: u64 = {
   let step = 1024 * core::mem::size_of::<MovEntry>() as u64;
   (i32::MAX as u64 / step) * 1024
 };
+
+/// The most sample descriptions FFmpeg's reader reads a track of, refusing
+/// the whole file past it (`mov_read_stsd`, `mov.c` 3338).
+const MOV_DESCRIPTIONS_MAX: usize = 1024;
+
+/// `MOVFragmentInfo`, movenc's entry of one fragment in a track's index, as
+/// `libavformat/movenc.h` 80–86 in FFmpeg 9.0.1 lays it out — mirrored for
+/// its size alone: 40 bytes, or 36 where an `int64_t` is aligned to four.
+#[repr(C)]
+#[allow(dead_code)]
+struct FragmentInfo {
+  offset: i64,
+  time: i64,
+  duration: i64,
+  tfrf_offset: i64,
+  size: i32,
+}
+
+/// The most fragments ISMV's index of a track holds (R14): movenc grows the
+/// index 64 entries at a time from its first, through `av_reallocp_array`
+/// (`mov_add_tfra_entries`, `movenc.c` 5803–5820), whose refusal past
+/// libavutil's `INT_MAX` bytes frees the index after its count is raised,
+/// the trailer's `tfra` then read through a null pointer (6118–6140) — the
+/// last count its growth reaches: 53 687 040, or 59 652 288 of 36-byte
+/// entries. Never reached: a fragment of a track is at least one of its
+/// samples (5810–5811), which [`PayloadRule::SampleTable`] counts across
+/// the fragments, within [`MOV_SAMPLES_MAX`], which a constant asserts.
+const FRAGMENTS_MAX: u64 = {
+  let size = core::mem::size_of::<FragmentInfo>() as u64;
+  64 + 64 * ((i32::MAX as u64 / size - 65) / 64)
+};
+
+const _: () = assert!(MOV_SAMPLES_MAX < FRAGMENTS_MAX);
+
+/// The movie's own boxes in a `moov`, at most (R14; the sizes table of the
+/// census): its header (8), `mvhd` (120 of version 1, 4500–4563), `iods`
+/// (24, 4447–4474), `udta` (8) and, in it, `meta` (12) with its `hdlr`
+/// (33, 4565–4578) and `ilst` (8) holding `©too`, libavformat's name
+/// (at most 56, 4848–4851) — 269 bytes; PSP's `uuid` box, written only of
+/// a title, and `loci`, only of a location, neither of which the muxer
+/// hands — taken as 1024.
+const MOOV_SLACK: u64 = 1024;
+
+/// A track's own boxes in a `moov` beside its sample descriptions and its
+/// per-sample tables, at most (R14): `trak` (8), `tkhd` (104 of version 1,
+/// 3990–4096), MOV's `tapt` (68, 4098–4127), `edts` (24 and 20 an entry,
+/// at most two, 4133–4239), `tref`'s header (8), `mdia` (8), `mdhd` (44,
+/// 3920–3955), `hdlr` (33 and its description, at most 21 bytes, 3565–3648,
+/// twice in MOV), `minf` (8), its media header (`gmhd` the largest, at most
+/// 88, 3488–3538), `dinf` (36, 3441–3448), `stbl` (8), `stsd`'s header (16),
+/// the per-sample tables' headers (at most 196, 201–336, 3200–3400), and
+/// `udta` with its DASH kinds (8, and at most 66 a kind, 4312–4389) — under
+/// 1.4 KB — taken as 4096; and `tref`'s references, 4 bytes a track
+/// beside ([`moov_track_fixed`]).
+const TRAK_SLACK: u64 = 4096;
+
+/// A sample entry's own boxes beside its configuration, at most (R14): a
+/// video entry's 86 bytes and `fiel` (10), `gama` (12), `colr` of
+/// `nclx` (19), `clli` (12), `mdcv` (32), `amve` (16), `st3d` and `sv3d`,
+/// MOV's `vexu` and `hfov`, `pasp` (16), `clap` (40), `btrt` (20), the
+/// iPod's `uuid` (28), AVIF's `ccst` and `auxi` (2796–3063) — under 700;
+/// an audio entry's 72 at most (version 2), MOV's `wave` around its
+/// configuration (1059–1100), `dac3`, `dec3` of at most 15 substreams,
+/// `dOps`, `dfLa`, `srat`, `pcmC`, `btrt` (1379–1559); a subtitle's
+/// (2246–2289) — taken as 4096, and 24 bytes a channel beside for `chnl`,
+/// `chan` and `SA3D` (998–1057, 1299–1339).
+const ENTRY_SLACK: u64 = 4096;
+
+/// APV's `apvC`, which MP4 makes of the packets, at most (R14): 14 bytes,
+/// and at most five PBU types' entries of 2 bytes and 255 frame
+/// informations of at most 19 (`ff_isom_write_apvc`, `apv.c`; R11, ruling
+/// 2) — 24 249 — taken as 32 KiB, in each sample entry.
+const APVC_MAX: u64 = 32 * 1024;
+
+/// What the MOV family's `moov` holds of a track, by which its bound is
+/// counted ([`PayloadRule::MovieBox`]; R14): the per-sample tables a track
+/// of its kind and codec can write, and what each sample entry holds beside
+/// its configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MoovShape {
+  /// A video track's: `ctts`, `sdtp` (3402–3439).
+  video: bool,
+  /// Constant-size audio's one time-to-sample run and one sample size
+  /// (3248–3256; 225–259): of a sample size past zero, whose packets are
+  /// whole samples ([`PayloadRule::PartialSample`]), each sample's size the
+  /// same; one of zero writes each packet's size.
+  constant: bool,
+  /// A sync-sample table (`mp4_syncs`).
+  sync: bool,
+  /// MOV's video: a partial-sync table (3423–3424).
+  partial: bool,
+  /// AAC's and Opus's roll groups (3305–3400).
+  roll: Roll,
+  /// A sample entry's own bytes beside its configuration ([`ENTRY_SLACK`],
+  /// its channels', an ICC profile's `colr`, APV's `apvC`).
+  entry: u64,
+  /// The configuration boxes an entry writes of its configuration: HEVC's
+  /// `hvcC` and `lhvC`, two; another codec's one.
+  configurations: u64,
+}
+
+/// A track's roll groups (`mov_preroll_write_stbl_atoms`, 3305–3400).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Roll {
+  /// None written.
+  #[default]
+  None,
+  /// AAC's one group: `sgpd` of 26 bytes, `sbgp` of 28.
+  Aac,
+  /// Opus's, a run of roll distances at most a sample.
+  Opus,
+}
+
+/// A track's per-sample tables in the `moov` at their worst for `samples`
+/// samples (R14, ruled): each box's type and its bytes — a chunk a sample,
+/// its offset in 64 bits (`co64`, 16 and 8 a chunk) and its own `stsc` run
+/// (16 and 12); a time-to-sample run a sample (16 and 8) but constant-size
+/// audio's one (24); a composition-offset run a sample of video (16 and 8);
+/// a sync sample a sample (16 and 4), MOV video's partial sync too; a
+/// dependency byte a sample of video (12 and 1); a sample size a sample (20
+/// and 4) but constant-size audio's one size (20); AAC's one roll group,
+/// Opus's a run a sample (`sgpd` 24 and 2, `sbgp` 20 and 8) — each a bound
+/// of what movenc writes of them (`movenc.c` 201–336, 3200–3400).
+fn moov_tables(shape: MoovShape, samples: u64) -> [([u8; 4], u64); 10] {
+  let n = samples;
+  let video = |bytes: u64| if shape.video { bytes } else { 0 };
+  [
+    (*b"stts", if shape.constant { 24 } else { 16 + 8 * n }),
+    (*b"ctts", video(16 + 8 * n)),
+    (*b"stss", if shape.sync { 16 + 4 * n } else { 0 }),
+    (*b"stps", if shape.partial { 16 + 4 * n } else { 0 }),
+    (*b"sdtp", video(12 + n)),
+    (*b"stsc", 16 + 12 * n),
+    (*b"stsz", if shape.constant { 20 } else { 20 + 4 * n }),
+    (*b"co64", 16 + 8 * n),
+    (
+      *b"sgpd",
+      match shape.roll {
+        Roll::None => 0,
+        Roll::Aac => 26,
+        Roll::Opus => 24 + 2 * n,
+      },
+    ),
+    (
+      *b"sbgp",
+      match shape.roll {
+        Roll::None => 0,
+        Roll::Aac => 28,
+        Roll::Opus => 20 + 8 * n,
+      },
+    ),
+  ]
+}
+
+/// A sample entry's bytes at most, of a configuration of `len` bytes
+/// (R14): its own ([`MoovShape::entry`]) and each configuration box movenc
+/// writes of it — `avcC`, `hvcC`, `lhvC`, `vvcC`, `evcC`, `lvcC`, `av1C`,
+/// `vpcC`, `dvc1`, `av3c`, `esds`, `dOps`, `dfLa`, `glbl` — each at most
+/// twice its configuration's bytes and 256: a unit's start code of three
+/// bytes at least made a length of two, beside an array's header of three
+/// and a record's of at most 64 (`avc.c`, `hevc.c`, `vvc.c`, `evc.c`,
+/// `lcevc.c`, `av1.c`, `vpcc.c`; `movenc.c` 765–816, 857–909, 1186–1210).
+fn moov_entry(shape: MoovShape, len: usize) -> u64 {
+  shape.entry + shape.configurations * (2 * len as u64 + 256)
+}
+
+/// What the `moov` holds of the chapter track movenc makes of the chapters
+/// (`mov_create_chapter_track`, 7727–7811): a text track of a sample a
+/// titled chapter (7783–7805), every chapter here titled
+/// ([`MuxOpenError::ChapterWithoutTitle`]), its sample entry of the 43-byte
+/// text stub (`stub_header`, 7729–7748) — taken as 64 — and no table but
+/// the five every track writes.
+const CHAPTER_SHAPE: MoovShape = MoovShape {
+  video: false,
+  constant: false,
+  sync: false,
+  partial: false,
+  roll: Roll::None,
+  entry: ENTRY_SLACK + 64,
+  configurations: 1,
+};
+
+/// The `pssh` boxes movenc writes into the `moov` of a stream's encryption
+/// initialization side data, at most (R14): each initialization the side
+/// data's parse reads — a count, then each of 16 bytes and its system id,
+/// key ids and data (`av_encryption_init_info_get_side_data`,
+/// `libavutil/encryption_info.c` 231–290) — one of neither key ids nor
+/// data skipped, another written in 20 bytes and the same
+/// (`mov_write_pssh_tag`, `movenc.c` 5175–5210), for every stream
+/// (5450–5451). A parse that fails midway writes none, counted as far as
+/// it read.
+fn pssh_bytes(bytes: &[u8]) -> u64 {
+  let word = |at: usize| {
+    bytes
+      .get(at..at + 4)
+      .map(|word| u64::from(u32::from_be_bytes([word[0], word[1], word[2], word[3]])))
+  };
+  let Some(count) = word(0) else { return 0 };
+  let mut at = 4_usize;
+  let mut total = 0_u64;
+  for _ in 0..count {
+    let (Some(system), Some(keys), Some(key), Some(data)) =
+      (word(at), word(at + 4), word(at + 8), word(at + 12))
+    else {
+      break;
+    };
+    // At most `UINT64_MAX`, as libavutil's comment says.
+    let payload = system + data + keys * key;
+    if ((bytes.len() - at - 16) as u64) < payload {
+      break;
+    }
+    if keys != 0 || data != 0 {
+      total += 20 + payload;
+    }
+    at += 16 + payload as usize;
+  }
+  total
+}
+
+/// A track's own boxes in the `moov` ([`TRAK_SLACK`]), of a file of
+/// `tracks` tracks, and its `tref`'s references, 4 bytes an id — `chap` to
+/// the chapter track, an audio track's `fall` to the track its fallback
+/// side data names, and the first track's `tmcd` to each timecode track
+/// copied in (8707–8719): at most one id a track and one more, their
+/// types' 8 bytes each within the slack (4241–4255, 5359–5414). The base
+/// makes no stream group, so no `sbas` reference and no other source
+/// (8640–8701).
+const fn moov_track_fixed(tracks: u64) -> u64 {
+  TRAK_SLACK + 4 * (tracks + 1)
+}
 
 /// One of libavformat's bitstream filters a muxer inserts for a track —
 /// when it writes the track's first packet, or at its start
@@ -3016,6 +3320,31 @@ pub enum PayloadRule {
   /// holds (R13, Codex R12 1). One the track holds already changes nothing.
   #[error("ISMV's configuration would change after its moov is written")]
   ConfigurationUpdate,
+  /// The MOV family, of no fragments: a packet after which the `moov` its
+  /// trailer writes could pass the 32 bits `update_size` writes its size in
+  /// (`movenc.c` 155–163), cut, the file unreadable — judged by an upper
+  /// bound, as ruled (R14, Codex R12 2): each track's per-sample tables at
+  /// their worst for the samples so far and two its trailer may add — a
+  /// chunk a sample, its offset in 64 bits and its own `stsc` entry, a
+  /// time-to-sample, composition offset, sync and dependency entry a sample
+  /// — its sample descriptions each bounded by its configuration, the
+  /// chapter track's tables, and every other box of the `moov` by what the
+  /// open knows — covers, chapters, `pssh` boxes — with slacks derived from
+  /// movenc's source (the bound's table in the census). Where the chunks a
+  /// track's samples make rest on libavformat's interleaving, which this
+  /// release does not mirror, the bound refuses a file FFmpeg could have
+  /// written, and only past it; Q870's exact mirror is booked to replace
+  /// it.
+  #[error("the packet could take the moov the trailer writes past its 32-bit size")]
+  MovieBox,
+  /// ISMV: a packet after which the `mfra` its trailer makes in a dynamic
+  /// buffer of `INT_MAX` bytes could pass it, cut — each track's `tfra`, 24
+  /// bytes and 19 a fragment (`mov_write_tfra_tag`, `movenc.c` 6118–6140;
+  /// `mov_write_mfra_tag`, 6142–6178), judged by an upper bound, as ruled
+  /// (R14): a track's fragments at most its samples, and at most one more
+  /// than its one video track's key frames, which cut them (7450–7472).
+  #[error("the packet could take the mfra the trailer makes past its buffer")]
+  FragmentIndex,
   /// MP4's APV: a packet whose frame brings a 256th frame information of
   /// its PBU type to the track's `apvC`, which MP4 makes of its parse of
   /// every packet and counts them in 8 bits (`apv_add_frameinfo`, `apv.c`
@@ -3709,6 +4038,12 @@ struct TrackState {
   /// before the track's first sample, whose superframe that sample is
   /// (`merge_superframe`, `vp9_superframe.c` 52–98).
   first_held: Vec<Vec<u8>>,
+  /// The MOV family, of no fragments: what its `moov` holds of the track
+  /// ([`MoovShape`]), `None` of another container's or ISMV's.
+  moov: Option<MoovShape>,
+  /// The bound of the track's `stsd` (16 and each description's
+  /// [`moov_entry`]), so far.
+  stsd: u64,
   /// The MOV family's APV: the frame informations its `apvC` records so
   /// far, by PBU type, in the order the types came
   /// ([`records::apv_frame_infos`]).
@@ -8040,6 +8375,9 @@ struct Learned {
   /// MP4's VP9 of no configuration: the hidden frame the filter holds
   /// before the track's first sample ([`TrackState::first_held`]).
   first_held: Option<Vec<u8>>,
+  /// The MOV family: the bound of the track's `stsd` after the packet,
+  /// where its descriptions grow ([`TrackState::stsd`]).
+  stsd: Option<u64>,
   /// The MOV family's APV: the frame informations the packet adds to the
   /// track's `apvC`, by PBU type.
   apv: Vec<(u8, records::ApvFrameInfo)>,
@@ -8075,7 +8413,32 @@ pub struct CarrierMuxer<W, C: FfmpegCarrier> {
   /// PGS: the packets of each display set left open, in the order offered,
   /// which no packet has completed ([`Self::take_held`]).
   held: Vec<HeldPacket<C::Buffer>>,
+  /// The MOV family, of no fragments: the bound of the `moov`'s own boxes,
+  /// its covers', its chapters' and its streams' `pssh` boxes
+  /// ([`PayloadRule::MovieBox`]); `None` of another container or ISMV.
+  movie: Option<u64>,
+  /// The MOV family, of no fragments: the samples of the chapter track its
+  /// mode makes of the chapters, one a chapter; `None` where it makes none.
+  chapter_samples: Option<u64>,
+  /// ISMV: the key frames its one video track has written, each a
+  /// fragment's start ([`PayloadRule::FragmentIndex`]); `None` of another.
+  keys: Option<u64>,
   _carrier: PhantomData<fn() -> C>,
+}
+
+/// The bound the MOV family's `moov` is judged by, as it stands
+/// ([`PayloadRule::MovieBox`]; R14): the laws' seam.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovieBoxBound {
+  /// The `moov`'s, in bytes.
+  pub total: u64,
+  /// Each track's per-sample tables, of the tracks its `moov` holds, in
+  /// their order, and the chapter track's last: each box's type and its
+  /// bound ([`moov_tables`]); `co64` stands for `stco` too.
+  pub tables: Vec<Vec<([u8; 4], u64)>>,
+  /// Each such track's `stsd` bound, in the same order.
+  pub stsd: Vec<u64>,
 }
 
 /// The FFmpeg muxer over the **view** lane's packets — what
@@ -8538,6 +8901,8 @@ where
       let mut rules = PacketRules::default();
       let mut sides = SideRules::unclaimed();
       let mut descriptions = Descriptions::default();
+      let mut moov = None;
+      let mut stsd = 0;
       let stream = match (stream, road) {
         (Some((stream, _)), Road::Timed) => {
           let time_base = output
@@ -8646,6 +9011,38 @@ where
           if family == Family::Mp4 {
             descriptions = Descriptions::of(&codec);
           }
+          // What the `moov` its trailer writes holds of the track (R14):
+          // ISMV's written at its start, of no samples.
+          if family == Family::Mp4 && audited != Audited::Mov(MovMode::Ism) {
+            let id = codec.codec();
+            let ticket = tracks[index].side_data();
+            let icc = ticket
+              .coded_side_data()
+              .iter()
+              .find(|entry| entry.kind() == AVPacketSideDataType::AV_PKT_DATA_ICC_PROFILE as i32)
+              .map_or(0, |entry| 12 + entry.data().len() as u64);
+            let channels = u64::try_from(ticket.ch_layout().channels()).unwrap_or(0);
+            let shape = MoovShape {
+              video: kind == TrackKind::Video,
+              constant: rules.mp4_constant.is_some_and(|size| size > 0),
+              sync: mp4_syncs(kind, id, codec.profile()),
+              partial: audited == Audited::Mov(MovMode::Mov) && kind == TrackKind::Video,
+              roll: if id == CodecId::AAC {
+                Roll::Aac
+              } else if id == CodecId::OPUS {
+                Roll::Opus
+              } else {
+                Roll::None
+              },
+              entry: ENTRY_SLACK
+                + 24 * channels
+                + icc
+                + if id == CodecId::APV { APVC_MAX } else { 0 },
+              configurations: if id == CodecId::HEVC { 2 } else { 1 },
+            };
+            moov = Some(shape);
+            stsd = 16 + moov_entry(shape, codec.extradata().len());
+          }
           Some((stream, time_base))
         }
         // An attachment stream takes no packet; a cover takes its one,
@@ -8691,6 +9088,8 @@ where
         mp4_entries: 0,
         descriptions,
         first_held: Vec::new(),
+        moov,
+        stsd,
         apv: Vec::new(),
         key_times: None,
         mxf: MxfMirror {
@@ -8719,6 +9118,58 @@ where
         .map(|state| (state.kind, state.sides.codec, state.stream.is_some()))
         .collect::<Vec<_>>(),
     );
+    // The `moov`'s own boxes, its covers', its chapters' and its streams'
+    // `pssh` boxes, at most (R14; [`PayloadRule::MovieBox`]): `covr`, 8
+    // bytes and 16 a picture beside its bytes (4815–4839); `chpl`, 17 and,
+    // of the first 255 chapters, 9 and a title of at most 255 bytes each
+    // (5040–5064); each stream's encryption initialization's `pssh` boxes
+    // ([`pssh_bytes`]; 5175–5210, 5450–5451). The chapter track is its own
+    // ([`CarrierMuxer::chapter_samples`]).
+    let movie = track_states
+      .iter()
+      .any(|state| state.moov.is_some())
+      .then(|| {
+        let covers: Vec<u64> = roads
+          .iter()
+          .zip(&tracks)
+          .filter(|(road, _)| **road == Road::Cover)
+          .filter_map(|(_, description)| description.file())
+          .map(|file| 16 + file.payload().data().as_ref().len() as u64)
+          .collect();
+        let covers = if covers.is_empty() {
+          0
+        } else {
+          8 + covers.iter().sum::<u64>()
+        };
+        let titles = chapters
+          .iter()
+          .take(255)
+          .map(|chapter| {
+            9 + chapter
+              .title()
+              .map_or(0, |title| title.as_str().len().min(255)) as u64
+          })
+          .sum::<u64>();
+        let nero = if chapters.is_empty() { 0 } else { 17 + titles };
+        let pssh = tracks
+          .iter()
+          .map(|description| {
+            description
+              .side_data()
+              .coded_side_data()
+              .iter()
+              .find(|entry| {
+                entry.kind() == AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO as i32
+              })
+              .map_or(0, |entry| pssh_bytes(entry.data()))
+          })
+          .sum::<u64>();
+        MOOV_SLACK + covers + nero + pssh
+      });
+    // The chapter track movenc makes of the chapters, a sample a chapter
+    // ([`CHAPTER_SHAPE`]), where its mode makes one.
+    let chapter_samples = (movie.is_some() && audited.chapter_track() && !chapters.is_empty())
+      .then_some(chapters.len() as u64);
     let either = family != Family::Other
       && track_states.iter().any(|state| {
         state.kind == TrackKind::Video
@@ -8746,10 +9197,108 @@ where
         report: report.clone(),
         shift,
         held: Vec::new(),
+        movie,
+        chapter_samples,
+        keys: (audited == Audited::Mov(MovMode::Ism)).then_some(0),
         _carrier: PhantomData,
       },
       report,
     ))
+  }
+
+  /// Each track's part of the `moov`'s bound, of the tracks it holds, in
+  /// their order and the chapter track last — its per-sample tables
+  /// ([`moov_tables`]) and its `stsd`'s bound — the track at `with`'s index,
+  /// where given, at its samples and `stsd` bound there: each at its
+  /// samples and two the trailer may add, a `mov_text` cue track's end and
+  /// the one another track's packet may make first, or TTML's document
+  /// (R14).
+  fn movie_parts(
+    &self,
+    with: Option<(usize, u64, u64)>,
+  ) -> impl Iterator<Item = ([([u8; 4], u64); 10], u64)> + '_ {
+    let tracks = self
+      .tracks
+      .iter()
+      .enumerate()
+      .filter_map(move |(index, state)| {
+        let shape = state.moov?;
+        let (entries, stsd) = match with {
+          Some((at, entries, stsd)) if at == index => (entries, stsd),
+          _ => (state.mp4_entries, state.stsd),
+        };
+        Some((moov_tables(shape, entries + 2), stsd))
+      });
+    let chapters = self.chapter_samples.map(|samples| {
+      (
+        moov_tables(CHAPTER_SHAPE, samples),
+        16 + moov_entry(CHAPTER_SHAPE, 0),
+      )
+    });
+    tracks.chain(chapters)
+  }
+
+  /// The `moov`'s bound, the track at `with`'s index, where given, at its
+  /// samples and `stsd` bound there: its own boxes, and each track's —
+  /// its own boxes ([`moov_track_fixed`]), its `stsd` and its per-sample
+  /// tables ([`Self::movie_parts`]) (R14).
+  fn movie_bound(&self, with: Option<(usize, u64, u64)>) -> Option<u64> {
+    let fixed = self.movie?;
+    let tracks = self.tracks.len() as u64;
+    Some(
+      fixed
+        + self
+          .movie_parts(with)
+          .map(|(tables, stsd)| {
+            moov_track_fixed(tracks) + stsd + tables.iter().map(|&(_, bytes)| bytes).sum::<u64>()
+          })
+          .sum::<u64>(),
+    )
+  }
+
+  /// ISMV's `mfra`'s bound, the track at `with`'s index, where given, at its
+  /// samples there, its video track having written `keys` key frames: 24
+  /// bytes, and each track's `tfra` of 24 and 19 a fragment, its fragments
+  /// at most its samples and one more than the key frames (R14).
+  fn index_bound(&self, with: Option<(usize, u64)>, keys: u64) -> u64 {
+    24 + self
+      .tracks
+      .iter()
+      .enumerate()
+      .filter(|(_, state)| state.stream.is_some())
+      .map(|(index, state)| {
+        let entries = match with {
+          Some((at, entries)) if at == index => entries,
+          _ => state.mp4_entries,
+        };
+        24 + 19 * entries.min(keys + 1)
+      })
+      .sum::<u64>()
+  }
+
+  /// The bound the MOV family's `moov` is judged by, as the samples written
+  /// leave it ([`PayloadRule::MovieBox`]): the laws' seam. `None` of another
+  /// container or ISMV.
+  #[doc(hidden)]
+  pub fn movie_box_bound(&self) -> Option<MovieBoxBound> {
+    let total = self.movie_bound(None)?;
+    let (tables, stsd) = self
+      .movie_parts(None)
+      .map(|(tables, stsd)| (tables.to_vec(), stsd))
+      .unzip();
+    Some(MovieBoxBound {
+      total,
+      tables,
+      stsd,
+    })
+  }
+
+  /// ISMV's `mfra`'s bound, as the samples written leave it
+  /// ([`PayloadRule::FragmentIndex`]): the laws' seam. `None` of another
+  /// container.
+  #[doc(hidden)]
+  pub fn fragment_index_bound(&self) -> Option<u64> {
+    self.keys.map(|keys| self.index_bound(None, keys))
   }
 
   /// What the container could not carry: what the open answered, then what
@@ -9174,6 +9723,30 @@ where
       self.bounds,
     )
     .map_err(Refusal::Container)?;
+    // The `moov`'s and ISMV's `mfra`'s bounds after the packet (R14).
+    let entries = learned.mp4_entries.unwrap_or(state.mp4_entries);
+    if self
+      .movie_bound(Some((
+        track.get(),
+        entries,
+        learned.stsd.unwrap_or(state.stsd),
+      )))
+      .is_some_and(|bound| bound > self.bounds.movie)
+    {
+      return Err(Refusal::Container(FfmpegMuxRefusal::Payload {
+        track,
+        rule: PayloadRule::MovieBox,
+      }));
+    }
+    if let Some(keys) = self.keys {
+      let keys = keys + u64::from(state.kind == TrackKind::Video && payload.key && learned.writes);
+      if self.index_bound(Some((track.get(), entries)), keys) > self.bounds.index {
+        return Err(Refusal::Container(FfmpegMuxRefusal::Payload {
+          track,
+          rule: PayloadRule::FragmentIndex,
+        }));
+      }
+    }
     let mut uncarried = learned_losses(
       state,
       track,
@@ -9361,6 +9934,17 @@ where
     }
     if let Some(frame) = plan.learned.first_held {
       state.first_held.push(frame);
+    }
+    if let Some(stsd) = plan.learned.stsd {
+      state.stsd = stsd;
+    }
+    // ISMV: its video track's key frames, each a fragment's start (R14).
+    if state.kind == TrackKind::Video
+      && plan.key
+      && plan.learned.writes
+      && let Some(keys) = &mut self.keys
+    {
+      *keys += 1;
     }
     for &(kind, info) in &plan.learned.apv {
       match state.apv.iter_mut().find(|(entry, _)| *entry == kind) {
@@ -10345,7 +10929,7 @@ fn check_packet_rules(
   // the packet's own, else the packet's own new extradata, where it reaches
   // the container — taken as movenc takes it ([`Descriptions`]), judged on
   // borrowed bytes, nothing allocated before its refusals.
-  let (descriptions, first_held) = if rules.mp4
+  let (descriptions, first_held, stsd) = if rules.mp4
     && rules.ttml_document.is_none()
     && state.descriptions.current < state.descriptions.entries.len()
   {
@@ -10444,9 +11028,29 @@ fn check_packet_rules(
       || step.overwrite.is_some()
       || step.append.is_some()
       || step.current != current;
-    (changes.then_some(step), held)
+    // The `stsd`'s bound after it (R14): each description's growth, never
+    // its shrinking, counted.
+    let stsd = state.moov.filter(|_| changes).map(|shape| {
+      let grown =
+        |old: usize, new: usize| moov_entry(shape, new).saturating_sub(moov_entry(shape, old));
+      let old = |index: usize| entries[index].as_ref().map_or(0, Vec::len);
+      state.stsd
+        + step
+          .first
+          .as_ref()
+          .map_or(0, |first| grown(old(0), first.len()))
+        + step
+          .overwrite
+          .as_ref()
+          .map_or(0, |configuration| grown(old(current), configuration.len()))
+        + step
+          .append
+          .as_ref()
+          .map_or(0, |configuration| moov_entry(shape, configuration.len()))
+    });
+    (changes.then_some(step), held, stsd)
   } else {
-    (None, None)
+    (None, None, None)
   };
   if rules.prores && !prores_atom(payload.bytes) {
     return refused(PayloadRule::ProResAtom);
@@ -10586,6 +11190,7 @@ fn check_packet_rules(
     mp4_entries,
     descriptions,
     first_held,
+    stsd,
     apv,
     key_times,
     mxf,
