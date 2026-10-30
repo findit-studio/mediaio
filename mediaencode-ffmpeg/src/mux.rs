@@ -719,6 +719,7 @@
 //! | S10 | MP4's `lvcC` (`ff_isom_write_lvcc`, `lcevc.c` 251–339; `ff_h2645_packet_split`, `h2645_parse.c` 480–665; R20, r2) | the split's RBSP buffer past `INT_MAX` with `MAX_MBPAIR_SIZE` and the padding, its unit list past `INT_MAX` over an `H2645NAL`'s 88 bytes — 24 403 222 units kept and one more found — a unit's emulation prevention positions past `2^28`: each the split's failure, which MP4 discards (1700), the `lvcC` written empty — past a budget the caller raises | omission, as A4's | counted exactly ([`records::SplitLimits`]) | refused at open ([`MuxOpenError::ConfigurationInvalid`]) — `lcevcs_split_is_held_to_what_libavcodec_allocates` |
 //! | S11 | MPEG-TS's PES payloads (`mpegts_write_packet_internal`, `mpegts_write_pes`, `mpegtsenc.c` 1669–1678, 1851–1864, 1907–2070, 2095–2099, 2205; R20, r2) | an H.264, HEVC or VVC picture behind the delimiter and the configuration MPEG-TS adds (`h26x_prefix_aud`; 1958), an Opus packet behind its control header, an audio packet beside the one held, each summed in an `int`, past it undefined — a wrapped size `av_malloc` refuses, answered `ENOMEM` — and the PES length of them in another, an audio packet's written wrapped — past a budget the caller raises ([`PacketLimits`], `CodecTicket::mirror_with`), a packet and the configuration beside it of two gibibytes | misreport; undefined | counted exactly ([`ts_prefixed_bytes`], [`opus_control_bytes`]), Opus's start trim among them — its padding's count refused at open where it wraps (S12; R20, part 2b-i) | refused at the packet ([`PayloadRule::PesSize`]) — L177, L178, `mpeg_ts_reads_a_units_type_as_its_start_code_search_leaves_it`, `opus_control_headers_are_counted_with_their_trims` |
 //! | S12 | MPEG-TS's Opus start trim (`mpegts_init`, `mpegtsenc.c` 1277–1279; R20, part 2b-i) | a stream's initial padding counted at 48 kHz as `initial_padding * 48000` in an `int`: past 44 739 samples either way a signed overflow, undefined — the trim its control headers write then any | misreport; undefined | exact ([`OPUS_TS_PADDING`]) | refused at open ([`MuxOpenError::InitialPaddingTooLong`]) — L182 |
+//! | S13 | FLV's `extract_extradata` split (`ff_h2645_packet_split`, `h2645_parse.c` 534–540, 590–610, 113–125; `ff_av1_packet_split`, `av1_parse.c` 67–80; R20, part 2b-i) | on a track of no configuration, each packet split into a list, a slot a unit — H.264's, HEVC's and VVC's `H2645NAL`, 88 bytes, refused past 24 403 222 kept and one more asked for; AV1's `AV1OBU`, 48, past 44 739 241 — and a NAL unit's emulation prevention positions past `2^28`, the RBSP buffer of small padding past `INT_MAX` less 64, past any packet: each the filter's failure of memory, which libavformat returns (`mux.c` 1132–1140) — a write failed by a size alone | misreport | the lists exact: their slots outlive the packet, but none is asked for past a limit unless the packet's kept units reach it; the positions as a fresh filter's, at `2^28` a unit — stricter than FFmpeg only where an earlier packet's unit, near that packet's end, made the slot at a size not a power of two ([`records::SplitLimits::SMALL_PADDING`], [`av1_split`]) | refused at the packet, judged where libavformat runs the filter, before FLV's own rules ([`PayloadRule::SplitSize`]) — L183, `flvs_filter_split_is_held_to_what_libavcodec_allocates`; every packet that reaches a list or the positions, of 89 MB and more, is past the 24 bits of FLV's tag too, and was refused before the write as [`PayloadRule::TagSize`] or a rule before it — never a fault |
 //! | — | every failure FFmpeg returns through a callback: an open's, a header's, a packet's, a trailer's | — | — | — | reported, the muxer's fault ([`MuxFault`]), once: the output then failed, no later write or trailer reaching what the failure left (r1; [`FfmpegMuxRefusal::OutputFailed`]) — L164 (the open), L169 (a cluster's growth, at the trailer), L173 (a packet's) |
 //!
 //! **Letter 1 (R19, asked).** A2–A27 are FFmpeg's — a failure it never
@@ -829,6 +830,21 @@
 //! open by name ([`MuxOpenError::InitialPaddingTooLong`]; L182). With it,
 //! S11 counts Opus's start trim exactly, no case left to take it as left.
 //!
+//! **Part 2b-i, FLV's filter split** (S13): FLV's `extract_extradata`
+//! splits a packet with the limits S10 holds LCEVC's split to at open —
+//! its list of units, a slot each, refused at 24 403 223 slots of
+//! `H2645NAL`, and a unit's emulation prevention positions past `2^28` —
+//! and an AV1 packet with its list of OBUs, refused at 44 739 242 slots of
+//! `AV1OBU`; each the filter's failure of memory, which libavformat
+//! returns. Each judged at the packet as the filter walks it, before FLV's
+//! rules, and refused by name ([`PayloadRule::SplitSize`]; L183, by its
+//! seams [`MuxOptions::with_lowered_split_bounds`] and
+//! [`MuxOptions::with_lowered_obu_bound`]). Part 2a reported such a packet
+//! coming back as a fault; it never did: every packet that reaches a list
+//! or the positions holds 89 MB and more, past the 24 bits of FLV's tag,
+//! and was refused before the write — as [`PayloadRule::TagSize`], or a
+//! rule before it. It is now refused by the limit FFmpeg meets first.
+//!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
 //! sample entry calls for a video configuration (`mov_write_video_tag`,
@@ -917,6 +933,7 @@
 //! | | | a frame of an odd bit depth, which no profile allows: the parse stops there | b | not refused, mirrored ([`records::apv_frame_infos`]) |
 //! | | | a sixth PBU type's entry (`av_assert0`, 214) | — | never reached: five types are recorded |
 //! | FLV's `extract_extradata` (`extract_extradata.c` 166–275) | FLV, a track of no configuration (1495–1501) | a packet of no unit `ff_h2645_packet_split` splits off: the filter refuses it, and libavformat drops it | a | refused ([`PayloadRule::NalUnits`]) — L121 |
+//! | | | a packet whose split passes what libavutil allocates — its list of H.264's, HEVC's or VVC's units past 24 403 222 kept, of AV1's OBUs past 44 739 241, or a unit's emulation prevention positions past `2^28` (`h2645_parse.c` 590–610, 113–125; `av1_parse.c` 67–80): the filter's failure of memory, which libavformat returns (`mux.c` 1132–1140) — a packet past FLV's 24-bit tag too (R20, part 2b-i) | a | refused by the filter's name, judged before the tag's ([`PayloadRule::SplitSize`]; S13) — L183 |
 //! | | | the configuration it makes of a packet's parameter sets, which the writer writes | a | judged as the writer's, above — L121 |
 //! | each writer | — | an allocation (R19: no longer outside the trust model) | — | MP4's and FLV's callers discard the answer, the record written empty or cut — R19's census, A4 and A22, letter 1; Matroska's returns it, its fault at the header |
 //!
@@ -1209,7 +1226,7 @@
 //! | MP3, at open (R15b, ruled; R17) | a chapter without a title, or of an empty one | written with no `TIT2`, or one of no text its reader skips (`read_ttag`, `id3v2.c` 370–374), read back titled with its element id, `ch` and its position (`write_chapter`, `id3v2enc.c` 292–329; `ff_id3v2_parse_chapters`, `id3v2.c` 1238–1243; `avpriv_new_chapter`, `demux_utils.c` 75), as the MOV family's untitled chapter is refused | [`MuxOpenError::ChapterWithoutTitle`] — L161, L163 |
 //! | IVF | a dimension past 65535 | written cut into its 16-bit field (`ivfenc.c` 65–66) | [`MuxOpenError::Dimensions`] — L77 |
 //! | WAV | a packet past 4 GiB of file; of every codec tag but integer PCM's, a packet past 2^32 samples of presentation span, its duration counted | the sizes left at their placeholders, the file broken; the fact chunk's count cut, read back as the stream's length (`wavenc.c` 409–495) | [`PayloadRule::FileSize`] — L78, L104 |
-//! | FLV | a reordering H.264, MPEG-4, HEVC, AV1, VP9 or VVC packet with no presentation time; a decode time past 32 bits of milliseconds; a composition time past 24 bits; a tag past 24 bits of size; ADTS AAC no filter converts; AAC with no configuration whose first packet brings none; AV1's new configuration — the packet's, or the one `extract_extradata` makes of its sequence headers — `ff_isom_write_av1c` fails on, and under that filter a unit whose OBUs do not parse | refused after taking the packet; written cut; written cut; refused after taking the packet; refused after taking the first, the rest written with their headers in; an empty sequence header, unreadable; an empty sequence header; refused by the filter (`flvenc.c` 1252–1352, 807–860, 892–893; `av1_parse.c` 56–97) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`PayloadRule::TagSize`], [`PayloadRule::AdtsHeader`], [`PayloadRule::ConfigurationAbsent`], [`PayloadRule::NewExtradata`], [`PayloadRule::Obus`] — L50, L82, L109 |
+//! | FLV | a reordering H.264, MPEG-4, HEVC, AV1, VP9 or VVC packet with no presentation time; a decode time past 32 bits of milliseconds; a composition time past 24 bits; a tag past 24 bits of size; ADTS AAC no filter converts; AAC with no configuration whose first packet brings none; AV1's new configuration — the packet's, or the one `extract_extradata` makes of its sequence headers — `ff_isom_write_av1c` fails on, and under that filter a unit whose OBUs do not parse; and a unit whose split under it passes what libavutil allocates — its list of units or OBUs, or a unit's emulation prevention positions (R20, part 2b-i) | refused after taking the packet; written cut; written cut; refused after taking the packet; refused after taking the first, the rest written with their headers in; an empty sequence header, unreadable; an empty sequence header; refused by the filter; the write failed by a size (`flvenc.c` 1252–1352, 807–860, 892–893; `av1_parse.c` 56–97; `mux.c` 1132–1140) | [`FfmpegMuxRefusal::MissingPts`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::PresentationOffset`], [`PayloadRule::TagSize`], [`PayloadRule::AdtsHeader`], [`PayloadRule::ConfigurationAbsent`], [`PayloadRule::NewExtradata`], [`PayloadRule::Obus`], [`PayloadRule::SplitSize`] — L50, L82, L109, L183 |
 //! | AVI | a frame more than 60 000 frames after the stream's place, but XSUB's, whose gaps it fills not; H.264 it tags `H264` not opening on a start code; at open, raw video of no tag of another pixel format than its bits name | refused after taking it; the first refused after taking it, the rest written as they are; written, "unreadable" (`avienc.c` 744–778, 446–461) | [`FfmpegMuxRefusal::FrameGap`], [`PayloadRule::StartCode`], [`MuxOpenError::ConfigurationInvalid`] — L84 |
 //! | AVI (R20, by the class) | a packet after which a stream's frames — its packets, and its gaps' empty frames to the packet's end, as though it were the last — pass an `int`; or the OpenDML header's sum of them, its video streams' most and its MP2 and MP3 streams' added; or a block-aligned audio stream's blocks, its bytes over its block alignment, pass 32 bits | a signed overflow of the count no index bounds, the counts written wrapped; the length written cut (`avienc.c` 86, 877, 744–766, 924, 203–235, 941–953) | [`PayloadRule::FrameCount`] — L171 |
 //! | FLV, at open | Opus or FLAC with no configuration; H.264, HEVC, VVC, AV1, MPEG-4 or AAC with none and the filters off; AV1's configuration `ff_isom_write_av1c` fails on | the header's `av_assert0` ends the process; written behind an empty sequence header; an empty sequence header (`flvenc.c` 853, 1491–1503, 892–893) | [`MuxOpenError::ConfigurationMissing`], [`MuxOpenError::ConfigurationInvalid`] — L82, L109 |
@@ -1945,6 +1962,17 @@ struct Bounds {
   /// payload it holds, or the PES header — an `int`
   /// ([`PayloadRule::PesSize`]).
   pes: u64,
+  /// The slot count FLV's `extract_extradata` refuses of an H.264, HEVC or
+  /// VVC packet's list of units: `INT_MAX` over an `H2645NAL`'s bytes
+  /// ([`records::SplitLimits`]; [`PayloadRule::SplitSize`]).
+  units: u64,
+  /// The most bytes a unit's emulation prevention positions take in that
+  /// split: libavutil's `INT_MAX` ([`PayloadRule::SplitSize`]).
+  positions: u64,
+  /// The slot count FLV's `extract_extradata` refuses of an AV1 packet's
+  /// list of OBUs: `INT_MAX` over an `AV1OBU`'s bytes ([`AV1_OBU_SLOTS`];
+  /// [`PayloadRule::SplitSize`]).
+  obus: u64,
 }
 
 impl Bounds {
@@ -1969,6 +1997,9 @@ impl Bounds {
     descriptor: DESCRIPTOR_BYTES_MAX,
     reader: records::GET_BITS_BYTES_MAX as u64,
     pes: i32::MAX as u64,
+    units: records::SplitLimits::SMALL_PADDING.slots,
+    positions: records::SplitLimits::SMALL_PADDING.positions,
+    obus: AV1_OBU_SLOTS,
   };
 }
 
@@ -2166,6 +2197,9 @@ impl MuxOptions {
       descriptor: self.bounds.descriptor,
       reader: self.bounds.reader,
       pes: self.bounds.pes,
+      units: self.bounds.units,
+      positions: self.bounds.positions,
+      obus: self.bounds.obus,
     };
     self
   }
@@ -2387,6 +2421,36 @@ impl MuxOptions {
   pub const fn with_lowered_pes_bound(mut self, bytes: u64) -> Self {
     if bytes < self.bounds.pes {
       self.bounds.pes = bytes;
+    }
+    self
+  }
+
+  /// Lowers what FLV's `extract_extradata` splits an H.264, HEVC or VVC
+  /// packet into — the slot count its list of units refuses, `units`, and
+  /// the bytes a unit's emulation prevention positions may take,
+  /// `positions` — never raising either: the laws' seam, which shows the
+  /// bounds without tens of millions of units ([`PayloadRule::SplitSize`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_split_bounds(mut self, units: u64, positions: u64) -> Self {
+    if units < self.bounds.units {
+      self.bounds.units = units;
+    }
+    if positions < self.bounds.positions {
+      self.bounds.positions = positions;
+    }
+    self
+  }
+
+  /// Lowers the slot count FLV's `extract_extradata` refuses of an AV1
+  /// packet's list of OBUs to `obus`, never raising it: the laws' seam,
+  /// which shows the bound without tens of millions of OBUs
+  /// ([`PayloadRule::SplitSize`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_obu_bound(mut self, obus: u64) -> Self {
+    if obus < self.bounds.obus {
+      self.bounds.obus = obus;
     }
     self
   }
@@ -4494,6 +4558,30 @@ pub enum PayloadRule {
   /// `h2645_parse.c` 527–667; `mux.c` 1132–1140; R10).
   #[error("the packet holds no NAL unit FLV's filter splits off")]
   NalUnits,
+  /// H.264, HEVC, VVC or AV1 on an FLV track of no configuration, under its
+  /// `extract_extradata`: a packet whose split would ask libavutil for more
+  /// than it allocates (R20, part 2b-i: a length that wraps is refused,
+  /// and never a misreport) — the list of its units, a slot each, the next
+  /// asked for before the first unit and before each one after a kept one,
+  /// refused at `INT_MAX` over a slot's bytes: H.264's, HEVC's and VVC's
+  /// `H2645NAL`, 24 403 223 slots of 88 bytes (`ff_h2645_packet_split`,
+  /// `h2645_parse.c` 590–610), AV1's `AV1OBU`, 44 739 242 of 48
+  /// (`ff_av1_packet_split`, `av1_parse.c` 67–80), each of the target's C
+  /// layout; and a unit's emulation prevention positions, `int`s, at first
+  /// `min(1024, b / 3 + 1)` of the `b` bytes left from the unit that asks
+  /// for the slot, doubled as they are outrun, refused past `INT_MAX` bytes
+  /// (`ff_h2645_extract_rbsp`, 113–125). The filter's failure, of memory,
+  /// libavformat returns (`mux.c` 1132–1140), the write failed by a size
+  /// alone — judged first, as libavformat runs the filter before FLV meets
+  /// the packet, though a packet that reaches either list is past the 24
+  /// bits of FLV's tag ([`PayloadRule::TagSize`]) too. The lists are judged
+  /// exactly — their slots outlive the packet, but no packet passes a list's
+  /// limit unless it asks for a slot past it — and the positions as a fresh
+  /// filter's: at `2^28` a unit, stricter than FFmpeg only where an earlier
+  /// packet's unit, near that packet's end, made the unit's slot at a size
+  /// not a power of two.
+  #[error("the packet's units would pass what FLV's filter allocates to split them")]
+  SplitSize,
   /// Matroska WavPack whose blocks do not parse whole: Matroska refuses
   /// the packet after taking it, and drops bytes left over after the last
   /// whole block (`matroskaenc.c` 2775–2816; `wv.c` 30–53).
@@ -7898,6 +7986,62 @@ fn av1_obu_bits(payload: &[u8], kind: u8) -> Option<usize> {
   Some(size * 8 - (payload[last].trailing_zeros() as usize + 1))
 }
 
+/// `AV1OBU`, libavcodec's entry of one OBU in a split packet, as
+/// `libavcodec/av1_parse.h` 38–57 in FFmpeg 9.0.1 lays it out — mirrored
+/// for its size alone, which the target's C layout sets: 48 bytes, or 32
+/// where a pointer is four bytes.
+#[repr(C)]
+#[allow(dead_code)]
+struct Av1Obu {
+  size: i32,
+  data: *const u8,
+  size_bits: i32,
+  raw_size: i32,
+  raw_data: *const u8,
+  kind: i32,
+  temporal_id: i32,
+  spatial_id: i32,
+}
+
+/// The slot count `ff_av1_packet_split` refuses of its list of OBUs:
+/// `INT_MAX` over an `AV1OBU`'s bytes (`av1_parse.c` 67–80 in FFmpeg
+/// 9.0.1) — 44 739 242 slots of 48 bytes.
+const AV1_OBU_SLOTS: u64 = (i32::MAX as usize / core::mem::size_of::<Av1Obu>()) as u64;
+
+/// `AV1_OBU_TEMPORAL_DELIMITER` and `AV1_OBU_PADDING` (`libavcodec/av1.h`
+/// 30–39): the OBUs `ff_av1_packet_split` keeps of no bits.
+const AV1_OBU_KEPT_EMPTY: [u8; 2] = [2, 15];
+
+/// How `ff_av1_packet_split` (`av1_parse.c` 55–97 in FFmpeg 9.0.1) fares
+/// with the OBUs of `bytes` under FLV's `extract_extradata`, `obus` the
+/// slot count its list refuses, walked as it walks them: the list's next
+/// slot asked for before the first OBU and before each after a kept one,
+/// and refused there ([`PayloadRule::SplitSize`]); an OBU whose header does
+/// not parse refused ([`PayloadRule::Obus`]); one of bits past `INT_MAX`,
+/// or of none but a temporal delimiter or padding, skipped unkept. The
+/// first refusal in that order is the filter's. The list's slots outlive
+/// the packet, but none is asked for past the limit unless the packet's
+/// kept OBUs reach it: exact.
+fn av1_split(bytes: &[u8], obus: u64) -> Result<(), PayloadRule> {
+  let mut rest = bytes;
+  let mut kept: u64 = 0;
+  while !rest.is_empty() {
+    if kept + 1 >= obus {
+      return Err(PayloadRule::SplitSize);
+    }
+    let Some(obu) = obu_header(rest) else {
+      return Err(PayloadRule::Obus);
+    };
+    if av1_obu_bits(&rest[obu.start..obu.len], obu.kind)
+      .is_some_and(|bits| bits > 0 || AV1_OBU_KEPT_EMPTY.contains(&obu.kind))
+    {
+      kept += 1;
+    }
+    rest = &rest[obu.len..];
+  }
+  Ok(())
+}
+
 /// Whether `ff_isom_write_av1c` writes `config` without failing (`av1.c`
 /// 399–502 in FFmpeg 9.0.1): MP4's `av1C` writer and FLV's sequence header
 /// ignore its failure, the box or the header left empty (`movenc.c`
@@ -8111,8 +8255,9 @@ enum FlvMade<'a> {
 /// of bits has a payload. Answered as [`av1c_written`] answers of the
 /// headers joined, each read where it lies in the packet, nothing made
 /// (R15): a joined run reads back as its OBUs, each a whole OBU of the
-/// packet's, one of no size field its last. The unit's OBUs parse
-/// ([`obus_parse`]), or the filter refuses it.
+/// packet's, one of no size field its last. The unit's OBUs parse, and
+/// its list of them lies within its limit ([`av1_split`]), or the filter
+/// refuses it.
 fn av1_extracted_written(bytes: &[u8]) -> Option<bool> {
   let sequences = || {
     let mut rest = bytes;
@@ -13197,18 +13342,29 @@ fn check_packet_rules<'p>(
   // filter refuses, libavformat drops (`mux.c` 1132–1140): AV1's whose OBUs
   // do not parse (`ff_av1_packet_split`, `av1_parse.c` 56–97), H.264's,
   // HEVC's or VVC's of no unit it splits off (`ff_h2645_packet_split`;
-  // R9: ruling 4c; R10, Codex R9 [high]).
+  // R9: ruling 4c; R10, Codex R9 [high]). One whose split asks libavutil
+  // for more than it allocates, libavformat returns the failure of: refused
+  // by its name (R20, part 2b-i).
   let flv_made = match rules.flv_tag {
     Some(tag) if tag.extracts && tag.codec == CodecId::AV1 => {
-      if !obus_parse(payload.bytes) {
-        return refused(PayloadRule::Obus);
+      if let Err(rule) = av1_split(payload.bytes, bounds.obus) {
+        return refused(rule);
       }
       av1_extracted_written(payload.bytes).map(|whole| FlvMade::Sequences { whole })
     }
     Some(tag) if tag.extracts => match h26x_units(tag.codec) {
-      Some(units) => match records::h2645_extracted(units, payload.bytes) {
+      Some(units) => match records::h2645_extracted(
+        units,
+        payload.bytes,
+        records::SplitLimits {
+          slots: bounds.units,
+          positions: bounds.positions,
+          ..records::SplitLimits::SMALL_PADDING
+        },
+      ) {
         Ok(made) => made.map(FlvMade::Sets),
-        Err(()) => return refused(PayloadRule::NalUnits),
+        Err(records::SplitError::Units) => return refused(PayloadRule::NalUnits),
+        Err(records::SplitError::Allocation) => return refused(PayloadRule::SplitSize),
       },
       None => None,
     },

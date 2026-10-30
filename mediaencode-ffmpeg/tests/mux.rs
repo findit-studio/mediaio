@@ -22128,3 +22128,189 @@ fn l182_mpeg_ts_refuses_an_opus_padding_its_int_cannot_count() {
     );
   }
 }
+
+/// The OBUs of the AV1 unit `bytes`, or `None` where one has no size field
+/// or runs past the unit.
+fn sized_obus_of(bytes: &[u8]) -> Option<usize> {
+  let (mut at, mut count) = (0, 0);
+  while at < bytes.len() {
+    let header = bytes[at];
+    if header & 0x02 == 0 {
+      return None;
+    }
+    at += 1 + usize::from(header & 0x04 != 0);
+    let mut size = 0;
+    for shift in 0..8 {
+      let byte = *bytes.get(at)?;
+      at += 1;
+      size |= usize::from(byte & 0x7F) << (7 * shift);
+      if byte & 0x80 == 0 {
+        break;
+      }
+    }
+    at += size;
+    count += 1;
+  }
+  (at == bytes.len()).then_some(count)
+}
+
+/// **L183 — FLV's `extract_extradata` split is held to what libavcodec
+/// allocates** (R20, part 2b-i, ruled: a length that wraps is refused,
+/// never a misreport): on an FLV track of no configuration the filter
+/// splits each packet into a list — H.264's, HEVC's and VVC's NAL units,
+/// AV1's OBUs — a slot each, the next asked for before the first unit and
+/// before each after a kept one, refused at `INT_MAX` over a slot's bytes;
+/// and a NAL unit's emulation prevention positions into a buffer doubled
+/// as they outrun it, refused past `INT_MAX` bytes (`ff_h2645_packet_split`,
+/// `h2645_parse.c` 590–610, 113–125; `ff_av1_packet_split`, `av1_parse.c`
+/// 67–80): a failure of memory, which libavformat returns (`mux.c`
+/// 1132–1140). Under the lowered seams: an H.264 packet of `k` units
+/// written at a list of `k + 1` slots, the very file libavcodec's own
+/// limits write, and refused by name at `k`, untouched; a unit of 1025
+/// emulation prevention bytes written where its 2048 positions' 8192 bytes
+/// are allowed, refused a byte below; an AV1 unit of two OBUs written at a
+/// list of three, refused at two; and an OBU that does not parse after
+/// them refused as the list where its slot is asked for past it, as
+/// unparsed a slot later.
+///
+/// PLANT: the list unjudged; the positions unjudged; the seams' limits not
+/// passed; AV1's list unjudged; the failure named as the filter's drop.
+#[test]
+fn l183_flvs_filter_split_is_held_to_what_libavcodec_allocates() {
+  let Some(corpus) = Corpus::new() else { return };
+  let written = |name: &str,
+                 row: Described,
+                 frame: &Video,
+                 bytes: &[u8],
+                 options: MuxOptions|
+   -> Result<Vec<u8>, FfmpegMuxRefusal> {
+    let target = output(&corpus, &format!("l183-{name}.flv"));
+    let mut muxer = muxer_with(&target, ContainerName::new("flv"), vec![row], options);
+    let offered = VideoTrackPacket::new(TrackIndex::new(0), video_holding(frame, bytes));
+    match refusing!(muxer.write_video(offered.clone())) {
+      Ok(()) => {}
+      Err(MuxError::Backend { refusal, packet }) => {
+        untouched!(offered, packet);
+        return Err(refusal);
+      }
+      Err(other) => panic!("{name}: {other:?}"),
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    Ok(std::fs::read(&target).expect("the file"))
+  };
+  let lowered = |units, positions| filters(true).with_lowered_split_bounds(units, positions);
+
+  // H.264: the picture's units behind its SPS and PPS.
+  let (row, frames, sps, pps) = h264_fixture(&corpus);
+  let h264 = || {
+    restated(
+      &row,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+      &[],
+      None,
+      None,
+    )
+  };
+  let frame = frames[0].data().as_ref().to_vec();
+  let slices: Vec<&[u8]> = nal_units_of(&frame)
+    .into_iter()
+    .filter(|unit| unit[0] & 0x1F != 7 && unit[0] & 0x1F != 8)
+    .collect();
+  assert!(!slices.is_empty(), "the premise: the picture's units");
+  let listed = start_coded(&[vec![&sps[..], &pps[..]], slices.clone()].concat());
+  let k = 2 + slices.len() as u64;
+  let real = written("h264", h264(), &frames[0], &listed, filters(true)).expect("written");
+  assert_eq!(
+    written(
+      "h264-at",
+      h264(),
+      &frames[0],
+      &listed,
+      lowered(k + 1, u64::MAX)
+    ),
+    Ok(real),
+    "a list of k + 1 slots: the very file"
+  );
+  assert_eq!(
+    written(
+      "h264-below",
+      h264(),
+      &frames[0],
+      &listed,
+      lowered(k, u64::MAX)
+    ),
+    Err(payload(PayloadRule::SplitSize)),
+    "a list of k slots"
+  );
+
+  // A unit of 1025 emulation prevention bytes: its slot's 1024 positions
+  // doubled to 2048.
+  let escapes: Vec<u8> = (0..1025).flat_map(|_| [0, 0, 3, 0x11]).collect();
+  let sei = [&[0x06][..], &escapes, &[0x80]].concat();
+  let escaped = start_coded(&[vec![&sps[..], &pps[..], &sei[..]], slices].concat());
+  let real = written("escaped", h264(), &frames[0], &escaped, filters(true)).expect("written");
+  assert_eq!(
+    written(
+      "escaped-at",
+      h264(),
+      &frames[0],
+      &escaped,
+      lowered(u64::MAX, 2048 * 4)
+    ),
+    Ok(real),
+    "8192 bytes of positions: the very file"
+  );
+  assert_eq!(
+    written(
+      "escaped-below",
+      h264(),
+      &frames[0],
+      &escaped,
+      lowered(u64::MAX, 2048 * 4 - 1)
+    ),
+    Err(payload(PayloadRule::SplitSize)),
+    "a byte below"
+  );
+
+  // AV1: a unit of a sequence header and a frame, its matrix stated (L143).
+  let av1 = av1_mkv(&corpus);
+  let (_, units) = first_track(&av1, TrackKind::Video, 1);
+  let unit = video_of(&units[0]);
+  let bytes = unit.data().as_ref().to_vec();
+  assert_eq!(
+    sized_obus_of(&bytes),
+    Some(2),
+    "the premise: two OBUs, each sized"
+  );
+  let configured = || {
+    reticketed(table_of(&av1, TrackKind::Video).remove(0), |par| {
+      par.color_space = ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_BT709;
+    })
+    .with_extradata(Some(bytes_of(&[])))
+  };
+  let obus = |obus| filters(true).with_lowered_obu_bound(obus);
+  let real = written("av1", configured(), &unit, &bytes, filters(true)).expect("written");
+  assert_eq!(
+    written("av1-at", configured(), &unit, &bytes, obus(3)),
+    Ok(real),
+    "a list of three slots: the very file"
+  );
+  assert_eq!(
+    written("av1-below", configured(), &unit, &bytes, obus(2)),
+    Err(payload(PayloadRule::SplitSize)),
+    "a list of two slots"
+  );
+  let unparsed = [&bytes[..], &[0x80]].concat();
+  assert_eq!(
+    written("unparsed-listed", configured(), &unit, &unparsed, obus(3)),
+    Err(payload(PayloadRule::SplitSize)),
+    "its slot asked for past the list"
+  );
+  assert_eq!(
+    written("unparsed", configured(), &unit, &unparsed, obus(4)),
+    Err(payload(PayloadRule::Obus)),
+    "a slot later, refused as unparsed"
+  );
+}

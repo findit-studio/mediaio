@@ -4297,7 +4297,8 @@ fn avs3s_and_vc1s_configurations_are_judged_as_mp4_writes_them() {
 fn flvs_filter_makes_h26x_configurations_as_extract_extradata_makes_them() {
   use records::Units;
   let extracted_bytes = |units, bytes: &[u8]| {
-    records::h2645_extracted(units, bytes).map(|made| made.map(records::Extracted::bytes))
+    records::h2645_extracted(units, bytes, records::SplitLimits::SMALL_PADDING)
+      .map(|made| made.map(records::Extracted::bytes))
   };
   let sps: &[u8] = &[0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40];
   let pps: &[u8] = &[0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
@@ -4328,7 +4329,7 @@ fn flvs_filter_makes_h26x_configurations_as_extract_extradata_makes_them() {
   );
   assert_eq!(
     extracted_bytes(Units::H264, &[0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x10]),
-    Err(()),
+    Err(records::SplitError::Units),
     "length-prefixed: no start code"
   );
   assert_eq!(
@@ -4348,7 +4349,7 @@ fn flvs_filter_makes_h26x_configurations_as_extract_extradata_makes_them() {
         0, 0, 1, 0x80, 0x01, 0, 0, 3, 1, 0, 0, 2, 0x11, 0x11, 0x11, 0x11
       ]
     ),
-    Err(()),
+    Err(records::SplitError::Units),
     "a unit an escape and `00 00 02` end, its header refused, then a search reaching the end"
   );
   assert_eq!(
@@ -5324,6 +5325,138 @@ fn lcevcs_split_is_held_to_what_libavcodec_allocates() {
     }),
     Wrote::Failed
   );
+}
+
+/// FLV's `extract_extradata` split is held to what libavcodec allocates
+/// of it (R20, part 2b-i): its RBSP buffer of small padding, the packet's
+/// bytes and the padding within `INT_MAX`; its list of H.264's, HEVC's and
+/// VVC's units, and of AV1's OBUs, a slot asked for before the first unit
+/// and before each after a kept one — an unkept one's too — refused at
+/// `INT_MAX` over a slot's bytes; a unit's emulation prevention positions
+/// as LCEVC's split holds them. Each the filter's failure of memory, apart
+/// from its refusal of what it cannot split; and every packet that reaches
+/// a limit is past the 24 bits of FLV's tag.
+#[test]
+fn flvs_filter_split_is_held_to_what_libavcodec_allocates() {
+  use super::{AV1_OBU_SLOTS, av1_split};
+  use records::{SplitError, SplitLimits, Units, h2645_extracted};
+  let small = SplitLimits::SMALL_PADDING;
+  assert_eq!(small.bytes, i32::MAX as usize - 64);
+  assert_eq!(
+    (small.slots, small.positions),
+    (SplitLimits::REAL.slots, SplitLimits::REAL.positions)
+  );
+  assert_eq!(
+    (
+      Bounds::REAL.units,
+      Bounds::REAL.positions,
+      Bounds::REAL.obus
+    ),
+    (small.slots, small.positions, AV1_OBU_SLOTS)
+  );
+  #[cfg(target_pointer_width = "64")]
+  assert_eq!(AV1_OBU_SLOTS, i32::MAX as u64 / 48, "an AV1OBU of 48 bytes");
+  // Past FLV's tag: a kept H.264 unit is a start code and a byte at least,
+  // an OBU two bytes, an emulation prevention byte three.
+  assert!(4 * (small.slots - 1) >= 1 << 24);
+  assert!(2 * (AV1_OBU_SLOTS - 1) >= 1 << 24);
+  assert!(3 * (1_u64 << 28) >= 1 << 24);
+  let sps: &[u8] = &[0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40];
+  let pps: &[u8] = &[0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
+  let idr: &[u8] = &[0x65, 0x88, 0x84, 0x21];
+  let forbidden: &[u8] = &[0x80, 0x01];
+  let split = |bytes: &[u8], limits: SplitLimits| {
+    h2645_extracted(Units::H264, bytes, limits).map(|made| made.is_some())
+  };
+  let packet = start_coded(&[sps, pps, idr]);
+  assert_eq!(split(&packet, small), Ok(true), "the premise");
+  assert_eq!(
+    split(
+      &packet,
+      SplitLimits {
+        bytes: packet.len(),
+        ..small
+      }
+    ),
+    Ok(true)
+  );
+  assert_eq!(
+    split(
+      &packet,
+      SplitLimits {
+        bytes: packet.len() - 1,
+        ..small
+      }
+    ),
+    Err(SplitError::Allocation)
+  );
+  // Three units kept, the third's slot the third asked for.
+  assert_eq!(split(&packet, SplitLimits { slots: 4, ..small }), Ok(true));
+  assert_eq!(
+    split(&packet, SplitLimits { slots: 3, ..small }),
+    Err(SplitError::Allocation)
+  );
+  // An unkept unit after them asks for a fourth.
+  let unkept = start_coded(&[sps, pps, idr, forbidden]);
+  assert_eq!(split(&unkept, SplitLimits { slots: 5, ..small }), Ok(true));
+  assert_eq!(
+    split(&unkept, SplitLimits { slots: 4, ..small }),
+    Err(SplitError::Allocation)
+  );
+  // A packet the filter cannot split refused as before, whatever the list.
+  assert_eq!(
+    split(
+      &[0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x10],
+      SplitLimits { slots: 1, ..small }
+    ),
+    Err(SplitError::Units)
+  );
+  // A unit of 1025 emulation prevention bytes: its slot's 1024 positions
+  // doubled to 2048, 8192 bytes.
+  let escapes: Vec<u8> = (0..1025).flat_map(|_| [0, 0, 3, 0x11]).collect();
+  let sei = [&[0x06][..], &escapes, &[0x80]].concat();
+  let escaped = start_coded(&[sps, pps, &sei, idr]);
+  assert_eq!(split(&escaped, small), Ok(true));
+  assert_eq!(
+    split(
+      &escaped,
+      SplitLimits {
+        positions: 2048 * 4,
+        ..small
+      }
+    ),
+    Ok(true)
+  );
+  assert_eq!(
+    split(
+      &escaped,
+      SplitLimits {
+        positions: 2048 * 4 - 1,
+        ..small
+      }
+    ),
+    Err(SplitError::Allocation)
+  );
+  // AV1: temporal delimiters, kept of no bits as padding is, and a frame
+  // header of none, unkept.
+  let td: &[u8] = &[0x12, 0x00];
+  let padding: &[u8] = &[0x7A, 0x00];
+  let header: &[u8] = &[0x1A, 0x00];
+  let unit = [td, td, td].concat();
+  assert_eq!(av1_split(&unit, AV1_OBU_SLOTS), Ok(()));
+  assert_eq!(av1_split(&unit, 4), Ok(()));
+  assert_eq!(av1_split(&unit, 3), Err(PayloadRule::SplitSize));
+  let unkept = [td, td, td, header].concat();
+  assert_eq!(av1_split(&unkept, 5), Ok(()));
+  assert_eq!(av1_split(&unkept, 4), Err(PayloadRule::SplitSize));
+  let padded = [td, padding, td].concat();
+  assert_eq!(av1_split(&padded, 4), Ok(()));
+  assert_eq!(av1_split(&padded, 3), Err(PayloadRule::SplitSize));
+  // An OBU that does not parse, refused so — but where its slot is asked
+  // for past the list.
+  let unparsed = [td, td, &[0x80][..]].concat();
+  assert_eq!(av1_split(&unparsed, 4), Err(PayloadRule::Obus));
+  assert_eq!(av1_split(&unparsed, 3), Err(PayloadRule::SplitSize));
 }
 
 /// MPEG-TS reads a unit's type as its start code search leaves it, and

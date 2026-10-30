@@ -1439,9 +1439,13 @@ struct Split<'a> {
 /// its units, nothing held. Where `limits` are given — the split of no
 /// small padding `ff_isom_write_lvcc` asks for — what it allocates by its
 /// input's sizes fails it past them ([`SplitLimits`]).
-fn h2645_split(bytes: &[u8], units: Units, limits: Option<SplitLimits>) -> Option<H2645Split<'_>> {
+fn h2645_split(
+  bytes: &[u8],
+  units: Units,
+  limits: Option<SplitLimits>,
+) -> Result<H2645Split<'_>, SplitError> {
   if limits.is_some_and(|limits| bytes.len() > limits.bytes) {
-    return None;
+    return Err(SplitError::Allocation);
   }
   let split = H2645Split {
     bytes,
@@ -1457,10 +1461,23 @@ fn h2645_split(bytes: &[u8], units: Units, limits: Option<SplitLimits>) -> Optio
   loop {
     match judged.step() {
       Ok(Some(_)) => {}
-      Ok(None) => return Some(split),
-      Err(()) => return None,
+      Ok(None) => return Ok(split),
+      Err(error) => return Err(error),
     }
   }
+}
+
+/// How `ff_h2645_packet_split` fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SplitError {
+  /// A search reaching the end with no unit kept, or a unit of more bits
+  /// than `init_get_bits` takes: `AVERROR_INVALIDDATA`, which libavformat
+  /// answers a filter's packet with by dropping it (`mux.c` 1132–1140).
+  Units,
+  /// What the split allocates by its input's sizes past libavutil's
+  /// `INT_MAX` ([`SplitLimits`]): `AVERROR(ENOMEM)`, which libavformat
+  /// returns.
+  Allocation,
 }
 
 /// The units [`h2645_split`] splits off, in order.
@@ -1549,11 +1566,19 @@ impl SplitLimits {
     slots: (i32::MAX as usize / core::mem::size_of::<H2645Nal>()) as u64,
     positions: i32::MAX as u64,
   };
+
+  /// A split of small padding's, `extract_extradata`'s (`extract_extradata.c`
+  /// 198–200): its RBSP buffer of the bytes and the padding alone, the list
+  /// and positions as [`Self::REAL`]'s.
+  pub(super) const SMALL_PADDING: Self = Self {
+    bytes: i32::MAX as usize - 64,
+    ..Self::REAL
+  };
 }
 
 impl<'a> H2645Split<'a> {
   /// The next unit, `None` at the end, or `Err` where the split fails.
-  fn step(&mut self) -> Result<Option<Split<'a>>, ()> {
+  fn step(&mut self) -> Result<Option<Split<'a>>, SplitError> {
     let bytes = self.bytes;
     let length = bytes.len();
     while length - self.at >= 4 {
@@ -1565,7 +1590,11 @@ impl<'a> H2645Split<'a> {
         .find(|&i| bytes[at + i] == 0 && bytes[at + i + 1] == 0 && bytes[at + i + 2] == 1)
         .map_or(rest, |i| i + 3);
       if self.at == length {
-        return if self.kept { Ok(None) } else { Err(()) };
+        return if self.kept {
+          Ok(None)
+        } else {
+          Err(SplitError::Units)
+        };
       }
       let start = self.at;
       // The unit's slot, where the list asks for a new one (590–607).
@@ -1573,7 +1602,7 @@ impl<'a> H2645Split<'a> {
         && self.slots == self.kept_units
       {
         if self.kept_units + 1 >= limits.slots {
-          return Err(());
+          return Err(SplitError::Allocation);
         }
         self.slots = self.kept_units + 1;
         self.positions = 1024.min((length - start) as u64 / 3 + 1);
@@ -1587,7 +1616,7 @@ impl<'a> H2645Split<'a> {
         while count > self.positions {
           self.positions *= 2;
           if self.positions * 4 > limits.positions {
-            return Err(());
+            return Err(SplitError::Allocation);
           }
         }
       }
@@ -1602,7 +1631,7 @@ impl<'a> H2645Split<'a> {
         continue;
       }
       if bits >= i64::from(i32::MAX - 512) {
-        return Err(());
+        return Err(SplitError::Units);
       }
       let mut header = Reader {
         bytes: rbsp,
@@ -1755,6 +1784,7 @@ impl<'a> Extracted<'a> {
   pub(super) fn bytes(self) -> Vec<u8> {
     let kept = self.kept;
     h2645_split(self.bytes, self.units, None)
+      .ok()
       .into_iter()
       .flatten()
       .filter(|unit| kept.contains(&unit.kind))
@@ -1770,6 +1800,7 @@ impl<'a> Extracted<'a> {
   fn units(self) -> impl Iterator<Item = &'a [u8]> {
     let kept = self.kept;
     h2645_split(self.bytes, self.units, None)
+      .ok()
       .into_iter()
       .flatten()
       .filter(move |unit| kept.contains(&unit.kind))
@@ -1793,8 +1824,12 @@ impl<'a> Extracted<'a> {
 /// and VVC's VPSs, SPSs and PPSs — each its raw bytes behind a 4-byte
 /// start code, where an SPS is among them, and for HEVC a VPS; read in
 /// place, never made (R15).
-pub(super) fn h2645_extracted(units: Units, bytes: &[u8]) -> Result<Option<Extracted<'_>>, ()> {
-  let split = h2645_split(bytes, units, None).ok_or(())?;
+pub(super) fn h2645_extracted(
+  units: Units,
+  bytes: &[u8],
+  limits: SplitLimits,
+) -> Result<Option<Extracted<'_>>, SplitError> {
+  let split = h2645_split(bytes, units, Some(limits))?;
   let (kept, sps, vps): (&'static [u8], u8, Option<u8>) = match units {
     Units::Vvc => (&[14, 15, 16], 15, None),
     Units::Hevc => (&[32, 33, 34], 33, Some(32)),
@@ -1971,7 +2006,7 @@ pub(super) fn lvcc_within(config: &[u8], limits: SplitLimits) -> Wrote {
   if !annex_b(config) {
     return Wrote::Whole;
   }
-  let Some(split) = h2645_split(config, Units::Lcevc, Some(limits)) else {
+  let Ok(split) = h2645_split(config, Units::Lcevc, Some(limits)) else {
     return Wrote::Failed;
   };
   let (mut idr, mut other, mut cut) = (0_usize, 0_usize, false);
