@@ -13,34 +13,73 @@ mod support;
 /// The bytes each thread of the lane allocates, counted for the laws that
 /// judge what a write allocates (L151): the system's allocator, each
 /// allocation's size added to the allocating thread's own count, so that
-/// the lane's parallel laws count apart.
+/// the lane's parallel laws count apart — and one allocation a thread
+/// names ([`starved!`]) refused, as an exhausted allocator refuses it
+/// (L160).
 struct Counting;
 
 std::thread_local! {
   static ALLOCATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+  /// The allocations to come until the one refused: none at zero.
+  static COUNTDOWN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn count(bytes: usize) {
   let _ = ALLOCATED.try_with(|allocated| allocated.set(allocated.get() + bytes as u64));
 }
 
+/// Whether this allocation of this thread is the one it names refused,
+/// counting it down.
+fn starving() -> bool {
+  COUNTDOWN
+    .try_with(|countdown| match countdown.get() {
+      0 => false,
+      1 => {
+        countdown.set(0);
+        true
+      }
+      left => {
+        countdown.set(left - 1);
+        false
+      }
+    })
+    .unwrap_or(false)
+}
+
+/// Refuses the `n`-th allocation this thread makes from now, and no other;
+/// none at zero (L160).
+fn refuse_allocation(n: u64) {
+  COUNTDOWN.with(|countdown| countdown.set(n));
+}
+
 // SAFETY: every call is the system allocator's, with the caller's own
-// arguments; the count touches no allocation, a thread-local of a constant
-// initializer, `try_with` answering nothing once the thread's are gone.
+// arguments, or a refusal — the null pointer `GlobalAlloc` answers an
+// exhausted allocator with, the block `realloc` was handed left as it is;
+// the count and the refusal touch no allocation, thread-locals of constant
+// initializers, `try_with` answering nothing once the thread's are gone.
 unsafe impl std::alloc::GlobalAlloc for Counting {
   unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+    if starving() {
+      return std::ptr::null_mut();
+    }
     count(layout.size());
     // SAFETY: the caller's layout, as `GlobalAlloc::alloc` takes it.
     unsafe { std::alloc::System.alloc(layout) }
   }
 
   unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+    if starving() {
+      return std::ptr::null_mut();
+    }
     count(layout.size());
     // SAFETY: as `alloc`.
     unsafe { std::alloc::System.alloc_zeroed(layout) }
   }
 
   unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+    if starving() {
+      return std::ptr::null_mut();
+    }
     count(new_size);
     // SAFETY: the caller's block, layout and size, as `GlobalAlloc::realloc`
     // takes them.
@@ -60,6 +99,43 @@ static ALLOCATOR: Counting = Counting;
 /// The bytes this thread has allocated so far.
 fn allocated() -> u64 {
   ALLOCATED.with(std::cell::Cell::get)
+}
+
+/// `$muxer.$write($packet)`, its packet made first — and, where the write
+/// refuses it, by the face's name or the muxer's, nothing allocated by the
+/// write: every rule is judged on borrowed bytes and counted lengths before
+/// anything is allocated (R15, Codex R14 3: decide first, pay after).
+/// Every refusal the laws make goes through it.
+macro_rules! refusing {
+  ($muxer:ident . $write:ident ( $packet:expr )) => {{
+    let packet = $packet;
+    let before = allocated();
+    let result = $muxer.$write(packet);
+    let spent = allocated() - before;
+    if matches!(
+      result,
+      Err(MuxError::Backend { .. } | MuxError::Refused { .. })
+    ) {
+      assert_eq!(
+        spent, 0,
+        "a refused packet allocated {spent} bytes: {result:?}"
+      );
+    }
+    result
+  }};
+}
+
+/// `$muxer.$write($packet)`, its packet made first, the write's `$n`-th
+/// allocation refused, as an exhausted allocator refuses it, and no other
+/// (L160).
+macro_rules! starved {
+  ($n:expr, $muxer:ident . $write:ident ( $packet:expr )) => {{
+    let packet = $packet;
+    refuse_allocation($n);
+    let result = $muxer.$write(packet);
+    refuse_allocation(0);
+    result
+  }};
 }
 
 use std::{
@@ -563,13 +639,13 @@ fn l4_every_refusal_hands_the_packet_back() {
   };
 
   let offered = restamped(&video[2], 5, Some(80), Some(80));
-  let (refusal, back) = refused(muxer.write_video(offered.clone()));
+  let (refusal, back) = refused(refusing!(muxer.write_video(offered.clone())));
   assert!(matches!(refusal, MuxRefusal::UnknownTrack { track } if track.get() == 5));
   check(&offered, &back);
 
   let (_, audio_packet) = audio.into_parts();
   let offered_audio = AudioTrackPacket::new(TrackIndex::new(0), audio_packet);
-  let (refusal, back) = refused(muxer.write_audio(offered_audio.clone()));
+  let (refusal, back) = refused(refusing!(muxer.write_audio(offered_audio.clone())));
   assert!(matches!(
     refusal,
     MuxRefusal::KindMismatch {
@@ -581,22 +657,22 @@ fn l4_every_refusal_hands_the_packet_back() {
   assert!(back.packet().data().ptr_eq(offered_audio.packet().data()));
 
   let offered = restamped(&video[2], 0, Some(80), None);
-  let (refusal, back) = refused(muxer.write_video(offered.clone()));
+  let (refusal, back) = refused(refusing!(muxer.write_video(offered.clone())));
   assert!(matches!(refusal, MuxRefusal::MissingDts { .. }));
   check(&offered, &back);
 
   let offered = restamped(&video[2], 0, Some(80), Some(20));
-  let (refusal, back) = refused(muxer.write_video(offered.clone()));
+  let (refusal, back) = refused(refusing!(muxer.write_video(offered.clone())));
   assert!(matches!(refusal, MuxRefusal::NonMonotonicDts { .. }));
   check(&offered, &back);
 
   let offered = restamped(&video[2], 0, Some(60), Some(80));
-  let (refusal, back) = refused(muxer.write_video(offered.clone()));
+  let (refusal, back) = refused(refusing!(muxer.write_video(offered.clone())));
   assert!(matches!(refusal, MuxRefusal::PtsBeforeDts { .. }));
   check(&offered, &back);
 
   let offered = restamped(&video[2], 0, Some(80), Some(40));
-  match muxer.write_video(offered.clone()) {
+  match refusing!(muxer.write_video(offered.clone())) {
     Err(MuxError::Backend {
       refusal: FfmpegMuxRefusal::RepeatedDts { track, dts },
       packet: back,
@@ -608,7 +684,7 @@ fn l4_every_refusal_hands_the_packet_back() {
   }
 
   let offered_font = DemuxedPacket::Attachment(font.clone());
-  let (refusal, back) = refused(muxer.write_packet(offered_font));
+  let (refusal, back) = refused(refusing!(muxer.write_packet(offered_font)));
   assert!(matches!(refusal, MuxRefusal::Attachment { .. }));
   match back {
     DemuxedPacket::Attachment(back) => {
@@ -869,7 +945,7 @@ fn l7_a_time_that_lands_on_no_timestamp_is_refused_by_name() {
     (Some(i64::MIN), Some(0), ms(i64::MIN)),
   ] {
     let offered = restamped(&video[0], 0, pts, dts);
-    match muxer.write_video(offered.clone()) {
+    match refusing!(muxer.write_video(offered.clone())) {
       Err(MuxError::Backend {
         refusal: FfmpegMuxRefusal::Unrepresentable { track, timestamp },
         packet: back,
@@ -936,7 +1012,7 @@ fn l8_presentation_order_is_judged_on_the_counts_libavformat_is_handed() {
     .expect("presented and decoded within one tick: admitted");
 
   let offered = at(&video[1], 300, 400);
-  let (refusal, back) = refused(muxer.write_video(offered.clone()));
+  let (refusal, back) = refused(refusing!(muxer.write_video(offered.clone())));
   match refusal {
     MuxRefusal::PtsBeforeDts { track, pts, dts } => {
       assert_eq!(track.get(), 0);
@@ -1627,7 +1703,7 @@ fn l11_a_negative_duration_is_written_as_libavformat_makes_it() {
     let target = output(&corpus, name);
     let mut muxer = muxer_into(&target, container, table);
     let duration = cue.packet().duration().expect("a duration");
-    let (refusal, back) = by_container(muxer.write_subtitle(cue.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_subtitle(cue.clone())));
     assert_eq!(
       refusal,
       FfmpegMuxRefusal::NegativeDuration {
@@ -1681,7 +1757,7 @@ fn l12_mp4_refuses_times_past_its_32_bit_fields() {
     Some(40),
     40,
   );
-  let (refusal, back) = by_container(muxer.write_video(long.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(long.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::DurationTooLong {
@@ -1692,12 +1768,12 @@ fn l12_mp4_refuses_times_past_its_32_bit_fields() {
   untouched!(long, back);
 
   let gap = video_at(&video_of(&packets[1]), Some(past.pts()), past.pts());
-  let (refusal, back) = by_container(muxer.write_video(gap.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(gap.clone())));
   assert_eq!(refusal, FfmpegMuxRefusal::DtsGap { track, dts: past });
   untouched!(gap, back);
 
   let late = video_at(&video_of(&packets[1]), Some(past.pts()), 40);
-  let (refusal, back) = by_container(muxer.write_video(late.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(late.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::PresentationOffset {
@@ -1719,7 +1795,7 @@ fn l12_mp4_refuses_times_past_its_32_bit_fields() {
     .write_video(video_at(&video_of(&packets[0]), Some(-far), -far))
     .expect("a time far below zero");
   let across = video_at(&video_of(&packets[1]), Some(far), far);
-  let (refusal, _) = by_container(muxer.write_video(across));
+  let (refusal, _) = by_container(refusing!(muxer.write_video(across)));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::DtsGap {
@@ -1751,7 +1827,7 @@ fn l13_a_reordering_stream_needs_a_presentation_time() {
       .write_video(video_at(&video_of(&packets[0]), Some(80), 0))
       .expect("the first packet");
     let offered = video_at(&video_of(&packets[1]), None, 40);
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(
       refusal,
       FfmpegMuxRefusal::MissingPts {
@@ -1771,7 +1847,7 @@ fn l13_a_reordering_stream_needs_a_presentation_time() {
     .write_video(video_at(&video_of(&packets[0]), Some(0), -80))
     .expect("the first packet");
   let offered = video_at(&video_of(&packets[1]), None, -60);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::MissingPts {
@@ -1893,7 +1969,7 @@ fn l14_a_time_before_the_earliest_written_is_moved_as_libavformat_moves_it() {
     .map_err(|error| error.map_packet(drop))
     .expect("moved by 40 ms");
   let late = video_at(&video_of(&bframes[1]), Some(-50), -60);
-  let (refusal, back) = by_container(muxer.write_video(late.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(late.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::BeforeZero {
@@ -1948,7 +2024,7 @@ fn l14_a_time_before_the_earliest_written_is_moved_as_libavformat_moves_it() {
       .expect("video");
   }
   let late = audio_on(1, &audio_of(&audio[0]), -22);
-  let (refusal, back) = by_container(muxer.write_audio(late.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(late.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::BeforeZero {
@@ -1996,7 +2072,7 @@ fn l15_mp4_refuses_a_cue_out_of_order() {
     .map_err(|error| error.map_packet(drop))
     .expect("the first cue");
   let early = cue_on(1, &cue, base, (500, 100));
-  let (refusal, back) = by_container(muxer.write_subtitle(early.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_subtitle(early.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::CueOrder {
@@ -2017,7 +2093,7 @@ fn l15_mp4_refuses_a_cue_out_of_order() {
     table(),
   );
   let before = cue_on(1, &cue, base, (-10, 100));
-  let (refusal, back) = by_container(muxer.write_subtitle(before.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_subtitle(before.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::CueOrder {
@@ -2107,7 +2183,7 @@ fn l17_an_empty_packet_a_container_drops_is_refused() {
     .write_video(video_at(&video_of(&video[0]), Some(0), 0))
     .expect("the first packet");
   let empty = video_at(&video_holding(&video_of(&video[1]), &[]), Some(40), 40);
-  let (refusal, back) = by_container(muxer.write_video(empty.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(empty.clone())));
   assert_eq!(refusal, payload(PayloadRule::Empty));
   untouched!(empty, back);
   muxer.finish().expect("finished");
@@ -2119,7 +2195,7 @@ fn l17_an_empty_packet_a_container_drops_is_refused() {
     audio_table,
   );
   let empty = audio_at(&audio_holding(&audio_of(&audio[0]), &[]), 0);
-  let (refusal, back) = by_container(muxer.write_audio(empty.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(empty.clone())));
   assert_eq!(refusal, payload(PayloadRule::Empty));
   untouched!(empty, back);
   muxer.finish().expect("finished");
@@ -2177,7 +2253,7 @@ fn l18_aac_in_an_adts_header_is_refused_on_a_configured_track() {
           .expect("a raw first packet, which inserts no filter");
       }
       let offered = audio_at(&audio_holding(&raw, &framed), 21);
-      let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+      let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
       assert_eq!(
         refusal,
         payload(PayloadRule::AdtsHeader),
@@ -2199,7 +2275,7 @@ fn l19_mp4_refuses_a_partial_pcm_frame() {
   let mut bytes = whole.data().as_ref().to_vec();
   bytes.push(0);
   let offered = audio_at(&audio_holding(&whole, &bytes), 0);
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::PartialSample));
   untouched!(offered, back);
   muxer
@@ -2229,7 +2305,7 @@ fn l20_av1_whose_obus_do_not_parse_is_refused() {
     let mut bytes = packet.data().as_ref().to_vec();
     bytes[0] |= 0x80;
     let offered = video_at(&video_holding(&packet, &bytes), Some(0), 0);
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(refusal, payload(PayloadRule::Obus), "{name}");
     untouched!(offered, back);
     muxer
@@ -2257,7 +2333,7 @@ fn l21_matroska_refuses_wavpack_that_does_not_parse_whole() {
   over.extend([1, 2, 3]);
   for bytes in [&whole[..whole.len() - 1], &over[..]] {
     let offered = audio_at(&audio_holding(&packet, bytes), 0);
-    let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
     assert_eq!(refusal, payload(PayloadRule::WavPackBlocks));
     untouched!(offered, back);
   }
@@ -2287,7 +2363,7 @@ fn l22_side_data_a_container_refuses_is_refused_by_name() {
     &skip,
   )]);
   let offered = AudioTrackPacket::new(TrackIndex::new(0), skipping);
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::SkipSamples));
   untouched!(offered, back);
 
@@ -2310,7 +2386,7 @@ fn l22_side_data_a_container_refuses_is_refused_by_name() {
     AudioTrackPacket::new(TrackIndex::new(0), packet)
   };
   let offered = with_extradata(&audio_of(&packets[0]), 0, &[1; 10]);
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::FlacStreamInfo));
   untouched!(offered, back);
   muxer
@@ -2333,7 +2409,7 @@ fn l23_matroska_refuses_prores_off_its_atom() {
   assert_eq!(&bytes[4..8], b"icpf", "the premise: a ProRes frame's atom");
   bytes[4] = b'x';
   let offered = video_at(&video_holding(&packet, &bytes), Some(0), 0);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::ProResAtom));
   untouched!(offered, back);
   for (index, packet) in frames.iter().enumerate() {
@@ -2372,7 +2448,7 @@ fn l24_a_webvtt_cue_that_would_not_read_back_is_refused() {
     assert!(!text.ends_with(b"\n"), "the premise: a cue's text");
     text.push(b'\n');
     let offered = subtitle_at(&subtitle_holding(&cue, &text), 0, 1000);
-    let (refusal, back) = by_container(muxer.write_subtitle(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_subtitle(offered.clone())));
     assert_eq!(refusal, payload(PayloadRule::WebVttCue), "{name}");
     untouched!(offered, back);
     muxer
@@ -2403,7 +2479,7 @@ fn l25_mp4_refuses_ac3_it_would_drop_or_refuse() {
   let mut bytes = packet.data().as_ref().to_vec();
   bytes[0] = 0;
   let offered = audio_at(&audio_holding(&packet, &bytes), 0);
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::Ac3Header));
   untouched!(offered, back);
   muxer
@@ -2418,7 +2494,7 @@ fn l25_mp4_refuses_ac3_it_would_drop_or_refuse() {
   tail.extend([1, 2, 3]);
   let mut muxer = muxer_into(&output(&corpus, "l25-eac3.mp4"), ContainerName::MP4, table);
   let offered = audio_at(&audio_holding(&first, &tail), 0);
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::Ac3Substreams));
   untouched!(offered, back);
 
@@ -2437,7 +2513,7 @@ fn l25_mp4_refuses_ac3_it_would_drop_or_refuse() {
     .write_audio(audio_at(&audio_holding(&first, &three), 0))
     .expect("three blocks, held back");
   let six = audio_at(&audio_of(&packets[1]), 32);
-  let (refusal, back) = by_container(muxer.write_audio(six.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(six.clone())));
   assert_eq!(refusal, payload(PayloadRule::Ac3Blocks));
   untouched!(six, back);
 }
@@ -2816,7 +2892,7 @@ fn l29_a_transport_streams_adts_aac_is_converted_and_reported() {
       filters(false),
     );
     let framed = audio_at(&audio_of(&frames[0]), 0);
-    let (refusal, back) = by_container(muxer.write_audio(framed.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(framed.clone())));
     assert_eq!(refusal, payload(PayloadRule::AdtsHeader), "{name}");
     untouched!(framed, back);
     muxer.finish().expect("finished");
@@ -2832,7 +2908,7 @@ fn l29_a_transport_streams_adts_aac_is_converted_and_reported() {
   let mut two = first.data().as_ref().to_vec();
   two.extend_from_slice(audio_of(&frames[1]).data().as_ref());
   let offered = audio_at(&audio_holding(&first, &two), 0);
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::AdtsFrame));
   untouched!(offered, back);
 }
@@ -3200,7 +3276,7 @@ fn l35_vp9_hidden_frames_join_a_superframe() {
       .expect("up to six hidden frames held");
   }
   let seventh = video_at(&video_holding(&frame, &hidden(4)), Some(400), 400);
-  let (refusal, back) = by_container(muxer.write_video(seventh.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(seventh.clone())));
   assert_eq!(refusal, payload(PayloadRule::Superframe));
   untouched!(seventh, back);
   muxer
@@ -3567,7 +3643,7 @@ fn l39_a_truncated_program_config_element_is_refused() {
     );
     for element in [&BARE_PCE[..5], &BARE_PCE[..]] {
       let cut = audio_at(&audio_holding(&frame, &adts_with(element)), 0);
-      let (refusal, back) = by_container(muxer.write_audio(cut.clone()));
+      let (refusal, back) = by_container(refusing!(muxer.write_audio(cut.clone())));
       assert_eq!(refusal, payload(PayloadRule::AdtsFrame), "{container}");
       untouched!(cut, back);
     }
@@ -3660,7 +3736,7 @@ fn l40_hdr_metadata_reaches_matroska_only_whole() {
     ),
   ] {
     let offered = with(0, entries);
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(refusal, payload(rule));
     untouched!(offered, back);
   }
@@ -3704,7 +3780,7 @@ fn l40_hdr_metadata_reaches_matroska_only_whole() {
       side(T::AV_PKT_DATA_A53_CC, &[2]),
     ],
   );
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::SideDataRepeated));
   untouched!(offered, back);
 }
@@ -3736,7 +3812,7 @@ fn l41_mp4_refuses_the_ac3_its_trailer_would_fail_on() {
   };
   let first = audio_of(&frames[0]);
   let offered = audio_at(&recoded(&first), 0);
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::Ac3BitStreamId));
   untouched!(offered, back);
   muxer
@@ -3922,7 +3998,7 @@ fn l43_new_extradata_a_container_would_refuse_is_refused() {
   let own = table[0].side_data().extradata().to_vec();
   let mut muxer = muxer_into(&output(&corpus, "l43-opus.mp4"), ContainerName::MP4, table);
   let offered = carrying(&audio_of(&frames[0]), 0, new_extradata(b"OpusHead"));
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::NewExtradata));
   untouched!(offered, back);
   muxer
@@ -3945,7 +4021,7 @@ fn l43_new_extradata_a_container_would_refuse_is_refused() {
     .extra_mut()
     .set_side_data(new_extradata(&[0, 0, 0, 1, 0x67, 0x42, 0, 0x0A]));
   let offered = VideoTrackPacket::new(TrackIndex::new(0), inner);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(
     refusal,
     payload(PayloadRule::NewExtradata),
@@ -3957,7 +4033,7 @@ fn l43_new_extradata_a_container_would_refuse_is_refused() {
   let (table, frames) = first_track(&flac, TrackKind::Audio, 1);
   let mut muxer = muxer_into(&output(&corpus, "l43-flac.mp4"), ContainerName::MP4, table);
   let offered = carrying(&audio_of(&frames[0]), 0, new_extradata(&[0; 33]));
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::FlacStreamInfo));
   untouched!(offered, back);
 
@@ -3985,7 +4061,7 @@ fn l43_new_extradata_a_container_would_refuse_is_refused() {
   // longer than the space Matroska's header reserved, the track's own.
   for bytes in [vec![0x11, 0xF8], config(he.len() + 1)] {
     let offered = carrying(&audio_of(&frames[0]), 0, new_extradata(&bytes));
-    let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
     assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{bytes:?}");
     untouched!(offered, back);
   }
@@ -4013,7 +4089,7 @@ fn l43_new_extradata_a_container_would_refuse_is_refused() {
     table,
   );
   let offered = carrying(&audio_of(&frames[0]), 0, new_extradata(&config(stated)));
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::NewExtradata), "AAC LC's");
   untouched!(offered, back);
 }
@@ -4327,7 +4403,7 @@ fn l45_mp4_spelled_in_any_case_meets_mp4s_rules() {
       .write_video(video_at(&video_of(&packets[0]), Some(0), 0))
       .expect("the first packet");
     let gap = video_at(&video_of(&packets[1]), Some(past.pts()), past.pts());
-    let (refusal, back) = by_container(muxer.write_video(gap.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(gap.clone())));
     assert_eq!(
       refusal,
       FfmpegMuxRefusal::DtsGap { track, dts: past },
@@ -4339,7 +4415,7 @@ fn l45_mp4_spelled_in_any_case_meets_mp4s_rules() {
       Some(40),
       40,
     );
-    let (refusal, _) = by_container(muxer.write_video(long));
+    let (refusal, _) = by_container(refusing!(muxer.write_video(long)));
     assert_eq!(
       refusal,
       FfmpegMuxRefusal::DurationTooLong {
@@ -4426,7 +4502,7 @@ fn l47_webm_spelled_in_capitals_meets_webms_rules() {
       .expect("up to six hidden frames held");
   }
   let seventh = video_at(&video_holding(&frame, &hidden), Some(240), 240);
-  let (refusal, back) = by_container(muxer.write_video(seventh.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(seventh.clone())));
   assert_eq!(refusal, payload(PayloadRule::Superframe));
   untouched!(seventh, back);
 }
@@ -4502,7 +4578,7 @@ fn l48_ivfs_vp9_superframes_are_bounded_with_the_filters_off() {
     Some(80),
     80,
   );
-  let (refusal, back) = by_container(muxer.write_video(third.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(third.clone())));
   assert_eq!(refusal, payload(PayloadRule::SuperframeSize));
   untouched!(third, back);
   muxer
@@ -4561,7 +4637,7 @@ fn l49_matroska_bounds_the_blocks_its_filters_put_out() {
   }
   for offered in [vp9_frame(40, false, 3), vp9_frame(20, true, 4)] {
     let packet = video_at(&video_holding(&frame, &offered), Some(80), 80);
-    let (refusal, back) = by_container(muxer.write_video(packet.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(packet.clone())));
     assert_eq!(refusal, payload(PayloadRule::ClusterSize), "{offered:?}");
     untouched!(packet, back);
   }
@@ -4605,7 +4681,7 @@ fn l50_aacs_filter_is_mirrored_in_another_container() {
     table_of(&ts, TrackKind::Audio),
   );
   let cut = audio_at(&audio_holding(&frame, &adts_with(&BARE_PCE[..5])), 0);
-  let (refusal, back) = by_container(muxer.write_audio(cut.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(cut.clone())));
   assert_eq!(refusal, payload(PayloadRule::AdtsFrame));
   untouched!(cut, back);
   muxer
@@ -4620,7 +4696,7 @@ fn l50_aacs_filter_is_mirrored_in_another_container() {
     table_of(&ts, TrackKind::Audio),
   );
   let bare = audio_at(&audio_holding(&frame, &[0x21, 0x10, 0x05]), 0);
-  let (refusal, back) = by_container(muxer.write_audio(bare.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(bare.clone())));
   assert_eq!(
     refusal,
     payload(PayloadRule::ConfigurationAbsent),
@@ -4636,7 +4712,7 @@ fn l50_aacs_filter_is_mirrored_in_another_container() {
     .map_err(|error| error.map_packet(drop))
     .expect("a raw first packet bringing its configuration");
   let framed = audio_at(&audio_holding(&frame, &adts_with(&BARE_PCE[..5])), 21);
-  let (refusal, back) = by_container(muxer.write_audio(framed.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(framed.clone())));
   assert_eq!(
     refusal,
     payload(PayloadRule::AdtsHeader),
@@ -4730,7 +4806,7 @@ fn l51_hdr10_plus_reaches_matroska_where_libavutil_round_trips_it() {
     table_of(&source, TrackKind::Video),
   );
   let refused = with(0, Some(&unwritten));
-  let (refusal, back) = by_container(muxer.write_video(refused.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(refused.clone())));
   assert_eq!(refusal, payload(PayloadRule::DynamicHdrPlus));
   untouched!(refused, back);
   muxer
@@ -4853,7 +4929,7 @@ fn l53_mov_text_cues_are_judged_from_the_samples_mp4_writes_around_them() {
     table_of(&source, TrackKind::Subtitle),
   );
   let first = subtitle_ticks(&cue, base, far, 1000);
-  let (refusal, back) = by_container(muxer.write_subtitle(first.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_subtitle(first.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::DtsGap {
@@ -4862,7 +4938,9 @@ fn l53_mov_text_cues_are_judged_from_the_samples_mp4_writes_around_them() {
     }
   );
   untouched!(first, back);
-  let (refusal, _) = by_container(muxer.write_subtitle(subtitle_ticks(&cue, base, 0, edge)));
+  let (refusal, _) = by_container(refusing!(
+    muxer.write_subtitle(subtitle_ticks(&cue, base, 0, edge))
+  ));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::DurationTooLong {
@@ -4912,7 +4990,7 @@ fn l54_mp4s_ttml_is_judged_by_the_sample_it_joins() {
   let edge = i64::from(i32::MAX);
   let mut muxer = muxer_into(&output(&corpus, "l54.mp4"), ContainerName::MP4, table);
   let past = subtitle_ticks(&paragraph, base, edge + 1, 0);
-  let (refusal, back) = by_container(muxer.write_subtitle(past.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_subtitle(past.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::DocumentSpan {
@@ -4993,7 +5071,7 @@ fn l55_what_a_packets_builder_refuses_is_refused_with_the_packet_back() {
     (trusted, PayloadRule::Trusted),
   ] {
     let offered = with(packet);
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(refusal, payload(rule));
     untouched!(offered, back);
   }
@@ -5011,7 +5089,7 @@ fn l55_what_a_packets_builder_refuses_is_refused_with_the_packet_back() {
       .with_pts(Some(ms(0)))
       .with_dts(Some(ms(0))),
   );
-  let (refusal, back) = by_container(muxer.write_video(large.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(large.clone())));
   assert_eq!(refusal, payload(PayloadRule::PayloadTooLarge));
   untouched!(large, back);
 
@@ -5169,7 +5247,7 @@ fn l57_mp4_judges_e_ac3_from_the_last_sample_it_wrote() {
   };
   let gap = |muxer: &mut FfmpegOwnedMuxer<File>, dts: i64| {
     let offered = audio_ticks(&one, dts, 256);
-    let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
     assert_eq!(
       refusal,
       FfmpegMuxRefusal::DtsGap {
@@ -5246,7 +5324,7 @@ fn l58_mp4_joins_e_ac3_within_the_largest_packet() {
         .expect("the sample at the bound");
       muxer.finish().expect("finished");
     } else {
-      let (refusal, back) = by_container(muxer.write_audio(sixth.clone()));
+      let (refusal, back) = by_container(refusing!(muxer.write_audio(sixth.clone())));
       assert_eq!(refusal, payload(PayloadRule::Ac3SampleSize), "{name}");
       untouched!(sixth, back);
     }
@@ -5686,7 +5764,7 @@ fn l65_mp4_takes_cues_before_the_last_ones_end_as_it_writes_them() {
     table_of(&source, TrackKind::Subtitle),
   );
   let before = cue_on(0, &cue, base, (-30, 10));
-  let (refusal, back) = by_container(muxer.write_subtitle(before.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_subtitle(before.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::CueOrder {
@@ -5743,7 +5821,7 @@ fn l66_beside_another_track_an_early_cue_is_taken_only_where_none_can_end_it_fir
       .expect("video");
     let early = cue_on(1, &cue, base, (50 * per_ms, 100 * per_ms));
     if beside_finer {
-      let (refusal, back) = by_container(muxer.write_subtitle(early.clone()));
+      let (refusal, back) = by_container(refusing!(muxer.write_subtitle(early.clone())));
       assert_eq!(
         refusal,
         FfmpegMuxRefusal::CueOrder {
@@ -5763,7 +5841,7 @@ fn l66_beside_another_track_an_early_cue_is_taken_only_where_none_can_end_it_fir
         .map_err(|error| error.map_packet(drop))
         .expect("video 11 s ahead");
       let late = cue_on(1, &cue, base, (60 * per_ms, 10 * per_ms));
-      let (refusal, back) = by_container(muxer.write_subtitle(late.clone()));
+      let (refusal, back) = by_container(refusing!(muxer.write_subtitle(late.clone())));
       assert_eq!(
         refusal,
         FfmpegMuxRefusal::CueOrder {
@@ -5845,7 +5923,7 @@ fn l67_a_configured_aac_tracks_first_packet_decides_its_filter() {
       // output one for this configuration's: the track entry would read
       // back corrupt (`matroskaenc.c` 3076–3081, 2129–2135).
       let first = audio_at(&audio_holding(&raw, &framed), 0);
-      let (refusal, back) = by_container(muxer.write_audio(first.clone()));
+      let (refusal, back) = by_container(refusing!(muxer.write_audio(first.clone())));
       assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{name}");
       untouched!(first, back);
       muxer
@@ -5891,7 +5969,7 @@ fn l67_a_configured_aac_tracks_first_packet_decides_its_filter() {
       table_of(&source, TrackKind::Audio),
     );
     if container == ContainerName::MATROSKA {
-      let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+      let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
       assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{name}");
       untouched!(offered, back);
     } else {
@@ -6073,7 +6151,7 @@ fn l69_every_mirror_moves_on_what_a_filter_puts_out() {
     .expect("audio 10 s on: libavformat's first write");
   assert!(!shifted(&muxer), "nothing early reached libavformat");
   let end = segment(1, -39_999);
-  let (refusal, back) = by_container(muxer.write_subtitle(end.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_subtitle(end.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::BeforeZero {
@@ -6154,7 +6232,7 @@ fn l70_flv_refuses_a_packet_before_the_first_it_wrote() {
     )
   };
   let early = sound(2_000);
-  let (refusal, back) = by_container(muxer.write_audio(early.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(early.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::BeforeFirstDts {
@@ -6411,7 +6489,7 @@ fn l72_a_configurations_packet_is_taken_where_the_container_takes_it() {
     .map_err(|error| error.map_packet(drop))
     .expect("a frame");
   let short = configuration(&frame, 0, 10, &streaminfo[..33]);
-  let (refusal, back) = by_container(muxer.write_audio(short.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(short.clone())));
   assert_eq!(
     refusal,
     payload(PayloadRule::FlacStreamInfo),
@@ -6434,7 +6512,7 @@ fn l72_a_configurations_packet_is_taken_where_the_container_takes_it() {
     }]
   );
   let late = audio_at(&frame, 44_739_301);
-  let (refusal, back) = by_container(muxer.write_audio(late.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(late.clone())));
   assert!(
     matches!(refusal, FfmpegMuxRefusal::DtsGap { .. }),
     "counted from the last sample, not the configuration's packet: {refusal:?}"
@@ -6467,7 +6545,7 @@ fn l72_a_configurations_packet_is_taken_where_the_container_takes_it() {
     .extra_mut()
     .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &[1, 2, 3, 4])]);
   let empty = VideoTrackPacket::new(TrackIndex::new(0), empty);
-  let (refusal, back) = by_container(muxer.write_video(empty.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(empty.clone())));
   assert_eq!(refusal, payload(PayloadRule::Empty), "MP4's H.264 drops it");
   untouched!(empty, back);
   muxer.finish().expect("finished");
@@ -6527,7 +6605,7 @@ fn l72_a_configurations_packet_is_taken_where_the_container_takes_it() {
     .map_err(|error| error.map_packet(drop))
     .expect("a frame");
   let unreserved = configuration(&frame, 0, 21, &lc_mono);
-  let (refusal, back) = by_container(muxer.write_audio(unreserved.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(unreserved.clone())));
   assert_eq!(refusal, payload(PayloadRule::NewExtradata), "AAC LC's");
   untouched!(unreserved, back);
   muxer.finish().expect("finished");
@@ -6545,7 +6623,7 @@ fn l72_a_configurations_packet_is_taken_where_the_container_takes_it() {
     .map_err(|error| error.map_packet(drop))
     .expect("a frame");
   let ignored = configuration(&frame, 0, 32, &[1, 2, 3]);
-  let (refusal, back) = by_container(muxer.write_audio(ignored.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(ignored.clone())));
   assert_eq!(
     refusal,
     payload(PayloadRule::Empty),
@@ -7067,7 +7145,7 @@ fn l75_the_adts_muxer_refuses_what_its_headers_cannot_carry() {
     (long, PayloadRule::AdtsFrameLength),
     (empty, PayloadRule::Empty),
   ] {
-    let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
     assert_eq!(refusal, payload(rule), "{rule:?}");
     untouched!(offered, back);
   }
@@ -7087,7 +7165,7 @@ fn l75_the_adts_muxer_refuses_what_its_headers_cannot_carry() {
   let unframed = audio_on_zero(audio_holding(&first, &payload_of(bytes)));
   let target = output(&corpus, "l75-configures.adts");
   let mut muxer = muxer_into(&target, adts(), table);
-  let (refusal, back) = by_container(muxer.write_audio(unframed.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(unframed.clone())));
   assert_eq!(
     refusal,
     payload(PayloadRule::AdtsFrame),
@@ -7099,7 +7177,7 @@ fn l75_the_adts_muxer_refuses_what_its_headers_cannot_carry() {
     .extra_mut()
     .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &usac)]);
   let configuring = audio_on_zero(configuring);
-  let (refusal, back) = by_container(muxer.write_audio(configuring.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(configuring.clone())));
   assert_eq!(refusal, payload(PayloadRule::NewExtradata), "USAC's");
   untouched!(configuring, back);
   // AAC LC at 48 kHz, stereo: from here on, a header before each frame.
@@ -7127,7 +7205,7 @@ fn l75_the_adts_muxer_refuses_what_its_headers_cannot_carry() {
       .with_pts(Some(after))
       .with_dts(Some(after)),
   );
-  let (refusal, back) = by_container(muxer.write_audio(framed.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(framed.clone())));
   assert_eq!(refusal, payload(PayloadRule::AdtsHeader), "configured now");
   untouched!(framed, back);
   muxer.finish().expect("finished");
@@ -7207,7 +7285,7 @@ fn l76_flac_and_mp3_refuse_what_they_would_not_write() {
     .map_err(|error| error.map_packet(drop))
     .expect("a frame");
   let empty = audio_on_zero(audio_holding(&frame, &[]));
-  let (refusal, back) = by_container(muxer.write_audio(empty.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(empty.clone())));
   assert_eq!(refusal, payload(PayloadRule::Empty));
   untouched!(empty, back);
   let mut updated = streaminfo.clone();
@@ -7368,7 +7446,7 @@ fn l78_wav_refuses_a_file_past_its_32_bit_size() {
   let mut taken = 0;
   let refused = frames.iter().find_map(|frame| {
     let offered = audio_on_zero(audio_of(frame));
-    match muxer.write_audio(offered.clone()) {
+    match refusing!(muxer.write_audio(offered.clone())) {
       Ok(()) => {
         taken += 1;
         None
@@ -7423,7 +7501,7 @@ fn l79_a_raw_stream_refuses_what_it_would_write_unreadable() {
     filters(false),
   );
   let offered = video_at(&video_of(&video[0]), Some(0), 0);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::StartCode), "length-prefixed");
   untouched!(offered, back);
   muxer.finish().expect("finished");
@@ -7451,7 +7529,7 @@ fn l79_a_raw_stream_refuses_what_it_would_write_unreadable() {
     table,
   );
   let offered = video_at(&video_of(&video[0]), Some(0), 0);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::InBandConfiguration));
   untouched!(offered, back);
   muxer.finish().expect("finished");
@@ -7464,7 +7542,7 @@ fn l79_a_raw_stream_refuses_what_it_would_write_unreadable() {
     table,
   );
   let empty = audio_on_zero(audio_holding(&audio_of(&audio[0]), &[]));
-  let (refusal, back) = by_container(muxer.write_audio(empty.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(empty.clone())));
   assert_eq!(refusal, payload(PayloadRule::Empty));
   untouched!(empty, back);
   muxer.finish().expect("finished");
@@ -7764,7 +7842,7 @@ fn l82_flv_refuses_what_its_tags_cannot_carry() {
       },
     ),
   ] {
-    let (refused, back) = by_container(muxer.write_video(offered.clone()));
+    let (refused, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(refused, refusal);
     untouched!(offered, back);
   }
@@ -7774,7 +7852,7 @@ fn l82_flv_refuses_what_its_tags_cannot_carry() {
       .with_pts(Some(ms(120)))
       .with_dts(Some(ms(120))),
   );
-  let (refused, back) = by_container(muxer.write_video(large.clone()));
+  let (refused, back) = by_container(refusing!(muxer.write_video(large.clone())));
   assert_eq!(
     refused,
     payload(PayloadRule::TagSize),
@@ -7792,7 +7870,7 @@ fn l82_flv_refuses_what_its_tags_cannot_carry() {
     filters(false),
   );
   let framed = audio_on_zero(audio_holding(&raw, &adts_frame_of(raw.data().as_ref(), 2)));
-  let (refused, back) = by_container(muxer.write_audio(framed.clone()));
+  let (refused, back) = by_container(refusing!(muxer.write_audio(framed.clone())));
   assert_eq!(
     refused,
     payload(PayloadRule::AdtsHeader),
@@ -7808,7 +7886,7 @@ fn l82_flv_refuses_what_its_tags_cannot_carry() {
   let unframed = audio_holding(&first, &bytes[if bytes[1] & 1 == 1 { 7 } else { 9 }..]);
   let mut muxer = muxer_into(&output(&corpus, "l82-absent.flv"), flv(), table);
   let bare = audio_on_zero(unframed.clone());
-  let (refused, back) = by_container(muxer.write_audio(bare.clone()));
+  let (refused, back) = by_container(refusing!(muxer.write_audio(bare.clone())));
   assert_eq!(refused, payload(PayloadRule::ConfigurationAbsent));
   untouched!(bare, back);
   let mut configuring = unframed;
@@ -7955,7 +8033,7 @@ fn l84_avi_refuses_what_it_cannot_place() {
     .map_err(|error| error.map_packet(drop))
     .expect("60 000 empty frames before it");
   let far = video_at(&frame, Some(120_003), 120_003);
-  let (refusal, back) = by_container(muxer.write_video(far.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(far.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::FrameGap {
@@ -7970,7 +8048,7 @@ fn l84_avi_refuses_what_it_cannot_place() {
   let (table, video) = first_track(&h264, TrackKind::Video, 1);
   let mut muxer = muxer_into(&output(&corpus, "l84-h264.avi"), avi(), table);
   let offered = video_at(&video_of(&video[0]), Some(0), 0);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(
     refusal,
     payload(PayloadRule::StartCode),
@@ -8364,7 +8442,7 @@ fn l86_asf_refuses_a_time_past_its_field() {
     .map_err(|error| error.map_packet(drop))
     .expect("within the field");
   let past = at((1 << 32) - 3100);
-  let (refusal, back) = by_container(muxer.write_video(past.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::TimeWraps {
@@ -8424,7 +8502,7 @@ fn l86_asf_refuses_a_time_past_its_field() {
     .map_err(|error| error.map_packet(drop))
     .expect("the first");
   let far = presented(2_147_479_996_901, 40);
-  let (refusal, back) = by_container(muxer.write_video(far.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(far.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::PresentationOffset {
@@ -8464,7 +8542,7 @@ fn l86_asf_refuses_a_time_past_its_field() {
   };
   // (80 + 3100 + duration) · 10^4 within `i64::MAX`.
   let long = lasting(80, 922_337_203_682_298);
-  let (refusal, back) = by_container(muxer.write_video(long.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(long.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::DurationTooLong {
@@ -8483,7 +8561,7 @@ fn l86_asf_refuses_a_time_past_its_field() {
       .with_pts(Some(ms(120)))
       .with_dts(Some(ms(120))),
   );
-  let (refusal, back) = by_container(muxer.write_video(empty.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(empty.clone())));
   assert_eq!(refusal, payload(PayloadRule::Empty));
   untouched!(empty, back);
   muxer.finish().expect("finished");
@@ -8741,7 +8819,7 @@ fn l90_nut_refuses_what_its_frames_and_index_cannot_hold() {
   };
   let mut muxer = muxer_into(&output(&corpus, "l90-keys.nut"), nut(), table);
   let offered = at(None, 0, true);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(refusal, FfmpegMuxRefusal::MissingPts { track });
   untouched!(offered, back);
   for (pts, dts, key) in [(200, 0, true), (220, 40, false)] {
@@ -8752,7 +8830,7 @@ fn l90_nut_refuses_what_its_frames_and_index_cannot_hold() {
   }
   for (pts, dts) in [(100, 80), (200, 80)] {
     let offered = at(Some(pts), dts, true);
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(
       refusal,
       FfmpegMuxRefusal::KeyFrameOrder {
@@ -8791,7 +8869,7 @@ fn l90_nut_refuses_what_its_frames_and_index_cannot_hold() {
       .expect("audio");
   }
   let early = at(Some(40), -80, true);
-  let (refusal, back) = by_container(muxer.write_video(early.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(early.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::BeforeZero {
@@ -8828,7 +8906,7 @@ fn l90_nut_refuses_what_its_frames_and_index_cannot_hold() {
     .map_err(|error| error.map_packet(drop))
     .expect("the first frame");
   let offered = at(Some(ok_ms + 1), ok_ms - 1, true);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::TimeWraps {
@@ -9477,7 +9555,7 @@ fn l92_ogg_refuses_what_its_start_and_granules_cannot_hold() {
     table,
   );
   let empty = VideoTrackPacket::new(track, video_holding(&frame, &[]));
-  let (refusal, back) = by_container(muxer.write_video(empty.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(empty.clone())));
   assert_eq!(refusal, payload(PayloadRule::Empty));
   untouched!(empty, back);
   let lasting = |pts: i64, duration: i64| {
@@ -9496,7 +9574,7 @@ fn l92_ogg_refuses_what_its_start_and_granules_cannot_hold() {
     (lasting(wrap - 40, 40), wrap - 40),
     (lasting(wrap - 40, 0), wrap - 40),
   ] {
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(
       refusal,
       FfmpegMuxRefusal::TimeWraps {
@@ -9531,7 +9609,7 @@ fn l92_ogg_refuses_what_its_start_and_granules_cannot_hold() {
     )
   };
   let past = theora_frame((1 << 57) - 1);
-  let (refusal, back) = by_container(muxer.write_video(past.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::TimeWraps {
@@ -9569,7 +9647,7 @@ fn l92_ogg_refuses_what_its_start_and_granules_cannot_hold() {
     AudioTrackPacket::new(track, packet)
   };
   let unset = ending(-961 - i64::from(skip), &frames[0], None);
-  let (refusal, back) = by_container(muxer.write_audio(unset.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(unset.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::UnsetGranule {
@@ -9583,7 +9661,7 @@ fn l92_ogg_refuses_what_its_start_and_granules_cannot_hold() {
     .map_err(|error| error.map_packet(drop))
     .expect("ending at zero; the first packet's metadata ignored");
   let malformed = ending(-i64::from(skip), &frames[1], Some(b"title\0later"));
-  let (refusal, back) = by_container(muxer.write_audio(malformed.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(malformed.clone())));
   assert_eq!(refusal, payload(PayloadRule::MetadataUpdate));
   untouched!(malformed, back);
   muxer
@@ -9853,7 +9931,7 @@ fn l94_mpeg_ps_refuses_what_its_ids_and_headers_cannot_hold() {
     table,
   );
   let empty = audio_at(&audio_holding(&audio_of(&frames[0]), &[]), 0);
-  let (refusal, back) = by_container(muxer.write_audio(empty.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(empty.clone())));
   assert_eq!(refusal, payload(PayloadRule::Empty));
   untouched!(empty, back);
   muxer.finish().expect("finished");
@@ -9879,7 +9957,7 @@ fn l94_mpeg_ps_refuses_what_its_ids_and_headers_cannot_hold() {
     .map_err(|error| error.map_packet(drop))
     .expect("the first");
   let far = ending(i64::MAX / 2 + 1);
-  let (refusal, back) = by_container(muxer.write_audio(far.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(far.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::TimeWraps {
@@ -9901,7 +9979,7 @@ fn l94_mpeg_ps_refuses_what_its_ids_and_headers_cannot_hold() {
     dvd_pcm(48_000),
   );
   let short = audio_at(&audio_holding(&audio_of(&frames[0]), &[0, 1]), 0);
-  let (refusal, back) = by_container(muxer.write_audio(short.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(short.clone())));
   assert_eq!(refusal, payload(PayloadRule::PcmHeader));
   untouched!(short, back);
   muxer
@@ -10239,12 +10317,12 @@ fn l96_mpeg_ts_refuses_what_its_pmt_and_pes_cannot_hold() {
   let track = TrackIndex::new(0);
   let mut muxer = muxer_with(&output(&corpus, "l96-h264.ts"), ts(), table, filters(false));
   let missing = video_at(&frame, None, 0);
-  let (refusal, back) = by_container(muxer.write_video(missing.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(missing.clone())));
   assert_eq!(refusal, FfmpegMuxRefusal::MissingPts { track });
   untouched!(missing, back);
   for bytes in [frame.data().as_ref().to_vec(), vec![0, 0, 1, 0x65]] {
     let offered = video_at(&video_holding(&frame, &bytes), Some(0), 0);
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(refusal, payload(PayloadRule::StartCode));
     untouched!(offered, back);
   }
@@ -10259,7 +10337,7 @@ fn l96_mpeg_ts_refuses_what_its_pmt_and_pes_cannot_hold() {
     (vec![], PayloadRule::Empty),
   ] {
     let offered = audio_at(&audio_holding(&raw, &bytes), 0);
-    let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
     assert_eq!(refusal, payload(rule), "{} bytes", bytes.len());
     untouched!(offered, back);
   }
@@ -10291,7 +10369,7 @@ fn l96_mpeg_ts_refuses_what_its_pmt_and_pes_cannot_hold() {
     .map_err(|error| error.map_packet(drop))
     .expect("the first");
   let far = at(i64::MAX / 600 + 1);
-  let (refusal, back) = by_container(muxer.write_audio(far.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(far.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::TimeWraps {
@@ -10312,7 +10390,7 @@ fn l96_mpeg_ts_refuses_what_its_pmt_and_pes_cannot_hold() {
     .collect();
   let mut muxer = muxer_with(&output(&corpus, "l96-bare.ts"), ts(), bare, filters(false));
   let offered = audio_at(&raw, 0);
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::AdtsFrame));
   untouched!(offered, back);
   muxer.finish().expect("finished");
@@ -10609,7 +10687,7 @@ fn l88_riff_formats_take_aac_raw_and_asf_marks_its_audio() {
       table_of(&source, TrackKind::Audio),
     );
     let offered = audio_at(&audio_holding(&raw, &framed), 0);
-    let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
     assert_eq!(refusal, payload(PayloadRule::AdtsHeader), "{container}");
     untouched!(offered, back);
     muxer
@@ -11184,7 +11262,7 @@ fn l99_mxf_refuses_what_its_frame_parsers_and_interleaving_lose() {
     .map_err(|error| error.map_packet(drop))
     .expect("an intra picture");
   let predicted = video_at(&video_of(&frames[1]), Some(40), 40);
-  let (refusal, back) = by_container(muxer.write_video(predicted.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(predicted.clone())));
   assert_eq!(refusal, payload(PayloadRule::PredictedPicture));
   untouched!(predicted, back);
   // The intra picture with its first picture header's coding type 0, then
@@ -11204,12 +11282,12 @@ fn l99_mxf_refuses_what_its_frame_parsers_and_interleaving_lose() {
   simple[extension + 4] = (simple[extension + 4] & 0xf8) | 5;
   for bytes in [untyped, simple] {
     let offered = video_at(&video_holding(&video_of(&frames[0]), &bytes), Some(40), 40);
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(refusal, payload(PayloadRule::FrameHeader));
     untouched!(offered, back);
   }
   let empty = video_at(&video_holding(&video_of(&frames[0]), &[]), Some(40), 40);
-  let (refusal, back) = by_container(muxer.write_video(empty.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(empty.clone())));
   assert_eq!(refusal, payload(PayloadRule::Empty));
   untouched!(empty, back);
   muxer
@@ -11226,7 +11304,7 @@ fn l99_mxf_refuses_what_its_frame_parsers_and_interleaving_lose() {
   unnamed[0x2b] ^= 0x40;
   for bytes in [first[..43].to_vec(), unnamed] {
     let offered = video_at(&video_holding(&video_of(&frames[0]), &bytes), Some(0), 0);
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(refusal, payload(PayloadRule::FrameHeader));
     untouched!(offered, back);
   }
@@ -11237,7 +11315,7 @@ fn l99_mxf_refuses_what_its_frame_parsers_and_interleaving_lose() {
   let mut longer = video_of(&frames[1]).data().as_ref().to_vec();
   longer.push(0);
   let offered = video_at(&video_holding(&video_of(&frames[1]), &longer), Some(40), 40);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::FrameSize));
   untouched!(offered, back);
   muxer
@@ -11261,7 +11339,7 @@ fn l99_mxf_refuses_what_its_frame_parsers_and_interleaving_lose() {
     Some(0),
     0,
   );
-  let (refusal, back) = by_container(muxer.write_video(short.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(short.clone())));
   assert_eq!(refusal, payload(PayloadRule::FrameSize));
   untouched!(short, back);
   muxer
@@ -11780,7 +11858,7 @@ fn l103_the_mov_familys_held_samples_and_nero_chapters() {
     .map_err(|error| error.map_packet(drop))
     .expect("within the bound");
   let next = AudioTrackPacket::new(TrackIndex::new(0), audio_of(&frames[1]));
-  let (refusal, back) = by_container(muxer.write_audio(next.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(next.clone())));
   assert_eq!(refusal, payload(PayloadRule::FragmentSize));
   untouched!(next, back);
   muxer.finish().expect("finished");
@@ -11799,7 +11877,7 @@ fn l103_the_mov_familys_held_samples_and_nero_chapters() {
     .map_err(|error| error.map_packet(drop))
     .expect("the first frame");
   let next = VideoTrackPacket::new(TrackIndex::new(0), video_of(&frames[1]));
-  let (refusal, back) = by_container(muxer.write_video(next.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(next.clone())));
   assert_eq!(refusal, payload(PayloadRule::FragmentSize));
   untouched!(next, back);
   muxer.finish().expect("finished");
@@ -11874,7 +11952,7 @@ fn l104_wav_refuses_a_fact_count_past_its_32_bits() {
     let time_base = packet.pts().expect("a time").timebase();
     let offered =
       audio_on_zero(packet.with_duration(Some(Timestamp::new(lengths[index], time_base))));
-    let result = muxer.write_audio(offered.clone());
+    let result = refusing!(muxer.write_audio(offered.clone()));
     if index < expected {
       result
         .map_err(|error| error.map_packet(drop))
@@ -12459,7 +12537,7 @@ fn l111_after_the_first_write_each_container_writes_its_own_earliest() {
     };
     if let Some(past) = refused {
       let offered = sound(past);
-      let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+      let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
       assert_eq!(
         refusal,
         FfmpegMuxRefusal::BeforeZero {
@@ -12550,7 +12628,7 @@ fn l108_a_tracks_first_packet_brings_the_configuration_where_the_container_takes
     );
     let first = audio_of(&frames[0]);
     let raw = audio_on_zero(first.clone());
-    let (refusal, back) = by_container(muxer.write_audio(raw.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(raw.clone())));
     assert_eq!(refusal, payload(PayloadRule::ConfigurationAbsent), "{name}");
     untouched!(raw, back);
     // The configuration's packet a tick before the first frame: a strict
@@ -12565,7 +12643,7 @@ fn l108_a_tracks_first_packet_brings_the_configuration_where_the_container_takes
     };
     if name.ends_with(".mkv") {
       let unparsed = bringing(&before, &[], &[0xF8, 0x86, 0x40, 0x00]);
-      let (refusal, back) = by_container(muxer.write_audio(unparsed.clone()));
+      let (refusal, back) = by_container(refusing!(muxer.write_audio(unparsed.clone())));
       assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{name}");
       untouched!(unparsed, back);
     }
@@ -12591,7 +12669,7 @@ fn l108_a_tracks_first_packet_brings_the_configuration_where_the_container_takes
       &audio_of(&frames[3]),
       &adts_frame_of(audio_of(&frames[3]).data().as_ref(), 2),
     ));
-    let (refusal, back) = by_container(muxer.write_audio(framed.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(framed.clone())));
     assert_eq!(refusal, payload(PayloadRule::AdtsHeader), "{name}");
     untouched!(framed, back);
     muxer.finish().expect("finished");
@@ -12624,7 +12702,7 @@ fn l108_a_tracks_first_packet_brings_the_configuration_where_the_container_takes
   let mut muxer = muxer_into(&target, ContainerName::MP4, unconfigured());
   let first = audio_of(&frames[0]);
   let short = bringing(&first, first.data().as_ref(), &streaminfo[..33]);
-  let (refusal, back) = by_container(muxer.write_audio(short.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(short.clone())));
   assert_eq!(refusal, payload(PayloadRule::FlacStreamInfo));
   untouched!(short, back);
   muxer
@@ -12757,7 +12835,7 @@ fn l109_av1s_configuration_is_refused_where_ff_isom_write_av1c_would_fail() {
         .extra_mut()
         .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x82, 0, 0, 0])]);
       let offered = VideoTrackPacket::new(TrackIndex::new(0), first);
-      let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+      let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
       assert_eq!(
         refusal,
         payload(PayloadRule::NewExtradata),
@@ -12799,7 +12877,7 @@ fn l109_av1s_configuration_is_refused_where_ff_isom_write_av1c_would_fail() {
     ),
   ] {
     let offered = VideoTrackPacket::new(TrackIndex::new(0), video_holding(&unit, &bytes));
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(refusal, payload(rule), "{name}");
     untouched!(offered, back);
   }
@@ -12842,7 +12920,7 @@ fn l112_the_program_streams_preload_is_refused_where_it_would_wrap() {
       table_of(&source, TrackKind::Video),
     );
     let offered = video_at(&video_of(&frames[0]), Some(far), far);
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(
       refusal,
       FfmpegMuxRefusal::TimeWraps {
@@ -12926,7 +13004,7 @@ fn l113_mp4s_dvd_subtitle_configuration_is_taken_where_it_reads_back() {
       .extra_mut()
       .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, black.as_bytes())]);
     let offered = SubtitleTrackPacket::new(TrackIndex::new(0), first);
-    let (refusal, back) = by_container(muxer.write_subtitle(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_subtitle(offered.clone())));
     assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{name}");
     untouched!(offered, back);
     muxer
@@ -13187,7 +13265,7 @@ fn configuration_law(
         .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, config)]);
       let offered = VideoTrackPacket::new(TrackIndex::new(0), first);
       if *refused {
-        let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+        let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
         assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{what}, new");
         untouched!(offered, back);
         write(&mut muxer, frames, &what);
@@ -14643,7 +14721,7 @@ fn l119c_a_vp9_configuration_past_the_reader_is_refused() {
   sample.resize(past, 0);
   let offered = VideoTrackPacket::new(TrackIndex::new(0), video_holding(&frame, &sample));
   drop(sample);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::NewExtradata));
   untouched!(offered, back);
   drop((offered, back));
@@ -14788,7 +14866,7 @@ fn l121_flvs_filter_makes_a_configuration_the_writer_must_take() {
     ),
   ] {
     let offered = VideoTrackPacket::new(TrackIndex::new(0), video_holding(&frames[0], &bytes));
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(refusal, payload(rule), "{name}");
     untouched!(offered, back);
   }
@@ -14831,7 +14909,7 @@ fn l121_flvs_filter_makes_a_configuration_the_writer_must_take() {
     TrackIndex::new(0),
     video_holding(&frames[0], &[0, 0, 0, 3, 0x26, 0x01, 0xAF]),
   );
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::NalUnits), "HEVC");
   untouched!(offered, back);
 }
@@ -14984,7 +15062,7 @@ fn l123a_ismv_refuses_a_gap_its_shifted_second_check_would_move() {
   let (frame, pts, dts) = &frames[predicted];
   let after = limit - (dts - frames[predicted - 1].2);
   let offered = ism_at(0, frame, pts + after, dts + after);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::DtsGap {
@@ -15021,7 +15099,7 @@ fn l123a_ismv_refuses_a_gap_its_shifted_second_check_would_move() {
   let (frame, pts, dts) = &frames[second_key];
   let after = i64::from(i32::MAX) - (dts - frames[second_key - 1].2);
   let offered = ism_at(0, frame, pts + after, dts + after);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::DtsGap {
@@ -15284,14 +15362,14 @@ fn l124b_matroskas_av1_refuses_a_configuration_past_its_room() {
       let target = output(&corpus, &format!("l124b-{}.{container}", form.len()));
       let mut muxer = unconfigured_av1_muxer(&av1, &target, name);
       let offered = configuring(&frames[0], config);
-      let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+      let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
       assert_eq!(refusal, payload(PayloadRule::NewExtradata), "{what}");
       untouched!(offered, back);
     }
     let target = output(&corpus, &format!("l124b-none.{container}"));
     let mut muxer = unconfigured_av1_muxer(&av1, &target, name);
     let offered = VideoTrackPacket::new(TrackIndex::new(0), frames[0].clone());
-    let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+    let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
     assert_eq!(
       refusal,
       payload(PayloadRule::ConfigurationAbsent),
@@ -16247,7 +16325,7 @@ fn l139_mp4_refuses_pcm_samples_past_what_it_counts_them_in() {
     place += samples(packet) as i64;
   }
   let offered = audio_at_sample(&audio[2], place);
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::SampleCount));
   untouched!(offered, back);
   muxer.finish().expect("finished");
@@ -16360,7 +16438,7 @@ fn l140_mp4_refuses_an_apv_frame_past_its_configurations_count() {
     .map_err(|error| error.map_packet(drop))
     .expect("a frame information recorded already");
   let offered = frame(256 * 40, 255);
-  let (refusal, back) = by_container(muxer.write_video(offered.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
   assert_eq!(refusal, payload(PayloadRule::ApvFrameInfo));
   untouched!(offered, back);
   muxer.finish().expect("finished");
@@ -17357,7 +17435,7 @@ fn l149_mp4_refuses_a_sample_past_its_sample_table() {
     );
   }
   let fourth = VideoTrackPacket::new(TrackIndex::new(0), video_of(&frames[3]));
-  let (refusal, back) = by_container(muxer.write_video(fourth.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(fourth.clone())));
   assert_eq!(
     refusal,
     payload(PayloadRule::SampleTable),
@@ -17382,7 +17460,7 @@ fn l149_mp4_refuses_a_sample_past_its_sample_table() {
     );
   }
   let twelfth = audio_ticks(&one, 11 * 256, 256);
-  let (refusal, back) = by_container(muxer.write_audio(twelfth.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(twelfth.clone())));
   assert_eq!(
     refusal,
     payload(PayloadRule::SampleTable),
@@ -17410,7 +17488,7 @@ fn l149_mp4_refuses_a_sample_past_its_sample_table() {
     "the empty sample at its end and the second cue, the trailer's room kept"
   );
   let third = cue_on(0, &cue, base, (4000, 1000));
-  let (refusal, back) = by_container(muxer.write_subtitle(third.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_subtitle(third.clone())));
   assert_eq!(refusal, payload(PayloadRule::SampleTable), "the third cue");
   untouched!(third, back);
   muxer
@@ -17536,7 +17614,7 @@ fn l150_mp4_counts_sample_descriptions_and_ismv_refuses_an_update() {
     "the tenth's replaced configuration, the 1024th"
   );
   let past = bringing(&streaminfo(6000), true);
-  let (refusal, back) = by_container(muxer.write_audio(past.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(past.clone())));
   assert_eq!(
     refusal,
     payload(PayloadRule::SampleDescriptions),
@@ -17574,7 +17652,7 @@ fn l150_mp4_counts_sample_descriptions_and_ismv_refuses_an_update() {
     "the stream's own configuration"
   );
   let update = with(&audio_of(&frames[1]), &other, 1024);
-  let (refusal, back) = by_container(muxer.write_audio(update.clone()));
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(update.clone())));
   assert_eq!(
     refusal,
     payload(PayloadRule::ConfigurationUpdate),
@@ -17690,7 +17768,7 @@ fn l152_vp9s_first_superframe_is_its_first_description() {
     }
     let packet = video_at(&packet, Some(at), at);
     at += 40;
-    let result = muxer.write_video(packet.clone());
+    let result = refusing!(muxer.write_video(packet.clone()));
     (result, packet, what.to_owned())
   };
   for (bytes, what) in [
@@ -18237,7 +18315,7 @@ fn l154_the_moov_and_mfra_bounds_refuse_the_first_packet_past_them() {
     }
     let past = packets.next().expect("the packet past the bound");
     let track = past.track();
-    let (refusal, back) = by_container(muxer.write_packet(past));
+    let (refusal, back) = by_container(refusing!(muxer.write_packet(past)));
     assert_eq!(
       refusal,
       FfmpegMuxRefusal::Payload { track, rule },
@@ -18542,5 +18620,363 @@ fn l158_a_table_of_no_sample_meets_the_movie_bound_at_open_and_the_trailer_again
     written_box(&target, b"moov"),
     None,
     "the trailer wrote no moov"
+  );
+}
+
+/// **L159 — a packet refused by any rule allocates nothing** (R15, Codex
+/// R14 3: decide first, pay after): every refusal the laws make goes
+/// through [`refusing!`], which holds the write that refuses to no byte
+/// allocated — the face's rules, the times, the packet's build, the
+/// automatic filters, libavformat's timing and shift, each container's
+/// times and fields, the payload's content, the configuration writers, the
+/// counts and sizes, the sample descriptions, the `moov`'s and the `mfra`'s
+/// bounds — and here the four no other law reaches through a write: PGS
+/// segments that do not parse and a display set past the largest packet,
+/// MP4's Annex B rewrite past it, and a TTML document past it; HDR10+
+/// refused at its read-back, which no other refusal reaches; and the road
+/// Codex R14 named, a description rewritten in place past the `moov`'s
+/// bound — each refused by name with nothing allocated.
+///
+/// PLANT (one a family of rules, an allocation put back before its
+/// refusals): a buffer before the face's rules, the times, the packet's
+/// build and the filter's step; the filter's outputs collected; the shift
+/// copied; a buffer before the container's times; HDR10+'s bits in a
+/// vector; APV's frame informations listed; FLV's split listed; a unit's
+/// RBSP and a configuration's units held; a buffer before the sizes; a
+/// description's configuration copied; and a buffer before the `moov`'s
+/// and the `mfra`'s bounds — each family's refusals allocating, here or in
+/// the family's own law.
+#[test]
+fn l159_a_packet_refused_by_any_rule_allocates_nothing() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  // PGS's segments, and its display set past the largest packet.
+  let sup = pgs_sup(&corpus);
+  let (_, segments) = first_track(&sup, TrackKind::Subtitle, 2);
+  let presentation = subtitle_of(&segments[0]);
+  let cue = |packet: &Subtitle| {
+    SubtitleTrackPacket::new(TrackIndex::new(0), packet.clone().with_pts(Some(ms(0))))
+  };
+  let mut muxer = muxer_into(
+    &output(&corpus, "l159-segments.mkv"),
+    ContainerName::MATROSKA,
+    table_of(&sup, TrackKind::Subtitle),
+  );
+  let (refusal, _) = by_container(refusing!(
+    muxer.write_subtitle(cue(&subtitle_holding(&presentation, &[0x16, 0x00])))
+  ));
+  assert_eq!(refusal, payload(PayloadRule::PgsSegments), "a segment cut");
+  let presented = presentation.data().as_ref().len() as u64;
+  let mut muxer = muxer_with(
+    &output(&corpus, "l159-display-set.mkv"),
+    ContainerName::MATROSKA,
+    table_of(&sup, TrackKind::Subtitle),
+    MuxOptions::new().with_lowered_bounds(presented + 2, u64::MAX),
+  );
+  let (refusal, _) = by_container(refusing!(muxer.write_subtitle(cue(&presentation))));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::DisplaySetSize),
+    "no end segment fits"
+  );
+  // HDR10+ that reads back otherwise than written, past every check before
+  // the read-back: a window of no tone mapping, its saturation flagged,
+  // before one of three anchors — 424 bits declared, 417 written, in 53
+  // bytes either way — the reader taking the next window's flag for its
+  // saturation.
+  let mkv = corpus.multi_track_mkv();
+  let (_, video) = first_track(&mkv, TrackKind::Video, 1);
+  let misread = mediaio_ffmpeg::hdr_metadata::hdr10_plus_from_t35(&bit_payload(&[
+    (1, 8),
+    (2, 2),
+    (0, 153),
+    (0, 27),
+    (0, 1),
+    (0, 82),
+    (0, 82),
+    (0, 1),
+    (0, 1),
+    (1, 1),
+    (1, 6),
+    (1, 1),
+    (0, 24),
+    (3, 4),
+    (0, 30),
+    (0, 1),
+  ]))
+  .expect("libavutil parses the two windows");
+  let mut packet = video_of(&video[0])
+    .with_pts(Some(ms(0)))
+    .with_dts(Some(ms(0)));
+  packet
+    .extra_mut()
+    .set_side_data(vec![side(T::AV_PKT_DATA_DYNAMIC_HDR10_PLUS, &misread)]);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l159-hdr10-plus.mkv"),
+    ContainerName::MATROSKA,
+    table_of(&mkv, TrackKind::Video),
+  );
+  let (refusal, _) = by_container(refusing!(
+    muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), packet))
+  ));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::DynamicHdrPlus),
+    "read back otherwise"
+  );
+  // MP4's rewrite of an Annex B track past the largest packet.
+  let (table, video) = first_track(&corpus.transport_stream(), TrackKind::Video, 1);
+  let mut muxer = muxer_with(
+    &output(&corpus, "l159-rewritten.mp4"),
+    ContainerName::MP4,
+    table,
+    MuxOptions::new().with_lowered_bounds(16, u64::MAX),
+  );
+  let (refusal, _) = by_container(refusing!(muxer.write_video(VideoTrackPacket::new(
+    TrackIndex::new(0),
+    video_of(&video[0])
+  ))));
+  assert_eq!(refusal, payload(PayloadRule::RewrittenSize));
+  // TTML's document past the largest packet.
+  let ttml = ttml_mp4(&corpus);
+  let (mut table, cues) = first_track(&ttml, TrackKind::Subtitle, 1);
+  table[0].set_extradata(Some(bytes_of(b"lavc-ttmlenc")));
+  let mut muxer = muxer_with(
+    &output(&corpus, "l159-document.mp4"),
+    ContainerName::MP4,
+    table,
+    MuxOptions::new().with_lowered_bounds(8, u64::MAX),
+  );
+  let (refusal, _) = by_container(refusing!(muxer.write_subtitle(SubtitleTrackPacket::new(
+    TrackIndex::new(0),
+    subtitle_of(&cues[0])
+  ))));
+  assert_eq!(refusal, payload(PayloadRule::DocumentSize));
+  // An AAC configuration rewritten in place, four bytes larger, past the
+  // `moov`'s bound lowered to where the first frame left it.
+  let (table, frames) = first_track(&h264_aac(&corpus, "h264-aac.mp4"), TrackKind::Audio, 1);
+  let mut larger = table[0].side_data().extradata().to_vec();
+  larger.extend_from_slice(&[0x56, 0xE5, 0x00, 0x00]);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l159-description.mp4"),
+    ContainerName::MP4,
+    table,
+  );
+  muxer
+    .write_audio(audio_at(&audio_of(&frames[0]), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  muxer.lower_movie_bound(muxer.movie_box_bound().expect("a bound").total);
+  let mut inner = audio_holding(&audio_of(&frames[0]), &[])
+    .with_pts(Some(ms(10)))
+    .with_dts(Some(ms(10)));
+  inner
+    .extra_mut()
+    .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &larger)]);
+  let (refusal, back) = by_container(refusing!(
+    muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), inner))
+  ));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::MovieBox),
+    "a description past the bound"
+  );
+  assert_eq!(
+    back.packet().extra().side_data()[0].data(),
+    &larger[..],
+    "handed back untouched"
+  );
+  muxer.finish().expect("finished");
+}
+
+/// L160's run: `$packets` written in turn into the fresh muxer `$open`
+/// makes, through `$write`, with the `$n`-th allocation of packet `$k`'s
+/// write refused — none past the packets — and that packet, refused,
+/// checked and offered again: whether it was refused, and what the file
+/// ends with, the `moov`'s bound before the trailer and the report.
+macro_rules! starving_run {
+  ($open:expr, $packets:expr, $write:ident, $k:expr, $n:expr) => {{
+    let (k, n): (usize, u64) = ($k, $n);
+    let mut muxer = $open;
+    let mut refused = false;
+    for (index, packet) in $packets.iter().cloned().enumerate() {
+      if index != k {
+        muxer
+          .$write(packet)
+          .map_err(|error| error.map_packet(drop))
+          .unwrap_or_else(|error| panic!("packet {index}: {error:?}"));
+        continue;
+      }
+      let (bound, report) = (muxer.movie_box_bound(), muxer.report().clone());
+      match starved!(n, muxer.$write(packet.clone())) {
+        Err(MuxError::Backend {
+          refusal,
+          packet: back,
+        }) => {
+          assert_eq!(
+            refusal,
+            FfmpegMuxRefusal::OutOfMemory {
+              track: packet.track()
+            },
+            "packet {k}, allocation {n} refused"
+          );
+          untouched!(packet, back);
+          assert_eq!(
+            muxer.movie_box_bound(),
+            bound,
+            "packet {k}, allocation {n}: the bound where it stood"
+          );
+          assert_eq!(
+            muxer.report(),
+            &report,
+            "packet {k}, allocation {n}: the report where it stood"
+          );
+          muxer
+            .$write(back)
+            .map_err(|error| error.map_packet(drop))
+            .unwrap_or_else(|error| panic!("packet {k}, allocation {n}: taken again: {error:?}"));
+          refused = true;
+        }
+        Ok(()) => {}
+        Err(other) => panic!("packet {k}, allocation {n}: {other:?}"),
+      }
+    }
+    let bound = muxer.movie_box_bound();
+    let (_, report) = muxer.finish_into_sink().expect("finished");
+    (refused, (bound, report))
+  }};
+}
+
+/// L160's judgment of one file: each packet's write offered with its first
+/// allocation refused, then its second, and so on until the write is taken
+/// whole, each run ending as the file never refused ends; the allocations
+/// refused, counted.
+macro_rules! exhaust {
+  ($name:expr, $open:expr, $packets:expr, $write:ident) => {{
+    let packets = $packets;
+    let (_, never) = starving_run!($open, packets, $write, usize::MAX, 0);
+    let mut refusals = 0;
+    for k in 0..packets.len() {
+      for n in 1_u64.. {
+        let (refused, ends) = starving_run!($open, packets, $write, k, n);
+        if !refused {
+          break;
+        }
+        assert_eq!(
+          ends, never,
+          "{}: packet {k}, allocation {n}: the file ends as one never refused",
+          $name
+        );
+        refusals += 1;
+      }
+    }
+    assert!(refusals > 0, "{}: the commits allocate", $name);
+    refusals
+  }};
+}
+
+/// **L160 — every allocation a commit makes, refused, hands the packet back
+/// by name** (R15, Codex R14 3: decide first, pay after): three files, each
+/// packet's write offered to a fresh muxer with its first allocation
+/// refused, then its second, and so on — each refused allocation a
+/// commit's, the write refused by name ([`FfmpegMuxRefusal::OutOfMemory`])
+/// and the packet handed back untouched, nothing recorded: the `moov`'s
+/// bound and the report where they stood; offered again, the packet is
+/// taken, and the file ends as the file never refused ends — until the
+/// write makes fewer allocations than the one refused and is taken whole.
+/// The files: an MP4 AAC track's frame, a configuration's packet four bytes
+/// larger than the configuration it rewrites in place, and a frame (the
+/// report's lines, the description's configuration); an MP4 VP9 track of
+/// no configuration, two hidden frames and the frame shown after them (the
+/// frames held, the superframe made the first description); and a PGS
+/// track's first segments, which leave the display set open (the packets
+/// this muxer holds, their times). No allocation after a commit's is the
+/// muxer's to refuse: what settling the write records goes into room the
+/// commit reserved.
+///
+/// PLANT: the configuration copied infallibly, the lane aborting at the
+/// refused allocation; the `stsd` recorded before the commit pays, the
+/// bound moved by a packet refused.
+#[test]
+fn l160_every_allocation_a_commit_makes_refused_hands_the_packet_back() {
+  use ffmpeg_next::ffi::{AVPacketSideDataType as T, av_freep};
+  let Some(corpus) = Corpus::new() else { return };
+  // AAC: a frame, a configuration's packet, a frame.
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let (table, frames) = first_track(&source, TrackKind::Audio, 2);
+  let mut larger = table[0].side_data().extradata().to_vec();
+  larger.extend_from_slice(&[0x56, 0xE5, 0x00, 0x00]);
+  let mut configuration = audio_holding(&audio_of(&frames[0]), &[])
+    .with_pts(Some(ms(10)))
+    .with_dts(Some(ms(10)));
+  configuration
+    .extra_mut()
+    .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &larger)]);
+  let aac = vec![
+    audio_at(&audio_of(&frames[0]), 0),
+    AudioTrackPacket::new(TrackIndex::new(0), configuration),
+    audio_at(&audio_of(&frames[1]), 30),
+  ];
+  exhaust!(
+    "aac",
+    muxer_into(
+      &output(&corpus, "l160-aac.mp4"),
+      ContainerName::MP4,
+      first_track(&source, TrackKind::Audio, 0).0,
+    ),
+    aac,
+    write_audio
+  );
+  // VP9 of no configuration: two hidden frames, then one shown.
+  let webm = vp9_webm(&corpus);
+  let (_, frames) = first_track(&webm, TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  let unconfigured = || {
+    reticketed(table_of(&webm, TrackKind::Video).remove(0), |par| {
+      // SAFETY: the parameters' extradata is libavutil's, freed by
+      // `av_freep`, which leaves it null; its size follows.
+      unsafe { av_freep(core::ptr::addr_of_mut!(par.extradata).cast()) };
+      par.extradata_size = 0;
+    })
+  };
+  let vp9: Vec<_> = [vec![0x80, 1, 1], vec![0x80, 2, 2], vec![0x82, 9, 9, 9]]
+    .iter()
+    .enumerate()
+    .map(|(index, bytes)| {
+      let at = 40 * index as i64;
+      video_at(&video_holding(&frame, bytes), Some(at), at)
+    })
+    .collect();
+  exhaust!(
+    "vp9",
+    muxer_into(
+      &output(&corpus, "l160-vp9.mp4"),
+      ContainerName::MP4,
+      vec![unconfigured()],
+    ),
+    vp9,
+    write_video
+  );
+  // PGS: the first segments, which leave the display set open.
+  let sup = pgs_sup(&corpus);
+  let (_, segments) = first_track(&sup, TrackKind::Subtitle, 2);
+  let pgs: Vec<_> = segments
+    .iter()
+    .map(|segment| {
+      SubtitleTrackPacket::new(
+        TrackIndex::new(0),
+        subtitle_of(segment).with_pts(Some(ms(0))),
+      )
+    })
+    .collect();
+  exhaust!(
+    "pgs",
+    muxer_into(
+      &output(&corpus, "l160-pgs.mkv"),
+      ContainerName::MATROSKA,
+      table_of(&sup, TrackKind::Subtitle),
+    ),
+    pgs,
+    write_subtitle
   );
 }

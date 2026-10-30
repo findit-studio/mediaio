@@ -31,8 +31,12 @@
 //! (`ff_isom_parse_apvc`, `apv.c` 253–318): each frame's information,
 //! recorded by its PBU type, its 256th distinct one past the record's
 //! 8-bit count ([`apv_frame_infos`]).
-
-use std::borrow::Cow;
+//!
+//! **Nothing allocated** (R15, Codex R14 3): these mirrors run in the
+//! muxer's judgment of a packet, before any of its refusals, so each reads
+//! its configuration in place — a unit's RBSP through [`Bytes`], its units
+//! through iterators, the configuration FLV's `extract_extradata` makes of
+//! a packet through [`Extracted`] — and holds no buffer of its own.
 
 use mediaio_ffmpeg::ffi::pix_fmt_sampling;
 
@@ -69,13 +73,174 @@ impl Wrote {
   }
 }
 
+/// The bytes a reader reads, in place: a buffer as it is, or the RBSP of a
+/// unit — each emulation prevention byte, a `3` after two zeros at its
+/// `header`th byte or later, dropped, as `ff_nal_unit_extract_rbsp` and
+/// `ff_h2645_extract_rbsp` drop it (`nal.c` 163–193; `h2645_parse.c`
+/// 37–149) — from its `from`th byte to its `len`th (R15).
+#[derive(Clone, Copy)]
+enum Bytes<'a> {
+  Plain(&'a [u8]),
+  Rbsp {
+    raw: &'a [u8],
+    header: usize,
+    from: usize,
+    len: usize,
+  },
+}
+
+impl<'a> Bytes<'a> {
+  /// The RBSP of `raw`, its first `header` bytes as they are: `raw` itself
+  /// where it holds no emulation prevention byte.
+  fn rbsp(raw: &'a [u8], header: usize) -> Self {
+    let len = nal_rbsp_len(raw, header);
+    if len == raw.len() {
+      Self::Plain(raw)
+    } else {
+      Self::Rbsp {
+        raw,
+        header,
+        from: 0,
+        len,
+      }
+    }
+  }
+
+  fn len(self) -> usize {
+    match self {
+      Self::Plain(bytes) => bytes.len(),
+      Self::Rbsp { from, len, .. } => len - from,
+    }
+  }
+
+  fn is_empty(self) -> bool {
+    self.len() == 0
+  }
+
+  /// The byte at `at`, or `None` past the end.
+  fn get(self, at: usize) -> Option<u8> {
+    match self {
+      Self::Plain(bytes) => bytes.get(at).copied(),
+      Self::Rbsp {
+        raw,
+        header,
+        from,
+        len,
+      } => {
+        let at = from.checked_add(at).filter(|&at| at < len)?;
+        RbspBytes::new(raw, header).nth(at)
+      }
+    }
+  }
+
+  /// The bytes from the `at`th on.
+  fn from(self, at: usize) -> Self {
+    match self {
+      Self::Plain(bytes) => Self::Plain(bytes.get(at..).unwrap_or(&[])),
+      Self::Rbsp {
+        raw,
+        header,
+        from,
+        len,
+      } => Self::Rbsp {
+        raw,
+        header,
+        from: from.saturating_add(at).min(len),
+        len,
+      },
+    }
+  }
+
+  /// Each byte, in order.
+  fn iter(self) -> impl Iterator<Item = u8> + 'a {
+    let (plain, rbsp) = match self {
+      Self::Plain(bytes) => (Some(bytes.iter().copied()), None),
+      Self::Rbsp {
+        raw,
+        header,
+        from,
+        len,
+      } => (
+        None,
+        Some(RbspBytes::new(raw, header).skip(from).take(len - from)),
+      ),
+    };
+    plain
+      .into_iter()
+      .flatten()
+      .chain(rbsp.into_iter().flatten())
+  }
+}
+
+/// The RBSP of `raw`, byte by byte, its first `header` bytes as they are
+/// (`nal.c` 163–193): each `00 00 03` read as `00 00`, past it the bytes
+/// after the `03`; its last two bytes as they are.
+#[derive(Clone)]
+struct RbspBytes<'a> {
+  raw: &'a [u8],
+  header: usize,
+  at: usize,
+  zero: bool,
+}
+
+impl<'a> RbspBytes<'a> {
+  fn new(raw: &'a [u8], header: usize) -> Self {
+    Self {
+      raw,
+      header,
+      at: 0,
+      zero: false,
+    }
+  }
+}
+
+impl Iterator for RbspBytes<'_> {
+  type Item = u8;
+
+  fn next(&mut self) -> Option<u8> {
+    if self.zero {
+      self.zero = false;
+      return Some(0);
+    }
+    let (raw, at) = (self.raw, self.at);
+    let byte = *raw.get(at)?;
+    if at >= self.header && at + 2 < raw.len() && byte == 0 && raw[at + 1] == 0 && raw[at + 2] == 3
+    {
+      self.at += 3;
+      self.zero = true;
+      return Some(0);
+    }
+    self.at += 1;
+    Some(byte)
+  }
+}
+
+/// Where in the RBSP of `raw` — of no header — each emulation prevention
+/// byte was dropped, at the second zero before it, in order:
+/// `ff_h2645_extract_rbsp`'s `skipped_bytes_pos` (`h2645_parse.c` 37–149).
+fn skipped(raw: &[u8]) -> impl Iterator<Item = usize> + '_ {
+  let (mut at, mut dropped) = (0, 0);
+  core::iter::from_fn(move || {
+    while at + 2 < raw.len() {
+      if raw[at] == 0 && raw[at + 1] == 0 && raw[at + 2] == 3 {
+        let position = at + 1 - dropped;
+        dropped += 1;
+        at += 3;
+        return Some(position);
+      }
+      at += 1;
+    }
+    None
+  })
+}
+
 /// Bits read as libavcodec's checked reader reads them (`get_bits.h`
 /// 107–700 in FFmpeg 9.0.1, its cached reader off): `bits` bits over
 /// `bytes`, which go on past them — a configuration's next bytes, or the
 /// zeroed padding past its end — and the place held at 8 bits past them.
 #[derive(Clone, Copy)]
 struct Reader<'a> {
-  bytes: &'a [u8],
+  bytes: Bytes<'a>,
   bits: usize,
   index: usize,
 }
@@ -83,6 +248,11 @@ struct Reader<'a> {
 impl<'a> Reader<'a> {
   /// The reader `init_get_bits8` makes of `bytes`, whole.
   fn new(bytes: &'a [u8]) -> Self {
+    Self::of(Bytes::Plain(bytes))
+  }
+
+  /// The reader `init_get_bits8` makes of `bytes`, whole.
+  fn of(bytes: Bytes<'a>) -> Self {
     Self {
       bytes,
       bits: bytes.len() * 8,
@@ -96,7 +266,7 @@ impl<'a> Reader<'a> {
   }
 
   fn byte(&self, at: usize) -> u8 {
-    self.bytes.get(at).copied().unwrap_or(0)
+    self.bytes.get(at).unwrap_or(0)
   }
 
   /// `get_bits_left`, below zero up to 8 bits past the end.
@@ -234,42 +404,59 @@ fn annex_b(bytes: &[u8]) -> bool {
 /// `nal.c` 74–111 in FFmpeg 9.0.1; `ff_nal_find_startcode`, 31–72): what
 /// the Annex B rewrite writes behind lengths, and the configuration
 /// writers walk.
-pub(super) fn nal_units(bytes: &[u8]) -> Vec<&[u8]> {
-  // `nal_find_startcode_internal` looks no further than four bytes before
-  // the end: a start code in the last three is no start code (31–66).
-  let find = |from: usize| -> usize {
-    let found = (from..bytes.len().saturating_sub(3))
-      .find(|&at| bytes[at] == 0 && bytes[at + 1] == 0 && bytes[at + 2] == 1)
-      .unwrap_or(bytes.len());
-    if from < found && found < bytes.len() && bytes[found - 1] == 0 {
-      found - 1
-    } else {
-      found
-    }
-  };
-  let mut units = Vec::new();
-  let mut start = find(0);
-  loop {
+pub(super) fn nal_units(bytes: &[u8]) -> NalUnits<'_> {
+  NalUnits {
+    bytes,
+    start: start_code(bytes, 0),
+  }
+}
+
+/// `nal_find_startcode_internal`'s search from `from` (`nal.c` 31–66): no
+/// further than four bytes before the end — a start code in the last three
+/// is no start code — its zero before it taken with it.
+fn start_code(bytes: &[u8], from: usize) -> usize {
+  let found = (from..bytes.len().saturating_sub(3))
+    .find(|&at| bytes[at] == 0 && bytes[at + 1] == 0 && bytes[at + 2] == 1)
+    .unwrap_or(bytes.len());
+  if from < found && found < bytes.len() && bytes[found - 1] == 0 {
+    found - 1
+  } else {
+    found
+  }
+}
+
+/// The units [`nal_units`] finds, in order, read in place.
+#[derive(Clone)]
+pub(super) struct NalUnits<'a> {
+  bytes: &'a [u8],
+  start: usize,
+}
+
+impl<'a> Iterator for NalUnits<'a> {
+  type Item = &'a [u8];
+
+  fn next(&mut self) -> Option<&'a [u8]> {
+    let bytes = self.bytes;
     // Past the zeros and the 1 of the start code.
-    while start < bytes.len() {
-      let byte = bytes[start];
-      start += 1;
+    while self.start < bytes.len() {
+      let byte = bytes[self.start];
+      self.start += 1;
       if byte != 0 {
         break;
       }
     }
-    if start >= bytes.len() {
-      break;
+    if self.start >= bytes.len() {
+      return None;
     }
-    let end = find(start);
-    let mut size = end - start;
-    while size > 0 && bytes[start + size - 1] == 0 {
+    let end = start_code(bytes, self.start);
+    let mut size = end - self.start;
+    while size > 0 && bytes[self.start + size - 1] == 0 {
       size -= 1;
     }
-    units.push(&bytes[start..start + size]);
-    start = end;
+    let unit = &bytes[self.start..self.start + size];
+    self.start = end;
+    Some(unit)
   }
-  units
 }
 
 /// Each unit the configuration writers' walk reads of the buffer
@@ -280,15 +467,13 @@ pub(super) fn nal_units(bytes: &[u8]) -> Vec<&[u8]> {
 /// two, the next unit's length, and past the buffer its padding's zeros.
 /// Each length is the unit's own, so a step is a unit; a last unit of none
 /// leaves four bytes, and is not walked.
-fn walked(bytes: &[u8]) -> Vec<(&[u8], [u8; 2])> {
-  let units = nal_units(bytes);
-  let mut out = Vec::with_capacity(units.len());
-  for (index, unit) in units.iter().enumerate() {
-    let next = units
-      .get(index + 1)
-      .map(|next| (next.len() as u32).to_be_bytes());
+fn walked<'a>(units: impl Iterator<Item = &'a [u8]>) -> impl Iterator<Item = (&'a [u8], [u8; 2])> {
+  let mut units = units.peekable();
+  core::iter::from_fn(move || {
+    let unit = units.next()?;
+    let next = units.peek().map(|next| (next.len() as u32).to_be_bytes());
     if unit.is_empty() && next.is_none() {
-      break;
+      return None;
     }
     // The bytes after this unit's length: its own, then the next length's.
     let after = |at: usize| -> u8 {
@@ -297,9 +482,8 @@ fn walked(bytes: &[u8]) -> Vec<(&[u8], [u8; 2])> {
         None => next.map_or(0, |length| length[at - unit.len()]),
       }
     };
-    out.push((*unit, [after(0), after(1)]));
-  }
-  out
+    Some((unit, [after(0), after(1)]))
+  })
 }
 
 /// The bytes of the RBSP `ff_nal_unit_extract_rbsp` makes of the NAL unit
@@ -319,27 +503,48 @@ fn nal_rbsp_len(nal: &[u8], header: usize) -> usize {
   nal.len() - dropped
 }
 
-/// The RBSP `ff_nal_unit_extract_rbsp` makes of the NAL unit `nal`
-/// (`nal.c` 163–193): its first `header` bytes as they are, then every
-/// emulation prevention byte — a 3 after two zeros — dropped.
-fn nal_rbsp(nal: &[u8], header: usize) -> Vec<u8> {
-  let mut out = Vec::with_capacity(nal.len());
-  let mut at = 0;
-  while at < header && at < nal.len() {
-    out.push(nal[at]);
-    at += 1;
-  }
-  while at + 2 < nal.len() {
-    if nal[at] == 0 && nal[at + 1] == 0 && nal[at + 2] == 3 {
-      out.extend_from_slice(&[0, 0]);
-      at += 3;
-    } else {
-      out.push(nal[at]);
-      at += 1;
+/// A configuration the writers read: its bytes, or the one FLV's
+/// `extract_extradata` makes of a packet, read in place ([`Extracted`]).
+#[derive(Clone, Copy)]
+pub(super) enum Config<'a> {
+  Bytes(&'a [u8]),
+  Extracted(Extracted<'a>),
+}
+
+impl<'a> Config<'a> {
+  fn len(self) -> usize {
+    match self {
+      Self::Bytes(bytes) => bytes.len(),
+      Self::Extracted(extracted) => extracted.len,
     }
   }
-  out.extend_from_slice(&nal[at..]);
-  out
+
+  /// Its first byte: an extracted one's start code's.
+  fn first(self) -> Option<u8> {
+    match self {
+      Self::Bytes(bytes) => bytes.first().copied(),
+      Self::Extracted(_) => Some(0),
+    }
+  }
+
+  fn annex_b(self) -> bool {
+    match self {
+      Self::Bytes(bytes) => annex_b(bytes),
+      Self::Extracted(_) => true,
+    }
+  }
+
+  /// Its units as libavformat's Annex B splitter finds them ([`nal_units`]).
+  fn units(self) -> impl Iterator<Item = &'a [u8]> {
+    let (bytes, extracted) = match self {
+      Self::Bytes(bytes) => (Some(nal_units(bytes)), None),
+      Self::Extracted(extracted) => (None, Some(extracted.units())),
+    };
+    bytes
+      .into_iter()
+      .flatten()
+      .chain(extracted.into_iter().flatten())
+  }
 }
 
 /// What `ff_isom_write_avcc` does with an H.264 configuration (`avc.c`
@@ -352,15 +557,20 @@ fn nal_rbsp(nal: &[u8], header: usize) -> Vec<u8> {
 /// at least one. `ff_avc_decode_sps` fails only on an allocation: its
 /// reader is the checked one, over at most 31 sets of 65 535 bytes.
 pub(super) fn avcc(config: &[u8]) -> Wrote {
+  avcc_config(Config::Bytes(config))
+}
+
+/// [`avcc`] of a configuration read in place.
+fn avcc_config(config: Config<'_>) -> Wrote {
   if config.len() <= 6 {
     return Wrote::Failed;
   }
-  if !annex_b(config) {
+  if !config.annex_b() {
     return Wrote::Whole;
   }
   let (mut sps, mut pps, mut extensions) = (0_u32, 0_u32, 0_u32);
   let (mut sps_bytes, mut pps_bytes) = (0_usize, 0_usize);
-  for (unit, [first, _]) in walked(config) {
+  for (unit, [first, _]) in walked(config.units()) {
     let (count, cap, bytes) = match first & 0x1F {
       7 => (&mut sps, 32, Some(&mut sps_bytes)),
       8 => (&mut pps, 256, Some(&mut pps_bytes)),
@@ -392,9 +602,9 @@ const HEVC_ARRAYS: [u8; 5] = [32, 33, 34, 39, 40];
 struct Hvcc {
   /// Each array's count of NAL units, held to 65 535 (847–848).
   counts: [u32; 5],
-  /// Each VPS parsed, in order: its id and its sub-layers less one, which
-  /// a multilayer SPS of it reads (642–652).
-  vps: Vec<(u8, u8)>,
+  /// Each VPS parsed, by its 4-bit id, the first of each: its sub-layers
+  /// less one, which a multilayer SPS of it reads (642–652).
+  vps: [Option<u8>; 16],
   /// The auxiliary alpha layer a VPS extension names, whose parameter sets
   /// the record keeps beside the base layer's (431, 452, 888).
   alpha: u8,
@@ -447,6 +657,11 @@ enum Parse {
 /// ([`hvcc_drops_layers`]); MP4 writes those of a stream flagged
 /// multilayer into `lhvC` beside it ([`lhvc`]).
 pub(super) fn hvcc(config: &[u8], complete: bool) -> Wrote {
+  hvcc_config(Config::Bytes(config), complete)
+}
+
+/// [`hvcc`] of a configuration read in place.
+fn hvcc_config(config: Config<'_>, complete: bool) -> Wrote {
   let record = match hvcc_walk(config, false) {
     Ok(record) => record,
     Err(wrote) => return wrote,
@@ -468,6 +683,11 @@ pub(super) fn hvcc(config: &[u8], complete: bool) -> Wrote {
 /// VPS extension named before it (R11, ruling 1). `false` where the record
 /// itself is refused ([`hvcc`]).
 pub(super) fn hvcc_drops_layers(config: &[u8]) -> bool {
+  hvcc_config_drops_layers(Config::Bytes(config))
+}
+
+/// [`hvcc_drops_layers`] of a configuration read in place.
+fn hvcc_config_drops_layers(config: Config<'_>) -> bool {
   hvcc_walk(config, false).is_ok_and(|record| record.dropped)
 }
 
@@ -485,6 +705,11 @@ pub(super) fn hvcc_drops_layers(config: &[u8]) -> bool {
 /// in `mov_realloc_extradata`'s unsigned test (8907–8914, 2248–2253): one
 /// of no unit of a layer past the base's, written of no array, `Corrupt`.
 pub(super) fn lhvc(config: &[u8], complete: bool) -> Wrote {
+  lhvc_config(Config::Bytes(config), complete)
+}
+
+/// [`lhvc`] of a configuration read in place.
+fn lhvc_config(config: Config<'_>, complete: bool) -> Wrote {
   let record = match hvcc_walk(config, true) {
     Ok(record) => record,
     Err(wrote) => return wrote,
@@ -502,12 +727,14 @@ pub(super) fn lhvc(config: &[u8], complete: bool) -> Wrote {
 /// `write_configuration_record`'s walk of `config` (`hevc.c` 1293–1399),
 /// `lhvc` its `FLAG_IS_LHVC`: the record as it stands before it is
 /// written, or what the writer answers where the walk stops.
-fn hvcc_walk(config: &[u8], lhvc: bool) -> Result<Hvcc, Wrote> {
+fn hvcc_walk(config: Config<'_>, lhvc: bool) -> Result<Hvcc, Wrote> {
   if config.len() < 6 {
     return Err(Wrote::Failed);
   }
   let mut record = Hvcc::default();
-  if config[0] == 1 {
+  if let Config::Bytes(config) = config
+    && config[0] == 1
+  {
     if config.len() < 23 || config.len() > GET_BITS_BYTES_MAX {
       return Err(Wrote::Failed);
     }
@@ -534,10 +761,10 @@ fn hvcc_walk(config: &[u8], lhvc: bool) -> Result<Hvcc, Wrote> {
         bits.skip_long(len as i64 * 8);
       }
     }
-  } else if !annex_b(config) {
+  } else if !config.annex_b() {
     return Err(Wrote::Failed);
   } else {
-    for (unit, [first, _]) in walked(config) {
+    for (unit, [first, _]) in walked(config.units()) {
       let kind = (first >> 1) & 0x3F;
       if let Some(array) = HEVC_ARRAYS.iter().position(|&kept| kept == kind)
         && hvcc_add(&mut record, unit, array, (true, lhvc)) == Parse::Failed
@@ -581,8 +808,7 @@ fn hvcc_add(record: &mut Hvcc, nal: &[u8], array: usize, (parsed, lhvc): (bool, 
   if !parsed || !(32..=33).contains(&kind) {
     return Parse::Done;
   }
-  let rbsp = nal_rbsp(nal, 2);
-  let mut bits = Reader::new(&rbsp);
+  let mut bits = Reader::of(Bytes::rbsp(nal, 2));
   bits.skip(16);
   if kind == 32 {
     hevc_vps(&mut bits, record);
@@ -598,15 +824,17 @@ fn hevc_ptl(bits: &mut Reader<'_>, profile_present: bool, sub_layers: u32) {
   // The general profile space, tier, profile, compatibility flags,
   // constraint flags and level: 96 bits; the level alone, 8.
   bits.skip(if profile_present { 96 } else { 8 });
-  let flags: Vec<(bool, bool)> = (0..sub_layers)
-    .map(|_| (bits.read1() == 1, bits.read1() == 1))
-    .collect();
+  // Of at most seven sub-layers, a 3-bit count.
+  let mut flags = [(false, false); 8];
+  for flag in flags.iter_mut().take(sub_layers as usize) {
+    *flag = (bits.read1() == 1, bits.read1() == 1);
+  }
   if sub_layers > 0 {
     for _ in sub_layers..8 {
       bits.skip(2);
     }
   }
-  for (profile, level) in flags {
+  for &(profile, level) in flags.iter().take(sub_layers as usize) {
     if profile {
       bits.skip(88);
     }
@@ -678,7 +906,10 @@ fn hevc_vps(bits: &mut Reader<'_>, record: &mut Hvcc) {
   bits.skip(1);
   let max_layers = bits.read(6);
   let sub_layers = bits.read(3);
-  record.vps.push((id, sub_layers as u8));
+  let first = &mut record.vps[usize::from(id)];
+  if first.is_none() {
+    *first = Some(sub_layers as u8);
+  }
   bits.skip(17);
   hevc_ptl(bits, true, sub_layers);
   let first = if bits.read(1) == 1 { 0 } else { sub_layers };
@@ -783,8 +1014,8 @@ fn hevc_sps(bits: &mut Reader<'_>, layer: u8, record: &Hvcc) -> Parse {
   } else {
     let extension = bits.read(3);
     if extension == 7 {
-      match record.vps.iter().find(|(id, _)| *id == vps_id) {
-        Some(&(_, sub_layers)) => (7, u32::from(sub_layers)),
+      match record.vps[usize::from(vps_id)] {
+        Some(sub_layers) => (7, u32::from(sub_layers)),
         None => return Parse::Failed,
       }
     } else {
@@ -929,18 +1160,23 @@ const VVC_ARRAYS: [u8; 6] = [12, 14, 15, 16, 23, 24];
 /// nothing; more than 16 VPSs, no SPS or more than 16, no PPS or more than
 /// 64, refused (683–688).
 pub(super) fn vvcc(config: &[u8]) -> Wrote {
+  vvcc_config(Config::Bytes(config))
+}
+
+/// [`vvcc`] of a configuration read in place.
+fn vvcc_config(config: Config<'_>) -> Wrote {
   if config.len() < 6 {
     return Wrote::Failed;
   }
-  if config[0] & 0xF8 == 0xF8 {
+  if config.first().is_some_and(|first| first & 0xF8 == 0xF8) {
     return Wrote::Whole;
   }
-  if !annex_b(config) {
+  if !config.annex_b() {
     return Wrote::Failed;
   }
   let mut counts = [0_u16; 6];
   let mut cut = false;
-  for (unit, [_, second]) in walked(config) {
+  for (unit, [_, second]) in walked(config.units()) {
     let Some(array) = VVC_ARRAYS.iter().position(|&kept| kept == second >> 3) else {
       continue;
     };
@@ -1039,7 +1275,7 @@ fn evc_sps(rest: &[u8], size: usize) -> Parse {
     return Parse::Failed;
   }
   let mut bits = Reader {
-    bytes: rest.get(2..).unwrap_or(&[]),
+    bytes: Bytes::Plain(rest.get(2..).unwrap_or(&[])),
     bits: bytes as usize * 8,
     index: 0,
   };
@@ -1073,115 +1309,156 @@ pub(super) enum Units {
 }
 
 /// A unit `ff_h2645_packet_split` splits off (`h2645_parse.c` 527–665 in
-/// FFmpeg 9.0.1).
+/// FFmpeg 9.0.1), read in place.
+#[derive(Clone, Copy)]
 struct Split<'a> {
   /// `raw_data`, `raw_size`: its bytes, its emulation prevention in.
   raw: &'a [u8],
-  /// `data`, `size`: its RBSP.
-  rbsp: Cow<'a, [u8]>,
-  /// `skipped_bytes_pos`: where in the RBSP each emulation prevention
-  /// byte was dropped, at the second zero before it.
-  skipped: Vec<usize>,
+  /// `data`, `size`: its RBSP; `skipped_bytes_pos` is [`skipped`]'s of
+  /// `raw`.
+  rbsp: Bytes<'a>,
   /// Its header's unit type.
   kind: u8,
 }
 
-/// `ff_h2645_packet_split` over the Annex B units of `bytes`, of
-/// `small_padding` or not (`h2645_parse.c` 527–665 in FFmpeg 9.0.1): each
-/// unit from past a start code to the next — or to the next `00 00 02` once
-/// an emulation prevention byte is met — its RBSP's trailing zeros and stop
-/// bit counted off; one of no bits, or whose header its codec refuses,
-/// dropped. `None` where it fails: a search reaching the end with no unit
-/// kept — of no start code at all — or a unit of more bits than
-/// `init_get_bits` takes.
-fn h2645_split(bytes: &[u8], units: Units, small_padding: bool) -> Option<Vec<Split<'_>>> {
-  let length = bytes.len();
-  let mut at = 0;
-  let mut split = Vec::new();
-  while length - at >= 4 {
-    // `find_next_start_code`: past the first start code with a byte after
-    // it, or to the end (`h2645_parse.c` 465–478).
-    let rest = length - at;
-    at += (0..rest - 3)
-      .find(|&i| bytes[at + i] == 0 && bytes[at + i + 1] == 0 && bytes[at + i + 2] == 1)
-      .map_or(rest, |i| i + 3);
-    if at == length {
-      return (!split.is_empty()).then_some(split);
+/// `ff_h2645_packet_split` over the Annex B units of `bytes` (`h2645_parse.c`
+/// 527–665 in FFmpeg 9.0.1): each unit from past a start code to the next —
+/// or to the next `00 00 02` once an emulation prevention byte is met — its
+/// RBSP's trailing zeros and stop bit counted off; one of no bits, or whose
+/// header its codec refuses, dropped. `None` where it fails: a search
+/// reaching the end with no unit kept — of no start code at all — or a unit
+/// of more bits than `init_get_bits` takes. Its padding, small or not,
+/// changes no unit it splits, only whether libavcodec copies one that holds
+/// no emulation prevention byte. Walked once to judge it, then again for
+/// its units, nothing held.
+fn h2645_split(bytes: &[u8], units: Units) -> Option<H2645Split<'_>> {
+  let split = H2645Split {
+    bytes,
+    units,
+    at: 0,
+    kept: false,
+  };
+  let mut judged = split;
+  loop {
+    match judged.step() {
+      Ok(Some(_)) => {}
+      Ok(None) => return Some(split),
+      Err(()) => return None,
     }
-    let (rbsp, raw, skipped) = extract_rbsp(&bytes[at..], small_padding);
-    let start = at;
-    at += raw;
-    let skip_trailing_zeros = bytes.get(at..at + 4) != Some(&[0, 0, 1, 0xE0][..]);
-    let bits = bit_length(
-      &rbsp,
-      if units == Units::Hevc { 2 } else { 1 },
-      skip_trailing_zeros,
-    );
-    if rbsp.is_empty() || bits <= 0 {
-      continue;
-    }
-    if bits >= i64::from(i32::MAX - 512) {
-      return None;
-    }
-    let mut header = Reader {
-      bytes: &rbsp,
-      bits: bits as usize,
-      index: 0,
-    };
-    let kind = match units {
-      Units::H264 => {
-        if header.read1() != 0 {
-          continue;
-        }
-        header.skip(2);
-        header.read(5)
-      }
-      Units::Hevc => {
-        if header.read1() != 0 {
-          continue;
-        }
-        let kind = header.read(6);
-        let layer = header.read(6);
-        if layer == 63 || header.read(3) == 0 {
-          continue;
-        }
-        kind
-      }
-      Units::Vvc => {
-        if header.read1() != 0 {
-          continue;
-        }
-        header.skip(7);
-        let kind = header.read(5);
-        let temporal = header.read(3);
-        if temporal == 0 || ((7..=11).contains(&kind) && temporal != 1) {
-          continue;
-        }
-        kind
-      }
-      Units::Lcevc => {
-        if header.read1() != 0 || header.read1() != 1 {
-          continue;
-        }
-        header.read(5)
-      }
-    };
-    split.push(Split {
-      raw: &bytes[start..at],
-      rbsp,
-      skipped,
-      kind: kind as u8,
-    });
   }
-  Some(split)
+}
+
+/// The units [`h2645_split`] splits off, in order.
+#[derive(Clone, Copy)]
+struct H2645Split<'a> {
+  bytes: &'a [u8],
+  units: Units,
+  at: usize,
+  /// Whether a unit is kept so far.
+  kept: bool,
+}
+
+impl<'a> H2645Split<'a> {
+  /// The next unit, `None` at the end, or `Err` where the split fails.
+  fn step(&mut self) -> Result<Option<Split<'a>>, ()> {
+    let bytes = self.bytes;
+    let length = bytes.len();
+    while length - self.at >= 4 {
+      // `find_next_start_code`: past the first start code with a byte after
+      // it, or to the end (`h2645_parse.c` 465–478).
+      let at = self.at;
+      let rest = length - at;
+      self.at += (0..rest - 3)
+        .find(|&i| bytes[at + i] == 0 && bytes[at + i + 1] == 0 && bytes[at + i + 2] == 1)
+        .map_or(rest, |i| i + 3);
+      if self.at == length {
+        return if self.kept { Ok(None) } else { Err(()) };
+      }
+      let start = self.at;
+      self.at += extract_rbsp_len(&bytes[start..]);
+      let raw = &bytes[start..self.at];
+      let rbsp = Bytes::rbsp(raw, 0);
+      let skip_trailing_zeros = bytes.get(self.at..self.at + 4) != Some(&[0, 0, 1, 0xE0][..]);
+      let bits = bit_length(
+        rbsp,
+        if self.units == Units::Hevc { 2 } else { 1 },
+        skip_trailing_zeros,
+      );
+      if rbsp.is_empty() || bits <= 0 {
+        continue;
+      }
+      if bits >= i64::from(i32::MAX - 512) {
+        return Err(());
+      }
+      let mut header = Reader {
+        bytes: rbsp,
+        bits: bits as usize,
+        index: 0,
+      };
+      let kind = match self.units {
+        Units::H264 => {
+          if header.read1() != 0 {
+            continue;
+          }
+          header.skip(2);
+          header.read(5)
+        }
+        Units::Hevc => {
+          if header.read1() != 0 {
+            continue;
+          }
+          let kind = header.read(6);
+          let layer = header.read(6);
+          if layer == 63 || header.read(3) == 0 {
+            continue;
+          }
+          kind
+        }
+        Units::Vvc => {
+          if header.read1() != 0 {
+            continue;
+          }
+          header.skip(7);
+          let kind = header.read(5);
+          let temporal = header.read(3);
+          if temporal == 0 || ((7..=11).contains(&kind) && temporal != 1) {
+            continue;
+          }
+          kind
+        }
+        Units::Lcevc => {
+          if header.read1() != 0 || header.read1() != 1 {
+            continue;
+          }
+          header.read(5)
+        }
+      };
+      self.kept = true;
+      return Ok(Some(Split {
+        raw,
+        rbsp,
+        kind: kind as u8,
+      }));
+    }
+    Ok(None)
+  }
+}
+
+impl<'a> Iterator for H2645Split<'a> {
+  type Item = Split<'a>;
+
+  /// The next unit — of a split [`h2645_split`] judged whole.
+  fn next(&mut self) -> Option<Split<'a>> {
+    self.step().ok().flatten()
+  }
 }
 
 /// `ff_h2645_extract_rbsp` (`h2645_parse.c` 37–149) of the unit opening
-/// `src`, which runs to the end at most: its RBSP, its raw size and where
-/// its emulation prevention bytes were dropped. It ends at the first start
-/// code before an emulation prevention byte, at the first `00 00 01` or
-/// `00 00 02` after one; of small padding and none met, it is its own RBSP.
-fn extract_rbsp(src: &[u8], small_padding: bool) -> (Cow<'_, [u8]>, usize, Vec<usize>) {
+/// `src`, which runs to the end at most: its raw size, its RBSP the bytes
+/// of it each emulation prevention byte dropped ([`Bytes::rbsp`]). It ends
+/// at the first start code before an emulation prevention byte, at the
+/// first `00 00 01` or `00 00 02` after one.
+fn extract_rbsp_len(src: &[u8]) -> usize {
   let mut length = src.len();
   let first = (0..length.saturating_sub(2))
     .find(|&i| src[i] == 0 && src[i + 1] == 0 && (src[i + 2] == 1 || src[i + 2] == 3));
@@ -1194,58 +1471,101 @@ fn extract_rbsp(src: &[u8], small_padding: bool) -> (Cow<'_, [u8]>, usize, Vec<u
     }
     None => length,
   };
-  if found + 1 >= length && small_padding {
-    return (Cow::Borrowed(&src[..length]), length, Vec::new());
-  }
-  let found = found.min(length);
-  let mut dst = src[..found].to_vec();
-  let mut skipped = Vec::new();
-  let mut si = found;
+  let mut si = found.min(length);
   while si + 2 < length {
     if src[si + 2] > 3 {
-      dst.extend_from_slice(&src[si..si + 2]);
+      // The two bytes copied, and the one after them below.
       si += 2;
     } else if src[si] == 0 && src[si + 1] == 0 && src[si + 2] != 0 {
       if src[si + 2] == 3 {
-        dst.extend_from_slice(&[0, 0]);
         si += 3;
-        skipped.push(dst.len() - 1);
         continue;
       }
-      return (Cow::Owned(dst), si, skipped);
+      return si;
     }
-    dst.push(src[si]);
     si += 1;
   }
-  dst.extend_from_slice(&src[si..length]);
-  (Cow::Owned(dst), length, skipped)
+  length
 }
 
 /// `get_bit_length` (`h2645_parse.c` 348–376): the bits of `rbsp` but its
 /// trailing zeros — where they are skipped — and its stop bit; one of no
 /// byte answering zero, one shorter than `min_size` or past `INT_MAX / 8`
 /// bytes below zero.
-fn bit_length(rbsp: &[u8], min_size: usize, skip_trailing_zeros: bool) -> i64 {
-  let mut size = rbsp.len();
-  while skip_trailing_zeros && size > 0 && rbsp[size - 1] == 0 {
-    size -= 1;
-  }
+fn bit_length(rbsp: Bytes<'_>, min_size: usize, skip_trailing_zeros: bool) -> i64 {
+  let len = rbsp.len();
+  let mut size = if skip_trailing_zeros {
+    rbsp
+      .iter()
+      .enumerate()
+      .filter(|&(_, byte)| byte != 0)
+      .last()
+      .map_or(0, |(at, _)| at + 1)
+  } else {
+    len
+  };
   if size == 0 {
     return 0;
   }
   let mut padding = 0;
   if size <= min_size {
-    if rbsp.len() < min_size {
+    if len < min_size {
       return -1;
     }
     size = min_size;
-  } else if rbsp[size - 1] != 0 {
-    padding = i64::from(rbsp[size - 1].trailing_zeros()) + 1;
+  } else if let Some(last) = rbsp.get(size - 1).filter(|&last| last != 0) {
+    padding = i64::from(last.trailing_zeros()) + 1;
   }
   if size > i32::MAX as usize / 8 {
     return -1;
   }
   size as i64 * 8 - padding
+}
+
+/// The configuration FLV's `extract_extradata` makes of an H.264, HEVC or
+/// VVC packet, read in place ([`h2645_extracted`]): the packet's parameter
+/// sets in their order, each its raw bytes behind a 4-byte start code.
+#[derive(Clone, Copy)]
+pub(super) struct Extracted<'a> {
+  bytes: &'a [u8],
+  units: Units,
+  kept: &'static [u8],
+  /// Its bytes: each set's and its start code's.
+  len: usize,
+}
+
+impl<'a> Extracted<'a> {
+  /// Its bytes, made: the laws' comparison.
+  #[cfg(test)]
+  pub(super) fn bytes(self) -> Vec<u8> {
+    let kept = self.kept;
+    h2645_split(self.bytes, self.units)
+      .into_iter()
+      .flatten()
+      .filter(|unit| kept.contains(&unit.kind))
+      .flat_map(|unit| [&[0_u8, 0, 0, 1][..], unit.raw].concat())
+      .collect()
+  }
+
+  /// Its units, as libavformat's Annex B splitter finds them in it: each
+  /// set's raw bytes, its trailing zeros dropped — none holds a start code,
+  /// which the split ends a unit before, so each start code it is put
+  /// behind opens it, and its zeros before the next are the splitter's to
+  /// drop.
+  fn units(self) -> impl Iterator<Item = &'a [u8]> {
+    let kept = self.kept;
+    h2645_split(self.bytes, self.units)
+      .into_iter()
+      .flatten()
+      .filter(move |unit| kept.contains(&unit.kind))
+      .map(|unit| {
+        let mut size = unit.raw.len();
+        while size > 0 && unit.raw[size - 1] == 0 {
+          size -= 1;
+        }
+        &unit.raw[..size]
+      })
+  }
 }
 
 /// The configuration FLV's `extract_extradata` makes of the H.264, HEVC or
@@ -1256,10 +1576,11 @@ fn bit_length(rbsp: &[u8], min_size: usize, skip_trailing_zeros: bool) -> i64 {
 /// `ff_h2645_packet_split` of small padding; `mux.c` 1132–1140): the
 /// packet's parameter sets in their order — H.264's SPSs and PPSs, HEVC's
 /// and VVC's VPSs, SPSs and PPSs — each its raw bytes behind a 4-byte
-/// start code, where an SPS is among them, and for HEVC a VPS.
-pub(super) fn h2645_extracted(units: Units, bytes: &[u8]) -> Result<Option<Vec<u8>>, ()> {
-  let split = h2645_split(bytes, units, true).ok_or(())?;
-  let (kept, sps, vps): (&[u8], u8, Option<u8>) = match units {
+/// start code, where an SPS is among them, and for HEVC a VPS; read in
+/// place, never made (R15).
+pub(super) fn h2645_extracted(units: Units, bytes: &[u8]) -> Result<Option<Extracted<'_>>, ()> {
+  let split = h2645_split(bytes, units).ok_or(())?;
+  let (kept, sps, vps): (&'static [u8], u8, Option<u8>) = match units {
     Units::Vvc => (&[14, 15, 16], 15, None),
     Units::Hevc => (&[32, 33, 34], 33, Some(32)),
     Units::H264 => (&[7, 8], 7, None),
@@ -1267,17 +1588,17 @@ pub(super) fn h2645_extracted(units: Units, bytes: &[u8]) -> Result<Option<Vec<u
     // writing no LCEVC, never reaches.
     Units::Lcevc => return Ok(None),
   };
-  let sets = || split.iter().filter(|unit| kept.contains(&unit.kind));
+  let sets = || split.filter(|unit| kept.contains(&unit.kind));
   let present = |kind: u8| sets().any(|unit| unit.kind == kind);
   if sets().next().is_none() || !present(sps) || vps.is_some_and(|vps| !present(vps)) {
     return Ok(None);
   }
-  let mut config = Vec::new();
-  for unit in sets() {
-    config.extend_from_slice(&[0, 0, 0, 1]);
-    config.extend_from_slice(unit.raw);
-  }
-  Ok(Some(config))
+  Ok(Some(Extracted {
+    bytes,
+    units,
+    kept,
+    len: sets().map(|unit| 4 + unit.raw.len()).sum(),
+  }))
 }
 
 /// The pictures `ff_lcevc_resolution_type` names, by resolution type
@@ -1316,15 +1637,15 @@ enum LcevcUnit {
 }
 
 /// `write_nalu` (`lcevc.c` 39–178) over the IDR or non-IDR unit `unit`.
-fn lcevc_unit(unit: &Split<'_>) -> LcevcUnit {
-  let data = &unit.rbsp[..];
+fn lcevc_unit(unit: Split<'_>) -> LcevcUnit {
+  let data = unit.rbsp;
   let mut at = data.len().min(2);
   let mut length = 3;
   let (mut sequence, mut global, mut unnamed) = (false, false, false);
-  let mut skipped = 0;
+  let mut skipped = skipped(unit.raw).peekable();
   while data.len() - at > 1 && !(sequence && global) {
     let left = data.len() - at;
-    let mut bits = Reader::new(&data[at..]);
+    let mut bits = Reader::of(data.from(at));
     let size_type = bits.read(3);
     let kind = bits.read(5);
     if size_type == 6 {
@@ -1345,9 +1666,8 @@ fn lcevc_unit(unit: &Split<'_>) -> LcevcUnit {
     }
     let end = at + block;
     let mut raw_block = block;
-    while skipped < unit.skipped.len() && unit.skipped[skipped] < end {
+    while skipped.next_if(|&position| position < end).is_some() {
       raw_block += 1;
-      skipped += 1;
     }
     match kind {
       0 if !sequence => {
@@ -1430,11 +1750,11 @@ pub(super) fn lvcc(config: &[u8]) -> Wrote {
   if !annex_b(config) {
     return Wrote::Whole;
   }
-  let Some(split) = h2645_split(config, Units::Lcevc, false) else {
+  let Some(split) = h2645_split(config, Units::Lcevc) else {
     return Wrote::Failed;
   };
   let (mut idr, mut other, mut cut) = (0_usize, 0_usize, false);
-  for unit in &split {
+  for unit in split {
     let count = match unit.kind {
       29 => &mut idr,
       28 => &mut other,
@@ -1577,47 +1897,67 @@ pub(super) struct ApvFrameInfo {
 /// 4:2:0 or a chroma format past 4, of a bit depth below 10 or past 16, or
 /// too short for them, failing the parse; its tiles, which the parse reads
 /// too, rest on the trust model: a stream the standards allow, they parse.
-pub(super) fn apv_frame_infos(au: &[u8]) -> Vec<(u8, ApvFrameInfo)> {
+pub(super) fn apv_frame_infos(au: &[u8]) -> ApvFrameInfos<'_> {
   const SIGNATURE: &[u8; 4] = b"aPv1";
+  let none = ApvFrameInfos { units: &[] };
   if au.len() < 8 || &au[..4] != SIGNATURE {
-    return Vec::new();
+    return none;
   }
-  let mut units = Vec::new();
-  let mut rest = &au[4..];
+  let units = ApvFrameInfos { units: &au[4..] };
+  // Every PBU split whole, and every frame's header parsed, or none read.
+  let mut rest = units.units;
   while !rest.is_empty() {
-    if rest.len() < 8 {
-      return Vec::new();
+    let Some((unit, after)) = apv_unit(rest) else {
+      return none;
+    };
+    if APV_FRAMES.contains(&unit[0]) && apv_frame_info(&unit[4..]).is_none() {
+      return none;
     }
-    let size = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-    rest = &rest[4..];
-    if size < 8 || size > rest.len() {
-      return Vec::new();
-    }
-    let unit = &rest[..size];
-    if unit[3] != 0 {
-      return Vec::new();
-    }
-    units.push(unit);
-    rest = &rest[size..];
+    rest = after;
   }
-  let mut infos = Vec::new();
-  let mut read = Vec::new();
-  for unit in &units {
-    if APV_FRAMES.contains(&unit[0]) {
-      match apv_frame_info(&unit[4..]) {
-        Some(info) => read.push((unit[0], info)),
-        None => return Vec::new(),
+  units
+}
+
+/// The PBU opening `rest` — its 4-byte size, at least 8 and within what is
+/// left, its header's reserved byte clear — and what follows it.
+fn apv_unit(rest: &[u8]) -> Option<(&[u8], &[u8])> {
+  if rest.len() < 8 {
+    return None;
+  }
+  let size = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+  let rest = &rest[4..];
+  if size < 8 || size > rest.len() || rest[3] != 0 {
+    return None;
+  }
+  Some(rest.split_at(size))
+}
+
+/// The frame informations [`apv_frame_infos`] reads of an access unit, in
+/// order, read in place.
+#[derive(Clone, Copy)]
+pub(super) struct ApvFrameInfos<'a> {
+  units: &'a [u8],
+}
+
+impl Iterator for ApvFrameInfos<'_> {
+  type Item = (u8, ApvFrameInfo);
+
+  fn next(&mut self) -> Option<(u8, ApvFrameInfo)> {
+    while let Some((unit, after)) = apv_unit(self.units) {
+      self.units = after;
+      if !APV_FRAMES.contains(&unit[0]) {
+        continue;
       }
+      let info = apv_frame_info(&unit[4..])?;
+      let depth = info.depth_minus8 + 8;
+      if !(8..=16).contains(&depth) || depth % 2 != 0 {
+        self.units = &[];
+        return None;
+      }
+      return Some((unit[0], info));
     }
+    None
   }
-  for (kind, info) in read {
-    let depth = info.depth_minus8 + 8;
-    if !(8..=16).contains(&depth) || depth % 2 != 0 {
-      break;
-    }
-    infos.push((kind, info));
-  }
-  infos
 }
 
 /// A frame header's frame information and colour description, its ranges
@@ -1703,24 +2043,6 @@ impl Writer {
   pub(super) fn writes(self, config: &[u8]) -> Wrote {
     match self {
       Self::Avcc => avcc(config),
-      // A layer's units `hvcC` skips are lost, but where `lhvC` writes
-      // them; a stream flagged multilayer whose `lhvC` fails of no such
-      // unit loses its flag alone, which the report names (R11, ruling 1).
-      Self::Hvcc {
-        complete,
-        lhvc: beside,
-      } => match hvcc(config, complete) {
-        Wrote::Whole if beside => match lhvc(config, complete) {
-          Wrote::Corrupt => Wrote::Corrupt,
-          Wrote::Failed if hvcc_drops_layers(config) => Wrote::Failed,
-          _ => Wrote::Whole,
-        },
-        Wrote::Whole if hvcc_drops_layers(config) => Wrote::Failed,
-        wrote => wrote,
-      },
-      Self::Vvcc => vvcc(config),
-      Self::Evcc => evcc(config),
-      Self::Lvcc => lvcc(config),
       Self::Vpcc { format, profile } => vpcc(config.len(), format, profile),
       Self::Av1c => {
         if super::av1c_written(config) {
@@ -1729,8 +2051,42 @@ impl Writer {
           Wrote::Failed
         }
       }
+      Self::Evcc => evcc(config),
+      Self::Lvcc => lvcc(config),
       Self::Av3c => av3c(config),
       Self::Dvc1 => dvc1(config),
+      _ => self.writes_config(Config::Bytes(config)),
+    }
+  }
+
+  /// What the writer does with `config`, read in place: the H.264, HEVC
+  /// and VVC writers', which FLV hands what `extract_extradata` makes.
+  pub(super) fn writes_config(self, config: Config<'_>) -> Wrote {
+    match self {
+      Self::Avcc => avcc_config(config),
+      // A layer's units `hvcC` skips are lost, but where `lhvC` writes
+      // them; a stream flagged multilayer whose `lhvC` fails of no such
+      // unit loses its flag alone, which the report names (R11, ruling 1).
+      Self::Hvcc {
+        complete,
+        lhvc: beside,
+      } => match hvcc_config(config, complete) {
+        Wrote::Whole if beside => match lhvc_config(config, complete) {
+          Wrote::Corrupt => Wrote::Corrupt,
+          Wrote::Failed if hvcc_config_drops_layers(config) => Wrote::Failed,
+          _ => Wrote::Whole,
+        },
+        Wrote::Whole if hvcc_config_drops_layers(config) => Wrote::Failed,
+        wrote => wrote,
+      },
+      Self::Vvcc => vvcc_config(config),
+      // A configuration of their own bytes.
+      Self::Evcc | Self::Lvcc | Self::Vpcc { .. } | Self::Av1c | Self::Av3c | Self::Dvc1 => {
+        match config {
+          Config::Bytes(bytes) => self.writes(bytes),
+          Config::Extracted(_) => Wrote::Failed,
+        }
+      }
     }
   }
 }

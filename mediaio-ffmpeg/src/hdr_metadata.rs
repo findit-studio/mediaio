@@ -612,28 +612,66 @@ pub fn check_hdr10_plus(bytes: &[u8]) -> Result<(), HdrMetadataError> {
   }
   // The reader reads the bits the serializer wrote, then the zeros it pads
   // the last byte with (`flush_put_bits`), to the payload's end; every field
-  // before the tone mapping reads back as written.
-  let mut bits = Vec::with_capacity(8 * declared.div_ceil(8));
+  // before the tone mapping reads back as written. Held on the stack: this
+  // check runs in a muxer's judgment of a packet, before its refusals, which
+  // allocate nothing (R15, Codex R14 3).
+  let mut bits = ToneBits {
+    bits: [false; TONE_BITS_MAX],
+    len: 0,
+  };
   for map in maps {
-    put(&mut bits, u32::from(map.tone), 1);
+    bits.put(u32::from(map.tone), 1);
     if map.tone {
-      put(&mut bits, map.knee[0], 12);
-      put(&mut bits, map.knee[1], 12);
-      put(&mut bits, u32::from(map.anchors), 4);
+      bits.put(map.knee[0], 12);
+      bits.put(map.knee[1], 12);
+      bits.put(u32::from(map.anchors), 4);
       for &anchor in &map.anchor[..usize::from(map.anchors)] {
-        put(&mut bits, anchor, 10);
+        bits.put(anchor, 10);
       }
-      put(&mut bits, u32::from(map.saturation), 1);
+      bits.put(u32::from(map.saturation), 1);
       if map.saturation {
-        put(&mut bits, map.weight, 6);
+        bits.put(map.weight, 6);
       }
     }
   }
-  bits.resize(8 * declared.div_ceil(8) - (declared - section), false);
-  if read_tone_maps(&bits, windows).as_deref() != Some(maps) {
+  bits.pad(8 * declared.div_ceil(8) - (declared - section));
+  if !read_tone_maps(bits.read(), windows).is_some_and(|read| read[..windows] == *maps) {
     return Err(HdrMetadataError::Syntax);
   }
   Ok(())
+}
+
+/// The most bits of the tone mapping and its last byte's padding: three
+/// windows of a flag, a knee point of 24 bits, an anchor count of 4 and 15
+/// anchors of 10, a saturation flag and its weight of 6 — 186 — and 7.
+const TONE_BITS_MAX: usize = 3 * 186 + 7;
+
+/// The tone mapping's bits as HDR10+'s serializer writes them, and the
+/// zeros that pad its last byte.
+struct ToneBits {
+  bits: [bool; TONE_BITS_MAX],
+  len: usize,
+}
+
+impl ToneBits {
+  /// Appends `value`'s low `width` bits, most significant first.
+  fn put(&mut self, value: u32, width: u32) {
+    for bit in (0..width).rev() {
+      if let Some(slot) = self.bits.get_mut(self.len) {
+        *slot = value >> bit & 1 == 1;
+      }
+      self.len += 1;
+    }
+  }
+
+  /// Pads with zeros to `len` bits, never past the most.
+  fn pad(&mut self, len: usize) {
+    self.len = self.len.max(len).min(TONE_BITS_MAX);
+  }
+
+  fn read(&self) -> &[bool] {
+    &self.bits[..self.len.min(TONE_BITS_MAX)]
+  }
 }
 
 /// One window's tone mapping and saturation, as the integers HDR10+'s
@@ -648,20 +686,13 @@ struct ToneMap {
   weight: u32,
 }
 
-/// Appends `value`'s low `width` bits to `bits`, most significant first.
-fn put(bits: &mut Vec<bool>, value: u32, width: u32) {
-  for bit in (0..width).rev() {
-    bits.push(value >> bit & 1 == 1);
-  }
-}
-
 /// HDR10+'s reader of the tone mapping, over `bits`, the payload's from
 /// where it begins (`av_dynamic_hdr_plus_from_t35`, `hdr_dynamic_metadata.c`
 /// 198–232 in FFmpeg 9.0.1): each window's tone mapping flag; with it, the
 /// knee point, the anchor count and the anchors; then, whatever the flag,
 /// the saturation flag and its weight — or `None` where the bits run out
 /// first, which the reader refuses (`get_bits_left`).
-fn read_tone_maps(bits: &[bool], windows: usize) -> Option<Vec<ToneMap>> {
+fn read_tone_maps(bits: &[bool], windows: usize) -> Option<[ToneMap; 3]> {
   let mut at = 0;
   let mut read = |width: usize| {
     let field = bits.get(at..at + width)?;
@@ -672,8 +703,8 @@ fn read_tone_maps(bits: &[bool], windows: usize) -> Option<Vec<ToneMap>> {
         .fold(0u32, |value, &bit| value << 1 | u32::from(bit)),
     )
   };
-  let mut maps = Vec::with_capacity(windows);
-  for _ in 0..windows {
+  let mut maps = [ToneMap::default(); 3];
+  for slot in maps.iter_mut().take(windows) {
     let mut map = ToneMap {
       tone: read(1)? == 1,
       ..ToneMap::default()
@@ -689,7 +720,7 @@ fn read_tone_maps(bits: &[bool], windows: usize) -> Option<Vec<ToneMap>> {
     if map.saturation {
       map.weight = read(6)?;
     }
-    maps.push(map);
+    *slot = map;
   }
   Some(maps)
 }

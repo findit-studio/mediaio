@@ -465,6 +465,14 @@ crate moves only when it changes.
   descriptions' exact sum. The laws' seams, hidden:
   `MuxOptions::with_lowered_fragment_index_bound` (split from
   `with_lowered_movie_bound`) and `CarrierMuxer::lower_movie_bound`.
+- **A packet refused allocates nothing; a write's allocation refused
+  hands the packet back (R15).** Every rule a packet meets — the face's,
+  libavformat's and the container's — is judged before anything is
+  allocated for it, over its borrowed bytes and counted lengths; what
+  recording the write needs is then allocated fallibly, and an allocation
+  the allocator refuses refuses the packet by name, handed back with
+  nothing recorded (`FfmpegMuxRefusal::OutOfMemory`, new). What
+  libavformat allocates as it writes the packet is its own.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer

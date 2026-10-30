@@ -513,6 +513,38 @@
 //! (`ff_id3v2_write_apic`, `id3v2enc.c` 352–420) — sent to the coordinator (R15,
 //! letter 1).
 //!
+//! **What a write allocates, and when** (R15, Codex R14 3: decide first,
+//! pay after): a packet is judged before anything is allocated for it —
+//! every rule of the face, of libavformat and of the container, over the
+//! packet's borrowed bytes, counted lengths and the muxer's state read in
+//! place — and only then paid for: what recording its write needs is
+//! allocated fallibly, a failure refused by name with the packet handed
+//! back and nothing recorded ([`FfmpegMuxRefusal::OutOfMemory`]). Then
+//! libavformat writes it — the line: what it allocates of the packet,
+//! through libavutil's allocator, is its own, and its failure a fault — and
+//! the write is recorded into room the payment reserved, nothing allocated.
+//! Every allocation the admission made before a refusal could come, by
+//! census, and where it is now (L159: every refusal the laws make
+//! allocates nothing, a plant a family of rules; L160: every allocation a
+//! payment makes, refused alone, hands the packet back with nothing
+//! recorded):
+//!
+//! | Where | What it allocated before the refusals | Now |
+//! |---|---|---|
+//! | the filter's outputs | the times of the packets the filter puts out with the packet, collected | read in place, the held times and the packet's own; the first and the last kept |
+//! | libavformat's shift | the shift copied, its holdings a stream | its state and the one holding the packet moves copied, applied once the packet is written |
+//! | FLV's AV1 | the sequence headers `extract_extradata` makes, listed | judged where they lie |
+//! | FLV's H.264, HEVC and VVC | the units split off listed, each one's RBSP copied and its skipped bytes listed, the configuration made | the split walked in place, judged whole first; each RBSP a view; the configuration counted, never made |
+//! | the configuration writers | the units listed, each RBSP copied, HEVC's profile flags and VPS listed | iterators over the units, RBSP views, fixed arrays |
+//! | MP4's Annex B rewrite | the units listed | walked in place |
+//! | APV's frame informations | each access unit's listed, then the ones its `apvC` lacks | an iterator over the units, judged whole first; the new ones listed at the payment |
+//! | HDR10+'s tone mapping | its bits in a vector and its maps listed (`mediaio_ffmpeg::hdr_metadata::check_hdr10_plus`) | an array on the stack |
+//! | the sample descriptions | the configuration a description takes copied, the first sample's or the superframe of the frames held, and the hidden frame VP9's filter holds — before the ProRes atom's, the cue's, the side data's, the sizes', the sample table's, the `moov`'s and the `mfra`'s refusals | judged on borrowed bytes; each made at the payment |
+//! | the report's lines | listed after the refusals, infallibly | listed at the payment |
+//! | recording the write | the descriptions, the frame held, APV's informations, the report's lines, pushed as they came | into room the payment reserved |
+//! | a PGS packet held | it and its outputs' times pushed | into room the payment reserved |
+//! | the display set it completes | its packets partitioned out, their lines listed anew | taken out in place, their lines moved into room reserved |
+//!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
 //! sample entry calls for a video configuration (`mov_write_video_tag`,
@@ -914,7 +946,10 @@
 //! | the MOV family's modes, at open | a codec this release admits not beside MP4's — MOV's raw video, DV, MPEG-2, H.263, DNxHD, ProRes, PCM, MP3, AMR, ADPCM, QDM2, G.726, iLBC, and H.264 of an intra profile or AVC-Intra tag; 3GP's and 3G2's H.263 and AMR; F4V's VP6; ISMV's WMA Pro and TTML; PSP's every codec but H.264, MPEG-4 Part 2 and AAC; AVIF's alpha plane — booked; a picture past 65535, and in MOV's mode one of an aspect ratio stated and not 1 whose track aperture — its width, height and display width shifted left 16 in an `int` — passes 32767, every MOV video codec, H.264, HEVC and MPEG-4 among them (`mov_write_tapt_tag`, `movenc.c` 4098–4126, 4430–4436; R11, Q869 L6 — L136); MPEG audio layer III below 16 kHz outside MOV; TTML's `dfxp` tag outside ISMV; PSP's table of other than one video and one audio track, AVIF's of more than one; ISMV's second video track, whose key frames' flushes before `check_pkt`'s second count rest on libavformat's interleaving, which this release does not mirror — booked to Q870 (R11, Codex R10 2); the Nero list's untitled chapter, which reads back titled empty, no longer untitled (R9: Fable R2, judged by the ruled rule), a title past 255 bytes, cut; MP4's, iPod's and F4V's covers whose movie `udta` would pass its dynamic buffer of `INT_MAX` bytes, its size counted exactly (R14b, ruled) | refused at the start, written with no configuration box, or so that it reads back otherwise, or the `covr` written cut (`movenc.c` 1380–2140, 5040–5064, 5066–5122, 6431–6448, 8129–8650) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::CoversTooLarge`] — L102, L132, L155 |
 
 use core::{fmt, marker::PhantomData};
-use std::io::{Seek, Write};
+use std::{
+  collections::TryReserveError,
+  io::{Seek, Write},
+};
 
 use ffmpeg_next::ffi::{AV_NOPTS_VALUE, AVChannel, AVChannelOrder, AVPacketSideDataType};
 use mediaencode::{
@@ -3346,6 +3381,16 @@ pub enum FfmpegMuxRefusal {
     /// The track.
     track: TrackIndex,
   },
+  /// What the muxer allocates to write an admitted packet — its report's
+  /// lines, the configurations its sample descriptions take, a frame
+  /// VP9's filter holds — could not be had (R15, Codex R14 3): every rule
+  /// is judged before anything is allocated, and the packet handed back
+  /// untouched where its write's allocation fails, nothing written.
+  #[error("track {}'s packet could not be given the memory its write needs", .track.get())]
+  OutOfMemory {
+    /// The track.
+    track: TrackIndex,
+  },
   /// The MOV family, of no fragments: the `moov` its trailer would write
   /// past the 32 bits its size is written in (`update_size`, `movenc.c`
   /// 155–163; R15, Codex R14 2), by the bound every packet is judged by
@@ -4549,6 +4594,17 @@ impl Neighbours {
 /// timestamp", 692–715).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Shift {
+  /// Its state but the interleaving's holdings.
+  now: ShiftNow,
+  /// What the interleaving holds before its first write, by track — none
+  /// for a track whose stream takes no packet.
+  held: Vec<Option<Held>>,
+}
+
+/// [`Shift`]'s state but the interleaving's holdings, which a packet's
+/// judgment copies (R15, Codex R14 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShiftNow {
   /// The times judged: presentation times in Matroska and WebM (3538–3541),
   /// decode times in another container and where Matroska writes a video
   /// track in VFW mode (`matroskaenc.c` 2077–2081).
@@ -4562,9 +4618,6 @@ struct Shift {
   earliest: Option<Timestamp>,
   /// Whether libavformat has made its first write, which settles the shift.
   written: bool,
-  /// What the interleaving holds before its first write, by track — none
-  /// for a track whose stream takes no packet.
-  held: Vec<Option<Held>>,
   /// The earliest decode time it holds: its queue's head, which its first
   /// write writes (`mux.c` 1006–1016).
   head: Option<Timestamp>,
@@ -4580,6 +4633,37 @@ struct Shift {
   /// The decode time of the first packet the container wrote, moved, in its
   /// own stream's ticks: FLV's reference, as FLV keeps it.
   first: Option<i128>,
+}
+
+#[cfg(test)]
+impl Shift {
+  /// A packet of `track` alone: the shift after it, applied — the laws'
+  /// seam.
+  fn take_alone(
+    &self,
+    track: usize,
+    times: (i64, i64, i64),
+    floor: Option<i128>,
+    time_base: Timebase,
+  ) -> Result<Self, Early> {
+    let step = self.take(self.step(track), times, floor, time_base)?;
+    let mut next = self.clone();
+    next.apply(step);
+    Ok(next)
+  }
+}
+
+/// What a packet's outputs do to libavformat's shift, judged over the shift
+/// they found ([`Shift::take`]): its state as they leave it, and the one
+/// holding of the packet's track they move — copied, nothing allocated,
+/// applied once the packet is written (R15, Codex R14 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShiftStep {
+  now: ShiftNow,
+  track: usize,
+  /// The decode time of the last packet of the track the interleaving
+  /// holds, in microseconds, where the step moves it.
+  last_us: Option<i128>,
 }
 
 /// Why libavformat's container would write a packet before where it may
@@ -4680,18 +4764,41 @@ impl Shift {
       .filter(|held| held.interleaved)
       .count();
     Some(Self {
-      by_pts,
-      passthrough: interleaved <= 1,
-      earliest: None,
-      written: false,
+      now: ShiftNow {
+        by_pts,
+        passthrough: interleaved <= 1,
+        earliest: None,
+        written: false,
+        head: None,
+        first_floor: muxer == "flv",
+        delta: !matches!(muxer, "asf" | "asf_stream"),
+        first: None,
+      },
       held,
-      head: None,
-      first_floor: muxer == "flv",
-      delta: !matches!(muxer, "asf" | "asf_stream"),
-      first: None,
     })
   }
 
+  /// The step a packet of `track` starts from: the shift as it stands.
+  const fn step(&self, track: usize) -> ShiftStep {
+    ShiftStep {
+      now: self.now,
+      track,
+      last_us: None,
+    }
+  }
+
+  /// Applies a packet's step, once the packet is written.
+  fn apply(&mut self, step: ShiftStep) {
+    self.now = step.now;
+    if let Some(last) = step.last_us
+      && let Some(Some(held)) = self.held.get_mut(step.track)
+    {
+      held.last_us = Some(last);
+    }
+  }
+}
+
+impl ShiftNow {
   /// Each stream's distance, rounded up to its own tick, `time_base`'s
   /// (`mux.c` 676–680): none before a time below the earliest is held.
   fn lift(&self, time_base: Timebase) -> i128 {
@@ -4707,7 +4814,9 @@ impl Shift {
       }
     })
   }
+}
 
+impl Shift {
   /// What libavformat makes of a packet of `track` — its time judged `at`,
   /// its decode time `dts`, its stream's earliest `lowest`, each in ticks of
   /// `time_base`: the shift after it, or why the container would write it
@@ -4718,57 +4827,69 @@ impl Shift {
   /// (`flvenc.c` 1270), every FLV stream's milliseconds (1074).
   fn take(
     &self,
-    track: usize,
+    step: ShiftStep,
     (at, dts, lowest): (i64, i64, i64),
     floor: Option<i128>,
     time_base: Timebase,
-  ) -> Result<Self, Early> {
+  ) -> Result<ShiftStep, Early> {
     let below = i128::from(at) - i128::from(lowest);
-    if self.written {
-      let lift = self.lift(time_base);
+    let now = step.now;
+    if now.written {
+      let lift = now.lift(time_base);
       if floor.is_some_and(|floor| i128::from(at) - floor + lift < 0) {
         return Err(Early::BeforeEarliest);
       }
-      if self.first_floor
-        && self
+      if now.first_floor
+        && now
           .first
           .is_some_and(|first| i128::from(dts) + lift < first)
       {
         return Err(Early::BeforeFirst);
       }
-      return Ok(self.clone());
+      return Ok(step);
     }
-    let mut next = self.clone();
+    let mut next = step;
     if below < 0 {
       let instant = Timestamp::new(i64::try_from(below).unwrap_or(i64::MIN), time_base);
-      next.earliest = Some(
+      next.now.earliest = Some(
         next
+          .now
           .earliest
           .map_or(instant, |earliest| earliest.min(instant)),
       );
     }
-    if let Some(Some(held)) = next.held.get_mut(track) {
-      held.last_us = Some(micros(dts, time_base));
+    if let Some(Some(_)) = self.held.get(step.track) {
+      next.last_us = Some(micros(dts, time_base));
     }
     let decoded = Timestamp::new(dts, time_base);
-    next.head = Some(next.head.map_or(decoded, |head| head.min(decoded)));
-    next.written = next.passthrough || next.flushes();
-    if next.written {
+    next.now.head = Some(next.now.head.map_or(decoded, |head| head.min(decoded)));
+    next.now.written = next.now.passthrough || self.flushes(next);
+    if next.now.written {
       // The first packet the container writes: the head, moved.
-      next.first = next
+      next.now.first = next
+        .now
         .head
-        .map(|head| i128::from(head.pts()) + next.lift(head.timebase()));
+        .map(|head| i128::from(head.pts()) + next.now.lift(head.timebase()));
     }
     Ok(next)
   }
 
-  /// Whether the interleaving, holding what it holds, writes its first
-  /// packet (`ff_interleave_packet_per_dts`, `mux.c` 939–1003): as many
-  /// streams hold one as it interleaves; or each that holds none may be
-  /// lacked, and the packets held span more than `max_interleave_delta` —
-  /// its default, the context keeping it — the subtitles' left aside.
-  fn flushes(&self) -> bool {
-    let streams = self.held.iter().flatten();
+  /// Whether the interleaving, holding what it holds — the step's track's
+  /// holding as the step leaves it — writes its first packet
+  /// (`ff_interleave_packet_per_dts`, `mux.c` 939–1003): as many streams
+  /// hold one as it interleaves; or each that holds none may be lacked, and
+  /// the packets held span more than `max_interleave_delta` — its default,
+  /// the context keeping it — the subtitles' left aside.
+  fn flushes(&self, step: ShiftStep) -> bool {
+    let streams = self.held.iter().enumerate().filter_map(|(index, held)| {
+      let mut held = (*held)?;
+      if index == step.track
+        && let Some(last) = step.last_us
+      {
+        held.last_us = Some(last);
+      }
+      Some(held)
+    });
     let holding = streams
       .clone()
       .filter(|held| held.last_us.is_some())
@@ -4781,11 +4902,15 @@ impl Shift {
       .clone()
       .filter(|held| held.last_us.is_none() && held.may_lack)
       .count();
-    let Some(head) = self.head.map(|head| micros(head.pts(), head.timebase())) else {
+    let Some(head) = step
+      .now
+      .head
+      .map(|head| micros(head.pts(), head.timebase()))
+    else {
       return false;
     };
     interleaved == holding + lacking
-      && self.delta
+      && step.now.delta
       && streams
         .filter(|held| !held.subtitle)
         .filter_map(|held| held.last_us)
@@ -5317,23 +5442,139 @@ fn superframe_matches(held: &[Vec<u8>], shown: &[u8], other: &[u8]) -> bool {
 }
 
 /// The superframe `vp9_superframe` makes of `held` and `shown`, owned
-/// ([`superframe_index`]).
-fn superframe_of(held: &[Vec<u8>], shown: &[u8]) -> Vec<u8> {
+/// ([`superframe_index`]), allocated fallibly (R15).
+fn superframe_of(held: &[Vec<u8>], shown: &[u8]) -> Result<Vec<u8>, TryReserveError> {
   let (index, index_len) = superframe_index(held, shown);
-  let mut frame =
-    Vec::with_capacity(held.iter().map(Vec::len).sum::<usize>() + shown.len() + index_len);
+  let mut frame = Vec::new();
+  frame.try_reserve_exact(held.iter().map(Vec::len).sum::<usize>() + shown.len() + index_len)?;
   for part in held {
     frame.extend_from_slice(part);
   }
   frame.extend_from_slice(shown);
   frame.extend_from_slice(&index[..index_len]);
-  frame
+  Ok(frame)
+}
+
+/// `bytes`, owned, allocated fallibly (R15, Codex R14 3).
+fn try_vec(bytes: &[u8]) -> Result<Vec<u8>, TryReserveError> {
+  let mut owned = Vec::new();
+  owned.try_reserve_exact(bytes.len())?;
+  owned.extend_from_slice(bytes);
+  Ok(owned)
+}
+
+/// Pushes `item` into room reserved for it first, the reservation's failure
+/// answered (R15, Codex R14 3).
+fn try_push<T>(items: &mut Vec<T>, item: T) -> Result<(), TryReserveError> {
+  items.try_reserve(1)?;
+  items.push(item);
+  Ok(())
+}
+
+/// The bytes of the superframe `vp9_superframe` makes of `held` and
+/// `shown` ([`superframe_of`]), counted.
+fn superframe_len(held: &[Vec<u8>], shown: &[u8]) -> usize {
+  let (_, index_len) = superframe_index(held, shown);
+  held.iter().map(Vec::len).sum::<usize>() + shown.len() + index_len
+}
+
+/// The frame informations of the access unit `bytes` MP4's parse records
+/// into a track's `apvC` that `recorded` holds not, nor the unit before
+/// them (`ff_isom_parse_apvc`, `apv.c` 253–318), in order — read in place,
+/// nothing allocated (R15, Codex R14 3).
+fn apv_added<'a>(
+  recorded: &'a [(u8, Vec<records::ApvFrameInfo>)],
+  bytes: &'a [u8],
+) -> impl Iterator<Item = (u8, records::ApvFrameInfo)> + 'a {
+  let infos = records::apv_frame_infos(bytes);
+  infos
+    .enumerate()
+    .filter(move |&(at, (kind, info))| {
+      let held = recorded
+        .iter()
+        .find(|(entry, _)| *entry == kind)
+        .is_some_and(|(_, infos)| infos.contains(&info));
+      !held && !infos.take(at).any(|seen| seen == (kind, info))
+    })
+    .map(|(_, added)| added)
+}
+
+/// The configuration of a packet that reaches movenc, read in place: its
+/// own new extradata, or the one AAC's filter makes of its first frame,
+/// held on the stack ([`made_configuration_into`]).
+#[derive(Debug, Clone, Copy)]
+enum Reaching<'p> {
+  Side(&'p [u8]),
+  Made {
+    bytes: [u8; 2 + MAX_PCE_SIZE],
+    len: usize,
+  },
+}
+
+impl Reaching<'_> {
+  fn bytes(&self) -> &[u8] {
+    match self {
+      Self::Side(bytes) => bytes,
+      Self::Made { bytes, len } => &bytes[..*len],
+    }
+  }
+}
+
+/// What a packet does to its track's sample descriptions ([`Descriptions`]),
+/// decided on borrowed bytes, owning nothing (R15, Codex R14 3): what the
+/// commit makes of them, the step ([`DescriptionStep`]).
+#[derive(Debug, Clone, Copy)]
+struct DescriptionChoice<'p> {
+  /// The first description made of the first sample: of the packet's
+  /// bytes, VP9's the superframe its filter makes of the frames it held
+  /// and them.
+  first: Option<&'p [u8]>,
+  /// The configuration that reaches movenc.
+  reaching: Option<Reaching<'p>>,
+  /// The description in use rewritten in place with it.
+  overwrite: bool,
+  /// A new description of it.
+  append: bool,
+  /// The description in use after the packet.
+  current: usize,
+}
+
+/// What a packet's judgment leaves the commit to make, borrowed (R15,
+/// Codex R14 3).
+#[derive(Debug, Clone, Copy, Default)]
+struct Choices<'p> {
+  /// The MOV family: what the packet does to its sample descriptions.
+  descriptions: Option<DescriptionChoice<'p>>,
+  /// MP4's VP9 of no configuration: the packet is a hidden frame the
+  /// filter holds before the track's first sample
+  /// ([`TrackState::first_held`]).
+  holds_first: bool,
+  /// The MOV family's APV: the packet brings frame informations its track's
+  /// `apvC` holds not ([`apv_added`]).
+  apv: bool,
+}
+
+/// What a packet's commit made of its judgment's choices, owned, for its
+/// settle (R15, Codex R14 3).
+#[derive(Debug, Default)]
+struct Paid {
+  /// The MOV family: what the packet does to its sample descriptions.
+  descriptions: Option<DescriptionStep>,
+  /// MP4's VP9 of no configuration: the hidden frame the filter holds.
+  first_held: Option<Vec<u8>>,
+  /// The MOV family's APV: the frame informations the packet adds to the
+  /// track's `apvC`, by PBU type, in order.
+  apv: Vec<(u8, records::ApvFrameInfo)>,
+  /// The PBU types among them the track holds none of, each with room
+  /// for its informations.
+  apv_kinds: Vec<(u8, Vec<records::ApvFrameInfo>)>,
 }
 
 /// What a packet does to its track's sample descriptions ([`Descriptions`]):
 /// judged on borrowed bytes, the refusals made before anything is
-/// allocated, owning only the configurations it adds or changes — applied
-/// once the packet is written (R14, Codex R13 1).
+/// allocated ([`DescriptionChoice`]), owning only the configurations it
+/// adds or changes — made by the commit, applied once the packet is
+/// written (R14, Codex R13 1; R15, Codex R14 3).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DescriptionStep {
   /// The first description, made of the track's first sample where it
@@ -5635,7 +5876,13 @@ fn flv_misplaced<D, S>(
 /// reserved bits (MPEG-4 Part 2's too, refused at the start, 1017–1027);
 /// none where there is none.
 fn flv_rewrites(codec: CodecId, configuration: &[u8]) -> bool {
-  let Some(&first) = configuration.first() else {
+  flv_rewrites_first(codec, configuration.first().copied())
+}
+
+/// [`flv_rewrites`] of a configuration opening on `first`, `None` of an
+/// empty one.
+fn flv_rewrites_first(codec: CodecId, first: Option<u8>) -> bool {
+  let Some(first) = first else {
     return false;
   };
   match codec {
@@ -5661,7 +5908,6 @@ const VP6A: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID
 /// behind a four-byte length (`ff_nal_find_startcode`, 30–72).
 fn nal_rewritten_bytes(bytes: &[u8]) -> u64 {
   records::nal_units(bytes)
-    .iter()
     .map(|unit| 4 + unit.len() as u64)
     .sum()
 }
@@ -6457,31 +6703,62 @@ fn av1_sequence_header_parses(payload: &[u8]) -> bool {
   bits.at == end
 }
 
-/// The sequence headers of the AV1 temporal unit `bytes` FLV's
-/// `extract_extradata` makes a configuration of, whole and in their order,
-/// or `None` where it holds none (`extract_extradata_av1`,
-/// `extract_extradata.c` 96–164, over `ff_av1_packet_split`,
-/// `av1_parse.c` 56–97, in FFmpeg 9.0.1): a sequence header of no
-/// bits split off unread, as is every OBU of none but a temporal delimiter
-/// or padding. The global metadata
-/// it adds too — HDR content light level, mastering display colour volume
-/// (81–93) — never fails `ff_isom_write_av1c`, as an OBU of no bits is
-/// never added and one of bits has a payload, so that what
-/// [`av1c_written`] answers of the configuration it answers of these. The
-/// unit's OBUs parse ([`obus_parse`]), or the filter refuses it.
-fn av1_extracted_sequences(bytes: &[u8]) -> Option<Vec<u8>> {
-  let mut sequences = Vec::new();
-  let mut rest = bytes;
-  while let Some(obu) = obu_header(rest) {
-    let raw = &rest[..obu.len];
-    if obu.kind == AV1_OBU_SEQUENCE_HEADER
-      && av1_obu_bits(&raw[obu.start..], obu.kind).is_some_and(|bits| bits > 0)
-    {
-      sequences.extend_from_slice(raw);
-    }
-    rest = &rest[obu.len..];
+/// The configuration FLV's `extract_extradata` makes of a packet, read in
+/// place (R15, Codex R14 3): an H.264, HEVC or VVC packet's parameter sets
+/// ([`records::Extracted`]), or what `ff_isom_write_av1c` does with an AV1
+/// temporal unit's sequence headers ([`av1_extracted_written`]).
+#[derive(Clone, Copy)]
+enum FlvMade<'a> {
+  Sets(records::Extracted<'a>),
+  Sequences { whole: bool },
+}
+
+/// Whether `ff_isom_write_av1c` takes the configuration FLV's
+/// `extract_extradata` makes of the AV1 temporal unit `bytes` — its
+/// sequence headers, whole and in their order — or `None` where it holds
+/// none (`extract_extradata_av1`, `extract_extradata.c` 96–164, over
+/// `ff_av1_packet_split`, `av1_parse.c` 56–97, in FFmpeg 9.0.1): a sequence
+/// header of no bits split off unread, as is every OBU of none but a
+/// temporal delimiter or padding. The global metadata it adds too — HDR
+/// content light level, mastering display colour volume (81–93) — never
+/// fails `ff_isom_write_av1c`, as an OBU of no bits is never added and one
+/// of bits has a payload. Answered as [`av1c_written`] answers of the
+/// headers joined, each read where it lies in the packet, nothing made
+/// (R15): a joined run reads back as its OBUs, each a whole OBU of the
+/// packet's, one of no size field its last. The unit's OBUs parse
+/// ([`obus_parse`]), or the filter refuses it.
+fn av1_extracted_written(bytes: &[u8]) -> Option<bool> {
+  let sequences = || {
+    let mut rest = bytes;
+    core::iter::from_fn(move || {
+      while let Some(obu) = obu_header(rest) {
+        let raw = &rest[..obu.len];
+        rest = &rest[obu.len..];
+        if obu.kind == AV1_OBU_SEQUENCE_HEADER
+          && av1_obu_bits(&raw[obu.start..], obu.kind).is_some_and(|bits| bits > 0)
+        {
+          return Some(raw);
+        }
+      }
+      None
+    })
+  };
+  let first = *sequences().next()?.first()?;
+  if first & 0x80 != 0 {
+    return Some(first & 0x7F == 1 && sequences().map(<[u8]>::len).sum::<usize>() >= 4);
   }
-  (!sequences.is_empty()).then_some(sequences)
+  let mut count = 0;
+  for raw in sequences() {
+    let Some(obu) = obu_header(raw) else {
+      return Some(false);
+    };
+    count += 1;
+    let payload = &raw[obu.start..obu.len];
+    if payload.is_empty() || count > 1 || !av1_sequence_header_parses(payload) {
+      return Some(false);
+    }
+  }
+  Some(count == 1)
 }
 
 /// Whether `bytes` is a run of WavPack blocks Matroska's reformatter
@@ -7192,7 +7469,7 @@ impl Emits {
 
   /// The times of what is put out, in the order put out, the packet's own
   /// being `own`.
-  fn times(self, own: Timed) -> impl Iterator<Item = Timed> {
+  fn times(self, own: Timed) -> impl Iterator<Item = Timed> + use<> {
     self.held.into_iter().chain(self.own.then_some(own))
   }
 }
@@ -8624,26 +8901,95 @@ impl Refusal {
 struct Plan {
   track: TrackIndex,
   stream: usize,
-  /// libavformat's shift after the packet, where this muxer mirrors it.
-  shift: Option<Shift>,
+  /// What the packet does to libavformat's shift, where this muxer mirrors
+  /// it.
+  shift: Option<ShiftStep>,
   dts: Timestamp,
   times: PacketTimes,
-  /// What libavformat's interleaving is handed at the packet's write, by
-  /// the times each carries: what the track's filter puts out ([`Emits`]).
-  outputs: Vec<Timed>,
+  /// The first and the last of what libavformat's interleaving is handed at
+  /// the packet's write, by the times each carries: what the track's filter
+  /// puts out ([`Emits`]).
+  first: Option<Timed>,
+  last: Option<Timed>,
   /// Whether this muxer holds the packet, with its display set, handing
   /// libavformat nothing.
   holds: bool,
-  /// What the packets this muxer holds of the track put out, once handed.
-  pending: Vec<Timed>,
+  /// What the filter puts out with the packet, and its own times: of a
+  /// held one, what its track's packets put out once handed.
+  emits: Emits,
+  own: Timed,
   /// Whether the packet reaches the container marked a key frame.
   key: bool,
   /// What the track's automatic filter holds after the packet.
   filter: Filter,
   /// What the container learns of the track from the packet.
   learned: Learned,
+  /// What the commit made of the judgment's choices (R15).
+  paid: Paid,
   /// What the report learns from the packet, once it is written.
   uncarried: Vec<Uncarried>,
+}
+
+/// A timed packet judged ([`CarrierMuxer::decide`]): every rule met,
+/// nothing allocated for it — its commit's to make (R15, Codex R14 3).
+struct Decided<'p> {
+  track: TrackIndex,
+  stream: usize,
+  shift: Option<ShiftStep>,
+  dts: Timestamp,
+  times: PacketTimes,
+  first: Option<Timed>,
+  last: Option<Timed>,
+  holds: bool,
+  emits: Emits,
+  own: Timed,
+  pts_ticks: Option<i64>,
+  dts_ticks: i64,
+  step: Step,
+  filter: Filter,
+  learned: Learned,
+  choices: Choices<'p>,
+}
+
+/// What a track's filter puts out with a packet, read in place: the times
+/// of what the packets this muxer held of the track put out, then the
+/// packet's own ([`Emits`]) — nothing allocated (R15, Codex R14 3).
+#[derive(Debug, Clone, Copy)]
+struct Outputs<'a> {
+  held: &'a [Timed],
+  emits: Emits,
+  own: Timed,
+}
+
+impl<'a> Outputs<'a> {
+  /// Nothing put out: of a packet this muxer holds, of `own` times.
+  const fn none(own: Timed) -> Self {
+    Self {
+      held: &[],
+      emits: Emits::NONE,
+      own,
+    }
+  }
+
+  fn iter(self) -> impl Iterator<Item = Timed> + 'a {
+    self.held.iter().copied().chain(self.emits.times(self.own))
+  }
+
+  fn len(self) -> usize {
+    self.iter().count()
+  }
+
+  fn is_empty(self) -> bool {
+    self.iter().next().is_none()
+  }
+
+  fn first(self) -> Option<Timed> {
+    self.iter().next()
+  }
+
+  fn last(self) -> Option<Timed> {
+    self.iter().last()
+  }
 }
 
 /// What a container learns of a track from a packet it writes, for the
@@ -8686,12 +9032,6 @@ struct Learned {
   /// The MOV family: the entries MP4 has made in the track's table of
   /// samples after the packet ([`PayloadRule::SampleTable`]).
   mp4_entries: Option<u64>,
-  /// The MOV family: what the packet does to its sample descriptions,
-  /// where it changes them ([`DescriptionStep`]).
-  descriptions: Option<DescriptionStep>,
-  /// MP4's VP9 of no configuration: the hidden frame the filter holds
-  /// before the track's first sample ([`TrackState::first_held`]).
-  first_held: Option<Vec<u8>>,
   /// The MOV family: the bound of the track's `stsd` after the packet,
   /// where its descriptions grow ([`TrackState::stsd`]).
   stsd: Option<u64>,
@@ -8702,9 +9042,6 @@ struct Learned {
   /// whole predicate, though ISMV admits H.264 alone of video here (table
   /// H), which has none.
   fragment_cut: bool,
-  /// The MOV family's APV: the frame informations the packet adds to the
-  /// track's `apvC`, by PBU type.
-  apv: Vec<(u8, records::ApvFrameInfo)>,
   /// NUT: the key frame's presentation and decode times, in ticks.
   key_times: Option<(i128, i128)>,
   /// The MXF muxers: what they know of the track's frames after it.
@@ -9802,11 +10139,16 @@ where
     Ok((sink, report))
   }
 
-  /// Judges a timed packet: the face's rules — the presentation rule on
-  /// the counts libavformat is handed — then the container's, in the
-  /// packet-rule table's order (see [the module](self)).
+  /// Admits a timed packet: judges it ([`Self::decide`]), then pays for its
+  /// write ([`Self::commit`]) — decide first, pay after (R15, Codex R14 3):
+  /// every rule is met before anything is allocated for the packet, and
+  /// what its write needs is allocated fallibly after, a failure handing
+  /// the packet back untouched ([`FfmpegMuxRefusal::OutOfMemory`]). The
+  /// line falls at libavformat's write: what it allocates of the packet is
+  /// its own; what settling the write records goes into room the commit
+  /// reserved, allocating nothing.
   fn admit(
-    &self,
+    &mut self,
     track: TrackIndex,
     offered: TrackKind,
     pts: Option<Timestamp>,
@@ -9814,6 +10156,23 @@ where
     duration: Option<Timestamp>,
     payload: Payload<'_>,
   ) -> Result<Plan, Refusal> {
+    let decided = self.decide(track, offered, (pts, dts, duration), payload)?;
+    self
+      .commit(decided, payload)
+      .map_err(|_| Refusal::Container(FfmpegMuxRefusal::OutOfMemory { track }))
+  }
+
+  /// Judges a timed packet: the face's rules — the presentation rule on
+  /// the counts libavformat is handed — then the container's, in the
+  /// packet-rule table's order (see [the module](self)); over borrowed
+  /// bytes and counted lengths alone, nothing allocated (R15, Codex R14 3).
+  fn decide<'p>(
+    &self,
+    track: TrackIndex,
+    offered: TrackKind,
+    (pts, dts, duration): (Option<Timestamp>, Option<Timestamp>, Option<Timestamp>),
+    payload: Payload<'p>,
+  ) -> Result<Decided<'p>, Refusal> {
     let state = self
       .tracks
       .get(track.get())
@@ -9931,17 +10290,23 @@ where
     // that completes the set hands them over.
     let holds =
       offered == TrackKind::Subtitle && matches!(filter, Filter::Pgs(next) if next.holding);
-    let emitted = state.pending.iter().copied().chain(step.emits.times(own));
-    let (outputs, pending): (Vec<Timed>, Vec<Timed>) = if holds {
-      (Vec::new(), emitted.collect())
+    // What the filter puts out now, read in place: what the packets this
+    // muxer held of the track put out, then the packet's own — nothing of
+    // a packet it holds, whose own wait with those held.
+    let outputs = if holds {
+      Outputs::none(own)
     } else {
-      (emitted.collect(), Vec::new())
+      Outputs {
+        held: &state.pending,
+        emits: step.emits,
+        own,
+      }
     };
     // libavformat's rule, exactly, on every packet it is handed: nothing is
     // checked while the last decode time is zero — its counter starts there
     // — and a repeat is refused after any other.
     let mut last_ticks = state.last_ticks;
-    for output in &outputs {
+    for output in outputs.iter() {
       if state.strict && matches!(last_ticks, Some(last) if last != 0 && last >= output.dts_ticks) {
         return Err(Refusal::Container(FfmpegMuxRefusal::RepeatedDts {
           track,
@@ -9968,22 +10333,22 @@ where
         let floor = if state.rules.mp4 {
           None
         } else {
-          let preload = match (state.rules.ps_preload, current.first) {
+          let preload = match (state.rules.ps_preload, current.now.first) {
             (Some(dvd), Some(first)) => ps_preload_ticks(first, dvd),
             _ => 0,
           };
           Some(i128::from(lowest) - preload)
         };
-        let mut next = current.clone();
-        for output in &outputs {
+        let mut next = current.step(track.get());
+        for output in outputs.iter() {
           // A reordering stream's packet without the presentation time
           // judged is refused below ([`FfmpegMuxRefusal::MissingPts`]), and
           // would move nothing: libavformat judges no packet without its
           // time (`mux.c` 650–651).
-          if next.by_pts && output.pts.is_none() && state.rules.needs_pts {
+          if next.now.by_pts && output.pts.is_none() && state.rules.needs_pts {
             continue;
           }
-          let (at, timestamp) = if next.by_pts {
+          let (at, timestamp) = if next.now.by_pts {
             (
               output.pts_ticks.unwrap_or(output.dts_ticks),
               output.pts.unwrap_or(output.dts),
@@ -9997,24 +10362,20 @@ where
           // a packet before that write that would be the first written,
           // the earliest held — the packet the write is decided by.
           if let Some(dvd) = state.rules.ps_preload
-            && !next.written
+            && !next.now.written
             && next
+              .now
               .head
               .is_none_or(|head| Timestamp::new(output.dts_ticks, time_base) < head)
-            && ps_preload_wraps(i128::from(output.dts_ticks) + next.lift(time_base), dvd)
+            && ps_preload_wraps(i128::from(output.dts_ticks) + next.now.lift(time_base), dvd)
           {
             return Err(Refusal::Container(FfmpegMuxRefusal::TimeWraps {
               track,
               timestamp: output.dts,
             }));
           }
-          next = next
-            .take(
-              track.get(),
-              (at, output.dts_ticks, lowest),
-              floor,
-              time_base,
-            )
+          next = current
+            .take(next, (at, output.dts_ticks, lowest), floor, time_base)
             .map_err(|early| {
               Refusal::Container(match early {
                 Early::BeforeEarliest => FfmpegMuxRefusal::BeforeZero { track, timestamp },
@@ -10034,12 +10395,12 @@ where
     } else {
       Neighbours::default()
     };
-    let lift = shift.as_ref().map_or(0, |shift| shift.lift(time_base));
-    let mut learned = check_packet_rules(
+    let lift = shift.map_or(0, |step| step.now.lift(time_base));
+    let (mut learned, choices) = check_packet_rules(
       state,
       time_base,
       neighbours,
-      (own, &outputs, lift),
+      (own, outputs, lift),
       payload,
       step,
       self.bounds,
@@ -10073,55 +10434,119 @@ where
         }));
       }
     }
-    let mut uncarried = learned_losses(
+    Ok(Decided {
+      track,
+      stream,
+      shift,
+      dts,
+      times: PacketTimes::new(pts_ticks, Some(dts_ticks), duration_ticks),
+      first: outputs.first(),
+      last: outputs.last(),
+      holds,
+      emits: step.emits,
+      own,
+      pts_ticks,
+      dts_ticks,
+      step,
+      filter,
+      learned,
+      choices,
+    })
+  }
+
+  /// Pays for a packet's write, judged ([`Self::decide`]): its report's
+  /// lines, the configurations its descriptions take, the frame VP9's
+  /// filter holds, APV's frame informations — each allocated fallibly —
+  /// and room for what settling the write records, reserved, so that the
+  /// settle allocates nothing. `Err` where an allocation fails, nothing
+  /// recorded (R15, Codex R14 3).
+  fn commit(
+    &mut self,
+    decided: Decided<'_>,
+    payload: Payload<'_>,
+  ) -> Result<Plan, TryReserveError> {
+    let Decided {
+      track,
+      stream,
+      shift,
+      dts,
+      times,
+      first,
+      last,
+      holds,
+      emits,
+      own,
+      pts_ticks,
+      dts_ticks,
+      step,
+      filter,
+      learned,
+      choices,
+    } = decided;
+    let state = &self.tracks[track.get()];
+    let mut uncarried = Vec::new();
+    // The filter this packet's write inserts, where the first packet
+    // decides it: named for the track then, once (table B).
+    if let Some(filter) = step.inserted {
+      let line = Uncarried::Filtered { track, filter };
+      if !self.report.uncarried.contains(&line) {
+        try_push(&mut uncarried, line)?;
+      }
+    }
+    learned_losses(
       state,
       track,
       &self.report.uncarried,
       payload,
       &learned,
       step.owns,
-    );
-    // The filter this packet's write inserts, where the first packet
-    // decides it: named for the track then, once (table B).
-    if let Some(filter) = step.inserted {
-      let line = Uncarried::Filtered { track, filter };
-      if !self.report.uncarried.contains(&line) {
-        uncarried.insert(0, line);
-      }
-    }
+      &mut uncarried,
+    )?;
     // Table H's field rows the packet shows: AVI's time not its place; a
     // time the container does not write, where its two differ.
     if learned.place.is_some_and(|(_, moved)| moved)
       || learned.mp4_place.is_some_and(|mp4| mp4.moved)
     {
-      uncarried.push(Uncarried::Rewritten {
-        track,
-        rewrite: Rewrite::Timeline,
-      });
+      try_push(
+        &mut uncarried,
+        Uncarried::Rewritten {
+          track,
+          rewrite: Rewrite::Timeline,
+        },
+      )?;
     }
     // FLV's Annex B rewrite, which a packet's new extradata can turn on
     // (`flvenc.c` 1250–1263, 1315–1327): reported once, at open or here.
     if learned.flv_rewrites == Some(true) {
-      uncarried.push(Uncarried::Rewritten {
-        track,
-        rewrite: Rewrite::LengthPrefixed,
-      });
+      try_push(
+        &mut uncarried,
+        Uncarried::Rewritten {
+          track,
+          rewrite: Rewrite::LengthPrefixed,
+        },
+      )?;
     }
     if let Some(fields) = state.rules.fields
       && step.owns
       && pts_ticks.is_some_and(|pts| pts != dts_ticks)
     {
       if fields.pts && !fields.dts {
-        uncarried.push(Uncarried::Rewritten {
-          track,
-          rewrite: Rewrite::DecodeTimes,
-        });
+        try_push(
+          &mut uncarried,
+          Uncarried::Rewritten {
+            track,
+            rewrite: Rewrite::DecodeTimes,
+          },
+        )?;
       }
       if fields.dts && !fields.pts {
-        uncarried.push(Uncarried::Rewritten {
-          track,
-          rewrite: Rewrite::PresentationTimes,
-        });
+        try_push(
+          &mut uncarried,
+          Uncarried::Rewritten {
+            track,
+            rewrite: Rewrite::PresentationTimes,
+          },
+        )?;
       }
     }
 
@@ -10129,41 +10554,129 @@ where
     // stream's times moved so that it lies half a second in where it lies
     // before, and always on DVD (`mpegenc.c` 1186–1201), every stream
     // counted in 90 kHz.
-    let first_write = shift.as_ref().is_some_and(|shift| shift.written)
-      && self.shift.as_ref().is_some_and(|shift| !shift.written);
+    let first_write = shift.is_some_and(|step| step.now.written)
+      && self.shift.as_ref().is_some_and(|shift| !shift.now.written);
     let preloads = state.rules.ps_preload.is_some_and(|dvd| {
       first_write
         && shift
-          .as_ref()
-          .and_then(|shift| shift.first)
+          .and_then(|step| step.now.first)
           .is_some_and(|first| first < PS_PRELOAD_TICKS || (dvd && first != PS_PRELOAD_TICKS))
     });
     // The shift, once a packet before the earliest makes it certain — or
     // the preload — reported once.
-    if ((shift.as_ref().is_some_and(|shift| shift.earliest.is_some())
+    if ((shift.is_some_and(|step| step.now.earliest.is_some())
       && self
         .shift
         .as_ref()
-        .is_some_and(|shift| shift.earliest.is_none()))
+        .is_some_and(|shift| shift.now.earliest.is_none()))
       || preloads)
       && !self.report.uncarried().contains(&Uncarried::TimesShifted)
     {
-      uncarried.push(Uncarried::TimesShifted);
+      try_push(&mut uncarried, Uncarried::TimesShifted)?;
     }
+    // PGS: the lines of the display set this packet completes, written
+    // before it ([`Muxer::write_subtitle`]).
+    let held_lines = if holds {
+      0
+    } else {
+      self
+        .held
+        .iter()
+        .filter(|entry| entry.packet.track() == track)
+        .map(|entry| entry.uncarried.len())
+        .sum()
+    };
+    uncarried.try_reserve(held_lines)?;
+    let paid = self.pay(
+      track,
+      choices,
+      payload,
+      (holds, emits.times(own).count()),
+      uncarried.len() + held_lines,
+    )?;
     Ok(Plan {
       track,
       stream,
       shift,
       dts,
-      times: PacketTimes::new(pts_ticks, Some(dts_ticks), duration_ticks),
-      outputs,
+      times,
+      first,
+      last,
       holds,
-      pending,
+      emits,
+      own,
       key: step.owns && payload.key,
       filter,
       learned,
+      paid,
       uncarried,
     })
+  }
+
+  /// Makes what a judged packet's `choices` leave to be made — the
+  /// configurations its descriptions take, the hidden frame VP9's filter
+  /// holds, APV's frame informations — each allocated fallibly, and
+  /// reserves room for what its settle records: a description, a held
+  /// frame, informations of a PBU type, `lines` of the report, and of a
+  /// packet this muxer holds — `held` — its outputs' times and itself
+  /// (R15, Codex R14 3). Nothing is recorded: room is not a record.
+  fn pay(
+    &mut self,
+    track: TrackIndex,
+    choices: Choices<'_>,
+    payload: Payload<'_>,
+    (holds, emitted): (bool, usize),
+    lines: usize,
+  ) -> Result<Paid, TryReserveError> {
+    let mut paid = Paid::default();
+    let state = &mut self.tracks[track.get()];
+    if let Some(choice) = choices.descriptions {
+      let reaching = choice.reaching.as_ref().map(Reaching::bytes);
+      let configuration = || try_vec(reaching.unwrap_or(&[]));
+      let first = match choice.first {
+        Some(shown) if state.first_held.is_empty() => Some(try_vec(shown)?),
+        Some(shown) => Some(superframe_of(&state.first_held, shown)?),
+        None => None,
+      };
+      let step = DescriptionStep {
+        first,
+        overwrite: choice.overwrite.then(configuration).transpose()?,
+        append: choice.append.then(configuration).transpose()?,
+        current: choice.current,
+      };
+      if step.append.is_some() {
+        state.descriptions.entries.try_reserve(1)?;
+      }
+      paid.descriptions = Some(step);
+    }
+    if choices.holds_first {
+      paid.first_held = Some(try_vec(payload.bytes)?);
+      state.first_held.try_reserve(1)?;
+    }
+    if choices.apv {
+      for (kind, info) in apv_added(&state.apv, payload.bytes) {
+        try_push(&mut paid.apv, (kind, info))?;
+      }
+      for &(kind, _) in &paid.apv {
+        let count = paid.apv.iter().filter(|&&(entry, _)| entry == kind).count();
+        match state.apv.iter_mut().find(|(entry, _)| *entry == kind) {
+          Some((_, infos)) => infos.try_reserve(count)?,
+          None if !paid.apv_kinds.iter().any(|(entry, _)| *entry == kind) => {
+            let mut infos = Vec::new();
+            infos.try_reserve_exact(count)?;
+            try_push(&mut paid.apv_kinds, (kind, infos))?;
+          }
+          None => {}
+        }
+      }
+      state.apv.try_reserve(paid.apv_kinds.len())?;
+    }
+    if holds {
+      state.pending.try_reserve(emitted)?;
+      self.held.try_reserve(1)?;
+    }
+    self.report.uncarried.try_reserve(lines)?;
+    Ok(paid)
   }
 
   /// What the file's other timed tracks can make MP4 write before a cue of
@@ -10197,16 +10710,19 @@ where
     written.map_err(|error| {
       MuxError::Fault(MuxFault::new(MuxStage::Write { track: plan.track }, error))
     })?;
-    if let Some(shift) = plan.shift {
-      self.shift = Some(shift);
+    // Into room the commit reserved: nothing allocated (R15).
+    if let Some(step) = plan.shift
+      && let Some(shift) = &mut self.shift
+    {
+      shift.apply(step);
     }
     let state = &mut self.tracks[plan.track.get()];
     state.last = Some(plan.dts);
     state.filter = plan.filter;
-    state.pending = plan.pending;
+    state.pending.clear();
     // What libavformat was handed moves every mirror of its timing and the
     // container's: the last packet the filter put out.
-    if let Some(last) = plan.outputs.last() {
+    if let Some(last) = plan.last {
       state.last_ticks = Some(last.dts_ticks);
       state.handed = Some(last.dts);
       if plan.learned.writes {
@@ -10219,7 +10735,7 @@ where
     // of its decode time where the stream does not reorder (`mux.c`
     // 531–532).
     if state.dts_shift.is_none()
-      && let Some(first) = plan.outputs.first()
+      && let Some(first) = plan.first
     {
       state.dts_shift = Some(
         first
@@ -10244,7 +10760,7 @@ where
     // The sample descriptions' step, applied as movenc applies it: the first
     // made of the first sample, the one in use rewritten, a new one, then
     // the one in use.
-    if let Some(step) = plan.learned.descriptions {
+    if let Some(step) = plan.paid.descriptions {
       let descriptions = &mut state.descriptions;
       if let Some(first) = step.first {
         descriptions.entries[0] = Some(first);
@@ -10258,7 +10774,7 @@ where
       }
       descriptions.current = step.current;
     }
-    if let Some(frame) = plan.learned.first_held {
+    if let Some(frame) = plan.paid.first_held {
       state.first_held.push(frame);
     }
     if let Some(stsd) = plan.learned.stsd {
@@ -10270,12 +10786,20 @@ where
     {
       *keys += 1;
     }
-    for &(kind, info) in &plan.learned.apv {
+    let Paid {
+      apv, mut apv_kinds, ..
+    } = plan.paid;
+    for (kind, info) in apv {
       match state.apv.iter_mut().find(|(entry, _)| *entry == kind) {
         Some((_, infos)) => infos.push(info),
-        None => state.apv.push((kind, vec![info])),
+        None => {
+          if let Some((_, infos)) = apv_kinds.iter_mut().find(|(entry, _)| *entry == kind) {
+            infos.push(info);
+          }
+        }
       }
     }
+    state.apv.append(&mut apv_kinds);
     if let Some(key_times) = plan.learned.key_times {
       state.key_times = Some(key_times);
     }
@@ -10318,7 +10842,8 @@ where
     let last = state.last;
     state.last = Some(plan.dts);
     state.filter = plan.filter;
-    state.pending = plan.pending;
+    // Into room the commit reserved: nothing allocated (R15).
+    state.pending.extend(plan.emits.times(plan.own));
     self.held.push(HeldPacket {
       packet,
       times: plan.times,
@@ -10363,12 +10888,14 @@ fn learned_losses(
   payload: Payload<'_>,
   learned: &Learned,
   owns: bool,
-) -> Vec<Uncarried> {
+  lines: &mut Vec<Uncarried>,
+) -> Result<(), TryReserveError> {
   let (payload_bytes, side_data) = (payload.bytes, payload.side_data);
-  let mut lines = Vec::new();
   let mut push = |line: Uncarried| {
     if !reported.contains(&line) && !lines.contains(&line) {
-      lines.push(line);
+      try_push(lines, line)
+    } else {
+      Ok(())
     }
   };
   if owns
@@ -10380,7 +10907,7 @@ fn learned_losses(
     push(Uncarried::Rewritten {
       track,
       rewrite: Rewrite::KeyFramesMarked,
-    });
+    })?;
   }
   // MP4's constant-size audio keeps each packet's duration as its samples,
   // whatever lies between its packets — its timeline's moves are
@@ -10394,7 +10921,7 @@ fn learned_losses(
     push(Uncarried::Rewritten {
       track,
       rewrite: Rewrite::Durations,
-    });
+    })?;
   }
   for entry in side_data {
     let new_extradata = entry.kind() == AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
@@ -10421,10 +10948,10 @@ fn learned_losses(
         kind: entry.kind(),
         name: packet_side_data_name(entry.kind()),
         fate,
-      });
+      })?;
     }
   }
-  lines
+  Ok(())
 }
 
 /// A timed packet's times, as offered and as counted in its stream's time
@@ -10562,15 +11089,15 @@ fn check_times(rules: &PacketRules, mp4: Mp4Times, timed: Timed) -> Result<(), F
 /// its track's filter does with it, `bounds` the sizes held to (table B);
 /// answers what the container learns of the track from it, for the next
 /// one's judgment.
-fn check_packet_rules(
+fn check_packet_rules<'p>(
   state: &TrackState,
   time_base: Timebase,
   neighbours: Neighbours,
-  (own, outputs, lift): (Timed, &[Timed], i128),
-  payload: Payload<'_>,
+  (own, outputs, lift): (Timed, Outputs<'_>, i128),
+  payload: Payload<'p>,
   step: Step,
   bounds: Bounds,
-) -> Result<Learned, FfmpegMuxRefusal> {
+) -> Result<(Learned, Choices<'p>), FfmpegMuxRefusal> {
   let owns = step.owns;
   let rules = &state.rules;
   let Timed {
@@ -10618,7 +11145,7 @@ fn check_packet_rules(
       shift.unwrap_or(0).max(0)
     }
   });
-  for output in outputs {
+  for output in outputs.iter() {
     // `check_pkt` counts a packet's gap from the last sample MP4 wrote on the
     // track — not from a packet MP4 holds — and a `mov_text` cue's from the
     // empty sample where MP4 writes it first (table C″).
@@ -10638,7 +11165,7 @@ fn check_packet_rules(
         shifted,
       },
     };
-    check_times(rules, mp4, *output)?;
+    check_times(rules, mp4, output)?;
     last_sample = Some(i128::from(output.dts_ticks));
     // A decode time the container counts in fewer bits, as it writes it:
     // moved by libavformat's shift, as far as the packet shows it.
@@ -10925,19 +11452,24 @@ fn check_packet_rules(
       if !obus_parse(payload.bytes) {
         return refused(PayloadRule::Obus);
       }
-      av1_extracted_sequences(payload.bytes)
+      av1_extracted_written(payload.bytes).map(|whole| FlvMade::Sequences { whole })
     }
     Some(tag) if tag.extracts => match h26x_units(tag.codec) {
       Some(units) => match records::h2645_extracted(units, payload.bytes) {
-        Ok(made) => made,
+        Ok(made) => made.map(FlvMade::Sets),
         Err(()) => return refused(PayloadRule::NalUnits),
       },
       None => None,
     },
     _ => None,
   };
-  if let (Some(made), Some(writer)) = (&flv_made, rules.writer)
-    && !writer.writes(made).whole()
+  if let (Some(made), Some(writer)) = (flv_made, rules.writer)
+    && !match made {
+      FlvMade::Sets(sets) => writer
+        .writes_config(records::Config::Extracted(sets))
+        .whole(),
+      FlvMade::Sequences { whole } => whole,
+    }
   {
     return refused(PayloadRule::NewExtradata);
   }
@@ -10966,8 +11498,16 @@ fn check_packet_rules(
   // replaces the packet's own (`av_packet_add_side_data`,
   // `libavcodec/packet.c` 197–212), else the packet's.
   let flv_rewrites = rules.flv_tag.map(|tag| {
-    if let Some(made) = &flv_made {
-      return flv_rewrites(tag.codec, made);
+    if let Some(made) = flv_made {
+      // The configuration opens on a start code, or on a sequence header's
+      // OBU, whatever FLV's AV1 makes of it.
+      return flv_rewrites_first(
+        tag.codec,
+        Some(match made {
+          FlvMade::Sets(_) => 0,
+          FlvMade::Sequences { .. } => AV1_OBU_SEQUENCE_HEADER << 3,
+        }),
+      );
     }
     match side_data(
       payload.side_data,
@@ -11065,24 +11605,23 @@ fn check_packet_rules(
   // The MOV family's APV: each frame's information MP4's parse of the
   // packet records into `apvC`, a type's 256th past its 8-bit count
   // (`ff_isom_parse_apvc`, `apv.c` 253–318; [`PayloadRule::ApvFrameInfo`]).
-  let mut apv: Vec<(u8, records::ApvFrameInfo)> = Vec::new();
-  if rules.apv && !config_only {
-    for (kind, info) in records::apv_frame_infos(payload.bytes) {
+  let apv = rules.apv && !config_only && {
+    for (index, (kind, _)) in apv_added(&state.apv, payload.bytes).enumerate() {
       let recorded = state
         .apv
         .iter()
         .find(|(entry, _)| *entry == kind)
-        .map_or(&[][..], |(_, infos)| infos.as_slice());
-      let added = apv.iter().filter(|(entry, _)| *entry == kind);
-      if recorded.contains(&info) || added.clone().any(|(_, seen)| *seen == info) {
-        continue;
-      }
-      if recorded.len() + added.count() >= usize::from(u8::MAX) {
+        .map_or(0, |(_, infos)| infos.len());
+      let added = apv_added(&state.apv, payload.bytes)
+        .take(index)
+        .filter(|&(entry, _)| entry == kind)
+        .count();
+      if recorded + added >= usize::from(u8::MAX) {
         return refused(PayloadRule::ApvFrameInfo);
       }
-      apv.push((kind, info));
     }
-  }
+    apv_added(&state.apv, payload.bytes).next().is_some()
+  };
   // NUT's index (`write_index`, `nutenc.c` 615–667): a key frame — one
   // libavformat marks so for a codec that counts every frame one among
   // them (`mux.c` 820–821) — presented before the last, or at it but
@@ -11253,25 +11792,28 @@ fn check_packet_rules(
   // the packet's own, else the packet's own new extradata, where it reaches
   // the container — taken as movenc takes it ([`Descriptions`]), judged on
   // borrowed bytes, nothing allocated before its refusals.
-  let (descriptions, first_held, stsd) = if rules.mp4
+  let (descriptions, holds_first, stsd) = if rules.mp4
     && rules.ttml_document.is_none()
     && state.descriptions.current < state.descriptions.entries.len()
   {
     let codec = state.sides.codec;
     let entries = &state.descriptions.entries;
     let current = state.descriptions.current;
-    let mut made = [0_u8; 2 + MAX_PCE_SIZE];
-    let reaching: Option<&[u8]> = if first_conversion(state.filter, payload.bytes) {
-      made_configuration_into(payload.bytes, &mut made).map(|len| &made[..len])
+    let configuration: Option<Reaching<'p>> = if first_conversion(state.filter, payload.bytes) {
+      let mut made = [0_u8; 2 + MAX_PCE_SIZE];
+      made_configuration_into(payload.bytes, &mut made)
+        .map(|len| Reaching::Made { bytes: made, len })
     } else if owns {
       side_data(
         payload.side_data,
         AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
       )
       .filter(|new| !new.is_empty())
+      .map(Reaching::Side)
     } else {
       None
     };
+    let reaching = configuration.as_ref().map(Reaching::bytes);
     let writes = !config_only && !outputs.is_empty();
     let empty = |entry: &Option<Vec<u8>>| entry.as_ref().is_some_and(Vec::is_empty);
     // `mov_write_single_packet`: MPEG-4 ALS's, AAC's, AV1's and FLAC's
@@ -11326,53 +11868,49 @@ fn check_packet_rules(
     if append && entries.len() >= MOV_DESCRIPTIONS_MAX {
       return refused(PayloadRule::SampleDescriptions);
     }
-    let step = DescriptionStep {
-      first: capture.then(|| {
-        if state.first_held.is_empty() {
-          payload.bytes.to_vec()
-        } else {
-          superframe_of(&state.first_held, payload.bytes)
-        }
-      }),
-      overwrite: overwrite.filter(|_| overwritten).map(<[u8]>::to_vec),
-      append: reaching.filter(|_| append).map(<[u8]>::to_vec),
+    let choice = DescriptionChoice {
+      first: capture.then_some(payload.bytes),
+      reaching: configuration,
+      overwrite: overwritten,
+      append,
       current: match found {
         Some(Some(index)) => index,
         Some(None) => entries.len(),
         None => current,
       },
     };
-    let held = (first_frame
-      && codec == CodecId::VP9
-      && !writes
-      && !config_only
-      && !payload.bytes.is_empty())
-    .then(|| payload.bytes.to_vec());
-    let changes = step.first.is_some()
-      || step.overwrite.is_some()
-      || step.append.is_some()
-      || step.current != current;
+    let holds_first =
+      first_frame && codec == CodecId::VP9 && !writes && !config_only && !payload.bytes.is_empty();
+    let changes =
+      choice.first.is_some() || choice.overwrite || choice.append || choice.current != current;
     // The `stsd`'s bound after it, the exact sum of its descriptions' as
     // the packet leaves them (R15, Codex R14 4): a description rewritten in
     // place counted at its new bytes instead of its old, the first made of
-    // the first sample instead of none, and a new one beside them.
+    // the first sample instead of none, and a new one beside them — each
+    // by its length, nothing made.
     let stsd = state.moov.filter(|_| changes).map(|shape| {
       let old = |index: usize| moov_entry(shape, entries[index].as_ref().map_or(0, Vec::len));
+      let reached = reaching.map_or(0, <[u8]>::len);
       let mut sum = state.stsd;
-      if let Some(first) = &step.first {
-        sum = sum - old(0) + moov_entry(shape, first.len());
+      if choice.first.is_some() {
+        let first = if state.first_held.is_empty() {
+          payload.bytes.len()
+        } else {
+          superframe_len(&state.first_held, payload.bytes)
+        };
+        sum = sum - old(0) + moov_entry(shape, first);
       }
-      if let Some(configuration) = &step.overwrite {
-        sum = sum - old(current) + moov_entry(shape, configuration.len());
+      if choice.overwrite {
+        sum = sum - old(current) + moov_entry(shape, reached);
       }
-      if let Some(configuration) = &step.append {
-        sum += moov_entry(shape, configuration.len());
+      if choice.append {
+        sum += moov_entry(shape, reached);
       }
       sum
     });
-    (changes.then_some(step), held, stsd)
+    (changes.then_some(choice), holds_first, stsd)
   } else {
-    (None, None, None)
+    (None, false, None)
   };
   if rules.prores && !prores_atom(payload.bytes) {
     return refused(PayloadRule::ProResAtom);
@@ -11497,36 +12035,41 @@ fn check_packet_rules(
           i128::from(dts_ticks) - i128::from(at) != i128::from(offered)
         })
     });
-  Ok(Learned {
-    sample,
-    writes: !config_only,
-    cues: cues.map(|cue| cue.next),
-    ac3: ac3.map(|(learned, _, _)| learned),
-    joined: matches!(ac3, Some((_, Ac3Step::Joins | Ac3Step::Completes(_), _))),
-    document,
-    durations,
-    adts,
-    bytes: payload.bytes.len() as u64,
-    place,
-    mp4_place,
-    mp4_entries,
+  let choices = Choices {
     descriptions,
-    first_held,
-    stsd,
-    fragment_cut: false,
+    holds_first,
     apv,
-    key_times,
-    mxf,
-    written,
-    flv_rewrites,
-    presented,
-    configured: step.inserted == Some(AutomaticFilter::AacAdtsToAsc)
-      || side_data(
-        payload.side_data,
-        AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
-      )
-      .is_some_and(|new| !new.is_empty()),
-  })
+  };
+  Ok((
+    Learned {
+      sample,
+      writes: !config_only,
+      cues: cues.map(|cue| cue.next),
+      ac3: ac3.map(|(learned, _, _)| learned),
+      joined: matches!(ac3, Some((_, Ac3Step::Joins | Ac3Step::Completes(_), _))),
+      document,
+      durations,
+      adts,
+      bytes: payload.bytes.len() as u64,
+      place,
+      mp4_place,
+      mp4_entries,
+      stsd,
+      fragment_cut: false,
+      key_times,
+      mxf,
+      written,
+      flv_rewrites,
+      presented,
+      configured: step.inserted == Some(AutomaticFilter::AacAdtsToAsc)
+        || side_data(
+          payload.side_data,
+          AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+        )
+        .is_some_and(|new| !new.is_empty()),
+    },
+    choices,
+  ))
 }
 
 /// Whether `bytes`, the first packet of a raw stream of `codec`, carries the
@@ -11842,15 +12385,19 @@ where
       return Ok(());
     }
     // The packets held of the display set this one completes go first, in
-    // the order offered: the filter puts the set out at this one.
+    // the order offered: the filter puts the set out at this one. Each
+    // taken out where it lies, its lines before the packet's own — in room
+    // the commit reserved, nothing allocated (R15).
     let track = plan.track;
-    let (held, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.held)
-      .into_iter()
-      .partition(|entry| entry.packet.track() == track);
-    self.held = kept;
     let mut plan = plan;
-    let mut lines = Vec::new();
-    for entry in held {
+    let own = plan.uncarried.len();
+    let mut at = 0;
+    while at < self.held.len() {
+      if self.held[at].packet.track() != track {
+        at += 1;
+        continue;
+      }
+      let entry = self.held.remove(at);
       self
         .output
         .write_packet::<C>(
@@ -11860,10 +12407,9 @@ where
           self.limits,
         )
         .map_err(|error| MuxError::Fault(MuxFault::new(MuxStage::Write { track }, error)))?;
-      lines.extend(entry.uncarried);
+      plan.uncarried.extend(entry.uncarried);
     }
-    lines.append(&mut plan.uncarried);
-    plan.uncarried = lines;
+    plan.uncarried.rotate_left(own);
     let written = self.output.write_packet::<C>(
       plan.stream,
       OutputPacket::Subtitle(p),

@@ -1310,16 +1310,25 @@ fn admit_eac3(
     held: None,
     inserted: None,
   };
-  let learned = check_packet_rules(
+  let (learned, _) = check_packet_rules(
     state,
     time_base,
     Neighbours::default(),
-    (timed, &[timed], 0),
+    (
+      timed,
+      Outputs {
+        held: &[],
+        emits: Emits::OWN,
+        own: timed,
+      },
+      0,
+    ),
     payload,
     step,
     Bounds::REAL,
   )?;
-  let lines = learned_losses(state, track, &[], payload, &learned, true);
+  let mut lines = Vec::new();
+  learned_losses(state, track, &[], payload, &learned, true, &mut lines).expect("room");
   if let Some(sample) = learned.sample {
     state.sample = Some(sample);
   }
@@ -2826,6 +2835,7 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   assert!(
     of(Family::Matroska, "matroska", &[video, audio])
       .expect("mirrored")
+      .now
       .by_pts
   );
   assert!(
@@ -2835,6 +2845,7 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
       &[(TrackKind::Video, CodecId::JPEG2000, true), audio]
     )
     .expect("mirrored")
+    .now
     .by_pts,
     "VFW mode"
   );
@@ -2854,83 +2865,88 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
     None,
     "VFW or QuickTime mode, by tables not mirrored"
   );
-  assert!(!of(Family::Other, "flv", &[video]).expect("mirrored").by_pts);
+  assert!(
+    !of(Family::Other, "flv", &[video])
+      .expect("mirrored")
+      .now
+      .by_pts
+  );
 
   // One stream interleaved, beside SMPTE 2038 data: the first packet is
   // the first write, and settles the move.
   let alone = of(Family::Other, "mpegts", &[video, data]).expect("mirrored");
-  assert!(alone.passthrough);
+  assert!(alone.now.passthrough);
   let moved = alone
-    .take(0, (-40, -40, 0), Some(0), ms)
+    .take_alone(0, (-40, -40, 0), Some(0), ms)
     .expect("before the write");
-  assert!(moved.written);
-  assert_eq!(moved.earliest, Some(Timestamp::new(-40, ms)));
+  assert!(moved.now.written);
+  assert_eq!(moved.now.earliest, Some(Timestamp::new(-40, ms)));
   assert!(
-    moved.take(1, (-40, -40, 0), Some(0), ms).is_ok(),
+    moved.take_alone(1, (-40, -40, 0), Some(0), ms).is_ok(),
     "lifted to zero"
   );
   assert_eq!(
-    moved.take(1, (-41, -41, 0), Some(0), ms),
+    moved.take_alone(1, (-41, -41, 0), Some(0), ms),
     Err(Early::BeforeEarliest),
     "left before it"
   );
 
   // Two: written once both hold a packet, the early one moving the other.
   let both = of(Family::Matroska, "matroska", &[video, audio]).expect("mirrored");
-  assert!(!both.passthrough);
-  let held = both.take(0, (0, 0, 0), Some(0), ms).expect("video");
-  assert!(!held.written, "the audio may still come earlier");
+  assert!(!both.now.passthrough);
+  let held = both.take_alone(0, (0, 0, 0), Some(0), ms).expect("video");
+  assert!(!held.now.written, "the audio may still come earlier");
   let moved = held
-    .take(1, (-30, -30, -21), Some(-21), ms)
+    .take_alone(1, (-30, -30, -21), Some(-21), ms)
     .expect("before the write");
-  assert!(moved.written);
-  assert_eq!(moved.earliest, Some(Timestamp::new(-9, ms)));
-  assert!(moved.take(0, (-9, -9, 0), Some(0), ms).is_ok());
+  assert!(moved.now.written);
+  assert_eq!(moved.now.earliest, Some(Timestamp::new(-9, ms)));
+  assert!(moved.take_alone(0, (-9, -9, 0), Some(0), ms).is_ok());
   assert_eq!(
-    moved.take(0, (-10, -10, 0), Some(0), ms),
+    moved.take_alone(0, (-10, -10, 0), Some(0), ms),
     Err(Early::BeforeEarliest)
   );
 
   // Each stream's distance rounded up to its own tick.
   let mixed = of(Family::Other, "mpegts", &[video, audio]).expect("mirrored");
   let fine = mixed
-    .take(0, (-1, -1, 0), Some(0), ninety)
-    .and_then(|shift| shift.take(1, (0, 0, 0), Some(0), ms))
+    .take_alone(0, (-1, -1, 0), Some(0), ninety)
+    .and_then(|shift| shift.take_alone(1, (0, 0, 0), Some(0), ms))
     .expect("both held");
-  assert!(fine.written);
+  assert!(fine.now.written);
   assert!(
-    fine.take(1, (-1, -1, 0), Some(0), ms).is_ok(),
+    fine.take_alone(1, (-1, -1, 0), Some(0), ms).is_ok(),
     "a tick of 90 kHz lifts a millisecond"
   );
   assert_eq!(
-    fine.take(1, (-2, -2, 0), Some(0), ms),
+    fine.take_alone(1, (-2, -2, 0), Some(0), ms),
     Err(Early::BeforeEarliest)
   );
   let coarse = mixed
-    .take(1, (-1, -1, 0), Some(0), ms)
-    .and_then(|shift| shift.take(0, (0, 0, 0), Some(0), ninety))
+    .take_alone(1, (-1, -1, 0), Some(0), ms)
+    .and_then(|shift| shift.take_alone(0, (0, 0, 0), Some(0), ninety))
     .expect("both held");
   assert!(
-    coarse.take(0, (-90, -90, 0), Some(0), ninety).is_ok(),
+    coarse.take_alone(0, (-90, -90, 0), Some(0), ninety).is_ok(),
     "a millisecond is 90 ticks"
   );
   assert_eq!(
-    coarse.take(0, (-91, -91, 0), Some(0), ninety),
+    coarse.take_alone(0, (-91, -91, 0), Some(0), ninety),
     Err(Early::BeforeEarliest)
   );
 
   // The delay: written once the packets held span more than 10 s.
   let spanned = both
-    .take(0, (0, 0, 0), Some(0), ms)
-    .and_then(|shift| shift.take(0, (10_000, 10_000, 0), Some(0), ms))
+    .take_alone(0, (0, 0, 0), Some(0), ms)
+    .and_then(|shift| shift.take_alone(0, (10_000, 10_000, 0), Some(0), ms))
     .expect("video");
-  assert!(!spanned.written, "10 s is not past the delay");
+  assert!(!spanned.now.written, "10 s is not past the delay");
   let late = spanned
-    .take(0, (10_001, 10_001, 0), Some(0), ms)
+    .take_alone(0, (10_001, 10_001, 0), Some(0), ms)
     .expect("video");
-  assert!(late.written);
+  assert!(late.now.written);
   assert_eq!(
-    late.take(1, (-22, -22, -21), Some(-21), ms),
+    late.take_alone(1, (-22, -22, -21), Some(-21), ms),
     Err(Early::BeforeEarliest),
     "the audio's, after it"
   );
@@ -2942,26 +2958,29 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   )
   .expect("mirrored");
   let waiting = vp8
-    .take(1, (0, 0, -21), Some(-21), ms)
-    .and_then(|shift| shift.take(1, (20_000, 20_000, -21), Some(-21), ms))
+    .take_alone(1, (0, 0, -21), Some(-21), ms)
+    .and_then(|shift| shift.take_alone(1, (20_000, 20_000, -21), Some(-21), ms))
     .expect("audio");
-  assert!(!waiting.written, "the interleaving waits on VP8");
+  assert!(!waiting.now.written, "the interleaving waits on VP8");
   // ... and not by a subtitle's span.
   let cues = of(Family::Matroska, "matroska", &[video, audio, subtitle]).expect("mirrored");
   let waiting = cues
-    .take(0, (0, 0, 0), Some(0), ms)
-    .and_then(|shift| shift.take(2, (20_000, 20_000, 0), Some(0), ms))
+    .take_alone(0, (0, 0, 0), Some(0), ms)
+    .and_then(|shift| shift.take_alone(2, (20_000, 20_000, 0), Some(0), ms))
     .expect("video and a cue");
-  assert!(!waiting.written, "a subtitle's span is left aside");
+  assert!(!waiting.now.written, "a subtitle's span is left aside");
 
   // SMPTE 2038 data, not interleaved, still counts among those holding.
   let counted = of(Family::Other, "mpegts", &[video, audio, data]).expect("mirrored");
-  assert!(!counted.passthrough);
+  assert!(!counted.now.passthrough);
   let written = counted
-    .take(0, (0, 0, 0), Some(0), ms)
-    .and_then(|shift| shift.take(2, (0, 0, 0), Some(0), ms))
+    .take_alone(0, (0, 0, 0), Some(0), ms)
+    .and_then(|shift| shift.take_alone(2, (0, 0, 0), Some(0), ms))
     .expect("video and data");
-  assert!(written.written, "two hold a packet, as two are interleaved");
+  assert!(
+    written.now.written,
+    "two hold a packet, as two are interleaved"
+  );
 
   // FLV keeps the first packet it wrote as its reference, moved: a packet
   // of the stream the delay left behind, before it, it refuses; another
@@ -2969,31 +2988,31 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   for (muxer, refused) in [("flv", true), ("mpegts", false)] {
     let first = of(Family::Other, muxer, &[video, audio])
       .expect("mirrored")
-      .take(0, (5_000, 5_000, 0), Some(0), ms)
-      .and_then(|shift| shift.take(0, (15_001, 15_001, 0), Some(0), ms))
+      .take_alone(0, (5_000, 5_000, 0), Some(0), ms)
+      .and_then(|shift| shift.take_alone(0, (15_001, 15_001, 0), Some(0), ms))
       .expect("video, past the delay");
-    assert!(first.written);
+    assert!(first.now.written);
     assert_eq!(
-      first.take(1, (2_000, 2_000, 0), Some(0), ms).err(),
+      first.take_alone(1, (2_000, 2_000, 0), Some(0), ms).err(),
       refused.then_some(Early::BeforeFirst),
       "{muxer}"
     );
     assert!(
-      first.take(1, (5_000, 5_000, 0), Some(0), ms).is_ok(),
+      first.take_alone(1, (5_000, 5_000, 0), Some(0), ms).is_ok(),
       "{muxer}"
     );
   }
   let moved = of(Family::Other, "flv", &[video, audio])
     .expect("mirrored")
-    .take(0, (-100, -100, 0), Some(0), ms)
-    .and_then(|shift| shift.take(0, (9_901, 9_901, 0), Some(0), ms))
+    .take_alone(0, (-100, -100, 0), Some(0), ms)
+    .and_then(|shift| shift.take_alone(0, (9_901, 9_901, 0), Some(0), ms))
     .expect("video, past the delay");
   assert!(
-    moved.take(1, (-50, -50, 0), Some(0), ms).is_ok(),
+    moved.take_alone(1, (-50, -50, 0), Some(0), ms).is_ok(),
     "moved past zero, the first"
   );
   assert_eq!(
-    moved.take(1, (-150, -150, 0), Some(0), ms),
+    moved.take_alone(1, (-150, -150, 0), Some(0), ms),
     Err(Early::BeforeEarliest),
     "before zero, moved"
   );
@@ -3314,12 +3333,20 @@ fn an_avi_xsub_cue_is_placed_one_packet_on_however_far() {
         &state,
         millis(),
         Neighbours::default(),
-        (timed, &[timed], 0),
+        (
+          timed,
+          Outputs {
+            held: &[],
+            emits: Emits::OWN,
+            own: timed,
+          },
+          0,
+        ),
         payload,
         step,
         Bounds::REAL,
       ) {
-        Ok(learned) => {
+        Ok((learned, _)) => {
           let (next, moved) = learned.place.expect("a place");
           state.place = next;
           state.written = true;
@@ -3507,17 +3534,23 @@ fn av1c_is_refused_where_ff_isom_write_av1c_would_fail() {
   }
   let frame: &[u8] = &[0x32, 0x01, 0x10];
   let unit = cat(&[&[0x12, 0x00], &sequence(&svt), frame]);
-  assert_eq!(av1_extracted_sequences(&unit), Some(sequence(&svt)));
-  assert_eq!(av1_extracted_sequences(&cat(&[&[0x12, 0x00], frame])), None);
+  assert_eq!(
+    av1_extracted_written(&unit),
+    Some(av1c_written(&sequence(&svt))),
+    "the unit's sequence header, as written of itself"
+  );
+  assert_eq!(av1_extracted_written(&unit), Some(true));
+  assert_eq!(av1_extracted_written(&cat(&[&[0x12, 0x00], frame])), None);
   // A sequence header of no bits split off unread: the configuration made
   // of the rest written, where the unit as a configuration is not.
   let unread = cat(&[&[0x0A, 0x01, 0x00], &sequence(&svt)]);
   assert!(!av1c_written(&unread));
-  let made = av1_extracted_sequences(&unread).expect("made");
-  assert!(av1c_written(&made));
-  let twice =
-    av1_extracted_sequences(&cat(&[&sequence(&svt), frame, &sequence(&svt)])).expect("made");
-  assert!(!av1c_written(&twice), "two sequence headers");
+  assert_eq!(av1_extracted_written(&unread), Some(true));
+  assert_eq!(
+    av1_extracted_written(&cat(&[&sequence(&svt), frame, &sequence(&svt)])),
+    Some(false),
+    "two sequence headers"
+  );
 }
 
 /// Bits as the standards' syntax writes them, for the configuration
@@ -4257,7 +4290,10 @@ fn avs3s_and_vc1s_configurations_are_judged_as_mp4_writes_them() {
 
 #[test]
 fn flvs_filter_makes_h26x_configurations_as_extract_extradata_makes_them() {
-  use records::{Units, h2645_extracted};
+  use records::Units;
+  let extracted_bytes = |units, bytes: &[u8]| {
+    records::h2645_extracted(units, bytes).map(|made| made.map(records::Extracted::bytes))
+  };
   let sps: &[u8] = &[0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40];
   let pps: &[u8] = &[0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
   let idr: &[u8] = &[0x65, 0x88, 0x84, 0x21];
@@ -4271,37 +4307,37 @@ fn flvs_filter_makes_h26x_configurations_as_extract_extradata_makes_them() {
       .collect()
   };
   assert_eq!(
-    h2645_extracted(Units::H264, &packet(&[sps, pps, idr])),
+    extracted_bytes(Units::H264, &packet(&[sps, pps, idr])),
     Ok(Some(made(&[sps, pps]))),
     "its parameter sets, each behind a 4-byte start code"
   );
   assert_eq!(
-    h2645_extracted(Units::H264, &packet(&[sps, idr])),
+    extracted_bytes(Units::H264, &packet(&[sps, idr])),
     Ok(Some(made(&[sps]))),
     "an SPS alone"
   );
   assert_eq!(
-    h2645_extracted(Units::H264, &packet(&[pps, idr])),
+    extracted_bytes(Units::H264, &packet(&[pps, idr])),
     Ok(None),
     "no SPS"
   );
   assert_eq!(
-    h2645_extracted(Units::H264, &[0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x10]),
+    extracted_bytes(Units::H264, &[0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x10]),
     Err(()),
     "length-prefixed: no start code"
   );
   assert_eq!(
-    h2645_extracted(Units::H264, &[0x65, 0x88, 0x84]),
+    extracted_bytes(Units::H264, &[0x65, 0x88, 0x84]),
     Ok(None),
     "three bytes"
   );
   assert_eq!(
-    h2645_extracted(Units::H264, &packet(&[&[0x80, 0x01]])),
+    extracted_bytes(Units::H264, &packet(&[&[0x80, 0x01]])),
     Ok(None),
     "its one unit's header of the forbidden bit, too little after it to search"
   );
   assert_eq!(
-    h2645_extracted(
+    extracted_bytes(
       Units::H264,
       &[
         0, 0, 1, 0x80, 0x01, 0, 0, 3, 1, 0, 0, 2, 0x11, 0x11, 0x11, 0x11
@@ -4311,7 +4347,7 @@ fn flvs_filter_makes_h26x_configurations_as_extract_extradata_makes_them() {
     "a unit an escape and `00 00 02` end, its header refused, then a search reaching the end"
   );
   assert_eq!(
-    h2645_extracted(
+    extracted_bytes(
       Units::H264,
       &[&[0, 0, 1][..], sps, &[0, 0, 1], pps, &[0, 0, 1], idr].concat()
     ),
@@ -4321,17 +4357,17 @@ fn flvs_filter_makes_h26x_configurations_as_extract_extradata_makes_them() {
   let (vps, hsps, hpps) = (hevc_vps(0, None), hevc_sps(0, 0, 1, None), hevc_pps());
   let slice = escaped(&hevc_header(19, 0), &[0xAF, 0x88]);
   assert_eq!(
-    h2645_extracted(Units::Hevc, &packet(&[&vps, &hsps, &hpps, &slice])),
+    extracted_bytes(Units::Hevc, &packet(&[&vps, &hsps, &hpps, &slice])),
     Ok(Some(made(&[&vps, &hsps, &hpps]))),
   );
   assert_eq!(
-    h2645_extracted(Units::Hevc, &packet(&[&hsps, &hpps, &slice])),
+    extracted_bytes(Units::Hevc, &packet(&[&hsps, &hpps, &slice])),
     Ok(None),
     "HEVC of no VPS"
   );
   let (vsps, vpps) = (vvc_unit(15), vvc_unit(16));
   assert_eq!(
-    h2645_extracted(Units::Vvc, &packet(&[&vsps, &vpps, &vvc_unit(8)])),
+    extracted_bytes(Units::Vvc, &packet(&[&vsps, &vpps, &vvc_unit(8)])),
     Ok(Some(made(&[&vsps, &vpps]))),
   );
 }
@@ -4708,9 +4744,9 @@ fn apv_frame_infos_follow_mp4s_parse_of_the_access_unit() {
     [1]
   );
   // Two distances, two informations; the same twice, equal.
-  let a = records::apv_frame_infos(&apv_access_unit(&[apv_pbu(1, 2, 3, 0)]));
-  let b = records::apv_frame_infos(&apv_access_unit(&[apv_pbu(1, 2, 4, 0)]));
-  let c = records::apv_frame_infos(&apv_access_unit(&[apv_pbu(1, 2, 3, 0)]));
+  let a: Vec<_> = records::apv_frame_infos(&apv_access_unit(&[apv_pbu(1, 2, 3, 0)])).collect();
+  let b: Vec<_> = records::apv_frame_infos(&apv_access_unit(&[apv_pbu(1, 2, 4, 0)])).collect();
+  let c: Vec<_> = records::apv_frame_infos(&apv_access_unit(&[apv_pbu(1, 2, 3, 0)])).collect();
   assert_ne!(a, b);
   assert_eq!(a, c);
 }

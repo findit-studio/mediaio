@@ -23,7 +23,8 @@ crate moves only when it changes.
   array, every denominator nonzero, no overflow in C's `int`, every value
   within its bits and a whole number of its unit, every flag 0 or 1, and
   the writer's and the reader's syntaxes in agreement
-  (`HdrMetadataError`). `hdr10_plus_from_t35` and
+  (`HdrMetadataError`) — allocating nothing, as a muxer's judgment of a
+  packet before its refusals requires. `hdr10_plus_from_t35` and
   `smpte2094_app5_from_t35` answer the struct libavutil parses from a
   T.35 payload, as a demuxer delivers it.
 - `CodecId::media_type`: the media type libavcodec's descriptor gives a
