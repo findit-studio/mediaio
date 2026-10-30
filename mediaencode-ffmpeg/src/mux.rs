@@ -511,6 +511,24 @@
 //! tag, written whole at its header, is judged at open by its exact size
 //! (R15b, below).
 //!
+//! **The tracks a `moov` holds** (R16, Codex R15): movenc writes a track's
+//! `trak` of a sample at least, in a file of no fragments
+//! (`mov_write_moov_tag`, `movenc.c` 5350–5351, 5430–5433), and the bound
+//! charges the tracks it writes alone, at open and at every packet, the
+//! `tref` slack counted of them ([`moov_track_fixed`]). Every road a timed
+//! track of no sample of its packets takes, censused:
+//!
+//! | the track | its `trak` | the bound |
+//! |---|---|---|
+//! | audio, video, data or subtitles, of no packet, or of packets of no sample — configurations' packets, an E-AC-3 run its end frees (7951–7955) | none | none |
+//! | `mov_text`, of no cue | of the end sample its trailer writes where its last sample is no end already (9025–9031) — always | its part, at open and after |
+//! | TTML of libavcodec's encoder, of no paragraph | none: its document of none is skipped (`mov_write_squashed_packet`, 6579–6615) | none |
+//! | the same, of paragraphs | of the document its trailer joins them into | its part, from the first paragraph judged |
+//! | the chapter track | of its samples, a chapter each, made at the header (`mov_create_chapter_track`, 7727–7815) | its part, where it has chapters |
+//! | ISMV's tracks, and AVIF's | every one, whatever its samples: ISMV's `moov` written at its header (8155–8189), AVIF's mode writing each (5430–5433) | every part |
+//! | a cover | none: its picture is the `udta`'s (4815–4839) | the `covr` alone |
+//! | a timecode track, a hint track | none made: the base sets no timecode and no hinting | — |
+//!
 //! **MP3's ID3v2 tag** (R15b; R15's letter 1, ruled: a length that wraps
 //! is refused). The mp3 muxer writes it whole at its header where no
 //! picture is to come (`mp3_write_header`, `mp3enc.c` 617–636): this muxer
@@ -2014,6 +2032,13 @@ struct MoovShape {
   /// The configuration boxes an entry writes of its configuration: HEVC's
   /// `hvcC` and `lhvC`, two; another codec's one.
   configurations: u64,
+  /// Whether movenc writes the track's `trak` whatever samples its packets
+  /// bring (R16, Codex R15; `mov_write_moov_tag`, 5350–5351, 5430–5433):
+  /// every track's in ISMV's `moov`, written at its header, and in AVIF's
+  /// mode; and a `mov_text` track's, of the end sample its trailer writes
+  /// where its last sample is no end already (9025–9031) — so always. Any
+  /// other track's is written of a sample at least ([`TrackState::trak_written`]).
+  always: bool,
 }
 
 /// A track's roll groups (`mov_preroll_write_stbl_atoms`, 3305–3400).
@@ -2095,6 +2120,7 @@ const CHAPTER_SHAPE: MoovShape = MoovShape {
   roll: Roll::None,
   entry: ENTRY_SLACK + 64,
   configurations: 1,
+  always: true,
 };
 
 /// The `pssh` boxes movenc writes into the `moov` of a stream's encryption
@@ -2246,14 +2272,16 @@ fn chpl_bytes(chapters: &[Chapter<Ffmpeg>]) -> u64 {
     .sum::<u64>()
 }
 
-/// A track's own boxes in the `moov` ([`TRAK_SLACK`]), of a file of
+/// A track's own boxes in the `moov` ([`TRAK_SLACK`]), of a `moov` of
 /// `tracks` tracks, and its `tref`'s references, 4 bytes an id — `chap` to
 /// the chapter track, an audio track's `fall` to the track its fallback
 /// side data names, and the first track's `tmcd` to each timecode track
 /// copied in (8707–8719): at most one id a track and one more, their
 /// types' 8 bytes each within the slack (4241–4255, 5359–5414). The base
 /// makes no stream group, so no `sbas` reference and no other source
-/// (8640–8701).
+/// (8640–8701), and no timecode track, so that a track's ids are two at
+/// most, `chap` and `fall`, within the count of the tracks the `moov`
+/// holds and one more (R16).
 const fn moov_track_fixed(tracks: u64) -> u64 {
   TRAK_SLACK + 4 * (tracks + 1)
 }
@@ -2292,6 +2320,8 @@ fn moov_shape(
     },
     entry: ENTRY_SLACK + 24 * channels + icc + if id == CodecId::APV { APVC_MAX } else { 0 },
     configurations: if id == CodecId::HEVC { 2 } else { 1 },
+    always: matches!(audited, Audited::Mov(MovMode::Ism | MovMode::Avif))
+      || id == CodecId::MOV_TEXT,
   }
 }
 
@@ -2356,13 +2386,14 @@ where
 }
 
 /// The `moov`'s bound: its own boxes `fixed`, and each track's — its own
-/// boxes in a file of `tracks` tracks ([`moov_track_fixed`]), its `stsd`
-/// and its per-sample tables — of `parts`, the chapter track's among them.
+/// boxes in a `moov` of as many tracks as `parts` ([`moov_track_fixed`]),
+/// its `stsd` and its per-sample tables — of `parts`, the tracks movenc
+/// writes a `trak` of, the chapter track's among them (R16).
 fn movie_total(
   fixed: u64,
-  tracks: u64,
-  parts: impl Iterator<Item = ([([u8; 4], u64); 10], u64)>,
+  parts: impl Iterator<Item = ([([u8; 4], u64); 10], u64)> + Clone,
 ) -> u64 {
+  let tracks = parts.clone().count() as u64;
   fixed
     + parts
       .map(|(tables, stsd)| {
@@ -4545,6 +4576,28 @@ struct TrackState {
   /// first must ([`PayloadRule::ConfigurationAbsent`]): a configuration's
   /// packet, of which no sample is written, among them.
   configured: bool,
+}
+
+impl TrackState {
+  /// Whether movenc writes the track's `trak`, of `shape`, were the file to
+  /// end with `entries` of its samples written — `judged`, a packet of it
+  /// judged and taken (R16, Codex R15): a file of no fragments leaves a
+  /// track of no sample out of its `moov` (`mov_write_moov_tag`, `movenc.c`
+  /// 5350–5351, 5430–5433) but where its trailer makes one — a `mov_text`
+  /// track's end ([`MoovShape::always`]), and TTML's document of the
+  /// paragraphs it joins, of one at least (`mov_write_squashed_packet`,
+  /// 6579–6615: a document of none skipped) — and ISMV and AVIF write every
+  /// track's ([`MoovShape::always`]). No other sample is a trailer's: an
+  /// E-AC-3 run its end frees is no sample (7951–7955), and the chapter
+  /// track is its own ([`chapter_part`]).
+  fn trak_written(&self, shape: MoovShape, entries: u64, judged: bool) -> bool {
+    shape.always
+      || entries > 0
+      || self
+        .rules
+        .ttml_document
+        .is_some_and(|header| judged || self.document > header)
+  }
 }
 
 /// What the ADTS muxer knows of an AAC track's configuration
@@ -9637,6 +9690,9 @@ where
     // each timed track's `stsd` and its tables of no sample but the two a
     // trailer may add, and the chapter track: past the 32 bits of its size,
     // the table refused, nothing written ([`MuxOpenError::MovieBoxTooLarge`]).
+    // Of a file of no fragments, a track of no sample is left out of it
+    // but where its trailer makes one: a `mov_text` track's end (R16, Codex
+    // R15; [`MoovShape::always`]).
     if family == Family::Mp4 {
       let parts = states
         .iter()
@@ -9644,13 +9700,14 @@ where
         .filter_map(|(index, (kind, stream, road, _))| {
           let (_, codec) = stream.as_ref().filter(|_| *road == Road::Timed)?;
           let shape = moov_shape(audited, *kind, codec, tracks[index].side_data());
-          Some((moov_tables(shape, 2), moov_stsd(shape, codec)))
+          shape
+            .always
+            .then(|| (moov_tables(shape, 2), moov_stsd(shape, codec)))
         });
       let chapters_part = (audited.chapter_track() && !chapters.is_empty())
         .then(|| chapter_part(chapters.len() as u64));
       if movie_total(
         movie_fixed(&roads, &tracks, chapters),
-        tracks.len() as u64,
         parts.chain(chapters_part),
       ) > bounds.movie
       {
@@ -9994,25 +10051,28 @@ where
   /// Each track's part of the `moov`'s bound, of the tracks it holds, in
   /// their order and the chapter track last — its per-sample tables
   /// ([`moov_tables`]) and its `stsd`'s bound — the track at `with`'s index,
-  /// where given, at its samples and `stsd` bound there: each at its
-  /// samples and two the trailer may add, a `mov_text` cue track's end and
-  /// the one another track's packet may make first, or TTML's document
-  /// (R14).
+  /// where given, at its samples and `stsd` bound there, the packet judged
+  /// taken: each at its samples and two the trailer may add, a `mov_text`
+  /// cue track's end and the one another track's packet may make first, or
+  /// TTML's document (R14); of the tracks movenc writes a `trak` of alone
+  /// ([`TrackState::trak_written`]; R16, Codex R15).
   fn movie_parts(
     &self,
     with: Option<(usize, u64, u64)>,
-  ) -> impl Iterator<Item = ([([u8; 4], u64); 10], u64)> + '_ {
+  ) -> impl Iterator<Item = ([([u8; 4], u64); 10], u64)> + Clone + '_ {
     let tracks = self
       .tracks
       .iter()
       .enumerate()
       .filter_map(move |(index, state)| {
         let shape = state.moov?;
-        let (entries, stsd) = match with {
-          Some((at, entries, stsd)) if at == index => (entries, stsd),
-          _ => (state.mp4_entries, state.stsd),
+        let (entries, stsd, judged) = match with {
+          Some((at, entries, stsd)) if at == index => (entries, stsd, true),
+          _ => (state.mp4_entries, state.stsd, false),
         };
-        Some((moov_tables(shape, entries + 2), stsd))
+        state
+          .trak_written(shape, entries, judged)
+          .then(|| (moov_tables(shape, entries + 2), stsd))
       });
     tracks.chain(self.chapter_samples.map(chapter_part))
   }
@@ -10023,11 +10083,7 @@ where
   /// tables ([`Self::movie_parts`]) (R14).
   fn movie_bound(&self, with: Option<(usize, u64, u64)>) -> Option<u64> {
     let fixed = self.movie?;
-    Some(movie_total(
-      fixed,
-      self.tracks.len() as u64,
-      self.movie_parts(with),
-    ))
+    Some(movie_total(fixed, self.movie_parts(with)))
   }
 
   /// ISMV's `mfra`'s bound, the track at `with`'s index, where given, at its

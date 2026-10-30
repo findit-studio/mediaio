@@ -19101,3 +19101,269 @@ fn l161_mp3s_id3v2_tag_is_counted_exactly_and_refused_past_its_28_bits() {
     "nothing written"
   );
 }
+
+/// A data track of GoPro metadata (`gpmd`, `AV_CODEC_ID_BIN_DATA`), made of
+/// `row`'s parameters, its time base `row`'s.
+fn gpmd_of(row: &Described) -> Described {
+  use ffmpeg_next::ffi::{AVCodecID, AVMediaType};
+  use mediaencode::mediaspine::demuxer::DataTrackParams;
+  let index = row.side_data().stream_index();
+  let mut parameters = row.side_data().rebuild().expect("the parameters");
+  // SAFETY: `parameters` owns its `AVCodecParameters`, live for the
+  // writes; the media type and the codec id each a value of its own enum,
+  // the tag a plain integer.
+  unsafe {
+    let par = parameters.as_mut_ptr();
+    (*par).codec_type = AVMediaType::AVMEDIA_TYPE_DATA;
+    (*par).codec_id = AVCodecID::AV_CODEC_ID_BIN_DATA;
+    (*par).codec_tag = 0;
+  }
+  let ticket = CodecTicket::mirror(&parameters, index, usize::MAX).expect("the ticket");
+  TrackDescription::new(
+    row.timebase(),
+    TrackParams::Data(DataTrackParams::new(CodecId::from_raw(
+      AVCodecID::AV_CODEC_ID_BIN_DATA as i32,
+    ))),
+    ticket,
+  )
+  .expect("a timed track")
+}
+
+/// L162's file into `target`: `table`, each of `packets` — each its
+/// track's index in it and the packet — written, the rest of the table of
+/// no packet; the `moov`'s bound at open and before the trailer, and the
+/// `moov` FFmpeg writes.
+fn moov_of_tracks(
+  target: &Path,
+  container: ContainerName,
+  table: Vec<Described>,
+  packets: &[(usize, &DemuxedPacket<Ffmpeg, FfmpegBytes>)],
+) -> (
+  mediaencode_ffmpeg::mux::MovieBoxBound,
+  mediaencode_ffmpeg::mux::MovieBoxBound,
+  (u64, Vec<Vec<([u8; 4], u64)>>),
+) {
+  let mut muxer = muxer_into(target, container, table);
+  let at_open = muxer.movie_box_bound().expect("a bound at open");
+  for &(index, packet) in packets {
+    let track = TrackIndex::new(index);
+    match packet {
+      DemuxedPacket::Video(p) => muxer
+        .write_video(VideoTrackPacket::new(track, p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      DemuxedPacket::Audio(p) => muxer
+        .write_audio(AudioTrackPacket::new(track, p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      DemuxedPacket::Subtitle(p) => muxer
+        .write_subtitle(SubtitleTrackPacket::new(track, p.packet().clone()))
+        .map_err(|error| error.map_packet(drop)),
+      other => panic!("a timed packet, got {other:?}"),
+    }
+    .unwrap_or_else(|error| panic!("{}: a packet: {error:?}", target.display()));
+  }
+  let before = muxer.movie_box_bound().expect("a bound");
+  muxer.finish().expect("finished");
+  (at_open, before, written_moov(target))
+}
+
+/// Each `trak` the `moov` `written` holds, one the bound `bound` holds
+/// too, every table and `stsd` within its part, and the `moov` within the
+/// total (as L153 judges them).
+fn moov_within(
+  name: &str,
+  bound: &mediaencode_ffmpeg::mux::MovieBoxBound,
+  written: &(u64, Vec<Vec<([u8; 4], u64)>>),
+) {
+  let (moov, traks) = written;
+  assert_eq!(
+    traks.len(),
+    bound.tables.len(),
+    "{name}: each trak one the bound holds"
+  );
+  assert!(*moov <= bound.total, "{name}: the moov past its bound");
+  for (index, (trak, tables)) in traks.iter().zip(&bound.tables).enumerate() {
+    for &(kind, size) in trak {
+      let kind = if &kind == b"stco" { *b"co64" } else { kind };
+      let limit = if &kind == b"stsd" {
+        bound.stsd[index]
+      } else {
+        tables
+          .iter()
+          .find(|(of, _)| *of == kind)
+          .map(|&(_, limit)| limit)
+          .unwrap_or_else(|| panic!("{name} track {index}: {kind:?} of no bound"))
+      };
+      assert!(
+        size <= limit,
+        "{name} track {index}: {kind:?} past its bound"
+      );
+    }
+  }
+}
+
+/// **L162 — the `moov`'s bound charges no track FFmpeg leaves out of it**
+/// (R16, Codex R15; `mov_write_moov_tag`, `movenc.c` 5350–5351, 5430–5433):
+/// in MP4 and MOV, a track of packets beside an empty audio, video or —
+/// MP4's, MOV admitting no data codec — data track: FFmpeg writes no
+/// `trak` of the empty one and not a byte more of `moov` than beside none,
+/// and the bound, at open and before the trailer, is the bound beside none,
+/// byte for byte. An empty `mov_text` track, whose trailer writes it an end
+/// sample (9025–9031), and an MP4 TTML track of a paragraph, whose trailer
+/// joins it into a document (6579–6615), are written: the bound holds a
+/// part of each, every table within it; TTML's of no paragraph, whose
+/// document of none is skipped, is not. MOV's data track is refused at
+/// open by name.
+///
+/// PLANT: every track charged again, the empty ones' parts in the bound;
+/// `mov_text`'s trailer sample uncounted, its trak past the bound's parts;
+/// TTML's paragraphs uncounted, the same.
+#[test]
+fn l162_the_movie_bound_charges_no_track_ffmpeg_leaves_out() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let cues = mov_text_mp4(&corpus);
+  let ttml = ttml_mp4(&corpus);
+  let (_, video) = first_track(&source, TrackKind::Video, 8);
+  let (_, audio) = first_track(&source, TrackKind::Audio, 8);
+  let (_, paragraphs) = first_track(&ttml, TrackKind::Subtitle, 1);
+  let row = |path: &Path, kind: TrackKind| first_track(path, kind, 0).0.remove(0);
+  let ttml_row = || {
+    let mut row = row(&ttml, TrackKind::Subtitle);
+    row.set_extradata(Some(bytes_of(b"lavc-ttmlenc")));
+    row
+  };
+  /// `packets`, each on the table's first track.
+  fn of(
+    packets: &[DemuxedPacket<Ffmpeg, FfmpegBytes>],
+  ) -> Vec<(usize, &DemuxedPacket<Ffmpeg, FfmpegBytes>)> {
+    packets.iter().map(|packet| (0, packet)).collect()
+  }
+  for (container, extension) in [
+    (ContainerName::MP4, "mp4"),
+    (ContainerName::new("mov"), "mov"),
+  ] {
+    // Left out: an empty audio track beside video, video beside audio, and
+    // in MP4 data beside audio.
+    let mut omitted: Vec<(&str, Vec<Described>, Vec<Described>, Vec<_>)> = vec![
+      (
+        "audio",
+        vec![
+          row(&source, TrackKind::Video),
+          row(&source, TrackKind::Audio),
+        ],
+        vec![row(&source, TrackKind::Video)],
+        of(&video),
+      ),
+      (
+        "video",
+        vec![
+          row(&source, TrackKind::Audio),
+          row(&source, TrackKind::Video),
+        ],
+        vec![row(&source, TrackKind::Audio)],
+        of(&audio),
+      ),
+    ];
+    if extension == "mp4" {
+      omitted.push((
+        "data",
+        vec![
+          row(&source, TrackKind::Audio),
+          gpmd_of(&row(&source, TrackKind::Audio)),
+        ],
+        vec![row(&source, TrackKind::Audio)],
+        of(&audio),
+      ));
+    } else {
+      let opened = FfmpegOwnedMuxer::open(
+        File::create(output(&corpus, "l162-data.mov")).expect("create"),
+        container.clone(),
+        vec![
+          row(&source, TrackKind::Audio),
+          gpmd_of(&row(&source, TrackKind::Audio)),
+        ],
+        &[],
+        PacketLimits::default(),
+      );
+      assert!(
+        matches!(opened, Err(MuxOpenError::CodecNotCarried { .. })),
+        "mov: a data track refused at open, got {:?}",
+        opened.map(|_| ())
+      );
+    }
+    for (kind, with, alone, packets) in omitted {
+      let name = format!("l162-{kind}.{extension}");
+      let (open_with, before_with, moov_with) = moov_of_tracks(
+        &output(&corpus, &format!("with-{name}")),
+        container.clone(),
+        with,
+        &packets,
+      );
+      let (open_alone, before_alone, moov_alone) = moov_of_tracks(
+        &output(&corpus, &format!("alone-{name}")),
+        container.clone(),
+        alone,
+        &packets,
+      );
+      assert_eq!(
+        moov_with, moov_alone,
+        "{name}: FFmpeg writes no trak of the empty track, nor a byte more of moov"
+      );
+      assert_eq!(
+        before_with, before_alone,
+        "{name}: the bound before the trailer charges nothing for it"
+      );
+      assert_eq!(open_with, open_alone, "{name}: nor the bound at open");
+      moov_within(&name, &before_with, &moov_with);
+    }
+    // Written by its trailer: an empty `mov_text` track's end sample.
+    let name = format!("l162-mov-text.{extension}");
+    let (open_with, before_with, moov_with) = moov_of_tracks(
+      &output(&corpus, &name),
+      container.clone(),
+      vec![
+        row(&source, TrackKind::Audio),
+        row(&cues, TrackKind::Subtitle),
+      ],
+      &of(&audio),
+    );
+    assert_eq!(
+      moov_with.1.len(),
+      2,
+      "{name}: its trailer writes the cue track"
+    );
+    assert_eq!(
+      (open_with.tables.len(), before_with.tables.len()),
+      (1, 2),
+      "{name}: the bound holds it at open and after"
+    );
+    moov_within(&name, &before_with, &moov_with);
+  }
+  // MP4's TTML of libavcodec's encoder: of no paragraph left out, of one
+  // its document written.
+  let name = "l162-ttml-none.mp4";
+  let (_, before, moov) = moov_of_tracks(
+    &output(&corpus, name),
+    ContainerName::MP4,
+    vec![row(&source, TrackKind::Audio), ttml_row()],
+    &of(&audio),
+  );
+  assert_eq!(moov.1.len(), 1, "{name}: no document of no paragraph");
+  moov_within(name, &before, &moov);
+  let name = "l162-ttml-one.mp4";
+  let mut packets = of(&audio);
+  packets.push((1, &paragraphs[0]));
+  let (open_with, before, moov) = moov_of_tracks(
+    &output(&corpus, name),
+    ContainerName::MP4,
+    vec![row(&source, TrackKind::Audio), ttml_row()],
+    &packets,
+  );
+  assert_eq!(moov.1.len(), 2, "{name}: the document of its paragraph");
+  assert_eq!(
+    open_with.tables.len(),
+    0,
+    "{name}: none at open, of no sample"
+  );
+  moov_within(name, &before, &moov);
+}

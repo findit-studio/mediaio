@@ -464,7 +464,11 @@ crate moves only when it changes.
   place counts its new bytes instead of its old: the bound keeps the
   descriptions' exact sum. The laws' seams, hidden:
   `MuxOptions::with_lowered_fragment_index_bound` (split from
-  `with_lowered_movie_bound`) and `CarrierMuxer::lower_movie_bound`.
+  `with_lowered_movie_bound`) and `CarrierMuxer::lower_movie_bound`. The
+  bound charges the tracks movenc writes alone (R16): outside ISMV and
+  AVIF, a track of no sample is left out of the `moov` but an empty
+  `mov_text` track, whose trailer writes it an end sample, and TTML of
+  libavcodec's encoder of a paragraph, whose trailer joins its document.
 - **A packet refused allocates nothing; a write's allocation refused
   hands the packet back (R15).** Every rule a packet meets — the face's,
   libavformat's and the container's — is judged before anything is
