@@ -33,10 +33,17 @@ pub mod ffi;
 pub mod footprint;
 #[doc(hidden)]
 pub mod frame;
+#[doc(hidden)]
+pub mod hdr_metadata;
 pub mod limits;
 #[doc(hidden)]
 pub mod measured;
 pub mod options;
+// The muxing context: public because the write adapter
+// (`mediaencode-ffmpeg`) drives it, hidden because nothing else should.
+// It takes no pointer from a caller, so nothing in it is an `unsafe fn`.
+#[doc(hidden)]
+pub mod output;
 mod pixdesc;
 #[doc(hidden)]
 pub mod reader_guard;
@@ -48,10 +55,12 @@ pub mod text;
 pub mod ticket;
 #[doc(hidden)]
 pub mod view;
+#[doc(hidden)]
+pub mod writer_guard;
 
 pub use adapter::Ffmpeg;
 pub use boundary::{
-  MediaKind, PacketBuildError, SendPayloadTooLarge, SendSideDataTooLarge,
+  MediaKind, PacketBuildError, PacketRefusal, SendPayloadTooLarge, SendSideDataTooLarge,
   attachment_packet_from_ffmpeg, audio_packet_from_ffmpeg, audio_packet_from_ffmpeg_in,
   data_packet_from_ffmpeg_in, empty_audio_frame, empty_owned_audio_frame,
   empty_owned_subtitle_frame, empty_owned_video_frame, empty_subtitle_frame, empty_video_frame,

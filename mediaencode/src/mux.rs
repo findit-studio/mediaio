@@ -171,6 +171,24 @@ pub enum MuxRefusal {
     /// The decode timestamp the packet carries.
     offered: Timestamp,
   },
+  /// The packet's presentation timestamp is earlier than its decode
+  /// timestamp, as the container stores the two. A picture cannot be
+  /// shown before it is decoded, and no container records one that is —
+  /// see [`check_presentation_order`], the rule itself, and why a
+  /// backend judges the stored times rather than the instants offered.
+  /// The fields are the times the packet carries.
+  #[error(
+    "a packet on track {} is presented at {} before it is decoded at {}",
+    .track.get(), .pts.pts(), .dts.pts()
+  )]
+  PtsBeforeDts {
+    /// The track the packet named.
+    track: TrackIndex,
+    /// The presentation timestamp the packet carries.
+    pts: Timestamp,
+    /// The decode timestamp the packet carries.
+    dts: Timestamp,
+  },
   /// An attachment was offered as a packet. A container writes its
   /// attachments with its header, so a muxer is given each one when it
   /// is opened, in its track table, and never takes one as a packet.
@@ -205,6 +223,39 @@ pub fn check_decode_order(
       last,
       offered,
     }),
+    _ => Ok(()),
+  }
+}
+
+/// The portable presentation-order rule, for a muxer to apply to each
+/// packet **as its container stores it**: a packet is presented no
+/// earlier than it is decoded — [`MuxRefusal::PtsBeforeDts`] otherwise.
+/// A packet with no presentation timestamp has nothing to judge.
+///
+/// It is the container's comparison, so a backend applies it to the two
+/// times in the representation it hands its container — counted in the
+/// stream's own time base, where that is how the container keeps them —
+/// and not to the instants a caller offered. **It is no law over
+/// instants**: two times a hair apart may count to one tick of the
+/// stream, and a container that stores them as one tick writes the
+/// packet, as a stream copy of a file with sub-tick jitter must. The
+/// refusal a backend returns names the times the packet carries. The
+/// timestamps given compare by the instant they name, so they may be
+/// stamped in different rulers; a backend whose container stores the
+/// instants themselves passes them as they are.
+///
+/// Every container keeps the rule over what it stores — libavformat
+/// refuses such a packet itself (`compute_muxer_pkt_fields`,
+/// `libavformat/mux.c` 567–572 in FFmpeg 9.0.1), comparing the counts it
+/// is handed, as a fault that consumes the packet — so a backend names
+/// it first, and hands the packet back.
+pub fn check_presentation_order(
+  track: TrackIndex,
+  pts: Option<Timestamp>,
+  dts: Timestamp,
+) -> Result<(), MuxRefusal> {
+  match pts {
+    Some(pts) if pts < dts => Err(MuxRefusal::PtsBeforeDts { track, pts, dts }),
     _ => Ok(()),
   }
 }
@@ -308,8 +359,9 @@ impl<E, R, P> MuxError<E, R, P> {
 /// # The refusals
 ///
 /// A packet for a track the muxer does not have, of the wrong kind for
-/// its track, without the timestamp its track is ordered by, or an
-/// attachment offered as a packet is refused by name — [`MuxRefusal`],
+/// its track, without the timestamp its track is ordered by, decoded
+/// before the last one on its track, presented before it is decoded, or
+/// an attachment offered as a packet is refused by name — [`MuxRefusal`],
 /// inside [`MuxError::Refused`] — and nothing is written. A packet that
 /// breaks a rule of the backend's container is refused by the backend's
 /// own name — [`Self::Refusal`], inside [`MuxError::Backend`] — and
@@ -520,17 +572,18 @@ mod tests {
     }
 
     /// What every timed write checks, from the packet's track, kind and
-    /// decode timestamp alone — the packet itself is not touched —
-    /// answering the timestamp to record.
+    /// timestamps alone — the packet itself is not touched — answering
+    /// the decode timestamp to record.
     fn check(
       &self,
       track: TrackIndex,
       offered: TrackKind,
-      dts: Option<Timestamp>,
+      (pts, dts): (Option<Timestamp>, Option<Timestamp>),
     ) -> Result<Timestamp, MuxRefusal> {
       self.kind_of(track, offered)?;
       let dts = dts.ok_or(MuxRefusal::MissingDts { track })?;
       check_decode_order(track, self.last[track.get()], dts)?;
+      check_presentation_order(track, pts, dts)?;
       Ok(dts)
     }
 
@@ -540,10 +593,10 @@ mod tests {
       &mut self,
       track: TrackIndex,
       offered: TrackKind,
-      dts: Option<Timestamp>,
+      times: (Option<Timestamp>, Option<Timestamp>),
       packet: P,
     ) -> Result<(), MuxError<Fault, StrictRefusal, P>> {
-      let dts = match self.check(track, offered, dts) {
+      let dts = match self.check(track, offered, times) {
         Ok(dts) => dts,
         Err(refusal) => return Err(MuxError::Refused { refusal, packet }),
       };
@@ -576,23 +629,24 @@ mod tests {
     type Error = Fault;
 
     fn write_video(&mut self, p: VTrack) -> Written<VTrack> {
-      let (track, dts) = (p.track(), p.packet().dts());
-      self.admit(track, TrackKind::Video, dts, p)
+      let (track, times) = (p.track(), (p.packet().pts(), p.packet().dts()));
+      self.admit(track, TrackKind::Video, times, p)
     }
 
     fn write_audio(&mut self, p: ATrack) -> Written<ATrack> {
-      let (track, dts) = (p.track(), p.packet().dts());
-      self.admit(track, TrackKind::Audio, dts, p)
+      let (track, times) = (p.track(), (p.packet().pts(), p.packet().dts()));
+      self.admit(track, TrackKind::Audio, times, p)
     }
 
+    // A subtitle or data packet is decoded when it is presented.
     fn write_subtitle(&mut self, p: STrack) -> Written<STrack> {
       let (track, pts) = (p.track(), p.packet().pts());
-      self.admit(track, TrackKind::Subtitle, pts, p)
+      self.admit(track, TrackKind::Subtitle, (pts, pts), p)
     }
 
     fn write_data(&mut self, p: DTrack) -> Written<DTrack> {
       let (track, pts) = (p.track(), p.packet().pts());
-      self.admit(track, TrackKind::Data, pts, p)
+      self.admit(track, TrackKind::Data, (pts, pts), p)
     }
 
     fn finish(self) -> Result<(), Fault> {
@@ -759,7 +813,10 @@ mod tests {
     // The handed-back packet is the caller's again: restamped, it goes.
     let (track, packet) = back.into_parts();
     muxer
-      .write_video(VideoTrackPacket::new(track, packet.with_dts(Some(ms(80)))))
+      .write_video(VideoTrackPacket::new(
+        track,
+        packet.with_dts(Some(ms(80))).with_pts(Some(ms(80))),
+      ))
       .expect("the same packet, advancing");
     assert_eq!(muxer.written, 4);
     muxer.finish().expect("the session ends cleanly");
@@ -913,7 +970,7 @@ mod tests {
     muxer
       .write_packet(DemuxedPacket::Video(VideoTrackPacket::new(
         track,
-        packet.with_dts(Some(ms(80))),
+        packet.with_dts(Some(ms(80))).with_pts(Some(ms(80))),
       )))
       .expect("the same packet, advancing");
     assert_eq!(muxer.written, 2);
@@ -948,5 +1005,40 @@ mod tests {
       }
       other => panic!("expected the backend's refusal in the subtitle envelope, got {other:?}"),
     }
+  }
+
+  /// **A packet presented before it is decoded is refused by name, and
+  /// handed back.** Presented at its decode time, or with no
+  /// presentation time at all, it is written.
+  #[test]
+  fn a_presentation_before_its_decode_time_is_refused_by_name() {
+    let mut muxer = Table::new();
+    let offered = VideoTrackPacket::new(
+      TrackIndex::new(0),
+      VideoPacket::new(PAYLOAD, ())
+        .with_dts(Some(ms(40)))
+        .with_pts(Some(ms(30))),
+    );
+    let kept = offered.clone();
+    let (refusal, back) = refused(muxer.write_video(offered));
+    match refusal {
+      MuxRefusal::PtsBeforeDts { track, pts, dts } => {
+        assert_eq!((track.get(), pts.pts(), dts.pts()), (0, 30, 40));
+      }
+      other => panic!("expected the presentation-order refusal, got {other:?}"),
+    }
+    assert_handed_back!(back, kept; pts, dts, duration, flags);
+    assert_eq!(muxer.written, 0, "nothing refused was written");
+
+    muxer
+      .write_video(video(0, Some(40)))
+      .expect("presented when decoded");
+    muxer
+      .write_video(VideoTrackPacket::new(
+        TrackIndex::new(0),
+        VideoPacket::new(PAYLOAD, ()).with_dts(Some(ms(80))),
+      ))
+      .expect("no presentation time: nothing to judge");
+    assert_eq!(muxer.written, 2);
   }
 }

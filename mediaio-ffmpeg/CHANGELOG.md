@@ -9,6 +9,101 @@ The FFmpeg-dependent crates — `mediaio-ffmpeg`, `mediadecode-ffmpeg`,
 `mediaencode-ffmpeg` and `mediaio` — release in lockstep; every other
 crate moves only when it changes.
 
+## [0.21.1] - unreleased
+
+### Added
+
+- **`hdr_metadata`** (hidden, for the muxer): `check_hdr10_plus` and
+  `check_smpte2094_app5` hold an HDR10+ or SMPTE ST 2094 APP5 side-data
+  entry — libavutil's struct, not bytes — to everything Matroska's writer
+  and libavutil's serializer assume of it, and to what the reader takes:
+  the linked libavutil's struct size, asked of its allocator once and
+  required to be the `repr(C)` mirror's (ffmpeg-sys-next 9.0.1 binds no
+  part of `libavutil/hdr_dynamic_metadata.h`), every count within its
+  array, every denominator nonzero, no overflow in C's `int`, every value
+  within its bits and a whole number of its unit, every flag 0 or 1, and
+  the writer's and the reader's syntaxes in agreement
+  (`HdrMetadataError`) — allocating nothing, as a muxer's judgment of a
+  packet before its refusals requires: `LinkedSizes::resolve` asks the
+  linked struct sizes once, and `check_hdr10_plus_sized` and
+  `check_smpte2094_app5_sized` judge against them, calling into no
+  library. `hdr10_plus_from_t35` and
+  `smpte2094_app5_from_t35` answer the struct libavutil parses from a
+  T.35 payload, as a demuxer delivers it.
+- `CodecId::media_type`: the media type libavcodec's descriptor gives a
+  codec, as the integer it stores, or `None` where the build has no
+  descriptor for the id.
+
+- **The write crossing**: `output::Output`, libavformat's muxing
+  context owned in Rust over a caller's `Write + Seek`, for
+  `mediaencode-ffmpeg`'s muxer. It takes no pointer from a caller, so
+  nothing in it is `unsafe`; `contracts` gains "Writing a container" and
+  "`AVOutputFormat`" for what it keeps with libavformat: the context
+  freed before its I/O context, the call order kept at run time
+  (`OutputError::OutOfOrder`), packets copied in on the copy road,
+  parameters rebuilt from a `CodecTicket`, ids crossing as integers.
+- **`writer_guard::GuardedWriter`**: a caller's sink behind the reader
+  guard's panic latch. A panic inside it becomes a latched I/O error,
+  named by the context (`OutputError::SinkPanic`), and a sink that
+  panicked is never called again.
+- Both guards reduce an error the stream returns to its OS code or its
+  kind inside their `catch_unwind`, dropping its payload there:
+  ffmpeg-next drops a returned error inside its `extern "C"` callback,
+  where a payload whose `Drop` panics aborted the process. That panic is
+  now latched and named like any other.
+- A write the sink fails is named the sink's at the call that met it
+  (`OutputError::SinkWrite`): the I/O context keeps it and writes nothing
+  after it, and every `Output` call that reached libavformat — the header,
+  a packet, the trailer — reads it there once libavformat returns, after
+  a panic and a failed seek and before libavformat's own error. The
+  header answers success over a write its own last flush failed, and a
+  packet and the trailer answer it as libavformat's code; both are now
+  the sink's. `Output::into_sink` reads it once more after the last
+  flush, so it hands the sink back only when every byte reached it,
+  whatever the sink's own flush answers — from any phase: before the
+  trailer it frees the context as dropping it does and hands back a
+  container without its trailer.
+- A seek the sink fails is kept by the writer guard
+  (`writer_guard::SeekRecord`, the third handle `GuardedWriter::new`
+  answers), which libavformat does not do: a muxer going back to patch
+  its header may ignore the answer and write on. The guard writes and
+  seeks nothing after it, and every `Output` call that reached
+  libavformat — the header, a packet, the trailer, `into_sink` — names
+  it once libavformat returns, whatever libavformat answered
+  (`OutputError::SinkSeek`), after a panic and before libavformat's own
+  error.
+- `CodecId::mime_type` — the descriptor's first MIME type — and the
+  `PNG`, `BMP`, `TTF`, `OTF` and `TEXT` ids.
+- What libavformat's packet path reads of a stream, for a muxer that
+  keeps each packet from a rule libavformat would apply only after
+  taking it: `Output::stream_codec` answers a stream's `StreamCodec` — its
+  codec, video delay, sample rate, channels, frame size, the samples its
+  codec fixes in each frame, block alignment, initial padding, profile,
+  codec tag, format, bits per coded sample and extradata — once `add_stream` made it; `Output::shifts_early_times`
+  whether libavformat moves every stream's times for an early first one;
+  `Output::position` the bytes written so far, the header's size once it
+  is written;
+  and `Output::set_automatic_filters` turns its automatic bitstream
+  filters on or off — on by default, as libavformat's own — so that a
+  caller who wants every packet to reach the muxer as handed over can
+  have it (`OutputCall::AutomaticFilters`).
+- `CodecId::intra_only` — whether libavformat takes every packet of the
+  codec for a key frame — and `CodecId::bits_per_sample`, with the
+  `LCEVC`, `EVC`, `APV`, `WAVPACK`, `TRUEHD` and `TTML` ids; the
+  big-endian `PCM_S24BE`, `PCM_S32BE`, `PCM_F32BE` and `PCM_F64BE`, and
+  `ATRAC3`, `COOK`, `RA_288`, `SIPR`, `RV10`, `RV20` and `RV30`.
+- `extras::packet_side_data_name`: libavcodec's name for a packet
+  side-data type, asked as the integer it is on the wire, or `None`
+  where this build names no such type.
+- `CodecTicket::with_sample_aspect_ratio` (hidden): the ticket of another
+  sample aspect ratio — for the FFmpeg demuxer's rows, libavformat's own
+  guess of the stream's (`av_guess_sample_aspect_ratio`).
+- `ffi::pix_fmt_sampling`: what libavutil's descriptor of a pixel format
+  states of its sampling (`ffi::PixFmtSampling`) — its chroma planes'
+  subsampling and its first component's depth — or `None` where it keeps
+  no descriptor for the integer asked, any integer a valid question
+  (`av_pix_fmt_desc_get`).
+
 ## [0.21.0] - 2026-10-24
 
 Released in lockstep with `mediadecode-ffmpeg` 0.21.0.

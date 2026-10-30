@@ -14,7 +14,7 @@ pub mod mux;
 pub mod settings;
 
 pub use encoder::{AudioEncoder, EncodeError, EncodeRefusal, Flushed, VideoEncoder};
-pub use mux::{MuxError, MuxRefusal, Muxer, check_decode_order};
+pub use mux::{MuxError, MuxRefusal, Muxer, check_decode_order, check_presentation_order};
 pub use settings::{
   AudioEncoderSettings, AudioParams, EncoderSettings, Gop, Level, Profile, RateControl,
   VideoEncoderSettings, VideoParams,

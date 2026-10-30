@@ -338,7 +338,7 @@ pub struct CallbackState {
   /// **The single source of truth for the allocator judge.** It used to
   /// be recovered from `AVCodecContext.max_pixels`, which is set to
   /// `min(pixel ceiling, byte ceiling / worst-bytes-per-pixel)` — so
-  /// when the *pixel* seat was the tighter of the two, `max_pixels`
+  /// when the *pixel* slot was the tighter of the two, `max_pixels`
   /// stopped encoding the byte ceiling at all and the recovery invented
   /// a smaller one. A 256x256 frame at 16 bytes a pixel under
   /// `max_pixels = 65536` and a 2 MiB byte budget satisfies both of the
@@ -569,7 +569,7 @@ pub unsafe extern "C" fn get_hw_format(
       return AVPixelFormat::AV_PIX_FMT_NONE;
     }
     if v == wanted_int {
-      // **The coded-dimension seat.** This is the last moment before
+      // **The coded-dimension slot.** This is the last moment before
       // the hardware frames pool is built, and the first at which the
       // *coded* extent is known — which is the extent that gets
       // allocated, and not the one `max_pixels` was checked against.
@@ -663,7 +663,7 @@ unsafe fn coded_extent_over_ceiling(
   // *smaller* than the pool. A conservative fallback that can
   // under-state is not conservative; it is a hole with a comment on it.
   //
-  // So this seat takes the rule the transfer judge already keeps: **a
+  // So this slot takes the rule the transfer judge already keeps: **a
   // pool that will not declare itself is a pool that cannot be judged,
   // and an unprovable extent is not a small one.** Refusing here
   // declines the hardware format, which falls the decode back to
@@ -676,7 +676,7 @@ unsafe fn coded_extent_over_ceiling(
   let device_ref = unsafe { (*ctx).hw_device_ctx };
   if device_ref.is_null() {
     // No device means no hardware frames pool will be built at all, so
-    // there is nothing for this seat to guard. That is a different
+    // there is nothing for this slot to guard. That is a different
     // thing from a pool declining to describe itself, which is refused
     // below — this crate's hardware road always attaches a device
     // before opening, so reaching here means the caller is not on it.
@@ -898,6 +898,16 @@ pub(crate) mod c_shims {
       desc: *const ffmpeg_next::ffi::AVPixFmtDescriptor,
     ) -> c_int;
 
+    /// Takes `AVPixelFormat` as `c_int`, answering the descriptor
+    /// libavutil keeps for that format — or null for any integer outside
+    /// its table, which it bounds-checks before indexing
+    /// (`pixdesc.c`'s `av_pix_fmt_desc_get`). The pointer is into the
+    /// static `av_pix_fmt_descriptors` table, live and unwritten for the
+    /// process; the struct holds no enum.
+    pub(crate) fn av_pix_fmt_desc_get(
+      pix_fmt: c_int,
+    ) -> *const ffmpeg_next::ffi::AVPixFmtDescriptor;
+
     /// Takes `AVPixelFormat` as `c_int`, so an id straight out of
     /// [`av_pix_fmt_desc_get_id`] can be priced without ever being an
     /// enum.
@@ -936,6 +946,97 @@ pub(crate) mod c_shims {
       formats: *mut *mut c_int,
       flags: c_int,
     ) -> c_int;
+
+    /// `AVCodecID` as `c_int`: whether a muxer can store a codec — `1`
+    /// yes, `0` no, negative when the muxer cannot tell. libavformat
+    /// answers every integer (its tag tables are searched, never
+    /// indexed).
+    pub(crate) fn avformat_query_codec(
+      ofmt: *const ffmpeg_next::ffi::AVOutputFormat,
+      codec_id: c_int,
+      std_compliance: c_int,
+    ) -> c_int;
+
+    /// `AVCodecID` as `c_int`: the tag a muxer's table gives a codec,
+    /// written to `tag`; answers `0` when the table names none.
+    pub(crate) fn av_codec_get_tag2(
+      tags: *const *const ffmpeg_next::ffi::AVCodecTag,
+      id: c_int,
+      tag: *mut libc::c_uint,
+    ) -> c_int;
+
+    /// Returns `AVCodecID` as `c_int`: the codec a muxer's table names
+    /// for a tag — `AV_CODEC_ID_NONE` where none — so an id this build's
+    /// bindings do not name is never formed into the enum.
+    pub(crate) fn av_codec_get_id(
+      tags: *const *const ffmpeg_next::ffi::AVCodecTag,
+      tag: libc::c_uint,
+    ) -> c_int;
+
+    /// `AVCodecID` as `c_int`: the bits one sample of the codec takes
+    /// where its samples have a fixed size, else `0` — libavcodec answers
+    /// every integer from a `switch` over the ids it names.
+    pub(crate) fn av_get_bits_per_sample(codec_id: c_int) -> c_int;
+
+    /// `AVPacketSideDataType` as `c_int`: libavcodec's name for a packet
+    /// side-data type, or null for a type it does not name — answered for
+    /// every integer from a `switch` over the types it names
+    /// (`libavcodec/packet.c` 269–317 in FFmpeg 9.0.1). Each name is a
+    /// string literal of libavcodec's, live and unwritten for the process.
+    pub(crate) fn av_packet_side_data_name(kind: c_int) -> *const libc::c_char;
+
+    /// `libavutil/hdr_dynamic_metadata.h`, which ffmpeg-sys-next 9.0.1
+    /// binds no part of: a zeroed `AVDynamicHDRPlus` of the linked
+    /// libavutil's own size, which it writes to `size` — 0 with a failed
+    /// allocation, answered as null (`hdr_dynamic_metadata.c` 36–44 in
+    /// FFmpeg 9.0.1). The struct stays opaque here: the pointer is read as
+    /// bytes and freed with `av_free`, never formed into a Rust type.
+    pub(crate) fn av_dynamic_hdr_plus_alloc(size: *mut usize) -> *mut libc::c_void;
+
+    /// As [`av_dynamic_hdr_plus_alloc`], for `AVDynamicHDRSmpte2094App5`
+    /// (`hdr_dynamic_metadata.c` 397–405).
+    pub(crate) fn av_dynamic_hdr_smpte2094_app5_alloc(size: *mut usize) -> *mut libc::c_void;
+
+    /// Parses an ITU-T T.35 HDR10+ payload of `size` bytes into the struct
+    /// `s` points at, answering 0 or a negative code
+    /// (`hdr_dynamic_metadata.c` 59–235): it refuses a payload past
+    /// `AV_HDR_PLUS_MAX_PAYLOAD_SIZE` bytes, copies the rest into a padded
+    /// buffer of its own, and writes only the struct's fields.
+    pub(crate) fn av_dynamic_hdr_plus_from_t35(
+      s: *mut libc::c_void,
+      data: *const u8,
+      size: usize,
+    ) -> c_int;
+
+    /// As [`av_dynamic_hdr_plus_from_t35`], for SMPTE ST 2094 application
+    /// 5 (`hdr_dynamic_metadata.c` 429–561), which copies the payload into
+    /// a padded buffer of its own first.
+    pub(crate) fn av_dynamic_hdr_smpte2094_app5_from_t35(
+      s: *mut libc::c_void,
+      data: *const u8,
+      size: usize,
+    ) -> c_int;
+
+    /// Serializes the `AVDynamicHDRPlus` `s` points at into the ITU-T T.35
+    /// HDR10+ payload (`hdr_dynamic_metadata.c` 237–395): into `*data`
+    /// where it is not null and `*size` bytes hold the payload, its size
+    /// written to `*size`. It trusts every count and divisor. The laws
+    /// alone call it, as the oracle the checks are held to.
+    #[cfg(test)]
+    pub(crate) fn av_dynamic_hdr_plus_to_t35(
+      s: *const libc::c_void,
+      data: *mut *mut u8,
+      size: *mut usize,
+    ) -> c_int;
+
+    /// As [`av_dynamic_hdr_plus_to_t35`], for SMPTE ST 2094 application 5
+    /// (`hdr_dynamic_metadata.c` 563–706).
+    #[cfg(test)]
+    pub(crate) fn av_dynamic_hdr_smpte2094_app5_to_t35(
+      s: *const libc::c_void,
+      data: *mut *mut u8,
+      size: *mut usize,
+    ) -> c_int;
   }
 }
 
@@ -953,6 +1054,56 @@ pub fn find_decoder_raw(id: c_int) -> Option<ptr::NonNull<AVCodec>> {
   // SAFETY: `avcodec_find_decoder` takes any integer and answers null or
   // a pointer into libavcodec's static codec table.
   ptr::NonNull::new(unsafe { c_shims::avcodec_find_decoder(id) }.cast_mut())
+}
+
+/// What libavutil's descriptor of a pixel format states of its planes'
+/// sampling: the chroma planes' horizontal and vertical subsampling, each
+/// as a power of two (`log2_chroma_w`, `log2_chroma_h`), and the bit depth
+/// of its first component (`comp[0].depth`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixFmtSampling {
+  log2_chroma_w: u8,
+  log2_chroma_h: u8,
+  depth: c_int,
+}
+
+impl PixFmtSampling {
+  /// The chroma planes' horizontal subsampling, as a power of two.
+  pub const fn log2_chroma_w(&self) -> u8 {
+    self.log2_chroma_w
+  }
+
+  /// The chroma planes' vertical subsampling, as a power of two.
+  pub const fn log2_chroma_h(&self) -> u8 {
+    self.log2_chroma_h
+  }
+
+  /// The first component's bit depth.
+  pub const fn depth(&self) -> c_int {
+    self.depth
+  }
+}
+
+/// The sampling libavutil's descriptor states of the pixel format `raw`
+/// (`av_pix_fmt_desc_get`, as `av_pix_fmt_get_chroma_sub_sample` reads
+/// it), or `None` where it keeps no descriptor for it — `AV_PIX_FMT_NONE`
+/// among them. Any integer is a valid question.
+pub fn pix_fmt_sampling(raw: c_int) -> Option<PixFmtSampling> {
+  // SAFETY: the redeclared lookup takes any integer and answers null or a
+  // pointer into libavutil's static descriptor table, which holds no enum;
+  // each field is read through `addr_of!` as the plain integer it is,
+  // without forming a reference.
+  unsafe {
+    let desc = c_shims::av_pix_fmt_desc_get(raw);
+    if desc.is_null() {
+      return None;
+    }
+    Some(PixFmtSampling {
+      log2_chroma_w: ptr::addr_of!((*desc).log2_chroma_w).read(),
+      log2_chroma_h: ptr::addr_of!((*desc).log2_chroma_h).read(),
+      depth: ptr::addr_of!((*desc).comp[0].depth).read(),
+    })
+  }
 }
 
 /// Visits the formats a hardware frame can be downloaded to — the
