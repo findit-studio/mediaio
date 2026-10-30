@@ -691,7 +691,7 @@
 //! | A13 | AVIF (9154–9213) | its sample buffer's growth read as none, an `mdat` of no sample written; its `moov`'s null buffer's open answered as the size, every chunk's offset moved by it | omission and misreport: 0 bytes and a null buffer written as none (9189–9198); the open's code taken as the size (8911–8912, 9179–9181) | bounded: the samples ([`FRAGMENT_BYTES_MAX`]), the `moov` (S2) | letter 1 |
 //! | A14 | Ogg's pages (`ogg_buffer_page`, `oggenc.c` 189–212) | a page's list node, its failure discarded at every call: the page left full and the next segment count, less one, handed to `memset` as `SIZE_MAX` (247–253) | memory fault: `memset` of `SIZE_MAX` bytes past the page's segments (252), then `segments[255]` (256) — every page buffered through `ogg_buffer_page` (233–234, 239–242, 275–280, 285–286), a page whose buffering fails taking the next segments until it is full: no road avoids it | out of reach: the node's and the page's fixed sizes; the comment header bounded (S1) | letter 1 |
 //! | A15 | the metadata conversion every Vorbis-comment, ID3v2, NUT and Matroska writer runs (`ff_metadata_conv`, `metadata.c` 26–57) | a tag dropped where its `av_dict_set` fails: Ogg's language, NUT's language and chapter titles, MP3's and Matroska's chapter titles | omission: the tag dropped (`av_dict_set`) | out of reach: each value one the base set through `av_dict_set` with its own copy, under the same limit, refused first there, the open's fault | letter 1 |
-//! | A16 | MPEG-TS's raw AAC, through its nested ADTS muxer (`mpegtsenc.c` 1980–2003) | the nested buffer closed unchecked: a null buffer and `-64` bytes copied into the PES payload (2232) | memory fault: `memcpy` of a null buffer and `SIZE_MAX - 63` bytes (2232) — avoided where the muxer frames each packet in ADTS itself, which MPEG-TS takes as it is (1977) | out of reach: an ADTS frame of at most 8191 bytes ([`PayloadRule::AdtsFrame`]) | letter 1 |
+//! | A16 | MPEG-TS's raw AAC, through its nested ADTS muxer (`mpegtsenc.c` 1980–2003) | the nested buffer closed unchecked: a null buffer and `-64` bytes copied into the PES payload (2232) | memory fault: `memcpy` of a null buffer and `SIZE_MAX - 63` bytes (2232) — avoided where the muxer frames each packet in ADTS itself, which MPEG-TS takes as it is (1977) | out of reach: an ADTS frame of at most 8191 bytes ([`PayloadRule::AdtsFrame`]) | closed by r3 (R20, ruled): this muxer frames each raw packet in ADTS itself, of the configuration, as FFmpeg's ADTS writer frames it, and MPEG-TS takes the frame as it is, its nested muxer never fed ([`AdtsFraming`]) — L179, L180, `adts_frames_are_made_as_ffmpegs_adts_writer_makes_them` |
 //! | A17 | MP3's Xing frame (`mp3enc.c` 145–286; discarded at 632) | its buffer's open discarded after the frame's offset is set, its close unchecked: the trailer writing into a null frame (400–469) | memory fault: the frame's fields written through the null frame and its offset (412–466), its CRC read through it (465) — avoided by `write_xing` off (161–162, 515–516) | out of reach: one frame of at most 1440 bytes (205–220) | letter 1 |
 //! | A18 | MP3's ID3v2 frames (`id3v2enc.c` 66–98, 259–329) | each frame made in a dynamic buffer, its growth read as none: a title's frame and the table of contents written empty; a chapter written empty while the tag's size, the writers' own sum (`ff_id3v2_finish`, 421–443), counts its element id, times and title — the reader taking the first audio frames as the tag's; a text frame's open failure taken for no match and written again as a `TXXX` frame | omission and misreport: 0 bytes and a null buffer written as none (85–94, 279–285, 317–323) | bounded exactly at open ([`ID3V2_BYTES_MAX`]) | letter 1 |
 //! | A19 | NUT's headers (`nutenc.c` 351–717, 1186–1207) | a header packet's buffer's growth read as none, each info packet's buffer closed unchecked — its count written, its tags not — the global info's, the repeated headers' and the index's failures discarded, an index entry's (1164): a stream's language and dispositions, a chapter's title, the index lost | misreport: each count written beside 0 bytes, or `-64` written as none (355, 366; 539–540, 570–580, 609–610) | the info packets: reachable, bounded exactly at open (S4); the stream headers' configuration under 2^30 bytes ([`MuxOpenError::ConfigurationInvalid`]); the key frame index: N1 | letter 1 |
@@ -784,6 +784,30 @@
 //! `evc.c`, `hevc.c`, `vvc.c`, `lcevc.c`, `riffenc.c` and Matroska's lines,
 //! corrected). Matroska's dynamic buffers return their errors: its
 //! header's past `INT_MAX`, FFmpeg's own answer, reported at open.
+//!
+//! **r3, MPEG-TS's raw AAC** (A16): MPEG-TS writes a raw AAC packet of a
+//! configured track through its nested ADTS muxer, into a dynamic buffer
+//! it closes unchecked — a failed growth there a null buffer and `-64`
+//! bytes, copied into its payload, a memory fault (`mpegtsenc.c`
+//! 1980–2003, 2232). This muxer frames each such packet in ADTS itself:
+//! the 7-byte header its configuration makes and, before the first frame,
+//! the program config element, as FFmpeg's ADTS writer makes them
+//! (`adts_write_frame_header`, `adts_write_packet`, `adtsenc.c` 130–208;
+//! [`adts_frame_header`], [`adts_pce_bytes`]), decided on the stack at the
+//! packet's judgment ([`AdtsFraming`]), copied before the payload into the
+//! one packet its write builds — a fallible build, its failure the write's
+//! fault, nothing handed over. MPEG-TS takes a frame opening on its sync
+//! word as it is (1977): its nested muxer, made at its start of the
+//! configuration and freed at its `deinit`, is never fed. What ADTS cannot
+//! carry is refused by name as FFmpeg's writer refuses it: at open, an
+//! object type past 4, the escape sampling index, a frame of 960 samples,
+//! the core coder, the extension flag ([`MuxOpenError::ConfigurationInvalid`]);
+//! at the packet, a frame past the 8191 bytes its 13-bit length counts
+//! ([`PayloadRule::AdtsFrameLength`]) — FFmpeg's writer checks 16 383,
+//! the length then written into the fields before it. The frames read back
+//! byte for byte as FFmpeg's ADTS writer makes them (L179), and a frame is
+//! written whole where libavutil's allocations are held below the nested
+//! muxer's buffer (L180).
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -3596,8 +3620,9 @@ pub enum Rewrite {
   /// census). Reported at the first packet whose two times differ, where
   /// the stream counts them.
   PresentationTimes,
-  /// AAC into ADTS, or into MPEG-TS, whose nested ADTS muxer writes a
-  /// configured track's raw frames (`mpegtsenc.c` 1253–1280, 1973–2005):
+  /// AAC into ADTS, or into MPEG-TS, a configured track's raw frames
+  /// framed by this muxer as its nested ADTS muxer would frame them
+  /// (`mpegtsenc.c` 1253–1280, 1973–2005; R20, r3, [`AdtsFraming`]):
   /// each packet is written behind a header made of the
   /// configuration's object type, sampling frequency and channel
   /// configuration — the program config element written once, before the
@@ -5199,6 +5224,11 @@ struct TrackState {
   ts_held: u64,
   /// MPEG-TS Opus: the start trim left to write ([`TsRules::Opus`]).
   ts_trim: Option<i64>,
+  /// MPEG-TS's raw AAC: the program config element the first frame this
+  /// muxer frames carries ([`AdtsFraming`]), and whether it is yet to be
+  /// written (R20, r3).
+  ts_pce: Vec<u8>,
+  ts_pce_pending: bool,
   /// The MOV family's constant-size audio: the place the next packet's
   /// first sample lies at, from the track's first packet's decode time, in
   /// the track's ticks, its samples ([`PacketRules::mp4_constant`]).
@@ -6064,15 +6094,17 @@ enum TsRules {
     /// 2042–2048).
     extradd: u64,
   },
-  /// AAC: two bytes at least; an ADTS frame written as it is; any other
-  /// packet put behind an ADTS header the configuration makes, within its
-  /// 13 bits — or, with no configuration, written as it is, unreadable
-  /// (1969–2004).
+  /// AAC: two bytes at least; a packet opening on twelve set bits — an
+  /// ADTS frame's sync word — written as it is; any other put behind an
+  /// ADTS header the configuration makes, within its 13 bits, by this muxer
+  /// itself, which MPEG-TS then takes as it is (R20, r3; [`AdtsFraming`]) —
+  /// or, with no configuration, refused: MPEG-TS would write it as it is,
+  /// unreadable (1969–2004).
   Aac {
     /// Whether the track states its configuration.
     configured: bool,
-    /// The program config element the first header carries.
-    pce: usize,
+    /// What each frame's header holds of it, where ADTS takes it.
+    fields: Option<AdtsFields>,
   },
   /// Opus: two bytes at least (2072–2075); a packet of no control header
   /// of its own written behind one, its size summed in an `int`
@@ -6674,6 +6706,8 @@ struct Choices<'p> {
   /// The MOV family's APV: the packet brings frame informations its track's
   /// `apvC` holds not ([`apv_added`]).
   apv: bool,
+  /// MPEG-TS's raw AAC: what this muxer puts before the packet (R20, r3).
+  adts: Option<AdtsFraming>,
 }
 
 /// What a packet's commit made of its judgment's choices, owned, for its
@@ -7627,7 +7661,7 @@ impl PacketRules {
           }),
           CodecId::AAC => Some(TsRules::Aac {
             configured: !codec.extradata().is_empty(),
-            pce: adts_configuration(codec.extradata()).map_or(0, |config| config.pce),
+            fields: adts_configuration(codec.extradata()).map(|config| config.fields),
           }),
           CodecId::OPUS => Some(TsRules::Opus {
             rate: codec.sample_rate(),
@@ -10235,6 +10269,8 @@ struct Plan {
   learned: Learned,
   /// What the commit made of the judgment's choices (R15).
   paid: Paid,
+  /// MPEG-TS's raw AAC: what its write puts before the payload (R20, r3).
+  adts: Option<AdtsFraming>,
   /// What the report learns from the packet, once it is written.
   uncarried: Vec<Uncarried>,
 }
@@ -10343,6 +10379,9 @@ struct Learned {
   ts_held: Option<u64>,
   /// MPEG-TS Opus: the start trim left after the packet.
   ts_trim: Option<Option<i64>>,
+  /// MPEG-TS's raw AAC: the packet's frame carries the program config
+  /// element, which no later frame does (R20, r3).
+  ts_pce_sent: bool,
   /// The MOV family's constant-size audio: what MP4 counts of the packet
   /// ([`Mp4Place`]).
   mp4_place: Option<Mp4Place>,
@@ -11113,6 +11152,7 @@ where
       let mut descriptions = Descriptions::default();
       let mut moov = None;
       let mut stsd = 0;
+      let mut ts_pce = Vec::new();
       let stream = match (stream, road) {
         (Some((stream, _)), Road::Timed) => {
           let time_base = output
@@ -11228,6 +11268,15 @@ where
           }
           sides = SideRules::of((family, audited), kind, &codec);
           sides.alone = ogg_streams == 1;
+          // MPEG-TS's raw AAC, which this muxer frames in ADTS: the program
+          // config element its first frame carries (R20, r3).
+          if audited == Audited::MpegTs
+            && codec.codec() == CodecId::AAC
+            && let Some(config) = adts_configuration(codec.extradata())
+            && config.pce > 0
+          {
+            ts_pce = adts_pce_bytes(codec.extradata(), config.pce_at);
+          }
           if family == Family::Mp4 {
             descriptions = Descriptions::of(&codec);
           }
@@ -11284,6 +11333,8 @@ where
           Some(TsRules::Opus { trim, .. }) => trim,
           _ => Some(0),
         },
+        ts_pce_pending: !ts_pce.is_empty(),
+        ts_pce,
         mp4_place: None,
         mp4_samples: 0,
         mp4_entries: 0,
@@ -11958,6 +12009,22 @@ where
       self.bounds,
     )
     .map_err(Refusal::Container)?;
+    // MPEG-TS's raw AAC, framed here (R20, r3): the packet its write builds
+    // holds the frame's header before the payload, judged as the builder
+    // judges it.
+    if let Some(framing) = choices.adts
+      && let Some(rule) = build_refusal(
+        payload.flags,
+        framing.len + payload.bytes.len(),
+        payload.side_data,
+        self.limits,
+      )
+    {
+      return Err(Refusal::Container(FfmpegMuxRefusal::Payload {
+        track,
+        rule,
+      }));
+    }
     learned.fragment_cut = self.keys.is_some()
       && state.kind == TrackKind::Video
       && (payload.key || state.rules.marks_key)
@@ -12173,6 +12240,7 @@ where
       filter,
       learned,
       paid,
+      adts: choices.adts,
       uncarried,
     })
   }
@@ -12322,6 +12390,9 @@ where
     }
     if let Some(trim) = plan.learned.ts_trim {
       state.ts_trim = trim;
+    }
+    if plan.learned.ts_pce_sent {
+      state.ts_pce_pending = false;
     }
     if let Some(mp4) = plan.learned.mp4_place {
       state.mp4_place = Some(mp4.next);
@@ -12909,6 +12980,7 @@ fn check_packet_rules<'p>(
   };
   // MPEG-TS's packets (`mpegts_write_packet_internal`, `mpegtsenc.c`
   // 1869–2240).
+  let mut ts_framing = None;
   match rules.ts {
     Some(TsRules::StartCodes { .. }) => {
       if !ts_annexb_filter(step, state) && (payload.bytes.len() < 5 || !annex_b(payload.bytes)) {
@@ -12918,14 +12990,22 @@ fn check_packet_rules<'p>(
     Some(TsRules::Aac { .. } | TsRules::Opus { .. }) if payload.bytes.len() < 2 => {
       return refused(PayloadRule::TooShort);
     }
-    Some(TsRules::Aac { configured, pce }) if !adts_header(payload.bytes) => {
-      if !configured {
+    Some(TsRules::Aac { configured, fields }) if !ts_adts(payload.bytes) => {
+      let Some(fields) = fields.filter(|_| configured) else {
         return refused(PayloadRule::AdtsFrame);
-      }
-      let first = if state.written { 0 } else { pce };
-      if ADTS_HEADER_BYTES + payload.bytes.len() + first > ADTS_FRAME_BYTES_MAX {
+      };
+      // The frame: the header, the program config element before the
+      // first, the packet (R20, r3) — framed here, on the stack.
+      let pce: &[u8] = if state.ts_pce_pending {
+        &state.ts_pce
+      } else {
+        &[]
+      };
+      let frame = ADTS_HEADER_BYTES + pce.len() + payload.bytes.len();
+      if frame > ADTS_FRAME_BYTES_MAX {
         return refused(PayloadRule::AdtsFrameLength);
       }
+      ts_framing = Some(AdtsFraming::of(fields, frame, pce));
     }
     _ => {}
   }
@@ -12964,17 +13044,11 @@ fn check_packet_rules<'p>(
         let (written, trim) = opus_control_bytes(payload.bytes, state.ts_trim, end);
         (Some(written), Some(trim))
       }
-      Some(TsRules::Aac { configured, pce })
-        if configured
-          && (payload.bytes.len() < 2
-            || u16::from_be_bytes([payload.bytes[0], payload.bytes[1]]) & 0xFFF0 != 0xFFF0) =>
-      {
-        let first = if state.written { 0 } else { pce };
-        (
-          Some((ADTS_HEADER_BYTES + payload.bytes.len() + first) as u64),
-          None,
-        )
-      }
+      // Raw AAC, framed here (R20, r3).
+      Some(TsRules::Aac { .. }) if ts_framing.is_some() => (
+        ts_framing.map(|framing| (framing.len + payload.bytes.len()) as u64),
+        None,
+      ),
       _ => (Some(payload.bytes.len() as u64), None),
     };
     if let Some(written) = written {
@@ -13713,6 +13787,7 @@ fn check_packet_rules<'p>(
     descriptions,
     holds_first,
     apv,
+    adts: ts_framing,
   };
   Ok((
     Learned {
@@ -13729,6 +13804,7 @@ fn check_packet_rules<'p>(
       avi_frames,
       ts_held,
       ts_trim,
+      ts_pce_sent: ts_framing.is_some_and(|framing| framing.pce),
       mp4_place,
       mp4_entries,
       stsd,
@@ -13831,6 +13907,159 @@ const ADTS_FRAME_BYTES_MAX: usize = (1 << 13) - 1;
 struct AdtsConfig {
   pce: usize,
   rebuilt: [u8; 2],
+  /// What each frame's header holds of it.
+  fields: AdtsFields,
+  /// Where in it, in bits, its program config element opens, of a channel
+  /// configuration of 0.
+  pce_at: usize,
+}
+
+/// What an ADTS frame's header holds of the configuration
+/// (`adts_write_frame_header`, `adtsenc.c` 130–166): its object type less
+/// one, of 2 bits — AAC Main, LC, SSR or LTP — its sampling index, its
+/// channel configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdtsFields {
+  profile: u8,
+  sampling: u8,
+  channels: u8,
+}
+
+/// Whether MPEG-TS takes an AAC packet of two bytes or more as an ADTS
+/// frame, as it is: its first twelve bits set (`mpegtsenc.c` 1977).
+fn ts_adts(bytes: &[u8]) -> bool {
+  bytes.len() >= 2 && u16::from_be_bytes([bytes[0], bytes[1]]) & 0xFFF0 == 0xFFF0
+}
+
+/// What this muxer puts before a raw AAC packet of an MPEG-TS track, its
+/// frame then one MPEG-TS takes as it is (R20, r3: A16, MPEG-TS's nested
+/// ADTS muxer never fed): the 7-byte header its configuration makes, and
+/// before the first frame the program config element — as the nested
+/// muxer writes them (`adts_write_packet`, `adtsenc.c` 168–208), made on
+/// the stack at the packet's judgment, copied into the packet its write
+/// builds before the payload.
+#[derive(Debug, Clone, Copy)]
+struct AdtsFraming {
+  bytes: [u8; ADTS_HEADER_BYTES + MAX_PCE_SIZE],
+  len: usize,
+  /// Whether the program config element is among them.
+  pce: bool,
+}
+
+impl AdtsFraming {
+  /// The header of a frame of `frame` bytes of `fields`, and `pce`.
+  fn of(fields: AdtsFields, frame: usize, pce: &[u8]) -> Self {
+    let mut bytes = [0; ADTS_HEADER_BYTES + MAX_PCE_SIZE];
+    bytes[..ADTS_HEADER_BYTES].copy_from_slice(&adts_frame_header(fields, frame));
+    bytes[ADTS_HEADER_BYTES..ADTS_HEADER_BYTES + pce.len()].copy_from_slice(pce);
+    Self {
+      bytes,
+      len: ADTS_HEADER_BYTES + pce.len(),
+      pce: !pce.is_empty(),
+    }
+  }
+
+  fn bytes(&self) -> &[u8] {
+    &self.bytes[..self.len]
+  }
+}
+
+/// The 7-byte header the ADTS muxer writes before a frame of `frame`
+/// bytes, its header and its program config element among them, of a
+/// configuration's `fields` (`adts_write_frame_header`, `adtsenc.c`
+/// 130–166 in FFmpeg 9.0.1, its `mpeg_id` 0 — its option's default, which
+/// MPEG-TS's nested muxer keeps): the sync word, MPEG-4, layer 0, no CRC,
+/// the profile, sampling index and channel configuration, no private,
+/// original, home or copyright bits, the frame's 13-bit length, the
+/// buffer fullness `0x7FF`, one raw data block. A length past 13 bits is
+/// refused before ([`PayloadRule::AdtsFrameLength`]).
+fn adts_frame_header(fields: AdtsFields, frame: usize) -> [u8; ADTS_HEADER_BYTES] {
+  let length = frame as u32 & 0x1FFF;
+  [
+    0xFF,
+    0xF1,
+    (fields.profile << 6) | (fields.sampling << 2) | (fields.channels >> 2),
+    ((fields.channels & 3) << 6) | (length >> 11) as u8,
+    (length >> 3) as u8,
+    (((length & 7) << 5) as u8) | 0x1F,
+    0xFC,
+  ]
+}
+
+/// The program config element the ADTS muxer writes before its first
+/// frame, of the configuration `config` whose element opens at bit `at`
+/// (`adts_decode_extradata`, `adtsenc.c` 95–101; `ff_copy_pce_data`,
+/// `mpeg4audio_copy_pce.h` 38–67): its three-bit element id, 5, then the
+/// element's fields as they are, the writer aligned with zeros, the
+/// reader to the configuration's next byte, the comment's count and its
+/// bytes.
+fn adts_pce_bytes(config: &[u8], at: usize) -> Vec<u8> {
+  let mut bits = Bits { bytes: config, at };
+  let mut out = BitWriter::default();
+  out.put(3, 5);
+  let copy = |out: &mut BitWriter, bits: &mut Bits<'_>, count: u32| {
+    let value = bits.read(count);
+    out.put(count, value);
+    value
+  };
+  // The tag, object type and sampling index; the front, side and back
+  // elements; the LFE and data elements; the coupling elements.
+  copy(&mut out, &mut bits, 10);
+  let mut five =
+    copy(&mut out, &mut bits, 4) + copy(&mut out, &mut bits, 4) + copy(&mut out, &mut bits, 4);
+  let four = copy(&mut out, &mut bits, 2) + copy(&mut out, &mut bits, 3);
+  five += copy(&mut out, &mut bits, 4);
+  // The mono, stereo and matrix mixdowns, each its flag and its index.
+  for width in [4, 4, 3] {
+    if copy(&mut out, &mut bits, 1) == 1 {
+      copy(&mut out, &mut bits, width);
+    }
+  }
+  let mut left = five * 5 + four * 4;
+  while left > 16 {
+    copy(&mut out, &mut bits, 16);
+    left -= 16;
+  }
+  if left > 0 {
+    copy(&mut out, &mut bits, left);
+  }
+  // The writer aligned with zeros, the reader to its next byte.
+  out.align();
+  bits.at = bits.at.div_ceil(8) * 8;
+  let comment = copy(&mut out, &mut bits, 8);
+  for _ in 0..comment {
+    copy(&mut out, &mut bits, 8);
+  }
+  out.out
+}
+
+/// Bits written as libavcodec's writer writes them, high bit first
+/// (`put_bits.h`).
+#[derive(Default)]
+struct BitWriter {
+  out: Vec<u8>,
+  acc: u32,
+  used: u32,
+}
+
+impl BitWriter {
+  fn put(&mut self, count: u32, value: u32) {
+    for bit in (0..count).rev() {
+      self.acc = (self.acc << 1) | ((value >> bit) & 1);
+      self.used += 1;
+      if self.used == 8 {
+        self.out.push(self.acc as u8);
+        (self.acc, self.used) = (0, 0);
+      }
+    }
+  }
+
+  /// `align_put_bits`: zeros to the next byte.
+  fn align(&mut self) {
+    if self.used > 0 {
+      self.put(8 - self.used, 0);
+    }
+  }
 }
 
 /// The configuration the ADTS muxer makes of the AudioSpecificConfig
@@ -13880,6 +14109,7 @@ fn adts_configuration(config: &[u8]) -> Option<AdtsConfig> {
   if bits.read(3) != 0 {
     return None;
   }
+  let pce_at = bits.at;
   let pce = if channels == 0 {
     // The element's fields, as `ff_copy_pce_data` copies them behind the
     // three bits of its id: the tag, object type and sampling index, the
@@ -13913,6 +14143,12 @@ fn adts_configuration(config: &[u8]) -> Option<AdtsConfig> {
       (object << 3) | (sampling >> 1),
       ((sampling & 1) << 7) | (channels << 3),
     ],
+    fields: AdtsFields {
+      profile: object - 1,
+      sampling,
+      channels,
+    },
+    pce_at,
   })
 }
 
@@ -14030,10 +14266,18 @@ where
       Ok(plan) => plan,
       Err(refusal) => return Err(refusal.with_packet(packet)),
     };
-    let written =
-      self
-        .output
-        .write_packet::<C>(plan.stream, OutputPacket::Audio(p), plan.times, self.limits);
+    // MPEG-TS's raw AAC, behind the ADTS header this muxer made of it, which
+    // MPEG-TS takes as it is (R20, r3).
+    let framed = match &plan.adts {
+      Some(framing) => OutputPacket::AudioFramed {
+        packet: p,
+        header: framing.bytes(),
+      },
+      None => OutputPacket::Audio(p),
+    };
+    let written = self
+      .output
+      .write_packet::<C>(plan.stream, framed, plan.times, self.limits);
     self.settle(plan, written)
   }
 
@@ -14522,9 +14766,10 @@ where
       Some(MuxOpenError::Dimensions { track })
     }
     // MPEG-TS names a codec of its list alone (`get_dvb_stream_type`,
-    // `mpegtsenc.c` 352–455), writes a configured AAC track behind ADTS
-    // headers its start's nested ADTS muxer makes of the configuration,
-    // which refuses one ADTS cannot write (1240–1268), describes an Opus
+    // `mpegtsenc.c` 352–455), makes a configured AAC track's nested ADTS
+    // muxer at its start, which refuses a configuration ADTS cannot write
+    // (1240–1268) — this muxer framing the track's raw packets behind the
+    // headers that muxer would make (R20, r3) — describes an Opus
     // stream's channels where its mapping is one it knows (607–679), and
     // ARIB captions of profile A or C (299–320).
     Audited::MpegTs

@@ -1072,3 +1072,67 @@ fn no_flush_reaches_the_sink_after_a_failed_seek() {
     );
   }
 }
+
+/// **An audio packet framed reaches libavformat behind its header.** A
+/// raw PCM stream, whose muxer writes each packet as it is: a packet of
+/// four bytes, behind a header of two, is written as the six — the header
+/// first — one packet built of both, its padding the copy road's, the
+/// caller's bytes untouched (R20, r3: MPEG-TS's raw AAC, which
+/// `mediaencode-ffmpeg`'s muxer frames in ADTS itself).
+#[test]
+fn an_audio_packet_framed_reaches_libavformat_behind_its_header() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let mut parameters = ffmpeg_next::codec::Parameters::new();
+  // SAFETY: `Parameters::new` allocated a live `AVCodecParameters` (it is
+  // checked non-null first) that nothing else holds; the enums are written
+  // as the integers they are stored as, the layout by libavutil's own.
+  unsafe {
+    let par = parameters.as_mut_ptr();
+    assert!(!par.is_null(), "avcodec_parameters_alloc");
+    write_unaligned(
+      addr_of_mut!((*par).codec_type).cast::<i32>(),
+      ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO as i32,
+    );
+    write_unaligned(
+      addr_of_mut!((*par).codec_id).cast::<i32>(),
+      CodecId::PCM_S16LE.raw(),
+    );
+    (*par).sample_rate = 48_000;
+    ffmpeg_next::ffi::av_channel_layout_default(addr_of_mut!((*par).ch_layout), 1);
+  }
+  let ticket = CodecTicket::mirror(&parameters, 0, 1 << 20).expect("a ticket");
+  let mut output = Output::open(Cursor::new(Vec::new()), "s16le").expect("open");
+  let stream = output
+    .add_stream(&StreamSpec::new(&ticket, millis()))
+    .expect("a stream");
+  output.write_header().expect("the header");
+  let packet = AudioPacket::new(
+    FfmpegBytes::copy_from_slice(&[1, 2, 3, 4]),
+    AudioPacketExtra::new(0),
+  )
+  .with_pts(Some(ms(0)))
+  .with_dts(Some(ms(0)));
+  output
+    .write_packet::<crate::Owned>(
+      stream,
+      OutputPacket::AudioFramed {
+        packet: &packet,
+        header: &[0xAA, 0xBB],
+      },
+      times(0),
+      PacketLimits::default(),
+    )
+    .expect("a framed packet");
+  output.write_trailer().expect("the trailer");
+  let bytes = output.into_sink().expect("the sink back").into_inner();
+  assert_eq!(
+    bytes,
+    [0xAA, 0xBB, 1, 2, 3, 4],
+    "the header, then the payload"
+  );
+  assert_eq!(
+    packet.data().as_ref(),
+    [1, 2, 3, 4],
+    "the caller's bytes untouched"
+  );
+}

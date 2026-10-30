@@ -1251,6 +1251,8 @@ fn eac3_track(frame_size: i32) -> TrackState {
     avi_frames: 0,
     ts_held: 0,
     ts_trim: Some(0),
+    ts_pce: Vec::new(),
+    ts_pce_pending: false,
     mp4_place: None,
     mp4_samples: 0,
     mp4_entries: 0,
@@ -5435,4 +5437,57 @@ fn opus_control_headers_are_counted_with_their_trims() {
     "of fewer than 10 bytes"
   );
   assert!(!opus_ts_end_trim(None, 48_000));
+}
+
+/// MPEG-TS's raw AAC is framed as FFmpeg's ADTS writer frames it (R20,
+/// r3): the header's fields — the sync word, MPEG-4, no CRC, the profile,
+/// the sampling index, the channel configuration across two bytes, the
+/// 13-bit length, the fullness `0x7FF`, one block — and the program
+/// config element behind its element id 5, the writer aligned with zeros,
+/// the comment's count and bytes, its length the mirror's.
+#[test]
+fn adts_frames_are_made_as_ffmpegs_adts_writer_makes_them() {
+  use super::{AdtsFields, AdtsFraming, adts_configuration, adts_frame_header, adts_pce_bytes};
+  // AAC LC, 44.1 kHz, stereo.
+  let config = adts_configuration(&[0x12, 0x10]).expect("LC");
+  assert_eq!(
+    config.fields,
+    AdtsFields {
+      profile: 1,
+      sampling: 4,
+      channels: 2,
+    }
+  );
+  assert_eq!(
+    adts_frame_header(config.fields, 7 + 300),
+    [0xFF, 0xF1, 0x50, 0x80, 0x26, 0x7F, 0xFC]
+  );
+  // A length of 13 bits, its top two bits in the fourth byte.
+  let long = adts_frame_header(config.fields, 8191);
+  assert_eq!(
+    (usize::from(long[3] & 3) << 11) | (usize::from(long[4]) << 3) | usize::from(long[5] >> 5),
+    8191
+  );
+  // Seven channels' configuration, its top bit in the third byte.
+  let seven = adts_frame_header(
+    AdtsFields {
+      profile: 1,
+      sampling: 3,
+      channels: 7,
+    },
+    7,
+  );
+  assert_eq!((seven[2] & 1, seven[3] >> 6), (1, 3));
+  // Channel configuration 0 and a program config element of one front
+  // pair, no comment: 39 bits of fields behind the element id's 3, aligned,
+  // and the comment's count — 7 bytes.
+  let pce_config = [0x12, 0x00, 0x05, 0x04, 0x00, 0x00, 0x20, 0x00];
+  let config = adts_configuration(&pce_config).expect("a PCE");
+  assert_eq!(config.pce, 7);
+  let pce = adts_pce_bytes(&pce_config, config.pce_at);
+  assert_eq!(pce, [0xA0, 0xA0, 0x80, 0x00, 0x04, 0x00, 0x00]);
+  let framing = AdtsFraming::of(config.fields, 7 + 7 + 10, &pce);
+  assert!(framing.pce);
+  assert_eq!(&framing.bytes()[7..], &pce[..]);
+  assert_eq!(framing.bytes().len(), 14);
 }

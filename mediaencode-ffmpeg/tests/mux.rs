@@ -21661,3 +21661,308 @@ fn l178_mpeg_ts_counts_an_audio_payload_as_it_sums_it() {
     );
   }
 }
+
+/// The audio elementary stream of the MPEG-TS file `path`: its MPEG audio
+/// stream's PES payloads, joined.
+fn ts_audio_stream(path: &Path) -> Vec<u8> {
+  pes_of(path, 0xC0)
+    .into_iter()
+    .flat_map(|(_, bytes)| bytes)
+    .collect()
+}
+
+/// `fields`, each a value of its width in bits, high bit first, the last
+/// byte filled with zeros.
+fn bits_of(fields: &[(u32, u32)]) -> Vec<u8> {
+  let mut out = Vec::new();
+  let (mut acc, mut used) = (0_u32, 0_u32);
+  for &(value, width) in fields {
+    for bit in (0..width).rev() {
+      acc = (acc << 1) | ((value >> bit) & 1);
+      used += 1;
+      if used == 8 {
+        out.push(acc as u8);
+        (acc, used) = (0, 0);
+      }
+    }
+  }
+  if used > 0 {
+    out.push((acc << (8 - used)) as u8);
+  }
+  out
+}
+
+/// An AudioSpecificConfig of AAC LC at 44.1 kHz of channel configuration 0,
+/// its program config element naming one front channel pair and no
+/// comment.
+fn aac_pce_config() -> Vec<u8> {
+  bits_of(&[
+    (2, 5),
+    (4, 4),
+    (0, 4),
+    (0, 3),
+    // The element: its tag, object type, sampling index; one front
+    // element, no side, back, LFE, data or coupling element; no mixdown.
+    (0, 4),
+    (1, 2),
+    (4, 4),
+    (1, 4),
+    (0, 4),
+    (0, 4),
+    (0, 2),
+    (0, 3),
+    (0, 4),
+    (0, 3),
+    // The front element, a pair, of tag 0; the byte alignment; no comment.
+    (1, 1),
+    (0, 4),
+    (0, 1),
+    (0, 8),
+  ])
+}
+
+/// **L179 — MPEG-TS writes raw AAC in the ADTS frames FFmpeg's writer
+/// makes** (R20, r3, ruled: A16 — this muxer frames each raw AAC packet in
+/// ADTS itself, from the AudioSpecificConfig, so that MPEG-TS takes the
+/// frame as it is and never feeds its nested ADTS muxer, `mpegtsenc.c`
+/// 1977–2005): of the corpus's AAC LC and of a configuration of channel
+/// configuration 0 and a program config element, the packets written into
+/// MPEG-TS read back, byte for byte, as the frames FFmpeg's ADTS muxer
+/// writes of them — the one MPEG-TS nested — the element before the first
+/// alone. A configuration ADTS cannot carry is refused at open by name, as
+/// FFmpeg's ADTS writer refuses it (`adts_decode_extradata`, `adtsenc.c`
+/// 52–108): an object type past 4, the escape sampling index 15, a frame of
+/// 960 samples, the core coder, the extension flag; and a frame past the
+/// 8191 bytes the header's 13-bit length counts, at the packet, handed
+/// back untouched — at 8191, written.
+///
+/// PLANT: a frame's length a byte short; the element never written, or
+/// written before every frame; the object type written as it is.
+#[test]
+fn l179_mpeg_ts_writes_raw_aac_in_the_adts_frames_ffmpegs_writer_makes() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mkv");
+  let (table, packets) = first_track(&source, TrackKind::Audio, 8);
+  let lc = stream_extradata_of(&table[0]);
+  let frames: Vec<Audio> = packets.iter().map(audio_of).collect();
+  assert!(
+    frames
+      .iter()
+      .all(|frame| frame.data().as_ref()[..2] != [0xFF, 0xF1][..]),
+    "the premise: raw frames"
+  );
+  let restate = |config: &[u8]| {
+    let (rows, _) = first_track(&source, TrackKind::Audio, 0);
+    restated(
+      &rows[0],
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_AAC,
+      config,
+      None,
+      None,
+    )
+  };
+  let write = |name: &str, container: ContainerName, config: &[u8], frames: &[Audio]| {
+    let target = output(&corpus, name);
+    let mut muxer = muxer_into(&target, container, vec![restate(config)]);
+    for frame in frames {
+      muxer
+        .write_audio(AudioTrackPacket::new(TrackIndex::new(0), frame.clone()))
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    target
+  };
+  for (name, config, pce) in [("lc", lc.clone(), 0), ("pce", aac_pce_config(), 7)] {
+    let ts = write(
+      &format!("l179-{name}.ts"),
+      ContainerName::new("mpegts"),
+      &config,
+      &frames,
+    );
+    let adts = write(
+      &format!("l179-{name}.aac"),
+      ContainerName::new("adts"),
+      &config,
+      &frames,
+    );
+    let written = std::fs::read(&adts).expect("the ADTS file");
+    let expected: usize = frames
+      .iter()
+      .map(|frame| 7 + frame.data().as_ref().len())
+      .sum::<usize>()
+      + pce;
+    assert_eq!(
+      written.len(),
+      expected,
+      "{name}: the premise, FFmpeg's frames"
+    );
+    assert_eq!(
+      ts_audio_stream(&ts),
+      written,
+      "{name}: MPEG-TS's frames, FFmpeg's ADTS writer's byte for byte"
+    );
+  }
+  // Configurations ADTS cannot carry, refused at open.
+  let lc_with = |fields: &[(u32, u32)]| bits_of(fields);
+  for (name, config) in [
+    (
+      "an object type past 4",
+      lc_with(&[(23, 5), (4, 4), (2, 4), (0, 3)]),
+    ),
+    (
+      "the escape sampling index",
+      lc_with(&[(2, 5), (15, 4), (44_100, 24), (2, 4), (0, 3)]),
+    ),
+    (
+      "a frame of 960 samples",
+      lc_with(&[(2, 5), (4, 4), (2, 4), (4, 3)]),
+    ),
+    (
+      "the core coder",
+      lc_with(&[(2, 5), (4, 4), (2, 4), (2, 3), (0, 14)]),
+    ),
+    (
+      "the extension flag",
+      lc_with(&[(2, 5), (4, 4), (2, 4), (1, 3)]),
+    ),
+  ] {
+    let target = output(&corpus, "l179-refused.ts");
+    let opened = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new("mpegts"),
+      vec![restate(&config)],
+      &[],
+      PacketLimits::default(),
+    );
+    match opened {
+      Err(MuxOpenError::ConfigurationInvalid { track, codec }) => {
+        assert_eq!(track, TrackIndex::new(0), "{name}");
+        assert_eq!(codec, CodecId::AAC, "{name}");
+      }
+      other => panic!(
+        "{name}: expected ConfigurationInvalid, got {:?}",
+        other.map(|_| ())
+      ),
+    }
+    assert_eq!(
+      std::fs::metadata(&target).expect("the sink").len(),
+      0,
+      "{name}: nothing written"
+    );
+  }
+  // A frame past 8191 bytes, the first carrying the element: refused.
+  for (name, config, pce) in [("lc", lc, 0_usize), ("pce", aac_pce_config(), 7)] {
+    let target = output(&corpus, &format!("l179-{name}-long.ts"));
+    let mut muxer = muxer_into(
+      &target,
+      ContainerName::new("mpegts"),
+      vec![restate(&config)],
+    );
+    let long = |len: usize| {
+      AudioTrackPacket::new(
+        TrackIndex::new(0),
+        audio_holding(&frames[0], &vec![0x21; len]),
+      )
+    };
+    let past = long(8192 - 7 - pce);
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(past.clone())));
+    assert_eq!(refusal, payload(PayloadRule::AdtsFrameLength), "{name}");
+    untouched!(past, back);
+    muxer
+      .write_audio(long(8191 - 7 - pce))
+      .map_err(|error| error.map_packet(drop))
+      .unwrap_or_else(|error| panic!("{name}: at 8191: {error:?}"));
+    muxer
+      .finish()
+      .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    let stream = ts_audio_stream(&target);
+    assert_eq!(stream.len(), 8191, "{name}: one frame of 8191 bytes");
+    assert_eq!(
+      (usize::from(stream[3] & 3) << 11)
+        | (usize::from(stream[4]) << 3)
+        | usize::from(stream[5] >> 5),
+      8191,
+      "{name}: its length as its header counts it"
+    );
+  }
+}
+
+/// The variable whose presence makes [`l180_in_a_process_of_its_own`]
+/// run.
+const L180_CHILD: &str = "MEDIAENCODE_L180_CHILD";
+
+/// **L180 — A16's road is closed: MPEG-TS takes this muxer's frame as it
+/// is** (R20, r3, ruled): MPEG-TS's nested ADTS muxer writes each raw AAC
+/// frame into a dynamic buffer it closes unchecked (`mpegtsenc.c`
+/// 1985–2003): a frame of 1024 bytes, flushed after the packet into an
+/// allocation of 1024 (`flush_if_needed`, `mux.c` 426–434;
+/// `avio_write_marker`, `aviobuf.c` 464–470), whose close's 64 bytes of
+/// padding grow it to 1537 — and where that
+/// growth fails, the close answers a null buffer and `-64` bytes, which
+/// MPEG-TS copies into its payload, a memory fault (2232; `aviobuf.c`
+/// 1281–1311, 1410–1436). With libavutil's allocations held at 1536 bytes
+/// — below that growth, above the frame and its padding — a raw frame of
+/// 1017 bytes is written whole, framed here, the nested muxer never fed:
+/// in a process of its own, which ends well.
+///
+/// PLANT: the frame handed raw, MPEG-TS's nested muxer feeding it — the
+/// process ends by the null copy, `SIGSEGV`.
+#[test]
+fn l180_a16s_road_is_closed_mpeg_ts_takes_the_frame_as_it_is() {
+  if std::env::var_os(L180_CHILD).is_some() {
+    return;
+  }
+  let status = std::process::Command::new(std::env::current_exe().expect("the lane"))
+    .args([
+      "--exact",
+      "l180_in_a_process_of_its_own",
+      "--test-threads=1",
+      "--nocapture",
+    ])
+    .env(L180_CHILD, "1")
+    .status()
+    .expect("the process of its own");
+  assert!(
+    status.success(),
+    "the frame written whole under the cap: {status}"
+  );
+}
+
+/// L180's body, in a process of its own (its caller sets [`L180_CHILD`]);
+/// elsewhere nothing.
+#[test]
+fn l180_in_a_process_of_its_own() {
+  if std::env::var_os(L180_CHILD).is_none() {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mkv");
+  let (table, packets) = first_track(&source, TrackKind::Audio, 1);
+  let target = output(&corpus, "l180.ts");
+  let mut muxer = muxer_into(&target, ContainerName::new("mpegts"), table);
+  let frame = audio_holding(&audio_of(&packets[0]), &[0x21; 1017]);
+  // SAFETY: a store of the process's cap, which libavutil reads
+  // atomically at every allocation; this process runs this law alone.
+  unsafe { ffmpeg_next::ffi::av_max_alloc(1536) };
+  let written = muxer
+    .write_audio(AudioTrackPacket::new(TrackIndex::new(0), frame))
+    .map_err(|error| error.map_packet(drop));
+  // SAFETY: as above: the cap back at libavutil's own, `INT_MAX`.
+  unsafe { ffmpeg_next::ffi::av_max_alloc(i32::MAX as usize) };
+  written.expect("the frame written whole under the cap");
+  muxer.finish().expect("finished");
+  let stream = ts_audio_stream(&target);
+  assert_eq!(
+    stream.len(),
+    7 + 1017,
+    "the frame, its header and its payload"
+  );
+  assert_eq!(
+    &stream[7..],
+    &[0x21; 1017][..],
+    "the payload after the header"
+  );
+}

@@ -443,6 +443,33 @@ pub fn try_packet_copy(data: &[u8]) -> std::result::Result<Packet, ffmpeg_next::
   }
 }
 
+/// [`try_packet_copy`] of `header` and then `data`, into the one packet
+/// `av_new_packet` allocates, its padding zeroed: a header the caller made
+/// before a payload, copied once each, nothing allocated but the packet.
+fn try_packet_copy_framed(
+  header: &[u8],
+  data: &[u8],
+) -> std::result::Result<Packet, ffmpeg_next::Error> {
+  let len = header.len().saturating_add(data.len());
+  if len > c_int::MAX as usize {
+    return Err(ffmpeg_next::Error::Other {
+      errno: libc::EINVAL,
+    });
+  }
+  let mut pkt = Packet::new(len);
+  match pkt.data_mut() {
+    Some(slot) if slot.len() == len => {
+      let (front, back) = slot.split_at_mut(header.len());
+      front.copy_from_slice(header);
+      back.copy_from_slice(data);
+      Ok(pkt)
+    }
+    _ => Err(ffmpeg_next::Error::Other {
+      errno: libc::ENOMEM,
+    }),
+  }
+}
+
 /// Writes every flag the portable packet carries onto the `AVPacket`
 /// being rebuilt.
 ///
@@ -1185,6 +1212,39 @@ pub(crate) unsafe fn build_audio_packet<C: crate::FfmpegCarrier + crate::Carrier
   // below writes the payload: side data, timestamps, flags and the
   // stream index all live outside it.
   let mut out = unsafe { C::packet_body(packet.data(), route) }?;
+  attach_side_data(&mut out, packet.extra().side_data())?;
+  if let Some(ts) = packet.pts() {
+    out.set_pts(Some(ts.pts()));
+  }
+  if let Some(ts) = packet.dts() {
+    out.set_dts(Some(ts.pts()));
+  }
+  if let Some(d) = packet.duration() {
+    out.set_duration(d.pts());
+  }
+  write_md_flags(&mut out, packet.flags());
+  out.set_stream(packet.extra().stream_index() as usize);
+  Ok(out)
+}
+
+/// [`build_audio_packet`] of `header` put before the packet's payload —
+/// MPEG-TS's raw AAC, which `mediaencode-ffmpeg`'s muxer frames in ADTS
+/// itself: the two copied into the one packet built, its padding zeroed;
+/// the packet's side data, times, flags and stream as the copy road's. The
+/// packet is judged as built: of the header's bytes and the payload's.
+pub(crate) fn build_audio_packet_framed(
+  packet: &mediaspine::packet::AudioPacket<AudioPacketExtra, impl AsRef<[u8]>>,
+  header: &[u8],
+  limits: PacketLimits,
+) -> std::result::Result<Packet, PacketBuildError> {
+  let body = packet.data().as_ref();
+  check_packet_build(
+    packet.flags(),
+    header.len().saturating_add(body.len()),
+    packet.extra().side_data(),
+    limits,
+  )?;
+  let mut out = try_packet_copy_framed(header, body)?;
   attach_side_data(&mut out, packet.extra().side_data())?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));

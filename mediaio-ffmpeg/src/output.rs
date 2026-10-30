@@ -131,7 +131,7 @@
 //! | `add_chapter` | `nb_chapters`; `av_mallocz`; the chapter's fields; `av_dict_set`; `av_dynarray_add_nofree`; `nb_chapters` written | the count as the `int` the call takes, `c_int::MAX` refused; the chapter ours alone until the array takes it |
 //! | `free_chapter` | `av_dict_free`, `av_free` | a chapter this module allocated and no array took |
 //! | `write_header`, `write_trailer` | `avformat_write_header`, `av_write_trailer` | the phase allows exactly one of each, in order |
-//! | `write_packet` | the boundary's builders, on the copy road; the packet's `stream_index`; `av_interleaved_write_frame` | every builder copies, so nothing a caller holds is lent; a stream of this context; the reference taken over, the packet left blank |
+//! | `write_packet` | the boundary's builders, on the copy road — an audio packet framed (`OutputPacket::AudioFramed`), its header and its payload copied into one `av_new_packet` allocation; the packet's `stream_index`; `av_interleaved_write_frame` | every builder copies, so nothing a caller holds is lent; a stream of this context; the reference taken over, the packet left blank |
 //! | `into_sink` | the fields moved out of `ManuallyDrop`; `avformat_free_context`; `avio_flush`; `AVIOContext.error` | each field moved once; the context freed before the I/O context; `pb` live until `into_inner` |
 //! | `Drop` | `avformat_free_context`; `ManuallyDrop::drop` of the I/O context | each exactly once, the context first |
 //! | `unsafe impl Send` | — | the context and the I/O context are heap allocations reached only through `&mut self`; the sink is `W: Send` |
@@ -224,8 +224,8 @@ use smol_bytes::Utf8Bytes;
 use crate::{
   CodecId,
   boundary::{
-    PacketBuildError, build_attachment_packet, build_audio_packet, build_data_packet,
-    build_subtitle_packet, build_video_packet,
+    PacketBuildError, build_attachment_packet, build_audio_packet, build_audio_packet_framed,
+    build_data_packet, build_subtitle_packet, build_video_packet,
   },
   carrier::BodyRoute,
   error::ParametersError,
@@ -535,6 +535,16 @@ pub enum OutputPacket<'a, C: crate::FfmpegCarrier> {
   Video(&'a VideoPacket<VideoPacketExtra, C::Buffer>),
   /// An audio packet.
   Audio(&'a AudioPacket<AudioPacketExtra, C::Buffer>),
+  /// An audio packet behind a header its caller made: `header`, then the
+  /// packet's payload, copied into the one packet built — MPEG-TS's raw
+  /// AAC, which `mediaencode-ffmpeg`'s muxer frames in ADTS itself, so
+  /// that MPEG-TS takes it as it is.
+  AudioFramed {
+    /// The packet: its payload, side data, times, flags and stream.
+    packet: &'a AudioPacket<AudioPacketExtra, C::Buffer>,
+    /// The bytes put before its payload.
+    header: &'a [u8],
+  },
   /// A subtitle packet.
   Subtitle(&'a SubtitlePacket<SubtitlePacketExtra, C::Buffer>),
   /// A timed-data packet.
@@ -1270,6 +1280,9 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
       match packet {
         OutputPacket::Video(p) => build_video_packet::<C>(p, limits, BodyRoute::Copy),
         OutputPacket::Audio(p) => build_audio_packet::<C>(p, limits, BodyRoute::Copy),
+        OutputPacket::AudioFramed { packet, header } => {
+          build_audio_packet_framed(packet, header, limits)
+        }
         OutputPacket::Subtitle(p) => build_subtitle_packet::<C>(p, limits, BodyRoute::Copy),
         OutputPacket::Data(p) => build_data_packet::<C>(p, limits, BodyRoute::Copy),
         OutputPacket::Cover(p) => build_attachment_packet::<C>(p, limits, BodyRoute::Copy),
