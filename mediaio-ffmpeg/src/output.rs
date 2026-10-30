@@ -23,6 +23,22 @@
 //! run freed — so the order is kept here, at run time, and a call out of
 //! it is refused by name ([`OutputError::OutOfOrder`]).
 //!
+//! A step that failed is not continued from: a failed header, a stream
+//! half added, and a write libavformat answered with a failure — a
+//! packet's, and the interleaving queue's flush with it — leave the
+//! context [`OutputPhase::Failed`], and every call after, a write or the
+//! trailer, is refused by name before libavformat is reached
+//! ([`OutputError::FailedEarlier`]): a muxer whose write failed may hold
+//! state that is unsafe to go on from — NUT's key frame index, a failed
+//! growth of which frees one stream's array and leaves the next ones
+//! short, is written past them by the next key frame and read through the
+//! freed one by the trailer (`nutenc.c` 1055–1066, 1171–1172, 636–655 in
+//! FFmpeg 9.0.1). The failure is answered once, at the call that met it;
+//! what the context holds is freed at [`Output::into_sink`] or `Drop`, by
+//! `avformat_free_context`, which runs the muxer's `deinit` and frees the
+//! interleaving queue and the streams (`avformat.c` 148–200) — the road
+//! libavformat's own failures take.
+//!
 //! # The sink
 //!
 //! libavformat drives the sink from `extern "C"` callbacks, so every call
@@ -86,7 +102,7 @@
 //! | a refusal in `open` | before `avformat_alloc_output_context2`, nothing is allocated; after a failed one, the `StreamIo` drops (it flushes nothing, then the sink's flush through the guard, then frees) and the sink with it | `ctx` is null on failure and owns nothing of this crate's |
 //! | the file finished: `write_trailer`, then `into_sink` | the context freed; `avio_flush`; `AVIOContext.error` read; `into_inner` frees the buffer and the I/O context and hands back the guard; the sink's flush; then the latch, the seek record, the write error and the flush error are named, in that order, or the sink is handed back | each field is moved out of the `ManuallyDrop<Self>` once (`ptr::read`) and never used through it again; `pb` is read after the context that pointed at it is gone, and before `into_inner` frees it |
 //! | `into_sink` before the trailer — from `Building`, `Writing` or `Failed` | exactly the file-finished road: the context freed (from `Writing`, the muxer's `deinit` and the queued packets with it, as in `Drop`), then the I/O context flushed, read and freed, and the sink handed back holding what was written — a container without its trailer, which no phase check refuses: the call is the caller's way to take the sink back from any phase | as above; nothing in the road depends on the phase |
-//! | an error from any call | the call answers it, and the context stays as the phase says; a call out of order is refused before libavformat is reached (a second trailer would run a muxer's trailer over state its first freed) | the phase |
+//! | an error from any call | the call answers it, and the context stays as the phase says — a failed header, stream or write leaves it `Failed`; a call out of order, or after a failure, is refused before libavformat is reached (a second trailer would run a muxer's trailer over state its first freed; a write after a failed one, over state the failure left) | the phase |
 //! | a panic in the sink, in any callback | caught by the guard under `catch_unwind`, latched, answered to C as an I/O error; every later call into the sink answers an error without reaching it; the context names the panic first | the panic never reaches the `extern "C"` frame; nothing is freed while a callback runs |
 //! | an error whose payload panics when dropped | reduced inside the guard's `catch_unwind` to its OS code or kind, the payload dropped there and its panic latched | what reaches C owns nothing |
 //! | a failed seek | kept by the guard; every later write and seek refused; named by every call that reached libavformat, whatever libavformat answered | — |
@@ -140,7 +156,7 @@
 //! answer (`Ffmpeg`), or a refusal this crate makes of the caller's input
 //! before libavformat is reached (`UnknownContainer`, `NoByteStream`,
 //! `Nul`, `ExtradataTooLarge`, `TooManyChapters`, `NoSuchStream`,
-//! `OutOfOrder`, `TimeBase`, `Build`, `Parameters`). A call that reached
+//! `OutOfOrder`, `FailedEarlier`, `TimeBase`, `Build`, `Parameters`). A call that reached
 //! the sink names the sink's fault before libavformat's answer: a panic
 //! first, then a failed seek, then a failed write, whatever libavformat
 //! answered.
@@ -162,7 +178,7 @@
 //! | `avcodec_parameters_free`, in the rebuilt `Parameters`' `Drop` | `add_stream` | none | — |
 //! | the copy road: `av_new_packet`, `av_packet_new_side_data` | `write_packet` | an allocation; a limit; side data libavcodec cannot name | `Build`, before libavformat is reached |
 //! | `avformat_write_header` | `write_header` | a negative code; the sink's panic, failed seek or failed write — the last read from the I/O context, as the header's own flush follows its check of it (`mux.c` 482–486) | the sink's fault, else `Ffmpeg`; the context `Failed` |
-//! | `av_interleaved_write_frame` | `write_packet` | a negative code; the sink's panic, failed seek or failed write (`mux.c` 751–752 answers the last as its own) | the sink's fault, else `Ffmpeg` |
+//! | `av_interleaved_write_frame` | `write_packet` | a negative code; the sink's panic, failed seek or failed write (`mux.c` 751–752 answers the last as its own) | the sink's fault, else `Ffmpeg`; the context `Failed` |
 //! | `av_packet_unref`, in the blank `Packet`'s `Drop` | `write_packet` | none: a no-op on the packet `av_interleaved_write_frame` left blank | — |
 //! | `av_write_trailer` | `write_trailer` | a negative code; the sink's panic, failed seek or failed write (`mux.c` 1270–1272 answers the last as its own) | the sink's fault, else `Ffmpeg`; the context `Finished` either way |
 //! | `avio_flush` and `AVIOContext.error` | `into_sink` | the first failed write, which the I/O context keeps | `SinkWrite`, after a panic and a failed seek |
@@ -242,7 +258,10 @@ pub enum OutputPhase {
   /// The trailer was written, or attempted: the muxer is done.
   Finished,
   /// A step libavformat cannot be asked to continue from failed: the
-  /// header, or the addition of a stream it half-built.
+  /// header, the addition of a stream it half-built, or a write it
+  /// answered with a failure — a packet's, the interleaving queue's flush
+  /// with it. No call but [`Output::into_sink`] reaches libavformat after
+  /// it ([`OutputError::FailedEarlier`]).
   Failed,
 }
 
@@ -329,6 +348,15 @@ pub enum OutputError {
     call: OutputCall,
     /// Where the context was.
     phase: OutputPhase,
+  },
+  /// A call after a step that failed — the header, a stream's addition, a
+  /// write — refused before libavformat is reached: the context is
+  /// [`OutputPhase::Failed`], its failure answered once, at its call, and
+  /// libavformat is not asked to go on from what it left.
+  #[error("{call:?} refused: an earlier call failed, which libavformat is not asked to go on from")]
+  FailedEarlier {
+    /// The call refused.
+    call: OutputCall,
   },
   /// A time base libavformat chose that this family cannot carry (a
   /// zero or negative part).
@@ -883,6 +911,8 @@ impl<W> Output<W> {
   fn require(&self, call: OutputCall, phase: OutputPhase) -> Result<(), OutputError> {
     if self.phase == phase {
       Ok(())
+    } else if self.phase == OutputPhase::Failed {
+      Err(OutputError::FailedEarlier { call })
     } else {
       Err(OutputError::OutOfOrder {
         call,
@@ -1216,6 +1246,13 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
   /// copied into an allocation libavformat alone then holds — and handed
   /// to `av_interleaved_write_frame`, which takes it and may keep it
   /// queued past the call. Nothing the caller holds is lent.
+  ///
+  /// A failure libavformat answers — the packet's write, or the
+  /// interleaving queue's flush with it, the sink's fault among them —
+  /// leaves the context [`OutputPhase::Failed`]: every later write, and
+  /// the trailer, is refused ([`OutputError::FailedEarlier`]). A packet the
+  /// builder refuses never reached libavformat, and leaves the phase as it
+  /// was.
   pub fn write_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
     &mut self,
     stream: usize,
@@ -1250,7 +1287,13 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     // blank, which then drops here.
     let status = unsafe { av_interleaved_write_frame(self.ctx.as_ptr(), av_packet.as_mut_ptr()) };
     drop(av_packet);
-    self.settled(status)
+    let settled = self.settled(status);
+    // A failed write is not continued from: the muxer's state may be one
+    // no later write or trailer is safe over (see [the module](self)).
+    if settled.is_err() {
+      self.phase = OutputPhase::Failed;
+    }
+    settled
   }
 
   /// Writes the trailer: the packets still queued for interleaving, then
@@ -1258,6 +1301,8 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
   ///
   /// Asked once: the context is [`OutputPhase::Finished`] after it,
   /// whatever it answers, since libavformat ends the muxer either way.
+  /// Refused after a failed step ([`OutputError::FailedEarlier`]): no
+  /// trailer runs over the state a failure left.
   pub fn write_trailer(&mut self) -> Result<(), OutputError> {
     self.require(OutputCall::WriteTrailer, OutputPhase::Writing)?;
     // SAFETY: `ctx` is live and its header was written; this is the one

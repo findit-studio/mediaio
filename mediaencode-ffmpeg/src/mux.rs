@@ -702,14 +702,14 @@
 //! | A25 | MP4's joined TTML (`movenc_ttml.c` 289–317) | its buffer closed unchecked: a packet of a null payload and `-64` bytes written as the sample; its writes' failures, `avio_printf`'s, the buffer's error unread — the document cut | misreport: `avio_write` of `-64` bytes writes none (`movenc.c` 7231), the sample counted of them | bounded: the document ([`PayloadRule::DocumentSize`]) | letter 1 |
 //! | A26 | FLV's Annex B packets (`flvenc.c` 1318–1327; `nal.c` 133–144) | the rewrite's buffer closed unchecked, `-64` bytes and a null buffer answered: a tag of a 24-bit size of `-59` (1348–1355, 1454) | misreport: the packet's own bytes handed for the null buffer and `-64` written as none (1452) | out of reach: a tag under 2^24 bytes ([`PayloadRule::TagSize`]) | letter 1 |
 //! | A27 | MP4's HEVC of the `hvc1` tag and an Annex B configuration (`ff_hevc_annexb2mp4`, `hevc.c` 1203–1250) | each packet parsed into a dynamic buffer first, closed unchecked: the frame written as a sample of no bytes (`movenc.c` 7126) | misreport: a sample of no bytes; the walk sums a null pointer and `-64` (`hevc.c` 1220–1221), as A4's, no access | bounded: the rewrite ([`PayloadRule::RewrittenSize`]) | letter 1 |
-//! | N1 | NUT's key frame index (`nut_write_packet`, `nutenc.c` 1051–1068; R20) | at each syncpoint whose count is a power of two, each stream's `keyframe_pts` grown to twice the count; a failure frees and nulls that stream's (1058), leaves the streams after it at the count, and is returned (1059–1062) — but the muxer goes on after it: a write's failure leaves the output writing | memory fault, on the next call: a later key packet writes one entry past an array the loop left short (1171–1172), and the trailer's index reads the null one (636–655) | reachable at 2^27 syncpoints, 2^28 entries of 8 bytes past `INT_MAX`, the refusal reported as `ENOMEM`; the syncpoints rest on byte positions and libavformat's interleaving, which this release does not mirror: no exact bound | R20's letter |
+//! | N1 | NUT's key frame index (`nut_write_packet`, `nutenc.c` 1051–1068; R20) | at each syncpoint whose count is a power of two, each stream's `keyframe_pts` grown to twice the count; a failure frees and nulls that stream's (1058), leaves the streams after it at the count, and is returned (1059–1062) — but the muxer goes on after it: a write's failure leaves the output writing | memory fault, on the next call: a later key packet writes one entry past an array the loop left short (1171–1172), and the trailer's index reads the null one (636–655) | reachable at 2^27 syncpoints, 2^28 entries of 8 bytes past `INT_MAX`, the refusal FFmpeg's own answer, `ENOMEM` — reported once, the output failed after it (r1); the syncpoints rest on byte positions and libavformat's interleaving, which this release does not mirror: no bound of its own | closed by r1 (R20, ruled): the write that met the failure answers it, and no later write or trailer reaches what it left ([`FfmpegMuxRefusal::OutputFailed`]) — L173 |
 //! | S1 | Ogg's comment header (`ogg_write_vorbiscomment`, `oggenc.c` 291–319; `ff_vorbiscomment_length`, `vorbiscomment.c` 44–60) | measured in a null buffer of `INT_MAX`, its packet past `INT_MAX` refused — each reported as a failed allocation; FLAC's comments' 24 bits (352) | misreport | bounded exactly | bounded exactly at open ([`MuxOpenError::CommentHeaderTooLarge`], [`ogg_comment_bytes`]) — L166, `an_ogg_comment_header_holds_int_max` |
 //! | S2 | AVIF's `moov` (`get_moov_size`, `movenc.c` 8905–8916; 9179–9181) | measured in a null buffer of `INT_MAX`, its refusal taken as the size | misreport | bounded | judged at every packet and at open, bounded at `INT_MAX` ([`avif_movie_bound`]) — L167, `avifs_movie_box_holds_int_max` |
 //! | S3 | VP9's `vpcC`, MP4's and FLV's (`get_vp9_level`, `vpcc.c` 77–122) | a level of the width times the height in an `int`, where the ticket's is unknown | misreport | bounded | refused at open ([`MuxOpenError::Dimensions`]; [`vp9_picture_overflows`]) — L168 |
 //! | S4 | NUT's info packets (`write_streaminfo`, `write_chapter`, `nutenc.c` 545–613; R20, by the class) | a stream's tags — its language, the one of a length the table sets, its dispositions and a video stream's frame rate — or a chapter's, its title, made in a dynamic buffer closed with its 64 bytes of padding unchecked: past `INT_MAX` less them, the packet written with its count and fewer bytes, success answered | misreport | counted exactly ([`nut_stream_info_bytes`], [`nut_chapter_info_bytes`], [`NUT_INFO_BYTES_MAX`]) | refused at open ([`MuxOpenError::LanguageTooLong`], [`MuxOpenError::ChapterTitleTooLong`]) — L170, `a_nut_info_packet_holds_int_max_less_its_padding` |
 //! | S5 | AVI's counts (`avienc.c` 86, 877, 744–766, 924, 203–235, 941–953; R20, by the class, the census's line 86 corrected) | a stream's frames — its packets and the empty frames written into its gaps, the trailer's to the last packet's end among them — an `int` no index bounds, its overflow undefined; the OpenDML header's sum of them, video's most and MP2's and MP3's added, an `int`; a block-aligned audio stream's blocks, 32 bits, written cut | misreport | counted exactly, the trailer's gap as though each packet were the last | refused at the packet that would pass ([`PayloadRule::FrameCount`]) — L171, `avis_counts_and_flvs_sequence_header_hold_their_bits` |
 //! | S6 | FLV's sequence header (`flv_write_codec_header`, `flvenc.c` 807–914; R20, by the class) | the header's bytes and the record its codec's writer makes, their size written in the tag's 24 bits, cut past them: within the ticket's default budget a configuration of 16 MiB passes them — an `hvcC` of large SEI arrays, an `av1C` of metadata OBUs, which the standards allow | misreport | counted exactly ([`flv_sequence_bytes`]), VVC's `vvcC` of Annex B units at its profile, tier and level's most ([`records::vvcc_written_bound`]) | refused at open ([`MuxOpenError::ConfigurationInvalid`]) — L172 |
-//! | — | every failure FFmpeg returns through a callback: an open's, a header's, a packet's, a trailer's | — | — | — | reported, the muxer's fault ([`MuxFault`]) — L164 (the open), L169 (a cluster's growth, at the trailer) |
+//! | — | every failure FFmpeg returns through a callback: an open's, a header's, a packet's, a trailer's | — | — | — | reported, the muxer's fault ([`MuxFault`]), once: the output then failed, no later write or trailer reaching what the failure left (r1; [`FfmpegMuxRefusal::OutputFailed`]) — L164 (the open), L169 (a cluster's growth, at the trailer), L173 (a packet's) |
 //!
 //! **Letter 1 (R19, asked).** A2–A27 are FFmpeg's — a failure it never
 //! returns, or returns to a caller that drops it — and a refusal at open,
@@ -724,11 +724,37 @@
 //! memory faults not. The letter asks which: each refused as A1, the
 //! detection built, or FFmpeg patched upstream, the census its evidence.
 //!
-//! **R20's letter (asked, beside letter 1).** Two findings no exact bound
-//! holds. N1, NUT's key frame index: a memory fault on the call after a
-//! failure its writer returns — avoided by NUT's `write_index` off, the
-//! index lost, or by a write's failure ending the muxer, no packet and no
-//! trailer after it. And the budgets: the census reads a configuration as
+//! **R20's rulings** (the coordinator's, under the class rules ruled
+//! before). **r1, the write-failure poison:** a write that failed — the
+//! header's, a packet's, the interleaving queue's flush with it — leaves
+//! the output failed (`OutputPhase::Failed`): the failure is answered
+//! once, at that write, and no later write and no trailer reaches
+//! libavformat, each refused by name ([`FfmpegMuxRefusal::OutputFailed`];
+//! the base's `OutputError::FailedEarlier`) — closing N1, and with it
+//! every failure a writer returns whose state a later call could not go
+//! on from: of the census's rows, N1 alone needs a write after a returned
+//! failure; the A rows' faults are each a failure swallowed, which the
+//! next write and the trailer reach unreturned (L173). What a failed
+//! write leaves is freed at the drop:
+//!
+//! | muxer | what frees what it holds, past the stream's own parameters, at `avformat_free_context` (`avformat.c` 148–200: the `deinit` where its start ran, 158–159; then every stream — its parameters, its private data, its automatic filter — the interleaving queue's packets, the chapters, the metadata) | what its trailer frees, which a failed write skips |
+//! |---|---|---|
+//! | the MOV family (`movenc.c`) | `mov_free` (7925–7982): every track's sample table, its written table and fragment index, its configurations, its cover, E-AC-3's held packet, its encryption, its fragment buffer, APV's record, TTML's queue; the movie's buffer | the hybrid fragmented file's tables alone (9058), a flag this muxer never sets |
+//! | Matroska, WebM (`matroskaenc.c`) | `mkv_deinit` (880–894): the cluster's and the masters' buffers, the block's unit list, the cues, the tracks | the cues' buffer the trailer itself makes (3326–3369) |
+//! | MPEG-TS (`mpegtsenc.c`) | `mpegts_deinit` (2284–2308): each stream's payload and AC-3 descriptor, its nested ADTS context, the services | nothing |
+//! | the MPEG program streams (`mpegenc.c`) | `mpeg_mux_deinit` (1289–1302): each stream's packet descriptions and FIFO | nothing |
+//! | FLV (`flvenc.c`) | `flv_deinit` (1505–1521): the key frame positions, the last times, the metadata flags, the track map | nothing |
+//! | AVI (`avienc.c`) | `avi_deinit` (981–992): each stream's index clusters | nothing |
+//! | ASF (`asfenc.c`) | `asf_deinit` (1101–1106): the index | nothing |
+//! | NUT (`nutenc.c`) | `nut_write_deinit` (1209–1222): the syncpoints, each stream's key frame index — a failed growth's null among them — the streams', chapters' and time bases' arrays | the index's buffer the trailer itself makes (1198–1203) |
+//! | Ogg (`oggenc.c`) | `ogg_free` (801–819): each stream's headers, the pages still listed | nothing |
+//! | MXF (`mxfenc.c`) | `mxf_deinit` (3548–3555): the index entries, the body partitions, the timecode track | nothing |
+//! | WAV, Wave64 (`wavenc.c`) | `wav_deinit` (148–155): the peak buffers | nothing |
+//! | FLAC (`flacenc.c`) | `flac_deinit` (350–357): the queued packets, each stream's | nothing |
+//! | MP3 (`mp3enc.c`) | `mp3_deinit` (638–644): the queued packets, the Xing frame | nothing |
+//! | IVF, ADTS, the raw muxers (`ivfenc.c`, `adtsenc.c`, `rawenc.c`) | none needed: they allocate nothing past the stream's own parameters — ADTS's new extradata is the stream's (`adtsenc.c` 188) | nothing |
+//!
+//! **R20's letter (asked, beside letter 1).** The budgets: the census reads a configuration as
 //! within the ticket's budget — 16 MiB by default, the caller's to raise
 //! (`CodecTicket::mirror_with`) — and a packet as within the muxer's
 //! [`PacketLimits`] — a gibibyte by default, the caller's to raise to
@@ -1022,6 +1048,7 @@
 //! | [`FfmpegMuxRefusal::BeforeFirstDts`] | FLV keeps the first packet it writes as its reference and refuses every later packet decoded before it after taking it — "Packets are not in the proper order with respect to DTS" (`flvenc.c` 1267–1274): a packet of a stream the interleaving's 10 s delay wrote ahead of (`mux.c` 939–1003) — L70; PLANT: unmirrored, L70's audio at 2 s taken, FLV refusing it after taking it (`Invalid argument`) | refuses after taking |
 //! | [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Cropping`] | MP4's trailer refuses the box (`movenc.c` 1299–1340, 857–910, 3024–3036; `movenc_ttml.c` 236–317) | refuses after taking: the file |
 //! | [`MuxOpenError::SampleSize`], [`MuxOpenError::Cover`] | `pcm_rechunk`'s start fails the header (`pcm_rechunk.c` 49–58); the cover's builder fails after the header (`packet.c` 83–95) | refuses: the file |
+//! | [`FfmpegMuxRefusal::OutputFailed`] (R20, r1) | a write that failed may leave a muxer's state unsafe to go on from — NUT's key frame index written past an array a failed growth left short, read through a freed one at the trailer (`nutenc.c` 1055–1066, 1171–1172, 636–655) | a memory fault |
 //! | [`MuxOpenError::CoversTooLarge`] | the movie's `udta`, every cover in it, passes the dynamic buffer movenc makes it in, the `covr` written cut (`movenc.c` 5066–5122, 4815–4839; `aviobuf.c` 1281–1311; R14b) | corrupts: the file's metadata |
 //! | [`PayloadRule::FrameCount`]; NUT's [`MuxOpenError::LanguageTooLong`] and [`MuxOpenError::ChapterTitleTooLong`]; FLV's sequence header's [`MuxOpenError::ConfigurationInvalid`] (R20, by the class) | AVI counts a stream's frames and their OpenDML sum in an `int`, a signed overflow, and writes a block-aligned audio stream's blocks cut into 32 bits (`avienc.c` 877, 203–235, 941–953); NUT writes an info packet past its dynamic buffer with its count of tags and fewer bytes (`nutenc.c` 545–613); FLV writes its sequence header's size cut into 24 bits (807–914) | corrupts, success answered |
 //! | [`MuxOpenError::MediaTypeMismatch`] | a stream of one media type whose packets this muxer would judge as another's | corrupts |
@@ -1178,8 +1205,8 @@ use mediaio_ffmpeg::{
   extras::{SideDataEntry, packet_side_data_name},
   hdr_metadata::{LinkedSizes, check_hdr10_plus_sized, check_smpte2094_app5_sized},
   output::{
-    CodecQuery, Output, OutputError, OutputPacket, OutputText, PacketTimes, StreamCodec,
-    StreamMedia, StreamSpec,
+    CodecQuery, Output, OutputError, OutputPacket, OutputPhase, OutputText, PacketTimes,
+    StreamCodec, StreamMedia, StreamSpec,
   },
 };
 use smol_bytes::Utf8Bytes;
@@ -3929,6 +3956,26 @@ pub enum FfmpegMuxRefusal {
   /// unjudged ([`MuxFault::refusal`]).
   #[error("the movie box the trailer would write passes its 32-bit size")]
   MovieBox,
+  /// A write, or `finish`, after a write that failed (R20, ruled: the
+  /// write-failure poison). A failure libavformat answers at a write — a
+  /// packet's, or the interleaving queue's flush with it, the sink's fault
+  /// among them — leaves the output failed, as a failed header does: a
+  /// muxer's state after it may be unsafe to go on from — NUT's key frame
+  /// index, whose failed growth frees one stream's array and leaves the
+  /// next ones short, written past by the next key frame and read through
+  /// the freed one by the trailer (`nutenc.c` 1055–1066, 1171–1172,
+  /// 636–655) — so no later write reaches libavformat and no trailer runs:
+  /// the failure is answered once, at its write ([`MuxError::Fault`]), and
+  /// each write after it is refused by name, its packet handed back
+  /// untouched, nothing allocated; `finish` likewise, its trailer never
+  /// asked for ([`MuxFault::refusal`]). The muxer frees what libavformat
+  /// holds when it is dropped, by `avformat_free_context` and the muxer's
+  /// `deinit` (`avformat.c` 148–200) — every admitted muxer's: its
+  /// `deinit` frees what its start and its packets allocated, and its
+  /// trailer frees only what it made itself (the census, see [the
+  /// module](self)).
+  #[error("the output failed at an earlier write, which libavformat is not asked to go on from")]
+  OutputFailed,
   /// MP4 E-AC-3: the track's last sample, joined from frames of fewer than
   /// six blocks, lasting more than `i32::MAX` ticks of the stream's time
   /// base. MP4 joins such frames into one sample whose duration is the sum
@@ -10917,6 +10964,14 @@ where
   /// packets MXF's interleaving drops past the last edit unit every track
   /// fills ([`Uncarried::Trailing`]).
   pub fn finish_into_sink(mut self) -> Result<(W, MuxReport), MuxFault> {
+    // A write failed (R20, ruled): no trailer runs over what the failure
+    // left; dropping the muxer frees the context, its `deinit` with it.
+    if self.output.phase() == OutputPhase::Failed {
+      return Err(MuxFault::refused(
+        MuxStage::Trailer,
+        FfmpegMuxRefusal::OutputFailed,
+      ));
+    }
     // A trailer the container would fail for want of a frame no packet was
     // left to decide, or would end the process over the last sample's
     // duration, which only the stream's end decides: refused by name before
@@ -11093,6 +11148,10 @@ where
     (pts, dts, duration): (Option<Timestamp>, Option<Timestamp>, Option<Timestamp>),
     payload: Payload<'p>,
   ) -> Result<Decided<'p>, Refusal> {
+    // A write after a failed one, refused before anything (R20, ruled).
+    if self.output.phase() == OutputPhase::Failed {
+      return Err(Refusal::Container(FfmpegMuxRefusal::OutputFailed));
+    }
     let state = self
       .tracks
       .get(track.get())

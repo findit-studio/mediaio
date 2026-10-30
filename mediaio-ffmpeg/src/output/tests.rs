@@ -638,10 +638,16 @@ fn enospc() -> ffmpeg_next::Error {
 /// Each call reads the I/O context's error after the panic and the seek
 /// records, and names it [`OutputError::SinkWrite`]. The packet is MP4's,
 /// which writes each sample as it comes; Matroska holds its packets in a
-/// cluster, which reaches the sink at the trailer — the third case.
+/// cluster, which reaches the sink at the trailer — the third case. After
+/// the header's and the packet's, the context is failed (R20, ruled: the
+/// write-failure poison): a later packet and the trailer are refused by
+/// name, nothing reaching libavformat — the packet's though the sink would
+/// take it again.
 ///
 /// PLANT: without that read in `sink_fault`, the header answers `Ok` and
-/// the packet and the trailer `Ffmpeg(ENOSPC)`.
+/// the packet and the trailer `Ffmpeg(ENOSPC)`. Without the poison, the
+/// later packet and the trailer reach libavformat, which answers the I/O
+/// context's kept failure.
 #[test]
 fn a_failed_write_is_named_the_sinks_at_the_header_a_packet_and_the_trailer() {
   ffmpeg_next::init().expect("ffmpeg init");
@@ -674,6 +680,20 @@ fn a_failed_write_is_named_the_sinks_at_the_header_a_packet_and_the_trailer() {
   let (mut output, _) = open("matroska", true);
   named("the header", output.write_header());
   assert_eq!(output.phase(), OutputPhase::Failed);
+  assert!(
+    matches!(
+      output.write_packet::<crate::Owned>(
+        0,
+        OutputPacket::Subtitle(&cue(b"after", 0)),
+        times(0),
+        PacketLimits::default(),
+      ),
+      Err(OutputError::FailedEarlier {
+        call: OutputCall::WritePacket
+      })
+    ),
+    "a packet after a failed header refused by name"
+  );
   named("the sink handed back", output.into_sink().map(drop));
 
   // At a packet: the header was written; the cue's sample meets a full
@@ -689,6 +709,34 @@ fn a_failed_write_is_named_the_sinks_at_the_header_a_packet_and_the_trailer() {
       times(0),
       PacketLimits::default(),
     ),
+  );
+  // The failed write is not continued from (R20, ruled): the context is
+  // failed, a later packet and the trailer refused by name, the failure
+  // answered once.
+  assert_eq!(output.phase(), OutputPhase::Failed);
+  full.store(false, std::sync::atomic::Ordering::Relaxed);
+  assert!(
+    matches!(
+      output.write_packet::<crate::Owned>(
+        0,
+        OutputPacket::Subtitle(&cue(b"\x00\x05later", 1000)),
+        times(1000),
+        PacketLimits::default(),
+      ),
+      Err(OutputError::FailedEarlier {
+        call: OutputCall::WritePacket
+      })
+    ),
+    "a packet after the failed one refused by name"
+  );
+  assert!(
+    matches!(
+      output.write_trailer(),
+      Err(OutputError::FailedEarlier {
+        call: OutputCall::WriteTrailer
+      })
+    ),
+    "the trailer refused by name"
   );
   named("the sink handed back", output.into_sink().map(drop));
 

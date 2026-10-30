@@ -20864,3 +20864,128 @@ fn l172_flvs_sequence_header_is_held_to_its_24_bits() {
     );
   }
 }
+
+/// A buffer whose write fails once, as a full disk's would, once it is
+/// armed — 1, the next write fails and it is 2 — and that counts, at 2,
+/// every write that reaches it after: none must.
+#[derive(Debug, Default)]
+struct FailsOnce {
+  bytes: io::Cursor<Vec<u8>>,
+  state: Arc<AtomicU32>,
+  after: Arc<AtomicU32>,
+}
+
+impl Write for FailsOnce {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    match self.state.load(Ordering::Relaxed) {
+      1 => {
+        self.state.store(2, Ordering::Relaxed);
+        Err(io::Error::other("the disk is full"))
+      }
+      2 => {
+        self.after.fetch_add(1, Ordering::Relaxed);
+        self.bytes.write(buf)
+      }
+      _ => self.bytes.write(buf),
+    }
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    Ok(())
+  }
+}
+
+impl Seek for FailsOnce {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.bytes.seek(pos)
+  }
+}
+
+/// **L173 — a write that failed is not gone on from** (R20, ruled: the
+/// write-failure poison; N1 and its class): an AAC track into Matroska,
+/// MP4, NUT, AVI, MPEG-TS and FLV, its sink failing once after the
+/// header, packets written until one meets the failure: that write answers
+/// it, once, the muxer's fault; the next is refused by name, its packet
+/// handed back untouched and nothing allocated; `finish` is refused by
+/// name, no trailer asked for; and no write reaches the sink after the one
+/// that failed, though it would take it.
+///
+/// PLANT: the output not failed at a failed write — the next write and the
+/// trailer reach libavformat, which answers the I/O context's kept failure
+/// as a fault; the muxer's check dropped — the next write a fault, its
+/// packet not handed back; `finish`'s dropped — the trailer asked for.
+#[test]
+fn l173_a_write_that_failed_is_not_gone_on_from() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mkv");
+  let (_, frames) = whole_track(&source, TrackKind::Audio);
+  let frame = audio_of(&frames[0]);
+  for container in ["matroska", "mp4", "nut", "avi", "mpegts", "flv"] {
+    let sink = FailsOnce::default();
+    let (state, after) = (Arc::clone(&sink.state), Arc::clone(&sink.after));
+    let (mut muxer, _) = FfmpegOwnedMuxer::open(
+      sink,
+      ContainerName::new(container),
+      first_track(&source, TrackKind::Audio, 1).0,
+      &[],
+      PacketLimits::default(),
+    )
+    .unwrap_or_else(|error| panic!("{container}: {error:?}"));
+    state.store(1, Ordering::Relaxed);
+    let at = |index: i64| {
+      AudioTrackPacket::new(
+        TrackIndex::new(0),
+        frame
+          .clone()
+          .with_pts(Some(ms(24 * index)))
+          .with_dts(Some(ms(24 * index))),
+      )
+    };
+    let mut index = 0;
+    let fault = loop {
+      assert!(
+        index < 50_000,
+        "{container}: the premise, a write meets the failure"
+      );
+      match muxer.write_audio(at(index)) {
+        Ok(()) => index += 1,
+        Err(MuxError::Fault(fault)) => break fault,
+        Err(other) => panic!("{container}: expected the fault, got {other:?}"),
+      }
+    };
+    assert_eq!(
+      state.load(Ordering::Relaxed),
+      2,
+      "{container}: the sink's failure"
+    );
+    assert!(
+      matches!(fault.stage(), MuxStage::Write { .. }),
+      "{container}: a write's fault, at {:?}",
+      fault.stage()
+    );
+    assert_eq!(
+      fault.refusal(),
+      None,
+      "{container}: libavformat's answer, once"
+    );
+    let next = at(index + 1);
+    match refusing!(muxer.write_audio(next.clone())) {
+      Err(MuxError::Backend { refusal, packet }) => {
+        assert_eq!(refusal, FfmpegMuxRefusal::OutputFailed, "{container}");
+        untouched!(next, packet);
+      }
+      other => panic!("{container}: expected the refusal by name, got {other:?}"),
+    }
+    let finished = muxer.finish().expect_err("no trailer after a failed write");
+    assert_eq!(finished.stage(), MuxStage::Trailer, "{container}");
+    assert_eq!(
+      finished.refusal(),
+      Some(FfmpegMuxRefusal::OutputFailed),
+      "{container}: the trailer refused by name"
+    );
+    assert_eq!(
+      after.load(Ordering::Relaxed),
+      0,
+      "{container}: nothing written after the failure"
+    );
+  }
+}
