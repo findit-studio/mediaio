@@ -536,7 +536,7 @@
 //! | FLV's AV1 | the sequence headers `extract_extradata` makes, listed | judged where they lie |
 //! | FLV's H.264, HEVC and VVC | the units split off listed, each one's RBSP copied and its skipped bytes listed, the configuration made | the split walked in place, judged whole first; each RBSP a view; the configuration counted, never made |
 //! | the configuration writers | the units listed, each RBSP copied, HEVC's profile flags and VPS listed | iterators over the units, RBSP views, fixed arrays |
-//! | MP4's Annex B rewrite | the units listed | walked in place |
+//! | FLV's Annex B rewrite, its tag's size | the units listed | walked in place |
 //! | APV's frame informations | each access unit's listed, then the ones its `apvC` lacks | an iterator over the units, judged whole first; the new ones listed at the payment |
 //! | HDR10+'s tone mapping | its bits in a vector and its maps listed (`mediaio_ffmpeg::hdr_metadata::check_hdr10_plus`) | an array on the stack |
 //! | the sample descriptions | the configuration a description takes copied, the first sample's or the superframe of the frames held, and the hidden frame VP9's filter holds — before the ProRes atom's, the cue's, the side data's, the sizes', the sample table's, the `moov`'s and the `mfra`'s refusals | judged on borrowed bytes; each made at the payment |
