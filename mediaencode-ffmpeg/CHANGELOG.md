@@ -494,6 +494,12 @@ crate moves only when it changes.
   bytes its reader takes (`MuxOpenError::ChapterTitleTooLong`); Ogg's
   empty title in Opus tags and NUT's of 1024 bytes or more, each read
   back untitled, are reported (`Uncarried::ChapterTitle`, new).
+- **HDR side data judged against sizes resolved at open (R18).** The
+  linked libavutil's HDR10+ and APP5 struct sizes are asked at the open,
+  before anything else — their allocation's failure the open's allocation
+  fault — and a packet's HDR side data is judged against them, so that
+  the judgment of a packet calls into no library and allocates nothing,
+  and no allocation's failure is taken for a malformed entry.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer

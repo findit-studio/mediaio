@@ -19563,3 +19563,248 @@ fn l163_every_containers_chapter_title_reads_back_as_given() {
     assert_eq!(format!("{got:?}"), format!("{expected:?}"), "{name}");
   }
 }
+
+/// The variable that tells L164's body it runs in its own process.
+const L164_CHILD: &str = "MEDIAENCODE_FFMPEG_L164_CHILD";
+
+/// **L164 — a refusal calls on no libavutil allocation** (R18, Codex R17:
+/// the HDR checks' linked sizes resolved at open; the module's census of
+/// the judgment's calls into FFmpeg). libavutil offers no hook to count
+/// its allocations, but caps every one of the process's at `av_max_alloc`'s
+/// (`mem.c` 74–78, 102): in a process of its own — the cap is the
+/// process's, and the lane's laws run beside each other — the cap zero, so
+/// that libavutil refuses every allocation, each packet here is refused as
+/// it is without the cap. HDR10+ the writer takes whole, on a packet past
+/// Matroska's lowered block bound: refused by the cluster, not as
+/// malformed HDR, the linked size asked at open, not at the check; HDR10+
+/// it does not take: refused as malformed; PGS's cut segment, MP4's Annex
+/// B rewrite and TTML's document past the largest packet, and an AAC
+/// description past the `moov`'s bound: each as L159 refuses them. And,
+/// the cap zero at the open, the open is an allocation fault, nothing
+/// written.
+///
+/// PLANT: the HDR checks asking libavutil the size at the first check, as
+/// before, the first HDR10+ packet refused as malformed; a libavutil
+/// allocation put back before the build's rules, its failure a refusal,
+/// every case refused otherwise.
+#[test]
+fn l164_a_refusal_calls_on_no_libavutil_allocation() {
+  if std::env::var_os(L164_CHILD).is_some() {
+    return;
+  }
+  let status = std::process::Command::new(std::env::current_exe().expect("the lane"))
+    .args([
+      "--exact",
+      "l164_in_a_process_of_its_own",
+      "--test-threads=1",
+      "--nocapture",
+    ])
+    .env(L164_CHILD, "1")
+    .status()
+    .expect("the process of its own");
+  assert!(
+    status.success(),
+    "each refusal with libavutil refusing every allocation as without: {status}"
+  );
+}
+
+/// L164's body, in a process of its own (its caller sets [`L164_CHILD`]);
+/// elsewhere nothing.
+#[test]
+fn l164_in_a_process_of_its_own() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  use mediaio_ffmpeg::hdr_metadata::hdr10_plus_from_t35;
+  if std::env::var_os(L164_CHILD).is_none() {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  /// Refuses every libavutil allocation while it lives.
+  struct Starved;
+  impl Starved {
+    fn new() -> Self {
+      // SAFETY: a store of the process's cap, which libavutil reads
+      // atomically at every allocation; this process runs this law alone.
+      unsafe { ffmpeg_next::ffi::av_max_alloc(0) };
+      Self
+    }
+  }
+  impl Drop for Starved {
+    fn drop(&mut self) {
+      // SAFETY: as `new`: the cap back at libavutil's own, `INT_MAX`.
+      unsafe { ffmpeg_next::ffi::av_max_alloc(i32::MAX as usize) };
+    }
+  }
+  // HDR10+: two windows of nothing, which the writer takes whole; one
+  // window whose 22nd byte is never written, which it does not (L51).
+  let whole = hdr10_plus_from_t35(&bit_payload(&[
+    (1, 8),
+    (2, 2),
+    (0, 153),
+    (0, 27),
+    (0, 1),
+    (0, 82),
+    (0, 82),
+    (0, 1),
+  ]))
+  .expect("libavutil parses the two windows");
+  let unwritten = hdr10_plus_from_t35(&bit_payload(&[
+    (1, 8),
+    (1, 2),
+    (0, 27),
+    (1, 1),
+    (3, 5),
+    (3, 5),
+    (0, 36),
+    (0, 82),
+    (0, 1),
+    (0, 2),
+  ]))
+  .expect("libavutil parses the window");
+  let mkv = corpus.multi_track_mkv();
+  let (_, video) = first_track(&mkv, TrackKind::Video, 1);
+  for (name, entry, expected) in [
+    ("whole", &whole, payload(PayloadRule::ClusterSize)),
+    (
+      "unwritten",
+      &unwritten,
+      payload(PayloadRule::DynamicHdrPlus),
+    ),
+  ] {
+    let mut packet = video_of(&video[0])
+      .with_pts(Some(ms(0)))
+      .with_dts(Some(ms(0)));
+    packet
+      .extra_mut()
+      .set_side_data(vec![side(T::AV_PKT_DATA_DYNAMIC_HDR10_PLUS, entry)]);
+    let mut muxer = muxer_with(
+      &output(&corpus, &format!("l164-{name}.mkv")),
+      ContainerName::MATROSKA,
+      table_of(&mkv, TrackKind::Video),
+      MuxOptions::new().with_lowered_bounds(u64::MAX, 16),
+    );
+    let offered = VideoTrackPacket::new(TrackIndex::new(0), packet);
+    let result = {
+      let _starved = Starved::new();
+      muxer.write_video(offered)
+    };
+    let (refusal, _) = by_container(result);
+    assert_eq!(refusal, expected, "HDR10+ {name}");
+  }
+  // PGS's segment cut.
+  let sup = pgs_sup(&corpus);
+  let (_, segments) = first_track(&sup, TrackKind::Subtitle, 1);
+  let cut = SubtitleTrackPacket::new(
+    TrackIndex::new(0),
+    subtitle_holding(&subtitle_of(&segments[0]), &[0x16, 0x00]).with_pts(Some(ms(0))),
+  );
+  let mut muxer = muxer_into(
+    &output(&corpus, "l164-segments.mkv"),
+    ContainerName::MATROSKA,
+    table_of(&sup, TrackKind::Subtitle),
+  );
+  let result = {
+    let _starved = Starved::new();
+    muxer.write_subtitle(cut)
+  };
+  assert_eq!(
+    by_container(result).0,
+    payload(PayloadRule::PgsSegments),
+    "PGS's cut segment"
+  );
+  // MP4's rewrite of an Annex B track past the largest packet.
+  let (table, frames) = first_track(&corpus.transport_stream(), TrackKind::Video, 1);
+  let mut muxer = muxer_with(
+    &output(&corpus, "l164-rewritten.mp4"),
+    ContainerName::MP4,
+    table,
+    MuxOptions::new().with_lowered_bounds(16, u64::MAX),
+  );
+  let offered = VideoTrackPacket::new(TrackIndex::new(0), video_of(&frames[0]));
+  let result = {
+    let _starved = Starved::new();
+    muxer.write_video(offered)
+  };
+  assert_eq!(
+    by_container(result).0,
+    payload(PayloadRule::RewrittenSize),
+    "MP4's Annex B rewrite"
+  );
+  // TTML's document past the largest packet.
+  let ttml = ttml_mp4(&corpus);
+  let (mut table, cues) = first_track(&ttml, TrackKind::Subtitle, 1);
+  table[0].set_extradata(Some(bytes_of(b"lavc-ttmlenc")));
+  let mut muxer = muxer_with(
+    &output(&corpus, "l164-document.mp4"),
+    ContainerName::MP4,
+    table,
+    MuxOptions::new().with_lowered_bounds(8, u64::MAX),
+  );
+  let offered = SubtitleTrackPacket::new(TrackIndex::new(0), subtitle_of(&cues[0]));
+  let result = {
+    let _starved = Starved::new();
+    muxer.write_subtitle(offered)
+  };
+  assert_eq!(
+    by_container(result).0,
+    payload(PayloadRule::DocumentSize),
+    "TTML's document"
+  );
+  // An AAC description past the `moov`'s bound.
+  let (table, frames) = first_track(&h264_aac(&corpus, "h264-aac.mp4"), TrackKind::Audio, 1);
+  let mut larger = table[0].side_data().extradata().to_vec();
+  larger.extend_from_slice(&[0x56, 0xE5, 0x00, 0x00]);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l164-description.mp4"),
+    ContainerName::MP4,
+    table,
+  );
+  muxer
+    .write_audio(audio_at(&audio_of(&frames[0]), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  muxer.lower_movie_bound(muxer.movie_box_bound().expect("a bound").total);
+  let mut inner = audio_holding(&audio_of(&frames[0]), &[])
+    .with_pts(Some(ms(10)))
+    .with_dts(Some(ms(10)));
+  inner
+    .extra_mut()
+    .set_side_data(vec![side(T::AV_PKT_DATA_NEW_EXTRADATA, &larger)]);
+  let offered = AudioTrackPacket::new(TrackIndex::new(0), inner);
+  let result = {
+    let _starved = Starved::new();
+    muxer.write_audio(offered)
+  };
+  assert_eq!(
+    by_container(result).0,
+    payload(PayloadRule::MovieBox),
+    "a description past the moov's bound"
+  );
+  // The open itself, the cap zero: an allocation fault, nothing written.
+  let target = output(&corpus, "l164-open.mkv");
+  let sink = File::create(&target).expect("create");
+  let table = table_of(&mkv, TrackKind::Video);
+  let opened = {
+    let _starved = Starved::new();
+    FfmpegOwnedMuxer::open(
+      sink,
+      ContainerName::MATROSKA,
+      table,
+      &[],
+      PacketLimits::default(),
+    )
+  };
+  match opened {
+    Err(MuxOpenError::Fault(fault)) => {
+      assert_eq!(fault.stage(), MuxStage::Open, "the open's fault");
+    }
+    other => panic!(
+      "expected the open's allocation fault, got {:?}",
+      other.map(|_| ())
+    ),
+  }
+  assert_eq!(
+    std::fs::metadata(&target).expect("the sink").len(),
+    0,
+    "nothing written"
+  );
+}

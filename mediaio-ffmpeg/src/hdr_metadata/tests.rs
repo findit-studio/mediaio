@@ -173,6 +173,68 @@ fn the_mirrors_are_libavutils_layouts() {
   );
 }
 
+/// **A check of the sizes resolved before judges as the check that asks
+/// libavutil, and asks it nothing** (R18, Codex R17): the sizes
+/// [`LinkedSizes::resolve`] asks are the ones the checks ask; every entry —
+/// the canonical one, one a byte short, one of 16 bytes — answers the same
+/// of both checks; and of sizes another layout's, the sized check answers
+/// [`HdrMetadataError::Layout`] of what it was given, so that what it reads
+/// is the sizes, not the library.
+///
+/// PLANT: the sized check asking the library again, the other layout
+/// judged as the linked one's.
+#[test]
+fn a_check_of_resolved_sizes_judges_as_the_check_that_asks() {
+  let sizes = LinkedSizes::resolve().expect("the sizes");
+  assert_eq!(
+    sizes,
+    LinkedSizes::of(
+      linked_hdr_plus_size().expect("the HDR10+ size"),
+      linked_app5_size().expect("the APP5 size")
+    ),
+    "resolved as the checks ask"
+  );
+  let plus = hdr10_plus_from_t35(&hdr10_plus_payload()).expect("libavutil parses it");
+  let app5 = smpte2094_app5_from_t35(&app5_payload()).expect("libavutil parses it");
+  for entry in [plus.clone(), plus[..plus.len() - 1].to_vec(), vec![0; 16]] {
+    assert_eq!(
+      check_hdr10_plus_sized(&entry, sizes),
+      check_hdr10_plus(&entry),
+      "HDR10+ of {} bytes",
+      entry.len()
+    );
+  }
+  for entry in [app5.clone(), app5[..app5.len() - 1].to_vec(), vec![0; 16]] {
+    assert_eq!(
+      check_smpte2094_app5_sized(&entry, sizes),
+      check_smpte2094_app5(&entry),
+      "APP5 of {} bytes",
+      entry.len()
+    );
+  }
+  let (plus_size, app5_size) = (
+    size_of::<DynamicHdrPlus>(),
+    size_of::<DynamicHdrSmpte2094App5>(),
+  );
+  let other = LinkedSizes::of(plus_size + 8, app5_size + 8);
+  assert_eq!(
+    check_hdr10_plus_sized(&plus, other),
+    Err(HdrMetadataError::Layout {
+      linked: plus_size + 8,
+      mirrored: plus_size
+    }),
+    "HDR10+ judged of the sizes given"
+  );
+  assert_eq!(
+    check_smpte2094_app5_sized(&app5, other),
+    Err(HdrMetadataError::Layout {
+      linked: app5_size + 8,
+      mirrored: app5_size
+    }),
+    "APP5 judged of the sizes given"
+  );
+}
+
 /// **An HDR10+ struct libavutil parsed is admitted, and one the writer
 /// would read out of bounds, divide by zero, overflow, or write otherwise
 /// than it reads back is refused by what it breaks.**

@@ -24,7 +24,10 @@ crate moves only when it changes.
   within its bits and a whole number of its unit, every flag 0 or 1, and
   the writer's and the reader's syntaxes in agreement
   (`HdrMetadataError`) — allocating nothing, as a muxer's judgment of a
-  packet before its refusals requires. `hdr10_plus_from_t35` and
+  packet before its refusals requires: `LinkedSizes::resolve` asks the
+  linked struct sizes once, and `check_hdr10_plus_sized` and
+  `check_smpte2094_app5_sized` judge against them, calling into no
+  library. `hdr10_plus_from_t35` and
   `smpte2094_app5_from_t35` answer the struct libavutil parses from a
   T.35 payload, as a demuxer delivers it.
 - `CodecId::media_type`: the media type libavcodec's descriptor gives a

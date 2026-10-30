@@ -601,6 +601,28 @@
 //! | a PGS packet held | it and its outputs' times pushed | into room the payment reserved |
 //! | the display set it completes | its packets partitioned out, their lines listed anew | taken out in place, their lines moved into room reserved |
 //!
+//! And what the judgment calls into FFmpeg (R18, Codex R17: the census of
+//! C and libavutil allocations), by every call this module and [`records`]
+//! make into `mediaio_ffmpeg` or `ffmpeg_next` that a packet's judgment
+//! reaches:
+//!
+//! | the call | where the judgment makes it | what it allocates |
+//! |---|---|---|
+//! | `av_packet_side_data_name` | the build's rules: a side-data kind libavcodec names not (`check_packet_build`) | nothing: a pointer into a static table |
+//! | `av_get_bits_per_sample` | MP4's constant-size audio, MXF's samples (`mp4_sample_size`, `mp4_frame_bytes`, `mxf_refusal`) | nothing: a switch |
+//! | `avcodec_descriptor_get` | a codec's descriptor: its intra-only property, its media type | nothing: a static table |
+//! | `av_pix_fmt_desc_get` | VP9's `vpcC` at its first sample (`records::vpcc`) | nothing: a static table |
+//! | `av_dynamic_hdr_plus_alloc`, `av_dynamic_hdr_smpte2094_app5_alloc`, `av_free` — the linked HDR structs' sizes | HDR10+'s and APP5's checks, at the first check of each until R18 | a struct each, and an allocation's failure taken for a malformed entry: now asked at open, before anything else ([`LinkedSizes`]), its failure the open's allocation fault, and the checks judge against the sizes ([`hdr_metadata_rule`]) — no call, no allocation, no allocation's failure |
+//!
+//! Every other call into FFmpeg is the open's or the write's. libavutil
+//! offers no hook to count its allocations — `av_malloc`, `av_mallocz` and
+//! `av_realloc` call the system's (`mem.c` 98–153, 155–171, 256) — and
+//! interposing the system's allocator would count every library's; its
+//! one knob, `av_max_alloc`, caps every allocation of the process (74–78,
+//! 102). L164 holds the judgment to it in a process of its own, the cap
+//! zero so that libavutil refuses every allocation: each refusal it makes
+//! is the refusal made without the cap.
+//!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
 //! sample entry calls for a video configuration (`mov_write_video_tag`,
@@ -1030,7 +1052,7 @@ use mediaio_ffmpeg::{
   Owned, PacketLimits, PacketRefusal, Ratio, View,
   boundary::check_packet_build,
   extras::{SideDataEntry, packet_side_data_name},
-  hdr_metadata::{check_hdr10_plus, check_smpte2094_app5},
+  hdr_metadata::{LinkedSizes, check_hdr10_plus_sized, check_smpte2094_app5_sized},
   output::{
     CodecQuery, Output, OutputError, OutputPacket, OutputText, PacketTimes, StreamCodec,
     StreamMedia, StreamSpec,
@@ -5235,8 +5257,9 @@ struct PacketRules {
   /// and how it takes them.
   ac3: Option<Ac3Rules>,
   /// Matroska and WebM video: HDR10+ and APP5 side data is a struct the
-  /// writer serializes whole (table A of the census).
-  hdr_metadata: bool,
+  /// writer serializes whole (table A of the census), judged against the
+  /// linked libavutil's struct sizes, resolved at open (R18, Codex R17).
+  hdr_metadata: Option<LinkedSizes>,
   /// MP4, Matroska and WebM: the packets are rewritten from Annex B to
   /// length prefixes, which the rewriter counts in an `int`.
   length_prefixed: bool,
@@ -6320,6 +6343,7 @@ impl PacketRules {
     codec: &StreamCodec,
     (time_base, shifts): (Timebase, bool),
     (header, file): (i64, u64),
+    hdr: LinkedSizes,
   ) -> Self {
     let id = codec.codec();
     let raw = matches!(audited, Audited::Raw(_));
@@ -6451,7 +6475,7 @@ impl PacketRules {
       webvtt: either_matroska && id == CodecId::WEBVTT,
       ac3: (mp4 && (id == CodecId::AC3 || id == CodecId::EAC3))
         .then(|| Ac3Rules::of(codec, time_base)),
-      hdr_metadata: either_matroska && kind == TrackKind::Video,
+      hdr_metadata: (either_matroska && kind == TrackKind::Video).then_some(hdr),
       length_prefixed: length_prefixed(family, id, codec.extradata()),
       matroska_block: either_matroska,
       ttml_document: None,
@@ -9374,6 +9398,19 @@ where
     let limits = options.limits();
     let filters = options.automatic_filters();
     let bounds = options.bounds;
+    // The linked libavutil's sizes of the HDR structs a packet's side data
+    // is judged against, asked of its allocators here, before anything
+    // else, so that the judgment of a packet calls into no library and
+    // allocates nothing (R18, Codex R17): its failure the open's
+    // allocation fault, named so.
+    let hdr_sizes = LinkedSizes::resolve().map_err(|_| {
+      MuxOpenError::Fault(MuxFault::new(
+        MuxStage::Open,
+        OutputError::Ffmpeg(ffmpeg_next::Error::Other {
+          errno: ffmpeg_next::error::ENOMEM,
+        }),
+      ))
+    })?;
     let mut output = Output::open(sink, container.as_str()).map_err(|error| match error {
       OutputError::UnknownContainer { .. } | OutputError::Nul { .. } => {
         MuxOpenError::UnknownContainer {
@@ -9907,6 +9944,7 @@ where
             &codec,
             (time_base, shifts),
             (header, bounds.file),
+            hdr_sizes,
           );
           if audited == Audited::Mov(MovMode::Ism) {
             rules.ism = Some(IsmShift {
@@ -12175,9 +12213,11 @@ fn check_packet_rules<'p>(
   }
   // The side data the container's writer casts to libavutil's structs, on
   // a packet whose side data reaches it.
-  if rules.hdr_metadata && owns {
+  if let Some(sizes) = rules.hdr_metadata
+    && owns
+  {
     for entry in payload.side_data {
-      if let Some(rule) = hdr_metadata_rule(entry) {
+      if let Some(rule) = hdr_metadata_rule(entry, sizes) {
         return refused(rule);
       }
     }
@@ -12495,15 +12535,18 @@ fn adts_configuration(config: &[u8]) -> Option<AdtsConfig> {
 }
 
 /// The rule an HDR metadata entry Matroska's writer would cast breaks, if
-/// it breaks one (table A of the census, see [the module](self)).
-fn hdr_metadata_rule(entry: &SideDataEntry) -> Option<PayloadRule> {
+/// it breaks one (table A of the census, see [the module](self)) — judged
+/// against `sizes`, the linked libavutil's struct sizes the open resolved:
+/// no call into libavutil, nothing allocated, so that the only answers are
+/// the entry's own and none an allocation's (R18, Codex R17).
+fn hdr_metadata_rule(entry: &SideDataEntry, sizes: LinkedSizes) -> Option<PayloadRule> {
   use AVPacketSideDataType as T;
   if entry.kind() == T::AV_PKT_DATA_DYNAMIC_HDR10_PLUS as i32 {
-    check_hdr10_plus(entry.data())
+    check_hdr10_plus_sized(entry.data(), sizes)
       .is_err()
       .then_some(PayloadRule::DynamicHdrPlus)
   } else if entry.kind() == T::AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5 as i32 {
-    check_smpte2094_app5(entry.data())
+    check_smpte2094_app5_sized(entry.data(), sizes)
       .is_err()
       .then_some(PayloadRule::DynamicHdrApp5)
   } else {

@@ -30,9 +30,14 @@
 //! library's own, asked once of its allocator (`av_dynamic_hdr_plus_alloc`
 //! reports it, `hdr_dynamic_metadata.c` 36–44), and an entry is judged only
 //! where that size is the mirror's: under a libavutil whose struct differs,
-//! every such entry is refused by name ([`HdrMetadataError::Layout`]). The
-//! laws read libavutil's own parse of a payload through the mirrors'
-//! offsets, field by field.
+//! every such entry is refused by name ([`HdrMetadataError::Layout`]). A
+//! caller that must call into no library while it judges — a muxer's
+//! judgment of a packet, before its refusals — resolves both sizes first
+//! ([`LinkedSizes::resolve`]) and judges each entry against them
+//! ([`check_hdr10_plus_sized`], [`check_smpte2094_app5_sized`]): no
+//! allocation, and so no [`HdrMetadataError::Allocation`] (R18). The laws
+//! read libavutil's own parse of a payload through the mirrors' offsets,
+//! field by field.
 //!
 //! Nothing here forms a mirror from bytes: an entry is read through the
 //! mirrors' offsets (`offset_of!`) as the integers its fields are, so no
@@ -338,15 +343,11 @@ fn flag(value: u8) -> Result<bool, HdrMetadataError> {
   }
 }
 
-/// The linked libavutil's size for a struct, asked of `alloc` once (and
-/// again after a failed allocation, which is not remembered).
-fn linked_size(
-  cell: &OnceLock<usize>,
+/// The linked libavutil's size for a struct, asked of `alloc` — a struct
+/// of it allocated, its size read, and the struct freed at once.
+fn probed_size(
   alloc: unsafe extern "C" fn(*mut usize) -> *mut c_void,
 ) -> Result<usize, HdrMetadataError> {
-  if let Some(&size) = cell.get() {
-    return Ok(size);
-  }
   let mut size = 0usize;
   // SAFETY: `alloc` is one of libavutil's two allocators redeclared in
   // `c_shims`: it answers a zeroed struct of its own size, which it writes
@@ -357,7 +358,49 @@ fn linked_size(
   }
   // SAFETY: `ptr` is libavutil's own allocation, freed exactly once.
   unsafe { ffmpeg_next::ffi::av_free(ptr) };
+  Ok(size)
+}
+
+/// The linked libavutil's size for a struct, asked of `alloc` once (and
+/// again after a failed allocation, which is not remembered).
+fn linked_size(
+  cell: &OnceLock<usize>,
+  alloc: unsafe extern "C" fn(*mut usize) -> *mut c_void,
+) -> Result<usize, HdrMetadataError> {
+  if let Some(&size) = cell.get() {
+    return Ok(size);
+  }
+  let size = probed_size(alloc)?;
   Ok(*cell.get_or_init(|| size))
+}
+
+/// The linked libavutil's sizes of the two structs, asked of its
+/// allocators by [`LinkedSizes::resolve`], so that a check given them
+/// ([`check_hdr10_plus_sized`], [`check_smpte2094_app5_sized`]) calls into
+/// no library and allocates nothing — a muxer's judgment of a packet, which
+/// runs before its refusals, resolves them when it opens (R18, Codex R17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkedSizes {
+  hdr_plus: usize,
+  app5: usize,
+}
+
+impl LinkedSizes {
+  /// Asks the linked libavutil for each struct's size, a struct of each
+  /// allocated and freed at once, every time it is called:
+  /// [`HdrMetadataError::Allocation`] where an allocation fails.
+  pub fn resolve() -> Result<Self, HdrMetadataError> {
+    Ok(Self {
+      hdr_plus: probed_size(c_shims::av_dynamic_hdr_plus_alloc)?,
+      app5: probed_size(c_shims::av_dynamic_hdr_smpte2094_app5_alloc)?,
+    })
+  }
+
+  /// Sizes of the laws' own: a layout the linked library's is not.
+  #[cfg(test)]
+  pub(crate) const fn of(hdr_plus: usize, app5: usize) -> Self {
+    Self { hdr_plus, app5 }
+  }
 }
 
 /// The linked libavutil's `sizeof(AVDynamicHDRPlus)`.
@@ -422,9 +465,23 @@ fn peak_table(
 /// Whether `bytes` is an `AVDynamicHDRPlus` the HDR10+ serializer writes
 /// whole and its reader reads back as itself — see [the module](self) for
 /// what that takes, `av_dynamic_hdr_plus_to_t35` (`hdr_dynamic_metadata.c`
-/// 237–395) and `av_dynamic_hdr_plus_from_t35` (59–235) for each rule.
+/// 237–395) and `av_dynamic_hdr_plus_from_t35` (59–235) for each rule. The
+/// linked size asked of libavutil at the first call
+/// ([`HdrMetadataError::Allocation`] where that fails).
 pub fn check_hdr10_plus(bytes: &[u8]) -> Result<(), HdrMetadataError> {
-  whole(bytes, linked_hdr_plus_size()?, size_of::<DynamicHdrPlus>())?;
+  hdr10_plus_judged(bytes, linked_hdr_plus_size()?)
+}
+
+/// [`check_hdr10_plus`] against `sizes`, resolved before: no call into
+/// libavutil, nothing allocated, and so never
+/// [`HdrMetadataError::Allocation`] (R18, Codex R17).
+pub fn check_hdr10_plus_sized(bytes: &[u8], sizes: LinkedSizes) -> Result<(), HdrMetadataError> {
+  hdr10_plus_judged(bytes, sizes.hdr_plus)
+}
+
+/// [`check_hdr10_plus`] against the linked struct's `linked` bytes.
+fn hdr10_plus_judged(bytes: &[u8], linked: usize) -> Result<(), HdrMetadataError> {
+  whole(bytes, linked, size_of::<DynamicHdrPlus>())?;
   let fields = Fields(bytes);
   // The serializer writes application version 1 whatever the struct
   // holds (315–316); the reader keeps what it reads (83).
@@ -799,11 +856,22 @@ macro_rules! app5 {
 /// 563–706) and `av_dynamic_hdr_smpte2094_app5_from_t35` (429–561) for
 /// each rule.
 pub fn check_smpte2094_app5(bytes: &[u8]) -> Result<(), HdrMetadataError> {
-  whole(
-    bytes,
-    linked_app5_size()?,
-    size_of::<DynamicHdrSmpte2094App5>(),
-  )?;
+  app5_judged(bytes, linked_app5_size()?)
+}
+
+/// [`check_smpte2094_app5`] against `sizes`, resolved before: no call into
+/// libavutil, nothing allocated, and so never
+/// [`HdrMetadataError::Allocation`] (R18, Codex R17).
+pub fn check_smpte2094_app5_sized(
+  bytes: &[u8],
+  sizes: LinkedSizes,
+) -> Result<(), HdrMetadataError> {
+  app5_judged(bytes, sizes.app5)
+}
+
+/// [`check_smpte2094_app5`] against the linked struct's `linked` bytes.
+fn app5_judged(bytes: &[u8], linked: usize) -> Result<(), HdrMetadataError> {
+  whole(bytes, linked, size_of::<DynamicHdrSmpte2094App5>())?;
   let fields = Fields(bytes);
   // The serializer refuses these versions (575–576); each is 3 bits.
   if fields.u8(app5!(application_version)) >= 8
