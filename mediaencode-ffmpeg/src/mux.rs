@@ -428,6 +428,15 @@
 //! | `sgpd`, `sbgp` | AAC's 26 and 28; Opus's 24 and 2, and 20 and 8, a sample | a roll distance a sample (3305–3400) |
 //! | `stsd` | 16, and each description's entry: a slack of 4096 bytes, 24 a channel, an ICC profile's `colr`, APV's `apvC` at its most, and each configuration box at twice its configuration's bytes and 256 — HEVC's two | each description counted at its growth, never its shrinking (3165–3198; 7024–7074) |
 //!
+//! Each table is taken at its own worst, as ruled. Two of them meet their
+//! worsts together only where a chunk's samples or its description change
+//! from chunk to chunk, a run of `stsc` each (261–289; 5212–5234): where
+//! every packet is one sample — all but constant-size audio — and the
+//! description never changes, `stsc`'s runs and the chunk offsets together
+//! come to at most 40/3 bytes a sample and 7, not 20 a sample — a
+//! tightening of a sixth of a video track's tables, sent to the coordinator
+//! (R14, letter 2), not taken.
+//!
 //! Beside the tables, the boxes the open knows: each track's own, a slack
 //! of 4096 bytes and 4 a track of its references (`tref`, 4241–4255); the
 //! movie's own, a slack of 1024; the covers' `covr`, 8 and 16 a picture
@@ -443,7 +452,12 @@
 //! 8 KiB a track against 4 GiB. The packet after which the bound would
 //! pass `UINT32_MAX` is refused before it is written
 //! ([`PayloadRule::MovieBox`]): stricter than FFmpeg past the bound alone,
-//! where a file FFmpeg could have written is refused.
+//! where a file FFmpeg could have written is refused. The movie's `udta`,
+//! the covers in it, is made in a dynamic buffer of `INT_MAX` bytes
+//! (5066–5122; `dyn_buf_write`, `aviobuf.c` 1281–1311), which refuses the
+//! writes past it, the `covr` written cut: two covers of the default
+//! packet budget's gibibyte pass it — not judged here, sent to the
+//! coordinator (R14, letter 1).
 //!
 //! ISMV's `mfra`: 24 bytes and each track's `tfra` of 24 and 19 a fragment,
 //! a track's fragments at most its samples and at most one more than its
@@ -1754,6 +1768,8 @@ struct FragmentInfo {
 /// entries. Never reached: a fragment of a track is at least one of its
 /// samples (5810–5811), which [`PayloadRule::SampleTable`] counts across
 /// the fragments, within [`MOV_SAMPLES_MAX`], which a constant asserts.
+/// Should that rule count ISMV's samples a fragment at a time, as movenc's
+/// own table holds them, this cap must be judged in its own right.
 const FRAGMENTS_MAX: u64 = {
   let size = core::mem::size_of::<FragmentInfo>() as u64;
   64 + 64 * ((i32::MAX as u64 / size - 65) / 64)
