@@ -717,7 +717,8 @@
 //! | S8 | the MOV family's `esds` (`mov_write_esds_tag`, `movenc.c` 765–816; `put_descr`, 694–701; R20, r2) | its ES descriptor's length, the configuration and 32 bytes, written in four bytes of seven bits, the bits past 28 lost — past a budget the caller raises, a configuration of a quarter gibibyte | misreport | counted exactly, of each entry that writes one ([`DESCRIPTOR_BYTES_MAX`], [`esds_carries`]) | refused at open ([`MuxOpenError::ConfigurationInvalid`]) — L175, `an_esds_is_counted_where_the_mov_family_writes_one` |
 //! | S9 | MP4's `dvc1` (`mov_write_dvc1_structs`, `movenc.c` 1102–1184; R20, r2) | each VC-1 unit's bits counted `8 * size` in an `int` for `init_get_bits` (1134–1135), wrapped from `2^28` bytes; a sequence header past the 268 435 391 bytes the reader takes, read through the reader of no buffer `init_get_bits` answers, unchecked (1136–1149; `get_bits.h` 517–534) — past a budget the caller raises | memory fault: the sequence header's fields read through a null pointer; the wrap undefined | counted exactly, each unit unescaped as `vc1_unescape_buffer` unescapes it ([`records::dvc1_reads_past`]) | refused at open ([`MuxOpenError::ConfigurationInvalid`]) — L176, `a_vc1_units_bits_are_counted_where_their_int_wraps` |
 //! | S10 | MP4's `lvcC` (`ff_isom_write_lvcc`, `lcevc.c` 251–339; `ff_h2645_packet_split`, `h2645_parse.c` 480–665; R20, r2) | the split's RBSP buffer past `INT_MAX` with `MAX_MBPAIR_SIZE` and the padding, its unit list past `INT_MAX` over an `H2645NAL`'s 88 bytes — 24 403 222 units kept and one more found — a unit's emulation prevention positions past `2^28`: each the split's failure, which MP4 discards (1700), the `lvcC` written empty — past a budget the caller raises | omission, as A4's | counted exactly ([`records::SplitLimits`]) | refused at open ([`MuxOpenError::ConfigurationInvalid`]) — `lcevcs_split_is_held_to_what_libavcodec_allocates` |
-//! | S11 | MPEG-TS's PES payloads (`mpegts_write_packet_internal`, `mpegts_write_pes`, `mpegtsenc.c` 1669–1678, 1851–1864, 1907–2070, 2095–2099, 2205; R20, r2) | an H.264, HEVC or VVC picture behind the delimiter and the configuration MPEG-TS adds (`h26x_prefix_aud`; 1958), an Opus packet behind its control header, an audio packet beside the one held, each summed in an `int`, past it undefined — a wrapped size `av_malloc` refuses, answered `ENOMEM` — and the PES length of them in another, an audio packet's written wrapped — past a budget the caller raises ([`PacketLimits`], `CodecTicket::mirror_with`), a packet and the configuration beside it of two gibibytes | misreport; undefined | counted exactly ([`ts_prefixed_bytes`], [`opus_control_bytes`]), an Opus start trim whose count wraps taken as left | refused at the packet ([`PayloadRule::PesSize`]) — L177, L178, `mpeg_ts_reads_a_units_type_as_its_start_code_search_leaves_it`, `opus_control_headers_are_counted_with_their_trims` |
+//! | S11 | MPEG-TS's PES payloads (`mpegts_write_packet_internal`, `mpegts_write_pes`, `mpegtsenc.c` 1669–1678, 1851–1864, 1907–2070, 2095–2099, 2205; R20, r2) | an H.264, HEVC or VVC picture behind the delimiter and the configuration MPEG-TS adds (`h26x_prefix_aud`; 1958), an Opus packet behind its control header, an audio packet beside the one held, each summed in an `int`, past it undefined — a wrapped size `av_malloc` refuses, answered `ENOMEM` — and the PES length of them in another, an audio packet's written wrapped — past a budget the caller raises ([`PacketLimits`], `CodecTicket::mirror_with`), a packet and the configuration beside it of two gibibytes | misreport; undefined | counted exactly ([`ts_prefixed_bytes`], [`opus_control_bytes`]), Opus's start trim among them — its padding's count refused at open where it wraps (S12; R20, part 2b-i) | refused at the packet ([`PayloadRule::PesSize`]) — L177, L178, `mpeg_ts_reads_a_units_type_as_its_start_code_search_leaves_it`, `opus_control_headers_are_counted_with_their_trims` |
+//! | S12 | MPEG-TS's Opus start trim (`mpegts_init`, `mpegtsenc.c` 1277–1279; R20, part 2b-i) | a stream's initial padding counted at 48 kHz as `initial_padding * 48000` in an `int`: past 44 739 samples either way a signed overflow, undefined — the trim its control headers write then any | misreport; undefined | exact ([`OPUS_TS_PADDING`]) | refused at open ([`MuxOpenError::InitialPaddingTooLong`]) — L182 |
 //! | — | every failure FFmpeg returns through a callback: an open's, a header's, a packet's, a trailer's | — | — | — | reported, the muxer's fault ([`MuxFault`]), once: the output then failed, no later write or trailer reaching what the failure left (r1; [`FfmpegMuxRefusal::OutputFailed`]) — L164 (the open), L169 (a cluster's growth, at the trailer), L173 (a packet's) |
 //!
 //! **Letter 1 (R19, asked).** A2–A27 are FFmpeg's — a failure it never
@@ -821,6 +822,12 @@
 //! finding retracted, its census lines unreachable (L181, which a header
 //! handed the flag turns red). A12's clause of the manifest's omitted
 //! `CodecPrivateData` rests on the same road; its row is letter 1's.
+//!
+//! **Part 2b-i, MPEG-TS's Opus padding** (S12): MPEG-TS counts an Opus
+//! track's start trim as `initial_padding * 48000` in an `int`, a signed
+//! overflow past 44 739 samples either way; such a track is refused at
+//! open by name ([`MuxOpenError::InitialPaddingTooLong`]; L182). With it,
+//! S11 counts Opus's start trim exactly, no case left to take it as left.
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -1228,6 +1235,7 @@
 //! | MPEG-PS, at open | a codec its start or its reader takes not — but MPEG audio, AC-3, DTS, DVD PCM, the video an elementary-stream probe names and DVD subtitles; big-endian PCM, which reads back as DVD PCM, another codec, each packet behind its header (R9: Fable R6, judged by the ruled rule); DVD PCM its header cannot name; a stream id past its codec's range or on another's, or past the system header's room | refused at the start, or read back as another codec's or stream's (`mpegenc.c` 280–484; `mpeg.c` 528–630) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::StreamIds`] — L94 |
 //! | MPEG-TS | a reordering stream's packet with no presentation time; H.264, HEVC or VVC off a start code, or of fewer than 5 bytes, no filter converting it; AAC or Opus of fewer than 2 bytes; raw AAC on a track with no configuration, or past its ADTS header's 13 bits; an empty packet; a time past its clock reference's room | refused after taking the first, written without a time after; refused after taking the first, written as it is after; refused after taking it; written raw, unreadable, or cut; nothing of it, or a delimiter alone; an overflow (`mpegtsenc.c` 1869–2240) | [`FfmpegMuxRefusal::MissingPts`], [`PayloadRule::StartCode`], [`PayloadRule::TooShort`], [`PayloadRule::AdtsFrame`], [`PayloadRule::AdtsFrameLength`], [`PayloadRule::Empty`], [`FfmpegMuxRefusal::TimeWraps`] — L96 |
 //! | MPEG-TS, at open | a codec it writes as private data its reader may not name; AAC of a configuration ADTS cannot write; Opus of a channel mapping its PMT cannot describe; ARIB captions of another profile than A and C; a stream its PMT section has no room for, each descriptor counted at the size its loop writes — 4 bytes an ISO 639 code, 8 a DVB subtitle's, 5 a teletext's; a DVB subtitle or teletext language past its descriptor's 8-bit length, 31 codes or 51; a DVB subtitle's or teletext's configuration of another size than the entries its codes take, five bytes or two a code, or none | written unnamed; its nested ADTS muxer's start refuses it; an unknown mapping, undecodable; no descriptor; written undeclared, or no PMT at all, success answered; the length wrapped, the PMT misread; read back as a configuration of its codes' entries — the defaults' page ids where it has none (`mpegtsenc.c` 216–848, 1240–1268; `mpegts.c` 2152–2255) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::StreamIds`], [`MuxOpenError::LanguageTooLong`], [`MuxOpenError::ConfigurationMissing`] — L96, L107 |
+//! | MPEG-TS, at open (R20, part 2b-i) | an Opus track's initial padding past 44 739 samples either way | its start trim counted at 48 kHz as `initial_padding * 48000` in an `int`, a signed overflow, undefined (`mpegts_init`, `mpegtsenc.c` 1277–1279) | [`MuxOpenError::InitialPaddingTooLong`] ([`OPUS_TS_PADDING`]) — L182 |
 //! | NUT, at open | raw video of a tag its tables do not hold; a video stream of no width or height, an audio one of no sample rate or channels, a configuration of 2^30 bytes or more; a chapter starting past its count; a time base not in lowest terms | written under the tables' first raw tag, RGB 5:5:5's, read back as that; a stream header its reader refuses; wrapped; a main header its reader refuses (`nut.c` 50; `nutdec.c` 233–240, 447–470; `nutenc.c` 601) | [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ChapterSpan`]; the time base handed reduced — L90 |
 //! | NUT, at open (R20, by the class) | a stream's info — its language, its dispositions, a video stream's frame rate — or a chapter's, its title, past the dynamic buffer of `INT_MAX` bytes its tags are made in, less the 64 its close writes | the packet written with its count of tags and fewer bytes, success answered (`write_streaminfo`, `write_chapter`, `nutenc.c` 545–613; `aviobuf.c` 1281–1311, 1410–1436) | [`MuxOpenError::LanguageTooLong`], [`MuxOpenError::ChapterTitleTooLong`] ([`nut_stream_info_bytes`], [`nut_chapter_info_bytes`]) — L170 |
 //! | MXF, MXF D-10, MXF OP-Atom | an MPEG-2 picture of coding type 0, or of a profile and level MXF labels no codec for; a P or B picture, whose index offsets this release does not mirror; DNxHD's first frame short of its compression id, or of an id MXF labels none for; a frame of another size than a constant-bit-rate index counts — MXF D-10's of its bit rate, DNxHD's of its first; an empty packet; at the end, a track no packet reached | refused after taking it; its index written at the next segment, the whole file lost at an offset past a byte; refused after taking it; refused after taking it; an essence element of none; nothing written, the trailer failing (`mxfenc.c` 2361–2397, 2793–2858, 3325–3458, 3487–3606) | [`PayloadRule::FrameHeader`], [`PayloadRule::PredictedPicture`], [`PayloadRule::FrameSize`], [`PayloadRule::Empty`], [`FfmpegMuxRefusal::NoFrame`] — L99 |
@@ -4375,8 +4383,9 @@ pub enum PayloadRule {
   /// and three bytes, an `int` (1669–1678): an audio packet's written
   /// wrapped past it, a video packet's written as zero whatever its sum —
   /// MPEG-TS omits a video packet's length by default (2388–2389) — its
-  /// sum undefined all the same. Each counted exactly; a start trim
-  /// Opus's initial padding wraps the count of, as left.
+  /// sum undefined all the same. Each counted exactly, Opus's start trim
+  /// among them — a padding whose count wraps refused at open
+  /// ([`MuxOpenError::InitialPaddingTooLong`]; R20, part 2b-i).
   #[error("MPEG-TS would sum the packet's PES payload past an int")]
   PesSize,
   /// The MOV family, of no fragments: a constant-size audio track's packet
@@ -5159,6 +5168,17 @@ pub enum MuxOpenError {
     /// The chapters in the table.
     count: usize,
   },
+  /// MPEG-TS: an Opus track whose initial padding MPEG-TS counts at 48 kHz
+  /// in an `int` past its range (R20, part 2b-i, ruled: a length that
+  /// wraps is refused): `initial_padding * 48000`, a signed overflow past
+  /// 44 739 samples either way, the start trim its control headers write
+  /// then undefined (`mpegts_init`, `mpegtsenc.c` 1277–1279;
+  /// [`OPUS_TS_PADDING`]).
+  #[error("track {}'s initial padding passes what MPEG-TS counts it in", .track.get())]
+  InitialPaddingTooLong {
+    /// The track.
+    track: TrackIndex,
+  },
   /// A language longer than the container writes: of more codes than
   /// MPEG-TS's descriptor counts — its DVB subtitle descriptor, eight bytes
   /// a three-byte code, and its teletext descriptor, five, each of an 8-bit
@@ -5236,7 +5256,7 @@ struct TrackState {
   /// next one's PES packet ([`TsPes`]).
   ts_held: u64,
   /// MPEG-TS Opus: the start trim left to write ([`TsRules::Opus`]).
-  ts_trim: Option<i64>,
+  ts_trim: i64,
   /// MPEG-TS's raw AAC: the program config element the first frame this
   /// muxer frames carries ([`AdtsFraming`]), and whether it is yet to be
   /// written (R20, r3).
@@ -6127,8 +6147,9 @@ enum TsRules {
     rate: i32,
     /// The start trim MPEG-TS writes into the first control headers, at
     /// 48 kHz: the stream's initial padding counted in an `int` at open
-    /// (1277–1279), `None` where that count wraps.
-    trim: Option<i64>,
+    /// (1277–1279), exactly — a padding whose count wraps refused
+    /// ([`MuxOpenError::InitialPaddingTooLong`]).
+    trim: i64,
   },
 }
 
@@ -6194,13 +6215,25 @@ fn ts_extradd(config: &[u8]) -> u64 {
 
 /// The start trim MPEG-TS makes of an Opus stream's initial padding
 /// `padding` at its sample rate `rate` (`mpegts_init`, `mpegtsenc.c`
-/// 1277–1279): `padding * 48000 / rate`, of `int`s — `None` where the
-/// product wraps, which this muxer cannot know the count of. libavformat
-/// refuses a rate of none first (`init_muxer`, `mux.c` 237–242).
-fn opus_ts_trim(padding: i32, rate: i32) -> Option<i64> {
-  let product = i64::from(padding) * 48_000;
-  (rate > 0 && i32::try_from(product).is_ok()).then(|| product / i64::from(rate))
+/// 1277–1279): `padding * 48000 / rate`, of `int`s, exactly — a padding
+/// whose product wraps is refused at open
+/// ([`MuxOpenError::InitialPaddingTooLong`]; [`OPUS_TS_PADDING`]), and
+/// libavformat refuses a rate of none first (`init_muxer`, `mux.c`
+/// 237–242).
+fn opus_ts_trim(padding: i32, rate: i32) -> i64 {
+  if rate > 0 {
+    i64::from(padding) * 48_000 / i64::from(rate)
+  } else {
+    0
+  }
 }
+
+/// The initial paddings MPEG-TS counts an Opus stream's start trim of at
+/// 48 kHz in an `int` (R20, part 2b-i, ruled: a length that wraps is
+/// refused): `initial_padding * 48000`, a signed overflow — undefined, the
+/// trim then any — past `INT_MAX`, or below `INT_MIN` (`mpegts_init`,
+/// `mpegtsenc.c` 1277–1279): at most 44 739 samples either way.
+const OPUS_TS_PADDING: core::ops::RangeInclusive<i32> = (i32::MIN / 48_000)..=(i32::MAX / 48_000);
 
 /// `avpriv_find_start_code` (`libavcodec/utils.c` 941–973 in FFmpeg
 /// 9.0.1) over `bytes` from `at`, `state` the last four bytes read: the
@@ -6356,24 +6389,21 @@ fn opus_ts_samples(bytes: &[u8]) -> i64 {
 /// 2071–2140; R20, r2), and the start trim left after it: a packet whose
 /// first eleven bits are not its own control header's is put behind one —
 /// two bytes, a byte for each 255 of its size and one more, two for the
-/// start trim where one is left (`trim`: `None` where its count wrapped,
-/// taken as left), and two for an end trim, its side data's
-/// (`end_trim`) — the start trim then less the packet's samples, at most
-/// ([`opus_ts_samples`]).
-fn opus_control_bytes(bytes: &[u8], trim: Option<i64>, end_trim: bool) -> (u64, Option<i64>) {
+/// start trim where one is left (`trim`), and two for an end trim, its side
+/// data's (`end_trim`) — the start trim then less the packet's samples,
+/// at most ([`opus_ts_samples`]). Exact: a start trim whose count wraps is
+/// refused at open (R20, part 2b-i).
+fn opus_control_bytes(bytes: &[u8], trim: i64, end_trim: bool) -> (u64, i64) {
   let size = bytes.len() as u64;
   if bytes.len() >= 2 && u16::from_be_bytes([bytes[0], bytes[1]]) >> 5 == 0x3FF {
     return (size, trim);
   }
-  let left = trim.is_none_or(|trim| trim != 0);
-  let header = 2 + size / 255 + 1 + if left { 2 } else { 0 } + if end_trim { 2 } else { 0 };
-  let next = trim.map(|trim| {
-    if trim == 0 {
-      0
-    } else {
-      trim - trim.min(opus_ts_samples(bytes))
-    }
-  });
+  let header = 2 + size / 255 + 1 + if trim != 0 { 2 } else { 0 } + if end_trim { 2 } else { 0 };
+  let next = if trim == 0 {
+    0
+  } else {
+    trim - trim.min(opus_ts_samples(bytes))
+  };
   (size + header, next)
 }
 
@@ -10391,7 +10421,7 @@ struct Learned {
   /// packet ([`TsPes`]).
   ts_held: Option<u64>,
   /// MPEG-TS Opus: the start trim left after the packet.
-  ts_trim: Option<Option<i64>>,
+  ts_trim: Option<i64>,
   /// MPEG-TS's raw AAC: the packet's frame carries the program config
   /// element, which no later frame does (R20, r3).
   ts_pce_sent: bool,
@@ -11344,7 +11374,7 @@ where
         ts_held: 0,
         ts_trim: match rules.ts {
           Some(TsRules::Opus { trim, .. }) => trim,
-          _ => Some(0),
+          _ => 0,
         },
         ts_pce_pending: !ts_pce.is_empty(),
         ts_pce,
@@ -14801,6 +14831,13 @@ where
           && mpeg_ts_dvb_codes(mpeg_ts_language(description)).len() > 51) =>
     {
       Some(MuxOpenError::LanguageTooLong { track })
+    }
+    // Opus's start trim, its initial padding counted at 48 kHz in an `int`
+    // (`mpegts_init`, `mpegtsenc.c` 1277–1279; R20, part 2b-i).
+    Audited::MpegTs
+      if codec == CodecId::OPUS && !OPUS_TS_PADDING.contains(&ticket.initial_padding()) =>
+    {
+      Some(MuxOpenError::InitialPaddingTooLong { track })
     }
     // Each code of a DVB subtitle's descriptor takes an entry of its
     // configuration — five bytes — while one is left, a default after,

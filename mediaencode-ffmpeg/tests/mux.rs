@@ -22046,3 +22046,85 @@ fn l181_ismv_writes_no_manifest_and_cuts_nothing() {
     "no CodecPrivateData"
   );
 }
+
+/// `row` restated of the initial padding `padding`, its configuration and
+/// its other fields as they are.
+fn padded(row: &Described, padding: i32) -> Described {
+  let index = row.side_data().stream_index();
+  let mut parameters = row.side_data().rebuild().expect("the parameters");
+  // SAFETY: `parameters` owns its `AVCodecParameters`, live for the write
+  // of a plain integer field.
+  unsafe { (*parameters.as_mut_ptr()).initial_padding = padding };
+  let ticket = CodecTicket::mirror(&parameters, index, usize::MAX).expect("the ticket");
+  TrackDescription::new(row.timebase(), row.params().duplicate(), ticket)
+    .expect("a timed track")
+    .with_extradata(Some(bytes_of(&stream_extradata_of(row))))
+    .with_language(row.language().cloned())
+    .with_disposition(row.disposition())
+}
+
+/// **L182 — MPEG-TS refuses an Opus padding its `int` cannot count** (R20,
+/// part 2b-i, ruled: a length that wraps is refused): MPEG-TS counts an
+/// Opus track's start trim as `initial_padding * 48000 / sample_rate` in
+/// `int`s at its start (`mpegts_init`, `mpegtsenc.c` 1277–1279), a signed
+/// overflow past 44 739 samples either way. A track of 44 739 samples of
+/// padding, or of −44 739, is written, its first control header carrying
+/// a start trim; of 44 740, or −44 740, refused at open by name, nothing
+/// written.
+///
+/// PLANT: the padding unjudged; its range a sample short.
+#[test]
+fn l182_mpeg_ts_refuses_an_opus_padding_its_int_cannot_count() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = opus_of_two_bytes_mkv(&corpus);
+  let (table, packets) = first_track(&source, TrackKind::Audio, 4);
+  for (padding, refused) in [
+    (44_739, false),
+    (44_740, true),
+    (-44_739, false),
+    (-44_740, true),
+  ] {
+    let target = output(&corpus, &format!("l182-{padding}.ts"));
+    let opened = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new("mpegts"),
+      vec![padded(&table[0], padding)],
+      &[],
+      PacketLimits::default(),
+    );
+    if refused {
+      match opened {
+        Err(MuxOpenError::InitialPaddingTooLong { track }) => {
+          assert_eq!(track, TrackIndex::new(0), "{padding}");
+        }
+        other => panic!(
+          "{padding}: expected InitialPaddingTooLong, got {:?}",
+          other.map(|_| ())
+        ),
+      }
+      assert_eq!(
+        std::fs::metadata(&target).expect("the sink").len(),
+        0,
+        "{padding}: nothing written"
+      );
+      continue;
+    }
+    let (mut muxer, _) = opened.unwrap_or_else(|error| panic!("{padding}: {error:?}"));
+    for packet in &packets {
+      muxer
+        .write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet)))
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{padding}: {error:?}"));
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|error| panic!("{padding}: {error:?}"));
+    let pes = pes_of(&target, 0xBD);
+    assert_eq!(pes.len(), packets.len(), "{padding}: a PES packet a packet");
+    assert_ne!(
+      pes[0].1[1] & 0x10,
+      0,
+      "{padding}: the first control header's start trim"
+    );
+  }
+}

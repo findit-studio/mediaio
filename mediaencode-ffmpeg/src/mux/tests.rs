@@ -1250,7 +1250,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     place: 0,
     avi_frames: 0,
     ts_held: 0,
-    ts_trim: Some(0),
+    ts_trim: 0,
     ts_pce: Vec::new(),
     ts_pce_pending: false,
     mp4_place: None,
@@ -5391,9 +5391,10 @@ fn mpeg_ts_reads_a_units_type_as_its_start_code_search_leaves_it() {
 
 /// Opus's control header is counted with its trims (R20, r2): two bytes, a
 /// byte for each 255 of the packet and one more; two while a start trim is
-/// left — taken as left where its count wrapped — the packet's samples
-/// trimmed off it; two for an end trim its side data makes, of 32
-/// unsigned bits; none for a packet of its own control header.
+/// left, the packet's samples trimmed off it; two for an end trim its side
+/// data makes, of 32 unsigned bits; none for a packet of its own control
+/// header. The start trim's count exact: a padding whose `int` wraps is
+/// refused at open (R20, part 2b-i), at most 44 739 samples either way.
 #[test]
 fn opus_control_headers_are_counted_with_their_trims() {
   use super::{opus_control_bytes, opus_ts_end_trim, opus_ts_samples, opus_ts_trim};
@@ -5404,22 +5405,24 @@ fn opus_control_headers_are_counted_with_their_trims() {
   assert_eq!(opus_ts_samples(&[(15 << 3) | 3, 3]), 2880);
   assert_eq!(opus_ts_samples(&[(15 << 3) | 3, 7]), 0, "past 120 ms");
   assert_eq!(opus_ts_samples(&[(15 << 3) | 3]), 0, "no count byte");
-  assert_eq!(opus_control_bytes(&packet, Some(0), false), (304, Some(0)));
-  assert_eq!(
-    opus_control_bytes(&packet, Some(312), false),
-    (306, Some(0))
-  );
-  assert_eq!(
-    opus_control_bytes(&packet, Some(2000), false),
-    (306, Some(1040))
-  );
-  assert_eq!(opus_control_bytes(&packet, None, false), (306, None));
-  assert_eq!(opus_control_bytes(&packet, Some(0), true), (306, Some(0)));
+  assert_eq!(opus_control_bytes(&packet, 0, false), (304, 0));
+  assert_eq!(opus_control_bytes(&packet, 312, false), (306, 0));
+  assert_eq!(opus_control_bytes(&packet, 2000, false), (306, 1040));
+  assert_eq!(opus_control_bytes(&packet, 0, true), (306, 0));
   let own = [0x7F, 0xE0, 0x11];
-  assert_eq!(opus_control_bytes(&own, Some(312), true), (3, Some(312)));
-  assert_eq!(opus_ts_trim(312, 48_000), Some(312));
-  assert_eq!(opus_ts_trim(44_739, 48_000), Some(44_739));
-  assert_eq!(opus_ts_trim(44_740, 48_000), None, "its int wrapped");
+  assert_eq!(opus_control_bytes(&own, 312, true), (3, 312));
+  assert_eq!(opus_ts_trim(312, 48_000), 312);
+  assert_eq!(opus_ts_trim(44_739, 48_000), 44_739);
+  assert_eq!(opus_ts_trim(-44_739, 48_000), -44_739);
+  assert_eq!(
+    super::OPUS_TS_PADDING,
+    -44_739..=44_739,
+    "the int's range at 48 kHz"
+  );
+  assert!(i64::from(*super::OPUS_TS_PADDING.end()) * 48_000 <= i64::from(i32::MAX));
+  assert!((i64::from(*super::OPUS_TS_PADDING.end()) + 1) * 48_000 > i64::from(i32::MAX));
+  assert!(i64::from(*super::OPUS_TS_PADDING.start()) * 48_000 >= i64::from(i32::MIN));
+  assert!((i64::from(*super::OPUS_TS_PADDING.start()) - 1) * 48_000 < i64::from(i32::MIN));
   let skip = |end: u32| {
     let mut data = vec![0; 10];
     data[4..8].copy_from_slice(&end.to_le_bytes());
