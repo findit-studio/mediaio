@@ -4736,3 +4736,36 @@ fn movs_sample_table_holds_what_its_allocation_does() {
   assert!((max + 1024) * entry > i32::MAX as u64, "the next past it");
   assert_eq!(max, if entry == 72 { 29_826_048 } else { 33_553_408 });
 }
+
+/// The movie `udta` of two covers at the default packet budget passes the
+/// dynamic buffer movenc makes it in, and one cover filling it to the byte
+/// stays within (R14b, ruled; [`super::MuxOpenError::CoversTooLarge`]):
+/// `meta`, `hdlr`, `ilst` and `©too` of libavformat's name, 77 bytes and
+/// the name; `covr`, 8 and 16 a cover beside its picture, an empty one
+/// skipped; the Nero list, 17 and 9 a chapter beside its title.
+#[test]
+fn the_movie_udta_of_two_gibibyte_covers_passes_its_buffer() {
+  let version = ffmpeg_next::format::version();
+  let name = format!(
+    "Lavf{}.{}.{}",
+    version >> 16,
+    (version >> 8) & 0xFF,
+    version & 0xFF
+  );
+  let own = super::udta_bytes(0, &[]);
+  assert_eq!(own, 77 + name.len() as u64, "the iTunes metadata of {name}");
+  let budget = mediaio_ffmpeg::DEFAULT_MAX_PACKET_BYTES as u64;
+  let two = super::udta_bytes(super::covr_bytes([budget, budget].into_iter()), &[]);
+  assert_eq!(two, own + 8 + 2 * (16 + budget));
+  assert!(two > i32::MAX as u64, "two gibibyte covers pass INT_MAX");
+  let filling = i32::MAX as u64 - own - 24;
+  let one = super::udta_bytes(super::covr_bytes([filling].into_iter()), &[]);
+  assert_eq!(one, i32::MAX as u64, "one cover fills it to the byte");
+  assert_eq!(super::covr_bytes([0, 5].into_iter()), 24 + 5);
+  assert_eq!(super::covr_bytes([5, 0, 7].into_iter()), 24 + 5 + 16 + 7);
+  assert_eq!(
+    super::covr_bytes([0, 0].into_iter()),
+    0,
+    "no picture, no covr"
+  );
+}

@@ -433,31 +433,44 @@
 //! from chunk to chunk, a run of `stsc` each (261–289; 5212–5234): where
 //! every packet is one sample — all but constant-size audio — and the
 //! description never changes, `stsc`'s runs and the chunk offsets together
-//! come to at most 40/3 bytes a sample and 7, not 20 a sample — a
-//! tightening of a sixth of a video track's tables, sent to the coordinator
-//! (R14, letter 2), not taken.
+//! come to at most 40/3 bytes a sample and 7, not 20 a sample. That joint
+//! bound was weighed and left for Q870's exact mirror (R14b, letter 2,
+//! ruled): the per-table bound holds by construction, the joint one only
+//! by a brute force over compositions, and its looseness — about a sixth
+//! of a video track's tables — is the price, named here.
 //!
 //! Beside the tables, the boxes the open knows: each track's own, a slack
 //! of 4096 bytes and 4 a track of its references (`tref`, 4241–4255); the
 //! movie's own, a slack of 1024; the covers' `covr`, 8 and 16 a picture
-//! beside its bytes (4815–4839); the Nero list, 17 and, of the first 255
-//! chapters, 9 and a title of at most 255 bytes (5040–5064); each stream's
+//! beside its bytes, an empty one skipped (4815–4839); the Nero list, 17
+//! and, of the first 255 chapters, 9 and a title of at most 255 bytes
+//! (5040–5064) — both counted as the `udta`'s own bound counts them
+//! (below); each stream's
 //! `pssh` boxes, of its encryption initialization's parse (5175–5210); and
 //! the chapter track, a sample a chapter, its entry the text stub's
 //! (7727–7811). No timecode track is made (table E), and the Dolby Vision
 //! and `hvcE` boxes are written only at a strictness below normal, which
 //! the muxer never sets (3000–3018). Each slack is the sum its derivation
-//! comes to, rounded up — the movie's 269 bytes taken as 1024, a track's
+//! comes to, rounded up — the movie's 252 bytes taken as 1024, a track's
 //! under 1.4 KB as 4096, a sample entry's under 700 as 4096 — at most
 //! 8 KiB a track against 4 GiB. The packet after which the bound would
 //! pass `UINT32_MAX` is refused before it is written
 //! ([`PayloadRule::MovieBox`]): stricter than FFmpeg past the bound alone,
-//! where a file FFmpeg could have written is refused. The movie's `udta`,
-//! the covers in it, is made in a dynamic buffer of `INT_MAX` bytes
-//! (5066–5122; `dyn_buf_write`, `aviobuf.c` 1281–1311), which refuses the
-//! writes past it, the `covr` written cut: two covers of the default
-//! packet budget's gibibyte pass it — not judged here, sent to the
-//! coordinator (R14, letter 1).
+//! where a file FFmpeg could have written is refused.
+//!
+//! The movie's `udta`, every cover in it, is made in a dynamic buffer of
+//! `INT_MAX` bytes (`mov_write_udta_tag`, 5066–5122; `dyn_buf_write`,
+//! `aviobuf.c` 1281–1311), which refuses the writes past it, the `covr`
+//! then written cut, its sizes counting bytes the file lacks — two covers
+//! of the default packet budget's gibibyte pass it. Its size is known at
+//! open, and counted exactly ([`udta_bytes`]): in MP4's, iPod's and F4V's
+//! modes, the iTunes `meta` — `hdlr`, `ilst` and its `©too` of
+//! libavformat's name and version — the covers' `covr` and the Nero list;
+//! the table whose covers would take it past the buffer is refused at
+//! open, nothing written, by the cover at which it passes
+//! ([`MuxOpenError::CoversTooLarge`]; R14b, letter 1, ruled). MOV's and
+//! 3GP's `udta` hold no cover, and at most the Nero list beside a string
+//! or two.
 //!
 //! ISMV's `mfra`: 24 bytes and each track's `tfra` of 24 and 19 a fragment,
 //! a track's fragments at most its samples and at most one more than its
@@ -754,6 +767,7 @@
 //! | [`FfmpegMuxRefusal::BeforeFirstDts`] | FLV keeps the first packet it writes as its reference and refuses every later packet decoded before it after taking it — "Packets are not in the proper order with respect to DTS" (`flvenc.c` 1267–1274): a packet of a stream the interleaving's 10 s delay wrote ahead of (`mux.c` 939–1003) — L70; PLANT: unmirrored, L70's audio at 2 s taken, FLV refusing it after taking it (`Invalid argument`) | refuses after taking |
 //! | [`MuxOpenError::ChannelLayout`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::Cropping`] | MP4's trailer refuses the box (`movenc.c` 1299–1340, 857–910, 3024–3036; `movenc_ttml.c` 236–317) | refuses after taking: the file |
 //! | [`MuxOpenError::SampleSize`], [`MuxOpenError::Cover`] | `pcm_rechunk`'s start fails the header (`pcm_rechunk.c` 49–58); the cover's builder fails after the header (`packet.c` 83–95) | refuses: the file |
+//! | [`MuxOpenError::CoversTooLarge`] | the movie's `udta`, every cover in it, passes the dynamic buffer movenc makes it in, the `covr` written cut (`movenc.c` 5066–5122, 4815–4839; `aviobuf.c` 1281–1311; R14b) | corrupts: the file's metadata |
 //! | [`MuxOpenError::MediaTypeMismatch`] | a stream of one media type whose packets this muxer would judge as another's | corrupts |
 //! | [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::ChapterSample`] | MP4 writes every chapter into its Nero list but a titled one alone into its chapter track, which its reader lays over the list by position, with a 16-bit title length (`movenc.c` 7791–7807); `ff_mov_write_packet`'s answer for a chapter's sample ignored, a sample past `INT_MAX` lost, one out of range moved (7807) | corrupts, or loses |
 //!
@@ -869,7 +883,7 @@
 //! | MXF, MXF D-10, MXF OP-Atom | an MPEG-2 picture of coding type 0, or of a profile and level MXF labels no codec for; a P or B picture, whose index offsets this release does not mirror; DNxHD's first frame short of its compression id, or of an id MXF labels none for; a frame of another size than a constant-bit-rate index counts — MXF D-10's of its bit rate, DNxHD's of its first; an empty packet; at the end, a track no packet reached | refused after taking it; its index written at the next segment, the whole file lost at an offset past a byte; refused after taking it; refused after taking it; an essence element of none; nothing written, the trailer failing (`mxfenc.c` 2361–2397, 2793–2858, 3325–3458, 3487–3606) | [`PayloadRule::FrameHeader`], [`PayloadRule::PredictedPicture`], [`PayloadRule::FrameSize`], [`PayloadRule::Empty`], [`FfmpegMuxRefusal::NoFrame`] — L99 |
 //! | MXF, MXF D-10, MXF OP-Atom, at open | a codec but MPEG-2, DNxHD and ProRes video — MXF D-10's MPEG-2 alone — and 16- and 24-bit PCM: H.264, DV, FFV1 and JPEG 2000, whose frame parsers this release has not audited, and the data and caption tracks, booked; a first track not the one video track, OP-Atom's second track, MXF D-10's audio track not its second; a frame rate MXF names no content package for, or none; no pixel format; ProRes of no profile its labels name; sound but at 48 kHz, OP-Atom's but mono; MXF D-10's video at a bit rate it names not, or at a rate but 25 and 30000/1001; its sound past eight channels, or of a block alignment not its channels' samples | refused at its start; or its label another standard's; or its writer dividing by the alignment (`mxfenc.c` 2941–3165, 3222–3248) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ConfigurationInvalid`] — L98 |
 //! | the MOV family's modes | MP4's packet rules; ISMV's and AVIF's samples past the dynamic buffer they are written into — AVIF's held until its trailer, ISMV's until its next fragment's flush, counted here from the track's first sample, stricter than FFmpeg and losing nothing; ISMV's decode gap of `i32::MAX` less the track's first composition offset, but before a key frame of its one video track | as MP4's; the buffer refusing the write, the sample tables counting bytes the file lacks (`movenc.c` 6961–6981; `aviobuf.c` 1281–1311); the decode time rewritten that offset back, the next flush's `av_assert0` ending the process (6897–6923, 7396–7410, 1248–1256) | as MP4's — each mode's table of a track's samples, ISMV's counted from its first sample, never reset at a flush ([`PayloadRule::SampleTable`]; R12); [`PayloadRule::FragmentSize`], [`FfmpegMuxRefusal::DtsGap`] — L103, L123 |
-//! | the MOV family's modes, at open | a codec this release admits not beside MP4's — MOV's raw video, DV, MPEG-2, H.263, DNxHD, ProRes, PCM, MP3, AMR, ADPCM, QDM2, G.726, iLBC, and H.264 of an intra profile or AVC-Intra tag; 3GP's and 3G2's H.263 and AMR; F4V's VP6; ISMV's WMA Pro and TTML; PSP's every codec but H.264, MPEG-4 Part 2 and AAC; AVIF's alpha plane — booked; a picture past 65535, and in MOV's mode one of an aspect ratio stated and not 1 whose track aperture — its width, height and display width shifted left 16 in an `int` — passes 32767, every MOV video codec, H.264, HEVC and MPEG-4 among them (`mov_write_tapt_tag`, `movenc.c` 4098–4126, 4430–4436; R11, Q869 L6 — L136); MPEG audio layer III below 16 kHz outside MOV; TTML's `dfxp` tag outside ISMV; PSP's table of other than one video and one audio track, AVIF's of more than one; ISMV's second video track, whose key frames' flushes before `check_pkt`'s second count rest on libavformat's interleaving, which this release does not mirror — booked to Q870 (R11, Codex R10 2); the Nero list's untitled chapter, which reads back titled empty, no longer untitled (R9: Fable R2, judged by the ruled rule), a title past 255 bytes, cut | refused at the start, written with no configuration box, or so that it reads back otherwise (`movenc.c` 1380–2140, 5040–5064, 6431–6448, 8129–8650) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`] — L102, L132 |
+//! | the MOV family's modes, at open | a codec this release admits not beside MP4's — MOV's raw video, DV, MPEG-2, H.263, DNxHD, ProRes, PCM, MP3, AMR, ADPCM, QDM2, G.726, iLBC, and H.264 of an intra profile or AVC-Intra tag; 3GP's and 3G2's H.263 and AMR; F4V's VP6; ISMV's WMA Pro and TTML; PSP's every codec but H.264, MPEG-4 Part 2 and AAC; AVIF's alpha plane — booked; a picture past 65535, and in MOV's mode one of an aspect ratio stated and not 1 whose track aperture — its width, height and display width shifted left 16 in an `int` — passes 32767, every MOV video codec, H.264, HEVC and MPEG-4 among them (`mov_write_tapt_tag`, `movenc.c` 4098–4126, 4430–4436; R11, Q869 L6 — L136); MPEG audio layer III below 16 kHz outside MOV; TTML's `dfxp` tag outside ISMV; PSP's table of other than one video and one audio track, AVIF's of more than one; ISMV's second video track, whose key frames' flushes before `check_pkt`'s second count rest on libavformat's interleaving, which this release does not mirror — booked to Q870 (R11, Codex R10 2); the Nero list's untitled chapter, which reads back titled empty, no longer untitled (R9: Fable R2, judged by the ruled rule), a title past 255 bytes, cut; MP4's, iPod's and F4V's covers whose movie `udta` would pass its dynamic buffer of `INT_MAX` bytes, its size counted exactly (R14b, ruled) | refused at the start, written with no configuration box, or so that it reads back otherwise, or the `covr` written cut (`movenc.c` 1380–2140, 5040–5064, 5066–5122, 6431–6448, 8129–8650) | [`MuxOpenError::CodecNotCarried`], [`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`], [`MuxOpenError::TrackLayout`], [`MuxOpenError::ChapterWithoutTitle`], [`MuxOpenError::ChapterTitleTooLong`], [`MuxOpenError::CoversTooLarge`] — L102, L132, L155 |
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -1526,6 +1540,9 @@ struct Bounds {
   /// The most bytes ISMV's `mfra` holds, the dynamic buffer it is made in
   /// ([`PayloadRule::FragmentIndex`]).
   index: u64,
+  /// The most bytes the MOV family's movie `udta` holds, the dynamic
+  /// buffer it is made in ([`MuxOpenError::CoversTooLarge`]).
+  user_data: u64,
 }
 
 impl Bounds {
@@ -1539,6 +1556,7 @@ impl Bounds {
     table: MOV_SAMPLES_MAX,
     movie: u32::MAX as u64,
     index: FRAGMENT_BYTES_MAX,
+    user_data: i32::MAX as u64,
   };
 }
 
@@ -1629,6 +1647,7 @@ impl MuxOptions {
       table: self.bounds.table,
       movie: self.bounds.movie,
       index: self.bounds.index,
+      user_data: self.bounds.user_data,
     };
     self
   }
@@ -1697,6 +1716,19 @@ impl MuxOptions {
     }
     if bytes < self.bounds.index {
       self.bounds.index = bytes;
+    }
+    self
+  }
+
+  /// Lowers the bytes the MOV family's movie `udta` may come to — its
+  /// dynamic buffer's `INT_MAX` — to `bytes`, never raising it: the laws'
+  /// seam, which shows the bound without gibibytes of covers
+  /// ([`MuxOpenError::CoversTooLarge`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_user_data_bound(mut self, bytes: u64) -> Self {
+    if bytes < self.bounds.user_data {
+      self.bounds.user_data = bytes;
     }
     self
   }
@@ -1782,10 +1814,12 @@ const _: () = assert!(MOV_SAMPLES_MAX < FRAGMENTS_MAX);
 /// The movie's own boxes in a `moov`, at most (R14; the sizes table of the
 /// census): its header (8), `mvhd` (120 of version 1, 4500–4563), `iods`
 /// (24, 4447–4474), `udta` (8) and, in it, `meta` (12) with its `hdlr`
-/// (33, 4565–4578) and `ilst` (8) holding `©too`, libavformat's name
-/// (at most 56, 4848–4851) — 269 bytes; PSP's `uuid` box, written only of
-/// a title, and `loci`, only of a location, neither of which the muxer
-/// hands — taken as 1024.
+/// (33, 4565–4578) and `ilst` (8) holding `©too`, 24 bytes and
+/// libavformat's name, at most 15 (4854–4857) — 252 bytes; MOV's `©swr`
+/// in its stead, of the same name (5093); PSP's `uuid` box, written only
+/// of a title, and `loci`, only of a location, neither of which the muxer
+/// hands — taken as 1024. The covers' `covr` and the Nero list are counted
+/// apart, exactly ([`covr_bytes`], [`chpl_bytes`]).
 const MOOV_SLACK: u64 = 1024;
 
 /// A track's own boxes in a `moov` beside its sample descriptions and its
@@ -1962,6 +1996,54 @@ fn pssh_bytes(bytes: &[u8]) -> u64 {
     at += 16 + payload as usize;
   }
   total
+}
+
+/// The bytes the MOV family's movie `udta` holds in the dynamic buffer
+/// movenc makes it in, beside its own 8-byte header, exactly, of `covers`
+/// bytes of `covr` ([`covr_bytes`]) and `chapters` (R14b, ruled;
+/// `mov_write_udta_tag`, `movenc.c` 5066–5122), in a mode that writes
+/// covers — MP4's, iPod's and F4V's iTunes metadata: `meta`'s 12 bytes,
+/// `hdlr`'s 33 (4565–4578), `ilst`'s 8, and in it `©too`, 24 bytes and
+/// libavformat's name, `Lavf` and the linked library's version
+/// (4854–4857; `LIBAVFORMAT_IDENT`, `version.h` 45; no bit-exact flag set
+/// here), and the covers' `covr`; then the Nero list ([`chpl_bytes`]).
+/// Every other box it may hold is of the context's metadata, which holds
+/// libavformat's `encoder` alone (`mux.c` 352–356), read by none of them
+/// (4848–4880): its `loci`, of a location, none (4710–4758, 5108).
+fn udta_bytes(covers: u64, chapters: &[Chapter<Ffmpeg>]) -> u64 {
+  let version = ffmpeg_next::format::version();
+  let digits = |value: u32| u64::from(value.checked_ilog10().map_or(1, |log| log + 1));
+  let name =
+    4 + digits(version >> 16) + 1 + digits((version >> 8) & 0xFF) + 1 + digits(version & 0xFF);
+  12 + 33 + 8 + 24 + name + covers + chpl_bytes(chapters)
+}
+
+/// The covers' `covr` in the movie's `ilst`, exactly, of each cover's
+/// bytes in the table's order (`mov_write_covr`, `movenc.c` 4815–4839): 8
+/// bytes where any holds a picture, and 16 a cover beside its picture's —
+/// an empty one skipped (4823).
+fn covr_bytes(covers: impl Iterator<Item = u64>) -> u64 {
+  covers.filter(|&bytes| bytes > 0).fold(0, |total, bytes| {
+    total + if total == 0 { 24 } else { 16 } + bytes
+  })
+}
+
+/// The Nero list in the movie's `udta`, exactly (`mov_write_chpl_tag`,
+/// `movenc.c` 5040–5064): of a table that holds chapters, 17 bytes, and of
+/// its first 255 each 9 and its title cut at 255 bytes.
+fn chpl_bytes(chapters: &[Chapter<Ffmpeg>]) -> u64 {
+  if chapters.is_empty() {
+    return 0;
+  }
+  17 + chapters
+    .iter()
+    .take(255)
+    .map(|chapter| {
+      9 + chapter
+        .title()
+        .map_or(0, |title| title.as_str().len().min(255)) as u64
+    })
+    .sum::<u64>()
 }
 
 /// A track's own boxes in the `moov` ([`TRAK_SLACK`]), of a file of
@@ -3765,6 +3847,19 @@ pub enum MuxOpenError {
     track: TrackIndex,
     /// What its packet breaks.
     rule: PayloadRule,
+  },
+  /// The MOV family's covers, whose movie `udta` would pass the dynamic
+  /// buffer of `INT_MAX` bytes movenc makes it in (R14b, ruled): its iTunes
+  /// metadata holds every cover (`mov_write_udta_tag`, `movenc.c`
+  /// 5066–5122; `mov_write_covr`, 4815–4839), the buffer refuses the writes
+  /// past it (`dyn_buf_write`, `aviobuf.c` 1281–1311), and the `covr` is
+  /// written cut, its sizes counting bytes the file lacks — the `udta`'s
+  /// size counted exactly ([`udta_bytes`]), the cover named the first of
+  /// the table's at which it passes.
+  #[error("cover track {} takes the covers past the movie metadata's buffer", .track.get())]
+  CoversTooLarge {
+    /// The track.
+    track: TrackIndex,
   },
   /// An attachment with no filename, which Matroska requires
   /// (`matroskaenc.c` 2538–2543 in FFmpeg 9.0.1).
@@ -8651,6 +8746,24 @@ where
     {
       return Err(MuxOpenError::ChapterSample { chapter });
     }
+    // The movie's `udta`, every cover in it, within the dynamic buffer
+    // movenc makes it in, counted exactly (R14b, letter 1, ruled): the
+    // cover at which it would pass refused, nothing written.
+    if audited.writes_covers() {
+      let mut covers = Vec::new();
+      for (index, (road, description)) in roads.iter().zip(&tracks).enumerate() {
+        if *road == Road::Cover
+          && let Some(file) = description.file()
+        {
+          covers.push(file.payload().data().as_ref().len() as u64);
+          if udta_bytes(covr_bytes(covers.iter().copied()), chapters) > bounds.user_data {
+            return Err(MuxOpenError::CoversTooLarge {
+              track: TrackIndex::new(index),
+            });
+          }
+        }
+      }
+    }
     // MP4's default selection, which needs the whole table (table E).
     let defaults_added = mp4_defaults_added(family, &tracks, &roads);
     // The MPEG program stream numbers its streams by codec from each
@@ -9158,28 +9271,15 @@ where
       .iter()
       .any(|state| state.moov.is_some())
       .then(|| {
-        let covers: Vec<u64> = roads
-          .iter()
-          .zip(&tracks)
-          .filter(|(road, _)| **road == Road::Cover)
-          .filter_map(|(_, description)| description.file())
-          .map(|file| 16 + file.payload().data().as_ref().len() as u64)
-          .collect();
-        let covers = if covers.is_empty() {
-          0
-        } else {
-          8 + covers.iter().sum::<u64>()
-        };
-        let titles = chapters
-          .iter()
-          .take(255)
-          .map(|chapter| {
-            9 + chapter
-              .title()
-              .map_or(0, |title| title.as_str().len().min(255)) as u64
-          })
-          .sum::<u64>();
-        let nero = if chapters.is_empty() { 0 } else { 17 + titles };
+        let covers = covr_bytes(
+          roads
+            .iter()
+            .zip(&tracks)
+            .filter(|(road, _)| **road == Road::Cover)
+            .filter_map(|(_, description)| description.file())
+            .map(|file| file.payload().data().as_ref().len() as u64),
+        );
+        let nero = chpl_bytes(chapters);
         let pssh = tracks
           .iter()
           .map(|description| {

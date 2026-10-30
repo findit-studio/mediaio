@@ -18248,3 +18248,112 @@ fn l154_the_moov_and_mfra_bounds_refuse_the_first_packet_past_them() {
     );
   }
 }
+
+/// `source`'s table and timed packets ([`copied_source`]), its cover's row
+/// again after them, of another reading of the file: two covers.
+fn two_covers(source: &Path) -> (Vec<Described>, Vec<DemuxedPacket<Ffmpeg, FfmpegBytes>>) {
+  let same = |_: usize, row: Described| row;
+  let (mut table, packets) = copied_source(source, &[], &same);
+  let (again, _) = copied_source(source, &[], &same);
+  table.push(
+    again
+      .into_iter()
+      .find(|row| row.file().is_some())
+      .expect("a cover"),
+  );
+  (table, packets)
+}
+
+/// The size of the movie `udta` FFmpeg wrote into `path`'s `moov`.
+fn written_udta(path: &Path) -> u64 {
+  let bytes = std::fs::read(path).expect("the file");
+  let (body, end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("a moov");
+  box_in(&bytes, (body, end), b"udta")
+    .expect("the movie's udta")
+    .2
+}
+
+/// **L155 — MP4 refuses at open the covers whose movie `udta` would pass
+/// its dynamic buffer, counted exactly** (R14b, letter 1, ruled;
+/// `mov_write_udta_tag`, `movenc.c` 5066–5122; `dyn_buf_write`, `aviobuf.c`
+/// 1281–1311): an MP3's cover twice and two chapters — the `udta` FFmpeg
+/// writes measured; its buffer lowered one byte below what it holds, the
+/// table refused by its second cover, nothing written; lowered to what it
+/// holds, the table taken and the same `udta` written. The bound is
+/// therefore the `udta`'s size to the byte: no larger, or the second would
+/// refuse, and no smaller, or the first would take. Two covers of the
+/// default packet budget's gibibyte pass `INT_MAX` (the unit law
+/// `the_movie_udta_of_two_gibibyte_covers_passes_its_buffer`).
+///
+/// PLANT: the Nero list left out of the count, the table one byte past
+/// taken; the check dropped, the same; the `covr`'s header counted twice,
+/// the table of exactly its bytes refused.
+#[test]
+fn l155_mp4_refuses_covers_past_the_movie_metadatas_buffer() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.cover_art_mp3();
+  let chapters: Vec<Chapter<Ffmpeg>> = (0..2)
+    .map(|index| {
+      chapter_of(
+        index,
+        index * 100,
+        index * 100 + 100,
+        Some("a chapter's title"),
+      )
+    })
+    .collect();
+  let open = |name: &str, bound: Option<u64>| {
+    let (table, packets) = two_covers(&source);
+    let second = TrackIndex::new(table.len() - 1);
+    let target = output(&corpus, name);
+    let options = bound.map_or_else(MuxOptions::new, |bytes| {
+      MuxOptions::new().with_lowered_user_data_bound(bytes)
+    });
+    let opened = FfmpegOwnedMuxer::open_with(
+      File::create(&target).expect("create"),
+      ContainerName::MP4,
+      table,
+      &chapters,
+      options,
+    );
+    (target, second, packets, opened)
+  };
+  let write =
+    |name: &str,
+     packets: Vec<DemuxedPacket<Ffmpeg, FfmpegBytes>>,
+     opened: Result<(FfmpegOwnedMuxer<File>, mediaencode_ffmpeg::MuxReport), MuxOpenError>| {
+      let (mut muxer, _) = opened.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+      for packet in packets {
+        muxer
+          .write_packet(packet)
+          .map_err(|error| error.map_packet(drop))
+          .expect("a packet");
+      }
+      muxer.finish().expect("finished");
+    };
+  // What FFmpeg writes.
+  let (target, _, packets, opened) = open("l155.mp4", None);
+  write("l155.mp4", packets, opened);
+  let udta = written_udta(&target);
+  let held = udta - 8;
+  let bytes = std::fs::read(&target).expect("the file");
+  let pictures = bytes.windows(4).filter(|window| window == b"data").count();
+  assert!(pictures >= 2, "both covers in the covr");
+  // One byte below what it holds: refused by the second cover.
+  let (refused, second, _, opened) = open("l155-refused.mp4", Some(held - 1));
+  match opened {
+    Err(MuxOpenError::CoversTooLarge { track }) => {
+      assert_eq!(track, second, "the cover at which it passes")
+    }
+    other => panic!("expected CoversTooLarge, got {:?}", other.map(|_| ())),
+  }
+  assert_eq!(
+    std::fs::metadata(&refused).expect("the sink").len(),
+    0,
+    "nothing written"
+  );
+  // What it holds: taken, the same udta.
+  let (taken, _, packets, opened) = open("l155-taken.mp4", Some(held));
+  write("l155-taken.mp4", packets, opened);
+  assert_eq!(written_udta(&taken), udta, "the same udta");
+}
