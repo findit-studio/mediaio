@@ -1436,13 +1436,22 @@ struct Split<'a> {
 /// of more bits than `init_get_bits` takes. Its padding, small or not,
 /// changes no unit it splits, only whether libavcodec copies one that holds
 /// no emulation prevention byte. Walked once to judge it, then again for
-/// its units, nothing held.
-fn h2645_split(bytes: &[u8], units: Units) -> Option<H2645Split<'_>> {
+/// its units, nothing held. Where `limits` are given — the split of no
+/// small padding `ff_isom_write_lvcc` asks for — what it allocates by its
+/// input's sizes fails it past them ([`SplitLimits`]).
+fn h2645_split(bytes: &[u8], units: Units, limits: Option<SplitLimits>) -> Option<H2645Split<'_>> {
+  if limits.is_some_and(|limits| bytes.len() > limits.bytes) {
+    return None;
+  }
   let split = H2645Split {
     bytes,
     units,
     at: 0,
     kept: false,
+    limits,
+    kept_units: 0,
+    slots: 0,
+    positions: 0,
   };
   let mut judged = split;
   loop {
@@ -1462,6 +1471,84 @@ struct H2645Split<'a> {
   at: usize,
   /// Whether a unit is kept so far.
   kept: bool,
+  /// What the split allocates is held to, where mirrored.
+  limits: Option<SplitLimits>,
+  /// `nb_nals`: the units kept so far.
+  kept_units: u64,
+  /// `nals_allocated`: the slots of the unit list so far.
+  slots: u64,
+  /// `skipped_bytes_pos_size` of the slot the next unit is split into.
+  positions: u64,
+}
+
+/// `MAX_MBPAIR_SIZE` (`h2645_parse.h` 32): the padding a split of no small
+/// padding allocates its RBSP buffer with.
+const MAX_MBPAIR_SIZE: usize = 256 * 1024;
+
+/// `GetBitContext`, libavcodec's uncached bit reader (`get_bits.h`
+/// 109–114 in FFmpeg 9.0.1), mirrored for its size alone.
+#[repr(C)]
+#[allow(dead_code)]
+struct GetBitContext {
+  buffer: *const u8,
+  index: i32,
+  size_in_bits: i32,
+  size_in_bits_plus8: i32,
+}
+
+/// `H2645NAL`, a split's unit (`h2645_parse.h` 34–72 in FFmpeg 9.0.1),
+/// mirrored for its size alone, which the target's C layout sets: 88
+/// bytes of a 64-bit target.
+#[repr(C)]
+#[allow(dead_code)]
+struct H2645Nal {
+  data: *const u8,
+  size: i32,
+  size_bits: i32,
+  raw_size: i32,
+  raw_data: *const u8,
+  gb: GetBitContext,
+  kind: i32,
+  ref_idc: i32,
+  temporal_id: i32,
+  nuh_layer_id: i32,
+  skipped_bytes: i32,
+  skipped_bytes_pos_size: i32,
+  skipped_bytes_pos: *mut i32,
+}
+
+/// What `ff_h2645_packet_split` of no small padding allocates by its
+/// input's sizes, each refused past libavutil's `INT_MAX` and the split
+/// failed (R20, r2: `ff_isom_write_lvcc`'s split, `lcevc.c` 270, whose
+/// failure MP4 discards, the `lvcC` written empty): its RBSP buffer, the
+/// configuration's bytes, `MAX_MBPAIR_SIZE` and the padding
+/// (`alloc_rbsp_buffer`, `h2645_parse.c` 480–486; 534–540); its unit
+/// list, a slot a unit, the next one asked for before each unit after a
+/// kept one and the first (590–607); and each slot's emulation prevention
+/// positions, `int`s, at first `min(1024, b / 3 + 1)` of the `b` bytes left
+/// from the unit that asks for the slot, doubled as a unit's emulation
+/// prevention bytes outrun them (`ff_h2645_extract_rbsp`, 112–125). Each
+/// exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SplitLimits {
+  /// The most bytes split: `INT_MAX` less the padding and
+  /// `MAX_MBPAIR_SIZE`.
+  pub(super) bytes: usize,
+  /// The slot count asked for that is refused, and every one past it:
+  /// `INT_MAX` over an `H2645NAL`'s bytes (594).
+  pub(super) slots: u64,
+  /// The most bytes a slot's positions take: libavutil's `INT_MAX`
+  /// (`av_reallocp_array`).
+  pub(super) positions: u64,
+}
+
+impl SplitLimits {
+  /// libavcodec's and libavutil's own.
+  pub(super) const REAL: Self = Self {
+    bytes: i32::MAX as usize - 64 - MAX_MBPAIR_SIZE,
+    slots: (i32::MAX as usize / core::mem::size_of::<H2645Nal>()) as u64,
+    positions: i32::MAX as u64,
+  };
 }
 
 impl<'a> H2645Split<'a> {
@@ -1481,8 +1568,29 @@ impl<'a> H2645Split<'a> {
         return if self.kept { Ok(None) } else { Err(()) };
       }
       let start = self.at;
+      // The unit's slot, where the list asks for a new one (590–607).
+      if let Some(limits) = self.limits
+        && self.slots == self.kept_units
+      {
+        if self.kept_units + 1 >= limits.slots {
+          return Err(());
+        }
+        self.slots = self.kept_units + 1;
+        self.positions = 1024.min((length - start) as u64 / 3 + 1);
+      }
       self.at += extract_rbsp_len(&bytes[start..]);
       let raw = &bytes[start..self.at];
+      // Its emulation prevention bytes' positions, each doubling of their
+      // room asked for of libavutil (112–125).
+      if let Some(limits) = self.limits {
+        let count = skipped(raw).count() as u64;
+        while count > self.positions {
+          self.positions *= 2;
+          if self.positions * 4 > limits.positions {
+            return Err(());
+          }
+        }
+      }
       let rbsp = Bytes::rbsp(raw, 0);
       let skip_trailing_zeros = bytes.get(self.at..self.at + 4) != Some(&[0, 0, 1, 0xE0][..]);
       let bits = bit_length(
@@ -1540,6 +1648,7 @@ impl<'a> H2645Split<'a> {
         }
       };
       self.kept = true;
+      self.kept_units += 1;
       return Ok(Some(Split {
         raw,
         rbsp,
@@ -1645,7 +1754,7 @@ impl<'a> Extracted<'a> {
   #[cfg(test)]
   pub(super) fn bytes(self) -> Vec<u8> {
     let kept = self.kept;
-    h2645_split(self.bytes, self.units)
+    h2645_split(self.bytes, self.units, None)
       .into_iter()
       .flatten()
       .filter(|unit| kept.contains(&unit.kind))
@@ -1660,7 +1769,7 @@ impl<'a> Extracted<'a> {
   /// drop.
   fn units(self) -> impl Iterator<Item = &'a [u8]> {
     let kept = self.kept;
-    h2645_split(self.bytes, self.units)
+    h2645_split(self.bytes, self.units, None)
       .into_iter()
       .flatten()
       .filter(move |unit| kept.contains(&unit.kind))
@@ -1685,7 +1794,7 @@ impl<'a> Extracted<'a> {
 /// start code, where an SPS is among them, and for HEVC a VPS; read in
 /// place, never made (R15).
 pub(super) fn h2645_extracted(units: Units, bytes: &[u8]) -> Result<Option<Extracted<'_>>, ()> {
-  let split = h2645_split(bytes, units).ok_or(())?;
+  let split = h2645_split(bytes, units, None).ok_or(())?;
   let (kept, sps, vps): (&'static [u8], u8, Option<u8>) = match units {
     Units::Vvc => (&[14, 15, 16], 15, None),
     Units::Hevc => (&[32, 33, 34], 33, Some(32)),
@@ -1844,19 +1953,25 @@ fn lcevc_picture(bits: &mut Reader<'_>) -> bool {
 /// What `ff_isom_write_lvcc` does with an LCEVC configuration (`lcevc.c`
 /// 251–339 in FFmpeg 9.0.1): at most 6 bytes refused; one opening on no
 /// start code — an `lvcC` — written as it is; else its units split as
-/// libavcodec splits them, of no small padding, refused where that fails;
-/// every IDR and non-IDR unit written through `write_nalu`
-/// ([`lcevc_unit`]), refused where it refuses one of no sequence or global
-/// configuration, its 16-bit length cut past 65 535; none at all refused;
-/// the counts of each, 16 bits, wrapped past 65 535.
+/// libavcodec splits them, of no small padding, refused where that fails —
+/// what the split allocates by the configuration's sizes among it
+/// ([`SplitLimits`]; R20, r2); every IDR and non-IDR unit written through
+/// `write_nalu` ([`lcevc_unit`]), refused where it refuses one of no
+/// sequence or global configuration, its 16-bit length cut past 65 535;
+/// none at all refused; the counts of each, 16 bits, wrapped past 65 535.
 pub(super) fn lvcc(config: &[u8]) -> Wrote {
+  lvcc_within(config, SplitLimits::REAL)
+}
+
+/// [`lvcc`], its split held to `limits`: the laws' seam.
+pub(super) fn lvcc_within(config: &[u8], limits: SplitLimits) -> Wrote {
   if config.len() <= 6 {
     return Wrote::Failed;
   }
   if !annex_b(config) {
     return Wrote::Whole;
   }
-  let Some(split) = h2645_split(config, Units::Lcevc) else {
+  let Some(split) = h2645_split(config, Units::Lcevc, Some(limits)) else {
     return Wrote::Failed;
   };
   let (mut idr, mut other, mut cut) = (0_usize, 0_usize, false);
@@ -1962,6 +2077,88 @@ pub(super) fn dvc1(config: &[u8]) -> Wrote {
     start = next;
   }
   if found { Wrote::Whole } else { Wrote::Failed }
+}
+
+/// The bits past which `init_get_bits`'s `int` count of a VC-1 unit's
+/// bytes, eight a byte, wraps: `2^28` bytes (`movenc.c` 1134–1135).
+pub(super) const VC1_UNIT_BYTES_WRAP: usize = 1 << 28;
+
+/// Whether `mov_write_dvc1_structs` reads a unit of the VC-1
+/// configuration `config` past what its reader holds (R20, r2; `movenc.c`
+/// 1102–1184): between its markers — as [`dvc1`] finds them — each unit is
+/// unescaped into a buffer of the configuration's size
+/// (`vc1_unescape_buffer`, `vc1_common.h` 70–88) and its bits counted
+/// `8 * size` in an `int` for `init_get_bits` (`get_bits.h` 517–534): a
+/// unit of `wrap` bytes or more — [`VC1_UNIT_BYTES_WRAP`] — its count
+/// wrapped, the length undefined; a sequence header of more than `reader`
+/// bytes — [`GET_BITS_BYTES_MAX`], past which `init_get_bits` answers a
+/// reader of no buffer, unchecked — its fields read through that null
+/// pointer (1137–1149). Each unit's bytes counted unescaped, exactly.
+pub(super) fn dvc1_reads_past(config: &[u8], reader: usize, wrap: usize) -> bool {
+  let len = config.len();
+  let marker = |from: usize| -> usize {
+    if len < from.saturating_add(4) {
+      return len;
+    }
+    (from..=len - 4)
+      .find(|&at| config[at] == 0 && config[at + 1] == 0 && config[at + 2] == 1)
+      .unwrap_or(len)
+  };
+  let mut start = marker(0);
+  while start < len {
+    let next = marker(start + 4);
+    let size = next.saturating_sub(start + 4);
+    if size > 0 {
+      let sequence = u32::from_be_bytes([
+        config[start],
+        config[start + 1],
+        config[start + 2],
+        config[start + 3],
+      ]) == VC1_SEQUENCE_HEADER;
+      // Fewer bytes than either bound are fewer unescaped: counted only
+      // past.
+      if size >= reader.min(wrap) {
+        let unescaped = vc1_unescaped_len(&config[start + 4..next]);
+        if unescaped >= wrap || (sequence && unescaped > reader) {
+          return true;
+        }
+      }
+      // A sequence header of another profile than the advanced one ends
+      // the walk, its first byte its own (1137–1141).
+      if sequence && config[start + 4] >> 6 != 3 {
+        return false;
+      }
+    }
+    start = next;
+  }
+  false
+}
+
+/// The bytes `vc1_unescape_buffer` makes of `unit` (`vc1_common.h`
+/// 70–88): a `3` after two zeros and before a byte below 4 dropped, from
+/// its third byte to its last but one; a unit of fewer than 4 bytes as it
+/// is.
+fn vc1_unescaped_len(unit: &[u8]) -> usize {
+  let size = unit.len();
+  if size < 4 {
+    return size;
+  }
+  let (mut i, mut dropped) = (0, 0);
+  while i < size {
+    if unit[i] == 3
+      && i >= 2
+      && unit[i - 1] == 0
+      && unit[i - 2] == 0
+      && i < size - 1
+      && unit[i + 1] < 4
+    {
+      dropped += 1;
+      i += 2;
+    } else {
+      i += 1;
+    }
+  }
+  size - dropped
 }
 
 /// The PBU types of a frame, each its own entry of APV's `apvC`

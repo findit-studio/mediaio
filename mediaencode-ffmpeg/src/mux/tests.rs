@@ -1249,6 +1249,8 @@ fn eac3_track(frame_size: i32) -> TrackState {
     bytes: 0,
     place: 0,
     avi_frames: 0,
+    ts_held: 0,
+    ts_trim: Some(0),
     mp4_place: None,
     mp4_samples: 0,
     mp4_entries: 0,
@@ -5114,4 +5116,323 @@ fn avis_counts_and_flvs_sequence_header_hold_their_bits() {
     super::records::avcc_written_len(&high),
     6 + (2 + 5) + 1 + (2 + 3) + 4
   );
+}
+
+/// The configuration writers' Annex B rewrite is judged where they make it
+/// (R20, r2): the MOV family's, FLV's and Matroska's H.264, HEVC and VVC
+/// writers, each of the configuration it reaches the rewrite of — H.264's
+/// of more than 6 bytes, HEVC's and VVC's of 6 or more — its bytes each
+/// unit behind a 4-byte length, against the bound; no other codec's or
+/// container's, nor a record of its own form.
+#[test]
+fn configuration_rewrites_are_held_where_their_writers_make_them() {
+  assert_eq!(super::Bounds::REAL.rewrite, i32::MAX as u64 - 64);
+  let mp4 = (Family::Mp4, Audited::Mov(MovMode::Mp4));
+  let flv = (Family::Other, Audited::Flv);
+  let mkv = (Family::Matroska, Audited::Matroska);
+  // A 4-byte start code, then a 3-byte one: 13 bytes rewritten of 12.
+  let units = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3];
+  for family in [mp4, flv, mkv] {
+    for codec in [CodecId::H264, CodecId::HEVC, CodecId::VVC] {
+      assert!(
+        super::rewrite_cut(family, codec, &units, 12),
+        "{family:?} {codec:?}: a byte below"
+      );
+      assert!(
+        !super::rewrite_cut(family, codec, &units, 13),
+        "{family:?} {codec:?}: at it"
+      );
+    }
+    assert!(
+      !super::rewrite_cut(family, CodecId::AV1, &units, 0),
+      "AV1's none"
+    );
+  }
+  assert!(
+    !super::rewrite_cut((Family::Other, Audited::MpegTs), CodecId::H264, &units, 0),
+    "MPEG-TS writes no record"
+  );
+  let avcc = [1, 0x64, 0, 0x1F, 0xFF, 0xE1, 0, 2, 0x67, 0x64];
+  assert!(
+    !super::rewrite_cut(mp4, CodecId::H264, &avcc, 0),
+    "an avcC as it is"
+  );
+  let six = [0, 0, 1, 0x67, 1, 2];
+  assert!(
+    !super::rewrite_cut(mp4, CodecId::H264, &six, 0),
+    "H.264's of 6 bytes refused first"
+  );
+  assert!(
+    super::rewrite_cut(mp4, CodecId::HEVC, &six, 0),
+    "HEVC's of 6 rewritten"
+  );
+  assert!(
+    super::rewrite_cut(mp4, CodecId::VVC, &six, 0),
+    "VVC's of 6 rewritten"
+  );
+  assert!(
+    !super::rewrite_cut(mp4, CodecId::HEVC, &six[..5], 0),
+    "of 5 refused first"
+  );
+}
+
+/// The MOV family's `esds` is counted where it writes one (R20, r2): an
+/// entry of `mp4v` or `mp4a`, MOV's AAC through its `wave`, MOV's MPEG-4
+/// Part 2 of its own tag where that is `mp4v` or none — not another tag's,
+/// written with a `glbl`; DVD subtitles' holds the palette, not their
+/// configuration.
+#[test]
+fn an_esds_is_counted_where_the_mov_family_writes_one() {
+  use super::{MovMode as M, esds_carries};
+  assert_eq!(super::Bounds::REAL.descriptor, (1 << 28) - 1);
+  let mp4v = u32::from_le_bytes(*b"mp4v");
+  let xvid = u32::from_le_bytes(*b"XVID");
+  let mov = |mode| Audited::Mov(mode);
+  assert!(esds_carries(mov(M::Mp4), CodecId::AAC, 0));
+  assert!(
+    esds_carries(mov(M::Mp4), CodecId::MP3, 0),
+    "MP4's MP3, mp4a"
+  );
+  assert!(
+    esds_carries(mov(M::Mp4), CodecId::MJPEG, 0),
+    "MP4's MJPEG, mp4v"
+  );
+  assert!(!esds_carries(mov(M::Mp4), CodecId::H264, 0), "an avcC");
+  assert!(
+    !esds_carries(mov(M::Mp4), CodecId::DVD_SUBTITLE, 0),
+    "the palette's"
+  );
+  assert!(esds_carries(mov(M::Ipod), CodecId::MPEG4, 0));
+  assert!(esds_carries(mov(M::Ism), CodecId::AAC, 0));
+  assert!(!esds_carries(mov(M::F4v), CodecId::MP3, 0), "F4V's .mp3");
+  assert!(esds_carries(mov(M::Mov), CodecId::AAC, xvid), "MOV's wave");
+  assert!(
+    esds_carries(mov(M::Mov), CodecId::MPEG4, 0),
+    "mp4v, its first"
+  );
+  assert!(esds_carries(mov(M::Mov), CodecId::MPEG4, mp4v));
+  assert!(!esds_carries(mov(M::Mov), CodecId::MPEG4, xvid), "a glbl");
+  assert!(!esds_carries(mov(M::Avif), CodecId::AV1, 0));
+  assert!(!esds_carries(Audited::Matroska, CodecId::AAC, 0));
+}
+
+/// A VC-1 unit's bits are counted where their `int` wraps, and a sequence
+/// header's where its reader stops (R20, r2): each unit's bytes unescaped,
+/// a `3` after two zeros and before a byte below 4 dropped; a unit of the
+/// wrap's bytes or more past it, of any type; a sequence header past the
+/// reader's; and a sequence header of another profile than the advanced
+/// one ends the walk.
+#[test]
+fn a_vc1_units_bits_are_counted_where_their_int_wraps() {
+  use records::{GET_BITS_BYTES_MAX, VC1_UNIT_BYTES_WRAP, dvc1_reads_past};
+  assert_eq!(VC1_UNIT_BYTES_WRAP, 1 << 28);
+  // `init_get_bits` takes eight bits a byte of the most, refuses a byte's
+  // more (`get_bits.h` 522).
+  let limit = i64::from(i32::MAX) - 512;
+  assert!((GET_BITS_BYTES_MAX as i64) * 8 < limit);
+  assert!((GET_BITS_BYTES_MAX as i64 + 1) * 8 >= limit);
+  assert_eq!(
+    super::Bounds::REAL.reader,
+    GET_BITS_BYTES_MAX as u64,
+    "the reader's"
+  );
+  let wrap = 1 << 28;
+  let header = [0, 0, 1, 0x0F, 0xC8, 0x0A];
+  assert!(!dvc1_reads_past(&header, 2, wrap));
+  assert!(dvc1_reads_past(&header, 1, wrap));
+  let escaped = [0, 0, 1, 0x0F, 0xC8, 0x0A, 0, 0, 3, 1, 0x0A];
+  assert!(!dvc1_reads_past(&escaped, 6, wrap), "its escape dropped");
+  assert!(dvc1_reads_past(&escaped, 5, wrap));
+  // An entry point of four bytes, its bits' count past a wrap of four.
+  let entry = [0, 0, 1, 0x0E, 0x48, 0x80, 0x11, 0x22];
+  assert!(dvc1_reads_past(&entry, 0, 4), "any unit's count");
+  assert!(!dvc1_reads_past(&entry, 0, 5), "no sequence header read");
+  // A simple profile's sequence header ends the walk; an advanced one's
+  // goes on to the entry point.
+  let walk = |profile: u8| [&[0, 0, 1, 0x0F, profile, 0x0A][..], &entry].concat();
+  assert!(!dvc1_reads_past(&walk(0x08), 2, 4), "the walk ended");
+  assert!(dvc1_reads_past(&walk(0xC8), 2, 4), "the walk went on");
+  assert!(
+    dvc1_reads_past(&walk(0x08), 1, 4),
+    "read before its profile"
+  );
+}
+
+/// LCEVC's split is held to what libavcodec allocates of it (R20, r2): its
+/// RBSP buffer, the configuration's bytes and `MAX_MBPAIR_SIZE` and the
+/// padding, within `INT_MAX`; its unit list, a slot asked for each unit
+/// after a kept one, refused at `INT_MAX` over an `H2645NAL`'s bytes; and
+/// each slot's emulation prevention positions, 1024 at first, doubled as a
+/// unit's outrun them, their bytes within `INT_MAX` — `2^28` at most.
+#[test]
+fn lcevcs_split_is_held_to_what_libavcodec_allocates() {
+  use records::{SplitLimits, Wrote, lvcc_within};
+  let real = SplitLimits::REAL;
+  assert_eq!(real.bytes, i32::MAX as usize - 64 - 256 * 1024);
+  #[cfg(target_pointer_width = "64")]
+  assert_eq!(real.slots, i32::MAX as u64 / 88, "an H2645NAL of 88 bytes");
+  assert_eq!(real.positions, i32::MAX as u64);
+  let mut positions = 1024_u64;
+  while positions * 2 * 4 <= real.positions {
+    positions *= 2;
+  }
+  assert_eq!(positions, 1 << 28, "the most a unit's positions hold");
+  let sequence: &[u8] = &[0x20, 0x11];
+  let global: &[u8] = &[0x41, 17 << 1, 0x40];
+  let idr = lcevc_unit_of(29, &[sequence, global]);
+  let other = lcevc_unit_of(1, &[sequence]);
+  let config = start_coded(&[&idr, &other, &other]);
+  let within = |limits: SplitLimits| lvcc_within(&config, limits);
+  assert_eq!(within(real), Wrote::Whole, "the premise");
+  assert_eq!(
+    within(SplitLimits {
+      bytes: config.len(),
+      ..real
+    }),
+    Wrote::Whole
+  );
+  assert_eq!(
+    within(SplitLimits {
+      bytes: config.len() - 1,
+      ..real
+    }),
+    Wrote::Failed
+  );
+  // Three units kept, the third's slot the third asked for.
+  assert_eq!(within(SplitLimits { slots: 4, ..real }), Wrote::Whole);
+  assert_eq!(within(SplitLimits { slots: 3, ..real }), Wrote::Failed);
+  // A unit of 1025 emulation prevention bytes: its slot's 1024 positions
+  // doubled to 2048, 8192 bytes.
+  let escapes: Vec<u8> = (0..1025).flat_map(|_| [0, 0, 3, 0x11]).collect();
+  let escaped = [&[0x40 | (1 << 1) | 1, 0xFF][..], &escapes, &[0x80]].concat();
+  let config = start_coded(&[&idr, &escaped]);
+  let within = |limits: SplitLimits| lvcc_within(&config, limits);
+  assert_eq!(within(real), Wrote::Whole);
+  assert_eq!(
+    within(SplitLimits {
+      positions: 2048 * 4,
+      ..real
+    }),
+    Wrote::Whole
+  );
+  assert_eq!(
+    within(SplitLimits {
+      positions: 2048 * 4 - 1,
+      ..real
+    }),
+    Wrote::Failed
+  );
+}
+
+/// MPEG-TS reads a unit's type as its start code search leaves it, and
+/// adds a delimiter and the configuration as it reads them (R20, r2):
+/// `avpriv_find_start_code` past the byte after each start code, its state
+/// the four bytes before; H.264's delimiter added, or moved before the
+/// configuration where the picture has its own; an SPS before dropping the
+/// configuration; HEVC's configuration only before a random access
+/// picture; VVC's first type read as 0, a delimiter of its own among them.
+#[test]
+fn mpeg_ts_reads_a_units_type_as_its_start_code_search_leaves_it() {
+  use super::{TsVideo, find_start_code, ts_extradd, ts_prefixed_bytes};
+  let bytes = [0, 0, 0, 1, 0x65, 0x88, 0, 0, 1, 0x41, 0x9A];
+  let mut state = u32::MAX;
+  let at = find_start_code(&bytes, 0, &mut state);
+  assert_eq!((at, state), (5, 0x0000_0165));
+  let at = find_start_code(&bytes, at, &mut state);
+  assert_eq!((at, state), (10, 0x0000_0141));
+  assert_eq!(find_start_code(&bytes, at, &mut state), 11, "the end");
+  let config = 20;
+  let idr = [0, 0, 0, 1, 0x65, 0x88, 0x84];
+  assert_eq!(
+    ts_prefixed_bytes(TsVideo::H264, &idr, true, config),
+    7 + 6 + 20
+  );
+  assert_eq!(ts_prefixed_bytes(TsVideo::H264, &idr, false, config), 7 + 6);
+  let delimited = [0, 0, 0, 1, 9, 0xF0, 0, 0, 0, 1, 0x65, 0x88, 0x84];
+  assert_eq!(
+    ts_prefixed_bytes(TsVideo::H264, &delimited, true, config),
+    13 + 1 + 20,
+    "moved"
+  );
+  assert_eq!(
+    ts_prefixed_bytes(TsVideo::H264, &delimited, false, config),
+    13
+  );
+  let with_sps = [0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x65, 0x88, 0x84];
+  assert_eq!(
+    ts_prefixed_bytes(TsVideo::H264, &with_sps, true, config),
+    13 + 6
+  );
+  let hevc = |kind: u8| [0, 0, 0, 1, kind << 1, 1, 0xAF];
+  assert_eq!(
+    ts_prefixed_bytes(TsVideo::Hevc, &hevc(19), true, config),
+    7 + 7 + 20
+  );
+  assert_eq!(
+    ts_prefixed_bytes(TsVideo::Hevc, &hevc(1), true, config),
+    7 + 7
+  );
+  assert_eq!(ts_prefixed_bytes(TsVideo::Hevc, &hevc(35), true, config), 7);
+  let vvc_delimiter = [0, 0, 0, 1, 0, (20 << 3) | 1, 0x80];
+  assert_eq!(
+    ts_prefixed_bytes(TsVideo::Vvc, &vvc_delimiter, true, config),
+    7 + 7 + 20,
+    "VVC's first type read as 0"
+  );
+  assert_eq!(ts_extradd(&[0, 0, 0, 1, 0x67]), 5);
+  assert_eq!(ts_extradd(&[0, 0, 1, 0x67]), 4);
+  assert_eq!(ts_extradd(&[0]), 1, "read on into the padding's zeros");
+  assert_eq!(ts_extradd(&[0, 0, 2]), 0);
+  assert_eq!(ts_extradd(&[1, 0x64, 0]), 0, "an avcC");
+  assert_eq!(ts_extradd(&[]), 0);
+}
+
+/// Opus's control header is counted with its trims (R20, r2): two bytes, a
+/// byte for each 255 of the packet and one more; two while a start trim is
+/// left — taken as left where its count wrapped — the packet's samples
+/// trimmed off it; two for an end trim its side data makes, of 32
+/// unsigned bits; none for a packet of its own control header.
+#[test]
+fn opus_control_headers_are_counted_with_their_trims() {
+  use super::{opus_control_bytes, opus_ts_end_trim, opus_ts_samples, opus_ts_trim};
+  // Hybrid fullband, 20 ms, code 0: 960 samples.
+  let mut packet = vec![15 << 3];
+  packet.resize(300, 0x11);
+  assert_eq!(opus_ts_samples(&packet), 960);
+  assert_eq!(opus_ts_samples(&[(15 << 3) | 3, 3]), 2880);
+  assert_eq!(opus_ts_samples(&[(15 << 3) | 3, 7]), 0, "past 120 ms");
+  assert_eq!(opus_ts_samples(&[(15 << 3) | 3]), 0, "no count byte");
+  assert_eq!(opus_control_bytes(&packet, Some(0), false), (304, Some(0)));
+  assert_eq!(
+    opus_control_bytes(&packet, Some(312), false),
+    (306, Some(0))
+  );
+  assert_eq!(
+    opus_control_bytes(&packet, Some(2000), false),
+    (306, Some(1040))
+  );
+  assert_eq!(opus_control_bytes(&packet, None, false), (306, None));
+  assert_eq!(opus_control_bytes(&packet, Some(0), true), (306, Some(0)));
+  let own = [0x7F, 0xE0, 0x11];
+  assert_eq!(opus_control_bytes(&own, Some(312), true), (3, Some(312)));
+  assert_eq!(opus_ts_trim(312, 48_000), Some(312));
+  assert_eq!(opus_ts_trim(44_739, 48_000), Some(44_739));
+  assert_eq!(opus_ts_trim(44_740, 48_000), None, "its int wrapped");
+  let skip = |end: u32| {
+    let mut data = vec![0; 10];
+    data[4..8].copy_from_slice(&end.to_le_bytes());
+    data
+  };
+  assert!(!opus_ts_end_trim(Some(&skip(0)), 48_000));
+  assert!(opus_ts_end_trim(Some(&skip(1)), 48_000));
+  assert!(opus_ts_end_trim(Some(&skip(89_478)), 48_000));
+  assert!(
+    !opus_ts_end_trim(Some(&skip(89_479)), 48_000),
+    "its 32 bits wrapped below the rate"
+  );
+  assert!(
+    !opus_ts_end_trim(Some(&skip(1)[..9]), 48_000),
+    "of fewer than 10 bytes"
+  );
+  assert!(!opus_ts_end_trim(None, 48_000));
 }

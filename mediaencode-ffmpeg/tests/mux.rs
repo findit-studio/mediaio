@@ -20989,3 +20989,675 @@ fn l173_a_write_that_failed_is_not_gone_on_from() {
     );
   }
 }
+
+/// The read-back configuration of `path`'s first track of `kind`: the
+/// record its writer made.
+fn record_of(path: &Path, kind: TrackKind) -> Vec<u8> {
+  let (table, _) = first_track(path, kind, 0);
+  stream_extradata_of(&table[0])
+}
+
+/// **L174 — a configuration's Annex B rewrite is held to its buffer**
+/// (R20, r2, ruled: a length that wraps is refused, under the budget the
+/// caller raises, `CodecTicket::mirror_with`): MP4's, FLV's and
+/// Matroska's H.264 writer rewrites an Annex B configuration, each unit
+/// behind a 4-byte length, into a dynamic buffer of `INT_MAX` with its
+/// padding, cut past it (`ff_nal_parse_units_buf`, `nal.c` 133–144;
+/// `avc.c` 50). Of a configuration whose SPS opens on a 4-byte start code
+/// and whose PPS on a 3-byte one — its rewrite a byte longer than it —
+/// each writer's record reads back the same at a bound of the rewrite's
+/// bytes; a byte below, the track is refused by name, nothing written.
+///
+/// PLANT: the rewrite unjudged, judged a byte early, or not FLV's.
+#[test]
+fn l174_a_configurations_annex_b_rewrite_is_held_to_its_buffer() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, frames, sps, pps) = h264_fixture(&corpus);
+  assert!(
+    sps.last() != Some(&0) && pps.last() != Some(&0),
+    "the premise: units of no trailing zero"
+  );
+  let config = [&[0, 0, 0, 1][..], &sps, &[0, 0, 1], &pps].concat();
+  // Each unit behind a 4-byte length: a byte more than the 3-byte start
+  // code it replaces.
+  let rewritten = (4 + sps.len() + 4 + pps.len()) as u64;
+  assert_eq!(
+    rewritten,
+    config.len() as u64 + 1,
+    "the premise: a byte longer"
+  );
+  for (container, extension) in [
+    (ContainerName::MP4, "mp4"),
+    (ContainerName::new("flv"), "flv"),
+    (ContainerName::MATROSKA, "mkv"),
+  ] {
+    let open = |name: &str, bound: Option<u64>| {
+      let target = output(&corpus, &format!("{name}.{extension}"));
+      let options = bound.map_or_else(MuxOptions::new, |bytes| {
+        MuxOptions::new().with_lowered_rewrite_bound(bytes)
+      });
+      let opened = FfmpegOwnedMuxer::open_with(
+        File::create(&target).expect("create"),
+        container.clone(),
+        vec![restated(
+          &row,
+          ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+          &config,
+          None,
+          None,
+        )],
+        &[],
+        options,
+      );
+      (target, opened)
+    };
+    let record = |name: &str, bound: Option<u64>| {
+      let (target, opened) = open(name, bound);
+      let (mut muxer, _) = opened.unwrap_or_else(|error| panic!("{name}.{extension}: {error:?}"));
+      for frame in &frames {
+        muxer
+          .write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone()))
+          .map_err(|error| error.map_packet(drop))
+          .unwrap_or_else(|error| panic!("{name}.{extension}: {error:?}"));
+      }
+      muxer
+        .finish()
+        .unwrap_or_else(|error| panic!("{name}.{extension}: {error:?}"));
+      record_of(&target, TrackKind::Video)
+    };
+    let written = record("l174", None);
+    assert_eq!(written[0], 1, "{extension}: the premise, an avcC read back");
+    assert_eq!(
+      record("l174-at", Some(rewritten)),
+      written,
+      "{extension}: at the bound, the same record"
+    );
+    let (refused, opened) = open("l174-below", Some(rewritten - 1));
+    match opened {
+      Err(MuxOpenError::ConfigurationInvalid { track, codec }) => {
+        assert_eq!(track, TrackIndex::new(0), "{extension}");
+        assert_eq!(codec, CodecId::H264, "{extension}");
+      }
+      other => panic!(
+        "{extension}: expected ConfigurationInvalid, got {:?}",
+        other.map(|_| ())
+      ),
+    }
+    assert_eq!(
+      std::fs::metadata(&refused).expect("the sink").len(),
+      0,
+      "{extension}: nothing written"
+    );
+  }
+}
+
+/// The `esds` box `path` holds, and its ES descriptor's length as its four
+/// bytes of seven bits read (`put_descr`, `movenc.c` 694–701).
+fn esds_of(path: &Path) -> (u32, Vec<u8>) {
+  let bytes = std::fs::read(path).expect("the file");
+  let at = bytes
+    .windows(4)
+    .position(|window| window == b"esds")
+    .expect("an esds");
+  let size = u32::from_be_bytes([bytes[at - 4], bytes[at - 3], bytes[at - 2], bytes[at - 1]]);
+  let whole = bytes[at - 4..at - 4 + size as usize].to_vec();
+  assert_eq!(bytes[at + 8], 0x03, "the ES descriptor's tag");
+  let length = bytes[at + 9..at + 13]
+    .iter()
+    .fold(0_u32, |length, byte| length << 7 | u32::from(byte & 0x7F));
+  (length, whole)
+}
+
+/// **L175 — an `esds` is held to its descriptors' 28 bits** (R20, r2,
+/// ruled: a length that wraps is refused, under the budget the caller
+/// raises): the MOV family writes an AAC track's configuration into its
+/// `esds`, MP4's sample entry's and MOV's `wave`'s, its ES descriptor of
+/// it and 32 bytes, each descriptor's length in four bytes of seven bits,
+/// the bits past 28 lost (`movenc.c` 694–701, 765–816, 1072–1077). The
+/// length read back is the configuration's and 32; at a bound of it the
+/// same `esds`; a byte below, the track is refused by name, nothing
+/// written.
+///
+/// PLANT: the descriptor unjudged, its 32 bytes counted 31, or MOV's AAC
+/// not counted as written.
+#[test]
+fn l175_an_esds_is_held_to_its_descriptors_28_bits() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mkv");
+  let (table, packets) = first_track(&source, TrackKind::Audio, 8);
+  let config = stream_extradata_of(&table[0]);
+  assert!(!config.is_empty(), "the premise: an AudioSpecificConfig");
+  for (container, extension) in [
+    (ContainerName::MP4, "mp4"),
+    (ContainerName::new("mov"), "mov"),
+  ] {
+    let open = |name: &str, bound: Option<u64>| {
+      let target = output(&corpus, &format!("{name}.{extension}"));
+      let options = bound.map_or_else(MuxOptions::new, |bytes| {
+        MuxOptions::new().with_lowered_descriptor_bound(bytes)
+      });
+      let opened = FfmpegOwnedMuxer::open_with(
+        File::create(&target).expect("create"),
+        container.clone(),
+        first_track(&source, TrackKind::Audio, 0).0,
+        &[],
+        options,
+      );
+      (target, opened)
+    };
+    let esds = |name: &str, bound: Option<u64>| {
+      let (target, opened) = open(name, bound);
+      let (mut muxer, _) = opened.unwrap_or_else(|error| panic!("{name}.{extension}: {error:?}"));
+      for packet in &packets {
+        muxer
+          .write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet)))
+          .map_err(|error| error.map_packet(drop))
+          .unwrap_or_else(|error| panic!("{name}.{extension}: {error:?}"));
+      }
+      muxer
+        .finish()
+        .unwrap_or_else(|error| panic!("{name}.{extension}: {error:?}"));
+      esds_of(&target)
+    };
+    let (length, written) = esds("l175", None);
+    assert_eq!(
+      u64::from(length),
+      config.len() as u64 + 32,
+      "{extension}: the ES descriptor, the configuration and 32 bytes"
+    );
+    assert_eq!(
+      esds("l175-at", Some(u64::from(length))),
+      (length, written),
+      "{extension}: at the bound, the same esds"
+    );
+    let (refused, opened) = open("l175-below", Some(u64::from(length) - 1));
+    match opened {
+      Err(MuxOpenError::ConfigurationInvalid { track, codec }) => {
+        assert_eq!(track, TrackIndex::new(0), "{extension}");
+        assert_eq!(codec, CodecId::AAC, "{extension}");
+      }
+      other => panic!(
+        "{extension}: expected ConfigurationInvalid, got {:?}",
+        other.map(|_| ())
+      ),
+    }
+    assert_eq!(
+      std::fs::metadata(&refused).expect("the sink").len(),
+      0,
+      "{extension}: nothing written"
+    );
+  }
+}
+
+/// **L176 — a VC-1 sequence header is held to its reader** (R20, r2,
+/// ruled: a length that wraps is refused, under the budget the caller
+/// raises): MP4's `dvc1` unescapes each unit of the configuration and
+/// reads a sequence header's fields through libavcodec's bit reader,
+/// which takes no more than its bits' `int` holds — past them a reader of
+/// no buffer, read through (`movenc.c` 1126–1149; `get_bits.h` 517–534).
+/// Of a sequence header of two bytes, and of one of seven whose
+/// emulation prevention byte unescaping drops: at a bound of its
+/// unescaped bytes the same record reads back; a byte below, the track is
+/// refused by name, nothing written.
+///
+/// PLANT: the sequence header unjudged, or counted escaped.
+#[test]
+fn l176_a_vc1_sequence_header_is_held_to_its_reader() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, frames) = recoded_fixture(&corpus, &[0, 0, 1, 0x0D, 0x11]);
+  for (name, config, unescaped) in [
+    ("l176-two", vec![0, 0, 1, 0x0F, 0xC8, 0x0A], 2_u64),
+    (
+      "l176-escaped",
+      vec![0, 0, 1, 0x0F, 0xC8, 0x0A, 0, 0, 3, 1, 0x0A],
+      6,
+    ),
+  ] {
+    let open = |suffix: &str, bound: Option<u64>| {
+      let target = output(&corpus, &format!("{name}{suffix}.mp4"));
+      let options = bound.map_or_else(MuxOptions::new, |bytes| {
+        MuxOptions::new().with_lowered_reader_bound(bytes)
+      });
+      let opened = FfmpegOwnedMuxer::open_with(
+        File::create(&target).expect("create"),
+        ContainerName::MP4,
+        vec![restated(
+          &row,
+          ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_VC1,
+          &config,
+          None,
+          None,
+        )],
+        &[],
+        options,
+      );
+      (target, opened)
+    };
+    let record = |suffix: &str, bound: Option<u64>| {
+      let (target, opened) = open(suffix, bound);
+      let (mut muxer, _) = opened.unwrap_or_else(|error| panic!("{name}{suffix}: {error:?}"));
+      for frame in &frames {
+        muxer
+          .write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone()))
+          .map_err(|error| error.map_packet(drop))
+          .unwrap_or_else(|error| panic!("{name}{suffix}: {error:?}"));
+      }
+      muxer
+        .finish()
+        .unwrap_or_else(|error| panic!("{name}{suffix}: {error:?}"));
+      std::fs::read(&target).expect("the file")
+    };
+    let written = record("", None);
+    assert!(
+      written.windows(4).any(|window| window == b"dvc1"),
+      "{name}: the premise, a dvc1 written"
+    );
+    assert_eq!(
+      record("-at", Some(unescaped)),
+      written,
+      "{name}: at the bound, the same file"
+    );
+    let (refused, opened) = open("-below", Some(unescaped - 1));
+    match opened {
+      Err(MuxOpenError::ConfigurationInvalid { track, codec }) => {
+        assert_eq!(track, TrackIndex::new(0), "{name}");
+        assert_eq!(codec, CodecId::VC1, "{name}");
+      }
+      other => panic!(
+        "{name}: expected ConfigurationInvalid, got {:?}",
+        other.map(|_| ())
+      ),
+    }
+    assert_eq!(
+      std::fs::metadata(&refused).expect("the sink").len(),
+      0,
+      "{name}: nothing written"
+    );
+  }
+}
+
+/// Each PES packet of the stream `id` in the MPEG-TS file `path`, in
+/// order: its header's PTS and DTS bytes, and its payload, joined across
+/// its transport packets.
+fn pes_of(path: &Path, id: u8) -> Vec<(u64, Vec<u8>)> {
+  let bytes = std::fs::read(path).expect("the file");
+  let mut pid = None;
+  let mut pes: Vec<Vec<u8>> = Vec::new();
+  for packet in bytes.chunks_exact(188) {
+    assert_eq!(packet[0], 0x47, "a sync byte");
+    let this = (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]);
+    let start = packet[1] & 0x40 != 0;
+    let control = (packet[3] >> 4) & 3;
+    if control & 1 == 0 {
+      continue;
+    }
+    let offset = if control & 2 != 0 {
+      5 + usize::from(packet[4])
+    } else {
+      4
+    };
+    let payload = &packet[offset..];
+    if start && payload.len() >= 4 && payload[..3] == [0, 0, 1] && payload[3] == id {
+      pid = Some(this);
+      pes.push(payload.to_vec());
+    } else if pid == Some(this)
+      && let Some(last) = pes.last_mut()
+    {
+      last.extend_from_slice(payload);
+    }
+  }
+  pes
+    .into_iter()
+    .map(|bytes| {
+      let header = usize::from(bytes[8]);
+      (header as u64, bytes[9 + header..].to_vec())
+    })
+    .collect()
+}
+
+/// **L177 — MPEG-TS's picture payloads are counted as it sums them** (R20,
+/// r2, ruled: a length that wraps is refused, under the budget the caller
+/// raises, [`PacketLimits`]): MPEG-TS writes an H.264, HEVC or VVC packet
+/// behind an access unit delimiter where its picture carries none, and an
+/// IDR picture behind the configuration where it carries no parameter set,
+/// summing them in an `int`, and the PES packet's length of them, its
+/// header's PTS and DTS and three bytes, in another (`mpegtsenc.c`
+/// 1851–1864, 1907–2070, 1669). Of an Annex B configuration: H.264's IDR
+/// of no delimiter, its delimiter and configuration added; a frame of its
+/// own delimiter, as it is; the IDR behind its own delimiter, the
+/// delimiter moved before the configuration; the IDR behind its own
+/// parameter sets, a delimiter alone. HEVC's IDR, a delimiter and the
+/// configuration; VVC's, the same — MPEG-TS reads VVC's first type as 0,
+/// whatever it is. Each payload read back is as counted; at a bound of
+/// the most a packet's PES length comes to, every packet is written the
+/// same; a byte below, the packet that comes to it is refused by name,
+/// handed back untouched, the others written.
+///
+/// PLANT: the sums unjudged; the moved delimiter counted as added; VVC's
+/// type read as its unit's.
+#[test]
+fn l177_mpeg_ts_counts_a_pictures_payload_as_it_sums_it() {
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, frames, sps, pps) = h264_fixture(&corpus);
+  let aud: &[u8] = &[0, 0, 0, 1, 9, 0xF0];
+  let idr = frames[0].data().as_ref().to_vec();
+  let p = frames[1].data().as_ref().to_vec();
+  let (hevc_row, hevc_frames) = recoded_fixture(
+    &corpus,
+    &start_coded(&[&escaped(&hevc_header(19, 0), &[0xAF, 0x88, 0x42])]),
+  );
+  let (vvc_row, vvc_frames) = recoded_fixture(&corpus, &start_coded(&[&vvc_unit(8)]));
+  let at = |index: i64, bytes: &[u8], key: bool| {
+    let flags = if key {
+      PacketFlags::KEY
+    } else {
+      PacketFlags::empty()
+    };
+    video_at(
+      &video_holding(&frames[0], bytes).with_flags(flags),
+      Some(40 * index),
+      40 * index,
+    )
+  };
+  let h264_config = start_coded(&[&sps, &pps]);
+  let recoded =
+    |frames: &[Video], config: &[u8]| -> Vec<(VideoTrackPacket<Ffmpeg, FfmpegBytes>, u64)> {
+      frames
+        .iter()
+        .map(|frame| {
+          let key = frame.flags().contains(PacketFlags::KEY);
+          (
+            VideoTrackPacket::new(TrackIndex::new(0), frame.clone()),
+            7 + if key { config.len() as u64 } else { 0 },
+          )
+        })
+        .collect()
+    };
+  let cases: Vec<(
+    &str,
+    &Described,
+    Id,
+    Vec<u8>,
+    Vec<(VideoTrackPacket<Ffmpeg, FfmpegBytes>, u64)>,
+  )> = vec![
+    (
+      "h264",
+      &row,
+      Id::AV_CODEC_ID_H264,
+      h264_config.clone(),
+      vec![
+        (at(0, &idr, true), 6 + h264_config.len() as u64),
+        (at(1, &[aud, &p].concat(), false), 0),
+        (
+          at(2, &[aud, &idr].concat(), true),
+          1 + h264_config.len() as u64,
+        ),
+        (at(3, &[&h264_config[..], &idr].concat(), true), 6),
+      ],
+    ),
+    (
+      "hevc",
+      &hevc_row,
+      Id::AV_CODEC_ID_HEVC,
+      hevc_base(),
+      recoded(&hevc_frames, &hevc_base()),
+    ),
+    (
+      "vvc",
+      &vvc_row,
+      Id::AV_CODEC_ID_VVC,
+      vvc_sets(1, 1, 1),
+      recoded(&vvc_frames, &vvc_sets(1, 1, 1)),
+    ),
+  ];
+  for (name, row, codec, config, packets) in cases {
+    assert!(
+      packets[0].0.packet().flags().contains(PacketFlags::KEY),
+      "{name}: the premise, a key frame first"
+    );
+    let write = |suffix: &str, bound: Option<u64>| {
+      let target = output(&corpus, &format!("l177-{name}{suffix}.ts"));
+      let options = bound.map_or_else(MuxOptions::new, |bytes| {
+        MuxOptions::new().with_lowered_pes_bound(bytes)
+      });
+      let mut muxer = muxer_with(
+        &target,
+        ContainerName::new("mpegts"),
+        vec![restated(row, codec, &config, None, None)],
+        options,
+      );
+      let mut refused = Vec::new();
+      for (index, (packet, _)) in packets.iter().enumerate() {
+        match refusing!(muxer.write_video(packet.clone())) {
+          Ok(()) => {}
+          Err(MuxError::Backend {
+            refusal,
+            packet: back,
+          }) => {
+            assert_eq!(refusal, payload(PayloadRule::PesSize), "{name}{suffix}");
+            untouched!(packet, back);
+            refused.push(index);
+          }
+          Err(other) => panic!("{name}{suffix}: {other:?}"),
+        }
+      }
+      muxer
+        .finish()
+        .unwrap_or_else(|error| panic!("{name}{suffix}: {error:?}"));
+      (pes_of(&target, 0xE0), refused)
+    };
+    let (written, none) = write("", None);
+    assert!(none.is_empty(), "{name}: nothing refused");
+    assert_eq!(written.len(), packets.len(), "{name}: a PES packet a frame");
+    // Each payload as counted: the packet, and what MPEG-TS adds before it
+    // — but where it moves the packet's own delimiter first.
+    let mut longest = 0;
+    for ((header, bytes), (packet, added)) in written.iter().zip(&packets) {
+      let data = packet.packet().data().as_ref();
+      assert_eq!(
+        bytes.len() as u64,
+        data.len() as u64 + added,
+        "{name}: the payload as counted"
+      );
+      assert!(
+        bytes.ends_with(data) || *added == 1 + config.len() as u64,
+        "{name}: the packet last"
+      );
+      longest = longest.max(bytes.len() as u64 + header + 3);
+    }
+    let (at_bound, none) = write("-at", Some(longest));
+    assert!(none.is_empty(), "{name}: at the bound, nothing refused");
+    assert_eq!(at_bound, written, "{name}: at the bound, the same payloads");
+    let (below, refused) = write("-below", Some(longest - 1));
+    let expected: Vec<usize> = written
+      .iter()
+      .enumerate()
+      .filter(|(_, (header, bytes))| bytes.len() as u64 + header + 3 > longest - 1)
+      .map(|(index, _)| index)
+      .collect();
+    assert!(!expected.is_empty(), "{name}: the premise, one refused");
+    assert_eq!(
+      refused, expected,
+      "{name}: refused where it comes to the bound"
+    );
+    let kept: Vec<(u64, Vec<u8>)> = written
+      .iter()
+      .enumerate()
+      .filter(|(index, _)| !expected.contains(index))
+      .map(|(_, pes)| pes.clone())
+      .collect();
+    assert_eq!(below, kept, "{name}: the others written the same");
+  }
+}
+
+/// The samples of the Opus packet `bytes` as MPEG-TS counts them, of its
+/// table-of-contents byte and, for code 3, its count byte; none past
+/// 120 ms (`opus_get_packet_samples`, `mpegtsenc.c` 1803–1849).
+fn opus_samples_of(bytes: &[u8]) -> i64 {
+  const DURATIONS: [i64; 32] = [
+    480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 480, 960, 120, 240,
+    480, 960, 120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960,
+  ];
+  let toc = bytes[0];
+  let frames = match toc & 3 {
+    0 => 1,
+    1 | 2 => 2,
+    _ => i64::from(bytes[1] & 63),
+  };
+  let duration = frames * DURATIONS[usize::from(toc >> 3)];
+  if duration > 5760 { 0 } else { duration }
+}
+
+/// **L178 — MPEG-TS's audio payloads are counted as it sums them** (R20,
+/// r2, by the class: a length that wraps is refused, under the budget the
+/// caller raises, [`PacketLimits`]): MPEG-TS writes an Opus packet behind
+/// a control header — two bytes, a byte for each 255 of its size and one
+/// more, and two while the start trim its initial padding makes is left —
+/// summed in an `int`; holds an audio packet of at most its PES payload
+/// size, 2930 bytes, for the next, summing the two in an `int` before it
+/// writes the held one; and writes a longer one alone, its PES length of
+/// it, its header's PTS and DTS and three bytes in an `int`
+/// (`mpegtsenc.c` 2071–2140, 2205–2236, 1669). Of the packets as encoded,
+/// each held; and of the first grown past 2930 bytes, written alone: each
+/// payload read back as counted; at a bound of the most a packet comes to
+/// — alone, or beside the one held — every packet written the same; a
+/// byte below, each packet that comes to it refused by name, handed back
+/// untouched, the next judged beside the last one written.
+///
+/// PLANT: the sums unjudged; the held sum unjudged; the start trim or the
+/// PES header not counted.
+#[test]
+fn l178_mpeg_ts_counts_an_audio_payload_as_it_sums_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = opus_of_two_bytes_mkv(&corpus);
+  let (table, packets) = first_track(&source, TrackKind::Audio, 8);
+  let ticket = table[0].side_data();
+  let trim = i64::from(ticket.initial_padding()) * 48_000 / i64::from(ticket.sample_rate());
+  assert!(trim > 0, "the premise: a start trim");
+  let encoded: Vec<Audio> = packets.iter().map(audio_of).collect();
+  let mut grown = encoded.clone();
+  let mut big = grown[0].data().as_ref().to_vec();
+  big.resize(4000, 0x11);
+  grown[0] = audio_holding(&grown[0], &big);
+  for (name, frames) in [("held", encoded), ("alone", grown)] {
+    let offered: Vec<AudioTrackPacket<Ffmpeg, FfmpegBytes>> = frames
+      .iter()
+      .map(|frame| AudioTrackPacket::new(TrackIndex::new(0), frame.clone()))
+      .collect();
+    // Each packet's bytes behind its control header: two for the start
+    // trim while one is left, each packet's samples trimmed off it.
+    let mut left = trim;
+    let counted: Vec<u64> = frames
+      .iter()
+      .map(|frame| {
+        let bytes = frame.data().as_ref();
+        let size = bytes.len() as u64;
+        let trimming = left != 0;
+        left -= left.min(opus_samples_of(bytes));
+        size + 2 + size / 255 + 1 + if trimming { 2 } else { 0 }
+      })
+      .collect();
+    let write = |suffix: &str, bound: Option<u64>| {
+      let target = output(&corpus, &format!("l178-{name}{suffix}.ts"));
+      let options = bound.map_or_else(MuxOptions::new, |bytes| {
+        MuxOptions::new().with_lowered_pes_bound(bytes)
+      });
+      let mut muxer = muxer_with(
+        &target,
+        ContainerName::new("mpegts"),
+        first_track(&source, TrackKind::Audio, 0).0,
+        options,
+      );
+      let mut refused = Vec::new();
+      for (index, packet) in offered.iter().enumerate() {
+        match refusing!(muxer.write_audio(packet.clone())) {
+          Ok(()) => {}
+          Err(MuxError::Backend {
+            refusal,
+            packet: back,
+          }) => {
+            assert_eq!(refusal, payload(PayloadRule::PesSize), "{name}{suffix}");
+            untouched!(packet, back);
+            refused.push(index);
+          }
+          Err(other) => panic!("{name}{suffix}: {other:?}"),
+        }
+      }
+      muxer
+        .finish()
+        .unwrap_or_else(|error| panic!("{name}{suffix}: {error:?}"));
+      (pes_of(&target, 0xBD), refused)
+    };
+    let (written, none) = write("", None);
+    assert!(none.is_empty(), "{name}: nothing refused");
+    assert_eq!(
+      written.len(),
+      offered.len(),
+      "{name}: a PES packet a packet"
+    );
+    for ((_, bytes), counted) in written.iter().zip(&counted) {
+      assert_eq!(
+        bytes.len() as u64,
+        *counted,
+        "{name}: the payload as counted"
+      );
+    }
+    assert_eq!(
+      counted[0] > 2930,
+      name == "alone",
+      "{name}: the premise, the first alone or held"
+    );
+    assert!(
+      counted[1..].iter().all(|&size| size <= 2930),
+      "{name}: the premise, the others held"
+    );
+    // What each packet comes to beside the last one written: alone, its
+    // PES length; held, beside the one held before it.
+    let judge = |bound: u64| {
+      let mut held = 0;
+      let mut refused = Vec::new();
+      for (index, ((header, _), &size)) in written.iter().zip(&counted).enumerate() {
+        let alone = size > 2930;
+        if size > bound || (held > 0 && held + size > bound) || (alone && size + header + 3 > bound)
+        {
+          refused.push(index);
+        } else {
+          held = if alone { 0 } else { size };
+        }
+      }
+      refused
+    };
+    let most = written
+      .iter()
+      .zip(&counted)
+      .enumerate()
+      .map(|(index, ((header, _), &size))| {
+        let held = index.checked_sub(1).map_or(0, |last| {
+          if counted[last] > 2930 {
+            0
+          } else {
+            counted[last]
+          }
+        });
+        let alone = if size > 2930 { size + header + 3 } else { 0 };
+        size.max(held + size).max(alone)
+      })
+      .max()
+      .expect("a packet");
+    assert!(
+      judge(most).is_empty(),
+      "{name}: nothing refused at the most"
+    );
+    let (at, none) = write("-at", Some(most));
+    assert!(none.is_empty(), "{name}: at the bound, nothing refused");
+    assert_eq!(at, written, "{name}: at the bound, the same payloads");
+    let expected = judge(most - 1);
+    assert!(!expected.is_empty(), "{name}: the premise, one refused");
+    let (_, refused) = write("-below", Some(most - 1));
+    assert_eq!(
+      refused, expected,
+      "{name}: refused where each comes to the bound"
+    );
+  }
+}
