@@ -1328,7 +1328,7 @@ fn admit_eac3(
       },
       0,
     ),
-    payload,
+    (payload, 0),
     step,
     Bounds::REAL,
   )?;
@@ -3347,7 +3347,7 @@ fn an_avi_xsub_cue_is_placed_one_packet_on_however_far() {
           },
           0,
         ),
-        payload,
+        (payload, 0),
         step,
         Bounds::REAL,
       ) {

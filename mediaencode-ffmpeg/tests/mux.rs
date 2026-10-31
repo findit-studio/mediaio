@@ -22536,3 +22536,149 @@ fn l185_flvs_257th_track_of_a_kind_is_refused() {
     "nothing written"
   );
 }
+
+/// The samples the fact chunk of the WAV file at `path` counts.
+fn wav_fact(path: &Path) -> u32 {
+  let bytes = std::fs::read(path).expect("the file");
+  let mut at = 12;
+  while at + 8 <= bytes.len() {
+    let size = u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]]);
+    if &bytes[at..at + 4] == b"fact" {
+      return u32::from_le_bytes([bytes[at + 8], bytes[at + 9], bytes[at + 10], bytes[at + 11]]);
+    }
+    at += 8 + size as usize + (size as usize & 1);
+  }
+  panic!("no fact chunk")
+}
+
+/// **L186 — WAV counts a packet that states no duration as libavformat
+/// guesses it** (R21, Codex R20 2, ruled: the library's question; a length
+/// that wraps is refused): libavformat gives such a packet libavcodec's
+/// count of its samples, of the stream's parameters and the packet's size
+/// (`guess_pkt_duration`, `mux.c` 605–633; `av_get_audio_frame_duration2`,
+/// `libavcodec/utils.c` 578–833), and WAV counts the last packet's into its
+/// fact chunk's 32 bits (`wavenc.c` 409–420, 448–462). AC-3 whose stream
+/// states no frame size — 1536 samples whatever its bytes — and float PCM,
+/// its samples its bytes over four a channel: two such packets at zero and
+/// at the latest time the count holds, written, the fact chunk counting
+/// 2^32 − 1; at a sample later, the second refused by name, untouched. And
+/// a duration stated past the `int` WAV keeps the last one in (82, 412):
+/// refused by name; at `INT_MAX`, written and counted.
+///
+/// PLANT: the guess unasked; the guess asked of no bytes; the `int`
+/// unjudged.
+#[test]
+fn l186_wav_counts_a_durationless_packet_as_libavformat_guesses_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let rate = Timebase::new(1, NonZeroI32::new(48_000).expect("non-zero"));
+  #[rustfmt::skip]
+  let ac3 = generated(&corpus, "l186-ac3.mkv", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.2",
+    "-ac", "2", "-c:a", "ac3",
+  ]);
+  #[rustfmt::skip]
+  let float = generated(&corpus, "l186-f32.mkv", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.2",
+    "-ac", "2", "-c:a", "pcm_f32le",
+  ]);
+  let at = |packet: Audio, ticks: i64, duration: Option<i64>| {
+    audio_on_zero(
+      packet
+        .with_pts(Some(Timestamp::new(ticks, rate)))
+        .with_dts(Some(Timestamp::new(ticks, rate)))
+        .with_duration(duration.map(|ticks| Timestamp::new(ticks, rate))),
+    )
+  };
+  // Each case: the source, the samples libavcodec counts of its packet.
+  for (name, source, samples) in [("ac3", &ac3, None), ("f32", &float, Some(8))] {
+    let (_, frames) = first_track(source, TrackKind::Audio, 2);
+    let (first, second) = (audio_of(&frames[0]), audio_of(&frames[1]));
+    let counted = samples.map_or(1536, |bytes_a_sample: i64| {
+      second.data().as_ref().len() as i64 / bytes_a_sample
+    });
+    let table = || {
+      vec![reticketed(
+        table_of(source, TrackKind::Audio).remove(0),
+        |par| {
+          par.frame_size = 0;
+        },
+      )]
+    };
+    let latest = i64::from(u32::MAX) - counted;
+    for (case, second_at, taken) in [("at", latest, true), ("past", latest + 1, false)] {
+      let target = output(&corpus, &format!("l186-{name}-{case}.wav"));
+      let mut muxer = muxer_into(&target, ContainerName::new("wav"), table());
+      muxer
+        .write_audio(at(first.clone(), 0, None))
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{name} {case}: {error:?}"));
+      let offered = at(second.clone(), second_at, None);
+      let result = refusing!(muxer.write_audio(offered.clone()));
+      if taken {
+        result
+          .map_err(|error| error.map_packet(drop))
+          .unwrap_or_else(|error| panic!("{name} {case}: {error:?}"));
+      } else {
+        let Err(MuxError::Backend {
+          refusal,
+          packet: back,
+        }) = result
+        else {
+          panic!("{name} {case}: expected the container's refusal, got {result:?}");
+        };
+        assert_eq!(refusal, payload(PayloadRule::FileSize), "{name} {case}");
+        untouched!(offered, back);
+      }
+      muxer
+        .finish()
+        .unwrap_or_else(|error| panic!("{name} {case}: {error:?}"));
+      if taken {
+        assert_eq!(
+          wav_fact(&target),
+          u32::MAX,
+          "{name}: the count FFmpeg writes"
+        );
+      }
+    }
+  }
+  // A stated duration past the `int`.
+  let (_, frames) = first_track(&ac3, TrackKind::Audio, 1);
+  let packet = audio_of(&frames[0]);
+  for (case, duration, taken) in [
+    ("int", i64::from(i32::MAX), true),
+    ("past-int", i64::from(i32::MAX) + 1, false),
+  ] {
+    let target = output(&corpus, &format!("l186-{case}.wav"));
+    let mut muxer = muxer_into(
+      &target,
+      ContainerName::new("wav"),
+      table_of(&ac3, TrackKind::Audio),
+    );
+    let offered = at(packet.clone(), 0, Some(duration));
+    let result = refusing!(muxer.write_audio(offered.clone()));
+    if taken {
+      result
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+    } else {
+      let Err(MuxError::Backend {
+        refusal,
+        packet: back,
+      }) = result
+      else {
+        panic!("{case}: expected the container's refusal, got {result:?}");
+      };
+      assert!(
+        matches!(refusal, FfmpegMuxRefusal::DurationTooLong { .. }),
+        "{case}: {refusal:?}"
+      );
+      untouched!(offered, back);
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+    if taken {
+      assert_eq!(wav_fact(&target), i32::MAX as u32, "{case}: counted");
+    }
+  }
+}

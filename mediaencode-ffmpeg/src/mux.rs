@@ -861,6 +861,23 @@
 //! sums of an H.264, HEVC or VVC packet are unreachable, past FLV's tag
 //! more than a hundredfold (S15).
 //!
+//! **The durations FFmpeg derives** (R21, Codex R20 2: the library's
+//! question, a length that wraps refused): every duration this muxer
+//! mirrors that FFmpeg derives rather than takes — by grep of `duration`
+//! over libavformat's packet path (`mux.c`) and the admitted muxers'
+//! writers — judged by FFmpeg's own derivation:
+//!
+//! | where FFmpeg derives it | of what | mirrored for | how |
+//! |---|---|---|---|
+//! | libavformat's guess for a packet that states none, a negative one zeroed (`guess_pkt_duration`, `mux.c` 605–633) | video: a frame at `avg_frame_rate` — the base's of the track's frame rate — where its numerator and denominator are above zero, else a tick where the time base is a millisecond or coarser; audio: libavcodec's count of the packet's samples, of the stream's parameters and the packet's size (`av_get_audio_frame_duration2`, `libavcodec/utils.c` 578–833), at the sample rate | WAV's and Wave64's fact chunk ([`PayloadRule::FileSize`], [`FfmpegMuxRefusal::DurationTooLong`]); AVI's frames ([`PayloadRule::FrameCount`]); Ogg's granule ([`FfmpegMuxRefusal::TimeWraps`]) | exact: the video's as `av_rescale_q` rounds ([`guessed_duration`]); the audio's asked of libavformat's own stream at the packet's judgment, allocating nothing ([`Output::guessed_audio_duration`]) — no filter takes these tracks' packets, so that the packet's size is the one libavformat guesses of. Before R21 an audio guess was the frame size alone: AC-3 of none, whose guess is 1536, and PCM, whose guess is its bytes over its sample's, guessed none — L186 |
+//! | the same, on MP4's AC-3 and E-AC-3 tracks | AC-3's 1536 whatever its bytes (`utils.c` 612); E-AC-3's frame size where above one, of a packet of bytes (797–798): no other branch reaches either codec | MP4's E-AC-3 join and its checks ([`Ac3Rules`]) | exact: MP4 refuses an empty packet first ([`PayloadRule::Empty`]) |
+//! | the duration WAV keeps of the last packet, an `int` (`wavenc.c` 82, 412) | the duration libavformat hands | WAV's and Wave64's fact chunk | a stated one past `INT_MAX` refused ([`FfmpegMuxRefusal::DurationTooLong`]); a guess a count of samples at the sample rate its time base is of, within it |
+//! | Matroska's default duration (`mkv_write_track`, `matroskaenc.c` 2058–2065, 2119–2124) | video: `avg_frame_rate` above zero in both, else `r_frame_rate`, which the base leaves unset; audio: `av_get_audio_frame_duration2` of no bytes, else the frame size, where not zero | the report's durations line ([`Rewrite::Durations`]) | exact ([`default_duration`]; R21: the rate's denominator judged, and no sample rate, as Matroska judges them) |
+//! | MP4's own: a constant-size audio track's samples by its bytes (`mov_init`, 8538–8560), the E-AC-3 sample's durations summed (597), `mov_text`'s cue to the next sample (7646–7656), TTML's document to its latest end (6579–6615) | the packets | [`Mp4Place`], [`Ac3Run`], [`Cues`], TTML's span | as tables C′ and C″ |
+//! | MPEG-TS's Opus samples, of each packet's table of contents (`opus_get_packet_samples`, `mpegtsenc.c` 1803–1849) | the packet | S11, S12 ([`opus_ts_samples`]) | exact (r2; part 2b-i) |
+//! | `compute_muxer_pkt_fields` (`mux.c` 509–600) | derives no duration: a presentation time of the decode time where the stream reorders not | — | — |
+//! | ASF's play duration (`asfenc.c` 1030–1031); FLV's and Matroska's file durations, written as doubles | the latest end, each packet's duration as libavformat hands it | ASF's [`FfmpegMuxRefusal::DurationTooLong`], of a stated one | a guess a count of samples at a sample rate, or a frame, within each bound by arithmetic |
+//!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
 //! sample entry calls for a video configuration (`mov_write_video_tag`,
@@ -3938,7 +3955,11 @@ pub enum FfmpegMuxRefusal {
   /// taking the packet (`movenc.c` 6925–6928); ASF's whose end, the
   /// file's play duration, passes `i64` in 100 ns ticks, its preroll's
   /// 3.1 s added, an overflow of a signed count (`asfenc.c` 372,
-  /// 1030–1031).
+  /// 1030–1031); WAV's and Wave64's of more than `i32::MAX` ticks on a
+  /// track whose trailer writes a fact chunk — every codec tag but integer
+  /// PCM's — which WAV keeps the last packet's in, an `int`, and counts the
+  /// fact chunk's samples with, cut (`wavenc.c` 82, 412, 451–462, 608–616),
+  /// judged as though the packet were the last (R21, Codex R20 2).
   #[error("track {}: the duration {} is longer than the container counts", .track.get(), .duration.pts())]
   DurationTooLong {
     /// The track.
@@ -6064,11 +6085,13 @@ struct PacketRules {
   /// WAV: the most bytes of packets the file takes before its size passes
   /// what its RIFF header counts ([`PayloadRule::FileSize`]).
   file_bytes: Option<u64>,
-  /// WAV of every codec tag but integer PCM's: the most samples its fact
-  /// chunk counts in 32 bits at the trailer — the presentation span with
-  /// the last packet's duration, cut past them with `rf64` never, its
-  /// default (`wav_write_trailer`, `wavenc.c` 448–462) — which its reader
-  /// takes as the stream's length ([`PayloadRule::FileSize`]).
+  /// WAV and Wave64 of every codec tag but integer PCM's: the most samples
+  /// the fact chunk counts at the trailer — the presentation span with the
+  /// last packet's duration, cut past WAV's 32 bits with `rf64` never, its
+  /// default (`wav_write_trailer`, `wavenc.c` 448–462), Wave64's 64 bits
+  /// past none (608–616) — which its reader takes as the stream's length
+  /// ([`PayloadRule::FileSize`]); the last packet's duration kept in an
+  /// `int` beside it (82, 412; [`FfmpegMuxRefusal::DurationTooLong`]).
   fact_samples: Option<u64>,
   /// A raw stream's codec whose configuration the track states and the
   /// muxer does not write, so that its first packet must carry it in band
@@ -6119,12 +6142,11 @@ struct PacketRules {
   nut: Option<NutTimes>,
   /// Ogg: the granule it writes of a packet ([`OggGranule`]).
   ogg: Option<OggGranule>,
-  /// The duration libavformat hands a packet that states none — a video
-  /// frame's at the stream's frame rate, or a tick where its time base is
-  /// a millisecond or coarser; an audio packet's frame size where its
-  /// codec packs one — in the stream's ticks (`guess_pkt_duration`,
-  /// `mux.c` 605–633). Ogg's granule counts it.
-  guessed: Option<(TrackKind, i64)>,
+  /// The duration libavformat hands a packet that states none
+  /// (`guess_pkt_duration`, `mux.c` 605–633), as the track's rules take it
+  /// ([`Guess`]): WAV's fact chunk, AVI's counts and Ogg's granule count
+  /// it.
+  guessed: Option<Guess>,
   /// Ogg: a lone Vorbis, FLAC or Opus stream, whose later packets'
   /// strings metadata Ogg writes as a chained stream's tags.
   ogg_metadata: bool,
@@ -7778,9 +7800,14 @@ impl PacketRules {
       file_bytes: (audited == Audited::Wav { w64: false })
         .then(|| (file + 8).saturating_sub(u64::try_from(header).unwrap_or(0))),
       // The fact chunk of every tag but integer PCM's, 0x01 (`wavenc.c`
-      // 347–352, 455–462), its 32 bits the file bound's.
-      fact_samples: (audited == Audited::Wav { w64: false } && codec.codec_tag() != 0x0001)
-        .then_some(file),
+      // 347–352, 455–462, 608–616): WAV's 32 bits the file bound's,
+      // Wave64's 64 bits none.
+      fact_samples: match audited {
+        Audited::Wav { w64 } if codec.codec_tag() != 0x0001 => {
+          Some(if w64 { u64::MAX } else { file })
+        }
+        _ => None,
+      },
       in_band: (raw && !codec.extradata().is_empty()).then_some(id),
       // AVI checks an H.264 stream it tags `H264` for a start code
       // (`ff_check_h264_startcode`, `avienc.c` 774–778), refusing the first
@@ -11502,7 +11529,7 @@ where
           // WAV's fact chunk counts the last duration libavformat hands
           // (table H).
           if rules.fact_samples.is_some() {
-            rules.guessed = Some((kind, guessed_duration(kind, &codec, None, time_base)));
+            rules.guessed = Some(guessed_duration(kind, None, time_base));
           }
           // AVI's trailer fills a stream's gap to its last packet's end, of
           // the duration libavformat hands (R20; [`PayloadRule::FrameCount`]).
@@ -11511,7 +11538,7 @@ where
               TrackParams::Video(params) => params.frame_rate(),
               _ => None,
             };
-            rules.guessed = Some((kind, guessed_duration(kind, &codec, frame_rate, time_base)));
+            rules.guessed = Some(guessed_duration(kind, frame_rate, time_base));
           }
           // Ogg counts the duration libavformat hands into its granule, and
           // writes a lone Vorbis, FLAC or Opus stream's later metadata as a
@@ -11521,7 +11548,7 @@ where
               TrackParams::Video(params) => params.frame_rate(),
               _ => None,
             };
-            rules.guessed = Some((kind, guessed_duration(kind, &codec, frame_rate, time_base)));
+            rules.guessed = Some(guessed_duration(kind, frame_rate, time_base));
             rules.ogg_metadata = ogg_streams == 1
               && [CodecId::VORBIS, CodecId::FLAC, CodecId::OPUS].contains(&codec.codec());
           }
@@ -12302,12 +12329,23 @@ where
       Neighbours::default()
     };
     let lift = shift.map_or(0, |step| step.now.lift(time_base));
+    // libavformat's guess of the packet's duration where it states none
+    // (`guess_pkt_duration`, `mux.c` 605–633): of the tracks whose rules
+    // count it, which no filter takes, of the packet's own bytes.
+    let guessed = match state.rules.guessed {
+      Some(Guess::Fixed(ticks)) => ticks,
+      Some(Guess::Audio) if duration_ticks <= 0 => self
+        .output
+        .guessed_audio_duration(stream, payload.bytes.len())
+        .map_err(|_| Refusal::Portable(MuxRefusal::UnknownTrack { track }))?,
+      _ => 0,
+    };
     let (mut learned, choices) = check_packet_rules(
       state,
       time_base,
       neighbours,
       (own, outputs, lift),
-      payload,
+      (payload, guessed),
       step,
       self.bounds,
     )
@@ -13041,7 +13079,7 @@ fn check_packet_rules<'p>(
   time_base: Timebase,
   neighbours: Neighbours,
   (own, outputs, lift): (Timed, Outputs<'_>, i128),
-  payload: Payload<'p>,
+  (payload, guessed): (Payload<'p>, i64),
   step: Step,
   bounds: Bounds,
 ) -> Result<(Learned, Choices<'p>), FfmpegMuxRefusal> {
@@ -13205,12 +13243,7 @@ fn check_packet_rules<'p>(
     if let Some(granule) = rules.ogg {
       let pts = i128::from(output.pts_ticks.unwrap_or(output.dts_ticks)) + lift;
       let stated = output.duration_ticks;
-      let guess = match rules.guessed {
-        Some((TrackKind::Audio, _)) if payload.bytes.is_empty() => 0,
-        Some((_, guess)) => guess,
-        None => 0,
-      };
-      let duration = i128::from(if stated > 0 { stated } else { guess });
+      let duration = i128::from(if stated > 0 { stated } else { guessed });
       let wraps = || {
         Err(FfmpegMuxRefusal::TimeWraps {
           track,
@@ -13626,11 +13659,11 @@ fn check_packet_rules<'p>(
   // to judge ([`CarrierMuxer::avi_total`]).
   let avi_frames = match (rules.avi, place) {
     (Some(AviPlace::Frames), Some((after, _))) => {
-      let duration = if duration_ticks > 0 {
-        i128::from(duration_ticks)
+      let duration = i128::from(if duration_ticks > 0 {
+        duration_ticks
       } else {
-        rules.guessed.map_or(0, |(_, guess)| i128::from(guess))
-      };
+        guessed
+      });
       let end = i128::from(dts_ticks) + lift + duration;
       Some(if end > after && end - after <= 60_000 {
         end
@@ -13739,11 +13772,21 @@ fn check_packet_rules<'p>(
       let (earliest, latest) = state.presented.map_or((pts, pts), |(earliest, latest)| {
         (earliest.min(pts), latest.max(pts))
       });
-      let duration = if duration_ticks > 0 {
-        i128::from(duration_ticks)
+      let duration = i128::from(if duration_ticks > 0 {
+        duration_ticks
       } else {
-        rules.guessed.map_or(0, |(_, guess)| i128::from(guess))
-      };
+        guessed
+      });
+      // The trailer counts the span with the last packet's duration, which
+      // WAV keeps in an `int` (`wavenc.c` 82, 412), cut past it: a duration
+      // offered past it, as though the packet were the last — libavformat's
+      // guess is a count of samples at the sample rate WAV's time base is
+      // of, an `int` (R21, Codex R20 2).
+      if let Some(duration) = own.duration
+        && duration_ticks > i64::from(i32::MAX)
+      {
+        return Err(FfmpegMuxRefusal::DurationTooLong { track, duration });
+      }
       if latest - earliest + duration > i128::from(limit) {
         return refused(PayloadRule::FileSize);
       }
@@ -16586,17 +16629,19 @@ fn length_prefixed_bytes(bytes: &[u8]) -> u64 {
 }
 
 /// Whether Matroska writes a default duration for a timed track of `kind`
-/// whose stream libavformat holds as `stream`, at `frame_rate`: a video
-/// track's from its frame rate, an audio track's from the samples its
-/// codec fixes in each frame (`matroskaenc.c` 2058–2065, 2119–2124). A
-/// subtitle's duration is written with every block (2895–2898), as if it
-/// had one.
+/// whose stream libavformat holds as `stream`, at `frame_rate`
+/// (`matroskaenc.c` 2058–2065, 2119–2124): a video track's of its
+/// `avg_frame_rate` — the base's of the track's frame rate — where its
+/// numerator and denominator are above zero, its `r_frame_rate`, which the
+/// base leaves unset, else; an audio track's of libavcodec's count of a
+/// frame's samples of no bytes, else of its frame size, where not zero
+/// (R21's census of durations: exactly, the video rate's denominator and
+/// no sample rate judged as Matroska judges them). A subtitle's duration is
+/// written with every block (2895–2898), as if it had one.
 fn default_duration(kind: TrackKind, stream: &StreamCodec, frame_rate: Option<Timebase>) -> bool {
   match kind {
-    TrackKind::Video => frame_rate.is_some_and(|rate| rate.num() > 0),
-    TrackKind::Audio => {
-      stream.sample_rate() > 0 && (stream.frame_duration() != 0 || stream.frame_size() != 0)
-    }
+    TrackKind::Video => frame_rate.is_some_and(|rate| rate.num() > 0 && rate.den().get() > 0),
+    TrackKind::Audio => stream.frame_duration() != 0 || stream.frame_size() != 0,
     _ => true,
   }
 }
@@ -17804,38 +17849,47 @@ fn ogg_granule(codec: &StreamCodec, time_base: Timebase) -> OggGranule {
   }
 }
 
-/// The duration libavformat hands a packet of `kind` that states none, in
-/// ticks of `time_base` (`guess_pkt_duration`, `mux.c` 605–633): a video
-/// frame's at `frame_rate`, or a tick where the time base is a millisecond
-/// or coarser; an audio packet's frame size where the codec packs one
-/// (`av_get_audio_frame_duration2`, `libavcodec/utils.c` 797–821), at the
-/// stream's sample rate. Each rescale rounds to the nearest.
-fn guessed_duration(
-  kind: TrackKind,
-  codec: &StreamCodec,
-  frame_rate: Option<Timebase>,
-  time_base: Timebase,
-) -> i64 {
+/// The duration libavformat hands a packet that states none — a negative
+/// one zeroed first — as a track's rules take it (`guess_pkt_duration`,
+/// `mux.c` 605–633 in FFmpeg 9.0.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Guess {
+  /// A video track's, in its ticks — a frame at the frame rate
+  /// libavformat holds as the stream's (`avg_frame_rate`, which the base
+  /// sets of the track's), or a tick where the time base is a millisecond
+  /// or coarser — the same for every packet; a track of another kind but
+  /// audio, none.
+  Fixed(i64),
+  /// An audio track's: libavcodec's count of each packet's samples, of the
+  /// stream's parameters and the packet's size
+  /// (`av_get_audio_frame_duration2`, `libavcodec/utils.c` 578–833), at
+  /// the stream's sample rate — asked of libavformat's own stream at the
+  /// packet's judgment ([`Output::guessed_audio_duration`]), exactly (R21,
+  /// Codex R20 2).
+  Audio,
+}
+
+/// How libavformat guesses the duration of a packet of `kind` that states
+/// none, in ticks of `time_base` ([`Guess`]): a video frame's at
+/// `frame_rate` where it is above zero, rounded to the nearest; a tick
+/// where the time base is a millisecond or coarser.
+fn guessed_duration(kind: TrackKind, frame_rate: Option<Timebase>, time_base: Timebase) -> Guess {
   let (num, den) = (
     i128::from(time_base.num()),
     i128::from(time_base.den().get()),
   );
   match kind {
-    TrackKind::Video => match frame_rate {
-      Some(rate) if rate.num() > 0 => rescale_nearest(
+    TrackKind::Video => Guess::Fixed(match frame_rate {
+      Some(rate) if rate.num() > 0 && rate.den().get() > 0 => rescale_nearest(
         den * i128::from(rate.den().get()),
         1,
         i128::from(rate.num()) * num,
       ),
       _ if num * 1000 > den => 1,
       _ => 0,
-    },
-    TrackKind::Audio if codec.frame_size() > 1 && codec.sample_rate() > 0 => rescale_nearest(
-      i128::from(codec.frame_size()) * den,
-      1,
-      i128::from(codec.sample_rate()) * num,
-    ),
-    _ => 0,
+    }),
+    TrackKind::Audio => Guess::Audio,
+    _ => Guess::Fixed(0),
   }
 }
 

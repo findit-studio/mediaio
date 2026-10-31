@@ -123,6 +123,7 @@
 //! | `query_codec` | `avformat_query_codec` through a shim taking the codec id as `c_int` | no bindgen enum formed from an integer; libavformat searches its tag tables, never indexes them |
 //! | `streams`, `stream`, `stream_time_base` | `nb_streams`; `streams[index]`; a stream's `time_base` | `index < nb_streams`, checked first |
 //! | `stream_codec` | a stream's `codecpar` fields, the codec id and media type as integers, the extradata as `extradata_size` bytes; `av_get_audio_frame_duration2` | libavutil's allocation, null when empty; the call reads plain fields and writes nothing |
+//! | `guessed_audio_duration` | a stream's `codecpar` and `time_base`; `av_get_audio_frame_duration2` of a packet's size; `av_rescale_q` | `index < nb_streams`, checked first; the call reads plain fields and the extradata's pointer, compared with null, and writes nothing; the size an `int`, saturated |
 //! | `set_automatic_filters` | `ctx.flags` (`AVFMT_FLAG_AUTO_BSF`) | read by libavformat only when it writes a packet |
 //! | `add_stream` | `avformat_new_stream`; `avcodec_parameters_copy`; the media type written as an integer; `replace_extradata`; `settle_codec_tag`; `stream_copy_audio_rule`; the stream's `time_base`, `disposition`, `sample_aspect_ratio`, `avg_frame_rate`; `av_dict_set` | the stream just added, its `codecpar` its own; the ticket's parameters live and null-checked; extradata whose size with its padding fits an `int`, judged first; no `DONT_STRDUP`, so the texts are copied |
 //! | `replace_extradata` | `av_freep` of the old extradata; `av_mallocz`; the copy | the old one null or libavutil's; a fresh allocation of `bytes.len()` plus the padding, which cannot overlap `bytes` |
@@ -173,7 +174,8 @@
 //! | `av_codec_get_id`, `av_codec_get_tag2` | `settle_codec_tag` | none: an answer | — |
 //! | `av_dict_set` | `add_stream`, `add_chapter` | a negative code (an allocation) | `Ffmpeg`; in `add_stream` the context `Failed`; in `add_chapter` the chapter not yet taken is freed, and the context still being built |
 //! | `av_mallocz`, `av_dynarray_add_nofree` | `add_chapter` | null; a negative code | `Ffmpeg(ENOMEM)`; `Ffmpeg`, the chapter freed |
-//! | `av_get_audio_frame_duration2` | `stream_codec` | none: zero for a codec it does not know | — |
+//! | `av_get_audio_frame_duration2` | `stream_codec`, `guessed_audio_duration` | none: zero for a codec it does not know | — |
+//! | `av_rescale_q` | `guessed_audio_duration` | none: arithmetic, `INT64_MIN` of a sample rate below zero, as libavformat's own guess answers | — |
 //! | the ticket's rebuild (`avcodec_parameters_alloc` and its copies) | `add_stream` | its allocations, its limits | `Parameters`, before any stream is added |
 //! | `avcodec_parameters_free`, in the rebuilt `Parameters`' `Drop` | `add_stream` | none | — |
 //! | the copy road: `av_new_packet`, `av_packet_new_side_data` | `write_packet` | an allocation; a limit; side data libavcodec cannot name | `Build`, before libavformat is reached |
@@ -206,10 +208,10 @@ use ffmpeg_next::{
     AV_DISPOSITION_ATTACHED_PIC, AV_INPUT_BUFFER_PADDING_SIZE, AVChapter, AVCodecParameters,
     AVFMT_FLAG_AUTO_BSF, AVFMT_FLAG_CUSTOM_IO, AVFMT_NOFILE, AVFMT_NOTIMESTAMPS, AVFMT_TS_NEGATIVE,
     AVFMT_TS_NONSTRICT, AVFormatContext, AVIOContext, AVRational, AVStream, av_dict_free,
-    av_dict_set, av_dynarray_add_nofree, av_free, av_freep, av_guess_format,
-    av_interleaved_write_frame, av_mallocz, av_write_trailer, avcodec_parameters_copy,
-    avformat_alloc_output_context2, avformat_free_context, avformat_new_stream,
-    avformat_write_header, avio_flush, avio_seek,
+    av_dict_set, av_dynarray_add_nofree, av_free, av_freep, av_get_audio_frame_duration2,
+    av_guess_format, av_interleaved_write_frame, av_mallocz, av_rescale_q, av_write_trailer,
+    avcodec_parameters_copy, avformat_alloc_output_context2, avformat_free_context,
+    avformat_new_stream, avformat_write_header, avio_flush, avio_seek,
   },
   format::context::StreamIo,
   packet::Mut,
@@ -781,6 +783,43 @@ impl<W> Output<W> {
     match (num > 0, NonZeroI32::new(den)) {
       (true, Some(nz)) if den > 0 => Ok(Timebase::new(num, nz)),
       _ => Err(OutputError::TimeBase { stream, num, den }),
+    }
+  }
+
+  /// The duration libavformat gives a packet of `frame_bytes` bytes on the
+  /// audio stream `stream` that states none, in the stream's time base
+  /// (`guess_pkt_duration`, `libavformat/mux.c` 624–631 in FFmpeg 9.0.1):
+  /// libavcodec's count of the packet's samples, of the stream's parameters
+  /// and the packet's size (`av_get_audio_frame_duration2`,
+  /// `libavcodec/utils.c` 578–833), at the stream's sample rate as
+  /// `av_rescale_q` rounds it — `0` where it counts none or the stream
+  /// states no sample rate. Of the parameters as they stand; nothing
+  /// allocated.
+  pub fn guessed_audio_duration(
+    &self,
+    stream: usize,
+    frame_bytes: usize,
+  ) -> Result<i64, OutputError> {
+    let st = self.stream(stream)?;
+    // A packet's size is an `int`: none larger is built.
+    let bytes = c_int::try_from(frame_bytes).unwrap_or(c_int::MAX);
+    // SAFETY: `st` is a live stream of the live context and its
+    // `codecpar` the stream's own. libavcodec reads the parameters' plain
+    // fields, and compares the extradata's pointer with null, writing
+    // nothing; `av_rescale_q` is arithmetic on the values passed.
+    unsafe {
+      let par = (*st).codecpar;
+      let samples = av_get_audio_frame_duration2(par, bytes);
+      let rate = (*par).sample_rate;
+      Ok(if samples != 0 && rate != 0 {
+        av_rescale_q(
+          i64::from(samples),
+          AVRational { num: 1, den: rate },
+          (*st).time_base,
+        )
+      } else {
+        0
+      })
     }
   }
 
