@@ -1136,3 +1136,117 @@ fn an_audio_packet_framed_reaches_libavformat_behind_its_header() {
     "the caller's bytes untouched"
   );
 }
+
+/// An AAC stream's ticket, at 44.1 kHz in stereo, of the configuration
+/// `config`.
+fn aac(config: &[u8]) -> CodecTicket {
+  let mut parameters = ffmpeg_next::codec::Parameters::new();
+  // SAFETY: `Parameters::new` allocated a live `AVCodecParameters` (it is
+  // checked non-null first) that nothing else holds; the enums are written
+  // as the integers they are stored as, the layout by libavutil's own, and
+  // the extradata into an allocation of libavutil's, zero-padded.
+  unsafe {
+    let par = parameters.as_mut_ptr();
+    assert!(!par.is_null(), "avcodec_parameters_alloc");
+    write_unaligned(
+      addr_of_mut!((*par).codec_type).cast::<i32>(),
+      ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO as i32,
+    );
+    write_unaligned(
+      addr_of_mut!((*par).codec_id).cast::<i32>(),
+      CodecId::AAC.raw(),
+    );
+    (*par).sample_rate = 44_100;
+    ffmpeg_next::ffi::av_channel_layout_default(addr_of_mut!((*par).ch_layout), 2);
+    let extradata = av_mallocz(config.len() + PADDING).cast::<u8>();
+    assert!(!extradata.is_null(), "av_mallocz");
+    ptr::copy_nonoverlapping(config.as_ptr(), extradata, config.len());
+    (*par).extradata = extradata;
+    (*par).extradata_size = config.len() as i32;
+  }
+  CodecTicket::mirror(&parameters, 0, 1 << 20).expect("a ticket")
+}
+
+/// **A context whose call failed writes nothing more into its sink, by
+/// either road out** (R21, Codex R20 3; r1, refined: fail closed). FLV
+/// writes an AAC packet's new configuration as a sequence header, then
+/// refuses the packet, its tag past 24 bits (`flv_write_packet`,
+/// `flvenc.c` 1250–1263, 1346–1351 in FFmpeg 9.0.1): a failure that is not
+/// the sink's, the header's bytes still in the I/O context's buffer. Then
+/// the context is dropped, or handed back: no byte and no flush reaches
+/// the sink after the failure — the buffered bytes discarded, the sink's
+/// flush not called — and the sink holds what was written before it; its
+/// hand-back is refused by name, the sink dropped once.
+///
+/// PLANT: `Drop` torn down open; `into_sink` torn down open; the guard's
+/// closing word unread.
+#[test]
+fn a_failed_context_writes_nothing_more_into_its_sink() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let ticket = aac(&[0x12, 0x10]);
+  for road in ["drop", "into_sink"] {
+    let sink = Counted::default();
+    let tally = std::sync::Arc::clone(&sink.tally);
+    let mut output = Output::open(sink, "flv").expect("open");
+    let stream = output
+      .add_stream(&StreamSpec::new(&ticket, millis()))
+      .expect("a stream");
+    output.write_header().expect("the header");
+    let packet = AudioPacket::new(
+      FfmpegBytes::copy_from_slice(&vec![0; 1 << 24]),
+      AudioPacketExtra::new(0).with_side_data(vec![crate::extras::SideDataEntry::new(
+        ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32,
+        FfmpegBytes::copy_from_slice(&[0x11, 0x90]),
+      )]),
+    )
+    .with_pts(Some(ms(0)))
+    .with_dts(Some(ms(0)));
+    let failed = output.write_packet::<crate::Owned>(
+      stream,
+      OutputPacket::Audio(&packet),
+      times(0),
+      PacketLimits::default(),
+    );
+    assert!(
+      matches!(failed, Err(OutputError::Ffmpeg(_))),
+      "{road}: the premise, a failure not the sink's: {failed:?}"
+    );
+    assert_eq!(output.phase(), OutputPhase::Failed, "{road}");
+    let (written, flushes) = (
+      tally.written.lock().expect("the tally").len(),
+      tally.flushes.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    assert!(
+      output.position() > written as i64,
+      "{road}: the premise, the sequence header's bytes still buffered"
+    );
+    if road == "drop" {
+      drop(output);
+    } else {
+      assert!(
+        matches!(
+          output.into_sink(),
+          Err(OutputError::FailedEarlier {
+            call: OutputCall::IntoSink
+          })
+        ),
+        "{road}: the hand-back refused by name"
+      );
+    }
+    assert_eq!(
+      tally.written.lock().expect("the tally").len(),
+      written,
+      "{road}: no byte after the failure"
+    );
+    assert_eq!(
+      tally.flushes.load(std::sync::atomic::Ordering::Relaxed),
+      flushes,
+      "{road}: no flush after the failure"
+    );
+    assert_eq!(
+      tally.drops.load(std::sync::atomic::Ordering::Relaxed),
+      1,
+      "{road}: the sink dropped once"
+    );
+  }
+}

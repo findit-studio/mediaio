@@ -36,6 +36,14 @@
 //! every failure, refuses every later call — write, seek and flush — and
 //! the context names it.
 //!
+//! **And so is the sink of an output whose call failed, once the output
+//! is torn down** ([`SinkClosed`]; R21, Codex R20 3). The output closes
+//! the guard before its context is freed: what the muxer's `deinit`
+//! might write, the I/O context's last flush and the sink's own `flush`
+//! that ffmpeg-next's `StreamIo` runs on its way out are each refused, so
+//! that the sink holds the bytes written before the failure, and nothing
+//! after it.
+//!
 //! # Every entry into the sink
 //!
 //! The guard is the one way into the caller's sink: `Output` builds its
@@ -45,9 +53,9 @@
 //!
 //! | entry | called from | asked first |
 //! |---|---|---|
-//! | [`Write::write`] | ffmpeg-next's `write` callback, which loops it over the buffer libavformat hands it (`stream_io.rs` 323–347), for every `avio_flush` and every buffer libavformat fills — at the header, a packet, the trailer, `into_sink` (`output.rs`), `StreamIo::into_inner` and its `Drop` (240, 269) | the latch, then the seek record |
-//! | [`Seek::seek`], any `SeekFrom` | the `seek` callback, for `avio_seek`'s positioning (`stream_io.rs` 374–394), and for `AVSEEK_SIZE`, which asks `stream_position` — `seek(SeekFrom::Current(0))` — then `SeekFrom::End(0)`, then `SeekFrom::Start` back (358–372) | the latch, then the seek record; a failure of any kind recorded but an interrupted one, which did nothing and is asked again (388–391) |
-//! | [`Write::flush`] | `into_sink`, once the I/O context is flushed (`output.rs`); `StreamIo`'s `Drop`, through `flush_stream` (`stream_io.rs` 270–272, 405–407), when the context is dropped | the latch, then the seek record |
+//! | [`Write::write`] | ffmpeg-next's `write` callback, which loops it over the buffer libavformat hands it (`stream_io.rs` 323–347), for every `avio_flush` and every buffer libavformat fills — at the header, a packet, the trailer, `into_sink` (`output.rs`), `StreamIo::into_inner` and its `Drop` (240, 269) | whether the sink is closed; the latch and the seek record |
+//! | [`Seek::seek`], any `SeekFrom` | the `seek` callback, for `avio_seek`'s positioning (`stream_io.rs` 374–394), and for `AVSEEK_SIZE`, which asks `stream_position` — `seek(SeekFrom::Current(0))` — then `SeekFrom::End(0)`, then `SeekFrom::Start` back (358–372) | whether the sink is closed; the latch and the seek record; a failure of any kind recorded but an interrupted one, which did nothing and is asked again (388–391) |
+//! | [`Write::flush`] | `into_sink`, once the I/O context is flushed (`output.rs`); `StreamIo`'s `Drop`, through `flush_stream` (`stream_io.rs` 270–272, 405–407), when the context is dropped | whether the sink is closed; the latch and the seek record |
 //! | [`Seek::stream_position`] and the other provided methods | anyone holding the guard | their defaults, over the three above |
 //!
 //! [`GuardedWriter::into_inner`] calls nothing: it hands the sink back. A
@@ -128,6 +136,28 @@ impl SeekRecord {
   }
 }
 
+/// The word, beside the guard, that the output whose call failed is torn
+/// down ([`GuardedWriter::closer`]): from then on the guard refuses every
+/// write, every seek and every flush, so that nothing more reaches the
+/// caller's sink (R21, Codex R20 3).
+#[derive(Debug, Default)]
+pub(crate) struct SinkClosed {
+  closed: AtomicBool,
+}
+
+impl SinkClosed {
+  /// Closes the sink to every later call: a `Release` store.
+  pub(crate) fn close(&self) {
+    self.closed.store(true, Ordering::Release);
+  }
+
+  /// Whether the sink is closed: an `Acquire` load, pairing with the
+  /// `Release` store in [`Self::close`].
+  pub(crate) fn is_closed(&self) -> bool {
+    self.closed.load(Ordering::Acquire)
+  }
+}
+
 /// A caller's byte sink, wrapped so that a panic inside it becomes an
 /// I/O error instead of an abort, and stays one.
 ///
@@ -140,6 +170,7 @@ pub struct GuardedWriter<W> {
   inner: W,
   latch: Arc<PanicLatch>,
   seeks: Arc<SeekRecord>,
+  closed: Arc<SinkClosed>,
 }
 
 impl<W> GuardedWriter<W> {
@@ -154,10 +185,17 @@ impl<W> GuardedWriter<W> {
         inner,
         latch: Arc::clone(&latch),
         seeks: Arc::clone(&seeks),
+        closed: Arc::new(SinkClosed::default()),
       },
       latch,
       seeks,
     )
+  }
+
+  /// A handle on the word that closes the sink ([`SinkClosed`]), for the
+  /// output that owns the guard.
+  pub(crate) fn closer(&self) -> Arc<SinkClosed> {
+    Arc::clone(&self.closed)
   }
 
   /// The caller's sink, handed back.
@@ -204,9 +242,15 @@ impl<W> GuardedWriter<W> {
 }
 
 impl<W> GuardedWriter<W> {
-  /// Refuses a write, a seek or a flush once a seek has failed
+  /// Refuses a write, a seek or a flush once the output whose call failed
+  /// has closed the sink ([`SinkClosed`]), or once a seek has failed
   /// ([`SeekRecord`]).
   fn positioned(&self) -> io::Result<()> {
+    if self.closed.is_closed() {
+      return Err(io::Error::other(
+        "the output failed, and nothing more reaches the caller's writer",
+      ));
+    }
     if self.seeks.is_set() {
       Err(io::Error::other(
         "the caller's writer failed a seek earlier, and nothing more is written",
@@ -252,6 +296,25 @@ impl<W: Seek> Seek for GuardedWriter<W> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// **A closed sink is not called again** (R21, Codex R20 3): once the
+  /// output whose call failed closes it, a write, a seek and a flush each
+  /// answer an error without reaching the sink, and none is kept as a
+  /// failed seek.
+  #[test]
+  fn a_closed_sink_is_not_called_again() {
+    let (mut guarded, latch, seeks) = GuardedWriter::new(io::Cursor::new(Vec::new()));
+    guarded.closer().close();
+    assert!(guarded.write(b"after").is_err());
+    assert!(guarded.flush().is_err());
+    assert!(guarded.seek(SeekFrom::Start(0)).is_err());
+    assert!(!seeks.is_set(), "no failed seek kept");
+    assert!(!latch.is_latched(), "no panic latched");
+    assert!(
+      guarded.into_inner().into_inner().is_empty(),
+      "nothing reached the sink"
+    );
+  }
 
   /// A sink that panics in each of its three calls, and counts them.
   #[derive(Default)]

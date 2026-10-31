@@ -747,8 +747,14 @@
 //! every failure a writer returns whose state a later call could not go
 //! on from: of the census's rows, N1 alone needs a write after a returned
 //! failure; the A rows' faults are each a failure swallowed, which the
-//! next write and the trailer reach unreturned (L173). What a failed
-//! write leaves is freed at the drop:
+//! next write and the trailer reach unreturned (L173). And, refined in
+//! R21 (Codex R20 3: fail closed), nothing more reaches the sink: the base
+//! closes the writer guard before the context is freed, discards what the
+//! I/O context still buffers, and runs no flush of its or of the sink's
+//! own, by either road out — so that the sink holds the bytes written
+//! into it before the failure, and nothing after it
+//! (`mediaio_ffmpeg::output`; `a_failed_context_writes_nothing_more_into_its_sink`).
+//! What a failed write leaves is freed at the drop:
 //!
 //! | muxer | what frees what it holds, past the stream's own parameters, at `avformat_free_context` (`avformat.c` 148–200: the `deinit` where its start ran, 158–159; then every stream — its parameters, its private data, its automatic filter — the interleaving queue's packets, the chapters, the metadata) | what its trailer frees, which a failed write skips |
 //! |---|---|---|

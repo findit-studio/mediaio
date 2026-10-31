@@ -37,7 +37,12 @@
 //! what the context holds is freed at [`Output::into_sink`] or `Drop`, by
 //! `avformat_free_context`, which runs the muxer's `deinit` and frees the
 //! interleaving queue and the streams (`avformat.c` 148–200) — the road
-//! libavformat's own failures take.
+//! libavformat's own failures take. And nothing more reaches the sink
+//! (R21, Codex R20 3): the guard is closed before the context is freed,
+//! what the I/O context still buffers is discarded, and no flush of the
+//! I/O context's or the sink's own runs on the way out, so that the sink
+//! holds the bytes written into it before the failure, and nothing after
+//! it.
 //!
 //! # The sink
 //!
@@ -101,12 +106,13 @@
 //! |---|---|---|
 //! | a refusal in `open` | before `avformat_alloc_output_context2`, nothing is allocated; after a failed one, the `StreamIo` drops (it flushes nothing, then the sink's flush through the guard, then frees) and the sink with it | `ctx` is null on failure and owns nothing of this crate's |
 //! | the file finished: `write_trailer`, then `into_sink` | the context freed; `avio_flush`; `AVIOContext.error` read; `into_inner` frees the buffer and the I/O context and hands back the guard; the sink's flush; then the latch, the seek record, the write error and the flush error are named, in that order, or the sink is handed back | each field is moved out of the `ManuallyDrop<Self>` once (`ptr::read`) and never used through it again; `pb` is read after the context that pointed at it is gone, and before `into_inner` frees it |
-//! | `into_sink` before the trailer — from `Building`, `Writing` or `Failed` | exactly the file-finished road: the context freed (from `Writing`, the muxer's `deinit` and the queued packets with it, as in `Drop`), then the I/O context flushed, read and freed, and the sink handed back holding what was written — a container without its trailer, which no phase check refuses: the call is the caller's way to take the sink back from any phase | as above; nothing in the road depends on the phase |
+//! | `into_sink` before the trailer — from `Building` or `Writing` | exactly the file-finished road: the context freed (from `Writing`, the muxer's `deinit` and the queued packets with it, as in `Drop`), then the I/O context flushed, read and freed, and the sink handed back holding what was written — a container without its trailer, which no phase check refuses: the call is the caller's way to take the sink back | as above |
+//! | `into_sink` from `Failed` (R21, Codex R20 3) | the guard closed; the context freed; what the I/O context buffers discarded (`discard_buffered`); `into_inner` frees it, flushing nothing, and calls no `flush` of the sink's; the guard and the sink dropped; `FailedEarlier` | as the file-finished road; the guard, closed, refuses whatever the `deinit` writes |
 //! | an error from any call | the call answers it, and the context stays as the phase says — a failed header, stream or write leaves it `Failed`; a call out of order, or after a failure, is refused before libavformat is reached (a second trailer would run a muxer's trailer over state its first freed; a write after a failed one, over state the failure left) | the phase |
 //! | a panic in the sink, in any callback | caught by the guard under `catch_unwind`, latched, answered to C as an I/O error; every later call into the sink answers an error without reaching it; the context names the panic first | the panic never reaches the `extern "C"` frame; nothing is freed while a callback runs |
 //! | an error whose payload panics when dropped | reduced inside the guard's `catch_unwind` to its OS code or kind, the payload dropped there and its panic latched | what reaches C owns nothing |
 //! | a failed seek | kept by the guard; every later write and seek refused; named by every call that reached libavformat, whatever libavformat answered | — |
-//! | the `Output` dropped, at any point — mid-file, after an error, while the caller unwinds | `avformat_free_context` (the muxer's `deinit`, the queued packets freed), then the `StreamIo` drops: buffered bytes flushed through the guard, which writes nothing after a panic or a failed seek, then the sink's flush, then the frees | the context is freed before the I/O context its `pb` points at, and each exactly once |
+//! | the `Output` dropped, at any point — mid-file, after an error, while the caller unwinds | `avformat_free_context` (the muxer's `deinit`, the queued packets freed), then the `StreamIo` drops: buffered bytes flushed through the guard, which writes nothing after a panic or a failed seek, then the sink's flush, then the frees — but from `Failed` (R21, Codex R20 3) the guard is closed first and what the I/O context buffers discarded after the context is freed, so that the `StreamIo` writes nothing and the guard refuses its call of the sink's flush | the context is freed before the I/O context its `pb` points at, and each exactly once |
 //!
 //! # Every `unsafe` read and write
 //!
@@ -133,8 +139,9 @@
 //! | `free_chapter` | `av_dict_free`, `av_free` | a chapter this module allocated and no array took |
 //! | `write_header`, `write_trailer` | `avformat_write_header`, `av_write_trailer` | the phase allows exactly one of each, in order |
 //! | `write_packet` | the boundary's builders, on the copy road — an audio packet framed (`OutputPacket::AudioFramed`), its header and its payload copied into one `av_new_packet` allocation; the packet's `stream_index`; `av_interleaved_write_frame` | every builder copies, so nothing a caller holds is lent; a stream of this context; the reference taken over, the packet left blank |
-//! | `into_sink` | the fields moved out of `ManuallyDrop`; `avformat_free_context`; `avio_flush`; `AVIOContext.error` | each field moved once; the context freed before the I/O context; `pb` live until `into_inner` |
-//! | `Drop` | `avformat_free_context`; `ManuallyDrop::drop` of the I/O context | each exactly once, the context first |
+//! | `into_sink` | the fields moved out of `ManuallyDrop`; `avformat_free_context`; `avio_flush`; `AVIOContext.error`; from `Failed`, `discard_buffered` in place of the flush | each field moved once; the context freed before the I/O context; `pb` live until `into_inner` |
+//! | `Drop` | `avformat_free_context`; from `Failed`, `discard_buffered`; `ManuallyDrop::drop` of the I/O context | each exactly once, the context first |
+//! | `discard_buffered` | the write context's `buf_ptr` and `buf_ptr_max` set to its `buffer` | the context live, no call using it; the buffer its own, freed with it |
 //! | `unsafe impl Send` | — | the context and the I/O context are heap allocations reached only through `&mut self`; the sink is `W: Send` |
 //!
 //! And the other reads of FFmpeg the muxer reaches, outside this module:
@@ -238,7 +245,7 @@ use crate::{
   limits::PacketLimits,
   reader_guard::PanicLatch,
   ticket::CodecTicket,
-  writer_guard::{GuardedWriter, SeekRecord},
+  writer_guard::{GuardedWriter, SeekRecord, SinkClosed},
 };
 
 /// `AVMEDIA_TYPE_VIDEO`, as the integer `AVCodecParameters.codec_type`
@@ -283,6 +290,9 @@ pub enum OutputCall {
   WriteTrailer,
   /// [`Output::set_automatic_filters`].
   AutomaticFilters,
+  /// [`Output::into_sink`], after a call that failed: the context freed,
+  /// and the sink not handed back as a whole one.
+  IntoSink,
 }
 
 /// A text handed to libavformat as a C string.
@@ -697,6 +707,9 @@ pub struct Output<W> {
   latch: Arc<PanicLatch>,
   /// The writer guard's record of a failed seek, to name it.
   seeks: Arc<SeekRecord>,
+  /// The word that closes the sink, said as a context whose call failed is
+  /// torn down ([`SinkClosed`]).
+  closed: Arc<SinkClosed>,
   phase: OutputPhase,
   /// The sink's type, held by `io` type-erased.
   _sink: PhantomData<fn(W) -> W>,
@@ -1000,6 +1013,7 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     }
 
     let (guarded, latch, seeks) = GuardedWriter::new(sink);
+    let closed = guarded.closer();
     let mut io = StreamIo::from_write_seek(guarded)?;
     // `from_write_seek` answers a live I/O context or an error, so the
     // pointer is never null; checked rather than assumed, before anything
@@ -1040,6 +1054,7 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
       pb,
       latch,
       seeks,
+      closed,
       phase: OutputPhase::Building,
       _sink: PhantomData,
     })
@@ -1381,32 +1396,76 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
   /// missing, however the rest went.
   ///
   /// **From any phase.** Called before the trailer — while the context is
-  /// being built, while it is writing, or after a step failed — it frees
-  /// the context exactly as dropping it does (from
-  /// [`OutputPhase::Writing`], the muxer's `deinit` and the packets still
-  /// queued for interleaving go with it), and hands back the sink holding
-  /// what was written: a container without its trailer, answered `Ok`
-  /// when nothing failed. No phase is refused: this is how a caller takes
-  /// its sink back from wherever the context is, and the muxer above
+  /// being built, or while it is writing — it frees the context exactly as
+  /// dropping it does (from [`OutputPhase::Writing`], the muxer's `deinit`
+  /// and the packets still queued for interleaving go with it), and hands
+  /// back the sink holding what was written: a container without its
+  /// trailer, answered `Ok` when nothing failed. This is how a caller
+  /// takes its sink back from wherever the context is, and the muxer above
   /// writes the trailer first.
+  ///
+  /// **After a call that failed** ([`OutputPhase::Failed`]; R21, Codex R20
+  /// 3) it frees the context closed: the guard shut first, so that nothing
+  /// the muxer's `deinit` writes reaches the sink, then what the I/O
+  /// context still buffers discarded, and no flush asked of it or of the
+  /// sink. The sink, holding the bytes written into it before the failure
+  /// and nothing after, is dropped, not handed back as a whole one: its
+  /// own fault is named as above — the panic, the failed seek, the failed
+  /// write the I/O context kept, read before the teardown — and a failure
+  /// that was not the sink's refuses the call by name
+  /// ([`OutputError::FailedEarlier`]), answered once at its call.
   pub fn into_sink(self) -> Result<W, OutputError> {
     let this = ManuallyDrop::new(self);
+    let failed = this.phase == OutputPhase::Failed;
+    // The first failed write the I/O context keeps, read before anything
+    // of the teardown can touch it (`writeout`, `aviobuf.c` 136–166).
+    // SAFETY: `pb` is the live I/O context `io` owns; `error` a plain field.
+    let kept = unsafe { (*this.pb.as_ptr()).error };
     // SAFETY: `this` is never dropped, so each field is moved out exactly
     // once here, and none is used through `this` again.
-    let (ctx, io, latch, seeks) = unsafe {
+    let (ctx, io, latch, seeks, closed) = unsafe {
       (
         this.ctx,
         ptr::read(&this.io),
         ptr::read(&this.latch),
         ptr::read(&this.seeks),
+        ptr::read(&this.closed),
       )
     };
+    // A context whose call failed is torn down closed (R21, Codex R20 3):
+    // the sink shut before the muxer's `deinit` can write into it.
+    if failed {
+      closed.close();
+    }
     // SAFETY: the context is this value's, freed exactly once — before
     // the I/O context its `pb` points at, which `AVFMT_FLAG_CUSTOM_IO`
     // keeps libavformat from touching.
     unsafe { avformat_free_context(ctx.as_ptr()) };
     let mut io = ManuallyDrop::into_inner(io);
     let pb = io.as_mut_ptr();
+    if failed {
+      // SAFETY: `pb` is the live write context `io` owns, which no format
+      // context points at any more.
+      unsafe { discard_buffered(pb) };
+      // `into_inner` flushes nothing — nothing is buffered — and calls no
+      // `flush` of the sink's; the sink is dropped with the guard, holding
+      // the bytes written before the failure. The sink's own fault is
+      // named, as on every road, the panic first; else the call is refused,
+      // the failure answered at its call.
+      drop(io.into_inner::<GuardedWriter<W>>());
+      if let Some(message) = latch.message() {
+        return Err(OutputError::SinkPanic { message });
+      }
+      if let Some(error) = seeks.failure() {
+        return Err(OutputError::SinkSeek(error));
+      }
+      if kept < 0 {
+        return Err(OutputError::SinkWrite(ffmpeg_next::Error::from(kept)));
+      }
+      return Err(OutputError::FailedEarlier {
+        call: OutputCall::IntoSink,
+      });
+    }
     // SAFETY: `pb` is the live I/O context `io` owns, a write context
     // (`open` built it over the sink), and no format context points at it
     // any more. `avio_flush` writes what is still buffered through the
@@ -1441,14 +1500,46 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
 
 impl<W> Drop for Output<W> {
   fn drop(&mut self) {
+    // A context whose call failed is torn down closed (R21, Codex R20 3):
+    // the sink shut before the muxer's `deinit` can write into it, and
+    // what the I/O context still buffers discarded after it, so that
+    // nothing more reaches the sink — `StreamIo`'s `Drop` then flushes
+    // nothing, and its call of the sink's `flush` the guard refuses.
+    let failed = self.phase == OutputPhase::Failed;
+    if failed {
+      self.closed.close();
+    }
     // SAFETY: the context is this value's, freed exactly once — here, or
     // in `into_sink`, which does not drop `self`. Freed before the I/O
     // context: `avformat_free_context` may run the muxer's `deinit`,
     // which must find `pb` alive, and leaves `pb` alone.
     unsafe { avformat_free_context(self.ctx.as_ptr()) };
+    if failed {
+      // SAFETY: `pb` is the live write context `io` owns, which no format
+      // context points at any more.
+      unsafe { discard_buffered(self.pb.as_ptr()) };
+    }
     // SAFETY: dropped exactly once, after the context. Its `Drop` flushes
     // the buffered bytes and the sink through the guard, then frees.
     unsafe { ManuallyDrop::drop(&mut self.io) };
+  }
+}
+
+/// Discards what the write context `pb` still buffers: its pointers set
+/// back to its buffer's start, as `flush_buffer` leaves them once it has
+/// written (`libavformat/aviobuf.c` 168–182 in FFmpeg 9.0.1), so that a
+/// later `avio_flush` finds nothing to write and nothing to seek back over
+/// (228–234).
+///
+/// # Safety
+///
+/// `pb` is a live write context that no call is using.
+unsafe fn discard_buffered(pb: *mut AVIOContext) {
+  // SAFETY: the caller's: `pb` is live; `buffer` is its own allocation,
+  // which the two pointers point into.
+  unsafe {
+    (*pb).buf_ptr = (*pb).buffer;
+    (*pb).buf_ptr_max = (*pb).buffer;
   }
 }
 
