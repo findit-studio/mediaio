@@ -445,7 +445,7 @@ fn a_configuration_is_judged_and_its_rewrite_reported() {
   ));
   // MP4's AAC, AV1, FLAC and MPEG-4 ALS, and Matroska's AAC, take their
   // first packet's new extradata as their configuration (R9: ruling 4a);
-  // not ISMV's nor AVIF's, nor WebM's.
+  // not AVIF's, nor WebM's.
   for (family, audited, codec, takes) in [
     (Family::Mp4, Audited::Mov(MovMode::Mp4), CodecId::AAC, true),
     (Family::Mp4, Audited::Mov(MovMode::Mp4), CodecId::AV1, true),
@@ -464,7 +464,6 @@ fn a_configuration_is_judged_and_its_rewrite_reported() {
       CodecId::OPUS,
       false,
     ),
-    (Family::Mp4, Audited::Mov(MovMode::Ism), CodecId::AAC, false),
     (
       Family::Mp4,
       Audited::Mov(MovMode::Avif),
@@ -578,25 +577,6 @@ fn a_configuration_is_judged_and_its_rewrite_reported() {
     field_rows(Audited::Wav { w64: false }, CodecId::PCM_S16LE),
     vec![Rewrite::Timeline]
   );
-  // ASF: the decode time and the key flag, no duration — and an audio
-  // track's key flag, which its reader sets on every packet, is reported
-  // where a packet is offered unmarked, not at open.
-  for stream in [false, true] {
-    assert_eq!(
-      field_rows(Audited::Asf { stream }, CodecId::H264),
-      vec![Rewrite::Durations]
-    );
-    assert_eq!(
-      rewrites(
-        (Family::Other, Audited::Asf { stream }, TrackKind::Audio),
-        CodecId::AAC,
-        &[],
-        true
-      )
-      .collect::<Vec<_>>(),
-      vec![Rewrite::Durations]
-    );
-  }
 }
 
 /// The audited muxer a family's unit laws stand for.
@@ -605,7 +585,7 @@ fn audited_for(family: Family) -> Audited {
     Family::Mp4 => Audited::Mov(MovMode::Mp4),
     Family::Matroska => Audited::Matroska,
     Family::WebM => Audited::WebM,
-    Family::Other => Audited::Mxf(MxfKind::Mxf),
+    Family::Other => Audited::MpegTs,
   }
 }
 
@@ -900,30 +880,16 @@ fn mp4s_ac3_handling_is_mirrored() {
   assert_eq!(take(held, true, &independent), Err(PayloadRule::Ac3Blocks));
 }
 
-/// The kind of a track of `codec`, as the laws' tracks are: audio for AAC
-/// and PCM, a subtitle for PGS and EIA-608, else video.
-fn kind_of(codec: CodecId) -> TrackKind {
-  if codec == CodecId::AAC || codec == CodecId::PCM_S16LE {
-    TrackKind::Audio
-  } else if codec == CodecId::HDMV_PGS_SUBTITLE || codec == EIA_608 {
-    TrackKind::Subtitle
-  } else {
-    TrackKind::Video
-  }
-}
-
 /// **Every filter table B names is settled where its muxer inserts it, and
 /// named for the track where open decides it** (E″ of the census): every
 /// `check_bitstream` answers 1 or the insertion's answer, so libavformat
 /// decides a muxer's filters at a track's first packet, never later
 /// (`mux.c` 1063–1068); a muxer's start inserts the rest whatever the
-/// option says. `pcm_rechunk` in DAUD, GXF and the three MXF muxers;
-/// `av1_metadata` in IVF at its start and in OBU at the first packet;
-/// `eia608_to_smpte436m` in MCC and the MXF muxers; `extract_extradata` in
-/// FLV where the track states no configuration; the Annex B conversions,
-/// undecided until the first packet, in MPEG-TS — and RTP MPEG-TS's nested
-/// one, the option aside — in MXF and MXF OP-Atom for H.264, and in each
-/// raw muxer for its codec.
+/// option says. `av1_metadata` in IVF at its start and in OBU at the first
+/// packet; `extract_extradata` in FLV where the track states no
+/// configuration; the Annex B conversions, undecided until the first
+/// packet, in MPEG-TS — and RTP MPEG-TS's nested one, the option aside —
+/// and in each raw muxer for its codec.
 #[test]
 fn every_filter_table_b_names_is_settled_where_its_muxer_inserts_it() {
   use AutomaticFilter as A;
@@ -931,7 +897,7 @@ fn every_filter_table_b_names_is_settled_where_its_muxer_inserts_it() {
     Filter::settle(
       Sites::of(muxer, None),
       Family::of(muxer),
-      (kind_of(codec), codec),
+      codec,
       extradata,
       on,
     )
@@ -939,24 +905,9 @@ fn every_filter_table_b_names_is_settled_where_its_muxer_inserts_it() {
   let named =
     |muxer: &str, codec, extradata: &[u8], on| settle(muxer, codec, extradata, on).named();
   for on in [true, false] {
-    for muxer in ["daud", "gxf", "mxf", "mxf_d10", "mxf_opatom"] {
-      assert_eq!(
-        named(muxer, CodecId::PCM_S16LE, &[], on),
-        Some(A::PcmRechunk),
-        "{muxer}"
-      );
-    }
-    for muxer in ["mcc", "mxf", "mxf_d10", "mxf_opatom"] {
-      assert_eq!(
-        named(muxer, EIA_608, &[], on),
-        Some(A::Eia608ToSmpte436m),
-        "{muxer}"
-      );
-    }
     assert_eq!(named("ivf", CodecId::AV1, &[], on), Some(A::Av1Metadata));
   }
   assert_eq!(named("wav", CodecId::PCM_S16LE, &[], true), None);
-  assert_eq!(named("mov", EIA_608, &[], true), None);
   assert_eq!(named("obu", CodecId::AV1, &[], true), Some(A::Av1Metadata));
   assert_eq!(named("obu", CodecId::AV1, &[], false), None);
   assert_eq!(named("mp4", CodecId::AV1, &[1], true), None);
@@ -1026,26 +977,7 @@ fn every_filter_table_b_names_is_settled_where_its_muxer_inserts_it() {
     settle("mpegts", CodecId::VVC, &[0x01], true),
     undecided(A::VvcMp4ToAnnexB, false)
   );
-  for muxer in ["mxf", "mxf_opatom"] {
-    assert_eq!(
-      settle(muxer, CodecId::H264, &[1], true),
-      undecided(A::H264Mp4ToAnnexB, false),
-      "{muxer}"
-    );
-    assert_eq!(
-      settle(muxer, CodecId::HEVC, &[], true),
-      Filter::None,
-      "{muxer}"
-    );
-  }
-  assert_eq!(
-    settle("mxf_d10", CodecId::H264, &[], true),
-    Filter::None,
-    "no check_bitstream"
-  );
-  assert_eq!(A::PcmRechunk.name(), "pcm_rechunk");
   assert_eq!(A::Av1Metadata.name(), "av1_metadata");
-  assert_eq!(A::Eia608ToSmpte436m.name(), "eia608_to_smpte436m");
   assert_eq!(A::ExtractExtradata.name(), "extract_extradata");
   assert_eq!(A::H264Mp4ToAnnexB.name(), "h264_mp4toannexb");
   assert_eq!(A::HevcMp4ToAnnexB.name(), "hevc_mp4toannexb");
@@ -1237,7 +1169,6 @@ fn eac3_track(frame_size: i32) -> TrackState {
       sample_rate: 48_000,
       frame_size,
       initial_padding: 0,
-      format: -1,
       extradata: Vec::new(),
       alone: false,
     },
@@ -1247,8 +1178,6 @@ fn eac3_track(frame_size: i32) -> TrackState {
     document: 0,
     adts: None,
     bytes: 0,
-    place: 0,
-    avi_frames: 0,
     ts_held: 0,
     ts_trim: 0,
     ts_pce: Vec::new(),
@@ -1261,10 +1190,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     moov: None,
     stsd: 0,
     apv: Vec::new(),
-    key_times: None,
-    mxf: MxfMirror::default(),
     buffered: 0,
-    dts_shift: None,
     flv_rewrites: false,
     presented: None,
     configured: false,
@@ -1987,7 +1913,6 @@ fn each_container_keeps_the_side_data_it_has_a_place_for() {
     sample_rate: 48_000,
     frame_size: 1024,
     initial_padding: 1024,
-    format: -1,
     extradata: vec![0x11, 0x90],
     alone: false,
   };
@@ -2119,10 +2044,10 @@ fn each_container_keeps_the_side_data_it_has_a_place_for() {
 /// **The filters are those each muxer inserts, by grep 1 and 2 of the
 /// census** (table B): IVF's VP9 at its start, the filters on or off;
 /// Matroska's, WebM's and the MOV family's at the first packet, with them
-/// on; AVIF's and ISMV's none; AAC's in the MOV family and Matroska for a
-/// track with no configuration, and in FLV and LATM undecided until the
-/// first packet; PGS's in Matroska's video muxer, and neither AAC's nor
-/// PGS's in its audio one; PCM rechunked in DAUD, GXF and MXF.
+/// on; AVIF's none; AAC's in the MOV family and Matroska for a track with
+/// no configuration, and in FLV and LATM undecided until the first packet;
+/// PGS's in Matroska's video muxer, and neither AAC's nor PGS's in its
+/// audio one.
 #[test]
 fn the_filters_are_those_each_muxer_inserts() {
   use AutomaticFilter as A;
@@ -2130,7 +2055,7 @@ fn the_filters_are_those_each_muxer_inserts() {
     Filter::settle(
       Sites::of(muxer, mime),
       Family::of(muxer),
-      (kind_of(codec), codec),
+      codec,
       extradata,
       on,
     )
@@ -2147,9 +2072,7 @@ fn the_filters_are_those_each_muxer_inserts() {
       "IVF, on {on}"
     );
   }
-  for muxer in [
-    "matroska", "webm", "mov", "3gp", "mp4", "psp", "3g2", "ipod", "f4v",
-  ] {
+  for muxer in ["matroska", "webm", "mov", "mp4", "ipod"] {
     assert_eq!(settle(muxer, None, CodecId::VP9, &[], true), vp9, "{muxer}");
     assert_eq!(
       settle(muxer, None, CodecId::VP9, &[], false),
@@ -2157,7 +2080,7 @@ fn the_filters_are_those_each_muxer_inserts() {
       "{muxer}"
     );
   }
-  for muxer in ["avif", "ismv", "mpegts", "flv", "nut"] {
+  for muxer in ["avif", "mpegts", "flv"] {
     assert_eq!(
       settle(muxer, None, CodecId::VP9, &[], true),
       Filter::None,
@@ -2243,10 +2166,6 @@ fn the_filters_are_those_each_muxer_inserts() {
     settle("mp4", None, CodecId::HDMV_PGS_SUBTITLE, &[], true),
     Filter::None
   );
-  for muxer in ["daud", "gxf", "mxf", "mxf_d10", "mxf_opatom"] {
-    assert!(Sites::of(muxer, None).rechunk, "{muxer}");
-  }
-  assert!(!Sites::of("wav", None).rechunk);
   assert_eq!(A::AacAdtsToAsc.name(), "aac_adtstoasc");
   assert_eq!(A::Vp9Superframe.to_string(), "vp9_superframe");
   assert_eq!(A::PgsFrameMerge.name(), "pgs_frame_merge");
@@ -2692,19 +2611,6 @@ fn mp4s_ac3_refuses_a_first_frame_dac3_does_not_define() {
   assert!(take(Ac3State::default(), true, &frame(9)).is_ok());
 }
 
-/// **PCM rechunking's sample size is counted as its start counts it**, in
-/// C's `int`: 33 554 431 channels of 64 bits fit, one more does not.
-#[test]
-fn pcm_rechunkings_sample_size_is_counted_in_an_int() {
-  assert!(!rechunk_overflows(2, 16));
-  assert!(!rechunk_overflows(33_554_431, 64));
-  assert!(rechunk_overflows(33_554_432, 64));
-  assert!(
-    !rechunk_overflows(i32::MAX, 0),
-    "no fixed width: no filter takes it"
-  );
-}
-
 /// **MP4's movie timescale is `mov_init`'s fold of `av_gcd_q`**: the least
 /// common multiple of the streams' denominators below `INT_MAX`, at least
 /// 1000, none for good once it passes.
@@ -2807,8 +2713,8 @@ fn what_a_filter_holds_at_the_end_is_counted() {
 
 /// **libavformat's move of every stream's times is mirrored where its
 /// first write settles it** (`handle_avoid_negative_ts`, `mux.c` 636–717;
-/// table G): MP4 makes none; GXF, MXF, and Matroska beside a video track of
-/// no native id are not mirrored; Matroska judges presentation times, but
+/// table G): MP4 makes none; Matroska beside a video track of no native id
+/// is not mirrored; Matroska judges presentation times, but
 /// decode times beside JPEG 2000, and another container decode times. With
 /// one stream interleaved — SMPTE 2038 data not counted — the first packet
 /// is written as it comes. With two: once as many hold a packet as are
@@ -2830,9 +2736,6 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
   };
 
   assert_eq!(Shift::of(Family::Mp4, "mp4", false, &[video]), None);
-  for muxer in ["gxf", "mxf", "mxf_d10", "mxf_opatom"] {
-    assert_eq!(of(Family::Other, muxer, &[video]), None, "{muxer}");
-  }
   assert_eq!(
     Shift::of(Family::Other, "ogg", false, &[audio]),
     None,
@@ -3078,74 +2981,6 @@ fn matroska_reserves_aacs_output_rate_as_its_header_writes_it() {
   );
 }
 
-/// **libavformat's language table, as `ff_convert_lang_to` reads it**
-/// (`avlanguage.c` 741–770): a bibliographic code to its ISO 639-1 one and
-/// back; a terminological one to its bibliographic sibling; a code no
-/// codespace names, none. ASF keeps a tag only where it is the round
-/// trip's own.
-#[test]
-fn a_language_converts_as_libavformat_converts_it() {
-  use LanguageSpace as L;
-  assert_eq!(convert_language("eng", L::Iso639_1), Some("en"));
-  assert_eq!(
-    convert_language("en", L::Iso639_2Bibliographic),
-    Some("eng")
-  );
-  assert_eq!(convert_language("fra", L::Iso639_1), Some("fr"));
-  assert_eq!(
-    convert_language("fr", L::Iso639_2Bibliographic),
-    Some("fre")
-  );
-  assert_eq!(
-    convert_language("fra", L::Iso639_2Bibliographic),
-    Some("fre")
-  );
-  assert_eq!(convert_language("ger", L::Iso639_2Terminology), Some("deu"));
-  assert_eq!(
-    convert_language("eng", L::Iso639_2Terminology),
-    Some("eng"),
-    "B where T is the same"
-  );
-  assert_eq!(convert_language("zzz", L::Iso639_1), None);
-  assert!(LanguageRule::ThroughIso639_1.keeps("eng"));
-  assert!(!LanguageRule::ThroughIso639_1.keeps("fra"));
-  assert!(!LanguageRule::ThroughIso639_1.keeps("en"));
-  assert!(
-    !LanguageRule::ThroughIso639_1.keeps("ace"),
-    "no ISO 639-1 code: not written"
-  );
-}
-
-/// **NUT's time bases, as its header sets them** (`choose_timebase`,
-/// `nut_write_header`, `nutenc.c` 48–59, 749–753): an audio stream's its
-/// sample rate's; any other's made at least 1/48000 fine, its numerator
-/// divided by 2, 3, 5, 7, 9, 11 and 13 while it divides, then its
-/// denominator doubled below 2^24 — every tick of the base handed a whole
-/// number of the new one's.
-#[test]
-fn nuts_time_base_is_the_one_its_header_chooses() {
-  assert_eq!(
-    nut_time_base(TrackKind::Audio, 44_100, (1, 1000)),
-    (1, 44_100)
-  );
-  assert_eq!(nut_time_base(TrackKind::Video, 0, (1, 1000)), (1, 64_000));
-  assert_eq!(
-    nut_time_base(TrackKind::Video, 0, (1001, 30_000)),
-    (1, 60_000)
-  );
-  assert_eq!(nut_time_base(TrackKind::Video, 0, (1, 90_000)), (1, 90_000));
-  assert_eq!(nut_time_base(TrackKind::Video, 0, (1, 25)), (1, 51_200));
-  assert_eq!(
-    nut_time_base(TrackKind::Subtitle, 0, (17, 1000)),
-    (17, 1_024_000)
-  );
-  assert_eq!(
-    nut_time_base(TrackKind::Audio, 0, (1, 1000)),
-    (1, 64_000),
-    "an audio stream of no sample rate as any other"
-  );
-}
-
 /// **The Xiph headers, as `avpriv_split_xiph_headers` splits them**
 /// (`libavcodec/xiph.c` 25–66): three lengths of 16 bits, the first the
 /// identification header's; or Xiph lacing, its lengths runs of 255 and a
@@ -3187,71 +3022,6 @@ fn a_dictionary_unpacks_as_libavformat_unpacks_it() {
   assert!(!dictionary_unpacks(b"title\0hello"), "unterminated");
   assert!(!dictionary_unpacks(b"\0hello\0"), "an empty key");
   assert!(!dictionary_unpacks(b"title\0"), "a key with no value");
-}
-
-/// **The ISO 639-1 block's tail is found as the C library's `bsearch`
-/// finds it** (R9: Fable R1; `avlanguage.c` 683–693, 748–755): libavformat's
-/// block of ISO 639-1 codes is out of order at its end, so that a binary
-/// search's answer there is its probes'. glibc's `bsearch` and macOS's —
-/// FreeBSD's — walked here over every code of the table and a few it holds
-/// not, agree, and the lookup follows them by name: every code each finds
-/// found at its entry, the ten neither finds not, `xh` and `yi` among the
-/// found — so that ASF keeps `xho` and `yid`, and not `chi`.
-#[test]
-fn the_iso_639_1_tail_is_found_as_the_c_librarys_bsearch_finds_it() {
-  use core::cmp::Ordering;
-  type Search = fn(&str, &[(&str, u16)]) -> Option<usize>;
-  fn glibc(key: &str, block: &[(&str, u16)]) -> Option<usize> {
-    let (mut low, mut high) = (0, block.len());
-    while low < high {
-      let middle = (low + high) / 2;
-      match key.cmp(block[middle].0) {
-        Ordering::Less => high = middle,
-        Ordering::Greater => low = middle + 1,
-        Ordering::Equal => return Some(middle),
-      }
-    }
-    None
-  }
-  fn bsd(key: &str, block: &[(&str, u16)]) -> Option<usize> {
-    let (mut base, mut limit) = (0, block.len());
-    while limit != 0 {
-      let probe = base + (limit >> 1);
-      match key.cmp(block[probe].0) {
-        Ordering::Equal => return Some(probe),
-        Ordering::Greater => {
-          base = probe + 1;
-          limit -= 1;
-        }
-        Ordering::Less => {}
-      }
-      limit >>= 1;
-    }
-    None
-  }
-  let found = |search: Search, tag: &str| {
-    LANGUAGE_SPACES.iter().find_map(|&(start, count)| {
-      search(tag, &LANGUAGES[start..start + count]).map(|at| start + at)
-    })
-  };
-  let mut unfound = Vec::new();
-  for &(code, _) in LANGUAGES.iter().chain(&[("zzz", 0), ("xx", 0), ("", 0)]) {
-    let by_glibc = found(glibc, code);
-    assert_eq!(
-      by_glibc,
-      found(bsd, code),
-      "{code}: the two libraries agree"
-    );
-    assert_eq!(language_entry(code), by_glibc, "{code}");
-    if by_glibc.is_none() && LANGUAGES.iter().any(|&(held, _)| held == code) {
-      unfound.push(code);
-    }
-  }
-  assert_eq!(unfound, ISO_639_1_UNFOUND, "the codes named, and no other");
-  assert!(LanguageRule::ThroughIso639_1.keeps("xho"));
-  assert!(LanguageRule::ThroughIso639_1.keeps("yid"));
-  assert!(!LanguageRule::ThroughIso639_1.keeps("chi"));
-  assert!(!LanguageRule::ThroughIso639_1.keeps("zul"));
 }
 
 /// **MPEG-TS's descriptors' codes, as its loops write them** (R9: Codex R8
@@ -3297,81 +3067,6 @@ fn mpeg_ts_writes_a_languages_codes_as_its_loops_do() {
   assert!(LanguageRule::DvbCodes.keeps("eng,fra"));
   assert!(!LanguageRule::DvbCodes.keeps("eng-fra"));
   assert!(!LanguageRule::DvbCodes.keeps("en"));
-}
-
-/// **AVI places an XSUB cue one packet on, however far on its time** (R9:
-/// Codex R8 [medium]; `avienc.c` 745–766, 407–408; `avidec.c` 686–699,
-/// 1548–1590): `write_skip_frames` fills no gap of an XSUB stream, and its
-/// reader counts its cues by packet in the main header's frame period — so
-/// that a cue 100 000 ticks after the first is placed one packet on, never
-/// refused, and reported where its time is not its count's; on the frames'
-/// road, a stream of no block alignment's, it would be refused past the
-/// 60 000 empty frames AVI fills (L84: AVI's tag tables name no XSUB, so
-/// that the open refuses it first).
-///
-/// PLANT: XSUB on the frames' road refuses its far cue.
-#[test]
-fn an_avi_xsub_cue_is_placed_one_packet_on_however_far() {
-  let place = |road: AviPlace| {
-    let mut state = eac3_track(0);
-    state.stream = Some((0, millis()));
-    state.rules = PacketRules {
-      avi: Some(road),
-      ..PacketRules::default()
-    };
-    let mut steps = Vec::new();
-    for at in [0, 100_000] {
-      let timed = timed_at(at);
-      let payload = Payload {
-        bytes: b"[00:00:00.000-00:00:01.000]",
-        key: true,
-        flags: PacketFlags::KEY,
-        side_data: &[],
-      };
-      let step = Step {
-        owns: true,
-        emits: Emits::OWN,
-        largest: Some(payload.bytes.len() as u64),
-        held: None,
-        inserted: None,
-      };
-      match check_packet_rules(
-        &state,
-        millis(),
-        Neighbours::default(),
-        (
-          timed,
-          Outputs {
-            held: &[],
-            emits: Emits::OWN,
-            own: timed,
-          },
-          0,
-        ),
-        (payload, 0),
-        step,
-        Bounds::REAL,
-      ) {
-        Ok((learned, _)) => {
-          let (next, moved) = learned.place.expect("a place");
-          state.place = next;
-          state.written = true;
-          steps.push(Ok(moved));
-        }
-        Err(refusal) => steps.push(Err(refusal)),
-      }
-    }
-    steps
-  };
-  assert_eq!(
-    place(AviPlace::Packets { reader: (1, 25) }),
-    [Ok(false), Ok(true)],
-    "the first at its place, the second one packet on, 40 ms, offered at 100 s"
-  );
-  assert!(matches!(
-    place(AviPlace::Frames)[1],
-    Err(FfmpegMuxRefusal::FrameGap { .. })
-  ));
 }
 
 /// AV1's configurations as `ff_isom_write_av1c` takes them (R9: ruling 4c;
@@ -4381,8 +4076,8 @@ fn flvs_filter_makes_h26x_configurations_as_extract_extradata_makes_them() {
 
 /// **A track's channel layout reads back as each container writes it and
 /// each decoder reads it** (table E, R10's L1): RIFF's extensible form
-/// alone carries a mask, and that only below `0x40000`; Matroska, NUT, MXF
-/// and MP4 of no layout box write the count alone; FLAC's comment carries
+/// alone carries a mask, and that only below `0x40000`; Matroska and MP4
+/// of no layout box write the count alone; FLAC's comment carries
 /// what its own order does not name, and its decoder fills its own order
 /// in where the container states none; FLV's multichannel configuration
 /// drops the channels it has no bit or id for; a decoder of its own layout
@@ -4520,14 +4215,6 @@ fn channel_layouts_read_back_as_each_container_and_decoder_reads_them() {
       native(0x3 | LFE2),
       mask(0x7),
     ),
-    ("AVI PCM stereo", Audited::Avi, pcm, native(0x3), alone(2)),
-    (
-      "ASF PCM stereo",
-      Audited::Asf { stream: false },
-      pcm,
-      native(0x3),
-      alone(2),
-    ),
     (
       "Matroska PCM",
       Audited::Matroska,
@@ -4556,8 +4243,6 @@ fn channel_layouts_read_back_as_each_container_and_decoder_reads_them() {
       native(0x3 | LFE2),
       mask(0x7),
     ),
-    ("NUT PCM", Audited::Nut, pcm, native(0x3), alone(2)),
-    ("NUT FLAC 2.1", Audited::Nut, flac, native(0xB), mask(0x7)),
     ("MP4 PCM mono", mp4, pcm, native(0x4), alone(1)),
     ("MP4 PCM stereo", mp4, pcm, native(0x3), mask(0x3)),
     (
@@ -4575,13 +4260,6 @@ fn channel_layouts_read_back_as_each_container_and_decoder_reads_them() {
       at(mpegh, 0, 48_000),
       native(0x60F),
       mpegh_back,
-    ),
-    (
-      "MXF PCM mono",
-      Audited::Mxf(MxfKind::OpAtom),
-      pcm,
-      native(0x4),
-      alone(1),
     ),
     (
       "FLV FLAC, a wide channel",
@@ -4639,13 +4317,6 @@ fn channel_layouts_read_back_as_each_container_and_decoder_reads_them() {
       Audited::Matroska,
       at(CodecId::AAC, 0, 48_000),
       custom(&named),
-      mask(0x3),
-    ),
-    (
-      "MPEG-PS DVD PCM, of its own",
-      Audited::MpegPs(PsKind::Dvd),
-      at(id(Id::AV_CODEC_ID_PCM_DVD), 0, 48_000),
-      native(0x3),
       mask(0x3),
     ),
   ] {
@@ -4967,102 +4638,13 @@ fn avifs_movie_box_holds_int_max() {
   assert_eq!(super::avif_movie_bound(4096), 4096);
 }
 
-/// A NUT info packet's tags are counted exactly and held to `INT_MAX` less
-/// the 64 bytes of padding its dynamic buffer's close writes (R20, by the
-/// class; [`super::NUT_INFO_BYTES_MAX`]): `put_v`'s bytes, seven bits a
-/// byte (`nutenc.c` 306–327); a chapter's `title` tag, the longest title
-/// taken and a byte more refused; a stream's language, dispositions and
-/// frame rate, each tag as `add_info` writes it (509–515, 545–585).
-#[test]
-fn a_nut_info_packet_holds_int_max_less_its_padding() {
-  let bound = super::Bounds::REAL.info;
-  assert_eq!(
-    bound,
-    i32::MAX as u64 - 64,
-    "INT_MAX less the close's padding"
-  );
-  for (value, bytes) in [
-    (0, 1),
-    (127, 1),
-    (128, 2),
-    (16_383, 2),
-    (16_384, 3),
-    ((1 << 28) - 1, 4),
-    (1 << 28, 5),
-    (u64::from(u32::MAX), 5),
-    (1 << 35, 6),
-  ] {
-    assert_eq!(super::nut_v_bytes(value), bytes, "put_v of {value}");
-  }
-  // `title` behind its length, the type, the title behind its five bytes
-  // of length.
-  let longest = bound - (1 + 5 + 1 + 5);
-  assert_eq!(super::nut_chapter_info_bytes(Some(longest)), bound, "taken");
-  assert_eq!(
-    super::nut_chapter_info_bytes(Some(longest + 1)),
-    bound + 1,
-    "a byte more refused"
-  );
-  assert_eq!(super::nut_chapter_info_bytes(None), 0, "no tag");
-  assert_eq!(
-    super::nut_chapter_info_bytes(Some(0)),
-    8,
-    "an empty title's tag"
-  );
-  let none = TrackDisposition::empty();
-  let all = TrackDisposition::DEFAULT
-    | TrackDisposition::DUB
-    | TrackDisposition::ORIGINAL
-    | TrackDisposition::COMMENT
-    | TrackDisposition::LYRICS
-    | TrackDisposition::KARAOKE;
-  assert_eq!(super::nut_stream_info_bytes(None, none, None), 0);
-  assert_eq!(
-    super::nut_stream_info_bytes(Some(3), none, None),
-    1 + 10 + 1 + 1 + 3,
-    "X-Language and three bytes"
-  );
-  assert_eq!(
-    super::nut_stream_info_bytes(None, all, None),
-    6 * (1 + 11 + 1 + 1) + (7 + 3 + 8 + 7 + 6 + 7),
-    "six Disposition tags"
-  );
-  assert_eq!(
-    super::nut_stream_info_bytes(None, TrackDisposition::FORCED, None),
-    0,
-    "a flag NUT names not"
-  );
-  assert_eq!(
-    super::nut_stream_info_bytes(None, none, Some(None)),
-    1 + 12 + 1 + 1 + 3,
-    "a video stream of no frame rate: 0/0"
-  );
-  let ntsc = Timebase::new(30_000, NonZeroI32::new(1001).expect("a denominator"));
-  assert_eq!(
-    super::nut_stream_info_bytes(None, none, Some(Some(ntsc))),
-    1 + 12 + 1 + 1 + 10,
-    "30000/1001"
-  );
-  assert_eq!(super::decimal_digits(i32::MIN), 11, "the sign among them");
-  assert_eq!(super::decimal_digits(0), 1);
-  // The longest language taken, its tag and the rest at their least.
-  let longest = bound - (1 + 10 + 1 + 5);
-  assert_eq!(
-    super::nut_stream_info_bytes(Some(longest), none, None),
-    bound
-  );
-}
-
-/// AVI's counts hold their `int` and their 32 bits, and FLV's sequence
-/// header its 24 (R20, by the class): the real bounds; FLV's header bytes
-/// of each road of `flv_write_codec_header` (`flvenc.c` 807–914) — an
+/// FLV's sequence header holds its 24 bits (R20, by the class): the real
+/// bound; FLV's header bytes of each road of `flv_write_codec_header` (`flvenc.c` 807–914) — an
 /// extended header and two more past a kind's first, AAC's legacy two,
 /// H.264's legacy five — beside the record as its writer makes it.
 #[test]
-fn avis_counts_and_flvs_sequence_header_hold_their_bits() {
+fn flvs_sequence_header_holds_its_bits() {
   let real = super::Bounds::REAL;
-  assert_eq!(real.frames, i32::MAX as u64, "AVI's frames, an int");
-  assert_eq!(real.blocks, u64::from(u32::MAX), "AVI's length, 32 bits");
   assert_eq!(real.sequence, (1 << 24) - 1, "FLV's tag size, 24 bits");
   let aac = [0x12, 0x10];
   assert_eq!(
@@ -5207,8 +4789,6 @@ fn an_esds_is_counted_where_the_mov_family_writes_one() {
     "the palette's"
   );
   assert!(esds_carries(mov(M::Ipod), CodecId::MPEG4, 0));
-  assert!(esds_carries(mov(M::Ism), CodecId::AAC, 0));
-  assert!(!esds_carries(mov(M::F4v), CodecId::MP3, 0), "F4V's .mp3");
   assert!(esds_carries(mov(M::Mov), CodecId::AAC, xvid), "MOV's wave");
   assert!(
     esds_carries(mov(M::Mov), CodecId::MPEG4, 0),
