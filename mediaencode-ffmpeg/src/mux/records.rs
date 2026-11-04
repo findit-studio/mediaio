@@ -680,6 +680,11 @@ struct Hvcc {
   /// The bytes of the units the record keeps, each written behind its
   /// 16-bit length (`hvcc_write`, 1187–1198).
   unit_bytes: u64,
+  /// The luma and chroma bit depths less 8 of the last SPS parsed of a
+  /// layer the record keeps, each a `uint8_t` of its `ue(v)` (698–699),
+  /// which `hvcc_write` writes in 3 bits (1137–1148): H.265 allows 8 —
+  /// sixteen bits — which reads back as 0 (R21, census R20-5).
+  depths: Option<(u8, u8)>,
 }
 
 /// How a parse of a parameter set ends, as far as the record needs it.
@@ -727,7 +732,11 @@ fn hvcc_config(config: Config<'_>, complete: bool) -> Wrote {
   let [vps, sps, pps, ..] = record.counts;
   if complete && (vps == 0 || vps > 16 || sps == 0 || sps > 16 || pps == 0 || pps > 64) {
     Wrote::Failed
-  } else if record.cut {
+  } else if record.cut
+    || record
+      .depths
+      .is_some_and(|(luma, chroma)| luma > 7 || chroma > 7)
+  {
     Wrote::Corrupt
   } else {
     Wrote::Whole
@@ -1076,7 +1085,7 @@ fn hevc_vps_extension(
 /// `hvcc_parse_sps` (`hevc.c` 628–767) of a unit of `layer`, the reader past
 /// its header, to its count of long-term reference pictures — after it
 /// nothing fails.
-fn hevc_sps(bits: &mut Reader<'_>, layer: u8, record: &Hvcc) -> Parse {
+fn hevc_sps(bits: &mut Reader<'_>, layer: u8, record: &mut Hvcc) -> Parse {
   let vps_id = bits.read(4) as u8;
   let (extension, sub_layers) = if layer == 0 {
     (0, bits.read(3))
@@ -1113,8 +1122,10 @@ fn hevc_sps(bits: &mut Reader<'_>, layer: u8, record: &Hvcc) -> Parse {
         bits.ue_long();
       }
     }
-    bits.ue_long();
-    bits.ue_long();
+    // The bit depths less 8, each held in a `uint8_t` (698–699).
+    let luma = bits.ue_long() as u8;
+    let chroma = bits.ue_long() as u8;
+    record.depths = Some((luma, chroma));
   }
   bits.ue_long();
   if !multilayer {
@@ -1245,6 +1256,13 @@ fn vvcc_config(config: Config<'_>) -> Wrote {
   }
   let mut counts = [0_u16; 6];
   let mut cut = false;
+  // The profile, tier and level the record writes, and the fields it
+  // writes with them: present where a VPS is parsed or an SPS states them
+  // (`vvcc_parse_vps`, 315; `vvcc_parse_sps`, 353–356); the largest
+  // picture of the SPSs and the last one's bit depth (R21, census R20-5).
+  let mut ptl = false;
+  let mut wide = false;
+  let mut depth = None;
   for (unit, [_, second]) in walked(config.units()) {
     let Some(array) = VVC_ARRAYS.iter().position(|&kept| kept == second >> 3) else {
       continue;
@@ -1255,14 +1273,152 @@ fn vvcc_config(config: Config<'_>) -> Wrote {
     let (count, wrapped) = counts[array].overflowing_add(1);
     counts[array] = count;
     cut |= wrapped || unit.len() > usize::from(u16::MAX);
+    match VVC_ARRAYS[array] {
+      14 => ptl = true,
+      15 => {
+        let mut bits = Reader::of(Bytes::rbsp(unit, 2));
+        bits.skip(16);
+        if let Some(sps) = vvc_sps(&mut bits) {
+          ptl |= sps.ptl;
+          wide |= sps.width > u32::from(u16::MAX) || sps.height > u32::from(u16::MAX);
+          depth = Some(sps.depth);
+        }
+      }
+      _ => {}
+    }
   }
   let [_, vps, sps, pps, ..] = counts;
   if vps > 16 || sps == 0 || sps > 16 || pps == 0 || pps > 64 {
     Wrote::Failed
-  } else if cut {
+  } else if cut || (ptl && (wide || depth.is_some_and(|depth| depth > 7))) {
     Wrote::Corrupt
   } else {
     Wrote::Whole
+  }
+}
+
+/// What the record holds of an SPS (`vvcc_parse_sps`, `vvc.c` 333–416) that
+/// it writes in fewer bits than it holds (R21, census R20-5): whether the
+/// SPS states a profile, tier and level, which the record then writes with
+/// the fields below; its largest picture's width and height, `ue(v)`s the
+/// record keeps the largest of in `uint16_t`s and writes in 16 bits
+/// (364–368, 767–771) — H.266's level 15.5, of no limits, allows them past
+/// 65 535 — and its bit depth less 8, a `ue(v)` in a `uint8_t` written in 3
+/// bits (413, 711), H.266 allowing 8. Its subpictures' layout read as
+/// FFmpeg reads it: the picture's size in coding tree blocks of
+/// `AV_CEIL_RSHIFT` of an `unsigned`, whose negation shifts the wrong way,
+/// and the bits of each position of `av_ceil_log2` of that (383–388) —
+/// what the record holds, of the bits FFmpeg reads. `None` of eight
+/// sub-layers, which the standard caps at seven — the parse indexes its
+/// arrays past their end — of an id length past 16, or of an SPS that runs
+/// out before its fields: the trust model's (table C‴), the parse stopped.
+fn vvc_sps(bits: &mut Reader<'_>) -> Option<VvcSps> {
+  bits.skip(8);
+  let sub_layers = bits.read(3);
+  if sub_layers == 7 {
+    return None;
+  }
+  bits.skip(2);
+  let ctu = bits.read(2);
+  let ptl = bits.read1() == 1;
+  if ptl {
+    vvc_ptl(bits, sub_layers);
+  }
+  bits.skip(1);
+  if bits.read1() == 1 {
+    bits.skip(1);
+  }
+  let width = bits.ue_long();
+  let height = bits.ue_long();
+  // An SPS that runs out before its fields are read is the trust model's.
+  if bits.left() < 0 {
+    return None;
+  }
+  if bits.read1() == 1 {
+    for _ in 0..4 {
+      bits.ue_long();
+    }
+  }
+  if bits.read1() == 1 {
+    let subpics = bits.ue_long();
+    let ctb_log2 = ctu + 5;
+    let ctb_size = 1_u32 << ctb_log2;
+    // `-((-(a)) >> (b))` of an `unsigned`, into an `int`.
+    let ceil_rshift =
+      |value: u32| value.wrapping_neg().wrapping_shr(ctb_log2).wrapping_neg() as i32;
+    // `av_ceil_log2_c`: `av_log2((x - 1U) << 1)`.
+    let ceil_log2 = |value: i32| log2((value as u32).wrapping_sub(1).wrapping_shl(1));
+    let wlen = ceil_log2(ceil_rshift(width));
+    let hlen = ceil_log2(ceil_rshift(height));
+    if subpics > 0 {
+      let independent = bits.read1() == 1;
+      let same_size = bits.read1() == 1;
+      // The loop reads nothing but skips, each held within the buffer, so
+      // that its bits are summed and skipped at once: the first position's
+      // ends, every middle one's starts and ends but where the sizes are
+      // the same, the last one's starts so, and each one's two flags where
+      // the subpictures are not independent.
+      let position = u64::from(if width > ctb_size { wlen } else { 0 })
+        + u64::from(if height > ctb_size { hlen } else { 0 });
+      let flags = if independent { 0 } else { 2 };
+      let middle = if same_size { 0 } else { 2 * position } + flags;
+      let last = if same_size { 0 } else { position } + flags;
+      let total = (position + flags)
+        .saturating_add(middle.saturating_mul(u64::from(subpics - 1)))
+        .saturating_add(last);
+      bits.skip(usize::try_from(total).unwrap_or(usize::MAX));
+    }
+    // Each id `ue(v) + 1` bits, as an `int` (`skip_bits_long`): H.266 caps
+    // the length at 16, a longer one the trust model's.
+    let id_len = bits.ue_long().wrapping_add(1);
+    if !(1..=16).contains(&id_len) {
+      return None;
+    }
+    if bits.read1() == 1 && bits.read1() == 1 {
+      let ids = u64::from(subpics) + 1;
+      bits.skip(usize::try_from(ids * u64::from(id_len)).unwrap_or(usize::MAX));
+    }
+  }
+  let depth = bits.ue_long() as u8;
+  (bits.left() >= 0).then_some(VvcSps {
+    ptl,
+    width,
+    height,
+    depth,
+  })
+}
+
+/// [`vvc_sps`]'s answer.
+struct VvcSps {
+  ptl: bool,
+  width: u32,
+  height: u32,
+  depth: u8,
+}
+
+/// `vvcc_parse_ptl` (`vvc.c` 178–224) of a profile, tier and level present,
+/// of `sub_layers` sub-layers less one, below seven: the bits it reads.
+fn vvc_ptl(bits: &mut Reader<'_>, sub_layers: u32) {
+  bits.skip(7 + 1 + 8 + 1 + 1);
+  if bits.read1() == 1 {
+    bits.skip(8 * 8 + 7);
+    let reserved = bits.read(8) as usize;
+    bits.skip(reserved);
+  }
+  bits.align();
+  let mut present = [false; 6];
+  for index in (0..sub_layers as usize).rev() {
+    present[index] = bits.read1() == 1;
+  }
+  bits.align();
+  for index in (0..sub_layers as usize).rev() {
+    if present[index] {
+      bits.skip(8);
+    }
+  }
+  let sub_profiles = bits.read(8);
+  for _ in 0..sub_profiles {
+    bits.read_long(32);
   }
 }
 

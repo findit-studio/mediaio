@@ -1268,6 +1268,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     flv_rewrites: false,
     presented: None,
     configured: false,
+    ivf_frames: 0,
   }
 }
 
@@ -5677,4 +5678,55 @@ fn adts_frames_are_made_as_ffmpegs_adts_writer_makes_them() {
   assert!(framing.pce);
   assert_eq!(&framing.bytes()[7..], &pce[..]);
   assert_eq!(framing.bytes().len(), 14);
+}
+
+/// A VVC SPS stating its profile, tier and level, of a picture of 1920 by
+/// 1080 in coding tree blocks of 128, of two subpictures of one size, their
+/// positions' bits `layout` as written, then an id length of one, no id
+/// mapping, and the bit depth less 8 `depth`.
+fn vvc_subpicture_sps(layout: u32, depth: u32) -> Vec<u8> {
+  let syntax = Syntax::default()
+    .u(0, 8)
+    .u(0, 3)
+    .u(1, 2)
+    .u(2, 2)
+    .u(1, 1)
+    .u(1, 7)
+    .u(0, 1)
+    .u(83, 8)
+    .u(1, 1)
+    .u(0, 1)
+    .u(0, 1)
+    .aligned()
+    .u(0, 8)
+    .u(0, 2)
+    .ue(1920)
+    .ue(1080)
+    .u(0, 1)
+    .u(1, 1)
+    .ue(1)
+    .u(1, 1)
+    .u(1, 1)
+    .u(0, layout)
+    .ue(0)
+    .u(0, 1)
+    .ue(depth)
+    .u(0, 8);
+  escaped(&[0x00, (15 << 3) | 1], &syntax.rbsp())
+}
+
+/// **The VVC record's SPS is read as `vvcc_parse_sps` reads it** (R21,
+/// census R20-5): its subpictures' positions take `av_ceil_log2` of
+/// `AV_CEIL_RSHIFT` of the picture's `unsigned` size — the negation's
+/// shift the wrong way, 31 bits each where the standard's take 4
+/// (`vvc.c` 383–388) — so that the bit depth FFmpeg writes is the one 62
+/// bits on; of 16 bits, its 3-bit field cuts it.
+///
+/// PLANT: the positions' bits as the standard counts them.
+#[test]
+fn vvcs_subpictures_are_read_as_ffmpeg_reads_them() {
+  use records::{Wrote, vvcc};
+  let config = |depth: u32| start_coded(&[&vvc_subpicture_sps(62, depth), &vvc_unit(16)]);
+  assert_eq!(vvcc(&config(8)), Wrote::Corrupt, "sixteen bits, cut");
+  assert_eq!(vvcc(&config(2)), Wrote::Whole, "ten bits");
 }

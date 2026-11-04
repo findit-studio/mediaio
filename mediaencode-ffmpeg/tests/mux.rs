@@ -1786,14 +1786,18 @@ fn l12_mp4_refuses_times_past_its_32_bit_fields() {
   muxer.finish().expect("finished");
   assert_eq!(packet_count(&target), 1, "only what was admitted");
 
-  // MP4 takes negative times as they are; a gap from far below zero to far
-  // above it is past an `i64` of ticks, and judged without overflow.
+  // MP4 takes negative times as they are — a first one past the 32 bits of
+  // its edit list's media time refused (L188) — and a gap from below zero
+  // to far above it is judged without overflow.
   let target = output(&corpus, "l12-wide.mp4");
   let mut muxer = muxer_into(&target, ContainerName::MP4, table);
   let far = 300_000_000_000_000_000;
+  // MP4's 1/16 000 of the source's milliseconds (L188): the earliest first
+  // decode time its media time holds, a tick of the source on.
+  let early = -(1_i64 << 27) + 1;
   muxer
-    .write_video(video_at(&video_of(&packets[0]), Some(-far), -far))
-    .expect("a time far below zero");
+    .write_video(video_at(&video_of(&packets[0]), Some(early), early))
+    .expect("a time below zero");
   let across = video_at(&video_of(&packets[1]), Some(far), far);
   let (refusal, _) = by_container(refusing!(muxer.write_video(across)));
   assert_eq!(
@@ -7781,8 +7785,8 @@ fn l81_a_stream_round_trips_through_flv() {
 
 /// **L82 — FLV's refusals** (table H; `flvenc.c` 975–1486): a packet of a
 /// reordering H.264 stream with no presentation time
-/// ([`FfmpegMuxRefusal::MissingPts`]); a decode time of 2^32 ms, past its
-/// 32 bits ([`FfmpegMuxRefusal::TimeWraps`]); a presentation 2^23 ms after
+/// ([`FfmpegMuxRefusal::MissingPts`]); a decode time of 2^31 ms, past its
+/// 31 bits ([`FfmpegMuxRefusal::TimeWraps`]; L187); a presentation 2^23 ms after
 /// its decode, past its 24-bit composition time
 /// ([`FfmpegMuxRefusal::PresentationOffset`]); a tag of 2^24 bytes with its
 /// flags ([`PayloadRule::TagSize`]); with the filters off, ADTS AAC on a
@@ -7827,10 +7831,10 @@ fn l82_flv_refuses_what_its_tags_cannot_carry() {
   for (offered, refusal) in [
     (at(None, 40), FfmpegMuxRefusal::MissingPts { track }),
     (
-      at(Some(1 << 32), 1 << 32),
+      at(Some(1 << 31), 1 << 31),
       FfmpegMuxRefusal::TimeWraps {
         track,
-        timestamp: ms(1 << 32),
+        timestamp: ms(1 << 31),
       },
     ),
     (
@@ -22681,4 +22685,577 @@ fn l186_wav_counts_a_durationless_packet_as_libavformat_guesses_it() {
       assert_eq!(wav_fact(&target), i32::MAX as u32, "{case}: counted");
     }
   }
+}
+
+/// **L187 — FLV's decode time is held to the 31 bits it writes** (R21,
+/// census R20-5: a value FFmpeg holds wider than the field it writes):
+/// FLV writes a tag's decode time in 24 bits of milliseconds and 7 of its
+/// extended byte, masking the top bit off (`put_timestamp`, `flvenc.c`
+/// 255–258, 1356), and its reader reads all eight (`flvdec.c` 1407–1408).
+/// A packet at 2^31 − 1 ms is written and read back there; one at 2^31 ms
+/// is refused by name, untouched.
+///
+/// PLANT: the field counted as 32 bits.
+#[test]
+fn l187_flvs_decode_time_is_held_to_its_31_bits() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = picture_and_sound(
+    &corpus,
+    "h264-aac.mkv",
+    &[
+      "-c:v", "libx264", "-preset", "medium", "-bf", "2", "-g", "25", "-pix_fmt", "yuv420p",
+    ],
+    &["-c:a", "aac", "-ac", "2"],
+  );
+  let (table, frames) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  let latest = (1_i64 << 31) - 1;
+  let target = output(&corpus, "l187.flv");
+  let mut muxer = muxer_into(&target, ContainerName::new("flv"), table);
+  muxer
+    .write_video(video_at(&frame, Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the first frame");
+  muxer
+    .write_video(video_at(&frame, Some(latest), latest))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the latest decode time FLV writes");
+  let past = video_at(&frame, Some(latest + 1), latest + 1);
+  let (refused, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  assert_eq!(
+    refused,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: ms(latest + 1),
+    }
+  );
+  untouched!(past, back);
+  muxer.finish().expect("finished");
+  let seen = packets(&target);
+  assert_eq!(seen[0].len(), 2, "both packets written");
+  assert_eq!(seen[0][1].dts, Some(ms(latest)), "read back at 2^31 - 1 ms");
+}
+
+/// The offset of the first `fourcc` in `bytes`, past it.
+fn after_fourcc(bytes: &[u8], fourcc: &[u8; 4]) -> usize {
+  bytes
+    .windows(4)
+    .position(|window| window == fourcc)
+    .unwrap_or_else(|| panic!("no {}", String::from_utf8_lossy(fourcc)))
+    + 4
+}
+
+fn be32(bytes: &[u8], at: usize) -> u32 {
+  u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+/// A refusal at open by `matches`, nothing written; or the muxer opened.
+fn open_law(
+  corpus: &Corpus,
+  name: &str,
+  container: &str,
+  table: Vec<Described>,
+  refused: Option<&dyn Fn(&MuxOpenError) -> bool>,
+) {
+  match refused {
+    Some(matches) => {
+      let opened = opened_in(corpus, name, container, table);
+      assert!(opened.as_ref().is_err_and(matches), "{name}: {opened:?}");
+    }
+    // Opened: the MXF muxers and the MPEG program stream write nothing at
+    // open, their headers at their first packet.
+    None => drop(
+      FfmpegOwnedMuxer::open(
+        File::create(output(corpus, name)).expect("create"),
+        ContainerName::new(container),
+        table,
+        &[],
+        PacketLimits::default(),
+      )
+      .unwrap_or_else(|error| panic!("{name}: {error:?}")),
+    ),
+  }
+}
+
+/// `row` stating CPB properties of a maximum rate `max` and a buffer
+/// `buffer` in bits, any it stated before replaced (`AVCPBProperties`:
+/// its maximum, minimum and average rates, its buffer and its delay).
+fn with_cpb(row: Described, max: i64, buffer: i64) -> Described {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let mut bytes = Vec::new();
+  for value in [max, 0, 0, buffer, 0] {
+    bytes.extend(value.to_ne_bytes());
+  }
+  let unstated = reticketed(row, |par| {
+    // SAFETY: `par` is live, its coded side data its own; the removal
+    // frees each entry of the kind it names.
+    unsafe {
+      ffmpeg_next::ffi::av_packet_side_data_remove(
+        par.coded_side_data,
+        &mut par.nb_coded_side_data,
+        T::AV_PKT_DATA_CPB_PROPERTIES,
+      );
+    }
+  });
+  with_coded(unstated, T::AV_PKT_DATA_CPB_PROPERTIES, &bytes)
+}
+
+/// **L188 — MP4's edit list holds the track's first decode time to the 32
+/// bits of its media time** (R21, census R20-5: a value FFmpeg holds wider
+/// than the field it writes): of version 0 — the track's span and its
+/// delay within `INT32_MAX` movie ticks — the edit list's media time is
+/// the first decode time negated where it lies before zero, written in 32
+/// bits (`mov_write_edts_tag`, `movenc.c` 4135–4239). A first packet at
+/// `-2^31` ticks of MP4's 1/16 000 — the source's milliseconds doubled to
+/// 10 000 and past (`mov_init`, 8490–8492) — is refused by name, untouched;
+/// one 16 ticks later is written, its media time `2^31 - 16`.
+///
+/// PLANT: the first decode time unjudged.
+#[test]
+fn l188_mp4s_edit_list_holds_the_first_decode_time_to_its_32_bits() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, packets) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&packets[0]);
+  let earliest = -(1_i64 << 27);
+  let refused_target = output(&corpus, "l188-past.mp4");
+  let mut muxer = muxer_into(
+    &refused_target,
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Video),
+  );
+  let past = video_at(&frame, Some(earliest), earliest);
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: ms(earliest),
+    }
+  );
+  untouched!(past, back);
+  drop(muxer);
+  let target = output(&corpus, "l188.mp4");
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Video),
+  );
+  muxer
+    .write_video(video_at(&frame, Some(earliest + 1), earliest + 1))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the earliest first decode time the media time holds");
+  muxer.finish().expect("finished");
+  let bytes = std::fs::read(&target).expect("the file");
+  let elst = after_fourcc(&bytes, b"elst");
+  assert_eq!(bytes[elst], 0, "version 0");
+  assert_eq!(be32(&bytes, elst + 4), 1, "one entry");
+  assert_eq!(
+    be32(&bytes, elst + 12),
+    (1_u32 << 31) - 16,
+    "the media time, the first decode time negated"
+  );
+}
+
+/// **L189 — IVF's frames are held to the 32 bits its header counts them
+/// in** (R21, census R20-5: a length that wraps is refused): IVF raises an
+/// `unsigned` at each packet it writes (`ivf_write_packet`, `ivfenc.c` 84)
+/// and writes it at its trailer (100), its reader taking it as the
+/// stream's frames and length (`ivfdec.c` 57–65). Under the seam's bound
+/// of three frames, three VP8 packets are written, the header counting
+/// three; the fourth is refused by name, untouched.
+///
+/// PLANT: the frames uncounted.
+#[test]
+fn l189_ivfs_frames_are_held_to_its_32_bits() {
+  let Some(corpus) = Corpus::new() else { return };
+  #[rustfmt::skip]
+  let vp8 = generated(&corpus, "l189-vp8.webm", &[
+    "-f", "lavfi", "-i", "testsrc=size=64x64:rate=25:duration=0.2",
+    "-c:v", "libvpx",
+  ]);
+  let (table, frames) = first_track(&vp8, TrackKind::Video, 4);
+  let target = output(&corpus, "l189.ivf");
+  let mut muxer = muxer_with(
+    &target,
+    ContainerName::new("ivf"),
+    table,
+    MuxOptions::new().with_lowered_ivf_frame_bound(3),
+  );
+  for (index, frame) in frames.iter().enumerate() {
+    let offered = VideoTrackPacket::new(TrackIndex::new(0), video_of(frame));
+    if index < 3 {
+      muxer
+        .write_video(offered)
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("frame {index}: {error:?}"));
+    } else {
+      let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
+      assert_eq!(refusal, payload(PayloadRule::FrameCount));
+      untouched!(offered, back);
+    }
+  }
+  muxer.finish().expect("finished");
+  let bytes = std::fs::read(&target).expect("the file");
+  assert_eq!(
+    u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+    3,
+    "the header's frames"
+  );
+}
+
+/// An audio row of `source`, its parameters edited by `edit`, its block
+/// alignment left to libavformat's start.
+fn audio_edited(
+  source: &Path,
+  edit: impl FnOnce(&mut ffmpeg_next::ffi::AVCodecParameters),
+) -> Described {
+  reticketed(table_of(source, TrackKind::Audio).remove(0), |par| {
+    par.block_align = 0;
+    edit(par);
+  })
+}
+
+/// `par`'s channel layout, of no order, `channels` of them.
+fn channels_of(par: &mut ffmpeg_next::ffi::AVCodecParameters, channels: i32) {
+  // SAFETY: `par`'s layout is its own; uninitializing it frees a custom
+  // map, and an unspecified layout holds none.
+  unsafe {
+    ffmpeg_next::ffi::av_channel_layout_uninit(&mut par.ch_layout);
+  }
+  par.ch_layout.order = ffmpeg_next::ffi::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
+  par.ch_layout.nb_channels = channels;
+}
+
+/// **L190 — the RIFF format's fields are held to the bits FFmpeg writes
+/// them in** (R21, census R20-5; `ff_put_wav_header`, `riffenc.c` 54–233):
+/// WAV's and Wave64's — the block alignment, AAC's 768 a channel among
+/// them, the bits a sample and IMA ADPCM's samples a block in 16 bits; the
+/// bytes a second in 32, PCM's its rate times its block alignment in an
+/// `int`, another's an `int64_t` narrowed. Each past its field refused at
+/// open by name, nothing written; each at it opened.
+///
+/// PLANT: each field unjudged.
+#[test]
+fn l190_the_riff_formats_fields_are_held_to_their_bits() {
+  let Some(corpus) = Corpus::new() else { return };
+  let aac_source = audio_file(&corpus, "l190-aac.mkv", "aac");
+  let s16 = audio_file(&corpus, "l190-s16.mkv", "pcm_s16le");
+  let ac3 = audio_file(&corpus, "l190-ac3.mkv", "ac3");
+  let ima = audio_file(&corpus, "l190-ima.wav", "adpcm_ima_wav");
+  let invalid: &dyn Fn(&MuxOpenError) -> bool =
+    &|error| matches!(error, MuxOpenError::ConfigurationInvalid { .. });
+  // AAC, its block alignment 768 a channel.
+  let aac = |channels: i32| audio_edited(&aac_source, |par| channels_of(par, channels));
+  let cases: Vec<(&str, &str, Described, bool)> = vec![
+    ("aac-block", "wav", aac(86), true),
+    ("aac-block-max", "wav", aac(85), false),
+    ("aac-block", "w64", aac(86), true),
+    ("aac-block-max", "w64", aac(85), false),
+    (
+      "block",
+      "wav",
+      audio_edited(&s16, |par| par.block_align = 65_536),
+      true,
+    ),
+    (
+      "block-max",
+      "wav",
+      audio_edited(&s16, |par| {
+        par.block_align = 65_535;
+        par.sample_rate = 8000;
+      }),
+      false,
+    ),
+    (
+      "rate",
+      "wav",
+      audio_edited(&s16, |par| par.sample_rate = 536_870_912),
+      true,
+    ),
+    (
+      "rate-max",
+      "wav",
+      audio_edited(&s16, |par| par.sample_rate = 536_870_911),
+      false,
+    ),
+    (
+      "bits",
+      "wav",
+      audio_edited(&ac3, |par| par.bits_per_coded_sample = 65_536),
+      true,
+    ),
+    (
+      "bits-max",
+      "wav",
+      audio_edited(&ac3, |par| par.bits_per_coded_sample = 65_535),
+      false,
+    ),
+    (
+      "bytes",
+      "wav",
+      audio_edited(&ac3, |par| par.bit_rate = 8 << 32),
+      true,
+    ),
+    (
+      "bytes-max",
+      "wav",
+      audio_edited(&ac3, |par| par.bit_rate = (8 << 32) - 8),
+      false,
+    ),
+    (
+      "samples",
+      "wav",
+      reticketed(table_of(&ima, TrackKind::Audio).remove(0), |par| {
+        channels_of(par, 1);
+        par.block_align = 32_772;
+      }),
+      true,
+    ),
+    (
+      "samples-max",
+      "wav",
+      reticketed(table_of(&ima, TrackKind::Audio).remove(0), |par| {
+        channels_of(par, 1);
+        par.block_align = 32_771;
+      }),
+      false,
+    ),
+  ];
+  for (case, container, row, refused) in cases {
+    let name = format!("l190-{case}.{container}");
+    open_law(
+      &corpus,
+      &name,
+      container,
+      vec![row],
+      refused.then_some(invalid),
+    );
+  }
+}
+
+/// **L191 — the MOV family holds a track header's display width and the
+/// bit rates it states to their fields** (R21, census R20-5; `movenc.c`
+/// 4066–4085, 714–763): outside MOV and AVIF, the width by the aspect
+/// ratio in 16.16, past 32 bits replaced by the width alone; the `btrt`'s
+/// and `esds`'s rates in 32 bits, and the `btrt`'s buffer, the CPB
+/// properties' eighth — each past its field refused at open by name
+/// ([`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`]),
+/// nothing written; each at it opened, MP4's display width written as
+/// counted.
+///
+/// PLANT: each field unjudged.
+#[test]
+fn l191_the_mov_family_holds_its_entries_fields() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let video = || table_of(&source, TrackKind::Video).remove(0);
+  let dimensions: &dyn Fn(&MuxOpenError) -> bool =
+    &|error| matches!(error, MuxOpenError::Dimensions { .. });
+  let invalid: &dyn Fn(&MuxOpenError) -> bool =
+    &|error| matches!(error, MuxOpenError::ConfigurationInvalid { .. });
+  let aspect = |num: i32| {
+    reticketed(video(), |par| {
+      par.width = 4096;
+      par.height = 64;
+      par.sample_aspect_ratio = ffmpeg_next::ffi::AVRational { num, den: 4096 };
+    })
+  };
+  open_law(
+    &corpus,
+    "l191-aspect.mp4",
+    "mp4",
+    vec![aspect(65_536)],
+    Some(dimensions),
+  );
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let target = output(&corpus, "l191-aspect-max.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, vec![aspect(65_535)]);
+  muxer
+    .write_video(video_at(&video_of(&frames[0]), Some(0), 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a frame");
+  muxer.finish().expect("finished");
+  let bytes = std::fs::read(&target).expect("the file");
+  let tkhd = after_fourcc(&bytes, b"tkhd");
+  // Version 0: the width after the flags, times, id, duration, reserved,
+  // layer, group, volume and matrix (`mov_write_tkhd_tag`, 4029–4085).
+  assert_eq!(
+    be32(&bytes, tkhd + 76),
+    65_535 << 16,
+    "the display width as counted"
+  );
+  let rated = |bit_rate: i64| reticketed(video(), |par| par.bit_rate = bit_rate);
+  let max = i64::from(u32::MAX);
+  open_law(
+    &corpus,
+    "l191-rate.mp4",
+    "mp4",
+    vec![rated(max + 1)],
+    Some(invalid),
+  );
+  open_law(&corpus, "l191-rate-max.mp4", "mp4", vec![rated(max)], None);
+  let buffered = |bits: i64| with_cpb(video(), 0, bits);
+  open_law(
+    &corpus,
+    "l191-buffer.mp4",
+    "mp4",
+    vec![buffered((max + 1) * 8)],
+    Some(invalid),
+  );
+  open_law(
+    &corpus,
+    "l191-buffer-max.mp4",
+    "mp4",
+    vec![buffered(max * 8 + 7)],
+    None,
+  );
+}
+
+/// **L192 — Matroska's JPEG 2000 is held to the `int` its bitmap header
+/// counts the picture in** (R21, census R20-5): Matroska writes JPEG 2000
+/// in VFW mode (`matroskaenc.c` 2025–2030, 1258–1270), its bitmap header
+/// counting the picture's bytes — width by height by 24 bits, and 7, over 8
+/// — in an `int` (`ff_put_bmp_header`, `riffenc.c` 265), past it a signed
+/// overflow: refused at open by name, nothing written; at it opened.
+///
+/// PLANT: the product unjudged in Matroska.
+#[test]
+fn l192_matroskas_jpeg_2000_is_held_to_its_bitmap_headers_int() {
+  let Some(corpus) = Corpus::new() else { return };
+  #[rustfmt::skip]
+  let j2k = generated(&corpus, "l192-j2k.mkv", &[
+    "-f", "lavfi", "-i", "testsrc=size=64x64:rate=25:duration=0.08",
+    "-c:v", "jpeg2000",
+  ]);
+  let sized = |height: i32| {
+    reticketed(table_of(&j2k, TrackKind::Video).remove(0), |par| {
+      par.width = 16_384;
+      par.height = height;
+      par.bits_per_coded_sample = 0;
+    })
+  };
+  let dimensions: &dyn Fn(&MuxOpenError) -> bool =
+    &|error| matches!(error, MuxOpenError::Dimensions { .. });
+  open_law(
+    &corpus,
+    "l192.mkv",
+    "matroska",
+    vec![sized(5462)],
+    Some(dimensions),
+  );
+  open_law(&corpus, "l192-max.mkv", "matroska", vec![sized(5461)], None);
+}
+
+/// An HEVC SPS of luma and chroma bit depths `luma` and `chroma` less 8.
+fn hevc_sps_deep(luma: u32, chroma: u32) -> Vec<u8> {
+  let syntax = hevc_general_ptl(Syntax::default().u(0, 4).u(0, 3).u(1, 1))
+    .ue(0)
+    .ue(1)
+    .ue(64)
+    .ue(64)
+    .u(0, 1)
+    .ue(luma)
+    .ue(chroma)
+    .ue(4)
+    .u(1, 1)
+    .ue(4)
+    .ue(0)
+    .ue(0)
+    .ue(0)
+    .ue(1)
+    .ue(0)
+    .ue(1)
+    .ue(0)
+    .ue(0)
+    .u(0, 4)
+    .ue(0)
+    .u(0, 1);
+  escaped(&hevc_header(33, 0), &syntax.u(0, 4).rbsp())
+}
+
+/// A VVC SPS of a picture of `width` by `height`, of a bit depth `depth`
+/// less 8, stating its profile, tier and level where `ptl`.
+fn vvc_sps_of(width: u32, height: u32, depth: u32, ptl: bool) -> Vec<u8> {
+  let mut syntax = Syntax::default()
+    .u(0, 4)
+    .u(0, 4)
+    .u(0, 3)
+    .u(1, 2)
+    .u(2, 2)
+    .u(u64::from(ptl), 1);
+  if ptl {
+    syntax = syntax
+      .u(1, 7)
+      .u(0, 1)
+      .u(83, 8)
+      .u(1, 1)
+      .u(0, 1)
+      .u(0, 1)
+      .aligned()
+      .aligned()
+      .u(0, 8);
+  }
+  let syntax = syntax
+    .u(0, 1)
+    .u(0, 1)
+    .ue(width)
+    .ue(height)
+    .u(0, 1)
+    .u(0, 1)
+    .ue(depth)
+    .u(0, 8);
+  escaped(&[0x00, (15 << 3) | 1], &syntax.rbsp())
+}
+
+/// **L193 — the configuration records' bit depths and VVC's picture are
+/// held to their fields** (R21, census R20-5): `hvcC` writes the luma and
+/// chroma bit depths less 8 of the last SPS in 3 bits (`hevc.c` 698–699,
+/// 1137–1148) and `vvcC` its SPS's (`vvc.c` 413, 711), which H.265 and
+/// H.266 allow to 8 — sixteen bits — read back as 0; `vvcC` writes the
+/// SPSs' largest picture in 16 bits (364–368, 767–771), which H.266's level
+/// 15.5 allows past 65 535: each refused in MP4 and FLV, at open and as new
+/// extradata, by name; each at its bound taken.
+///
+/// PLANT: each field unjudged.
+#[test]
+fn l193_the_records_bit_depths_and_vvcs_picture_are_held() {
+  let hevc = |luma: u32, chroma: u32| {
+    start_coded(&[
+      &hevc_vps(0, None),
+      &hevc_sps_deep(luma, chroma),
+      &hevc_pps(),
+    ])
+  };
+  hvcc_law(
+    "l193-hevc",
+    &mp4_and_flv(),
+    None,
+    (&hevc_base(), true),
+    &[
+      ("luma 16", hevc(8, 0), true),
+      ("chroma 16", hevc(0, 8), true),
+      ("15", hevc(7, 7), false),
+    ],
+  );
+  let vvc = |width: u32, height: u32, depth: u32| {
+    start_coded(&[&vvc_sps_of(width, height, depth, true), &vvc_unit(16)])
+  };
+  vvcc_law(
+    "l193-vvc",
+    &mp4_and_flv(),
+    (&vvc_sets(0, 1, 1), true),
+    &[
+      ("depth 16", vvc(64, 64, 8), true),
+      ("depth 15", vvc(64, 64, 7), false),
+      ("wide", vvc(65_536, 64, 2), true),
+      ("tall", vvc(64, 65_536, 2), true),
+      ("widest", vvc(65_535, 65_535, 2), false),
+      (
+        "wide, no profile",
+        start_coded(&[&vvc_sps_of(65_536, 64, 8, false), &vvc_unit(16)]),
+        false,
+      ),
+    ],
+  );
 }
