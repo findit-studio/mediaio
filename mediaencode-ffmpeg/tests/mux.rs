@@ -6649,13 +6649,14 @@ const AUDITED: [&str; 19] = [
 ];
 
 /// The muxers this release audited and withholds, each by its reason
-/// (R21, the owner's ruling on letter 1).
-const WITHHELD: [(&str, Withheld); 5] = [
+/// (R21, the owner's ruling on letter 1; MP2, the owner's ruling of R22).
+const WITHHELD: [(&str, Withheld); 6] = [
   ("ogg", Withheld::OggPageBuffering),
   ("oga", Withheld::OggPageBuffering),
   ("ogv", Withheld::OggPageBuffering),
   ("opus", Withheld::OggPageBuffering),
   ("mp3", Withheld::Mp3XingFrame),
+  ("mp2", Withheld::Mp2AwaitsMpegoat),
 ];
 
 /// **L73 — a muxer opens only where this release audited it** (table H of
@@ -6673,7 +6674,8 @@ const WITHHELD: [(&str, Withheld); 5] = [
 ///
 /// PLANT: the check skipped: `srt` reaches the table's refusal; the
 /// withholding skipped: `ogg` refused as not supported; MP3's reason
-/// another's, `mp3` refused for Ogg's.
+/// another's, `mp3` refused for Ogg's; MP2 not withheld, `mp2` refused as
+/// not supported.
 #[test]
 fn l73_a_muxer_opens_only_where_this_release_audited_it() {
   use ffmpeg_next::ffi::{AVFMT_NOFILE, av_muxer_iterate};

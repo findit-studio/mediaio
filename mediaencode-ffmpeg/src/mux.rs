@@ -1200,12 +1200,14 @@
 //! and `opus`, whose page buffering can corrupt memory on an allocation
 //! failure (A14), until the project's own Ogg writer, findit-studio/oggoat,
 //! lands ([`Withheld::OggPageBuffering`]; R21, the owner's ruling on letter
-//! 1, Q3); and `mp3`, whose Xing frame can (A17), until its own MPEG audio
-//! writer, findit-studio/mpegoat, does ([`Withheld::Mp3XingFrame`]; Q4).
-//! R21 keeps the modern formats alone: PSP's, 3GP's, 3G2's,
-//! ISMV's and F4V's modes, the MPEG program stream's five names, AVI, ASF
-//! and its streaming form, NUT, Speex in Ogg, the MXF family's three, and
-//! the raw MPEG audio layer II, MPEG-4 Part 2 and MPEG-2 video streams,
+//! 1, Q3); `mp3`, whose Xing frame can (A17), until its own MPEG audio
+//! writer, findit-studio/mpegoat, does ([`Withheld::Mp3XingFrame`]; Q4);
+//! and `mp2`, the raw MPEG audio layer II stream, which the owner keeps for
+//! that writer ([`Withheld::Mp2AwaitsMpegoat`]; R22) — both until
+//! findit-studio/mediaio#98. R21 keeps the modern formats alone: PSP's,
+//! 3GP's, 3G2's, ISMV's and F4V's modes, the MPEG program stream's five
+//! names, AVI, ASF and its streaming form, NUT, Speex in Ogg, the MXF
+//! family's three, and the raw MPEG-4 Part 2 and MPEG-2 video streams,
 //! which this release wrote before it, are refused with every other.
 //!
 //! | family | the names | source |
@@ -1365,13 +1367,13 @@ impl fmt::Display for ContainerName {
 /// of the census, see [the module](self)): the MOV family's MP4, MOV, iPod
 /// and AVIF, Matroska's and WebM's, MPEG-TS, FLV, IVF, WAV and Wave64, and
 /// the raw streams of AAC (ADTS), AC-3, E-AC-3, DTS, FLAC, H.264, HEVC and
-/// AV1 (OBU) — the modern formats the owner keeps (R21). Ogg's four and MP3
-/// are withheld ([`Withheld::of`]); any other is refused at open
+/// AV1 (OBU) — the modern formats the owner keeps (R21). Ogg's four, MP3
+/// and MP2 are withheld ([`Withheld::of`]); any other is refused at open
 /// ([`MuxOpenError::ContainerNotSupported`]): PSP's, 3GP's, 3G2's, ISMV's
 /// and F4V's modes, the MPEG program stream's five, AVI, ASF and its
 /// streaming form, NUT, Speex in Ogg, the MXF family's three, and the raw
-/// MPEG audio layer II, MPEG-4 Part 2 and MPEG-2 video streams among them,
-/// which this release wrote before R21.
+/// MPEG-4 Part 2 and MPEG-2 video streams among them, which this release
+/// wrote before R21.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Audited {
   /// `movenc.c` 9343–9512, by the mode each registers (`movenc.h` 38–46).
@@ -1402,9 +1404,10 @@ enum Audited {
 }
 
 /// Why this release withholds a muxer it has audited
-/// ([`MuxOpenError::ContainerWithheld`]; R21, the owner's ruling on letter
-/// 1): its FFmpeg writer can corrupt memory where an allocation fails,
-/// until the project's own writer for the format lands.
+/// ([`MuxOpenError::ContainerWithheld`]), until the project's own writer for
+/// the format lands: its FFmpeg writer can corrupt memory where an
+/// allocation fails (Ogg, MP3: R21, the owner's ruling on letter 1), or the
+/// owner keeps the format for the project's own writer (MP2: R22).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Withheld {
@@ -1421,11 +1424,19 @@ pub enum Withheld {
   /// offset is set, its close unchecked, so that the trailer writes the
   /// frame's fields through a null pointer (`mp3enc.c` 145–286, 400–469;
   /// the census's A17). Lifted when the project's own MPEG audio writer,
-  /// findit-studio/mpegoat, lands.
+  /// findit-studio/mpegoat, lands (findit-studio/mediaio#98).
   #[error(
-    "FFmpeg's MP3 Xing frame can corrupt memory on an allocation failure, until findit-studio/mpegoat lands"
+    "FFmpeg's MP3 Xing frame can corrupt memory on an allocation failure, until findit-studio/mpegoat lands (findit-studio/mediaio#98)"
   )]
   Mp3XingFrame,
+  /// MPEG audio layer II — `mp2`, its raw stream (`rawenc.c` 522–534): the
+  /// owner keeps it for the project's own MPEG audio writer (R22). Lifted
+  /// when findit-studio/mpegoat lands (findit-studio/mediaio#98, which
+  /// covers MP2 and MP3).
+  #[error(
+    "MPEG audio layer II is written by the project's own MPEG audio writer once findit-studio/mpegoat lands (findit-studio/mediaio#98)"
+  )]
+  Mp2AwaitsMpegoat,
 }
 
 impl Withheld {
@@ -1436,6 +1447,7 @@ impl Withheld {
     match muxer {
       "ogg" | "oga" | "ogv" | "opus" => Some(Self::OggPageBuffering),
       "mp3" => Some(Self::Mp3XingFrame),
+      "mp2" => Some(Self::Mp2AwaitsMpegoat),
       _ => None,
     }
   }
@@ -4163,16 +4175,17 @@ pub enum MuxOpenError {
     /// `avi`.
     name: ContainerName,
   },
-  /// A muxer this release has audited and withholds: its FFmpeg writer can
-  /// corrupt memory where an allocation fails — undefined behaviour, which
-  /// no premise admits (the census's memory-fault rows, see [the
-  /// module](self)) — until the project's own writer for the format lands
-  /// (R21, the owner's ruling on letter 1). Refused by the name of the
-  /// muxer libavformat resolved, and the reason, before any stream is
-  /// added, so nothing is written.
+  /// A muxer this release has audited and withholds until the project's
+  /// own writer for the format lands: its FFmpeg writer can corrupt memory
+  /// where an allocation fails — undefined behaviour, which no premise
+  /// admits (the census's memory-fault rows, see [the module](self); R21,
+  /// the owner's ruling on letter 1) — or the owner keeps the format for
+  /// that writer (R22). Refused by the name of the muxer libavformat
+  /// resolved, and the reason ([`Withheld`]), before any stream is added,
+  /// so nothing is written.
   #[error("the {name} muxer is withheld: {reason}")]
   ContainerWithheld {
-    /// The name of the muxer libavformat resolved — `ogg`, `opus`.
+    /// The name of the muxer libavformat resolved — `ogg`, `opus`, `mp2`.
     name: ContainerName,
     /// Why, and until when.
     reason: Withheld,
