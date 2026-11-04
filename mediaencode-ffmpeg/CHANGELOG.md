@@ -345,8 +345,8 @@ crate moves only when it changes.
   does not mirror: each track's per-sample tables are counted at their
   worst for the samples taken — a chunk a sample, its offset in 64 bits,
   a run of every table a sample — beside its sample descriptions, the
-  chapter track, the covers, the chapters and a derived slack, and the
-  packet after which the bound would pass
+  chapter track, the covers, the chapters, the streams' `pssh` boxes and a
+  derived slack, and the packet after which the bound would pass
   `UINT32_MAX` is refused (`PayloadRule::MovieBox`, new): stricter than
   FFmpeg past the bound alone, until an exact mirror replaces it. The
   laws' seams, hidden: `MuxOptions::with_lowered_movie_bound` and
@@ -362,11 +362,10 @@ crate moves only when it changes.
   (`MuxOpenError::CoversTooLarge`, new; the laws' seam
   `MuxOptions::with_lowered_user_data_bound`, hidden).
 - **MP4's `moov` of no sample, and before its trailer (R15).** A table
-  whose `moov` would pass its 32 bits before any sample — covers, sample
-  descriptions — is refused at open
+  whose `moov` would pass its 32 bits before any sample — covers, `pssh`
+  boxes, sample descriptions — is refused at open
   (`MuxOpenError::MovieBoxTooLarge`, new); and the bound is checked once
-  more before the trailer
-  runs (`FfmpegMuxRefusal::MovieBox`, new). A description rewritten in
+  more before the trailer runs (`FfmpegMuxRefusal::MovieBox`, new). A description rewritten in
   place counts its new bytes instead of its old: the bound keeps the
   descriptions' exact sum. The laws' seam, hidden:
   `CarrierMuxer::lower_movie_bound`. The bound charges the tracks movenc
@@ -402,10 +401,10 @@ crate moves only when it changes.
   the judgment of a packet calls into no library and allocates nothing,
   and no allocation's failure is taken for a malformed entry.
 - **What FFmpeg's writers do with an allocation's failure, censused (R19).**
-  The MOV family refuses at open a track carrying an encryption
-  initialization, which movenc parses again at the `moov` and drops unsaid
-  where an allocation fails (`MuxOpenError::EncryptionInitialization`,
-  new). Ogg counts each stream's comment header exactly at open — an Opus
+  The MOV family writes a stream's encryption initialization as its
+  `pssh` boxes, counted in the `moov`'s bound — an allocation's failure
+  where movenc parses it again, which drops the boxes unsaid, rests on the
+  premise the census states (R21). Ogg counts each stream's comment header exactly at open — an Opus
   stream's chapters among them — and refuses one past the `int`
   libavformat builds it in, which it would report as a failed allocation
   (`MuxOpenError::CommentHeaderTooLarge`, new; the laws' seam
