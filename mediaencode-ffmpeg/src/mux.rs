@@ -595,7 +595,9 @@
 //! correcting two, AVI's frame count and NUT's key frame index, and its
 //! part 2b-i two more, ISMV's live manifest. The counts are of the muxers
 //! then admitted; R21 dropped AVI, ASF, NUT and ISMV, and with them their
-//! rows (A19, A20, A24, N1, S4, S5). Two mechanisms carry most findings. A dynamic buffer holds its first 1024
+//! rows (A19, A20, A24, N1, S4, S5), A12 left a note (Q5); and it withheld
+//! Ogg, and with it S1, its comment header's bound (Q3). Two mechanisms
+//! carry most findings. A dynamic buffer holds its first 1024
 //! bytes in the context its open allocates, and grows past them by
 //! `av_reallocp`, whose failure — or a write past `INT_MAX` — sets the
 //! buffer's own error and drops every later write; that error reaches no
@@ -644,7 +646,7 @@
 //! | A11 | DVD subtitles' palette (8000–8048; discarded at 8752) | the `esds` written of no palette | omission: returned before any write (8035–8037) | out of reach: 128 bytes | the premise |
 //! | — | a note: the `tfra` index of a fragmented MOV-family output — A12, ISMV's fragments, gone with ISMV (R21, the owner's ruling on letter 1, Q5) | every fragmented output of the MOV family collects the same `tfra` index: its count raised before the growth whose failure frees and nulls it, the answer discarded, the trailer's `mfra` reading every entry through the null index (`mov_add_tfra_entries`, `movenc.c` 5803–5840; 6107, 6850, 9127–9129) | memory fault | — | none written: no mode this release writes fragments. The pending fragmented-MP4 design meets it, `+skip_trailer` — no `mfra` written — the road there |
 //! | A13 | AVIF (9154–9213) | its sample buffer's growth read as none, an `mdat` of no sample written; its `moov`'s null buffer's open answered as the size, every chunk's offset moved by it | omission and misreport: 0 bytes and a null buffer written as none (9189–9198); the open's code taken as the size (8911–8912, 9179–9181) | bounded: the samples ([`FRAGMENT_BYTES_MAX`]), the `moov` (S2) | the premise |
-//! | A14 | Ogg's pages (`ogg_buffer_page`, `oggenc.c` 189–212) | a page's list node, its failure discarded at every call: the page left full and the next segment count, less one, handed to `memset` as `SIZE_MAX` (247–253) | memory fault: `memset` of `SIZE_MAX` bytes past the page's segments (252), then `segments[255]` (256) — every page buffered through `ogg_buffer_page` (233–234, 239–242, 275–280, 285–286), a page whose buffering fails taking the next segments until it is full: no road avoids it | out of reach: the node's and the page's fixed sizes; the comment header bounded (S1) | Ogg withheld at open (R21, the owner's ruling on letter 1, Q3: [`MuxOpenError::ContainerWithheld`], [`Withheld::OggPageBuffering`]) until the project's own Ogg writer, findit-studio/oggoat, lands — the row its evidence |
+//! | A14 | Ogg's pages (`ogg_buffer_page`, `oggenc.c` 189–212) | a page's list node, its failure discarded at every call: the page left full and the next segment count, less one, handed to `memset` as `SIZE_MAX` (247–253) | memory fault: `memset` of `SIZE_MAX` bytes past the page's segments (252), then `segments[255]` (256) — every page buffered through `ogg_buffer_page` (233–234, 239–242, 275–280, 285–286), a page whose buffering fails taking the next segments until it is full: no road avoids it | out of reach: the node's and the page's fixed sizes; the comment header bounded exactly at open until R21 (S1), Ogg withheld since | Ogg withheld at open (R21, the owner's ruling on letter 1, Q3: [`MuxOpenError::ContainerWithheld`], [`Withheld::OggPageBuffering`]) until the project's own Ogg writer, findit-studio/oggoat, lands — the row its evidence |
 //! | A15 | the metadata conversion every Vorbis-comment, ID3v2 and Matroska writer runs (`ff_metadata_conv`, `metadata.c` 26–57) | a tag dropped where its `av_dict_set` fails: Ogg's language, MP3's and Matroska's chapter titles | omission: the tag dropped (`av_dict_set`) | out of reach: each value one the base set through `av_dict_set` with its own copy, under the same limit, refused first there, the open's fault | the premise, Matroska's; Ogg's part and MP3's withheld muxers' (Q3, Q4), their evidence |
 //! | A16 | MPEG-TS's raw AAC, through its nested ADTS muxer (`mpegtsenc.c` 1980–2003) | the nested buffer closed unchecked: a null buffer and `-64` bytes copied into the PES payload (2232) | memory fault: `memcpy` of a null buffer and `SIZE_MAX - 63` bytes (2232) — avoided where the muxer frames each packet in ADTS itself, which MPEG-TS takes as it is (1977) | out of reach: an ADTS frame of at most 8191 bytes ([`PayloadRule::AdtsFrame`]) | closed by r3 (R20, ruled): this muxer frames each raw packet in ADTS itself, of the configuration, as FFmpeg's ADTS writer frames it, and MPEG-TS takes the frame as it is, its nested muxer never fed ([`AdtsFraming`]) — L179, L180, `adts_frames_are_made_as_ffmpegs_adts_writer_makes_them` |
 //! | A17 | MP3's Xing frame (`mp3enc.c` 145–286; discarded at 632) | its buffer's open discarded after the frame's offset is set, its close unchecked: the trailer writing into a null frame (400–469) | memory fault: the frame's fields written through the null frame and its offset (412–466), its CRC read through it (465) — avoided by `write_xing` off (161–162, 515–516) | out of reach: one frame of at most 1440 bytes (205–220) | MP3 withheld at open (R21, the owner's ruling on letter 1, Q4: [`MuxOpenError::ContainerWithheld`], [`Withheld::Mp3XingFrame`]) until the project's own MPEG audio writer, findit-studio/mpegoat, lands — the row its evidence; no Xing reservation built |
@@ -843,9 +845,10 @@
 //! IVF, WAV and Wave64, ADTS, FLAC and the raw AC-3, E-AC-3, DTS, H.264,
 //! HEVC and AV1 streams — and every helper their callbacks reach (grep
 //! R20-5). Each of the 1384 lines it prints is classified by the range of
-//! what it writes: 557 constants; 405 bounded by their source, a value only
+//! what it writes: 560 constants; 409 bounded by their source, a value only
 //! a stream the standards do not allow carries among them (the trust
-//! model's); 317 unreachable, on a road no admitted table or packet takes;
+//! model's), the `pssh` box's since A1's lift (Q2); 310 unreachable, on a
+//! road no admitted table or packet takes;
 //! 65 refused by an existing row; 1 out of reach by arithmetic; 18 that
 //! write nothing — a comment, a bit writer opened or flushed; and 21
 //! findings, below, each bounded exactly and refused by name, but one whose
