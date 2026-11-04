@@ -13058,7 +13058,7 @@ fn riff_extension_bytes(stream: &StreamCodec, layout: LayoutView<'_>) -> usize {
 /// left it, the start's own.
 fn started_block_align(stream: &StreamCodec) -> i128 {
   match stream.block_align() {
-    0 => i128::from(stream.channels()) * i128::from(stream.codec().bits_per_sample()) >> 3,
+    0 => (i128::from(stream.channels()) * i128::from(stream.codec().bits_per_sample())) >> 3,
     stated => i128::from(stated),
   }
 }
