@@ -9,9 +9,10 @@ pub mod mux;
 
 pub use catalogue::{Admitted, CATALOGUE, EncoderRefusal, Entry, License, encoder_by_name, lookup};
 pub use mux::{
-  AutomaticFilter, CarrierMuxer, CodedSideDataReadBack, ContainerName, FfmpegMuxRefusal,
-  FfmpegMuxer, FfmpegOwnedMuxer, LayoutReadBack, MuxFault, MuxOpenError, MuxOptions, MuxReport,
-  MuxStage, PayloadRule, Rewrite, SideDataFate, Uncarried, Withheld,
+  AutomaticFilter, BitRateBox, CarrierMuxer, CodedSideDataReadBack, ContainerName,
+  FfmpegMuxRefusal, FfmpegMuxer, FfmpegOwnedMuxer, LayoutReadBack, MuxFault, MuxOpenError,
+  MuxOptions, MuxReport, MuxStage, PayloadRule, Rewrite, SideDataFate, Uncarried, Withheld,
+  WriteBtrt,
 };
 // What a fault and a refusal name, from the base's muxing context. That
 // module is hidden from the base's documentation, but these four are this

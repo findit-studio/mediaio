@@ -1194,6 +1194,9 @@ fn eac3_track(frame_size: i32) -> TrackState {
     presented: None,
     configured: false,
     ivf_frames: 0,
+    mp4_counts: Mp4Counts::default(),
+    ttml: None,
+    rates: None,
   }
 }
 
@@ -1238,6 +1241,7 @@ fn admit_eac3(
     owns: true,
     emits: Emits::OWN,
     largest: Some(bytes.len() as u64),
+    out: Some(bytes.len() as u64),
     held: None,
     inserted: None,
   };
@@ -1625,6 +1629,7 @@ fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
     owns,
     emits,
     largest: largest.map(|bytes| bytes as u64),
+    out: None,
     held: held.map(|bytes| bytes as u64),
     inserted: None,
   };
@@ -2453,6 +2458,7 @@ fn vp9s_filter_puts_out_superframes_sized_with_what_it_holds() {
       owns: false,
       emits: Emits::NONE,
       largest: None,
+      out: None,
       held: Some(4 + 1 + 2 + 2),
       inserted: None,
     },
@@ -2467,6 +2473,7 @@ fn vp9s_filter_puts_out_superframes_sized_with_what_it_holds() {
       owns: true,
       emits: Emits::OWN,
       largest: Some(4 + 3 + 2 + 2 + 30),
+      out: Some(4 + 3 + 2 + 2),
       held: None,
       inserted: None,
     },
@@ -5160,4 +5167,114 @@ fn vvcs_subpictures_are_read_as_ffmpeg_reads_them() {
   let config = |depth: u32| start_coded(&[&vvc_subpicture_sps(62, depth), &vvc_unit(16)]);
   assert_eq!(vvcc(&config(8)), Wrote::Corrupt, "sixteen bits, cut");
   assert_eq!(vvcc(&config(2)), Wrote::Whole, "ten bits");
+}
+
+/// **The MOV family's bit rates are cut as `calculate_mpeg4_bit_rates` cuts
+/// them** (R22, the coordinator's ruling on W21; `movenc.c` 703–763 in
+/// FFmpeg 9.0.1): the computed average's product past 64 bits and its
+/// quotient past 32; the fallback of no average counted, the first rate
+/// not zero, below zero or past 32 bits; the maximum, a stated rate below
+/// zero ignored; the CPB average of none — the track variable-rate — no
+/// cut; the buffer's eighth in the `esds`'s 24 bits and the `btrt`'s 32,
+/// C's division; and nothing judged where no box is written.
+#[test]
+fn bit_rates_are_cut_where_movenc_cuts_them() {
+  let cpb = |max: i64, avg: i64, buffer: i64| Cpb {
+    max_bitrate: max,
+    avg_bitrate: avg,
+    buffer_size: buffer,
+  };
+  let input = |bytes: u128, duration: i128, cpb: Option<Cpb>, stated: i64| BitRateInputs {
+    bytes,
+    duration,
+    timescale: 90_000,
+    stated,
+    cpb,
+  };
+  let max = i64::from(u32::MAX);
+  // The computed average: its product, its quotient.
+  assert_eq!(
+    bit_rates_cut(input(1 << 61, 1 << 40, None, 0), true, false),
+    Some(BitRateBox::Btrt),
+    "the product past 64 bits"
+  );
+  assert_eq!(
+    bit_rates_cut(input(5966, 1, None, 0), true, false),
+    Some(BitRateBox::Btrt),
+    "the quotient past 32 bits"
+  );
+  assert_eq!(
+    bit_rates_cut(input(5965, 1, None, 0), true, false),
+    None,
+    "the quotient within them"
+  );
+  // Of no duration: the fallback, its first rate not zero.
+  assert_eq!(
+    bit_rates_cut(input(1, 0, Some(cpb(0, max + 1, 0)), 0), true, false),
+    Some(BitRateBox::Btrt),
+    "the CPB average past 32 bits"
+  );
+  assert_eq!(
+    bit_rates_cut(input(1, 0, Some(cpb(0, -1, 0)), 0), true, false),
+    Some(BitRateBox::Btrt),
+    "the CPB average below zero"
+  );
+  assert_eq!(
+    bit_rates_cut(input(1, 0, Some(cpb(max + 1, 0, 0)), 0), true, false),
+    Some(BitRateBox::Btrt),
+    "the CPB maximum, the last fallback, past 32 bits"
+  );
+  assert_eq!(
+    bit_rates_cut(input(1, 0, None, -5), true, false),
+    Some(BitRateBox::Btrt),
+    "a stated rate below zero, the fallback"
+  );
+  // Counted, the CPB average unread; the maximum of a stated rate below
+  // zero, the average.
+  assert_eq!(
+    bit_rates_cut(
+      input(1000, 90_000, Some(cpb(0, max + 1, 0)), -5),
+      true,
+      false
+    ),
+    None,
+    "the CPB average unread"
+  );
+  assert_eq!(
+    bit_rates_cut(input(1000, 90_000, Some(cpb(5, 0, 0)), 0), true, true),
+    None,
+    "the CPB average of none: the average written as zero"
+  );
+  // The buffer: 24 bits in the `esds`, 32 in the `btrt`, C's division.
+  assert_eq!(
+    bit_rates_cut(
+      input(1000, 90_000, Some(cpb(0, 1, (1 << 24) * 8)), 0),
+      false,
+      true
+    ),
+    Some(BitRateBox::Esds)
+  );
+  assert_eq!(
+    bit_rates_cut(
+      input(1000, 90_000, Some(cpb(0, 1, (1 << 24) * 8)), 0),
+      true,
+      false
+    ),
+    None
+  );
+  assert_eq!(
+    bit_rates_cut(input(1000, 90_000, Some(cpb(0, 1, -7)), 0), true, false),
+    None,
+    "-7 over 8 is 0, toward zero"
+  );
+  assert_eq!(
+    bit_rates_cut(input(1000, 90_000, Some(cpb(0, 1, -8)), 0), true, false),
+    Some(BitRateBox::Btrt),
+    "-8 over 8 is -1, cut"
+  );
+  // No box, no judgment.
+  assert_eq!(
+    bit_rates_cut(input(1 << 61, 1, None, 0), false, false),
+    None
+  );
 }

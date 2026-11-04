@@ -780,7 +780,7 @@
 //! | the muxer's writes | a refusal by name, the packet handed back | as it was (R15; R20, r1) | the packet-rule laws |
 //! | the muxer's writes | a failure the base answers | failed | L173 |
 //! | the muxer's finish | after a failure | refused by name, the output dropped failed: closed | L173 |
-//! | the muxer's finish | a trailer refused by name before it runs — no frame, a last sample too long, the `moov` past its bound | the output abandoned | L195 |
+//! | the muxer's finish | a trailer refused by name before it runs — no frame, a last sample too long, the `moov` past its bound, a bit rate its box cuts | the output abandoned | L195, L198 |
 //! | the muxer's finish | the trailer's failure; the hand-back's | failed; as the base's `into_sink` | L169 and the base's laws |
 //!
 //! **r2, sizes under budgets the caller raises** (a length that wraps is
@@ -899,11 +899,11 @@
 //! road no admitted table or packet takes;
 //! 65 refused by an existing row; 1 out of reach by arithmetic; 18 that
 //! write nothing — a comment, a bit writer opened or flushed; and 21
-//! findings, below, each bounded exactly and refused by name, but one whose
-//! exactness rests on the whole track, a ruling asked. The findings keep
-//! the numbers they were found by: those of the muxers R21 drops, and of
-//! MP3, withheld at open, went with them (W2, W3, W7–W10, W12, W14, W15,
-//! W20).
+//! findings, below, each bounded exactly and refused by name — W16 and
+//! W21, whose values are the whole track's, at `finish` (R22, the
+//! coordinator's ruling on W21). The findings keep the numbers they were
+//! found by: those of the muxers R21 drops, and of MP3, withheld at open,
+//! went with them (W2, W3, W7–W10, W12, W14, W15, W20).
 //!
 //! | | where | what is written, and how it is lost | here |
 //! |---|---|---|---|
@@ -913,10 +913,10 @@
 //! | W6 | the RIFF format of WAV and Wave64 (`ff_put_wav_header`, `riffenc.c` 54–233; 149–151, 182, 195) | the block alignment — AAC's 768 a channel among them — the bits a sample and IMA ADPCM's samples a block in 16 bits; the bytes a second in 32, PCM's an `int` product, a signed overflow, another's an `int64_t` narrowed into an `int` | refused at open ([`MuxOpenError::ConfigurationInvalid`]; [`riff_format_cut`]) — L190 |
 //! | W11 | FLV's tag time (`put_timestamp`, `flvenc.c` 255–258) | 31 bits of milliseconds, the top bit of the extended byte masked off | refused at the packet ([`FfmpegMuxRefusal::TimeWraps`]) — L187 |
 //! | W13 | Matroska's JPEG 2000 (`matroskaenc.c` 2025–2030, 1258–1270; `ff_put_bmp_header`, `riffenc.c` 265) | the bitmap header's picture bytes in an `int`, a signed overflow past it | refused at open ([`MuxOpenError::Dimensions`]) — L192 |
-//! | W16 | the MOV family's stated bit rates (`calculate_mpeg4_bit_rates`, `movenc.c` 714–763; 802, 1292–1293) | the stream's and its CPB properties' `int64_t`s in the `btrt`'s and the `esds`'s 32 bits, and the CPB buffer's eighth in the `btrt`'s, which H.266's level 15.5 allows past them | refused at open ([`MuxOpenError::ConfigurationInvalid`]) — L191 |
+//! | W16 | the MOV family's stated bit rates (`calculate_mpeg4_bit_rates`, `movenc.c` 714–763; 802, 1292–1293) | the stream's and its CPB properties' `int64_t`s in the `btrt`'s and the `esds`'s 32 bits, and the CPB buffer's eighth in the `btrt`'s 32 and the `esds`'s 24, which H.266's level 15.5 allows past them — each read where movenc reads it: the CPB average only where no average is counted, then the stated rate, then the CPB maximum; the maximum of the stated rate and the average, then of the CPB maximum; the average written as none of CPB properties of none | refused at `finish`, before the trailer runs, mirrored whole with W21 ([`FfmpegMuxRefusal::BitRates`], the box named; [`FfmpegMuxRefusal::CpbProperties`] of an entry shorter than the fields movenc reads; R22, the coordinator's ruling on W21; Codex R21 3) — the `btrt` where the `write_btrt` option resolves on ([`WriteBtrt`]: MP4's mode alone by default, `WriteBtrt::Off` the remedy), the `esds` of `mp4a`, `mp4v` and DVD subtitles; MP4's chapter track's at open ([`MuxOpenError::ChapterBitRate`]) — L198, `bit_rates_are_cut_where_movenc_cuts_them` |
 //! | W18 | MP4's track header (`mov_write_tkhd_tag`, `movenc.c` 4066–4085) | the display width, the width by the aspect ratio in 16.16, past 32 bits replaced by the width alone | refused at open ([`MuxOpenError::Dimensions`]) — L191 |
 //! | W19 | the MOV family's edit list (`mov_write_edts_tag`, `movenc.c` 4135–4239) | the media time of version 0, the first decode time negated, in 32 bits | refused at the packet that makes the first sample, as libavformat's shift leaves it, as though the track ended there ([`FfmpegMuxRefusal::TimeWraps`]) — L188 |
-//! | W21 | the MOV family's counted average (`compute_avg_bitrate`, `movenc.c` 703–712; 803, 1294) | the samples' bytes by 8 by the timescale over the duration, narrowed into an `unsigned`: cut past 4.29 Gb/s, raw video's among them | not built: the average is the whole track's, so that a judgment before the trailer counts each packet as though it were the last — a burst at the track's start refused where the file's average holds — and the bytes the rewrites make, of which this release keeps a bound; a ruling asked |
+//! | W21 | the MOV family's counted average (`compute_avg_bitrate`, `movenc.c` 703–712; 803, 1294) | the samples' bytes by 8 by the timescale over the duration, the product in a `uint64_t`, narrowed into an `unsigned`: cut past 4.29 Gb/s, raw video's among them, and of a product past 64 bits | refused at `finish`, before the trailer runs ([`FfmpegMuxRefusal::BitRates`]; R22, the coordinator's ruling: Codex R21 2): the product in 128 bits, its own wrap refused; the samples' bytes counted as movenc writes them — each rewrite mirrored exactly, read back against the written `stsz` and `stts` (L197) — and `track_duration`, the last sample's decode time and its duration as handed, from the first's — L197, L198 |
 //!
 //! W17, the MOV family's channels in 16 bits outside MOV, and W6's
 //! channels are withdrawn: the base refuses a layout past 65 535 channels
@@ -1331,7 +1331,8 @@
 //! | AVIF (R19) | the packet after which its `moov` would pass `INT_MAX`, and a table whose `moov` would at open | measured at the trailer in a null buffer of `INT_MAX` bytes, the refusal taken as the size, every chunk's offset moved by it (`movenc.c` 8905–8916, 9179–9181) | [`PayloadRule::MovieBox`], [`MuxOpenError::MovieBoxTooLarge`], at `INT_MAX` — L167 |
 //! | IVF (R21, census R20-5) | a packet after which the file's frames pass 32 bits | their count wrapped in the header the trailer writes, read back as the stream's frames and its length (`ivfenc.c` 84, 100; `ivfdec.c` 57–65) | [`PayloadRule::FrameCount`] — L189 |
 //! | WAV, Wave64, at open (R21, census R20-5) | a RIFF format's block alignment — AAC's 768 a channel among them — bits a sample or IMA ADPCM's samples a block past 16 bits; its bytes a second past 32 bits, PCM's of an `int` product; MS or IMA ADPCM of no samples a block | each written cut, or a signed overflow; refused at the header after the bytes before it (`riffenc.c` 54–233) | [`MuxOpenError::ConfigurationInvalid`] — L190 |
-//! | the MOV family's modes, at open (R21, census R20-5) | outside MOV and AVIF, a video's width by its aspect ratio past 32 bits of 16.16; stated bit rates past 32 bits where the `btrt` or the `esds` writes them | the display width written as the width alone; the rates cut (`movenc.c` 4066–4085, 714–763) | [`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`] — L191 |
+//! | the MOV family's modes, at open (R21, census R20-5) | outside MOV and AVIF, a video's width by its aspect ratio past 32 bits of 16.16 | the display width written as the width alone (`movenc.c` 4066–4085) | [`MuxOpenError::Dimensions`] — L191 |
+//! | the MOV family's modes, at `finish` (R22, the coordinator's ruling on W21) | a track's bit rates as its trailer computes them — its counted average, the fallbacks, the maximum and the buffer — past the field its `btrt` or `esds` writes them in; CPB properties shorter than the fields it reads | each written cut; the entry read past (`movenc.c` 703–763) | [`FfmpegMuxRefusal::BitRates`], [`FfmpegMuxRefusal::CpbProperties`] — L198 |
 //! | the MOV family's modes but AVIF (R21, census R20-5) | a track's first sample decoded at `-2^31` ticks or before | its edit list's media time written wrapped in 32 bits (`movenc.c` 4135–4239) | [`FfmpegMuxRefusal::TimeWraps`] — L188 |
 //! | Matroska, at open (R21, census R20-5) | JPEG 2000 whose bitmap header's picture bytes pass an `int` | a signed overflow (`matroskaenc.c` 2025–2030; `riffenc.c` 265) | [`MuxOpenError::Dimensions`] — L192 |
 //! | MP4, FLV, at open and as new extradata (R21, census R20-5) | an HEVC SPS of a bit depth of sixteen; a VVC SPS so, or of a picture past 65 535 | the depth written in 3 bits, read back as a depth of 8; the picture cut (`hevc.c` 1137–1148; `vvc.c` 711, 767–771) | [`MuxOpenError::ConfigurationInvalid`], [`PayloadRule::NewExtradata`] — L193 |
@@ -1795,6 +1796,118 @@ const TTML_PARAGRAPH_OVERHEAD: u64 = 160;
 /// (`ttml_header_text`, `ttml_footer_text`, `ttmlenc.c` 53–65).
 const TTML_DOCUMENT_OVERHEAD: u64 = 1024;
 
+/// The bytes MP4's joined TTML document adds around its paragraphs
+/// (`ttml_write_header`, `ttml_write_trailer`, `ttmlenc.c` 53–65,
+/// 124–158, 196–204 in FFmpeg 9.0.1): the header, of the configuration's
+/// two strings after libavcodec's 12-byte signature — the default
+/// namespacing and none, of an old configuration that holds none — and of
+/// the language, of which the writer's stream holds none, made of the
+/// track's parameters and none of its metadata (`mov_init_ttml_writer`,
+/// `movenc_ttml.c` 34–57); and the footer. A configuration whose strings do
+/// not parse is refused at open ([`ttml_header_strings`]). Exactly (R22,
+/// Codex R21 2).
+fn ttml_document_frame(extradata: &[u8]) -> u64 {
+  const HEADER: [&str; 4] = [
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<tt\n",
+    "  xml:lang=\"",
+    "\">\n",
+    "  <body>\n    <div>\n",
+  ];
+  const FOOTER: &str = "    </div>\n  </body>\n</tt>\n";
+  const DEFAULT_NAMESPACING: &str = "  xmlns=\"http://www.w3.org/ns/ttml\"\n  \
+    xmlns:ttm=\"http://www.w3.org/ns/ttml#metadata\"\n  \
+    xmlns:tts=\"http://www.w3.org/ns/ttml#styling\"\n  \
+    xmlns:ttp=\"http://www.w3.org/ns/ttml#parameter\"\n";
+  let strings = extradata.strip_prefix(b"lavc-ttmlenc").unwrap_or_default();
+  let (element, pre_body) = if strings.is_empty() {
+    (DEFAULT_NAMESPACING.len(), 0)
+  } else {
+    let first = strings
+      .iter()
+      .position(|&byte| byte == 0)
+      .unwrap_or(strings.len());
+    let rest = strings.get(first + 1..).unwrap_or_default();
+    let second = rest
+      .iter()
+      .position(|&byte| byte == 0)
+      .unwrap_or(rest.len());
+    (first, second)
+  };
+  (HEADER.iter().map(|part| part.len()).sum::<usize>() + element + pre_body + FOOTER.len()) as u64
+}
+
+/// The bytes of the paragraph MP4's joined TTML document holds of a packet
+/// of `bytes` at `pts` of `duration` ticks of `time_base`
+/// (`ttml_write_packet`, `ttmlenc.c` 161–181 in FFmpeg 9.0.1): its times
+/// rescaled to milliseconds, the duration where above zero
+/// (`av_packet_rescale_ts`, `mov_write_ttml_document_from_queue`,
+/// `movenc_ttml.c` 196–197), each written by `ttml_write_time`
+/// ([`ttml_time_bytes`]). Exactly (R22, Codex R21 2).
+fn ttml_paragraph_bytes(pts: i128, duration: i64, bytes: u64, time_base: Timebase) -> u64 {
+  let millis = |ticks: i128| {
+    i128::from(rescale_near_signed(
+      ticks,
+      i128::from(time_base.num()) * 1000,
+      i128::from(time_base.den().get()),
+    ))
+  };
+  let begin = millis(pts);
+  let end = begin
+    + if duration > 0 {
+      millis(i128::from(duration))
+    } else {
+      i128::from(duration)
+    };
+  // `      <p\n`, the times, `>`, the text, `</p>\n`.
+  9 + ttml_time_bytes(13, begin) + 1 + ttml_time_bytes(11, end) + 1 + bytes + 5
+}
+
+/// The bytes `ttml_write_time` writes of a tag of `tag` bytes and a time of
+/// `millis` (`ttmlenc.c` 67–80 in FFmpeg 9.0.1): the tag, `="`, its hours,
+/// minutes and seconds, each of two digits at least, and its milliseconds,
+/// of three, each of C's division toward zero, a part below zero signed,
+/// and `"`.
+fn ttml_time_bytes(tag: u64, millis: i128) -> u64 {
+  let digits = |value: i128, width: u64| {
+    let magnitude = value.unsigned_abs();
+    let count = u64::from(magnitude.checked_ilog10().map_or(1, |log| log + 1));
+    (count + u64::from(value < 0)).max(width)
+  };
+  let seconds = millis / 1000;
+  let millis = millis - 1000 * seconds;
+  let minutes = seconds / 60;
+  let seconds = seconds - 60 * minutes;
+  let hours = minutes / 60;
+  let minutes = minutes - 60 * hours;
+  tag
+    + 2
+    + digits(hours, 2)
+    + 1
+    + digits(minutes, 2)
+    + 1
+    + digits(seconds, 2)
+    + 1
+    + digits(millis, 3)
+    + 1
+}
+
+/// `av_rescale_q`'s rounding to the nearest, halves away from zero
+/// (`AV_ROUND_NEAR_INF`, `libavutil/mathematics.c` 58–129), of `a` by
+/// `b` over `c` — `INT64_MIN` past an `int64_t`, as libavutil answers.
+fn rescale_near_signed(a: i128, b: i128, c: i128) -> i64 {
+  if c <= 0 {
+    return i64::MIN;
+  }
+  let product = a.saturating_mul(b);
+  let magnitude = (product.unsigned_abs() + (c / 2) as u128) / c as u128;
+  let rounded = if product < 0 {
+    -i128::try_from(magnitude).unwrap_or(i128::MAX)
+  } else {
+    i128::try_from(magnitude).unwrap_or(i128::MAX)
+  };
+  i64::try_from(rounded).unwrap_or(i64::MIN)
+}
+
 /// How a muxer opens: the bound on what it copies of each packet, and
 /// whether libavformat's automatic bitstream filters run (see [the
 /// module](self)).
@@ -1802,7 +1915,39 @@ const TTML_DOCUMENT_OVERHEAD: u64 = 1024;
 pub struct MuxOptions {
   limits: PacketLimits,
   automatic_filters: bool,
+  write_btrt: WriteBtrt,
   bounds: Bounds,
+}
+
+/// The MOV family's `write_btrt` option: whether its sample entries hold a
+/// `btrt` box of their track's bit rates (`movenc.c` 125; 1550, 2284,
+/// 3047 in FFmpeg 9.0.1), its maximum and average rates and its buffer,
+/// each in 32 bits ([`MuxOptions::with_write_btrt`]; R22, the
+/// coordinator's ruling on W21). Another container writes no `btrt`, and
+/// reads none of it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum WriteBtrt {
+  /// FFmpeg's default: MP4's mode writes it, MOV's, iPod's and AVIF's do
+  /// not (8335–8337).
+  #[default]
+  Auto,
+  /// Every mode writes it.
+  On,
+  /// No mode writes it — the remedy for an MP4 track whose bit rates its
+  /// `btrt` cannot hold ([`FfmpegMuxRefusal::BitRates`]).
+  Off,
+}
+
+impl WriteBtrt {
+  /// Whether `mode` writes the `btrt`, the option resolved as movenc
+  /// resolves it at its start (8335–8337).
+  const fn resolved(self, mode: MovMode) -> bool {
+    match self {
+      Self::Auto => matches!(mode, MovMode::Mp4),
+      Self::On => true,
+      Self::Off => false,
+    }
+  }
 }
 
 /// The sizes the muxer holds what libavformat makes of a packet to: a
@@ -1963,6 +2108,7 @@ impl MuxOptions {
     Self {
       limits: PacketLimits::new(),
       automatic_filters: true,
+      write_btrt: WriteBtrt::Auto,
       bounds: Bounds::REAL,
     }
   }
@@ -1983,6 +2129,12 @@ impl MuxOptions {
     self.automatic_filters
   }
 
+  /// The MOV family's `write_btrt` option ([`WriteBtrt`]): FFmpeg's
+  /// default, MP4's mode alone, unless set.
+  pub const fn write_btrt(&self) -> WriteBtrt {
+    self.write_btrt
+  }
+
   /// Sets what one packet's payload may cost (consuming builder).
   #[must_use]
   pub const fn with_limits(mut self, limits: PacketLimits) -> Self {
@@ -1997,6 +2149,13 @@ impl MuxOptions {
     self
   }
 
+  /// Sets the MOV family's `write_btrt` option (consuming builder).
+  #[must_use]
+  pub const fn with_write_btrt(mut self, write_btrt: WriteBtrt) -> Self {
+    self.write_btrt = write_btrt;
+    self
+  }
+
   /// Sets what one packet's payload may cost, in place.
   pub const fn set_limits(&mut self, limits: PacketLimits) -> &mut Self {
     self.limits = limits;
@@ -2006,6 +2165,12 @@ impl MuxOptions {
   /// Turns the automatic filters on or off, in place.
   pub const fn set_automatic_filters(&mut self, on: bool) -> &mut Self {
     self.automatic_filters = on;
+    self
+  }
+
+  /// Sets the MOV family's `write_btrt` option, in place.
+  pub const fn set_write_btrt(&mut self, write_btrt: WriteBtrt) -> &mut Self {
+    self.write_btrt = write_btrt;
     self
   }
 
@@ -3754,6 +3919,62 @@ pub enum FfmpegMuxRefusal {
     /// The track.
     track: TrackIndex,
   },
+  /// The MOV family: a track's bit rates, as its trailer computes them, past
+  /// the fields its sample entry writes them in (R22, the coordinator's
+  /// ruling on W21; Codex R21 2 and 3): the average it counts of the
+  /// samples written — their bytes by 8 by the timescale, over the track's
+  /// duration — past 32 bits, or its product past the 64 it is made in;
+  /// else the stated or CPB rate it falls back on; the maximum; the CPB
+  /// buffer's eighth (`calculate_mpeg4_bit_rates`, `movenc.c` 703–763 in
+  /// FFmpeg 9.0.1; [`BitRateBox`]). FFmpeg writes each cut, success
+  /// answered. Only `finish` knows the samples, so it refuses this before
+  /// the trailer, which then writes nothing ([`MuxFault::refusal`]). Of
+  /// the `btrt` alone, MP4's by default, [`WriteBtrt::Off`] writes none —
+  /// the remedy.
+  #[error("track {}'s bit rates pass what its {written} writes them in{}", .track.get(), if matches!(.written, BitRateBox::Btrt) { "; WriteBtrt::Off writes no btrt" } else { "" })]
+  BitRates {
+    /// The track.
+    track: TrackIndex,
+    /// The box that cuts them: the `esds`'s first, which no option leaves
+    /// out.
+    written: BitRateBox,
+  },
+  /// The MOV family: a track's CPB properties shorter than the fields
+  /// `calculate_mpeg4_bit_rates` reads of them — the maximum, the average
+  /// and the buffer, 32 bytes — which it reads all the same, past the
+  /// entry's end (`movenc.c` 721–725 in FFmpeg 9.0.1), where its sample
+  /// entry writes a `btrt` or an `esds` (R22, census of the class: a bad
+  /// declaration, refused by name). Refused by `finish`, before the
+  /// trailer, which then writes nothing ([`MuxFault::refusal`]).
+  #[error("track {}'s CPB properties are shorter than the container reads", .track.get())]
+  CpbProperties {
+    /// The track.
+    track: TrackIndex,
+  },
+}
+
+/// The box of a MOV-family sample entry that writes a track's bit rates
+/// ([`FfmpegMuxRefusal::BitRates`]; R22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BitRateBox {
+  /// The `btrt` (`mov_write_btrt_tag`, `movenc.c` 1280–1297 in FFmpeg
+  /// 9.0.1): the buffer, the maximum and the average, each in 32 bits —
+  /// written where the `write_btrt` option resolves on ([`WriteBtrt`]).
+  Btrt,
+  /// The `esds`'s decoder configuration (`mov_write_esds_tag`, 765–816):
+  /// the buffer in 24 bits, the maximum and the average in 32 — written for
+  /// the `mp4a` and `mp4v` tags' codecs and DVD subtitles, whatever the
+  /// option.
+  Esds,
+}
+
+impl fmt::Display for BitRateBox {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::Btrt => "btrt",
+      Self::Esds => "esds",
+    })
+  }
 }
 
 /// What about a packet's bytes [`FfmpegMuxRefusal::Payload`] refuses — each
@@ -4625,6 +4846,19 @@ pub enum MuxOpenError {
     /// The track.
     track: TrackIndex,
   },
+  /// MP4's, MOV's and iPod's chapter track, which movenc makes of the
+  /// chapters at its header — a sample a chapter, of its title's bytes and
+  /// 14, at its start counted in the movie timescale and lasting to its end
+  /// (`mov_create_chapter_track`, `movenc.c` 7727–7815 in FFmpeg 9.0.1) —
+  /// whose average bit rate its `btrt` writes in 32 bits, past them: the
+  /// titles' bytes by 8 by the timescale, over the last chapter's end
+  /// (`calculate_mpeg4_bit_rates`, 703–763; [`FfmpegMuxRefusal::BitRates`];
+  /// R22, the coordinator's ruling on W21). Known at open, and refused
+  /// there; [`WriteBtrt::Off`] writes no `btrt`.
+  #[error(
+    "the chapter track's bit rate passes what its btrt writes it in; WriteBtrt::Off writes no btrt"
+  )]
+  ChapterBitRate,
   /// The MOV family: a stream whose encryption initialization
   /// (`AV_PKT_DATA_ENCRYPTION_INIT_INFO`) declares key ids of no bytes — a
   /// key id count above zero of a key id size of zero. libavutil's
@@ -4757,9 +4991,84 @@ struct TrackState {
   configured: bool,
   /// IVF: the frames it has written ([`PacketRules::ivf`]).
   ivf_frames: u64,
+  /// The MOV family: what its trailer counts the track's average bit rate
+  /// of so far ([`Mp4Counts`]; R22, Codex R21 2).
+  mp4_counts: Mp4Counts,
+  /// MP4's TTML from libavcodec's TTML encoder: the bytes of the paragraphs
+  /// its trailer joins into one document, exactly
+  /// ([`ttml_paragraph_bytes`]), and the latest end of one, in the track's
+  /// ticks; and the bytes the document adds around them
+  /// ([`ttml_document_frame`]).
+  ttml: Option<TtmlCounts>,
+  /// The MOV family: the rates its sample entries write of the track
+  /// ([`StatedRates`]; R22).
+  rates: Option<StatedRates>,
+}
+
+/// MP4's joined TTML document, as its trailer writes it
+/// ([`TrackState::ttml`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TtmlCounts {
+  /// The bytes the document adds around its paragraphs.
+  frame: u64,
+  /// The paragraphs' bytes so far.
+  paragraphs: u64,
+  /// The latest end of a paragraph, its time and its duration, in ticks.
+  end: Option<i128>,
+}
+
+/// What the MOV family's sample entry writes of a track's bit rates beside
+/// the average its trailer counts (`calculate_mpeg4_bit_rates`, `movenc.c`
+/// 714–763 in FFmpeg 9.0.1; [`bit_rates_cut`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatedRates {
+  /// The stream's stated bit rate (`par->bit_rate`).
+  stated: i64,
+  /// Its CPB properties, where its coded side data holds them whole.
+  cpb: Option<Cpb>,
+  /// Whether its coded side data holds CPB properties shorter than the
+  /// fields movenc reads of them ([`FfmpegMuxRefusal::CpbProperties`]).
+  cpb_short: bool,
+  /// Whether its sample entry writes an `esds`.
+  esds: bool,
 }
 
 impl TrackState {
+  /// What the MOV family's trailer counts the track's average bit rate of
+  /// (`compute_avg_bitrate`, `movenc.c` 703–712 in FFmpeg 9.0.1; R22,
+  /// Codex R21 2): its samples' bytes and `track_duration`, once the
+  /// trailer has made its own (8999–9037). A `mov_text` track's empty
+  /// sample at its last cue's end, of 2 bytes and no duration, at
+  /// `track_duration` read as a decode time — moved by `check_pkt` one tick
+  /// past the last sample where it lies before it, or `INT_MAX` ticks or
+  /// more after it (6897–6930) — the track's start taken there before any
+  /// cue (7289–7290); the same sample a later packet of another track
+  /// writes first, where it does (7646–7653). TTML's joined document, of
+  /// its paragraphs, at zero and lasting to the latest end of one, none
+  /// before zero (`mov_write_ttml_document_from_queue`, `movenc_ttml.c`
+  /// 105–117, 179–181), no sample of none (`mov_write_squashed_packet`,
+  /// `movenc.c` 6579–6615).
+  fn trailer_counts(&self) -> (u128, i128) {
+    if self.rules.mov_text {
+      let cues = self.cues;
+      let mut at = cues.end;
+      if let Some(last) = cues.last
+        && (at < last || at - last >= i128::from(i32::MAX))
+      {
+        at = last + 1;
+      }
+      let start = cues.start.map_or(at, i128::from);
+      return (self.mp4_counts.bytes + 2, at - start);
+    }
+    if let Some(ttml) = self.ttml {
+      return match ttml.end {
+        Some(end) => (u128::from(ttml.frame + ttml.paragraphs), end.max(0)),
+        None => (0, 0),
+      };
+    }
+    (self.mp4_counts.bytes, self.mp4_counts.duration())
+  }
+
   /// Whether movenc writes the track's `trak`, of `shape`, were the file to
   /// end with `entries` of its samples written — `judged`, a packet of it
   /// judged and taken (R16, Codex R15): a file of no fragments leaves a
@@ -5451,6 +5760,178 @@ struct PacketRules {
   /// time negated, is written in 32 bits ([`FfmpegMuxRefusal::TimeWraps`];
   /// R21, census R20-5).
   edit_list: bool,
+  /// The MOV family: how it writes a sample of each packet it is handed,
+  /// which its trailer counts the track's average bit rate of
+  /// ([`SampleRule`]; R22, Codex R21 2).
+  sample: SampleRule,
+}
+
+/// How the MOV family writes a sample of a packet it is handed, by the
+/// track's codec and the sample description in use (`ff_mov_write_packet`,
+/// `movenc.c` 7083–7232 in FFmpeg 9.0.1): the bytes its trailer counts the
+/// track's average bit rate of ([`mp4_sample_bytes`]; R22, Codex R21 2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SampleRule {
+  /// As it is handed — after the track's automatic filter, AAC's ADTS
+  /// header stripped, VP9's hidden frames joined (7230–7232).
+  #[default]
+  AsIs,
+  /// H.264 and LCEVC: its Annex B units behind 4-byte lengths, where the
+  /// description in use does not open with an `avcC`'s or `lvcC`'s
+  /// version, 1 (`ff_nal_parse_units`, 7083–7101, 7141–7158).
+  NotRecord,
+  /// HEVC and VVC: its units behind 4-byte lengths, where the description
+  /// in use is Annex B of more than 6 bytes; HEVC's parameter sets dropped
+  /// under `hvc1` (`ff_hevc_annexb2mp4`, `ff_vvc_annexb2mp4`, 7102–7140).
+  AnnexB {
+    /// HEVC under `hvc1`.
+    parameter_sets_dropped: bool,
+  },
+  /// AV1: its temporal delimiters, redundant frame headers, tile lists and
+  /// padding dropped (`ff_av1_filter_obus`, 7159–7173).
+  Obus,
+  /// EIA-608: a `cdat` box of its 0xFC triples' bytes (7182–7197).
+  Cdat,
+  /// APV: behind its 4-byte size (7198–7203).
+  Apv,
+}
+
+impl SampleRule {
+  /// The rule of a MOV-family track of `codec`, `hvc1` its tag.
+  fn of(codec: CodecId, hvc1: bool) -> Self {
+    if codec == CodecId::H264 || codec == CodecId::LCEVC {
+      Self::NotRecord
+    } else if codec == CodecId::HEVC {
+      Self::AnnexB {
+        parameter_sets_dropped: hvc1,
+      }
+    } else if codec == CodecId::VVC {
+      Self::AnnexB {
+        parameter_sets_dropped: false,
+      }
+    } else if codec == CodecId::AV1 {
+      Self::Obus
+    } else if codec == EIA_608 {
+      Self::Cdat
+    } else if codec == CodecId::APV {
+      Self::Apv
+    } else {
+      Self::AsIs
+    }
+  }
+}
+
+/// EIA-608 captions, which the base names no constant for.
+const EIA_608: CodecId = CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_EIA_608 as i32);
+
+/// The bytes the MOV family writes of a sample of `bytes` — `out` of them
+/// as the track's automatic filter puts them out — by `rule`, the sample
+/// description in use `description` (`ff_mov_write_packet`, `movenc.c`
+/// 7083–7232 in FFmpeg 9.0.1; R22, Codex R21 2), exactly.
+fn mp4_sample_bytes(rule: SampleRule, description: &[u8], bytes: &[u8], out: u64) -> u64 {
+  match rule {
+    SampleRule::AsIs => out,
+    SampleRule::NotRecord if description.first().is_some_and(|&first| first != 1) => {
+      nal_rewritten_bytes(bytes)
+    }
+    SampleRule::AnnexB {
+      parameter_sets_dropped,
+    } if description.len() > 6 && annex_b(description) => {
+      if parameter_sets_dropped {
+        hevc_units_kept_bytes(bytes)
+      } else {
+        nal_rewritten_bytes(bytes)
+      }
+    }
+    SampleRule::NotRecord | SampleRule::AnnexB { .. } => out,
+    SampleRule::Obus => obus_kept_bytes(bytes),
+    SampleRule::Cdat => cdat_bytes(bytes),
+    SampleRule::Apv => out + 4,
+  }
+}
+
+/// The bytes `ff_hevc_annexb2mp4` writes of `bytes` under `hvc1`
+/// (`hevc.c` 1203–1250 in FFmpeg 9.0.1): the packet's units rewritten
+/// behind 4-byte lengths ([`nal_rewritten_bytes`]), then walked while
+/// more than 4 bytes are left — an empty last unit's length the last 4 —
+/// each unit kept behind its length but a VPS, an SPS or a PPS, its type
+/// read from the byte after its length: an empty unit's, the next one's
+/// length's first.
+fn hevc_units_kept_bytes(bytes: &[u8]) -> u64 {
+  let mut units = records::nal_units(bytes).peekable();
+  let mut kept = 0_u64;
+  while let Some(unit) = units.next() {
+    let next = units.peek().map(|next| next.len());
+    if unit.is_empty() && next.is_none() {
+      break;
+    }
+    let first = match unit.first() {
+      Some(&first) => first,
+      None => (next.unwrap_or(0) >> 24) as u8,
+    };
+    if !matches!((first >> 1) & 0x3F, 32..=34) {
+      kept += 4 + unit.len() as u64;
+    }
+  }
+  kept
+}
+
+/// The bytes `ff_av1_filter_obus` writes of `bytes` (`av1.c` 33–81 in
+/// FFmpeg 9.0.1): every OBU but a temporal delimiter, a redundant frame
+/// header, a tile list and padding, header and payload, as libavcodec's
+/// `parse_obu_header` reads it ([`obu_header`]); a packet it fails to parse
+/// is refused before ([`PayloadRule::Obus`]).
+fn obus_kept_bytes(bytes: &[u8]) -> u64 {
+  let mut rest = bytes;
+  let mut kept = 0_u64;
+  while let Some(obu) = obu_header(rest) {
+    if !matches!(obu.kind, 2 | 7 | 8 | 15) {
+      kept += obu.len as u64;
+    }
+    rest = &rest[obu.len..];
+  }
+  kept
+}
+
+/// The bytes MP4 writes of an EIA-608 packet of `bytes` (`movenc.c`
+/// 7182–7197): a `cdat` box, 8 bytes and 2 for each triple opening with
+/// 0xFC.
+fn cdat_bytes(bytes: &[u8]) -> u64 {
+  8 + 2
+    * bytes
+      .iter()
+      .step_by(3)
+      .filter(|&&first| first == 0xFC)
+      .count() as u64
+}
+
+/// What the MOV family's trailer counts a track's average bit rate of
+/// (`compute_avg_bitrate`, `movenc.c` 703–712 in FFmpeg 9.0.1; R22, Codex
+/// R21 2): the bytes of every sample it wrote (`cluster[i].size`, 7246),
+/// and `track_duration` — the last sample's decode time and its duration
+/// as MP4 was handed it, from the first sample's decode time, `start_dts`
+/// (7289–7290, 7321).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Mp4Counts {
+  bytes: u128,
+  start: Option<i64>,
+  end: i128,
+}
+
+impl Mp4Counts {
+  /// The counts after a sample of `bytes`, at `dts` of `duration` ticks.
+  fn with(self, bytes: u64, dts: i64, duration: i128) -> Self {
+    Self {
+      bytes: self.bytes + u128::from(bytes),
+      start: Some(self.start.unwrap_or(dts)),
+      end: i128::from(dts) + duration,
+    }
+  }
+
+  /// `track_duration`: zero before the first sample.
+  fn duration(self) -> i128 {
+    self.start.map_or(0, |start| self.end - i128::from(start))
+  }
 }
 
 /// What MPEG-TS does with a track's packets (`mpegts_write_packet_internal`,
@@ -6972,6 +7453,11 @@ impl PacketRules {
       buffered: audited == Audited::Mov(MovMode::Avif),
       ivf: audited == Audited::Ivf,
       edit_list: mp4 && audited != Audited::Mov(MovMode::Avif),
+      sample: if mp4 {
+        SampleRule::of(id, hvc1(audited, codec.codec_tag()))
+      } else {
+        SampleRule::AsIs
+      },
     }
   }
 }
@@ -8176,6 +8662,11 @@ struct Step {
   /// The largest packet the filter puts out with this one — its payload's
   /// bytes and its side data's — or `None` where it puts out none.
   largest: Option<u64>,
+  /// The payload's bytes of the packet it puts out with this one's own
+  /// times — `None` where it puts out none, or none of them — which the
+  /// MOV family counts its average bit rate of (R22, Codex R21 2): AAC's
+  /// frame past its ADTS header, VP9's superframe.
+  out: Option<u64>,
   /// What the packets the filter holds after this one come to at the
   /// least, once put out — VP9's superframe of them and a frame of a byte,
   /// PGS's display set and its end segment — or `None` where it holds none.
@@ -8309,6 +8800,7 @@ impl Filter {
       owns: true,
       emits: Emits::OWN,
       largest: Some(len + side),
+      out: Some(len),
       held: None,
       inserted: None,
     };
@@ -8376,7 +8868,10 @@ impl Filter {
               configured,
               whole,
             },
-            passed,
+            Step {
+              out: Some(output as u64),
+              ..passed
+            },
           ))
         }
         _ => Err(PayloadRule::AdtsFrame),
@@ -8401,6 +8896,7 @@ impl Filter {
             owns: true,
             emits: Emits::OWN,
             largest: Some(out + side),
+            out: Some(out),
             held: None,
             inserted: None,
           }
@@ -8409,6 +8905,7 @@ impl Filter {
             owns: false,
             emits: Emits::NONE,
             largest: None,
+            out: None,
             held: Some(superframe_bytes(
               run.0 + 1,
               run.1.max(1),
@@ -8782,6 +9279,7 @@ fn pgs_frame_merge(
             owns: true,
             emits: Emits { own: true, ..emits },
             largest,
+            out: None,
             held: None,
             inserted: None,
           },
@@ -8846,6 +9344,7 @@ fn pgs_frame_merge(
       owns: own,
       emits,
       largest,
+      out: None,
       held,
       inserted: None,
     },
@@ -9707,6 +10206,12 @@ struct Learned {
   configured: bool,
   /// IVF: the frames after the packet.
   ivf_frames: Option<u64>,
+  /// The MOV family: what its trailer counts the track's average bit rate
+  /// of after the packet ([`Mp4Counts`]).
+  mp4_counts: Option<Mp4Counts>,
+  /// MP4's joined TTML: the paragraphs' bytes and latest end after the
+  /// packet.
+  ttml: Option<TtmlCounts>,
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
@@ -9731,6 +10236,13 @@ pub struct CarrierMuxer<W, C: FfmpegCarrier> {
   /// The MOV family: the samples of the chapter track its mode makes of the
   /// chapters, one a chapter; `None` where it makes none.
   chapter_samples: Option<u64>,
+  /// The MOV family: its mode, and whether its sample entries write the
+  /// `btrt` ([`WriteBtrt`]); `None` of another container.
+  bit_rates: Option<(MovMode, bool)>,
+  /// The MOV family's chapter track: what its trailer counts its average
+  /// bit rate of, its samples' bytes and its duration
+  /// ([`chapter_track_inputs`]); `None` where its mode makes none.
+  chapter_counts: Option<(u128, i128)>,
   _carrier: PhantomData<fn() -> C>,
 }
 
@@ -9872,6 +10384,20 @@ where
     output
       .set_automatic_filters(filters)
       .map_err(|error| MuxFault::new(MuxStage::Open, error))?;
+    // The MOV family's `btrt` as the caller chose (R22, the coordinator's
+    // ruling on W21): FFmpeg's own resolution where left to it.
+    let btrt = match audited {
+      Audited::Mov(mode) => {
+        let write_btrt = options.write_btrt();
+        if write_btrt != WriteBtrt::Auto {
+          output
+            .set_write_btrt(write_btrt == WriteBtrt::On)
+            .map_err(|error| MuxFault::new(MuxStage::Open, error))?;
+        }
+        write_btrt.resolved(mode)
+      }
+      _ => false,
+    };
 
     // **The whole table is judged before anything is added**, so a
     // refusal leaves nothing written.
@@ -9946,6 +10472,19 @@ where
     {
       return Err(MuxOpenError::ChapterSample { chapter });
     }
+    // The chapter track's average bit rate, which its `btrt` writes where
+    // the option resolves on (R22, the coordinator's ruling on W21): known
+    // at open, its samples made at the header.
+    let chapter_inputs = (audited.chapter_track() && !chapters.is_empty())
+      .then(|| chapter_track_inputs(chapters, &spans, movie_timescale));
+    if btrt
+      && let Some(inputs) = chapter_inputs
+      && let Some(written) = bit_rates_cut(inputs, true, false)
+    {
+      debug_assert_eq!(written, BitRateBox::Btrt);
+      return Err(MuxOpenError::ChapterBitRate);
+    }
+    let chapter_counts = chapter_inputs.map(|inputs| (inputs.bytes, inputs.duration));
     // The movie's `udta`, every cover in it, within the dynamic buffer
     // movenc makes it in, counted exactly (R14b, letter 1, ruled): the
     // cover at which it would pass refused, nothing written.
@@ -10161,6 +10700,8 @@ where
       let mut sides = SideRules::unclaimed();
       let mut descriptions = Descriptions::default();
       let mut moov = None;
+      let mut ttml = None;
+      let mut rates = None;
       let mut stsd = 0;
       let mut ts_pce = Vec::new();
       let stream = match (stream, road) {
@@ -10212,9 +10753,14 @@ where
             hdr_sizes,
           );
           // WAV's fact chunk counts the last duration libavformat hands
-          // (table H).
-          if rules.fact_samples.is_some() {
-            rules.guessed = Some(guessed_duration(kind, time_base));
+          // (table H), and the MOV family's trailer every sample's (R22,
+          // Codex R21 2).
+          if rules.fact_samples.is_some() || family == Family::Mp4 {
+            let frame_rate = match tracks[index].params() {
+              TrackParams::Video(params) => params.frame_rate(),
+              _ => None,
+            };
+            rules.guessed = Some(guessed_duration(kind, time_base, frame_rate));
           }
           // MP4's and Matroska's tracks of no configuration their first
           // packet configures (R9: ruling 4a).
@@ -10243,6 +10789,23 @@ where
             let language = tracks[index].language().map_or(0, |tag| tag.as_str().len());
             rules.ttml_document =
               Some((codec.extradata().len() + language) as u64 + TTML_DOCUMENT_OVERHEAD);
+            ttml = Some(TtmlCounts {
+              frame: ttml_document_frame(codec.extradata()),
+              paragraphs: 0,
+              end: None,
+            });
+          }
+          // What its sample entry writes of its bit rates beside the
+          // average its trailer counts (R22, the coordinator's ruling on
+          // W21).
+          if family == Family::Mp4 {
+            let ticket = tracks[index].side_data();
+            rates = Some(StatedRates {
+              stated: ticket.bit_rate(),
+              cpb: cpb_properties(ticket),
+              cpb_short: cpb_short(ticket),
+              esds: esds_written(audited, codec.codec(), codec.codec_tag()),
+            });
           }
           sides = SideRules::of((family, audited), kind, &codec);
           // MPEG-TS's raw AAC, which this muxer frames in ADTS: the program
@@ -10323,6 +10886,9 @@ where
         presented: None,
         configured: false,
         ivf_frames: 0,
+        mp4_counts: Mp4Counts::default(),
+        ttml,
+        rates,
       });
     }
 
@@ -10378,6 +10944,11 @@ where
         held: Vec::new(),
         movie,
         chapter_samples,
+        bit_rates: match audited {
+          Audited::Mov(mode) => Some((mode, btrt)),
+          _ => None,
+        },
+        chapter_counts,
         _carrier: PhantomData,
       },
       report,
@@ -10592,6 +11163,11 @@ where
     {
       return Err(self.refuse_trailer(FfmpegMuxRefusal::MovieBox));
     }
+    // The MOV family's bit rates, as its trailer computes and writes them
+    // (R22, the coordinator's ruling on W21; Codex R21 2 and 3).
+    if let Some(refusal) = self.bit_rates_refused() {
+      return Err(self.refuse_trailer(refusal));
+    }
     self
       .output
       .write_trailer()
@@ -10601,6 +11177,73 @@ where
       .into_sink()
       .map_err(|error| MuxFault::new(MuxStage::Finish, error))?;
     Ok((sink, report))
+  }
+
+  /// The first track whose bit rates the MOV family's trailer would write
+  /// cut ([`FfmpegMuxRefusal::BitRates`]), or whose CPB properties it would
+  /// read past ([`FfmpegMuxRefusal::CpbProperties`]): of each track whose
+  /// `trak` it writes ([`TrackState::trak_written`]) — AVIF's `moov` alone
+  /// of an animated image, of more than one sample (`avif_write_trailer`,
+  /// `movenc.c` 9156–9185 in FFmpeg 9.0.1) — where its sample entry writes a
+  /// `btrt` — the option resolved on, an entry of a video, audio or
+  /// subtitle track (1550, 2284, 3047) — or an `esds` ([`esds_written`]);
+  /// of its samples as the trailer counts them ([`TrackState::trailer_counts`])
+  /// and its timescale, its time base's denominator (`mov_init`, 8590–8700).
+  fn bit_rates_refused(&self) -> Option<FfmpegMuxRefusal> {
+    let (mode, btrt) = self.bit_rates?;
+    for (index, state) in self.tracks.iter().enumerate() {
+      let (Some(rates), Some(shape), Some((_, time_base))) =
+        (state.rates, state.moov, state.stream)
+      else {
+        continue;
+      };
+      if !state.trak_written(shape, state.mp4_entries, false)
+        || (mode == MovMode::Avif && state.mp4_entries <= 1)
+      {
+        continue;
+      }
+      let btrt = btrt
+        && matches!(
+          state.kind,
+          TrackKind::Video | TrackKind::Audio | TrackKind::Subtitle
+        );
+      if !btrt && !rates.esds {
+        continue;
+      }
+      let track = TrackIndex::new(index);
+      if rates.cpb_short {
+        return Some(FfmpegMuxRefusal::CpbProperties { track });
+      }
+      let (bytes, duration) = state.trailer_counts();
+      let input = BitRateInputs {
+        bytes,
+        duration,
+        timescale: u32::try_from(time_base.den().get()).unwrap_or(u32::MAX),
+        stated: rates.stated,
+        cpb: rates.cpb,
+      };
+      if let Some(written) = bit_rates_cut(input, btrt, rates.esds) {
+        return Some(FfmpegMuxRefusal::BitRates { track, written });
+      }
+    }
+    None
+  }
+
+  /// What the MOV family's trailer would count each track's average bit
+  /// rate of, as it stands — its samples' bytes and its duration
+  /// ([`TrackState::trailer_counts`]) — and the chapter track's last;
+  /// `None` of a track not timed, or of another container: the laws' seam,
+  /// which reads the written file's sample tables back against it (R22).
+  #[doc(hidden)]
+  pub fn bit_rate_counts(&self) -> Vec<Option<(u128, i128)>> {
+    self
+      .tracks
+      .iter()
+      .map(|state| {
+        (self.bit_rates.is_some() && state.rates.is_some()).then(|| state.trailer_counts())
+      })
+      .chain(self.chapter_counts.map(Some))
+      .collect()
   }
 
   /// A trailer refused by name before it runs: the output abandoned closed
@@ -11243,6 +11886,12 @@ where
     state.configured |= plan.learned.configured;
     if let Some(frames) = plan.learned.ivf_frames {
       state.ivf_frames = frames;
+    }
+    if let Some(counts) = plan.learned.mp4_counts {
+      state.mp4_counts = counts;
+    }
+    if let Some(ttml) = plan.learned.ttml {
+      state.ttml = Some(ttml);
     }
     if let Some(sample) = plan.learned.sample {
       state.sample = Some(sample);
@@ -12388,6 +13037,82 @@ fn check_packet_rules<'p>(
   // packet put out; and `mov_text`: MP4 keeps a cue's duration as the
   // distance to the next sample — the empty one at its end, or a cue before
   // that end (table C″): a cue before the end shortens the last one.
+  // The MOV family's average bit rate, which its trailer counts (R22, Codex
+  // R21 2; [`Mp4Counts`]): the bytes of each sample the packet makes, as MP4
+  // writes it by the sample description in use after the packet
+  // ([`mp4_sample_bytes`]), and the sample's decode time and duration as MP4
+  // is handed them — libavformat's guess where the packet states none, or
+  // states one below zero of a track not of subtitles (`guess_pkt_duration`,
+  // `mux.c` 605–633). A `mov_text` cue and the empty sample MP4 writes
+  // before it count their bytes, the track's duration its cues' own
+  // ([`Cues`]); an E-AC-3 run its bytes and its packets' durations, at the
+  // packet that completes it ([`Ac3Run`]); TTML's paragraphs MP4 joins at
+  // its trailer theirs ([`TtmlCounts`]).
+  let mp4_counts = if !rules.mp4 || config_only || rules.ttml_document.is_some() {
+    None
+  } else {
+    let counts = state.mp4_counts;
+    let handed = |offered: i64| {
+      i128::from(
+        if offered > 0 || (offered < 0 && state.kind == TrackKind::Subtitle) {
+          offered
+        } else {
+          guessed
+        },
+      )
+    };
+    let in_use: &[u8] = match &descriptions {
+      Some(choice) if choice.overwrite || choice.append => {
+        choice.reaching.as_ref().map_or(&[], Reaching::bytes)
+      }
+      Some(choice) if choice.current == 0 && choice.first.is_some() => {
+        choice.first.unwrap_or_default()
+      }
+      Some(choice) => state
+        .descriptions
+        .entries
+        .get(choice.current)
+        .and_then(Option::as_deref)
+        .unwrap_or_default(),
+      None => state
+        .descriptions
+        .entries
+        .get(state.descriptions.current)
+        .and_then(Option::as_deref)
+        .unwrap_or_default(),
+    };
+    Some(match (cues, ac3) {
+      (Some(cue), _) => Mp4Counts {
+        bytes: counts.bytes + u128::from(len) + if cue.ends { 2 } else { 0 },
+        ..counts
+      },
+      (None, Some((_, Ac3Step::Alone, duration))) => {
+        counts.with(len, dts_ticks, i128::from(duration))
+      }
+      (None, Some((_, Ac3Step::Completes(run), _))) => {
+        counts.with(run.bytes, run.dts, run.duration)
+      }
+      (None, Some(_)) => counts,
+      (None, None) => match outputs.last() {
+        Some(output) => counts.with(
+          mp4_sample_bytes(rules.sample, in_use, payload.bytes, step.out.unwrap_or(len)),
+          output.dts_ticks,
+          handed(output.duration_ticks),
+        ),
+        None => counts,
+      },
+    })
+  };
+  // MP4's joined TTML: the paragraph's exact bytes, and its end.
+  let ttml = state.ttml.filter(|_| !config_only).map(|ttml| {
+    let pts = i128::from(own.pts_ticks.unwrap_or(dts_ticks));
+    let at = pts + i128::from(duration_ticks);
+    TtmlCounts {
+      paragraphs: ttml.paragraphs + ttml_paragraph_bytes(pts, duration_ticks, len, time_base),
+      end: Some(ttml.end.map_or(at, |end| end.max(at))),
+      ..ttml
+    }
+  });
   let durations = outputs.iter().any(|output| output.duration_ticks < 0)
     || cues.is_some_and(|cue| {
       cue.early
@@ -12428,6 +13153,8 @@ fn check_packet_rules<'p>(
         )
         .is_some_and(|new| !new.is_empty()),
       ivf_frames,
+      mp4_counts,
+      ttml,
     },
     choices,
   ))
@@ -13745,43 +14472,21 @@ fn mov_refusal<D: AsRef<[u8]>>(
   {
     return Some(MuxOpenError::Dimensions { track });
   }
-  // The bit rates the `btrt` box — MP4's, of every sample entry
-  // (`write_btrt`, 8335–8337) — and the `esds` write in 32 bits
-  // (`calculate_mpeg4_bit_rates`, 714–763): the stated ones, the stream's
-  // and its CPB properties' maximum and average, `int64_t`s cut into
-  // `uint32_t`s past `UINT32_MAX`, and the `btrt`'s buffer, the CPB
-  // properties' eighth, so (R21, census R20-5) — H.266's level 15.5, of no
-  // limits, allows a buffer past it; the `esds`'s, 24 bits, its codecs'
-  // standards hold within them. The CPB properties' average stands only
-  // where the track's own is none, a track of no duration: refused
-  // whatever, stricter there alone. The average the trailer counts of the
-  // samples written (`compute_avg_bitrate`, 703–712), narrowed into an
-  // `unsigned`, is not judged in this release: the census's finding W21,
-  // which waits on a ruling.
-  if mov_bit_rates_written(mode, description.kind(), codec, ticket.codec_tag())
-    && (ticket.bit_rate() > i64::from(u32::MAX)
-      || cpb_properties(ticket).is_some_and(|cpb| {
-        cpb.max_bitrate > i64::from(u32::MAX)
-          || cpb.avg_bitrate > i64::from(u32::MAX)
-          || (mode == MovMode::Mp4 && cpb.buffer_size / 8 > i64::from(u32::MAX))
-      }))
-  {
-    return Some(MuxOpenError::ConfigurationInvalid { track, codec });
-  }
+  // The bit rates its sample entries write — the `btrt`'s and the
+  // `esds`'s — are judged at the trailer, which computes them of the
+  // samples written (R22, the coordinator's ruling on W21; Codex R21 2 and
+  // 3; [`bit_rates_cut`]).
   None
 }
 
-/// Whether the MOV family writes a track's bit rates — the `btrt` box,
-/// MP4's mode's by default for every sample entry (`write_btrt`,
-/// `movenc.c` 125, 8335–8337; 1550, 2284, 3047), or the `esds` of a codec
-/// it carries ([`esds_carries`]).
-fn mov_bit_rates_written(mode: MovMode, kind: TrackKind, codec: CodecId, tag: u32) -> bool {
-  (mode == MovMode::Mp4
-    && matches!(
-      kind,
-      TrackKind::Audio | TrackKind::Video | TrackKind::Subtitle
-    ))
-    || esds_carries(Audited::Mov(mode), codec, tag)
+/// Whether the MOV family's sample entry of a track of `codec`, under the
+/// codec tag `tag`, writes an `esds` and the bit rates in it
+/// (`mov_write_esds_tag`, `movenc.c` 765–816 in FFmpeg 9.0.1): of the
+/// codecs whose configuration it holds ([`esds_carries`]), and DVD
+/// subtitles', which holds their palette (2257–2258).
+fn esds_written(audited: Audited, codec: CodecId, tag: u32) -> bool {
+  esds_carries(audited, codec, tag)
+    || (matches!(audited, Audited::Mov(_)) && codec == CodecId::DVD_SUBTITLE)
 }
 
 /// A track's CPB properties (`AVCPBProperties`, `libavcodec/defs.h`
@@ -13794,8 +14499,128 @@ struct Cpb {
   buffer_size: i64,
 }
 
-/// The ticket's CPB properties, where its coded side data holds an entry
-/// of the struct's 40 bytes.
+/// Whether the ticket's coded side data holds CPB properties shorter than
+/// the fields `calculate_mpeg4_bit_rates` reads of them — the maximum, the
+/// average and the buffer, 32 bytes — which it reads all the same, past
+/// the entry (`movenc.c` 721–725 in FFmpeg 9.0.1;
+/// [`FfmpegMuxRefusal::CpbProperties`]).
+fn cpb_short(ticket: &CodecTicket) -> bool {
+  let kind = AVPacketSideDataType::AV_PKT_DATA_CPB_PROPERTIES as i32;
+  ticket
+    .coded_side_data()
+    .iter()
+    .find(|entry| entry.kind() == kind)
+    .is_some_and(|entry| entry.data().len() < 32)
+}
+
+/// What the MOV family's trailer computes a track's bit rates of
+/// (`calculate_mpeg4_bit_rates`, `movenc.c` 714–763 in FFmpeg 9.0.1;
+/// [`bit_rates_cut`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BitRateInputs {
+  /// The bytes of every sample written, summed (`cluster[i].size`).
+  bytes: u128,
+  /// `track_duration`, in the track's ticks.
+  duration: i128,
+  /// The track's timescale.
+  timescale: u32,
+  /// The stream's stated bit rate (`par->bit_rate`).
+  stated: i64,
+  /// Its CPB properties, where its coded side data holds them.
+  cpb: Option<Cpb>,
+}
+
+/// The box whose field cuts a value `calculate_mpeg4_bit_rates` computes
+/// of `input` — the `esds`'s first, which no option leaves out — where
+/// `btrt` and `esds` say which the track's sample entry writes; `None`
+/// where every value written is the one computed (R22, the coordinator's
+/// ruling on W21; Codex R21 2 and 3). Mirrored whole (`movenc.c` 703–763
+/// in FFmpeg 9.0.1):
+/// - the average `compute_avg_bitrate` counts: none of a duration of
+///   zero; else the samples' bytes by 8 by the timescale in a `uint64_t`,
+///   over the duration as a `uint64_t`, narrowed into an `unsigned` — cut
+///   where the product passes 64 bits or the quotient 32;
+/// - where it counts none, the CPB properties' average, else the stated
+///   rate, else the CPB properties' maximum, the first not zero, an
+///   `int64_t` narrowed into a `uint32_t` — cut past it, or below zero; the
+///   CPB properties' average read there alone (Codex R21 3);
+/// - the maximum: the stated rate or that average, the greater, narrowed;
+///   then, of CPB properties, it or their maximum, the greater, narrowed —
+///   cut past 32 bits;
+/// - of CPB properties of no average, the average written as zero, the
+///   track variable-rate — no value a field cuts;
+/// - the buffer, the CPB properties' buffer over 8, C's division, in the
+///   `btrt`'s 32 bits and the `esds`'s 24 — cut past either, or below zero.
+///
+/// A `btrt` of three zeros is skipped (1284–1287): a value cut to zero is
+/// cut all the same, the rate lost.
+fn bit_rates_cut(input: BitRateInputs, btrt: bool, esds: bool) -> Option<BitRateBox> {
+  if !btrt && !esds {
+    return None;
+  }
+  let cut = if esds {
+    BitRateBox::Esds
+  } else {
+    BitRateBox::Btrt
+  };
+  let fits = |value: i128| (0..=i128::from(u32::MAX)).contains(&value);
+  let computed = if input.duration == 0 {
+    0
+  } else {
+    let Ok(duration) = i64::try_from(input.duration) else {
+      return Some(cut);
+    };
+    let product = input
+      .bytes
+      .checked_mul(8)
+      .and_then(|bits| bits.checked_mul(u128::from(input.timescale)))
+      .filter(|&product| product <= u128::from(u64::MAX));
+    let Some(product) = product else {
+      return Some(cut);
+    };
+    // `track_duration`, an `int64_t`, made the `uint64_t` the division is
+    // made in.
+    let quotient = product as u64 / duration as u64;
+    if quotient > u64::from(u32::MAX) {
+      return Some(cut);
+    }
+    i128::from(quotient)
+  };
+  let average = if computed != 0 {
+    computed
+  } else if let Some(cpb) = input.cpb.filter(|cpb| cpb.avg_bitrate != 0) {
+    i128::from(cpb.avg_bitrate)
+  } else if input.stated != 0 {
+    i128::from(input.stated)
+  } else if let Some(cpb) = input.cpb.filter(|cpb| cpb.max_bitrate != 0) {
+    i128::from(cpb.max_bitrate)
+  } else {
+    0
+  };
+  let maximum = i128::from(input.stated).max(average);
+  if !fits(average) || !fits(maximum) {
+    return Some(cut);
+  }
+  let Some(cpb) = input.cpb else {
+    return None;
+  };
+  if !fits(maximum.max(i128::from(cpb.max_bitrate))) {
+    return Some(cut);
+  }
+  let buffer = i128::from(cpb.buffer_size / 8);
+  if esds && !(0..=0xFF_FFFF).contains(&buffer) {
+    return Some(BitRateBox::Esds);
+  }
+  if btrt && !fits(buffer) {
+    return Some(BitRateBox::Btrt);
+  }
+  None
+}
+
+/// The ticket's CPB properties, where its coded side data's first entry of
+/// them (`av_packet_side_data_get`) holds the fields movenc reads — the
+/// maximum, the average and the buffer, at 0, 16 and 24 of the struct's 40
+/// bytes; a shorter one [`cpb_short`] judges.
 fn cpb_properties(ticket: &CodecTicket) -> Option<Cpb> {
   let kind = AVPacketSideDataType::AV_PKT_DATA_CPB_PROPERTIES as i32;
   let bytes = ticket
@@ -14954,18 +15779,30 @@ enum Guess {
 }
 
 /// How libavformat guesses the duration of a packet of `kind` that states
-/// none, in ticks of `time_base` ([`Guess`]), of a stream of no frame rate,
-/// as the tracks whose rules count it hold: libavcodec's count of an audio
-/// packet's samples; a tick where the time base is a millisecond or
-/// coarser.
-fn guessed_duration(kind: TrackKind, time_base: Timebase) -> Guess {
+/// none, in ticks of `time_base` ([`Guess`]; `guess_pkt_duration`, `mux.c`
+/// 605–633 in FFmpeg 9.0.1), of a stream of the frame rate `frame_rate`
+/// (its `avg_frame_rate`, which the base sets of the track's): libavcodec's
+/// count of an audio packet's samples; a video frame at the frame rate,
+/// rounded to the nearest, where both its parts are above zero, else a
+/// tick where the time base is a millisecond or coarser; none of another
+/// kind.
+fn guessed_duration(kind: TrackKind, time_base: Timebase, frame_rate: Option<Timebase>) -> Guess {
   let (num, den) = (
     i128::from(time_base.num()),
     i128::from(time_base.den().get()),
   );
   match kind {
     TrackKind::Audio => Guess::Audio,
-    TrackKind::Video if num * 1000 > den => Guess::Fixed(1),
+    TrackKind::Video => match frame_rate.filter(|rate| rate.num() > 0 && rate.den().get() > 0) {
+      // `av_rescale_q(1, av_inv_q(avg_frame_rate), time_base)`.
+      Some(rate) => Guess::Fixed(rescale_nearest(
+        i128::from(rate.den().get()) * den,
+        1,
+        i128::from(rate.num()) * num,
+      )),
+      None if num * 1000 > den => Guess::Fixed(1),
+      None => Guess::Fixed(0),
+    },
     _ => Guess::Fixed(0),
   }
 }
@@ -15659,6 +16496,51 @@ fn mp4_chapter_sample_refused(
     last = start;
   }
   None
+}
+
+/// What MP4's trailer computes the chapter track's bit rates of
+/// ([`bit_rates_cut`]; R22): its samples, one a chapter of its title's
+/// bytes and 14 — the title behind its 16-bit length, then an `encd` box
+/// of 12 (`mov_create_chapter_track`, `movenc.c` 7783–7805 in FFmpeg
+/// 9.0.1) — and its duration, the last chapter's end counted in
+/// `movie_timescale`, from zero: no track past the streams is given a
+/// start of its own (8448–8474), and a sample `check_pkt` would move is
+/// refused first ([`mp4_chapter_sample_refused`]). Its parameters state no
+/// rate, and it has no stream to hold CPB properties.
+fn chapter_track_inputs(
+  chapters: &[Chapter<Ffmpeg>],
+  spans: &[(i64, i64)],
+  movie_timescale: i64,
+) -> BitRateInputs {
+  let bytes = chapters
+    .iter()
+    .map(|chapter| {
+      u128::from(
+        chapter
+          .title()
+          .map_or(0, |title| title.as_str().len() as u64)
+          + 14,
+      )
+    })
+    .sum();
+  let duration = chapters
+    .last()
+    .zip(spans.last())
+    .map_or(0, |(chapter, &(_, end))| {
+      let base = chapter.timebase();
+      i128::from(rescale_nearest(
+        i128::from(end),
+        i128::from(base.num()) * i128::from(movie_timescale),
+        i128::from(base.den().get()),
+      ))
+    });
+  BitRateInputs {
+    bytes,
+    duration,
+    timescale: u32::try_from(movie_timescale).unwrap_or(u32::MAX),
+    stated: 0,
+    cpb: None,
+  }
 }
 
 /// A chapter's span in its own time base, or a refusal naming it.

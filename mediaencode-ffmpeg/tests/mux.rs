@@ -167,9 +167,9 @@ use mediaencode::{
   },
 };
 use mediaencode_ffmpeg::{
-  AutomaticFilter, ContainerName, FfmpegMuxRefusal, FfmpegMuxer, FfmpegOwnedMuxer, LayoutReadBack,
-  MuxOpenError, MuxOptions, MuxStage, OutputError, OutputText, PayloadRule, Rewrite, SideDataFate,
-  Uncarried, Withheld,
+  AutomaticFilter, BitRateBox, ContainerName, FfmpegMuxRefusal, FfmpegMuxer, FfmpegOwnedMuxer,
+  LayoutReadBack, MuxOpenError, MuxOptions, MuxStage, OutputError, OutputText, PayloadRule,
+  Rewrite, SideDataFate, Uncarried, Withheld, WriteBtrt,
 };
 use mediaio_ffmpeg::{
   CodecTicket, FfmpegBytes, PacketLimits,
@@ -18166,29 +18166,6 @@ fn open_law(
   }
 }
 
-/// `row` stating CPB properties of a maximum rate `max` and a buffer
-/// `buffer` in bits, any it stated before replaced (`AVCPBProperties`:
-/// its maximum, minimum and average rates, its buffer and its delay).
-fn with_cpb(row: Described, max: i64, buffer: i64) -> Described {
-  use ffmpeg_next::ffi::AVPacketSideDataType as T;
-  let mut bytes = Vec::new();
-  for value in [max, 0, 0, buffer, 0] {
-    bytes.extend(value.to_ne_bytes());
-  }
-  let unstated = reticketed(row, |par| {
-    // SAFETY: `par` is live, its coded side data its own; the removal
-    // frees each entry of the kind it names.
-    unsafe {
-      ffmpeg_next::ffi::av_packet_side_data_remove(
-        par.coded_side_data,
-        &mut par.nb_coded_side_data,
-        T::AV_PKT_DATA_CPB_PROPERTIES,
-      );
-    }
-  });
-  with_coded(unstated, T::AV_PKT_DATA_CPB_PROPERTIES, &bytes)
-}
-
 /// **L188 — MP4's edit list holds the track's first decode time to the 32
 /// bits of its media time** (R21, census R20-5: a value FFmpeg holds wider
 /// than the field it writes): of version 0 — the track's span and its
@@ -18423,17 +18400,14 @@ fn l190_the_riff_formats_fields_are_held_to_their_bits() {
   }
 }
 
-/// **L191 — the MOV family holds a track header's display width and the
-/// bit rates it states to their fields** (R21, census R20-5; `movenc.c`
-/// 4066–4085, 714–763): outside MOV and AVIF, the width by the aspect
-/// ratio in 16.16, past 32 bits replaced by the width alone; the `btrt`'s
-/// and `esds`'s rates in 32 bits, and the `btrt`'s buffer, the CPB
-/// properties' eighth — each past its field refused at open by name
-/// ([`MuxOpenError::Dimensions`], [`MuxOpenError::ConfigurationInvalid`]),
-/// nothing written; each at it opened, MP4's display width written as
-/// counted.
+/// **L191 — the MOV family holds a track header's display width to its
+/// field** (R21, census R20-5; `movenc.c` 4066–4085): outside MOV and AVIF,
+/// the width by the aspect ratio in 16.16, past 32 bits replaced by the
+/// width alone — refused at open by name ([`MuxOpenError::Dimensions`]),
+/// nothing written; at it opened, and written as counted. The bit rates
+/// its sample entries write are the trailer's (R22, L198).
 ///
-/// PLANT: each field unjudged.
+/// PLANT: the field unjudged.
 #[test]
 fn l191_the_mov_family_holds_its_entries_fields() {
   let Some(corpus) = Corpus::new() else { return };
@@ -18441,8 +18415,6 @@ fn l191_the_mov_family_holds_its_entries_fields() {
   let video = || table_of(&source, TrackKind::Video).remove(0);
   let dimensions: &dyn Fn(&MuxOpenError) -> bool =
     &|error| matches!(error, MuxOpenError::Dimensions { .. });
-  let invalid: &dyn Fn(&MuxOpenError) -> bool =
-    &|error| matches!(error, MuxOpenError::ConfigurationInvalid { .. });
   let aspect = |num: i32| {
     reticketed(video(), |par| {
       par.width = 4096;
@@ -18473,31 +18445,6 @@ fn l191_the_mov_family_holds_its_entries_fields() {
     be32(&bytes, tkhd + 76),
     65_535 << 16,
     "the display width as counted"
-  );
-  let rated = |bit_rate: i64| reticketed(video(), |par| par.bit_rate = bit_rate);
-  let max = i64::from(u32::MAX);
-  open_law(
-    &corpus,
-    "l191-rate.mp4",
-    "mp4",
-    vec![rated(max + 1)],
-    Some(invalid),
-  );
-  open_law(&corpus, "l191-rate-max.mp4", "mp4", vec![rated(max)], None);
-  let buffered = |bits: i64| with_cpb(video(), 0, bits);
-  open_law(
-    &corpus,
-    "l191-buffer.mp4",
-    "mp4",
-    vec![buffered((max + 1) * 8)],
-    Some(invalid),
-  );
-  open_law(
-    &corpus,
-    "l191-buffer-max.mp4",
-    "mp4",
-    vec![buffered(max * 8 + 7)],
-    None,
   );
 }
 
@@ -18910,4 +18857,776 @@ fn l196_in_a_process_of_its_own() {
     "no flush asked of the sink"
   );
   assert_eq!(tally.drops.load(Ordering::Relaxed), 1, "dropped once");
+}
+
+/// The bytes and the duration of each `trak` FFmpeg wrote into `path`, in
+/// order: the sum of its `stsz`'s sample sizes — of one size times their
+/// count where the box states one — and of its `stts`'s deltas, its
+/// `track_duration` (`mov_write_stsz_tag`, `mov_write_stts_tag`,
+/// `movenc.c` 221–255, 3241–3288).
+fn written_counts(path: &Path) -> Vec<(u128, i128)> {
+  let bytes = std::fs::read(path).expect("the file");
+  let word = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+  let (body, end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("a moov");
+  boxes_of(&bytes, body, end)
+    .into_iter()
+    .filter(|(kind, _, _)| kind == b"trak")
+    .map(|(_, body, size)| {
+      let end = body - 8 + size as usize;
+      let (mdia, mdia_end, _) = box_in(&bytes, (body, end), b"mdia").expect("mdia");
+      let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+      let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+      // Each body after its version and flags.
+      let (stsz, _, _) = box_in(&bytes, (stbl, stbl_end), b"stsz").expect("stsz");
+      let (size, count) = (word(stsz + 4), word(stsz + 8));
+      let samples: u128 = if size != 0 {
+        u128::from(size) * u128::from(count)
+      } else {
+        (0..count as usize)
+          .map(|at| u128::from(word(stsz + 12 + 4 * at)))
+          .sum()
+      };
+      let (stts, _, _) = box_in(&bytes, (stbl, stbl_end), b"stts").expect("stts");
+      let duration: i128 = (0..word(stts + 4) as usize)
+        .map(|at| i128::from(word(stts + 8 + 8 * at)) * i128::from(word(stts + 12 + 8 * at)))
+        .sum();
+      (samples, duration)
+    })
+    .collect()
+}
+
+/// A muxer of `container` over `table` and `chapters` at `target`, `write`
+/// run on it, then what its trailer would count each track's bit rates of
+/// ([`FfmpegOwnedMuxer::bit_rate_counts`]) read just before it finishes,
+/// and read back from the file: they agree, trak by trak.
+fn counted_as_written(
+  target: &Path,
+  container: &str,
+  table: Vec<Described>,
+  chapters: &[Chapter<Ffmpeg>],
+  write: impl FnOnce(&mut FfmpegOwnedMuxer<File>),
+) {
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(target).expect("create"),
+    ContainerName::new(container),
+    table,
+    chapters,
+    PacketLimits::default(),
+  )
+  .unwrap_or_else(|error| panic!("{}: open, {error:?}", target.display()));
+  write(&mut muxer);
+  let counted: Vec<(u128, i128)> = muxer.bit_rate_counts().into_iter().flatten().collect();
+  muxer
+    .finish()
+    .unwrap_or_else(|error| panic!("{}: finished, {error:?}", target.display()));
+  assert_eq!(
+    counted,
+    written_counts(target),
+    "{}: each track's samples, as counted and as written",
+    target.display()
+  );
+}
+
+/// `result`, a write's, taken: a panic naming `what` and the error else.
+fn wrote<P>(
+  result: Result<(), MuxError<mediaencode_ffmpeg::MuxFault, FfmpegMuxRefusal, P>>,
+  what: &str,
+) {
+  result
+    .map_err(|error| error.map_packet(drop))
+    .unwrap_or_else(|error| panic!("{what}: {error:?}"));
+}
+
+/// HEVC in MPEG-TS, Annex B, its parameter sets in its first packet and
+/// its configuration of them: five frames of x265's.
+#[rustfmt::skip]
+fn hevc_annexb(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "annexb-hevc.ts", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25:duration=0.2",
+    "-c:v", "libx265", "-x265-params", "log-level=error",
+  ])
+}
+
+/// **L197 — the MOV family's samples are counted as it writes them** (R22,
+/// the coordinator's ruling on W21: the written sizes mirrored exactly,
+/// each mirror read back against the file): the bytes and the duration its
+/// trailer counts each track's average bit rate of — its samples' bytes,
+/// and `track_duration` (`compute_avg_bitrate`, `movenc.c` 703–712) — are
+/// the sums of the `stsz` and the `stts` it writes, on every road a sample
+/// takes: H.264 of an `avcC`, as it is; H.264 of an Annex B configuration,
+/// its units behind 4-byte lengths, of no duration stated, each libavformat's
+/// guess at the frame rate; HEVC of an Annex B configuration under `hev1`,
+/// rewritten, and under `hvc1`, its parameter sets dropped; AV1, its
+/// temporal delimiters dropped; AAC in ADTS, the header its filter strips;
+/// E-AC-3 joined from one-block frames; `mov_text` cues and the empty
+/// samples at their ends, one between two and one at the trailer; TTML
+/// joined at the trailer into one document; the chapter track, a title's
+/// bytes and 14 a chapter; and PCM, of a constant size.
+///
+/// PLANT: H.264's units counted as they are handed; HEVC's parameter sets
+/// counted under `hvc1`; AV1's temporal delimiters counted; AAC's header
+/// counted; a durationless frame's guess dropped; the `mov_text` trailer's
+/// sample uncounted; the TTML document's frame miscounted; the chapter
+/// track's `encd` uncounted.
+#[test]
+fn l197_the_mov_familys_samples_are_counted_as_it_writes_them() {
+  let Some(corpus) = Corpus::new() else { return };
+  let video = |packet: Video| VideoTrackPacket::new(TrackIndex::new(0), packet);
+
+  // H.264 of an `avcC`: as it is.
+  let source = corpus.multi_track_mkv();
+  let (table, frames) = first_track(&source, TrackKind::Video, 5);
+  counted_as_written(
+    &output(&corpus, "l197-avcc.mp4"),
+    "mp4",
+    table,
+    &[],
+    |muxer| {
+      for frame in &frames {
+        wrote(muxer.write_video(video(video_of(frame))), "an avcC frame");
+      }
+    },
+  );
+
+  // H.264 of an Annex B configuration, its frames of no duration.
+  let (row, frames, sps, pps) = h264_fixture(&corpus);
+  let annexb = [&[0, 0, 0, 1][..], &sps, &[0, 0, 0, 1], &pps].concat();
+  let row = reticketed(row, |par| {
+    // SAFETY: `par` is live; its extradata replaced by a padded copy of
+    // libavutil's allocation, the old one freed.
+    unsafe {
+      ffmpeg_next::ffi::av_freep((&raw mut par.extradata).cast());
+      let data = ffmpeg_next::ffi::av_mallocz(annexb.len() + 64).cast::<u8>();
+      assert!(!data.is_null(), "av_mallocz");
+      core::ptr::copy_nonoverlapping(annexb.as_ptr(), data, annexb.len());
+      par.extradata = data;
+      par.extradata_size = annexb.len() as i32;
+    }
+  });
+  counted_as_written(
+    &output(&corpus, "l197-annexb.mp4"),
+    "mp4",
+    vec![row],
+    &[],
+    |muxer| {
+      for frame in &frames {
+        // Each unit behind a 3-byte start code, which MP4 writes behind a
+        // 4-byte length.
+        let bytes = frame.data().as_ref();
+        let mut three = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+          if bytes[at..].starts_with(&[0, 0, 0, 1]) {
+            three.extend_from_slice(&[0, 0, 1]);
+            at += 4;
+          } else {
+            three.push(bytes[at]);
+            at += 1;
+          }
+        }
+        wrote(
+          muxer.write_video(video(video_holding(frame, &three).with_duration(None))),
+          "an Annex B frame",
+        );
+      }
+    },
+  );
+
+  // HEVC of an Annex B configuration, under `hev1` and under `hvc1`.
+  let hevc = hevc_annexb(&corpus);
+  for (tag, name) in [(None, "hev1"), (Some(*b"hvc1"), "hvc1")] {
+    let (mut table, packets) = whole_track(&hevc, TrackKind::Video);
+    if let Some(tag) = tag {
+      let row = table.remove(0);
+      table.push(reticketed(row, |par| {
+        par.codec_tag = u32::from_le_bytes(tag)
+      }));
+    }
+    counted_as_written(
+      &output(&corpus, &format!("l197-{name}.mp4")),
+      "mp4",
+      table,
+      &[],
+      |muxer| {
+        for packet in &packets {
+          wrote(muxer.write_video(video(video_of(packet))), name);
+        }
+      },
+    );
+  }
+
+  // AV1, each temporal unit opening with its temporal delimiter.
+  let av1 = av1_mkv(&corpus);
+  let (table, packets) = first_track(&av1, TrackKind::Video, 4);
+  counted_as_written(
+    &output(&corpus, "l197-av1.mp4"),
+    "mp4",
+    table,
+    &[],
+    |muxer| {
+      for packet in &packets {
+        let frame = video_holding(&video_of(packet), &AV1_TEMPORAL_UNIT);
+        wrote(muxer.write_video(video(frame)), "a temporal unit");
+      }
+    },
+  );
+
+  // AAC in ADTS.
+  let adts = audio_file(&corpus, "l197.aac", "aac");
+  let (table, packets) = whole_track(&adts, TrackKind::Audio);
+  counted_as_written(
+    &output(&corpus, "l197-adts.mp4"),
+    "mp4",
+    table,
+    &[],
+    |muxer| {
+      for packet in &packets {
+        wrote(
+          muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+          "an ADTS frame",
+        );
+      }
+    },
+  );
+
+  // E-AC-3: six one-block frames joined, then a frame of six alone.
+  let (source, six, one) = eac3_frames(&corpus);
+  counted_as_written(
+    &output(&corpus, "l197-eac3.mp4"),
+    "mp4",
+    table_of(&source, TrackKind::Audio),
+    &[],
+    |muxer| {
+      for block in 0..6 {
+        wrote(
+          muxer.write_audio(audio_ticks(&one, 256 * block, 256)),
+          "a block",
+        );
+      }
+      wrote(muxer.write_audio(audio_ticks(&six, 1536, 1536)), "a frame");
+    },
+  );
+
+  // `mov_text`: two cues 500 ms apart.
+  let cues_source = mov_text_ms_mp4(&corpus);
+  let (table, cues) = first_track(&cues_source, TrackKind::Subtitle, 1);
+  let cue = subtitle_of(&cues[0]);
+  counted_as_written(
+    &output(&corpus, "l197-movtext.mp4"),
+    "mp4",
+    table,
+    &[],
+    |muxer| {
+      for at in [0, 1500] {
+        wrote(
+          muxer.write_subtitle(cue_on(0, &cue, millis(), (at, 1000))),
+          "a cue",
+        );
+      }
+    },
+  );
+
+  // TTML from libavcodec's TTML encoder, joined at the trailer: of the old
+  // configuration, its signature alone, and of its two strings; a
+  // paragraph past 99 hours among them.
+  let ttml = ttml_mp4(&corpus);
+  for (name, extradata) in [
+    ("old", &b"lavc-ttmlenc"[..]),
+    (
+      "strings",
+      &b"lavc-ttmlenc  xmlns=\"t\"\n\0  <head/>\n\0"[..],
+    ),
+  ] {
+    let (table, paragraphs) = first_track(&ttml, TrackKind::Subtitle, 1);
+    // Counted in milliseconds, so that the joined document's span — within
+    // `INT_MAX` ticks — reaches past 99 hours.
+    let row = &table[0];
+    let mut row =
+      TrackDescription::new(millis(), row.params().duplicate(), row.side_data().clone())
+        .expect("a description");
+    row.set_extradata(Some(bytes_of(extradata)));
+    let table = vec![row];
+    let base = millis();
+    let paragraph = subtitle_of(&paragraphs[0]);
+    counted_as_written(
+      &output(&corpus, &format!("l197-ttml-{name}.mp4")),
+      "mp4",
+      table,
+      &[],
+      |muxer| {
+        for (at, duration, text) in [
+          (0, 1000, &b"hello"[..]),
+          (1000, 1000, b"world"),
+          (360_000_250, 500, b"late"),
+        ] {
+          let at = Timestamp::new(at, millis())
+            .checked_rescale_with(base, Rounding::Nearest)
+            .expect("a time")
+            .pts();
+          let duration = Timestamp::new(duration, millis())
+            .checked_rescale_with(base, Rounding::Nearest)
+            .expect("a duration")
+            .pts();
+          wrote(
+            muxer.write_subtitle(subtitle_ticks(
+              &subtitle_holding(&paragraph, text),
+              base,
+              at,
+              duration,
+            )),
+            "a paragraph",
+          );
+        }
+      },
+    );
+  }
+
+  // The chapter track, beside an AAC track.
+  let aac = audio_file(&corpus, "l197-aac.mkv", "aac");
+  let (table, packets) = whole_track(&aac, TrackKind::Audio);
+  let chapters = [
+    chapter_of(0, 0, 100, Some("one")),
+    chapter_of(1, 100, 300, Some("the second chapter")),
+    chapter_of(2, 300, 450, Some("")),
+  ];
+  counted_as_written(
+    &output(&corpus, "l197-chapters.mp4"),
+    "mp4",
+    table,
+    &chapters,
+    |muxer| {
+      for packet in &packets {
+        wrote(
+          muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+          "an AAC frame",
+        );
+      }
+    },
+  );
+
+  // PCM, of a constant size, in MP4's `ipcm`.
+  let pcm = pcm_mov(&corpus);
+  let (table, packets) = whole_track(&pcm, TrackKind::Audio);
+  counted_as_written(
+    &output(&corpus, "l197-pcm.mp4"),
+    "mp4",
+    table,
+    &[],
+    |muxer| {
+      for packet in &packets {
+        wrote(
+          muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+          "PCM",
+        );
+      }
+    },
+  );
+}
+
+/// `row` stating CPB properties of a maximum rate `max`, an average `avg`
+/// and a buffer `buffer` in bits, any it stated before replaced
+/// (`AVCPBProperties`: its maximum, minimum and average rates, its buffer
+/// and its delay).
+fn with_cpb_rates(row: Described, max: i64, avg: i64, buffer: i64) -> Described {
+  let mut bytes = Vec::new();
+  for value in [max, 0, avg, buffer, 0] {
+    bytes.extend(value.to_ne_bytes());
+  }
+  with_cpb_bytes(row, &bytes)
+}
+
+/// `row` whose coded side data's CPB properties entry holds `bytes`, any it
+/// held before replaced.
+fn with_cpb_bytes(row: Described, bytes: &[u8]) -> Described {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let unstated = reticketed(row, |par| {
+    // SAFETY: `par` is live, its coded side data its own; the removal
+    // frees each entry of the kind it names.
+    unsafe {
+      ffmpeg_next::ffi::av_packet_side_data_remove(
+        par.coded_side_data,
+        &mut par.nb_coded_side_data,
+        T::AV_PKT_DATA_CPB_PROPERTIES,
+      );
+    }
+  });
+  with_coded(unstated, T::AV_PKT_DATA_CPB_PROPERTIES, bytes)
+}
+
+/// The `btrt` boxes of the file at `path`: each its buffer, its maximum and
+/// its average.
+fn btrts(path: &Path) -> Vec<[u32; 3]> {
+  let bytes = std::fs::read(path).expect("the file");
+  bytes
+    .windows(4)
+    .enumerate()
+    .filter(|(_, window)| *window == b"btrt")
+    .map(|(at, _)| {
+      [
+        be32(&bytes, at + 4),
+        be32(&bytes, at + 8),
+        be32(&bytes, at + 12),
+      ]
+    })
+    .collect()
+}
+
+/// **L198 — the MOV family's bit rates are judged at its trailer, as it
+/// computes and writes them** (R22, the coordinator's ruling on W21; Codex
+/// R21 2 and 3; `calculate_mpeg4_bit_rates`, `movenc.c` 703–763): an H.264
+/// track of 90 kHz ticks whose one frame of 40 000 bytes lasts a tick, its
+/// average past 32 bits — refused by name at `finish` in MP4, whose `btrt`
+/// writes it by default, the output abandoned, and in MOV of
+/// `WriteBtrt::On`; written of `WriteBtrt::Off` and in MOV by default,
+/// each file of no `btrt`; at a rate the fields hold, the `btrt` written
+/// as computed. A stated rate past 32 bits refused, at them written — of
+/// every kind's sample entry, AC-3's and `mov_text`'s as H.264's; CPB
+/// properties of an average past them on a track whose average is counted
+/// — which FFmpeg reads not — written, and refused on a track of no
+/// duration, whose average falls back on them; their maximum past 32 bits
+/// refused; their buffer's eighth past the `btrt`'s 32 bits refused in
+/// MP4, at them written; past the `esds`'s 24 refused on each entry that
+/// writes one — AAC's `mp4a`, MPEG-4 video's `mp4v`, DVD subtitles' `mp4s`
+/// — whose `esds` no option leaves out, `WriteBtrt::Off` or not, at them
+/// written. CPB properties shorter than the fields movenc reads of them
+/// refused where a box reads them, and written in MOV, where none does.
+/// MP4's chapter track of nine chapters of 65 535-byte titles within a
+/// millisecond: refused at open, `MuxOpenError::ChapterBitRate`; of
+/// `WriteBtrt::Off`, opened and finished.
+///
+/// PLANT: the trailer's judgment skipped; the CPB average read whatever;
+/// the fallback without it; the option not handed to FFmpeg; the `btrt`
+/// judged whatever the option; the `btrt` of video alone, of video and
+/// audio; the `esds`'s buffer unjudged; AAC's, MPEG-4 video's and DVD
+/// subtitles' `esds` unjudged; the chapter track unjudged; short CPB
+/// properties read as none; the product's 64 bits unjudged.
+#[test]
+fn l198_the_mov_familys_bit_rates_are_judged_at_its_trailer() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (table, frames) = first_track(&source, TrackKind::Video, 1);
+  let tick = Timebase::new(1, NonZeroI32::new(90_000).expect("non-zero"));
+  // The track counted in 90 kHz ticks, of the frame rate it states or
+  // none, its frame of 40 000 bytes — one NAL unit of filler data behind
+  // its 4-byte length — lasting `duration`.
+  let rated_row = |rated: bool| {
+    use mediaencode::mediaspine::demuxer::VideoTrackParams;
+    let row = &table[0];
+    let params = match row.params() {
+      TrackParams::Video(params) => TrackParams::Video(VideoTrackParams::new(
+        params.codec(),
+        params.width(),
+        params.height(),
+        params.pixel_format().clone(),
+        params.frame_rate().filter(|_| rated),
+      )),
+      other => other.duplicate(),
+    };
+    TrackDescription::new(tick, params, row.side_data().clone())
+      .expect("a description")
+      .with_extradata(Some(bytes_of(&stream_extradata_of(row))))
+  };
+  let row = || rated_row(true);
+  let frame = |duration: i64| {
+    let unit = vec![0x0C; 40_000 - 4];
+    let bytes = [&(unit.len() as u32).to_be_bytes()[..], &unit].concat();
+    VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_holding(&video_of(&frames[0]), &bytes)
+        .with_pts(Some(Timestamp::new(0, tick)))
+        .with_dts(Some(Timestamp::new(0, tick)))
+        .with_duration(Some(Timestamp::new(duration, tick))),
+    )
+  };
+  let finished = |name: &str,
+                  container: &str,
+                  write_btrt: WriteBtrt,
+                  table: Vec<Described>,
+                  packet: VideoTrackPacket<Ffmpeg, FfmpegBytes>|
+   -> Result<PathBuf, mediaencode_ffmpeg::MuxFault> {
+    let target = output(&corpus, name);
+    let (mut muxer, _) = FfmpegOwnedMuxer::open_with(
+      File::create(&target).expect("create"),
+      ContainerName::new(container),
+      table,
+      &[],
+      MuxOptions::new().with_write_btrt(write_btrt),
+    )
+    .unwrap_or_else(|error| panic!("{name}: open, {error:?}"));
+    muxer
+      .write_video(packet)
+      .map_err(|error| error.map_packet(drop))
+      .unwrap_or_else(|error| panic!("{name}: the frame, {error:?}"));
+    muxer.finish().map(|()| target)
+  };
+  let refused = |result: Result<PathBuf, mediaencode_ffmpeg::MuxFault>, written: BitRateBox| {
+    let fault = result.expect_err("refused");
+    assert!(
+      matches!(
+        fault.refusal(),
+        Some(FfmpegMuxRefusal::BitRates { track, written: box_ })
+          if track.get() == 0 && box_ == written
+      ),
+      "{fault:?}"
+    );
+  };
+  // The average past 32 bits: 40 000 bytes by 8 by 90 000 over a tick.
+  refused(
+    finished("l198.mp4", "mp4", WriteBtrt::Auto, vec![row()], frame(1)),
+    BitRateBox::Btrt,
+  );
+  refused(
+    finished("l198-on.mov", "mov", WriteBtrt::On, vec![row()], frame(1)),
+    BitRateBox::Btrt,
+  );
+  for (name, container, write_btrt) in [
+    ("l198-off.mp4", "mp4", WriteBtrt::Off),
+    ("l198.mov", "mov", WriteBtrt::Auto),
+  ] {
+    let target = finished(name, container, write_btrt, vec![row()], frame(1))
+      .unwrap_or_else(|fault| panic!("{name}: {fault:?}"));
+    assert!(btrts(&target).is_empty(), "{name}: no btrt");
+  }
+  // At a rate the fields hold: 40 000 bytes by 8 by 90 000 over 840 ticks
+  // — 34 285 714 bits a second.
+  let target = finished(
+    "l198-held.mp4",
+    "mp4",
+    WriteBtrt::Auto,
+    vec![row()],
+    frame(840),
+  )
+  .unwrap_or_else(|fault| panic!("held: {fault:?}"));
+  assert_eq!(
+    btrts(&target),
+    [[0, 34_285_714, 34_285_714]],
+    "held: the btrt"
+  );
+  // A stated rate, past 32 bits and at them.
+  let max = i64::from(u32::MAX);
+  let stated = |rate: i64| reticketed(row(), |par| par.bit_rate = rate);
+  refused(
+    finished(
+      "l198-stated.mp4",
+      "mp4",
+      WriteBtrt::Auto,
+      vec![stated(max + 1)],
+      frame(840),
+    ),
+    BitRateBox::Btrt,
+  );
+  finished(
+    "l198-stated-max.mp4",
+    "mp4",
+    WriteBtrt::Auto,
+    vec![stated(max)],
+    frame(840),
+  )
+  .unwrap_or_else(|fault| panic!("stated at the field: {fault:?}"));
+  // CPB properties: an average FFmpeg reads not where it counts one,
+  // written; read where it counts none — a frame of no duration, of a
+  // track of no frame rate, whose duration libavformat guesses not —
+  // refused.
+  finished(
+    "l198-cpb-avg.mp4",
+    "mp4",
+    WriteBtrt::Auto,
+    vec![with_cpb_rates(row(), 0, max + 1, 0)],
+    frame(840),
+  )
+  .unwrap_or_else(|fault| panic!("the CPB average unread: {fault:?}"));
+  refused(
+    finished(
+      "l198-cpb-fallback.mp4",
+      "mp4",
+      WriteBtrt::Auto,
+      vec![with_cpb_rates(rated_row(false), 0, max + 1, 0)],
+      frame(0),
+    ),
+    BitRateBox::Btrt,
+  );
+  // Their maximum past 32 bits; their buffer's eighth past the `btrt`'s.
+  refused(
+    finished(
+      "l198-cpb-max.mp4",
+      "mp4",
+      WriteBtrt::Auto,
+      vec![with_cpb_rates(row(), max + 1, 0, 0)],
+      frame(840),
+    ),
+    BitRateBox::Btrt,
+  );
+  refused(
+    finished(
+      "l198-buffer.mp4",
+      "mp4",
+      WriteBtrt::Auto,
+      vec![with_cpb_rates(row(), 0, 0, (max + 1) * 8)],
+      frame(840),
+    ),
+    BitRateBox::Btrt,
+  );
+  finished(
+    "l198-buffer-max.mp4",
+    "mp4",
+    WriteBtrt::Auto,
+    vec![with_cpb_rates(row(), 0, 0, max * 8 + 7)],
+    frame(840),
+  )
+  .unwrap_or_else(|fault| panic!("the buffer at the field: {fault:?}"));
+  // Each kind's sample entry, and each that writes an `esds`.
+  let aac = audio_file(&corpus, "l198-aac.mkv", "aac");
+  let (_, aac_packets) = first_track(&aac, TrackKind::Audio, 2);
+  #[rustfmt::skip]
+  let mpeg4 = generated(&corpus, "l198-mpeg4.mkv", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=0.2", "-c:v", "mpeg4",
+  ]);
+  #[rustfmt::skip]
+  let ass = generated(&corpus, "l198-ass.mkv", &[
+    "-i",
+    written_text(&corpus, "l198.srt", "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n2\n00:00:01,000 --> 00:00:02,000\nworld\n\n")
+      .to_str().expect("utf-8 path"),
+    "-c:s", "ass",
+  ]);
+  let palette = format!("size: 720x480\npalette: {}\n", ["000000"; 16].join(", "));
+  // A track of the first two packets of `path`'s first track of `kind`,
+  // described by `row`, in MP4 of `write_btrt`.
+  let entry_finished = |name: &str, path: &Path, kind: TrackKind, row: Described, write_btrt| {
+    let target = output(&corpus, name);
+    let (mut muxer, _) = FfmpegOwnedMuxer::open_with(
+      File::create(&target).expect("create"),
+      ContainerName::MP4,
+      vec![row],
+      &[],
+      MuxOptions::new().with_write_btrt(write_btrt),
+    )
+    .unwrap_or_else(|error| panic!("{name}: open, {error:?}"));
+    for packet in first_track(path, kind, 2).1 {
+      let track = TrackIndex::new(0);
+      match packet {
+        DemuxedPacket::Video(p) => wrote(
+          muxer.write_video(VideoTrackPacket::new(track, p.packet().clone())),
+          name,
+        ),
+        DemuxedPacket::Audio(p) => wrote(
+          muxer.write_audio(AudioTrackPacket::new(track, p.packet().clone())),
+          name,
+        ),
+        DemuxedPacket::Subtitle(p) => wrote(
+          muxer.write_subtitle(SubtitleTrackPacket::new(track, p.packet().clone())),
+          name,
+        ),
+        other => panic!("{name}: {other:?}"),
+      }
+    }
+    muxer.finish().map(|()| target)
+  };
+  // The `btrt` of each kind's sample entry (1550, 2284, 3047) — AC-3's and
+  // `mov_text`'s, of no `esds`, as H.264's: a stated rate past 32 bits
+  // refused in MP4, of `WriteBtrt::Off` written.
+  let ac3 = audio_file(&corpus, "l198-ac3.mkv", "ac3");
+  let movtext = mov_text_ms_mp4(&corpus);
+  for (entry, path, kind) in [
+    ("ac3", &ac3, TrackKind::Audio),
+    ("movtext", &movtext, TrackKind::Subtitle),
+  ] {
+    let row = || {
+      reticketed(first_track(path, kind, 0).0.remove(0), |par| {
+        par.bit_rate = max + 1;
+      })
+    };
+    let name = format!("l198-btrt-{entry}.mp4");
+    refused(
+      entry_finished(&name, path, kind, row(), WriteBtrt::Auto),
+      BitRateBox::Btrt,
+    );
+    let name = format!("l198-btrt-{entry}-off.mp4");
+    entry_finished(&name, path, kind, row(), WriteBtrt::Off)
+      .unwrap_or_else(|fault| panic!("{name}: {fault:?}"));
+  }
+  // The `esds`'s buffer in 24 bits, of each sample entry that writes one —
+  // AAC's `mp4a`, MPEG-4 video's `mp4v`, DVD subtitles' `mp4s` — the
+  // option whatever.
+  for (entry, path, kind) in [
+    ("aac", &aac, TrackKind::Audio),
+    ("mpeg4", &mpeg4, TrackKind::Video),
+    ("dvdsub", &ass, TrackKind::Subtitle),
+  ] {
+    let row = |buffer: i64| {
+      let mut row = first_track(path, kind, 0).0.remove(0);
+      if kind == TrackKind::Subtitle {
+        row = recoded(
+          row,
+          ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_DVD_SUBTITLE,
+          palette.as_bytes(),
+        );
+      }
+      with_cpb_rates(row, 0, 0, buffer)
+    };
+    for write_btrt in [WriteBtrt::Auto, WriteBtrt::Off] {
+      let name = format!("l198-esds-{entry}-{write_btrt:?}.mp4");
+      refused(
+        entry_finished(&name, path, kind, row((1 << 24) * 8), write_btrt),
+        BitRateBox::Esds,
+      );
+    }
+    let name = format!("l198-esds-{entry}-max.mp4");
+    entry_finished(&name, path, kind, row(((1 << 24) - 1) * 8), WriteBtrt::Off)
+      .unwrap_or_else(|fault| panic!("{name}: the buffer at the field, {fault:?}"));
+  }
+  // CPB properties shorter than the fields movenc reads.
+  let short = || with_cpb_bytes(row(), &[0; 16]);
+  let fault = finished(
+    "l198-short.mp4",
+    "mp4",
+    WriteBtrt::Auto,
+    vec![short()],
+    frame(840),
+  )
+  .expect_err("refused");
+  assert!(
+    matches!(
+      fault.refusal(),
+      Some(FfmpegMuxRefusal::CpbProperties { track }) if track.get() == 0
+    ),
+    "short: {fault:?}"
+  );
+  finished(
+    "l198-short.mov",
+    "mov",
+    WriteBtrt::Auto,
+    vec![short()],
+    frame(840),
+  )
+  .unwrap_or_else(|fault| panic!("short in MOV, read by no box: {fault:?}"));
+  // MP4's chapter track: nine chapters within a millisecond, of titles of
+  // 65 535 bytes, beside the AAC track.
+  let title = "t".repeat(65_535);
+  let chapters: Vec<Chapter<Ffmpeg>> = (0..9)
+    .map(|id| chapter_of(id, 0, 1, Some(&title)))
+    .collect();
+  let chaptered = |write_btrt: WriteBtrt| {
+    FfmpegOwnedMuxer::open_with(
+      File::create(output(&corpus, "l198-chapters.mp4")).expect("create"),
+      ContainerName::MP4,
+      first_track(&aac, TrackKind::Audio, 0).0,
+      &chapters,
+      MuxOptions::new().with_write_btrt(write_btrt),
+    )
+  };
+  assert!(
+    matches!(
+      chaptered(WriteBtrt::Auto),
+      Err(MuxOpenError::ChapterBitRate)
+    ),
+    "the chapter track's rate refused at open"
+  );
+  let (mut muxer, _) = chaptered(WriteBtrt::Off).expect("of no btrt");
+  for packet in &aac_packets {
+    muxer
+      .write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  muxer.finish().expect("finished, of no btrt");
 }

@@ -150,6 +150,7 @@
 //! | `stream_codec` | a stream's `codecpar` fields, the codec id and media type as integers, the extradata as `extradata_size` bytes; `av_get_audio_frame_duration2` | libavutil's allocation, null when empty; the call reads plain fields and writes nothing |
 //! | `guessed_audio_duration` | a stream's `codecpar` and `time_base`; `av_get_audio_frame_duration2` of a packet's size; `av_rescale_q` | `index < nb_streams`, checked first; the call reads plain fields and the extradata's pointer, compared with null, and writes nothing; the size an `int`, saturated |
 //! | `set_automatic_filters` | `ctx.flags` (`AVFMT_FLAG_AUTO_BSF`) | read by libavformat only when it writes a packet |
+//! | `set_write_btrt` | `av_opt_set_int` on the context's `priv_data`, the option `write_btrt` | the private context the context's allocation made, or null, which libavutil answers as an option not found; a NUL-terminated literal name; read by the muxer only at its start |
 //! | `add_stream` | `avformat_new_stream`; `avcodec_parameters_copy`; the media type written as an integer; `replace_extradata`; `settle_codec_tag`; `stream_copy_audio_rule`; the stream's `time_base`, `disposition`, `sample_aspect_ratio`, `avg_frame_rate`; `av_dict_set` | the stream just added, its `codecpar` its own; the ticket's parameters live and null-checked; extradata whose size with its padding fits an `int`, judged first; no `DONT_STRDUP`, so the texts are copied |
 //! | `replace_extradata` | `av_freep` of the old extradata; `av_mallocz`; the copy | the old one null or libavutil's; a fresh allocation of `bytes.len()` plus the padding, which cannot overlap `bytes` |
 //! | `settle_codec_tag` | the parameters' tag and codec id; the muxer's `codec_tag` list; `av_codec_get_id`, `av_codec_get_tag2` through shims taking integers; the tag cleared | the list null or libavformat's static, null-terminated tables |
@@ -194,6 +195,7 @@
 //! | `StreamIo::from_write_seek`: `av_mallocz`, `avio_alloc_context` | `open` | `ENOMEM` | `Ffmpeg` |
 //! | `avformat_alloc_output_context2` | `open` | a negative code, or a null context | `Ffmpeg` (`AVERROR_UNKNOWN` were it to answer success with no context, which `mux.c` 95–159 never does) |
 //! | `avformat_query_codec` | `query_codec` | a negative code: libavformat cannot tell | `CodecQuery::Unknown` |
+//! | `av_opt_set_int` | `set_write_btrt` | a negative code: a muxer of no such option | `Ffmpeg`, before anything changes: the context as it was |
 //! | `avformat_new_stream` | `add_stream` | null: an allocation, or the context's `max_streams` reached (`options.c` 252–257) | `Ffmpeg(ENOMEM)`; nothing added; the context `Failed` (R22, Codex R21 1) |
 //! | `avcodec_parameters_copy` | `add_stream` | a negative code (an allocation) | `Ffmpeg`; the context `Failed`, a stream half made |
 //! | `av_mallocz`, after `av_freep` of the old extradata | `replace_extradata` | null | `Ffmpeg(ENOMEM)`; `Failed` |
@@ -235,9 +237,9 @@ use ffmpeg_next::{
     AVFMT_FLAG_AUTO_BSF, AVFMT_FLAG_CUSTOM_IO, AVFMT_NOFILE, AVFMT_NOTIMESTAMPS, AVFMT_TS_NEGATIVE,
     AVFMT_TS_NONSTRICT, AVFormatContext, AVIOContext, AVRational, AVStream, av_dict_free,
     av_dict_set, av_dynarray_add_nofree, av_free, av_freep, av_get_audio_frame_duration2,
-    av_guess_format, av_interleaved_write_frame, av_mallocz, av_rescale_q, av_write_trailer,
-    avcodec_parameters_copy, avformat_alloc_output_context2, avformat_free_context,
-    avformat_new_stream, avformat_write_header, avio_flush, avio_seek,
+    av_guess_format, av_interleaved_write_frame, av_mallocz, av_opt_set_int, av_rescale_q,
+    av_write_trailer, avcodec_parameters_copy, avformat_alloc_output_context2,
+    avformat_free_context, avformat_new_stream, avformat_write_header, avio_flush, avio_seek,
   },
   format::context::StreamIo,
   packet::Mut,
@@ -310,6 +312,8 @@ pub enum OutputCall {
   WriteTrailer,
   /// [`Output::set_automatic_filters`].
   AutomaticFilters,
+  /// [`Output::set_write_btrt`].
+  MuxerOption,
   /// [`Output::into_sink`], after a call that failed: the context freed,
   /// and the sink not handed back as a whole one.
   IntoSink,
@@ -1127,6 +1131,34 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
       } else {
         (*ctx).flags &= !AVFMT_FLAG_AUTO_BSF;
       }
+    }
+    Ok(())
+  }
+
+  /// Sets the MOV family's `write_btrt` option — whether its sample entries
+  /// hold a `btrt` box of their track's bit rates (`movenc.c` 125, 1550,
+  /// 2284, 3047 in FFmpeg 9.0.1), by default MP4's mode alone (8335–8337).
+  ///
+  /// Only while the context is being built: the muxer reads it at its
+  /// start. A muxer of no such option refuses it, the context as it was
+  /// (`AVERROR_OPTION_NOT_FOUND`, [`OutputError::Ffmpeg`]).
+  pub fn set_write_btrt(&mut self, on: bool) -> Result<(), OutputError> {
+    self.require(OutputCall::MuxerOption, OutputPhase::Building)?;
+    // SAFETY: `ctx` is live and being built; its `priv_data` is the
+    // muxer's private context, allocated with its options' defaults at
+    // `avformat_alloc_output_context2`, or null of a muxer of none, which
+    // `av_opt_set_int` answers as an option it does not find. The name is
+    // a NUL-terminated literal; nothing is searched but the context itself.
+    let status = unsafe {
+      av_opt_set_int(
+        (*self.ctx.as_ptr()).priv_data,
+        c"write_btrt".as_ptr(),
+        i64::from(on),
+        0,
+      )
+    };
+    if status < 0 {
+      return Err(OutputError::Ffmpeg(ffmpeg_next::Error::from(status)));
     }
     Ok(())
   }
