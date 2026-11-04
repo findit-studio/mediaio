@@ -1025,26 +1025,27 @@
 //! it stands, and what it holds of each bound is kept ([`Held::need`]) — a
 //! later packet before that write whose time moves the shift, or FLV's
 //! first decode time, past a bound a held packet's sum then passes is
-//! refused by that time ([`FfmpegMuxRefusal::TimeWraps`]). 15 rows: 7
-//! fixed, 6 shown exact, 2 unjudged.
+//! refused by that time ([`FfmpegMuxRefusal::TimeWraps`]). 16 rows: 7
+//! fixed, 6 shown exact, 1 unreached, 2 unjudged.
 //!
 //! | the sum | of | here |
 //! |---|---|---|
 //! | libavformat's count of the decode time after a packet, `priv_pts`: a video packet's a tick after it, an audio packet's its samples (`mux.c` 571–599, 75–92) | every packet any container is handed, before the interleaving | fixed ([`NextDts`], the remainder carried; L204, L205) |
-//! | libavformat's shift, its move added to each time, a move past `INT64_MAX` answered `INT64_MIN` (`mux.c` 676–688) | every packet of a container it moves | fixed, held as it settles (L205) |
-//! | the shift's earliest, a time less its stream's earliest (653, 662) | Matroska's codec delay, the one earliest below zero | exact: within Matroska's first sum below |
+//! | libavformat's shift, its move added to each time, a move past `INT64_MAX` answered `INT64_MIN` (`mux.c` 677–679, 688–690) | every packet of a container it moves | fixed, held as it settles (L205) |
+//! | libavformat's output offset added to each time (`mux.c` 731–738) | none: the muxer asks no `output_ts_offset` | unreached |
+//! | the shift's earliest, a time less its stream's earliest (653, 663) | Matroska's codec delay, the one earliest below zero | exact: within Matroska's first sum below |
 //! | Matroska's and WebM's time and codec delay; its end, the duration added (`matroskaenc.c` 3144, 3194–3195) | each block | fixed ([`EndSum::Matroska`], of [`MATROSKA_QT_VIDEO`] and VFW mode; L202) |
 //! | Matroska's cluster time, a packet's time less the open cluster's, its codec delay added (3214–3219) | each packet, of the cluster the interleaving's order has opened | unjudged: out of `int64_t` only of an audio time below zero after a cluster opened within its codec delay of `INT64_MAX`; exactness would need libavformat's interleaving mirrored (R24, a ruling asked) |
 //! | Matroska's block reference, the track's last time less this one (3024) | each block in a group | exact: both written at zero and after |
 //! | FLV's end, its delay the first decode time negated (`flvenc.c` 1268, 1455–1456) | each video and audio tag | fixed ([`EndSum::Flv`], held as FLV's first decode time settles; L203) |
-//! | FLV's composition time, `pts − dts` (1449) | H.264 and MPEG-4 Part 2 | exact: of a decode time in 31 bits and an offset in 24 |
+//! | FLV's composition time, `pts − dts` (1415, 1448) | H.264 and MPEG-4 Part 2 | exact: of a decode time in 31 bits and an offset in 24 |
 //! | FLV's decode time, moved by the shift (255–258) | each tag | fixed: held as the shift settles (W11; L203) |
 //! | MPEG-TS's times, the muxer's delay added, and its clock, 300 times over (`mpegtsenc.c` 1887–1898) | each packet | fixed: held as the shift settles, the mechanism's laws L202 and L203 |
 //! | the MOV family's `end_pts` (`movenc.c` 7334–7340) | each sample | fixed (L204) |
-//! | the MOV family's `track_duration` and presentation offset; its edit list and track header (7319, 7326; 4135–4239, 3990–3994) | each sample; at the trailer | exact: of decode-time gaps under `INT32_MAX` across at most [`MOV_SAMPLES_MAX`] samples, and an offset under it |
+//! | the MOV family's `track_duration` and presentation offset; its edit list and track header (7321, 7330; 4135–4239, 3990–3994) | each sample; at the trailer | exact: of decode-time gaps under `INT32_MAX` across at most [`MOV_SAMPLES_MAX`] samples, and an offset under it |
 //! | WAV's span and its last duration (`wavenc.c` 410–412, 451, 611) | at the trailer | exact: the span judged at each packet, the count at `finish` (R22) |
 //! | IVF's times (`ivfenc.c` 81–86) | each packet | none signed: `uint64_t` |
-//! | libavformat's interleaving's delay, each stream's last decode time less the head's, in microseconds — a time past what they hold answered `INT64_MIN` (`mux.c` 971–990) | each packet it holds, of two streams it interleaves or more | unjudged: out of `int64_t` only of decode times beyond ±2^62 microseconds, about 146 000 years; exactness would need libavformat's interleaving mirrored (R24, a ruling asked) |
+//! | libavformat's interleaving's delay, each stream's last decode time less the head's, in microseconds — a time past what they hold answered `INT64_MIN` (`mux.c` 978–994) | each packet it holds, of two streams it interleaves or more | unjudged: out of `int64_t` only of decode times beyond ±2^62 microseconds, about 146 000 years; exactness would need libavformat's interleaving mirrored (R24, a ruling asked) |
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -3909,7 +3910,7 @@ pub enum FfmpegMuxRefusal {
   /// the re-audit of signed arithmetic) a time a sum in `int64_t` takes
   /// past it, a signed overflow: libavformat's count of the decode time
   /// after the packet (`mux.c` 571–599) and its shift's move added to each
-  /// time (685–688); Matroska's and WebM's time with its codec delay
+  /// time (688–690); Matroska's and WebM's time with its codec delay
   /// (`matroskaenc.c` 3144). A packet before libavformat's first write
   /// whose time moves its shift — or FLV's first decode time — so that a
   /// packet held before it passes one of these bounds, or FLV's 31 bits or
@@ -12152,7 +12153,7 @@ where
         let mut remainder = state.remainder;
         for output in outputs.iter() {
           // libavformat skips its count of an empty packet at zero before
-          // any count (588–590).
+          // any count (589–593).
           if samples >= 0
             && (!payload.bytes.is_empty() || remainder != den >> 1 || output.dts_ticks != 0)
           {
@@ -12915,8 +12916,8 @@ fn check_packet_rules<'p>(
     let presented = output.pts_ticks.unwrap_or(output.dts_ticks);
     let latest = i128::from(presented).max(i128::from(output.dts_ticks));
     // libavformat's shift adds its move to both times in `int64_t`
-    // (`handle_avoid_negative_ts`, `mux.c` 685–688), a move past `INT64_MAX`
-    // answered `INT64_MIN` (`av_rescale_q_rnd`, 676–680): a sum out of
+    // (`handle_avoid_negative_ts`, `mux.c` 688–690), a move past `INT64_MAX`
+    // answered `INT64_MIN` (`av_rescale_q_rnd`, 677–679): a sum out of
     // `int64_t` a signed overflow, undefined, refused (R24, the re-audit of
     // signed arithmetic). Each bound below a moved time is held to, a packet
     // before the first write holds with the shift as it settles
