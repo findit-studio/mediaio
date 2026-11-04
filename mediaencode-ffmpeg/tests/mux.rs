@@ -20745,3 +20745,68 @@ fn l208_the_interleavings_delay_is_bounded() {
   );
   muxer.finish().expect("finished");
 }
+
+/// L209 (R25, Codex R24): MPEG-TS's clock bound is FFmpeg's own — of the
+/// decode time alone, 300 times over (`mpegtsenc.c` 1283, 1526, 1890),
+/// `max_delay` left unset and so zero (1130–1131): MP2 at 90 kHz, a decode
+/// time of `i64::MAX / 600 + 1` ticks taken, refused before R25; a
+/// presentation at `i64::MAX / 2` of a decode time of a second taken; and
+/// libavformat's shift counted — the first packet 1000 ticks before zero,
+/// one decoded at `i64::MAX / 300 − 999` refused, moved a tick past the
+/// bound, the packet untouched, and at `i64::MAX / 300 − 1000` taken.
+///
+/// PLANT: the bound of `i64::MAX / 600`, of both times.
+#[test]
+fn l209_mpeg_ts_holds_its_decode_time_to_the_clocks_room() {
+  let Some(corpus) = Corpus::new() else { return };
+  let bound = i64::MAX / 300;
+  let mp2 = audio_file(&corpus, "mp2.mkv", "mp2");
+  let (_, frames) = first_track(&mp2, TrackKind::Audio, 1);
+  let table = || table_of(&mp2, TrackKind::Audio);
+  let ts = || ContainerName::new("mpegts");
+  let at_90k = Timebase::new(1, NonZeroI32::new(90_000).expect("non-zero"));
+  let at = |pts: i64, dts: i64| {
+    AudioTrackPacket::new(
+      TrackIndex::new(0),
+      audio_of(&frames[0])
+        .with_pts(Some(Timestamp::new(pts, at_90k)))
+        .with_dts(Some(Timestamp::new(dts, at_90k))),
+    )
+  };
+  let mut muxer = muxer_into(&output(&corpus, "l209-between.ts"), ts(), table());
+  wrote(muxer.write_audio(at(0, 0)), "the first");
+  let between = i64::MAX / 600 + 1;
+  wrote(
+    muxer.write_audio(at(between, between)),
+    "a decode time past `i64::MAX / 600`, within `/ 300`",
+  );
+  muxer.finish().expect("finished");
+  let mut muxer = muxer_into(&output(&corpus, "l209-presented.ts"), ts(), table());
+  wrote(muxer.write_audio(at(0, 0)), "the first");
+  wrote(
+    muxer.write_audio(at(i64::MAX / 2, 90_000)),
+    "a presentation far past `i64::MAX / 300`",
+  );
+  muxer.finish().expect("finished");
+  let mut muxer = muxer_into(&output(&corpus, "l209-shifted.ts"), ts(), table());
+  wrote(
+    muxer.write_audio(at(-1000, -1000)),
+    "a first packet 1000 ticks before zero",
+  );
+  let past = at(bound - 999, bound - 999);
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: Timestamp::new(bound - 999, at_90k),
+    },
+    "moved a tick past the clock's room"
+  );
+  untouched!(past, back);
+  wrote(
+    muxer.write_audio(at(bound - 1000, bound - 1000)),
+    "moved to the clock's room",
+  );
+  muxer.finish().expect("finished");
+}

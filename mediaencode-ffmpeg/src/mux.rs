@@ -938,10 +938,10 @@
 //! packet, of a value the trailer computes of the whole track. Every
 //! condition on the sink's seeking holds: the base's I/O context is made
 //! with a seek callback, so that it seeks (`avio_alloc_context`,
-//! `aviobuf.c`), and each trailer's seekable branch is taken. 31 rows: 9
+//! `aviobuf.c`), and each trailer's seekable branch is taken. 32 rows: 10
 //! fixed — 7 of R22, W11's held decode time of R24, and Matroska's shift
-//! of a video codec of no native id of R25; 19 shown exact; 3
-//! bounds named — one ruled (the `moov`), and two where exactness would
+//! of a video codec of no native id and MPEG-TS's clock of R25; 19 shown
+//! exact; 3 bounds named — one ruled (the `moov`), and two where exactness would
 //! need libavformat's interleaving mirrored (the samples' table; Matroska's
 //! cluster, ruled in R24).
 //!
@@ -960,6 +960,7 @@
 //! | W6 | the RIFF format's fields as `ff_put_wav_header` chooses them — the extensible header and its fields where it takes it (`riffenc.c` 54–233) | [`riff_format_cut`], of the same branches | exact (L190) |
 //! | W11 | FLV's every tag's decode time, as libavformat's shift moves it (`flvenc.c` 255–258, 1356) | at each packet, of the shift as the packet showed it — looser where a packet before the first write moved the shift after a held one (R24, the re-audit of signed arithmetic) | fixed: a held packet's decode time judged again as the shift settles ([`Held::need`]; L187, L203) |
 //! | Matroska's shift | libavformat's move of early times in a Matroska file of a video codec of no native id, by presentation or decode times as the track's VFW or QuickTime mode chooses (`matroskaenc.c` 2063–2081; `mux.c` 636–717) | refused before the earliest, the mode unmirrored — stricter | fixed (R25, ruled): the mode mirrored ([`MATROSKA_QT_VIDEO`]), the times moved as FFmpeg moves them (the unit law of the shift) |
+//! | MPEG-TS's clock | the clock reference of the decode time, 300 times over, in `int64_t`, `max_delay` unset and so zero (`mpegtsenc.c` 1130–1131, 1283, 1526, 1890) | both times held to `i64::MAX / 600` — stricter (Codex R24) | fixed (R25): the decode time alone, moved by the shift, to `i64::MAX / 300` (L96, L209) |
 //! | W13 | Matroska's bitmap header of a codec it names no codec id of, JPEG 2000's among them (`matroskaenc.c` 2025–2030, 1258–1270) | at open, of JPEG 2000 | exact (L192) |
 //! | W18 | a video track's display width outside MOV and AVIF, of an aspect ratio stated (4066–4085); the width alone where the height read is not the coded one — D-10's tags, MOV's alone (8473–8483) | outside MOV and AVIF, of a ratio stated | exact (L191) |
 //! | S3 | VP9's `vpcC` level, of the picture's samples in an `int` where the ticket's level is unknown — MP4's and FLV's records (`vpcc.c` 77–122) | where the level is unknown, in MP4 and FLV | exact (L168) |
@@ -1028,7 +1029,16 @@
 //! later packet before that write whose time moves the shift, or FLV's
 //! first decode time, past a bound a held packet's sum then passes is
 //! refused by that time ([`FfmpegMuxRefusal::TimeWraps`]). 16 rows: 7
-//! fixed, 6 shown exact, 1 unreached, 2 bounds named (R25, ruled).
+//! fixed, 6 shown exact, 1 unreached, 2 bounds named (R25, ruled). Each
+//! multiplier and scale a bound uses is the one FFmpeg's line uses (R25,
+//! the class of Codex R24): MPEG-TS's 300, `SYSTEM_CLOCK_FREQUENCY_DIVISOR`
+//! (`mpegts.h` 38; `mpegtsenc.c` 1526, 1890), of a delay of zero; the
+//! interleaving's microseconds, `AV_TIME_BASE_Q`, rounded to the nearest
+//! as `av_rescale_q` rounds (`mux.c` 978–994); FLV's and Matroska's
+//! milliseconds, their streams' own time base, of no scale (`flvenc.c`
+//! 1074; `matroskaenc.c` 3604); FLV's 31 bits (255–258). The two named
+//! bounds' own constants — ±2^62 microseconds, and `INT64_MAX + 2` less
+//! the largest codec delay — are the rulings', not FFmpeg's.
 //!
 //! | the sum | of | here |
 //! |---|---|---|
@@ -1042,7 +1052,7 @@
 //! | FLV's end, its delay the first decode time negated (`flvenc.c` 1268, 1455–1456) | each video and audio tag | fixed ([`EndSum::Flv`], held as FLV's first decode time settles; L203) |
 //! | FLV's composition time, `pts − dts` (1415, 1448) | H.264 and MPEG-4 Part 2 | exact: of a decode time in 31 bits and an offset in 24 |
 //! | FLV's decode time, moved by the shift (255–258) | each tag | fixed: held as the shift settles (W11; L203) |
-//! | MPEG-TS's times, the muxer's delay added, and its clock, 300 times over (`mpegtsenc.c` 1887–1898) | each packet | fixed: held as the shift settles, the mechanism's laws L202 and L203 |
+//! | MPEG-TS's clock reference of the decode time, 300 times over — `first_pcr += dts * 300` and `(dts − delay) * 300`, `max_delay` unset and so zero (`mpegtsenc.c` 1130–1131, 1283, 1526, 1890) — and the delay, zero, added to both times (1896–1898) | each packet | fixed: the decode time, moved by the shift, held to `i64::MAX / 300` as the shift settles; the presentation time to `int64_t` alone (R25, Codex R24: both to `i64::MAX / 600` before, stricter; L96, L209) |
 //! | the MOV family's `end_pts` (`movenc.c` 7334–7340) | each sample | fixed (L204) |
 //! | the MOV family's `track_duration` and presentation offset; its edit list and track header (7321, 7330; 4135–4239, 3990–3994) | each sample; at the trailer | exact: of decode-time gaps under `INT32_MAX` across at most [`MOV_SAMPLES_MAX`] samples, and an offset under it |
 //! | WAV's span and its last duration (`wavenc.c` 410–412, 451, 611) | at the trailer | exact: the span judged at each packet, the count at `finish` (R22) |
@@ -6079,7 +6089,7 @@ struct PacketRules {
   ts: Option<TsRules>,
   /// MPEG-TS: what it sums the track's PES payloads in ([`TsPes`]).
   ts_pes: Option<TsPes>,
-  /// MPEG-TS: every time within its clock's room
+  /// MPEG-TS: every decode time within its clock's room
   /// ([`FfmpegMuxRefusal::TimeWraps`]).
   ts_clock: bool,
   /// AVIF: the track's samples counted against the buffer they are written
