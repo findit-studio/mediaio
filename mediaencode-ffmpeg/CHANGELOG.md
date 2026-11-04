@@ -18,16 +18,17 @@ crate moves only when it changes.
   release audited and keeps (`ContainerName`): the MOV family's MP4, MOV,
   iPod and AVIF, Matroska and WebM, MPEG-TS, FLV, IVF, WAV and Wave64,
   and the raw streams of ADTS AAC, AC-3, E-AC-3, DTS, FLAC, H.264, HEVC
-  and AV1 — Ogg and MP3, audited, withheld by name and the reason until
-  the project's own Ogg and MPEG audio writers land
+  and AV1 — Ogg, MP3 and raw MP2, audited, withheld by name and the
+  reason until the project's own Ogg and MPEG audio writers land
   (`MuxOpenError::ContainerWithheld`, `Withheld`), and any other
   libavformat names refused at open by the muxer's name
   (`MuxOpenError::ContainerNotSupported`). `open` takes the sink, the container, the track
   table with each track's `CodecTicket`, the chapters and the packet
   limits, refuses by name what the container cannot take
   (`MuxOpenError`) and reports what it drops (`MuxReport`, `Uncarried`);
-  `open_with` takes `MuxOptions` — the packet limits and whether
-  libavformat's automatic bitstream filters run — and the muxer's own
+  `open_with` takes `MuxOptions` — the packet limits, whether
+  libavformat's automatic bitstream filters run, and the MOV family's
+  `write_btrt` option — and the muxer's own
   `report` grows with what it learns writing.
   Matroska keeps attachments with their filename and MIME type, MP4 keeps
   cover art; the report follows each track's road, naming the flags an
@@ -233,11 +234,7 @@ crate moves only when it changes.
   whose OBUs do not parse, which the filter refuses (`PayloadRule::Obus`,
   now FLV's too). The configuration `extract_extradata` makes replaces the
   packet's own, and FLV's rewrite is decided by it.
-- **The coordinator's R8 letters, built (R10).** The MPEG program
-  stream's preload, an `int` of microseconds its first write adds the
-  half second less the first decode time to, refused where it would wrap
-  (`FfmpegMuxRefusal::TimeWraps`), at the packet that would be written
-  first.
+- **The coordinator's R8 letters, built (R10).**
   MP4's DVD subtitles: the configuration's text palette, which MP4
   writes as sixteen YUV colours and its reader writes back as a palette
   text of its own, reported (`Rewrite::Configuration`, new), or
@@ -385,6 +382,90 @@ crate moves only when it changes.
   of an unknown level whose picture's samples pass an `int`
   (`MuxOpenError::Dimensions`). The module's census names every other
   allocation failure FFmpeg swallows, by mechanism.
+- **Every finding classed by its source; sizes under budgets the caller
+  raises (R20).** A length that wraps is refused wherever a budget the
+  caller raises — `PacketLimits`, `CodecTicket::mirror_with` — lets one
+  reach it: the configuration writers' Annex B rewrite, held in a dynamic
+  buffer cut past `INT_MAX` with its padding, refused where the cut takes
+  a unit the record keeps (R22); the MOV family's `esds` descriptor in its
+  28 bits; MP4's `dvc1` and `lvcC` (`ConfigurationInvalid`); FLV's
+  sequence header in its tag's 24 bits, at open, as a packet's new
+  extradata and as `extract_extradata` makes it of a packet
+  (`ConfigurationInvalid`, `PayloadRule::NewExtradata`), and that filter's
+  split of a packet, held to what libavcodec allocates
+  (`PayloadRule::SplitSize`, new); MPEG-TS's PES payloads, summed in an
+  `int` (`PayloadRule::PesSize`, new), and an Opus initial padding its
+  `int` counts at 48 kHz (`MuxOpenError::InitialPaddingTooLong`, new).
+  MPEG-TS's raw AAC is framed in ADTS here, as FFmpeg's ADTS writer frames
+  it, and MPEG-TS takes the frame as it is: its nested ADTS muxer, which
+  copied a null buffer where its own close failed, is never fed. The laws'
+  seams, hidden: `MuxOptions::with_lowered_descriptor_bound`,
+  `with_lowered_obu_bound`, `with_lowered_pes_bound`,
+  `with_lowered_reader_bound`, `with_lowered_rewrite_bound`,
+  `with_lowered_sequence_bound` and `with_lowered_split_bounds`.
+- **A write that failed is not gone on from (R20–R22).** A libavformat
+  call that failed ends the output failed: every later write and the
+  trailer are refused by name (`FfmpegMuxRefusal::OutputFailed`, new), and
+  the sink is dropped, never handed back as a whole file. A trailer this
+  muxer refuses by name before it runs — no frame, a last sample too
+  long, the `moov` past its bound, a bit rate, an edit list or a fact
+  chunk its field would cut — abandons the output the same way, nothing
+  more reaching the sink.
+- **FLV's tracks of a kind, and the durations libavformat guesses
+  (R21).** FLV numbers each track of a kind in 8 bits: a kind's 257th
+  track is refused at open (`MuxOpenError::TrackLayout`). A packet that
+  states no duration is counted as libavformat guesses it
+  (`guess_pkt_duration`) wherever a container writes one — WAV's fact
+  chunk, MP4's samples — and Matroska's default duration is judged as
+  Matroska judges it.
+- **The narrow writes (R21).** Every fixed-width write of the kept
+  muxers and the helpers they call is classed by the range of what it
+  writes, and each a stream the standards allow can wrap is refused by
+  name: IVF's frame count (`PayloadRule::FrameCount`, new; the laws' seam
+  `MuxOptions::with_lowered_ivf_frame_bound`, hidden); WAV's and Wave64's
+  format fields; Matroska's JPEG 2000 bitmap header; MP4's display width;
+  the `hvcC` and `vvcC` bit depths and VVC's picture
+  (`ConfigurationInvalid`, `Dimensions`, `PayloadRule::NewExtradata`);
+  FLV's 31-bit tag time (`TimeWraps`); and, at `finish`, of the whole
+  track (R22), the MOV family's edit list and bit rates.
+- **The formats kept, and those withheld (R21, R22).** The muxers of
+  formats no longer in use are refused at open by the muxer's name
+  (`MuxOpenError::ContainerNotSupported`, renamed from
+  `ContainerNotAudited`), their rules, refusals and seams gone with them;
+  Ogg, MP3 and raw MP2, audited, are withheld by name and the reason
+  (`MuxOpenError::ContainerWithheld`; `Withheld`, new —
+  `OggPageBuffering` until findit-studio/oggoat, `Mp3XingFrame` and
+  `Mp2AwaitsMpegoat` until findit-studio/mpegoat, mediaio#98). The MOV
+  family writes a stream's encryption initialization as its `pssh` boxes
+  again, a key id of no bytes refused at open, before libavutil parses
+  it (`MuxOpenError::KeyIdWithoutBytes`, new).
+- **The MOV family's bit rates, as its trailer writes them (R22).**
+  `calculate_mpeg4_bit_rates` is mirrored whole: the average counted of
+  the samples as movenc writes them — each of its rewrites counted
+  exactly — its product in 128 bits; where it counts none, the CPB
+  properties' average, the stated rate, then their maximum; the maximum
+  and the buffer — each in the field its `btrt` or `esds` writes it,
+  refused at `finish`, before the trailer runs, the box named
+  (`FfmpegMuxRefusal::BitRates`, `BitRateBox`, new); CPB properties
+  shorter than the fields movenc reads, refused so
+  (`FfmpegMuxRefusal::CpbProperties`, new); MP4's chapter track's at open
+  (`MuxOpenError::ChapterBitRate`, new). FFmpeg's `write_btrt` option is
+  the caller's: `MuxOptions::with_write_btrt`, `set_write_btrt` and
+  `write_btrt`, of `WriteBtrt` (new) — `Auto`, MP4's mode alone, FFmpeg's
+  default; `On`; `Off`, the remedy for an MP4 track refused by its
+  `btrt`. The laws' seam, hidden: `CarrierMuxer::bit_rate_counts`.
+- **Exact both ways (R22).** Each predicate that mirrors an FFmpeg
+  computation is held neither looser nor stricter than it: the MOV
+  family's edit list judged at `finish` of the whole track — its media
+  time where its version is 0 (`TimeWraps`), and a span written below
+  zero, of a track that ends before zero or whose samples are all marked
+  discarded (`FfmpegMuxRefusal::NegativeSpan`, new); WAV's fact chunk of
+  the last packet's duration at `finish`, the span alone at the packet; a
+  subtitle track's header dimensions in the MOV family as a video's, a DVD
+  subtitle's of its configuration's size line (`Dimensions`); a packet's
+  Annex B rewrite counted exactly, MP4's HEVC under `hvc1` refused only
+  where its buffer's cut takes a unit its walk keeps (`RewrittenSize`; the
+  laws' seam `MuxOptions::with_lowered_sum_bound`, hidden).
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer
@@ -486,7 +567,8 @@ crate moves only when it changes.
   sum wrapped and its copy ran past the allocation); in another container,
   where the filter may run, a VP9 frame larger than a seventh of it. A PGS
   display set the filter would grow past it (`DisplaySetSize`); a packet
-  whose Annex B rewrite would pass it (`RewrittenSize`); a Matroska block
+  whose Annex B rewrite would pass the `int` its rewriter counts it in
+  (`RewrittenSize`); a Matroska block
   larger than half of what a cluster's buffer holds beside 5 MiB, which
   Matroska would write cut (`ClusterSize`); an MP4 TTML paragraph that
   would take the document MP4 joins at the trailer past it

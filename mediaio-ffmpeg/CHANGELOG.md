@@ -60,9 +60,32 @@ crate moves only when it changes.
   packet and the trailer answer it as libavformat's code; both are now
   the sink's. `Output::into_sink` reads it once more after the last
   flush, so it hands the sink back only when every byte reached it,
-  whatever the sink's own flush answers — from any phase: before the
-  trailer it frees the context as dropping it does and hands back a
-  container without its trailer.
+  whatever the sink's own flush answers — before the trailer it frees the
+  context as dropping it does and hands back a container without its
+  trailer; after a call that failed, never (below).
+- **A call that failed ends the output failed (R20–R22).** Every call
+  that reached libavformat, or libavutil on what the context holds, and
+  failed — a stream half added, a chapter its array did not take, the
+  header, a packet's write, the trailer — leaves the context
+  `OutputPhase::Failed`, `Finished` set on a trailer's success alone:
+  libavformat's error kept, every later call refused by name before
+  libavformat is reached (`OutputError::FailedEarlier`, new), and the
+  teardown closed — the guard shut before the muxer's `deinit`, what the
+  I/O context buffers discarded, no flush asked of it or of the sink.
+  `Output::into_sink` then drops the sink and answers the error kept, the
+  sink's fault first (`OutputCall::IntoSink`, new), never `Ok`; dropping
+  a context still being built asks nothing of the sink.
+  `Output::abandon` (new) ends an output as a failed call does, for a
+  caller whose own judgment ends it — a trailer it refuses by name.
+- `Output::guessed_audio_duration`: the duration libavformat gives an
+  audio packet that states none (`guess_pkt_duration`), of the stream's
+  parameters and the packet's size, for a muxer that counts durations as
+  libavformat hands them.
+- `Output::set_write_btrt`: the MOV family's `write_btrt` option, set
+  while the context is being built (`OutputCall::MuxerOption`, new).
+- `OutputPacket::AudioFramed`: an audio packet behind a header its caller
+  made, the two copied into the one packet built — MPEG-TS's raw AAC,
+  which `mediaencode-ffmpeg`'s muxer frames in ADTS itself.
 - A seek the sink fails is kept by the writer guard
   (`writer_guard::SeekRecord`, the third handle `GuardedWriter::new`
   answers), which libavformat does not do: a muxer going back to patch
