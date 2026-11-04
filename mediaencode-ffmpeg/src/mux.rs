@@ -12980,18 +12980,22 @@ fn check_packet_rules<'p>(
       }
       need = need.max(i128::from(output.dts_ticks) - ((1 << bits) - 1));
     }
-    // MPEG-TS counts its clock reference from the first decode time, 300
-    // times over, and its PES times, in `int64_t` (`mpegtsenc.c`
-    // 1887–1890, 1597–1611): a time past `i64::MAX / 600` refused, the
-    // clock's room.
+    // MPEG-TS counts its clock reference of the decode time, 300 times over,
+    // in `int64_t` — `first_pcr += dts * 300` from `max_delay`'s clock, and
+    // `(dts - delay) * 300` (`mpegtsenc.c` 1283, 1890, 1526) — and adds the
+    // delay to both times (1896–1898): `max_delay`, which this muxer leaves
+    // unset, is zero (1130–1131), so that the decode time is held to
+    // `i64::MAX / 300` and the presentation time to `int64_t` alone (R25,
+    // Codex R24: `i64::MAX / 600` of both before, stricter).
     if rules.ts_clock {
-      if latest + lift > i128::from(i64::MAX / 600) {
+      let dts = i128::from(output.dts_ticks);
+      if dts + lift > i128::from(i64::MAX / 300) {
         return Err(FfmpegMuxRefusal::TimeWraps {
           track,
-          timestamp: output.pts.unwrap_or(output.dts),
+          timestamp: output.dts,
         });
       }
-      need = need.max(latest - i128::from(i64::MAX / 600));
+      need = need.max(dts - i128::from(i64::MAX / 300));
     }
     // The end the container sums of the packet, in `int64_t` (R24, Codex
     // R23 [high]; [`EndSum`]), of the duration libavformat hands it.

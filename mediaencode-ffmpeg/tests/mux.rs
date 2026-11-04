@@ -8313,7 +8313,7 @@ fn l96_mpeg_ts_refuses_what_its_pmt_and_pes_cannot_hold() {
     .map_err(|error| error.map_packet(drop))
     .expect("an ADTS frame, written as it is");
   muxer.finish().expect("finished");
-  // A time past the clock's room, `i64::MAX / 600` ticks of 90 kHz.
+  // A time past the clock's room, `i64::MAX / 300` ticks of 90 kHz, the decode time 300 times over (R25: `i64::MAX / 600` before).
   let (table, frames) = first_track(&mp2, TrackKind::Audio, 1);
   let mut muxer = muxer_into(&output(&corpus, "l96-clock.ts"), ts(), table);
   let at_90k = Timebase::new(1, NonZeroI32::new(90_000).expect("non-zero"));
@@ -8329,18 +8329,18 @@ fn l96_mpeg_ts_refuses_what_its_pmt_and_pes_cannot_hold() {
     .write_audio(at(0))
     .map_err(|error| error.map_packet(drop))
     .expect("the first");
-  let far = at(i64::MAX / 600 + 1);
+  let far = at(i64::MAX / 300 + 1);
   let (refusal, back) = by_container(refusing!(muxer.write_audio(far.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::TimeWraps {
       track: TrackIndex::new(0),
-      timestamp: Timestamp::new(i64::MAX / 600 + 1, at_90k),
+      timestamp: Timestamp::new(i64::MAX / 300 + 1, at_90k),
     }
   );
   untouched!(far, back);
   muxer
-    .write_audio(at(i64::MAX / 600))
+    .write_audio(at(i64::MAX / 300))
     .map_err(|error| error.map_packet(drop))
     .expect("within it");
   muxer.finish().expect("finished");
