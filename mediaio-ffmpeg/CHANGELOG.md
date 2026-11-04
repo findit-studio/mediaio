@@ -63,6 +63,10 @@ crate moves only when it changes.
   whatever the sink's own flush answers — before the trailer it frees the
   context as dropping it does and hands back a container without its
   trailer; after a call that failed, never (below).
+- **`Output::audio_frame_samples` (R24).** The samples libavcodec counts
+  of an audio packet of a size on a stream (`av_get_audio_frame_duration2`),
+  which libavformat adds to its count of the stream's next decode time —
+  the muxer's mirror of that count.
 - **A call that failed ends the output failed (R20–R22).** Every call
   that reached libavformat, or libavutil on what the context holds, and
   failed — a stream half added, a chapter its array did not take, the

@@ -473,6 +473,18 @@ crate moves only when it changes.
   duration in the stream's time base and the packet handed back, where
   `check_pkt` failed the write (`DurationTooLong`), and MP4's skip samples
   (`SkipSamples`), which counted a packet of no duration as one frame.
+- **Every signed sum of a time (R24).** Each sum a packet's times meet in
+  `int64_t` — libavformat's count of the next decode time and its shift's
+  move; Matroska's and WebM's time, codec delay and end, of each track's
+  VFW or QuickTime mode; FLV's end and its delay; the MOV family's sample
+  end — is held to it exactly at the packet, by name, the packet handed
+  back (`TimeWraps`, `DurationTooLong`), where the sum was a signed
+  overflow. A packet before libavformat's first write whose time moves its
+  shift, or FLV's first decode time, so that a packet held before it passes
+  one of those bounds, FLV's 31 bits or MPEG-TS's clock, is refused by that
+  time. MP4's joined TTML document is held to the largest packet of its
+  exact bytes (`PayloadRule::DocumentSize`), no longer of an upper bound of
+  each paragraph.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer
