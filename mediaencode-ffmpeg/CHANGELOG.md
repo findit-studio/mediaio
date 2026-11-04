@@ -493,6 +493,12 @@ crate moves only when it changes.
   where two streams or more interleave. Matroska's move of early times in
   a file of a video codec of no native id is mirrored, of the codec's VFW
   or QuickTime mode, where such times were refused.
+- **MPEG-TS's clock, of FFmpeg's own expressions (R25).** The clock
+  reference counts the decode time alone, 300 times over, of a `max_delay`
+  the muxer leaves at zero: a decode time, moved by libavformat's shift,
+  past `i64::MAX / 300` ticks is refused (`TimeWraps`, the decode time
+  named), and the presentation time is held to `int64_t` alone, where both
+  were refused past `i64::MAX / 600`.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer
