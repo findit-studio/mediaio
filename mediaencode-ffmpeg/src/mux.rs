@@ -974,6 +974,42 @@
 //! | the samples' table | a sample a table entry, the `mov_text` empty sample before a first cue at zero where another track's packet makes it first (7646–7653) | room kept for that sample whatever the interleaving | a bound, stricter by one entry at [`MOV_SAMPLES_MAX`] at most: exactness would mirror libavformat's interleaving, which this release does not ([`PayloadRule::SampleTable`]) |
 //! | S2, the `moov` | the `moov`'s size, of every track's chunks as libavformat's interleaving makes them (5339–5453) | an upper bound | a bound, ruled (R14), stricter past the bound alone ([`PayloadRule::MovieBox`]) |
 //!
+//! **Every duration a packet's judgment reads** (R23, Codex R22, closed by
+//! class: a duration is the one libavformat hands the container). Before
+//! any muxer sees a packet, libavformat gives one that states no duration,
+//! or a negative one not a subtitle's, its guess (`guess_pkt_duration`,
+//! `mux.c` 605–633, at 1102, after the track's filter): every predicate
+//! here that reads a duration reads that one — the packet's own, else the
+//! guess ([`handed_duration`] over [`Guess`]: a video frame at the frame
+//! rate, or a tick of a millisecond's time base or coarser; an audio
+//! packet's samples as libavcodec counts them, asked of libavformat's own
+//! stream; none of a subtitle or data packet). By grep of `duration` over
+//! `mux.c` and the kept muxers' writers, each consumer, what it reads, and
+//! where it is judged. A judgment of a duration a later packet replaces
+//! waits for `finish`; one of each packet's own is made at the packet.
+//! 17 rows: 2 fixed, 6 shown exact, 3 written whole, 2 unreached, 2 of no
+//! consumer, the guess itself, and the report's lines.
+//!
+//! | consumer | the duration it reads | here | judged |
+//! |---|---|---|---|
+//! | the guess (`mux.c` 605–633, 1102) | the packet's own, a negative one not a subtitle's zeroed; else the frame rate's, a tick, or libavcodec's count | [`handed_duration`], [`guessed_duration`], `Output::guessed_audio_duration` (R21) — read by every row below that judges a duration | — |
+//! | MOV `check_pkt` (`movenc.c` 6925–6928) | the one handed, of each packet the track's filter puts out | [`FfmpegMuxRefusal::DurationTooLong`], a guessed one stated in the stream's time base — of the offered duration alone before R23, a guess past `INT_MAX` failing the write: fixed (L201) | at the packet |
+//! | MOV `check_pkt`, a subtitle's negative duration | the packet's own, which libavformat hands as it is | [`FfmpegMuxRefusal::NegativeDuration`] | at the packet; exact |
+//! | MOV skip samples (7311–7320) | the one handed, at least a frame | [`PayloadRule::SkipSamples`] — of the offered duration alone before R23, a packet of none counted as a frame: fixed (L201) | at the packet |
+//! | MOV E-AC-3's join (597) and its last sample (1248–1256) | the one handed, of each packet joined; the sum | [`Ac3Rules`] — [`PayloadRule::Ac3SampleSize`], [`PayloadRule::SkipSamples`]; [`FfmpegMuxRefusal::LastSampleTooLong`] | at the packet; the last sample at `finish`; exact |
+//! | MOV `track_duration`, `end_pts`, `elst_end_pts` (7289–7333) | the one handed, the last sample's and the latest end | [`Mp4Counts`], [`EditSpan`] — [`FfmpegMuxRefusal::BitRates`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::NegativeSpan`] (R22) | at `finish`; exact |
+//! | MOV `mov_text`'s cues (7646–7656, 9025–9031) | a cue's own: a subtitle's, of no guess | [`Cues`] — the cue's room in [`FfmpegMuxRefusal::DurationTooLong`], [`FfmpegMuxRefusal::DtsGap`], [`FfmpegMuxRefusal::CueOrder`] | at the packet; exact |
+//! | MOV TTML's joined document (`movenc_ttml.c` 127–188, 289–317; `movenc.c` 6579–6615) | each paragraph's own: a subtitle's | [`FfmpegMuxRefusal::DocumentSpan`]; [`TtmlCounts`] at `finish` | at the packet; at `finish`; exact |
+//! | WAV's and Wave64's fact chunk (`wavenc.c` 82, 412, 448–462, 608–616) | the last packet's handed, which each packet's replaces | [`PayloadRule::FileSize`] of the span at the packet; with the duration, and [`FfmpegMuxRefusal::DurationTooLong`], at `finish` (R22) | at the packet and at `finish`; exact |
+//! | Matroska's and WebM's `BlockDuration` and `CueDuration` (`matroskaenc.c` 2896–2911, 3134–3135) | the one handed, zero of a negative one | none needed: unsigned EBML integers, written whole | — |
+//! | Matroska's file and track durations (3194–3195, 3409–3411, 3460–3461) | the latest end, of the one handed | none needed: written as a float and a text — a stated duration within `INT64_MAX` of the end's `int64_t` sum aside | — |
+//! | FLV's file duration (`flvenc.c` 1455–1456, 1195–1197) | the latest end, of the one handed | none needed: written as a double — the same sum aside | — |
+//! | `compute_muxer_pkt_fields` (`mux.c` 545–553) | a decode time made of a presentation time and the duration | unreached: the face requires a decode time | — |
+//! | the interleaver's chunks (`mux.c` 843–879) | each packet's, against `max_chunk_duration` | unreached: none asked, 0 | — |
+//! | IVF (`ivfenc.c` 83) | the last packet's, kept | no consumer: its trailer reads none (96–104) | — |
+//! | MPEG-TS, ADTS, FLAC, the raw AC-3, E-AC-3, DTS, H.264, HEVC and AV1 streams | none: MPEG-TS counts an Opus packet's samples of its table of contents (`mpegtsenc.c` 1816–1848) | no consumer | — |
+//! | the report's durations lines ([`Rewrite::Durations`], [`Mp4Place`], a negative duration) | the offered duration, by design: what the caller offered and the file does not keep | reports, no judgment | — |
+//!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
 //! sample entry calls for a video configuration (`mov_write_video_tag`,
@@ -3747,8 +3783,10 @@ pub enum FfmpegMuxRefusal {
     duration: Timestamp,
   },
   /// A duration longer than the container counts: MP4's of more than
-  /// `i32::MAX` ticks of the stream's time base, which MP4 refuses after
-  /// taking the packet (`movenc.c` 6925–6928); WAV's and Wave64's of more
+  /// `i32::MAX` ticks of the stream's time base — the duration libavformat
+  /// hands it, the packet's own or, of a packet of none, its guess
+  /// (`guess_pkt_duration`, `mux.c` 605–633; R23, Codex R22) — which MP4
+  /// refuses after taking the packet (`movenc.c` 6925–6928); WAV's and Wave64's of more
   /// than `i32::MAX` ticks on a track whose trailer writes a fact chunk —
   /// every codec tag but integer PCM's — which WAV keeps the last packet's
   /// in, an `int`, and counts the fact chunk's samples with, cut
@@ -3760,7 +3798,9 @@ pub enum FfmpegMuxRefusal {
   DurationTooLong {
     /// The track.
     track: TrackIndex,
-    /// The duration offered.
+    /// The duration offered; of a packet of none, or of a negative one
+    /// libavformat writes as none, libavformat's guess, in the stream's
+    /// time base.
     duration: Timestamp,
   },
   /// MP4: a decode time `i32::MAX` ticks or more after the last sample
@@ -4354,8 +4394,10 @@ pub enum PayloadRule {
   WavPackBlocks,
   /// MP4: skip-samples side data that would shorten the packet below
   /// nothing, which MP4 refuses after taking it (`movenc.c` 7311–7320) —
-  /// a joined E-AC-3 sample's, its first packet's, against the duration of
-  /// the packet that completes it, refused there (table C″ of the census).
+  /// against the duration libavformat hands it, the packet's own or its
+  /// guess (R23, Codex R22's class); a joined E-AC-3 sample's, its first
+  /// packet's, against the duration of the packet that completes it,
+  /// refused there (table C″ of the census).
   #[error("the packet's skip-samples side data leaves less than nothing")]
   SkipSamples,
   /// Matroska FLAC: new STREAMINFO side data of another length than the
@@ -12411,8 +12453,17 @@ struct Mp4Times {
 /// the one sample MP4 joins them into; a missing presentation time on a
 /// stream that reorders; a time before the earliest the container writes,
 /// where this muxer does not mirror libavformat's move of every stream's
-/// times ([`Shift`]), which judges it where it does.
-fn check_times(rules: &PacketRules, mp4: Mp4Times, timed: Timed) -> Result<(), FfmpegMuxRefusal> {
+/// times ([`Shift`]), which judges it where it does. A duration is the one
+/// libavformat hands the container (R23, Codex R22): the packet's own, or
+/// of a packet of none, or a negative one not a subtitle's, the guess
+/// `guessed` of a track of `kind` ([`handed_duration`]), stated in
+/// `time_base`, the stream's, where it is libavformat's.
+fn check_times(
+  rules: &PacketRules,
+  mp4: Mp4Times,
+  timed: Timed,
+  (kind, guessed, time_base): (TrackKind, i64, Timebase),
+) -> Result<(), FfmpegMuxRefusal> {
   let Timed {
     track,
     pts,
@@ -12443,10 +12494,17 @@ fn check_times(rules: &PacketRules, mp4: Mp4Times, timed: Timed) -> Result<(), F
       });
     }
   } else if rules.mp4 {
-    if let Some(duration) = duration
-      && i128::from(duration_ticks) > mp4.longest
-    {
-      return Err(FfmpegMuxRefusal::DurationTooLong { track, duration });
+    // `check_pkt` reads the duration libavformat hands MP4, after its guess
+    // (`guess_pkt_duration`, `mux.c` 605–633, 1102; R23, Codex R22).
+    let handed = handed_duration(duration_ticks, kind, guessed);
+    if i128::from(handed) > mp4.longest {
+      return Err(FfmpegMuxRefusal::DurationTooLong {
+        track,
+        duration: match duration {
+          Some(offered) if handed == duration_ticks => offered,
+          _ => Timestamp::new(handed, time_base),
+        },
+      });
     }
     if mp4.sampled
       && let Some(last) = mp4.last
@@ -12557,7 +12615,7 @@ fn check_packet_rules<'p>(
         sampled: !config_only,
       },
     };
-    check_times(rules, mp4, output)?;
+    check_times(rules, mp4, output, (state.kind, guessed, time_base))?;
     last_sample = Some(i128::from(output.dts_ticks));
     // A decode time the container counts in fewer bits, as it writes it:
     // moved by libavformat's shift, as far as the packet shows it.
@@ -13030,7 +13088,14 @@ fn check_packet_rules<'p>(
       Some((_, Ac3Step::Alone, duration)) => {
         skips_below_nothing(payload.side_data, duration, skip, time_base)
       }
-      None => skips_below_nothing(payload.side_data, duration_ticks, skip, time_base),
+      // The duration libavformat hands MP4, its guess for a packet of none
+      // (R23, Codex R22's class).
+      None => skips_below_nothing(
+        payload.side_data,
+        handed_duration(duration_ticks, state.kind, guessed),
+        skip,
+        time_base,
+      ),
     };
     if below {
       return refused(PayloadRule::SkipSamples);

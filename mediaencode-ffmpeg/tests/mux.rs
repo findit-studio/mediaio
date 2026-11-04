@@ -19998,3 +19998,130 @@ fn l200_mp4s_packet_rewrites_are_held_to_what_their_rewriter_counts() {
   );
   untouched!(offered, back);
 }
+
+/// **L201 — MP4 holds the duration libavformat hands it, its guess
+/// among them, to what `check_pkt` and its skip samples take** (R23, Codex
+/// R22: the instance and its class): libavformat gives a packet that
+/// states no duration its guess (`guess_pkt_duration`, `mux.c` 605–633,
+/// 1102) — a video frame at the stream's frame rate, an audio packet
+/// libavcodec's count of its samples — before MP4's `check_pkt` refuses
+/// one past `INT_MAX` ticks (`movenc.c` 6925–6928) and its skip samples
+/// shorten it (7311–7320). An H.264 track of 90 kHz ticks: at a frame rate
+/// of one frame in 30 000 s a durationless frame is guessed 2 700 000 000
+/// ticks — refused by name, the guessed duration stated in the stream's
+/// time base, the packet untouched; at one in 23 861 s refused so; at one
+/// in 23 860 s, 2 147 400 000 ticks, written. PCM of a frame size of one
+/// sample: a durationless packet of 1024 samples, guessed 1024 ticks,
+/// whose skip samples drop 500 from its end, written — counted against the
+/// duration it states, none, it was refused; dropping 1025, refused by
+/// name, untouched.
+///
+/// PLANT: `check_pkt`'s limit of the offered duration alone; the guessed
+/// duration stated as none; the skip samples judged of the offered
+/// duration alone.
+#[test]
+fn l201_mp4_holds_the_duration_libavformat_hands_it() {
+  use mediaencode::mediaspine::demuxer::VideoTrackParams;
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (table, frames) = first_track(&source, TrackKind::Video, 1);
+  let tick = Timebase::new(1, NonZeroI32::new(90_000).expect("non-zero"));
+  // The track counted in 90 kHz ticks, of a frame rate of one frame in
+  // `seconds`.
+  let slow = |seconds: i32| {
+    let row = &table[0];
+    let params = match row.params() {
+      TrackParams::Video(params) => TrackParams::Video(VideoTrackParams::new(
+        params.codec(),
+        params.width(),
+        params.height(),
+        params.pixel_format().clone(),
+        Some(Timebase::new(
+          1,
+          NonZeroI32::new(seconds).expect("non-zero"),
+        )),
+      )),
+      other => other.duplicate(),
+    };
+    TrackDescription::new(tick, params, row.side_data().clone())
+      .expect("a description")
+      .with_extradata(Some(bytes_of(&stream_extradata_of(row))))
+  };
+  let durationless = VideoTrackPacket::new(
+    TrackIndex::new(0),
+    video_of(&frames[0])
+      .with_pts(Some(Timestamp::new(0, tick)))
+      .with_dts(Some(Timestamp::new(0, tick)))
+      .with_duration(None),
+  );
+  for (seconds, guessed) in [(30_000, 2_700_000_000_i64), (23_861, 2_147_490_000)] {
+    let mut muxer = muxer_into(
+      &output(&corpus, &format!("l201-{seconds}.mp4")),
+      ContainerName::MP4,
+      vec![slow(seconds)],
+    );
+    let (refusal, back) = by_container(refusing!(muxer.write_video(durationless.clone())));
+    assert_eq!(
+      refusal,
+      FfmpegMuxRefusal::DurationTooLong {
+        track: TrackIndex::new(0),
+        duration: Timestamp::new(guessed, tick),
+      },
+      "one frame in {seconds} s"
+    );
+    untouched!(durationless, back);
+  }
+  let mut muxer = muxer_into(
+    &output(&corpus, "l201-23860.mp4"),
+    ContainerName::MP4,
+    vec![slow(23_860)],
+  );
+  wrote(
+    muxer.write_video(durationless.clone()),
+    "one frame in 23 860 s",
+  );
+  muxer.finish().expect("finished");
+  // PCM of a frame size of one sample — stereo, its layout stated, as
+  // MP4's `chnl` writes one — a durationless packet of 1024 samples, its
+  // skip samples dropping `end` from it.
+  let pcm = pcm_mov(&corpus);
+  let (_, packets) = first_track(&pcm, TrackKind::Audio, 1);
+  let rate = Timebase::new(1, NonZeroI32::new(48_000).expect("non-zero"));
+  let skipping = |end: u32| {
+    let mut skip = [0u8; 10];
+    skip[4..8].copy_from_slice(&end.to_le_bytes());
+    let mut packet = audio_holding(&audio_of(&packets[0]), &[0x11; 4096])
+      .with_pts(Some(Timestamp::new(0, rate)))
+      .with_dts(Some(Timestamp::new(0, rate)))
+      .with_duration(None);
+    packet.extra_mut().set_side_data(vec![side(
+      ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES,
+      &skip,
+    )]);
+    AudioTrackPacket::new(TrackIndex::new(0), packet)
+  };
+  let one_sample = || {
+    vec![reticketed(
+      table_of(&pcm, TrackKind::Audio).remove(0),
+      |par| {
+        par.frame_size = 1;
+      },
+    )]
+  };
+  let target = output(&corpus, "l201-skip.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, one_sample());
+  wrote(
+    muxer.write_audio(skipping(500)),
+    "500 of its 1024 samples skipped",
+  );
+  muxer.finish().expect("finished");
+  let mut muxer = muxer_into(
+    &output(&corpus, "l201-skip-past.mp4"),
+    ContainerName::MP4,
+    one_sample(),
+  );
+  let past = skipping(1025);
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(past.clone())));
+  assert_eq!(refusal, payload(PayloadRule::SkipSamples), "1025 skipped");
+  untouched!(past, back);
+}
