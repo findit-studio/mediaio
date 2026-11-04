@@ -828,6 +828,24 @@ impl<W> Output<W> {
     }
   }
 
+  /// The samples libavcodec counts of a packet of `frame_bytes` bytes on
+  /// the audio stream `stream`, of the stream's parameters and the packet's
+  /// size (`av_get_audio_frame_duration2`, `libavcodec/utils.c` 578–833 in
+  /// FFmpeg 9.0.1) — what libavformat adds to its count of the stream's
+  /// next decode time (`compute_muxer_pkt_fields`, `libavformat/mux.c`
+  /// 581–590); `0` where it counts none. Of the parameters as they stand;
+  /// nothing allocated.
+  pub fn audio_frame_samples(&self, stream: usize, frame_bytes: usize) -> Result<i32, OutputError> {
+    let st = self.stream(stream)?;
+    // A packet's size is an `int`: none larger is built.
+    let bytes = c_int::try_from(frame_bytes).unwrap_or(c_int::MAX);
+    // SAFETY: `st` is a live stream of the live context and its
+    // `codecpar` the stream's own. libavcodec reads the parameters' plain
+    // fields, and compares the extradata's pointer with null, writing
+    // nothing.
+    Ok(unsafe { av_get_audio_frame_duration2((*st).codecpar, bytes) })
+  }
+
   /// The duration libavformat gives a packet of `frame_bytes` bytes on the
   /// audio stream `stream` that states none, in the stream's time base
   /// (`guess_pkt_duration`, `libavformat/mux.c` 624–631 in FFmpeg 9.0.1):

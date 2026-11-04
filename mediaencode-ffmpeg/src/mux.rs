@@ -938,9 +938,11 @@
 //! packet, of a value the trailer computes of the whole track. Every
 //! condition on the sink's seeking holds: the base's I/O context is made
 //! with a seek callback, so that it seeks (`avio_alloc_context`,
-//! `aviobuf.c`), and each trailer's seekable branch is taken. 29 rows: 7
-//! fixed here; 20 shown exact; 2 bounds named — one ruled, one where
-//! exactness would need libavformat's interleaving mirrored.
+//! `aviobuf.c`), and each trailer's seekable branch is taken. 30 rows: 8
+//! fixed — 7 of R22, and W11's held decode time of R24; 19 shown exact; 3
+//! bounds named — one ruled (the `moov`), and two where exactness would
+//! need libavformat's interleaving mirrored (the samples' table; Matroska's
+//! cluster, ruled in R24).
 //!
 //! | | the value, and when FFmpeg reads it | here, before R22 | now |
 //! |---|---|---|---|
@@ -955,7 +957,7 @@
 //! | W5 | `vvcC`'s picture, of the SPSs the walk parses (`vvc.c` 364–368, 767–771) | as W4 | exact (L193) |
 //! | W1 | IVF's frames, raised at each packet, written at the trailer where the context seeks (`ivfenc.c` 84, 96–104) | at the packet that passes 32 bits | exact: the count only grows (L189) |
 //! | W6 | the RIFF format's fields as `ff_put_wav_header` chooses them — the extensible header and its fields where it takes it (`riffenc.c` 54–233) | [`riff_format_cut`], of the same branches | exact (L190) |
-//! | W11 | FLV's every tag's decode time (`flvenc.c` 255–258, 1356) | at each packet | exact (L187) |
+//! | W11 | FLV's every tag's decode time, as libavformat's shift moves it (`flvenc.c` 255–258, 1356) | at each packet, of the shift as the packet showed it — looser where a packet before the first write moved the shift after a held one (R24, the re-audit of signed arithmetic) | fixed: a held packet's decode time judged again as the shift settles ([`Held::need`]; L187, L203) |
 //! | W13 | Matroska's bitmap header of a codec it names no codec id of, JPEG 2000's among them (`matroskaenc.c` 2025–2030, 1258–1270) | at open, of JPEG 2000 | exact (L192) |
 //! | W18 | a video track's display width outside MOV and AVIF, of an aspect ratio stated (4066–4085); the width alone where the height read is not the coded one — D-10's tags, MOV's alone (8473–8483) | outside MOV and AVIF, of a ratio stated | exact (L191) |
 //! | S3 | VP9's `vpcC` level, of the picture's samples in an `int` where the ticket's level is unknown — MP4's and FLV's records (`vpcc.c` 77–122) | where the level is unknown, in MP4 and FLV | exact (L168) |
@@ -973,6 +975,7 @@
 //! | A27 | MP4's HEVC of the `hvc1` tag and an Annex B configuration (`hevc.c` 1203–1250) | as the packet rewrite's row | exact |
 //! | the samples' table | a sample a table entry, the `mov_text` empty sample before a first cue at zero where another track's packet makes it first (7646–7653) | room kept for that sample whatever the interleaving | a bound, stricter by one entry at [`MOV_SAMPLES_MAX`] at most: exactness would mirror libavformat's interleaving, which this release does not ([`PayloadRule::SampleTable`]) |
 //! | S2, the `moov` | the `moov`'s size, of every track's chunks as libavformat's interleaving makes them (5339–5453) | an upper bound | a bound, ruled (R14), stricter past the bound alone ([`PayloadRule::MovieBox`]) |
+//! | Matroska's cluster | a cluster's bytes in its dynamic buffer, up to two blocks written after the size check that would close it, by the order libavformat's interleaving writes them (`matroskaenc.c` 2746–2749, 3213–3271) | a block held to half of what the buffer holds past the cluster's limit, with room for its elements | a bound, ruled (R24, Codex R23 3b), stricter past the bound alone: exactness would need libavformat's interleaving mirrored ([`PayloadRule::ClusterSize`]) |
 //!
 //! **Every duration a packet's judgment reads** (R23, Codex R22, closed by
 //! class: a duration is the one libavformat hands the container). Before
@@ -987,8 +990,10 @@
 //! `mux.c` and the kept muxers' writers, each consumer, what it reads, and
 //! where it is judged. A judgment of a duration a later packet replaces
 //! waits for `finish`; one of each packet's own is made at the packet.
-//! 17 rows: 2 fixed, 6 shown exact, 3 written whole, 2 unreached, 2 of no
-//! consumer, the guess itself, and the report's lines.
+//! 17 rows: 6 fixed — 2 of R23, 4 of R24 (Codex R23 [high], every sum a
+//! duration takes in `int64_t`, below) — 5 shown exact, 1 written whole,
+//! 1 unreached, 2 of no consumer, the guess itself, and the report's
+//! lines.
 //!
 //! | consumer | the duration it reads | here | judged |
 //! |---|---|---|---|
@@ -997,18 +1002,49 @@
 //! | MOV `check_pkt`, a subtitle's negative duration | the packet's own, which libavformat hands as it is | [`FfmpegMuxRefusal::NegativeDuration`] | at the packet; exact |
 //! | MOV skip samples (7311–7320) | the one handed, at least a frame | [`PayloadRule::SkipSamples`] — of the offered duration alone before R23, a packet of none counted as a frame: fixed (L201) | at the packet |
 //! | MOV E-AC-3's join (597) and its last sample (1248–1256) | the one handed, of each packet joined; the sum | [`Ac3Rules`] — [`PayloadRule::Ac3SampleSize`], [`PayloadRule::SkipSamples`]; [`FfmpegMuxRefusal::LastSampleTooLong`] | at the packet; the last sample at `finish`; exact |
-//! | MOV `track_duration`, `end_pts`, `elst_end_pts` (7289–7333) | the one handed, the last sample's and the latest end | [`Mp4Counts`], [`EditSpan`] — [`FfmpegMuxRefusal::BitRates`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::NegativeSpan`] (R22) | at `finish`; exact |
+//! | MOV `track_duration`, `end_pts`, `elst_end_pts` (7289–7333) | the one handed, the last sample's and the latest end | [`Mp4Counts`], [`EditSpan`] — [`FfmpegMuxRefusal::BitRates`], [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::NegativeSpan`] (R22); `end_pts`'s own sum in `int64_t` at each sample, unjudged before R24: fixed ([`FfmpegMuxRefusal::DurationTooLong`]; L204) | at `finish`; `end_pts`'s sum at the packet; exact |
 //! | MOV `mov_text`'s cues (7646–7656, 9025–9031) | a cue's own: a subtitle's, of no guess | [`Cues`] — the cue's room in [`FfmpegMuxRefusal::DurationTooLong`], [`FfmpegMuxRefusal::DtsGap`], [`FfmpegMuxRefusal::CueOrder`] | at the packet; exact |
 //! | MOV TTML's joined document (`movenc_ttml.c` 127–188, 289–317; `movenc.c` 6579–6615) | each paragraph's own: a subtitle's | [`FfmpegMuxRefusal::DocumentSpan`]; [`TtmlCounts`] at `finish` | at the packet; at `finish`; exact |
 //! | WAV's and Wave64's fact chunk (`wavenc.c` 82, 412, 448–462, 608–616) | the last packet's handed, which each packet's replaces | [`PayloadRule::FileSize`] of the span at the packet; with the duration, and [`FfmpegMuxRefusal::DurationTooLong`], at `finish` (R22) | at the packet and at `finish`; exact |
 //! | Matroska's and WebM's `BlockDuration` and `CueDuration` (`matroskaenc.c` 2896–2911, 3134–3135) | the one handed, zero of a negative one | none needed: unsigned EBML integers, written whole | — |
-//! | Matroska's file and track durations (3194–3195, 3409–3411, 3460–3461) | the latest end, of the one handed | none needed: written as a float and a text — a stated duration within `INT64_MAX` of the end's `int64_t` sum aside | — |
-//! | FLV's file duration (`flvenc.c` 1455–1456, 1195–1197) | the latest end, of the one handed | none needed: written as a double — the same sum aside | — |
-//! | `compute_muxer_pkt_fields` (`mux.c` 545–553) | a decode time made of a presentation time and the duration | unreached: the face requires a decode time | — |
+//! | Matroska's file and track durations (3194–3195, 3409–3411, 3460–3461) | the latest end — the time written, its codec delay and the one handed, zero of a negative one — summed in `int64_t` | written as a float and a text; the sum, unjudged before R24, a signed overflow past `INT64_MAX`: fixed ([`EndSum::Matroska`] — [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::DurationTooLong`]; L202) | at the packet, held as libavformat's shift settles |
+//! | FLV's file duration (`flvenc.c` 1455–1456, 1195–1197) | the latest end — the presentation time, the delay and the one handed — summed in `int64_t` | written as a double; the sum, unjudged before R24: fixed ([`EndSum::Flv`] — [`FfmpegMuxRefusal::DurationTooLong`]; L203) | at the packet, held as FLV's first decode time settles |
+//! | `compute_muxer_pkt_fields` (`mux.c` 545–553, 571–599) | a decode time made of a presentation time and the duration; its count of the decode time after each packet, of the frame's samples, not its duration | unreached: the face requires a decode time; the count, unjudged before R24: fixed ([`NextDts`]; L204, L205) | at the packet |
 //! | the interleaver's chunks (`mux.c` 843–879) | each packet's, against `max_chunk_duration` | unreached: none asked, 0 | — |
 //! | IVF (`ivfenc.c` 83) | the last packet's, kept | no consumer: its trailer reads none (96–104) | — |
 //! | MPEG-TS, ADTS, FLAC, the raw AC-3, E-AC-3, DTS, H.264, HEVC and AV1 streams | none: MPEG-TS counts an Opus packet's samples of its table of contents (`mpegtsenc.c` 1816–1848) | no consumer | — |
 //! | the report's durations lines ([`Rewrite::Durations`], [`Mp4Place`], a negative duration) | the offered duration, by design: what the caller offered and the file does not keep | reports, no judgment | — |
+//!
+//! **Every signed sum of a time** (R24, Codex R23 [high], closed by class:
+//! a value that wraps is refused, where FFmpeg loses it, and nowhere
+//! stricter). A sum in `int64_t` that leaves it is a signed overflow,
+//! undefined in C whatever the compiler makes of it. By grep of each `+`,
+//! `-` and `+=` on a time over `mux.c` and the kept muxers' writers, each
+//! sum a packet's times meet, and how it is held. Before libavformat's first
+//! write its shift may still move: a packet then is judged with the shift as
+//! it stands, and what it holds of each bound is kept ([`Held::need`]) — a
+//! later packet before that write whose time moves the shift, or FLV's
+//! first decode time, past a bound a held packet's sum then passes is
+//! refused by that time ([`FfmpegMuxRefusal::TimeWraps`]). 15 rows: 7
+//! fixed, 6 shown exact, 2 unjudged.
+//!
+//! | the sum | of | here |
+//! |---|---|---|
+//! | libavformat's count of the decode time after a packet, `priv_pts`: a video packet's a tick after it, an audio packet's its samples (`mux.c` 571–599, 75–92) | every packet any container is handed, before the interleaving | fixed ([`NextDts`], the remainder carried; L204, L205) |
+//! | libavformat's shift, its move added to each time, a move past `INT64_MAX` answered `INT64_MIN` (`mux.c` 676–688) | every packet of a container it moves | fixed, held as it settles (L205) |
+//! | the shift's earliest, a time less its stream's earliest (653, 662) | Matroska's codec delay, the one earliest below zero | exact: within Matroska's first sum below |
+//! | Matroska's and WebM's time and codec delay; its end, the duration added (`matroskaenc.c` 3144, 3194–3195) | each block | fixed ([`EndSum::Matroska`], of [`MATROSKA_QT_VIDEO`] and VFW mode; L202) |
+//! | Matroska's cluster time, a packet's time less the open cluster's, its codec delay added (3214–3219) | each packet, of the cluster the interleaving's order has opened | unjudged: out of `int64_t` only of an audio time below zero after a cluster opened within its codec delay of `INT64_MAX`; exactness would need libavformat's interleaving mirrored (R24, a ruling asked) |
+//! | Matroska's block reference, the track's last time less this one (3024) | each block in a group | exact: both written at zero and after |
+//! | FLV's end, its delay the first decode time negated (`flvenc.c` 1268, 1455–1456) | each video and audio tag | fixed ([`EndSum::Flv`], held as FLV's first decode time settles; L203) |
+//! | FLV's composition time, `pts − dts` (1449) | H.264 and MPEG-4 Part 2 | exact: of a decode time in 31 bits and an offset in 24 |
+//! | FLV's decode time, moved by the shift (255–258) | each tag | fixed: held as the shift settles (W11; L203) |
+//! | MPEG-TS's times, the muxer's delay added, and its clock, 300 times over (`mpegtsenc.c` 1887–1898) | each packet | fixed: held as the shift settles, the mechanism's laws L202 and L203 |
+//! | the MOV family's `end_pts` (`movenc.c` 7334–7340) | each sample | fixed (L204) |
+//! | the MOV family's `track_duration` and presentation offset; its edit list and track header (7319, 7326; 4135–4239, 3990–3994) | each sample; at the trailer | exact: of decode-time gaps under `INT32_MAX` across at most [`MOV_SAMPLES_MAX`] samples, and an offset under it |
+//! | WAV's span and its last duration (`wavenc.c` 410–412, 451, 611) | at the trailer | exact: the span judged at each packet, the count at `finish` (R22) |
+//! | IVF's times (`ivfenc.c` 81–86) | each packet | none signed: `uint64_t` |
+//! | libavformat's interleaving's delay, each stream's last decode time less the head's, in microseconds — a time past what they hold answered `INT64_MIN` (`mux.c` 971–990) | each packet it holds, of two streams it interleaves or more | unjudged: out of `int64_t` only of decode times beyond ±2^62 microseconds, about 146 000 years; exactness would need libavformat's interleaving mirrored (R24, a ruling asked) |
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -1868,16 +1904,6 @@ const MATROSKA_BLOCK_BYTES_MAX: u64 = (i32::MAX as u64 - 5 * 1024 * 1024 - 64 * 
 /// breaks, and each block addition's own elements (`mkv_write_block`,
 /// `matroskaenc.c` 2864–3010).
 const MATROSKA_BLOCK_OVERHEAD: u64 = 4 * 1024;
-
-/// What MP4's joined TTML document adds per paragraph, at most: its `<p>`
-/// element and its two times (`ttml_write_packet`, `ttmlenc.c` 161–181;
-/// `ttml_write_time`, 67–80).
-const TTML_PARAGRAPH_OVERHEAD: u64 = 160;
-
-/// What the document adds around its paragraphs beside the strings the
-/// track's configuration and language give it: its header and footer
-/// (`ttml_header_text`, `ttml_footer_text`, `ttmlenc.c` 53–65).
-const TTML_DOCUMENT_OVERHEAD: u64 = 1024;
 
 /// The bytes MP4's joined TTML document adds around its paragraphs
 /// (`ttml_write_header`, `ttml_write_trailer`, `ttmlenc.c` 53–65,
@@ -3793,7 +3819,13 @@ pub enum FfmpegMuxRefusal {
   /// (`wavenc.c` 82, 412, 451–462, 608–616; R21, Codex R20 2): the last
   /// packet's, judged at `finish`, before the trailer runs — a packet a
   /// later one follows has its duration replaced (R22, the census of
-  /// exactness).
+  /// exactness). And (R24, Codex R23 [high]) a duration that takes the
+  /// end a container sums of the packet past `INT64_MAX`, a signed
+  /// overflow: Matroska's and WebM's time, codec delay and duration
+  /// (`matroskaenc.c` 3194–3195), FLV's presentation time, delay and
+  /// duration (`flvenc.c` 1455–1456), the MOV family's sample end
+  /// (`movenc.c` 7334–7340) — the duration offered, or the one handed in
+  /// the stream's time base.
   #[error("track {}: the duration {} is longer than the container counts", .track.get(), .duration.pts())]
   DurationTooLong {
     /// The track.
@@ -3873,7 +3905,15 @@ pub enum FfmpegMuxRefusal {
   /// (`mov_write_edts_tag`, `movenc.c` 4135–4239): judged at `finish`, of
   /// the whole track, before the trailer runs (R22, the census of
   /// exactness) — of version 1, where the edit's span or its delay reaches
-  /// `INT32_MAX` movie ticks, it is written in 64 bits, whole.
+  /// `INT32_MAX` movie ticks, it is written in 64 bits, whole. And (R24,
+  /// the re-audit of signed arithmetic) a time a sum in `int64_t` takes
+  /// past it, a signed overflow: libavformat's count of the decode time
+  /// after the packet (`mux.c` 571–599) and its shift's move added to each
+  /// time (685–688); Matroska's and WebM's time with its codec delay
+  /// (`matroskaenc.c` 3144). A packet before libavformat's first write
+  /// whose time moves its shift — or FLV's first decode time — so that a
+  /// packet held before it passes one of these bounds, or FLV's 31 bits or
+  /// MPEG-TS's clock, is refused by that time.
   #[error("track {}: {} lies past what the container counts", .track.get(), .timestamp.pts())]
   TimeWraps {
     /// The track.
@@ -5070,9 +5110,9 @@ struct TrackState {
   cues: Cues,
   /// MP4 AC-3 and E-AC-3: what MP4 has learned of the track's frames.
   ac3: Ac3State,
-  /// MP4 TTML from libavcodec's TTML encoder: the bytes of the document
-  /// MP4 joins its paragraphs into, so far.
-  document: u64,
+  /// libavformat's remainder of the decode time it counts after the
+  /// track's packets ([`NextDts`]).
+  remainder: i128,
   /// ADTS: what the muxer knows of the track's configuration
   /// ([`AdtsMirror`]).
   adts: Option<AdtsMirror>,
@@ -5225,12 +5265,7 @@ impl TrackState {
   /// E-AC-3 run its end frees is no sample (7951–7955), and the chapter
   /// track is its own ([`chapter_part`]).
   fn trak_written(&self, shape: MoovShape, entries: u64, judged: bool) -> bool {
-    shape.always
-      || entries > 0
-      || self
-        .rules
-        .ttml_document
-        .is_some_and(|header| judged || self.document > header)
+    shape.always || entries > 0 || self.ttml.is_some_and(|ttml| judged || ttml.end.is_some())
   }
 }
 
@@ -5428,6 +5463,11 @@ struct ShiftNow {
   /// The decode time of the first packet the container wrote, moved, in its
   /// own stream's ticks: FLV's reference, as FLV keeps it.
   first: Option<i128>,
+  /// FLV: the latest end of a tag of what libavformat holds before its
+  /// first write — its presentation time and its duration, unmoved, in
+  /// milliseconds — whose sum with the delay the head makes FLV's
+  /// (`flvenc.c` 1455–1456; [`EndSum::Flv`]; R24).
+  flv_end: Option<i128>,
 }
 
 #[cfg(test)]
@@ -5459,6 +5499,9 @@ struct ShiftStep {
   /// The decode time of the last packet of the track the interleaving
   /// holds, in microseconds, where the step moves it.
   last_us: Option<i128>,
+  /// What the packet leaves of the bounds of the track's sums the shift
+  /// moves, unmoved, in the track's ticks ([`Held::need`]).
+  need: Option<(i128, Timebase)>,
 }
 
 /// Why libavformat's container would write a packet before where it may
@@ -5488,6 +5531,15 @@ struct Held {
   subtitle: bool,
   /// The decode time of the last packet of it held, in microseconds.
   last_us: Option<i128>,
+  /// The most a sum of a packet of it held lies past its bound, unmoved,
+  /// in the stream's ticks (R24, the re-audit of signed arithmetic): each
+  /// time and end the container or libavformat sums in `int64_t`, FLV's
+  /// decode time in 31 bits, MPEG-TS's clock — every bound a time moved by
+  /// the shift is held to ([`check_packet_rules`]). A packet before the
+  /// first write that moves the shift so that a held one passes its bound
+  /// is refused: judged with the shift as it then stood, the held packet's
+  /// sums are judged again as the shift moves.
+  need: Option<(i128, Timebase)>,
 }
 
 /// `ticks` of `time_base` in microseconds, as `av_rescale_q` rounds: to
@@ -5547,6 +5599,7 @@ impl Shift {
           may_lack: codec != CodecId::VP8 && codec != CodecId::VP9 && codec != SMPTE_2038,
           subtitle: kind == TrackKind::Subtitle,
           last_us: None,
+          need: None,
         })
       })
       .collect();
@@ -5564,6 +5617,7 @@ impl Shift {
         head: None,
         first_floor: muxer == "flv",
         first: None,
+        flv_end: None,
       },
       held,
     })
@@ -5575,17 +5629,46 @@ impl Shift {
       now: self.now,
       track,
       last_us: None,
+      need: None,
     }
   }
 
   /// Applies a packet's step, once the packet is written.
   fn apply(&mut self, step: ShiftStep) {
     self.now = step.now;
-    if let Some(last) = step.last_us
-      && let Some(Some(held)) = self.held.get_mut(step.track)
-    {
-      held.last_us = Some(last);
+    if let Some(Some(held)) = self.held.get_mut(step.track) {
+      if let Some(last) = step.last_us {
+        held.last_us = Some(last);
+      }
+      if let Some((need, time_base)) = step.need {
+        held.need = Some((
+          held.need.map_or(need, |(held, _)| held.max(need)),
+          time_base,
+        ));
+      }
     }
+  }
+
+  /// Whether a packet's step before the first write, `next`, moves the
+  /// shift so that a packet held before it passes a bound one of its sums
+  /// is held to (R24): its move, to a held packet's [`Held::need`]; FLV's
+  /// head, to the latest end of a tag held ([`ShiftNow::flv_end`]), the
+  /// delay FLV adds to it the first decode time negated.
+  fn moves_held_past(&self, next: ShiftStep) -> bool {
+    let lifted = next.now.earliest != self.now.earliest
+      && self
+        .held
+        .iter()
+        .flatten()
+        .filter_map(|held| held.need)
+        .any(|(need, time_base)| need + next.now.lift(time_base) > 0);
+    let headed = next.now.head != self.now.head
+      && self
+        .now
+        .flv_end
+        .zip(next.now.head)
+        .is_some_and(|(end, head)| end - i128::from(head.pts()) > i128::from(i64::MAX));
+    lifted || headed
   }
 }
 
@@ -5742,6 +5825,97 @@ const MATROSKA_NATIVE_VIDEO: [CodecId; 23] = [
 const SMPTE_2038: CodecId =
   CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_SMPTE_2038 as i32);
 
+/// The video codecs of no native Matroska id that Matroska writes in
+/// QuickTime mode, of their presentation times (`matroskaenc.c` 2063–2071
+/// in FFmpeg 9.0.1): those `ff_codec_movvideo_tags` names (`isom_tags.c`)
+/// and `ff_codec_bmp_tags` does not (`riff.c`), raw video aside, and SVQ1,
+/// SVQ3 and Cinepak, which both name. Every other video codec of no native
+/// id is written in VFW mode, of its decode times (2072–2077), JPEG 2000's
+/// whatever the tables say (2027–2030). Made of the three tables by script
+/// (R24, Codex R23 [high]).
+const MATROSKA_QT_VIDEO: [CodecId; 27] = {
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  [
+    CodecId::from_raw(Id::AV_CODEC_ID_8BPS as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_AIC as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_APV as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_AVRP as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_AVUI as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_CDTOONS as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_CINEPAK as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_DNXHD as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_DXV as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_EXR as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_GIF as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_HAP as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_LCEVC as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_MEDIA100 as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_MJPEGB as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_PIXLET as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_PRORES_RAW as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_QDRAW as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_QTRLE as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_SGI as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_SGIRLE as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_SHEERVIDEO as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_SMC as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_SVQ1 as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_SVQ3 as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_TARGA_Y216 as i32),
+    CodecId::from_raw(Id::AV_CODEC_ID_TIFF as i32),
+  ]
+};
+
+/// The end a container sums, in `int64_t`, of each packet it writes (R24,
+/// Codex R23 [high]): a sum that would leave `int64_t` is a signed
+/// overflow, undefined, refused at the packet by name, the packet untouched
+/// — exactly where the sum overflows, of the times libavformat hands the
+/// container, moved by its shift, and the duration it hands
+/// ([`handed_duration`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndSum {
+  /// Matroska and WebM (`mkv_write_packet_internal`, `matroskaenc.c`
+  /// 3134–3195 in FFmpeg 9.0.1): the time the track writes — its decode
+  /// time in VFW mode, else its presentation time (3137) — its codec delay
+  /// added (3144; 2089–2104), then the duration handed, zero of a negative
+  /// one (3134, 3194–3195): past `INT64_MAX`, the first sum
+  /// [`FfmpegMuxRefusal::TimeWraps`], the second
+  /// [`FfmpegMuxRefusal::DurationTooLong`]. Of no audio packet without
+  /// bytes, which Matroska never writes (3264–3266).
+  Matroska {
+    /// The track's codec delay, in its ticks ([`matroska_codec_delay`]).
+    delay: i64,
+    /// Whether the track writes its decode times: VFW mode.
+    by_dts: bool,
+  },
+  /// FLV's file duration (`flvenc.c` 1455–1456): of a video or audio tag,
+  /// its presentation time, the delay — the decode time of the first tag
+  /// it wrote, negated (1267–1268) — and the duration handed. The first sum
+  /// lies within FLV's 31 bits of milliseconds and its composition time's
+  /// 24 ([`FfmpegMuxRefusal::TimeWraps`],
+  /// [`FfmpegMuxRefusal::PresentationOffset`]); the second, past
+  /// `INT64_MAX`, [`FfmpegMuxRefusal::DurationTooLong`].
+  Flv,
+}
+
+/// libavformat's count of the decode time after each packet of a stream,
+/// `priv_pts` (`compute_muxer_pkt_fields`, `mux.c` 571–599 in FFmpeg
+/// 9.0.1; `frac_add`, 75–92; `init_pts`, 383–410), summed in `int64_t` of
+/// every packet any container is handed: past `INT64_MAX` a signed
+/// overflow, undefined, refused ([`FfmpegMuxRefusal::TimeWraps`]; R24, the
+/// re-audit of signed arithmetic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextDts {
+  /// A video stream's: a tick after the packet's decode time.
+  Video,
+  /// An audio stream's: the packet's samples, as libavcodec counts them
+  /// (`av_get_audio_frame_duration2`), after its decode time — `scale` ×
+  /// samples over `den`, the time base's denominator and its numerator ×
+  /// the sample rate, the remainder carried from packet to packet,
+  /// starting at half of `den`.
+  Audio { den: i128, scale: i128 },
+}
+
 /// The rows of the packet-rule table one track's packets meet in its
 /// container, settled at open from the container and the stream's own
 /// parameters ([`PacketRules::settle`]); each is refused by name, the
@@ -5820,7 +5994,7 @@ struct PacketRules {
   /// Matroska and WebM: each block fits a cluster's buffer.
   matroska_block: bool,
   /// MP4 TTML from libavcodec's TTML encoder: the bytes the joined
-  /// document takes beside its paragraphs.
+  /// document takes beside its paragraphs ([`ttml_document_frame`]).
   ttml_document: Option<u64>,
   /// What new extradata the container takes on the track (table C).
   new_extradata: ExtradataRule,
@@ -5886,6 +6060,11 @@ struct PacketRules {
   /// (`guess_pkt_duration`, `mux.c` 605–633), as the track's rules take it
   /// ([`Guess`]): WAV's fact chunk counts it.
   guessed: Option<Guess>,
+  /// The end the container sums of each packet it writes ([`EndSum`]).
+  end_sum: Option<EndSum>,
+  /// libavformat's count of the decode time after each packet
+  /// ([`NextDts`]).
+  next_dts: Option<NextDts>,
   /// MPEG-TS: what it does with the track's packets ([`TsRules`]).
   ts: Option<TsRules>,
   /// MPEG-TS: what it sums the track's PES payloads in ([`TsPes`]).
@@ -7656,6 +7835,26 @@ impl PacketRules {
         .flatten(),
       apv: mp4 && id == CodecId::APV,
       guessed: None,
+      end_sum: if either_matroska {
+        Some(EndSum::Matroska {
+          delay: matroska_codec_delay(kind, codec, time_base),
+          by_dts: kind == TrackKind::Video
+            && !MATROSKA_NATIVE_VIDEO.contains(&id)
+            && !MATROSKA_QT_VIDEO.contains(&id),
+        })
+      } else if flv && matches!(kind, TrackKind::Video | TrackKind::Audio) {
+        Some(EndSum::Flv)
+      } else {
+        None
+      },
+      next_dts: match kind {
+        TrackKind::Video => Some(NextDts::Video),
+        TrackKind::Audio => Some(NextDts::Audio {
+          den: i128::from(time_base.num()) * i128::from(codec.sample_rate()),
+          scale: i128::from(time_base.den().get()),
+        }),
+        _ => None,
+      },
       ts: (audited == Audited::MpegTs)
         .then(|| match id {
           CodecId::H264 | CodecId::HEVC | CodecId::VVC => Some(TsRules::StartCodes {
@@ -10430,8 +10629,14 @@ struct Learned {
   /// own is never written, but its new extradata, which MP4 reads before
   /// holding it (`movenc.c` 7044–7074, 7175–7181).
   joined: bool,
-  /// MP4 TTML from libavcodec's TTML encoder: the joined document's bytes.
-  document: Option<u64>,
+  /// libavformat's remainder of the decode time it counts after the
+  /// track's packets, after the packet ([`NextDts`]).
+  remainder: Option<i128>,
+  /// What the packet leaves of the bounds of the sums libavformat's shift
+  /// moves, before its first write, unmoved ([`Held::need`]).
+  need: Option<i128>,
+  /// FLV: the latest end of the packet's tags, unmoved ([`ShiftNow::flv_end`]).
+  flv_end: Option<i128>,
   /// The packet's duration as offered is not kept — a negative one, which
   /// libavformat or the container writes as zero, or as libavformat's
   /// guess; or a `mov_text` cue shortens the duration MP4 keeps of the last
@@ -11031,8 +11236,9 @@ where
           );
           // WAV's fact chunk counts the last duration libavformat hands
           // (table H), and the MOV family's trailer every sample's (R22,
-          // Codex R21 2).
-          if rules.fact_samples.is_some() || family == Family::Mp4 {
+          // Codex R21 2); Matroska and FLV sum it into each packet's end
+          // (R24, Codex R23 [high]; [`EndSum`]).
+          if rules.fact_samples.is_some() || family == Family::Mp4 || rules.end_sum.is_some() {
             let frame_rate = match tracks[index].params() {
               TrackParams::Video(params) => params.frame_rate(),
               _ => None,
@@ -11063,11 +11269,10 @@ where
             && codec.codec() == CodecId::TTML
             && codec.extradata().starts_with(b"lavc-ttmlenc")
           {
-            let language = tracks[index].language().map_or(0, |tag| tag.as_str().len());
-            rules.ttml_document =
-              Some((codec.extradata().len() + language) as u64 + TTML_DOCUMENT_OVERHEAD);
+            let frame = ttml_document_frame(codec.extradata());
+            rules.ttml_document = Some(frame);
             ttml = Some(TtmlCounts {
-              frame: ttml_document_frame(codec.extradata()),
+              frame,
               paragraphs: 0,
               end: None,
             });
@@ -11140,7 +11345,10 @@ where
         written: false,
         cues: Cues::default(),
         ac3: Ac3State::default(),
-        document: rules.ttml_document.unwrap_or(0),
+        remainder: match rules.next_dts {
+          Some(NextDts::Audio { den, .. }) => den >> 1,
+          _ => 0,
+        },
         adts: rules.adts,
         bytes: 0,
         ts_held: 0,
@@ -11854,6 +12062,25 @@ where
       }
       None => None,
     };
+    // A packet before libavformat's first write that moves its shift moves
+    // every packet the interleaving holds with it, judged with the shift as
+    // it stood (R24, the re-audit of signed arithmetic): one whose sums the
+    // move takes past their bounds — a time or an end out of `int64_t`,
+    // FLV's 31 bits, MPEG-TS's clock, FLV's end of its delay — refuses the
+    // packet that moves it, by its time, which moves it.
+    if let (Some(current), Some(next)) = (&self.shift, shift)
+      && !current.now.written
+      && current.moves_held_past(next)
+    {
+      return Err(Refusal::Container(FfmpegMuxRefusal::TimeWraps {
+        track,
+        timestamp: if next.now.by_pts {
+          pts.unwrap_or(dts)
+        } else {
+          dts
+        },
+      }));
+    }
     let neighbours = if state.rules.mov_text {
       self.neighbours(track, time_base)
     } else {
@@ -11871,16 +12098,78 @@ where
         .map_err(|_| Refusal::Portable(MuxRefusal::UnknownTrack { track }))?,
       _ => 0,
     };
-    let (learned, choices) = check_packet_rules(
+    // FLV's reference: the decode time of the first packet it writes,
+    // moved; before the first write, the head of what libavformat holds, as
+    // the shift then stands ([`EndSum::Flv`]).
+    let reference = shift.and_then(|step| {
+      step.now.first.or_else(|| {
+        step
+          .now
+          .head
+          .map(|head| i128::from(head.pts()) + step.now.lift(head.timebase()))
+      })
+    });
+    let (mut learned, choices) = check_packet_rules(
       state,
       time_base,
       neighbours,
-      (own, outputs, lift),
+      (own, outputs, (lift, reference)),
       (payload, guessed),
       step,
       self.bounds,
     )
     .map_err(Refusal::Container)?;
+    // What the packet leaves held before the first write ([`Held::need`]).
+    let shift = shift.map(|mut next| {
+      if !next.now.written {
+        next.need = learned.need.map(|need| (need, time_base));
+        next.now.flv_end = next.now.flv_end.max(learned.flv_end);
+      }
+      next
+    });
+    // libavformat's count of the decode time after each packet it is
+    // handed, in `int64_t`, before its interleaving (`compute_muxer_pkt_fields`,
+    // `mux.c` 571–599; [`NextDts`]): a video packet's a tick after its decode
+    // time, an audio packet's its samples after it, the remainder carried —
+    // past `INT64_MAX` a signed overflow, undefined, refused (R24, the
+    // re-audit of signed arithmetic).
+    match state.rules.next_dts {
+      Some(NextDts::Video) => {
+        if let Some(output) = outputs.iter().find(|output| output.dts_ticks == i64::MAX) {
+          return Err(Refusal::Container(FfmpegMuxRefusal::TimeWraps {
+            track,
+            timestamp: output.dts,
+          }));
+        }
+      }
+      Some(NextDts::Audio { den, scale }) if den > 0 => {
+        let samples = i128::from(
+          self
+            .output
+            .audio_frame_samples(stream, payload.bytes.len())
+            .map_err(|_| Refusal::Portable(MuxRefusal::UnknownTrack { track }))?,
+        );
+        let mut remainder = state.remainder;
+        for output in outputs.iter() {
+          // libavformat skips its count of an empty packet at zero before
+          // any count (588–590).
+          if samples >= 0
+            && (!payload.bytes.is_empty() || remainder != den >> 1 || output.dts_ticks != 0)
+          {
+            let num = remainder + scale * samples;
+            if i128::from(output.dts_ticks) + num / den > i128::from(i64::MAX) {
+              return Err(Refusal::Container(FfmpegMuxRefusal::TimeWraps {
+                track,
+                timestamp: output.dts,
+              }));
+            }
+            remainder = num % den;
+          }
+        }
+        learned.remainder = Some(remainder);
+      }
+      _ => {}
+    }
     // MPEG-TS's raw AAC, framed here (R20, r3): the packet its write builds
     // holds the frame's header before the payload, judged as the builder
     // judges it.
@@ -12280,8 +12569,8 @@ where
     if let Some(ac3) = plan.learned.ac3 {
       state.ac3 = ac3;
     }
-    if let Some(document) = plan.learned.document {
-      state.document = document;
+    if let Some(remainder) = plan.learned.remainder {
+      state.remainder = remainder;
     }
     for line in plan.uncarried {
       if !self.report.uncarried.contains(&line) {
@@ -12563,7 +12852,7 @@ fn check_packet_rules<'p>(
   state: &TrackState,
   time_base: Timebase,
   neighbours: Neighbours,
-  (own, outputs, lift): (Timed, Outputs<'_>, i128),
+  (own, outputs, (lift, reference)): (Timed, Outputs<'_>, (i128, Option<i128>)),
   (payload, guessed): (Payload<'p>, i64),
   step: Step,
   bounds: Bounds,
@@ -12597,6 +12886,11 @@ fn check_packet_rules<'p>(
   // filter holds meets none, its times reaching libavformat's timing and
   // the container only with what the filter puts out.
   let mut last_sample = state.sample.map(|sample| i128::from(sample.dts));
+  // What the packet's outputs leave of the bounds of the sums libavformat's
+  // shift moves, unmoved, and FLV's latest end of them: held until the
+  // first write settles the shift (R24; [`Held::need`]).
+  let mut needs: Option<i128> = None;
+  let mut flv_end: Option<i128> = None;
   for output in outputs.iter() {
     // `check_pkt` counts a packet's gap from the last sample MP4 wrote on the
     // track — not from a packet MP4 holds — and a `mov_text` cue's from the
@@ -12617,8 +12911,33 @@ fn check_packet_rules<'p>(
     };
     check_times(rules, mp4, output, (state.kind, guessed, time_base))?;
     last_sample = Some(i128::from(output.dts_ticks));
+    let max = i128::from(i64::MAX);
+    let presented = output.pts_ticks.unwrap_or(output.dts_ticks);
+    let latest = i128::from(presented).max(i128::from(output.dts_ticks));
+    // libavformat's shift adds its move to both times in `int64_t`
+    // (`handle_avoid_negative_ts`, `mux.c` 685–688), a move past `INT64_MAX`
+    // answered `INT64_MIN` (`av_rescale_q_rnd`, 676–680): a sum out of
+    // `int64_t` a signed overflow, undefined, refused (R24, the re-audit of
+    // signed arithmetic). Each bound below a moved time is held to, a packet
+    // before the first write holds with the shift as it settles
+    // ([`Held::need`]).
+    let moved = if lift > max {
+      i128::from(i64::MIN)
+    } else {
+      lift
+    };
+    if [output.dts_ticks, presented]
+      .into_iter()
+      .any(|time| !(i128::from(i64::MIN)..=max).contains(&(i128::from(time) + moved)))
+    {
+      return Err(FfmpegMuxRefusal::TimeWraps {
+        track,
+        timestamp: output.pts.unwrap_or(output.dts),
+      });
+    }
+    let mut need = latest - max;
     // A decode time the container counts in fewer bits, as it writes it:
-    // moved by libavformat's shift, as far as the packet shows it.
+    // moved by libavformat's shift.
     if let Some(bits) = rules.dts_field {
       let written = i128::from(output.dts_ticks) + lift;
       if !(0..1 << bits).contains(&written) {
@@ -12627,21 +12946,63 @@ fn check_packet_rules<'p>(
           timestamp: output.dts,
         });
       }
+      need = need.max(i128::from(output.dts_ticks) - ((1 << bits) - 1));
     }
     // MPEG-TS counts its clock reference from the first decode time, 300
     // times over, and its PES times, in `int64_t` (`mpegtsenc.c`
     // 1887–1890, 1597–1611): a time past `i64::MAX / 600` refused, the
     // clock's room.
-    if rules.ts_clock
-      && i128::from(output.pts_ticks.unwrap_or(output.dts_ticks)).max(i128::from(output.dts_ticks))
-        + lift
-        > i128::from(i64::MAX / 600)
-    {
-      return Err(FfmpegMuxRefusal::TimeWraps {
-        track,
-        timestamp: output.pts.unwrap_or(output.dts),
-      });
+    if rules.ts_clock {
+      if latest + lift > i128::from(i64::MAX / 600) {
+        return Err(FfmpegMuxRefusal::TimeWraps {
+          track,
+          timestamp: output.pts.unwrap_or(output.dts),
+        });
+      }
+      need = need.max(latest - i128::from(i64::MAX / 600));
     }
+    // The end the container sums of the packet, in `int64_t` (R24, Codex
+    // R23 [high]; [`EndSum`]), of the duration libavformat hands it.
+    let handed = handed_duration(output.duration_ticks, state.kind, guessed);
+    let too_long = || FfmpegMuxRefusal::DurationTooLong {
+      track,
+      duration: match output.duration {
+        Some(offered) if handed == output.duration_ticks => offered,
+        _ => Timestamp::new(handed, time_base),
+      },
+    };
+    match rules.end_sum {
+      Some(EndSum::Matroska { delay, by_dts })
+        if state.kind != TrackKind::Audio || !payload.bytes.is_empty() =>
+      {
+        let (at, timestamp) = if by_dts {
+          (output.dts_ticks, output.dts)
+        } else {
+          (presented, output.pts.unwrap_or(output.dts))
+        };
+        let time = i128::from(at) + i128::from(delay);
+        if time + lift > max {
+          return Err(FfmpegMuxRefusal::TimeWraps { track, timestamp });
+        }
+        let end = time + i128::from(handed.max(0));
+        if end + lift > max {
+          return Err(too_long());
+        }
+        need = need.max(end - max);
+      }
+      Some(EndSum::Flv) => {
+        // The presentation time and the delay, within FLV's bits; then the
+        // duration. Before the first write, the delay as the head of what
+        // libavformat holds makes it ([`ShiftNow::flv_end`]).
+        let end = i128::from(presented) + i128::from(handed);
+        if reference.is_some_and(|reference| end + lift - reference > max) {
+          return Err(too_long());
+        }
+        flv_end = flv_end.max(Some(end));
+      }
+      _ => {}
+    }
+    needs = needs.max(Some(need));
   }
   // A cue before the end MP4 marks the last one with, which MP4 takes as
   // it is — the last cue shortened to it — unless another track's packet
@@ -13366,16 +13727,24 @@ fn check_packet_rules<'p>(
       return refused(PayloadRule::ClusterSize);
     }
   }
-  let document = match rules.ttml_document {
-    Some(_) => {
-      let document = state.document + len + TTML_PARAGRAPH_OVERHEAD;
-      if document > bounds.packet {
-        return refused(PayloadRule::DocumentSize);
-      }
-      Some(document)
+  // MP4's joined TTML: the paragraph's exact bytes, and its end. The
+  // document, of its exact bytes (R22's mirror; R24, Codex R23 3a — of an
+  // upper bound of each paragraph before R24), is one packet the trailer
+  // makes, past the largest packet failing it (`av_packet_from_data`,
+  // `movenc_ttml.c` 300–305; `packet.c` 172–175): refused at the paragraph
+  // that takes it past.
+  let ttml = state.ttml.filter(|_| !config_only).map(|ttml| {
+    let pts = i128::from(own.pts_ticks.unwrap_or(dts_ticks));
+    let at = pts + i128::from(duration_ticks);
+    TtmlCounts {
+      paragraphs: ttml.paragraphs + ttml_paragraph_bytes(pts, duration_ticks, len, time_base),
+      end: Some(ttml.end.map_or(at, |end| end.max(at))),
+      ..ttml
     }
-    None => None,
-  };
+  });
+  if ttml.is_some_and(|ttml| ttml.frame + ttml.paragraphs > bounds.packet) {
+    return refused(PayloadRule::DocumentSize);
+  }
   // The sample MP4 writes with the packet, where it writes one: the last
   // packet the track's filter puts out with it, and none where the filter
   // puts out none; not where MP4 holds the packet — a frame of fewer than
@@ -13397,19 +13766,13 @@ fn check_packet_rules<'p>(
       }),
     }
   };
-  // The MOV family's edit list, as its trailer writes it of the whole
-  // track: judged at `finish` (R22, the census of exactness — judged here,
-  // as though the track ended at its first sample, it refused a track whose
-  // span its version writes in 64 bits; [`EditSpan`]). Each sample MP4
-  // writes with the packet counts its decode time and presentation offset
-  // as libavformat hands them, its end — its duration as handed, past the
-  // skip samples MP4 reads (7311–7320) — and whether it is marked
-  // discarded: an E-AC-3 sample its first packet's, its end its last
-  // packet's own duration (6940). `mov_text`'s and TTML's samples lie at
-  // zero and after, and are not counted.
-  let edit = if rules.edit_list && !rules.mov_text && rules.ttml_document.is_none() && !config_only
-  {
-    let span = state.edit;
+  // The sample the MOV family writes with the packet, as libavformat hands
+  // it: its decode time, its presentation offset, its end's duration — as
+  // handed, past the skip samples MP4 reads (7311–7320) — and whether it is
+  // marked discarded; an E-AC-3 sample its first packet's, its end its last
+  // packet's own duration (6940). Of no TTML paragraph, which the trailer
+  // joins (table C″).
+  let mov_sample = if rules.mp4 && rules.ttml_document.is_none() && !config_only {
     let ends = |own: i64, end: Option<u32>| match (rules.skip_samples, end) {
       (Some(skip), Some(end)) => skip_trimmed(end, own, skip, time_base),
       _ => i128::from(own),
@@ -13417,20 +13780,20 @@ fn check_packet_rules<'p>(
     let discard = payload.flags.contains(PacketFlags::DISCARD);
     match ac3 {
       Some((_, Ac3Step::Opens | Ac3Step::Joins, _)) => None,
-      Some((_, Ac3Step::Completes(run), duration)) => Some(span.with(
+      Some((_, Ac3Step::Completes(run), duration)) => Some((
         i128::from(run.dts) + lift,
         i128::from(run.cts),
         ends(duration, run.skip_end),
         run.discard,
       )),
-      Some((_, Ac3Step::Alone, duration)) => Some(span.with(
+      Some((_, Ac3Step::Alone, duration)) => Some((
         i128::from(dts_ticks) + lift,
         i128::from(own.pts_ticks.unwrap_or(dts_ticks)) - i128::from(dts_ticks),
         ends(duration, skip_end(payload.side_data)),
         discard,
       )),
       None => outputs.last().map(|output| {
-        span.with(
+        (
           i128::from(output.dts_ticks) + lift,
           i128::from(output.pts_ticks.unwrap_or(output.dts_ticks)) - i128::from(output.dts_ticks),
           ends(
@@ -13444,6 +13807,31 @@ fn check_packet_rules<'p>(
   } else {
     None
   };
+  // Its `end_pts`, the sample's decode time, offset and duration summed in
+  // `int64_t` at the packet (`movenc.c` 7334–7340): past `INT64_MAX` a
+  // signed overflow, undefined (R24, the re-audit of signed arithmetic —
+  // judged at `finish` alone before R24). The decode time and the offset
+  // make the presentation time, which `int64_t` holds.
+  if let Some((dts, cts, duration, _)) = mov_sample
+    && dts + cts + duration > i128::from(i64::MAX)
+  {
+    return Err(FfmpegMuxRefusal::DurationTooLong {
+      track,
+      duration: match own.duration {
+        Some(offered) if i128::from(duration_ticks) == duration => offered,
+        _ => Timestamp::new(i64::try_from(duration).unwrap_or(i64::MAX), time_base),
+      },
+    });
+  }
+  // The MOV family's edit list, as its trailer writes it of the whole
+  // track: judged at `finish` (R22, the census of exactness — judged here,
+  // as though the track ended at its first sample, it refused a track whose
+  // span its version writes in 64 bits; [`EditSpan`]), of each sample's
+  // times above. `mov_text`'s samples lie at zero and after, and are not
+  // counted.
+  let edit = mov_sample
+    .filter(|_| rules.edit_list && !rules.mov_text)
+    .map(|(dts, cts, duration, discard)| state.edit.with(dts, cts, duration, discard));
   // IVF's frames, an `unsigned` raised at each packet it writes — each its
   // track's filter puts out — and written at its trailer in its header's 32
   // bits (`ivf_write_packet`, `ivfenc.c` 84; `ivf_write_trailer`, 100; R21,
@@ -13545,16 +13933,6 @@ fn check_packet_rules<'p>(
       },
     })
   };
-  // MP4's joined TTML: the paragraph's exact bytes, and its end.
-  let ttml = state.ttml.filter(|_| !config_only).map(|ttml| {
-    let pts = i128::from(own.pts_ticks.unwrap_or(dts_ticks));
-    let at = pts + i128::from(duration_ticks);
-    TtmlCounts {
-      paragraphs: ttml.paragraphs + ttml_paragraph_bytes(pts, duration_ticks, len, time_base),
-      end: Some(ttml.end.map_or(at, |end| end.max(at))),
-      ..ttml
-    }
-  });
   let durations = outputs.iter().any(|output| output.duration_ticks < 0)
     || cues.is_some_and(|cue| {
       cue.early
@@ -13575,7 +13953,9 @@ fn check_packet_rules<'p>(
       cues: cues.map(|cue| cue.next),
       ac3: ac3.map(|(learned, _, _)| learned),
       joined: matches!(ac3, Some((_, Ac3Step::Joins | Ac3Step::Completes(_), _))),
-      document,
+      remainder: None,
+      need: needs,
+      flv_end,
       durations,
       adts,
       bytes: payload.bytes.len() as u64,

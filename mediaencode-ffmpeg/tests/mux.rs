@@ -20125,3 +20125,501 @@ fn l201_mp4_holds_the_duration_libavformat_hands_it() {
   assert_eq!(refusal, payload(PayloadRule::SkipSamples), "1025 skipped");
   untouched!(past, back);
 }
+
+/// L202 (R24, Codex R23 [high]): Matroska sums each packet's end in
+/// `int64_t` — the time it writes, its codec delay added, then the
+/// duration libavformat hands it (`matroskaenc.c` 3134–3195) — and each sum
+/// is held to `INT64_MAX` exactly: a video frame ending at `INT64_MAX`
+/// written, one a millisecond longer refused by its duration; PCM of a
+/// 7 ms codec delay written up to it, its time past it with the delay
+/// refused by that time, and its end past it by its duration. Before
+/// libavformat's first write, a packet whose time moves the shift so that
+/// a packet held before it ends past `INT64_MAX` is refused by that time;
+/// one that moves it to `INT64_MAX` taken, and the file finished.
+///
+/// PLANT: the duration's sum unjudged; the codec delay left out of the
+/// time; the held packet's end left unjudged as the shift moves.
+#[test]
+fn l202_matroska_holds_each_end_it_sums_to_int64() {
+  let Some(corpus) = Corpus::new() else { return };
+  let max = i64::MAX;
+  let mkv = corpus.multi_track_mkv();
+  let (_, frames) = first_track(&mkv, TrackKind::Video, 1);
+  let video_table = || table_of(&mkv, TrackKind::Video);
+  let frame = |at: i64, duration: Option<i64>| {
+    VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_of(&frames[0])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at)))
+        .with_duration(duration.map(ms)),
+    )
+  };
+  let mut muxer = muxer_into(
+    &output(&corpus, "l202-end.mkv"),
+    ContainerName::MATROSKA,
+    video_table(),
+  );
+  wrote(
+    muxer.write_video(frame(max - 10, Some(10))),
+    "an end at INT64_MAX",
+  );
+  muxer.finish().expect("finished");
+  let mut muxer = muxer_into(
+    &output(&corpus, "l202-end-past.mkv"),
+    ContainerName::MATROSKA,
+    video_table(),
+  );
+  let past = frame(max - 10, Some(11));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::DurationTooLong {
+      track: TrackIndex::new(0),
+      duration: ms(11),
+    },
+    "an end past INT64_MAX"
+  );
+  untouched!(past, back);
+
+  // PCM of 312 samples' initial padding at 48 kHz: a codec delay of 7 ms.
+  let pcm = pcm_mov(&corpus);
+  let (_, samples) = first_track(&pcm, TrackKind::Audio, 1);
+  let padded = || {
+    vec![reticketed(
+      table_of(&pcm, TrackKind::Audio).remove(0),
+      |par| {
+        par.initial_padding = 312;
+      },
+    )]
+  };
+  let sample = |track: usize, at: i64, duration: Option<i64>| {
+    AudioTrackPacket::new(
+      TrackIndex::new(track),
+      audio_holding(&audio_of(&samples[0]), &[0x11; 4])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at)))
+        .with_duration(duration.map(ms)),
+    )
+  };
+  let mut muxer = muxer_into(
+    &output(&corpus, "l202-delay.mkv"),
+    ContainerName::MATROSKA,
+    padded(),
+  );
+  wrote(
+    muxer.write_audio(sample(0, max - 8, Some(1))),
+    "its delay and its duration to INT64_MAX",
+  );
+  muxer.finish().expect("finished");
+  for (at, duration, expected) in [
+    (
+      max - 6,
+      None,
+      FfmpegMuxRefusal::TimeWraps {
+        track: TrackIndex::new(0),
+        timestamp: ms(max - 6),
+      },
+    ),
+    (
+      max - 8,
+      Some(2),
+      FfmpegMuxRefusal::DurationTooLong {
+        track: TrackIndex::new(0),
+        duration: ms(2),
+      },
+    ),
+  ] {
+    let mut muxer = muxer_into(
+      &output(&corpus, &format!("l202-delay-{duration:?}.mkv")),
+      ContainerName::MATROSKA,
+      padded(),
+    );
+    let past = sample(0, at, duration);
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(past.clone())));
+    assert_eq!(refusal, expected, "at {at}");
+    untouched!(past, back);
+  }
+
+  // A video frame and PCM, the frame held by the interleaving until the
+  // PCM's first packet: one before zero moves both.
+  let both = || {
+    let mut table = video_table();
+    table.extend(table_of(&pcm, TrackKind::Audio));
+    table
+  };
+  let mut muxer = muxer_into(
+    &output(&corpus, "l202-held.mkv"),
+    ContainerName::MATROSKA,
+    both(),
+  );
+  wrote(muxer.write_video(frame(max - 10, Some(5))), "a frame held");
+  let early = sample(1, -10, None);
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(early.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(1),
+      timestamp: ms(-10),
+    },
+    "a move of 10 ms takes the held frame's end past INT64_MAX"
+  );
+  untouched!(early, back);
+  wrote(
+    muxer.write_audio(sample(1, -5, None)),
+    "a move of 5 ms takes it to INT64_MAX",
+  );
+  muxer.finish().expect("finished");
+}
+
+/// L203 (R24, Codex R23 [high]): FLV sums each video and audio tag's end
+/// into its file's duration in `int64_t` — its presentation time, the delay
+/// of its first decode time negated, and the duration libavformat hands
+/// it (`flvenc.c` 1267–1268, 1455–1456) — held to `INT64_MAX` exactly: a
+/// frame 10 ms after the first, of a duration to `INT64_MAX`, written; a
+/// millisecond longer, refused by its duration. Before libavformat's first
+/// write, a packet whose decode time lowers the head — the first decode
+/// time FLV writes — so that a held tag ends past `INT64_MAX` is refused by
+/// that time; one that lowers it to `INT64_MAX` taken. And one whose time
+/// moves libavformat's shift so that a held tag's decode time passes FLV's
+/// 31 bits is refused by that time (W11, held as the shift settles).
+///
+/// PLANT: the sum unjudged; the held tag's end, and its decode time, left
+/// unjudged as the head and the shift move.
+#[test]
+fn l203_flv_holds_each_end_it_sums_to_int64() {
+  let Some(corpus) = Corpus::new() else { return };
+  let max = i64::MAX;
+  let flv = ContainerName::new("flv");
+  let mkv = corpus.multi_track_mkv();
+  let (_, frames) = first_track(&mkv, TrackKind::Video, 2);
+  let video_table = || table_of(&mkv, TrackKind::Video);
+  let frame = |index: usize, at: i64, duration: i64| {
+    VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_of(&frames[index])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at)))
+        .with_duration(Some(ms(duration))),
+    )
+  };
+  let mut muxer = muxer_into(&output(&corpus, "l203-end.flv"), flv.clone(), video_table());
+  wrote(muxer.write_video(frame(0, 0, 1)), "the first frame");
+  wrote(
+    muxer.write_video(frame(1, 10, max - 10)),
+    "an end at INT64_MAX",
+  );
+  muxer.finish().expect("finished");
+  let mut muxer = muxer_into(
+    &output(&corpus, "l203-end-past.flv"),
+    flv.clone(),
+    video_table(),
+  );
+  wrote(muxer.write_video(frame(0, 0, 1)), "the first frame");
+  let past = frame(1, 10, max - 9);
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::DurationTooLong {
+      track: TrackIndex::new(0),
+      duration: ms(max - 9),
+    },
+    "an end past INT64_MAX"
+  );
+  untouched!(past, back);
+
+  // A frame and AAC, the frame held by the interleaving until the AAC's
+  // first packet, whose decode time becomes FLV's first.
+  let aac = h264_aac(&corpus, "h264-aac.mp4");
+  let (_, frames_aac) = first_track(&aac, TrackKind::Audio, 1);
+  let both = || {
+    let mut table = video_table();
+    table.extend(table_of(&aac, TrackKind::Audio));
+    table
+  };
+  let sound = |at: i64| {
+    AudioTrackPacket::new(
+      TrackIndex::new(1),
+      audio_of(&frames_aac[0])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at)))
+        .with_duration(Some(ms(1))),
+    )
+  };
+  let mut muxer = muxer_into(&output(&corpus, "l203-held.flv"), flv, both());
+  wrote(muxer.write_video(frame(0, 100, max - 50)), "a frame held");
+  let early = sound(0);
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(early.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(1),
+      timestamp: ms(0),
+    },
+    "a first decode time of 0 takes the held frame's end past INT64_MAX"
+  );
+  untouched!(early, back);
+  wrote(
+    muxer.write_audio(sound(50)),
+    "one of 50 ms takes it to INT64_MAX",
+  );
+  muxer.finish().expect("finished");
+  // FLV's decode time in 31 bits, as the shift moves it: a frame held at
+  // 10 ms before 2^31, moved by an AAC packet before zero.
+  let mut muxer = muxer_into(
+    &output(&corpus, "l203-held-bits.flv"),
+    ContainerName::new("flv"),
+    both(),
+  );
+  wrote(
+    muxer.write_video(frame(0, (1 << 31) - 10, 1)),
+    "a frame held",
+  );
+  for early in [-20, -10] {
+    let early = sound(early);
+    let (refusal, back) = by_container(refusing!(muxer.write_audio(early.clone())));
+    assert!(
+      matches!(refusal, FfmpegMuxRefusal::TimeWraps { track, .. } if track == TrackIndex::new(1)),
+      "a move that takes the held frame to 2^31: {refusal:?}"
+    );
+    untouched!(early, back);
+  }
+  wrote(muxer.write_audio(sound(-9)), "a move to 2^31 - 1");
+  muxer.finish().expect("finished");
+}
+
+/// L204 (R24, the re-audit of signed arithmetic): the MOV family sums each
+/// sample's end — its decode time, its presentation offset, its duration —
+/// into `end_pts` in `int64_t` at the packet (`movenc.c` 7334–7340), held
+/// to `INT64_MAX` exactly: a first sample ending there written, the file
+/// finished; one a tick longer refused by its duration.
+///
+/// PLANT: the end unjudged; judged a tick early.
+#[test]
+fn l204_mp4_holds_each_samples_end_to_int64() {
+  use mediaencode::mediaspine::demuxer::VideoTrackParams;
+  let Some(corpus) = Corpus::new() else { return };
+  let max = i64::MAX;
+  let (table, frames) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 1);
+  let tick = Timebase::new(1, NonZeroI32::new(90_000).expect("non-zero"));
+  let row = || {
+    let row = &table[0];
+    let params = match row.params() {
+      TrackParams::Video(params) => TrackParams::Video(VideoTrackParams::new(
+        params.codec(),
+        params.width(),
+        params.height(),
+        params.pixel_format().clone(),
+        None,
+      )),
+      other => other.duplicate(),
+    };
+    vec![
+      TrackDescription::new(tick, params, row.side_data().clone())
+        .expect("a description")
+        .with_extradata(Some(bytes_of(&stream_extradata_of(row)))),
+    ]
+  };
+  let frame = |at: i64, duration: Option<i64>| {
+    VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_of(&frames[0])
+        .with_pts(Some(Timestamp::new(at, tick)))
+        .with_dts(Some(Timestamp::new(at, tick)))
+        .with_duration(duration.map(|ticks| Timestamp::new(ticks, tick))),
+    )
+  };
+  let mut muxer = muxer_into(&output(&corpus, "l204-end.mp4"), ContainerName::MP4, row());
+  wrote(
+    muxer.write_video(frame(max - 3000, Some(3000))),
+    "an end at INT64_MAX",
+  );
+  muxer.finish().expect("finished");
+  let mut muxer = muxer_into(
+    &output(&corpus, "l204-end-past.mp4"),
+    ContainerName::MP4,
+    row(),
+  );
+  let past = frame(max - 3000, Some(3001));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::DurationTooLong {
+      track: TrackIndex::new(0),
+      duration: Timestamp::new(3001, tick),
+    },
+    "an end past INT64_MAX"
+  );
+  untouched!(past, back);
+
+  // L205's first row: libavformat counts the decode time after a video
+  // packet a tick after it, in `int64_t`.
+  let mut muxer = muxer_into(
+    &output(&corpus, "l205-video.mp4"),
+    ContainerName::MP4,
+    row(),
+  );
+  let last = frame(max, None);
+  let (refusal, back) = by_container(refusing!(muxer.write_video(last.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: Timestamp::new(max, tick),
+    },
+    "a decode time at INT64_MAX"
+  );
+  untouched!(last, back);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l205-video-below.mp4"),
+    ContainerName::MP4,
+    row(),
+  );
+  wrote(muxer.write_video(frame(max - 1, None)), "a tick below");
+}
+
+/// L205 (R24, the re-audit of signed arithmetic): libavformat's own sums
+/// of a packet's times in `int64_t` (`mux.c`) — the decode time it counts
+/// after each packet (571–599): a video packet's a tick after it (L204's
+/// last rows), an audio packet's its samples after it, the remainder
+/// carried from packet to packet — PCM of 1024 samples a packet at
+/// 48 kHz, counted in milliseconds, its second packet at `INT64_MAX − 22`
+/// taken and at `INT64_MAX − 21` refused, where a count that did not carry
+/// the first packet's remainder would take it; and its shift's move added
+/// to each time (685–688): IVF moved 10 ms by its first packet, a frame
+/// moved to `INT64_MAX` taken, a millisecond later refused.
+///
+/// PLANT: the remainder not carried; the shift's sum unjudged.
+#[test]
+fn l205_libavformat_holds_its_own_sums_to_int64() {
+  let Some(corpus) = Corpus::new() else { return };
+  let max = i64::MAX;
+  let pcm = pcm_mov(&corpus);
+  let (_, samples) = first_track(&pcm, TrackKind::Audio, 1);
+  let table = || table_of(&pcm, TrackKind::Audio);
+  let frame = |at: i64| {
+    AudioTrackPacket::new(
+      TrackIndex::new(0),
+      audio_holding(&audio_of(&samples[0]), &[0x11; 4096])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at)))
+        .with_duration(Some(ms(1))),
+    )
+  };
+  let mut muxer = muxer_into(
+    &output(&corpus, "l205-audio.mkv"),
+    ContainerName::MATROSKA,
+    table(),
+  );
+  wrote(muxer.write_audio(frame(0)), "the first packet");
+  wrote(muxer.write_audio(frame(max - 22)), "a count to INT64_MAX");
+  muxer.finish().expect("finished");
+  let mut muxer = muxer_into(
+    &output(&corpus, "l205-audio-past.mkv"),
+    ContainerName::MATROSKA,
+    table(),
+  );
+  wrote(muxer.write_audio(frame(0)), "the first packet");
+  let past = frame(max - 21);
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: ms(max - 21),
+    },
+    "a count past INT64_MAX"
+  );
+  untouched!(past, back);
+
+  let av1 = av1_mkv(&corpus);
+  let (_, frames) = first_track(&av1, TrackKind::Video, 2);
+  let table = || table_of(&av1, TrackKind::Video);
+  let frame = |index: usize, at: i64| {
+    VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_of(&frames[index])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at)))
+        .with_duration(Some(ms(0))),
+    )
+  };
+  let ivf = ContainerName::new("ivf");
+  let mut muxer = muxer_into(&output(&corpus, "l205-shift.ivf"), ivf.clone(), table());
+  wrote(
+    muxer.write_video(frame(0, -10)),
+    "a first frame 10 ms before zero",
+  );
+  wrote(muxer.write_video(frame(1, max - 10)), "moved to INT64_MAX");
+  muxer.finish().expect("finished");
+  let mut muxer = muxer_into(&output(&corpus, "l205-shift-past.ivf"), ivf, table());
+  wrote(
+    muxer.write_video(frame(0, -10)),
+    "a first frame 10 ms before zero",
+  );
+  let past = frame(1, max - 9);
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: ms(max - 9),
+    },
+    "moved past INT64_MAX"
+  );
+  untouched!(past, back);
+}
+
+/// L206 (R24, Codex R23 3a): MP4's joined TTML document is held to the
+/// largest packet exactly, of its exact bytes: lowered to the bytes of the
+/// document two paragraphs make, both taken and the file finished; to one
+/// byte fewer, the second refused ([`PayloadRule::DocumentSize`]).
+///
+/// PLANT: judged a byte early.
+#[test]
+fn l206_mp4s_ttml_document_is_held_to_the_largest_packet_exactly() {
+  let Some(corpus) = Corpus::new() else { return };
+  let ttml = ttml_mp4(&corpus);
+  let (_, paragraphs) = first_track(&ttml, TrackKind::Subtitle, 1);
+  let paragraph = subtitle_of(&paragraphs[0]);
+  // Counted in milliseconds, of libavcodec's TTML encoder's configuration.
+  let table = || {
+    let row = table_of(&ttml, TrackKind::Subtitle).remove(0);
+    let mut row =
+      TrackDescription::new(millis(), row.params().duplicate(), row.side_data().clone())
+        .expect("a description");
+    row.set_extradata(Some(bytes_of(b"lavc-ttmlenc")));
+    vec![row]
+  };
+  let cue = |index: usize| {
+    let (at, text) = [(0, &b"hello"[..]), (1000, b"world")][index];
+    subtitle_ticks(&subtitle_holding(&paragraph, text), millis(), at, 1000)
+  };
+  let measured = output(&corpus, "l206-measured.mp4");
+  let mut muxer = muxer_into(&measured, ContainerName::MP4, table());
+  wrote(muxer.write_subtitle(cue(0)), "the first paragraph");
+  wrote(muxer.write_subtitle(cue(1)), "the second");
+  muxer.finish().expect("finished");
+  let (_, document) = first_track(&measured, TrackKind::Subtitle, 1);
+  let bytes = subtitle_of(&document[0]).data().as_ref().len() as u64;
+  let mut muxer = muxer_with(
+    &output(&corpus, "l206-largest.mp4"),
+    ContainerName::MP4,
+    table(),
+    MuxOptions::new().with_lowered_bounds(bytes, u64::MAX),
+  );
+  wrote(muxer.write_subtitle(cue(0)), "the first paragraph");
+  wrote(muxer.write_subtitle(cue(1)), "the second, to the bound");
+  muxer.finish().expect("finished");
+  let mut muxer = muxer_with(
+    &output(&corpus, "l206-past.mp4"),
+    ContainerName::MP4,
+    table(),
+    MuxOptions::new().with_lowered_bounds(bytes - 1, u64::MAX),
+  );
+  wrote(muxer.write_subtitle(cue(0)), "the first paragraph");
+  let past = cue(1);
+  let (refusal, back) = by_container(refusing!(muxer.write_subtitle(past.clone())));
+  assert_eq!(refusal, payload(PayloadRule::DocumentSize), "a byte past");
+  untouched!(past, back);
+}
