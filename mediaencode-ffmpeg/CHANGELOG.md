@@ -466,6 +466,13 @@ crate moves only when it changes.
   Annex B rewrite counted exactly, MP4's HEVC under `hvc1` refused only
   where its buffer's cut takes a unit its walk keeps (`RewrittenSize`; the
   laws' seam `MuxOptions::with_lowered_sum_bound`, hidden).
+- **The duration libavformat hands (R23).** Every judgment that reads a
+  packet's duration reads the one libavformat hands the container — the
+  packet's own, else its guess (`guess_pkt_duration`): MP4's limit of
+  `INT_MAX` ticks, a guess past it refused by name with the guessed
+  duration in the stream's time base and the packet handed back, where
+  `check_pkt` failed the write (`DurationTooLong`), and MP4's skip samples
+  (`SkipSamples`), which counted a packet of no duration as one frame.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer
