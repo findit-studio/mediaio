@@ -8856,16 +8856,21 @@ fn l103_avifs_held_samples_are_held_to_its_buffer() {
 
 /// **L104 — WAV refuses the packet that would take its fact chunk's count
 /// of samples past its 32 bits** (R9, the class; table H; `wavenc.c`
-/// 347–352, 409–420, 448–462): WAV writes a fact chunk for every codec tag
-/// but integer PCM's, its count of samples the presentation span with the
-/// last packet's duration, cut past 32 bits at the trailer, which its
-/// reader takes as the stream's length. With the bound lowered to 20 000,
-/// IMA ADPCM — two samples a byte — is refused at the packet whose span,
-/// its duration counted, passes it ([`PayloadRule::FileSize`]), by name,
-/// untouched, its file not much more than half the bound (L78: integer
-/// PCM, of no fact chunk, refused only where its file passes it).
+/// 347–352, 409–420, 448–462; R22, the census of exactness): WAV writes a
+/// fact chunk for every codec tag but integer PCM's, its count of samples
+/// the presentation span with the last packet's duration, cut past 32 bits
+/// at the trailer, which its reader takes as the stream's length. With the
+/// bound lowered to 20 000, IMA ADPCM — two samples a byte — is refused at
+/// the packet whose span alone passes it ([`PayloadRule::FileSize`]), by
+/// name, untouched, and the trailer after the packet before it, whose span
+/// and duration pass it, at `finish`, by the same name; a first packet
+/// whose duration passes the bound, a second's replacing it, written whole
+/// (L78: integer PCM, of no fact chunk, refused only where its file passes
+/// it).
 ///
-/// PLANT: the count unjudged takes the packets until the file passes.
+/// PLANT: the span unjudged takes the packets until the file passes; the
+/// count with the last duration unjudged at `finish`; the duration judged
+/// at each packet.
 #[test]
 fn l104_wav_refuses_a_fact_count_past_its_32_bits() {
   let Some(corpus) = Corpus::new() else { return };
@@ -8888,18 +8893,24 @@ fn l104_wav_refuses_a_fact_count_past_its_32_bits() {
     })
     .collect();
   let expected = (0..frames.len())
-    .find(|&index| ticks(&frames[index]) - origin + lengths[index] > BOUND)
+    .find(|&index| ticks(&frames[index]) - origin > BOUND)
     .expect("a packet past the bound");
   assert!(expected > 2, "the premise: a few packets within it");
-  let options = MuxOptions::new().with_lowered_file_bound(BOUND as u64);
-  let target = output(&corpus, "l104.wav");
-  let mut muxer = muxer_with(&target, ContainerName::new("wav"), table, options);
-  for (index, frame) in frames.iter().enumerate() {
-    let packet = audio_of(frame);
+  let offered = |index: usize, length: i64| {
+    let packet = audio_of(&frames[index]);
     let time_base = packet.pts().expect("a time").timebase();
-    let offered =
-      audio_on_zero(packet.with_duration(Some(Timestamp::new(lengths[index], time_base))));
-    let result = refusing!(muxer.write_audio(offered.clone()));
+    audio_on_zero(packet.with_duration(Some(Timestamp::new(length, time_base))))
+  };
+  let options = MuxOptions::new().with_lowered_file_bound(BOUND as u64);
+  let mut muxer = muxer_with(
+    &output(&corpus, "l104.wav"),
+    ContainerName::new("wav"),
+    table,
+    options,
+  );
+  for index in 0..=expected {
+    let packet = offered(index, lengths[index]);
+    let result = refusing!(muxer.write_audio(packet.clone()));
     if index < expected {
       result
         .map_err(|error| error.map_packet(drop))
@@ -8908,14 +8919,34 @@ fn l104_wav_refuses_a_fact_count_past_its_32_bits() {
     }
     let (refusal, back) = by_container(result);
     assert_eq!(refusal, payload(PayloadRule::FileSize), "at packet {index}");
-    untouched!(offered, back);
-    break;
+    untouched!(packet, back);
   }
-  muxer.finish().expect("finished");
-  let written = std::fs::metadata(&target).expect("the file").len();
-  assert!(
-    written < BOUND as u64 * 3 / 5,
-    "the file at {written} bytes: the count passed first"
+  let fault = muxer
+    .finish()
+    .expect_err("the last span and duration past it");
+  assert_eq!(
+    fault.refusal(),
+    Some(FfmpegMuxRefusal::Payload {
+      track: TrackIndex::new(0),
+      rule: PayloadRule::FileSize,
+    }),
+    "at finish"
+  );
+  // A duration past the bound a later packet's replaces.
+  let target = output(&corpus, "l104-replaced.wav");
+  let (table, _) = whole_track(&adpcm, TrackKind::Audio);
+  let mut muxer = muxer_with(&target, ContainerName::new("wav"), table, options);
+  for (index, length) in [(0, BOUND + 1), (1, lengths[1])] {
+    muxer
+      .write_audio(offered(index, length))
+      .map_err(|error| error.map_packet(drop))
+      .unwrap_or_else(|error| panic!("packet {index}: {error:?}"));
+  }
+  muxer.finish().expect("the last duration within the count");
+  assert_eq!(
+    i64::from(wav_fact(&target)),
+    lengths[0] + lengths[1],
+    "the span with the last duration"
   );
 }
 
@@ -13945,7 +13976,9 @@ fn l151_a_packet_of_no_new_extradata_allocates_nothing_for_descriptions() {
   let Some(corpus) = Corpus::new() else { return };
   let source = audio_file(&corpus, "l151.mp4", "aac");
   let (table, frames) = first_track(&source, TrackKind::Audio, 1);
-  let frame = audio_of(&frames[0]);
+  // The source's first frame, its priming, read back marked discarded: a
+  // track of nothing else spans no time MP4 can write (R22).
+  let frame = audio_of(&frames[0]).with_flags(PacketFlags::KEY);
   let mut muxer = muxer_into(&output(&corpus, "l151.mp4"), ContainerName::MP4, table);
   let configuration = |k: u8| {
     let mut bytes = vec![k; 64 * 1024];
@@ -14953,7 +14986,7 @@ fn l159_a_packet_refused_by_any_rule_allocates_nothing() {
     &output(&corpus, "l159-rewritten.mp4"),
     ContainerName::MP4,
     table,
-    MuxOptions::new().with_lowered_bounds(16, u64::MAX),
+    MuxOptions::new().with_lowered_sum_bound(16),
   );
   let (refusal, _) = by_container(refusing!(muxer.write_video(VideoTrackPacket::new(
     TrackIndex::new(0),
@@ -15728,7 +15761,7 @@ fn l164_in_a_process_of_its_own() {
     &output(&corpus, "l164-rewritten.mp4"),
     ContainerName::MP4,
     table,
-    MuxOptions::new().with_lowered_bounds(16, u64::MAX),
+    MuxOptions::new().with_lowered_sum_bound(16),
   );
   let offered = VideoTrackPacket::new(TrackIndex::new(0), video_of(&frames[0]));
   let result = {
@@ -16488,9 +16521,13 @@ fn record_of(path: &Path, kind: TrackKind) -> Vec<u8> {
 /// `avc.c` 50). Of a configuration whose SPS opens on a 4-byte start code
 /// and whose PPS on a 3-byte one — its rewrite a byte longer than it —
 /// each writer's record reads back the same at a bound of the rewrite's
-/// bytes; a byte below, the track is refused by name, nothing written.
+/// bytes; a byte below, the track is refused by name, nothing written. And
+/// exactly where it is cut (R22, the census of exactness): the buffer cut
+/// within an SEI of 3000 bytes the record leaves out, after the SPS and the
+/// PPS, the record reads back whole; within it before the PPS, refused.
 ///
-/// PLANT: the rewrite unjudged, judged a byte early, or not FLV's.
+/// PLANT: the rewrite unjudged, judged a byte early, or not FLV's; the cut
+/// refused whatever it takes.
 #[test]
 fn l174_a_configurations_annex_b_rewrite_is_held_to_its_buffer() {
   let Some(corpus) = Corpus::new() else { return };
@@ -16569,6 +16606,40 @@ fn l174_a_configurations_annex_b_rewrite_is_held_to_its_buffer() {
       std::fs::metadata(&refused).expect("the sink").len(),
       0,
       "{extension}: nothing written"
+    );
+    // An SEI of 3000 bytes, which the record leaves out: the buffer cut
+    // within it — `1024 × ⌊(bound + 64) / 1024⌋ − 64` bytes walked, a
+    // bound of that form its own — after the PPS, and before it.
+    let sei = [&[0, 0, 1, 0x06, 0x05][..], &[0x55; 2998]].concat();
+    let walked = |end: u64| (end + 63) / 1024 * 1024 - 64;
+    let after = [&config[..], &sei].concat();
+    let cut = walked(rewritten + 4 + 3000);
+    let opened = |name: &str, config: &[u8], bound: u64| {
+      FfmpegOwnedMuxer::open_with(
+        File::create(output(&corpus, &format!("{name}.{extension}"))).expect("create"),
+        container.clone(),
+        vec![restated(
+          &row,
+          ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+          config,
+          None,
+          None,
+        )],
+        &[],
+        MuxOptions::new().with_lowered_rewrite_bound(bound),
+      )
+      .map(drop)
+    };
+    opened("l174-cut-sei", &after, cut)
+      .unwrap_or_else(|error| panic!("{extension}: an SEI cut, {error:?}"));
+    let before = [&[0, 0, 0, 1][..], &sps, &sei, &[0, 0, 1], &pps].concat();
+    let cut = walked(4 + sps.len() as u64 + 4 + 3000);
+    assert!(
+      matches!(
+        opened("l174-cut-pps", &before, cut),
+        Err(MuxOpenError::ConfigurationInvalid { .. })
+      ),
+      "{extension}: the PPS cut away"
     );
   }
 }
@@ -17955,20 +18026,23 @@ fn wav_fact(path: &Path) -> u32 {
 
 /// **L186 — WAV counts a packet that states no duration as libavformat
 /// guesses it** (R21, Codex R20 2, ruled: the library's question; a length
-/// that wraps is refused): libavformat gives such a packet libavcodec's
-/// count of its samples, of the stream's parameters and the packet's size
+/// that wraps is refused; R22, the census of exactness: the last packet's,
+/// judged at `finish`): libavformat gives such a packet libavcodec's count
+/// of its samples, of the stream's parameters and the packet's size
 /// (`guess_pkt_duration`, `mux.c` 605–633; `av_get_audio_frame_duration2`,
 /// `libavcodec/utils.c` 578–833), and WAV counts the last packet's into its
 /// fact chunk's 32 bits (`wavenc.c` 409–420, 448–462). AC-3 whose stream
 /// states no frame size — 1536 samples whatever its bytes — and float PCM,
 /// its samples its bytes over four a channel: two such packets at zero and
 /// at the latest time the count holds, written, the fact chunk counting
-/// 2^32 − 1; at a sample later, the second refused by name, untouched. And
-/// a duration stated past the `int` WAV keeps the last one in (82, 412):
-/// refused by name; at `INT_MAX`, written and counted.
+/// 2^32 − 1; at a sample later, the second taken — its span alone within
+/// the count — and the trailer refused by name at `finish`. And a duration
+/// stated past the `int` WAV keeps the last one in (82, 412): of the last
+/// packet, refused by name at `finish`; replaced by a later packet's,
+/// written; at `INT_MAX`, written and counted.
 ///
 /// PLANT: the guess unasked; the guess asked of no bytes; the `int`
-/// unjudged.
+/// unjudged; the last duration unjudged at `finish`.
 #[test]
 fn l186_wav_counts_a_durationless_packet_as_libavformat_guesses_it() {
   let Some(corpus) = Corpus::new() else { return };
@@ -17991,6 +18065,10 @@ fn l186_wav_counts_a_durationless_packet_as_libavformat_guesses_it() {
         .with_duration(duration.map(|ticks| Timestamp::new(ticks, rate))),
     )
   };
+  let count_cut = Some(FfmpegMuxRefusal::Payload {
+    track: TrackIndex::new(0),
+    rule: PayloadRule::FileSize,
+  });
   // Each case: the source, the samples libavcodec counts of its packet.
   for (name, source, samples) in [("ac3", &ac3, None), ("f32", &float, Some(8))] {
     let (_, frames) = first_track(source, TrackKind::Audio, 2);
@@ -18010,45 +18088,38 @@ fn l186_wav_counts_a_durationless_packet_as_libavformat_guesses_it() {
     for (case, second_at, taken) in [("at", latest, true), ("past", latest + 1, false)] {
       let target = output(&corpus, &format!("l186-{name}-{case}.wav"));
       let mut muxer = muxer_into(&target, ContainerName::new("wav"), table());
-      muxer
-        .write_audio(at(first.clone(), 0, None))
-        .map_err(|error| error.map_packet(drop))
-        .unwrap_or_else(|error| panic!("{name} {case}: {error:?}"));
-      let offered = at(second.clone(), second_at, None);
-      let result = refusing!(muxer.write_audio(offered.clone()));
-      if taken {
-        result
+      for (packet, ticks) in [(&first, 0), (&second, second_at)] {
+        muxer
+          .write_audio(at(packet.clone(), ticks, None))
           .map_err(|error| error.map_packet(drop))
           .unwrap_or_else(|error| panic!("{name} {case}: {error:?}"));
-      } else {
-        let Err(MuxError::Backend {
-          refusal,
-          packet: back,
-        }) = result
-        else {
-          panic!("{name} {case}: expected the container's refusal, got {result:?}");
-        };
-        assert_eq!(refusal, payload(PayloadRule::FileSize), "{name} {case}");
-        untouched!(offered, back);
       }
-      muxer
-        .finish()
-        .unwrap_or_else(|error| panic!("{name} {case}: {error:?}"));
+      let finished = muxer.finish();
       if taken {
+        finished.unwrap_or_else(|error| panic!("{name} {case}: {error:?}"));
         assert_eq!(
           wav_fact(&target),
           u32::MAX,
           "{name}: the count FFmpeg writes"
         );
+      } else {
+        assert_eq!(
+          finished.expect_err("past the count").refusal(),
+          count_cut,
+          "{name} {case}"
+        );
       }
     }
   }
-  // A stated duration past the `int`.
+  // A stated duration past the `int`: the last packet's, and one a later
+  // packet's replaces.
   let (_, frames) = first_track(&ac3, TrackKind::Audio, 1);
   let packet = audio_of(&frames[0]);
-  for (case, duration, taken) in [
-    ("int", i64::from(i32::MAX), true),
-    ("past-int", i64::from(i32::MAX) + 1, false),
+  let past = i64::from(i32::MAX) + 1;
+  for (case, durations, kept) in [
+    ("int", &[i64::from(i32::MAX)][..], Some(i32::MAX as u32)),
+    ("past-int", &[past][..], None),
+    ("replaced", &[past, 1536][..], Some(1536 + 1536)),
   ] {
     let target = output(&corpus, &format!("l186-{case}.wav"));
     let mut muxer = muxer_into(
@@ -18056,31 +18127,25 @@ fn l186_wav_counts_a_durationless_packet_as_libavformat_guesses_it() {
       ContainerName::new("wav"),
       table_of(&ac3, TrackKind::Audio),
     );
-    let offered = at(packet.clone(), 0, Some(duration));
-    let result = refusing!(muxer.write_audio(offered.clone()));
-    if taken {
-      result
+    for (index, &duration) in durations.iter().enumerate() {
+      muxer
+        .write_audio(at(packet.clone(), 1536 * index as i64, Some(duration)))
         .map_err(|error| error.map_packet(drop))
         .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-    } else {
-      let Err(MuxError::Backend {
-        refusal,
-        packet: back,
-      }) = result
-      else {
-        panic!("{case}: expected the container's refusal, got {result:?}");
-      };
-      assert!(
-        matches!(refusal, FfmpegMuxRefusal::DurationTooLong { .. }),
-        "{case}: {refusal:?}"
-      );
-      untouched!(offered, back);
     }
-    muxer
-      .finish()
-      .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-    if taken {
-      assert_eq!(wav_fact(&target), i32::MAX as u32, "{case}: counted");
+    let finished = muxer.finish();
+    match kept {
+      Some(count) => {
+        finished.unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_eq!(wav_fact(&target), count, "{case}: counted");
+      }
+      None => assert!(
+        matches!(
+          finished.expect_err("refused at finish").refusal(),
+          Some(FfmpegMuxRefusal::DurationTooLong { .. })
+        ),
+        "{case}"
+      ),
     }
   }
 }
@@ -18167,51 +18232,84 @@ fn open_law(
 }
 
 /// **L188 — MP4's edit list holds the track's first decode time to the 32
-/// bits of its media time** (R21, census R20-5: a value FFmpeg holds wider
-/// than the field it writes): of version 0 — the track's span and its
-/// delay within `INT32_MAX` movie ticks — the edit list's media time is
-/// the first decode time negated where it lies before zero, written in 32
-/// bits (`mov_write_edts_tag`, `movenc.c` 4135–4239). A first packet at
-/// `-2^31` ticks of MP4's 1/16 000 — the source's milliseconds doubled to
-/// 10 000 and past (`mov_init`, 8490–8492) — is refused by name, untouched;
-/// one 16 ticks later is written, its media time `2^31 - 16`.
+/// bits of its media time, judged of the whole track** (R21, census R20-5;
+/// R22, the census of exactness): of version 0 — the edit's span and its
+/// delay within `INT32_MAX` movie ticks — the edit list's media time is the
+/// first decode time negated where it lies before zero, written in 32 bits
+/// (`mov_write_edts_tag`, `movenc.c` 4135–4239), and the version is the
+/// whole track's. A first frame at `-2^31` ticks of MP4's 1/16 000 — the
+/// source's milliseconds doubled to 10 000 and past (`mov_init`, 8490–8492)
+/// — the track ending 40 ms after zero, is taken, and refused by name at
+/// `finish`, the output abandoned; the same frame, the track spanning 2^31
+/// ms after it, written of version 1, its media time 2^31 in 64 bits; one 16
+/// ticks later written of version 0, its media time `2^31 - 16`. And the
+/// span below zero: a track of one frame ending 960 ms before zero refused
+/// by name at `finish` ([`FfmpegMuxRefusal::NegativeSpan`]), one ending at
+/// zero written; a frame at 1 s marked discarded, which leaves the edit's
+/// end at zero, refused so.
 ///
-/// PLANT: the first decode time unjudged.
+/// PLANT: the edit lists unjudged at `finish`; the version taken as 0; the
+/// discarded frame's end counted; the delay not added to the span.
 #[test]
 fn l188_mp4s_edit_list_holds_the_first_decode_time_to_its_32_bits() {
   let Some(corpus) = Corpus::new() else { return };
   let source = corpus.multi_track_mkv();
   let (_, packets) = first_track(&source, TrackKind::Video, 1);
-  let frame = video_of(&packets[0]);
+  let frame = video_of(&packets[0]).with_duration(Some(ms(40)));
+  let tick = Timebase::new(1, NonZeroI32::new(16_000).expect("non-zero"));
   let earliest = -(1_i64 << 27);
-  let refused_target = output(&corpus, "l188-past.mp4");
-  let mut muxer = muxer_into(
-    &refused_target,
-    ContainerName::MP4,
-    table_of(&source, TrackKind::Video),
-  );
-  let past = video_at(&frame, Some(earliest), earliest);
-  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
-  assert_eq!(
-    refusal,
-    FfmpegMuxRefusal::TimeWraps {
-      track: TrackIndex::new(0),
-      timestamp: ms(earliest),
+  // The frames `at` (ms) written, finished; the file, or the fault.
+  let finished = |name: &str, frames: &[(i64, bool)]| {
+    let target = output(&corpus, name);
+    let mut muxer = muxer_into(
+      &target,
+      ContainerName::MP4,
+      table_of(&source, TrackKind::Video),
+    );
+    for &(at, discard) in frames {
+      let mut offered = frame.clone().with_pts(Some(ms(at))).with_dts(Some(ms(at)));
+      if discard {
+        let flags = offered.flags() | PacketFlags::DISCARD;
+        offered = offered.with_flags(flags);
+      }
+      muxer
+        .write_video(VideoTrackPacket::new(TrackIndex::new(0), offered))
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{name}: a frame at {at}, {error:?}"));
     }
+    muxer.finish().map(|()| target)
+  };
+  let refusal = |result: Result<PathBuf, mediaencode_ffmpeg::MuxFault>| {
+    result.expect_err("refused at finish").refusal()
+  };
+  // The first decode time at -2^31 ticks, the track ending 40 ms after
+  // zero — each frame within the 32 bits of `stts` after the one before.
+  let ending = |first: i64| [(first, false), (-(1 << 26), false), (0, false)];
+  assert_eq!(
+    refusal(finished("l188-past.mp4", &ending(earliest))),
+    Some(FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: Timestamp::new(-(1_i64 << 31), tick),
+    }),
+    "the media time of version 0"
   );
-  untouched!(past, back);
-  drop(muxer);
-  let target = output(&corpus, "l188.mp4");
-  let mut muxer = muxer_into(
-    &target,
-    ContainerName::MP4,
-    table_of(&source, TrackKind::Video),
+  // The same first frame, 17 more each 2^27 - 1 ms on — each within the
+  // 32 bits of `stts` — the edit 2^31 + 2^27 + 23 ms long: version 1.
+  let spanned: Vec<(i64, bool)> = (0..18)
+    .map(|k| (earliest + k * ((1 << 27) - 1), false))
+    .collect();
+  let target = finished("l188-spanned.mp4", &spanned).expect("of version 1");
+  let bytes = std::fs::read(&target).expect("the file");
+  let elst = after_fourcc(&bytes, b"elst");
+  assert_eq!(bytes[elst], 1, "version 1");
+  assert_eq!(be32(&bytes, elst + 4), 1, "one entry");
+  assert_eq!(
+    (u64::from(be32(&bytes, elst + 16)) << 32) | u64::from(be32(&bytes, elst + 20)),
+    1_u64 << 31,
+    "the media time in 64 bits"
   );
-  muxer
-    .write_video(video_at(&frame, Some(earliest + 1), earliest + 1))
-    .map_err(|error| error.map_packet(drop))
-    .expect("the earliest first decode time the media time holds");
-  muxer.finish().expect("finished");
+  // 16 ticks later: version 0, the media time within its 32 bits.
+  let target = finished("l188.mp4", &ending(earliest + 1)).expect("of version 0");
   let bytes = std::fs::read(&target).expect("the file");
   let elst = after_fourcc(&bytes, b"elst");
   assert_eq!(bytes[elst], 0, "version 0");
@@ -18220,6 +18318,21 @@ fn l188_mp4s_edit_list_holds_the_first_decode_time_to_its_32_bits() {
     be32(&bytes, elst + 12),
     (1_u32 << 31) - 16,
     "the media time, the first decode time negated"
+  );
+  // The span below zero.
+  let negative = Some(FfmpegMuxRefusal::NegativeSpan {
+    track: TrackIndex::new(0),
+  });
+  assert_eq!(
+    refusal(finished("l188-before-zero.mp4", &[(-1000, false)])),
+    negative,
+    "a track ending before zero"
+  );
+  finished("l188-at-zero.mp4", &[(-40, false)]).expect("a track ending at zero");
+  assert_eq!(
+    refusal(finished("l188-discarded.mp4", &[(1000, true)])),
+    negative,
+    "a track of a discarded frame"
   );
 }
 
@@ -19629,4 +19742,259 @@ fn l198_the_mov_familys_bit_rates_are_judged_at_its_trailer() {
       .expect("a frame");
   }
   muxer.finish().expect("finished, of no btrt");
+}
+
+/// The width and height the first `tkhd` of the file at `path` writes, in
+/// 16.16 — of version 0, after its 76 bytes before them.
+fn track_header_size(path: &Path) -> (u32, u32) {
+  let bytes = std::fs::read(path).expect("the file");
+  let tkhd = after_fourcc(&bytes, b"tkhd");
+  assert_eq!(bytes[tkhd], 0, "version 0");
+  (be32(&bytes, tkhd + 76), be32(&bytes, tkhd + 80))
+}
+
+/// **L199 — the MOV family's track header holds a subtitle track's
+/// dimensions to its fields** (R22, the census of exactness: movenc writes
+/// a subtitle track's as a video's, `mov_write_tkhd_tag`, `movenc.c`
+/// 4064–4090): the width in 16.16 past 32 bits written as none, the height
+/// past 16 bits so, below zero wrapped; outside MOV and AVIF the width by
+/// the aspect ratio. A `mov_text` track of a width of 65 536, of a height
+/// of 65 536, of a width below zero, or in MP4 of an aspect ratio its
+/// 16.16 width passes 32 bits by: refused at open by name
+/// ([`MuxOpenError::Dimensions`]), nothing written; of 65 535 written as
+/// counted, in MOV of that ratio too. A DVD subtitle track's, the size its
+/// configuration's `size:` line states (8000–8046): 70 000 wide refused,
+/// one past an `int` refused; 1920 × 1080 written so, a size scanned across
+/// a line break so, of no size line 720 × 480.
+///
+/// PLANT: a subtitle's dimensions unjudged; the DVD subtitle's size line
+/// unread.
+#[test]
+fn l199_the_mov_familys_track_header_holds_a_subtitles_dimensions() {
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  let Some(corpus) = Corpus::new() else { return };
+  let dimensions: &dyn Fn(&MuxOpenError) -> bool =
+    &|error| matches!(error, MuxOpenError::Dimensions { .. });
+  let movtext = mov_text_ms_mp4(&corpus);
+  let sized = |width: i32, height: i32, ratio: (i32, i32)| {
+    reticketed(table_of(&movtext, TrackKind::Subtitle).remove(0), |par| {
+      par.width = width;
+      par.height = height;
+      par.sample_aspect_ratio = ffmpeg_next::ffi::AVRational {
+        num: ratio.0,
+        den: ratio.1,
+      };
+    })
+  };
+  for (name, row) in [
+    ("l199-wide.mp4", sized(65_536, 10, (0, 1))),
+    ("l199-tall.mp4", sized(10, 65_536, (0, 1))),
+    ("l199-negative.mp4", sized(-1, 10, (0, 1))),
+    ("l199-ratio.mp4", sized(65_535, 10, (2, 1))),
+  ] {
+    open_law(&corpus, name, "mp4", vec![row], Some(dimensions));
+  }
+  // At the fields, written as counted.
+  let written = |name: &str, container: ContainerName, row: Described, path: &Path| {
+    let target = output(&corpus, name);
+    let mut muxer = muxer_into(&target, container, vec![row]);
+    let (_, cues) = first_track(path, TrackKind::Subtitle, 1);
+    wrote(
+      muxer.write_subtitle(SubtitleTrackPacket::new(
+        TrackIndex::new(0),
+        subtitle_of(&cues[0]),
+      )),
+      name,
+    );
+    muxer
+      .finish()
+      .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    track_header_size(&target)
+  };
+  assert_eq!(
+    written(
+      "l199-held.mp4",
+      ContainerName::MP4,
+      sized(65_535, 65_535, (0, 1)),
+      &movtext
+    ),
+    (65_535 << 16, 65_535 << 16)
+  );
+  assert_eq!(
+    written(
+      "l199-ratio.mov",
+      ContainerName::new("mov"),
+      sized(65_535, 10, (2, 1)),
+      &movtext
+    ),
+    (65_535 << 16, 10 << 16),
+    "MOV writes the width alone"
+  );
+  // DVD subtitles, of the size their configuration states.
+  #[rustfmt::skip]
+  let ass = generated(&corpus, "l199-ass.mkv", &[
+    "-i",
+    written_text(&corpus, "l199.srt", "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n")
+      .to_str().expect("utf-8 path"),
+    "-c:s", "ass",
+  ]);
+  let palette = format!("palette: {}\n", ["000000"; 16].join(", "));
+  let dvd = |size: &str| {
+    recoded(
+      table_of(&ass, TrackKind::Subtitle).remove(0),
+      Id::AV_CODEC_ID_DVD_SUBTITLE,
+      format!("{size}{palette}").as_bytes(),
+    )
+  };
+  for (name, size) in [
+    ("l199-dvd-wide.mp4", "size: 70000x480\n"),
+    ("l199-dvd-past-int.mp4", "size: 99999999999x480\n"),
+  ] {
+    open_law(&corpus, name, "mp4", vec![dvd(size)], Some(dimensions));
+  }
+  for (name, size, expected) in [
+    ("l199-dvd.mp4", "size: 1920x1080\n", (1920, 1080)),
+    ("l199-dvd-across.mp4", "size:\n 640x360\n", (640, 360)),
+    ("l199-dvd-none.mp4", "", (720, 480)),
+  ] {
+    assert_eq!(
+      written(name, ContainerName::MP4, dvd(size), &ass),
+      (expected.0 << 16, expected.1 << 16),
+      "{name}"
+    );
+  }
+}
+
+/// **L200 — MP4's packet rewrites are held to what their rewriter counts,
+/// exactly** (R22, the census of exactness): H.264 of an Annex B
+/// configuration, each unit of a packet written behind a 4-byte length as
+/// the rewriter goes, its bytes summed in an `int` (`nal_parse_units`,
+/// `nal.c` 74–111; `movenc.c` 7087–7106): at a bound of the rewrite's
+/// bytes, counted exactly, written; a byte below, refused by name,
+/// untouched ([`PayloadRule::RewrittenSize`]). HEVC under `hvc1`, its
+/// rewrite held in a dynamic buffer and walked, its parameter sets dropped
+/// (`ff_hevc_annexb2mp4`, `hevc.c` 1203–1250): the buffer cut within a PPS
+/// of 3000 bytes at the packet's end, written, its sample counted as
+/// written; within it before an SEI, refused, untouched.
+///
+/// PLANT: the rewrite's upper bound counted; under `hvc1` the cut refused
+/// whatever it takes; under `hvc1` the cut unjudged.
+#[test]
+fn l200_mp4s_packet_rewrites_are_held_to_what_their_rewriter_counts() {
+  let Some(corpus) = Corpus::new() else { return };
+  // H.264 of the transport stream's Annex B: its first frame's rewrite.
+  let (table, frames) = first_track(&corpus.transport_stream(), TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  let units = |bytes: &[u8]| -> Vec<Vec<u8>> {
+    let mut units = Vec::new();
+    let mut at = 0;
+    while at + 3 <= bytes.len() {
+      if bytes[at..at + 3] == [0, 0, 1] {
+        let start = at + 3;
+        let mut end = start;
+        while end + 3 <= bytes.len() && bytes[end..end + 3] != [0, 0, 1] {
+          end += 1;
+        }
+        let end = if end + 3 > bytes.len() {
+          bytes.len()
+        } else {
+          end
+        };
+        let mut unit = bytes[start..end].to_vec();
+        while unit.last() == Some(&0) {
+          unit.pop();
+        }
+        units.push(unit);
+        at = end;
+      } else {
+        at += 1;
+      }
+    }
+    units
+  };
+  let rewritten = |bytes: &[u8]| {
+    units(bytes)
+      .iter()
+      .map(|unit| 4 + unit.len() as u64)
+      .sum::<u64>()
+  };
+  let exact = rewritten(frame.data().as_ref());
+  let again = table_of(&corpus.transport_stream(), TrackKind::Video);
+  for (name, bound, taken, table) in [
+    ("l200-at.mp4", exact, true, table),
+    ("l200-below.mp4", exact - 1, false, again),
+  ] {
+    let mut muxer = muxer_with(
+      &output(&corpus, name),
+      ContainerName::MP4,
+      table,
+      MuxOptions::new().with_lowered_sum_bound(bound),
+    );
+    let offered = VideoTrackPacket::new(TrackIndex::new(0), frame.clone());
+    let result = refusing!(muxer.write_video(offered.clone()));
+    if taken {
+      result
+        .map_err(|error| error.map_packet(drop))
+        .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+      muxer
+        .finish()
+        .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    } else {
+      let (refusal, back) = by_container(result);
+      assert_eq!(refusal, payload(PayloadRule::RewrittenSize), "{name}");
+      untouched!(offered, back);
+    }
+  }
+  // HEVC under `hvc1`: its first packet, a PPS of 3000 bytes after it — and
+  // an SEI after that.
+  let hevc = hevc_annexb(&corpus);
+  let hvc1 = || {
+    let row = table_of(&hevc, TrackKind::Video).remove(0);
+    vec![reticketed(row, |par| {
+      par.codec_tag = u32::from_le_bytes(*b"hvc1");
+    })]
+  };
+  let (_, packets) = first_track(&hevc, TrackKind::Video, 1);
+  let first = video_of(&packets[0]);
+  let pps = [&[0, 0, 1, 0x44, 0x01][..], &[0x55; 2998]].concat();
+  let sei = [0, 0, 1, 0x4E, 0x01, 0x05, 0x01, 0x55, 0x80].to_vec();
+  let walked = |end: u64| (end + 63) / 1024 * 1024 - 64;
+  let ends = [first.data().as_ref(), &pps].concat();
+  let cut = walked(rewritten(&ends));
+  let target = output(&corpus, "l200-hvc1.mp4");
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_with(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    hvc1(),
+    &[],
+    MuxOptions::new().with_lowered_rewrite_bound(cut),
+  )
+  .expect("open");
+  wrote(
+    muxer.write_video(VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_holding(&first, &ends),
+    )),
+    "a PPS cut",
+  );
+  let counted: Vec<(u128, i128)> = muxer.bit_rate_counts().into_iter().flatten().collect();
+  muxer.finish().expect("finished");
+  assert_eq!(counted, written_counts(&target), "the sample as written");
+  let before = [first.data().as_ref(), &pps, &sei].concat();
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_with(
+    File::create(output(&corpus, "l200-hvc1-sei.mp4")).expect("create"),
+    ContainerName::MP4,
+    hvc1(),
+    &[],
+    MuxOptions::new().with_lowered_rewrite_bound(cut),
+  )
+  .expect("open");
+  let offered = VideoTrackPacket::new(TrackIndex::new(0), video_holding(&first, &before));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(offered.clone())));
+  assert_eq!(
+    refusal,
+    payload(PayloadRule::RewrittenSize),
+    "an SEI cut away"
+  );
+  untouched!(offered, back);
 }

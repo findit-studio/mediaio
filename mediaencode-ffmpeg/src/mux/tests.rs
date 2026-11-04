@@ -799,6 +799,8 @@ fn ac3_at(bytes: &[u8], dts: i64, duration: i64) -> Ac3Packet<'_> {
     duration,
     offered: (duration > 0).then_some(duration),
     skip_end: None,
+    cts: 0,
+    discard: false,
   }
 }
 
@@ -1100,6 +1102,8 @@ fn mp4_joins_e_ac3s_short_frames_into_the_sample_it_writes() {
     offered: Some(12),
     bytes: 6 * 768,
     skip_end: Some(2000),
+    cts: 0,
+    discard: false,
   };
   assert_eq!(step, Ac3Step::Completes(run));
   assert_eq!(completed.run, None);
@@ -1192,11 +1196,13 @@ fn eac3_track(frame_size: i32) -> TrackState {
     buffered: 0,
     flv_rewrites: false,
     presented: None,
+    wav_last: None,
     configured: false,
     ivf_frames: 0,
     mp4_counts: Mp4Counts::default(),
     ttml: None,
     rates: None,
+    edit: EditSpan::default(),
   }
 }
 
@@ -2489,12 +2495,19 @@ fn vp9s_filter_puts_out_superframes_sized_with_what_it_holds() {
   );
 }
 
-/// **The Annex B rewrite is bounded by a byte more for each start code.**
+/// **The Annex B rewrite is counted exactly** (R22, the census of
+/// exactness; `nal_parse_units`, `nal.c` 74–111): each unit behind a
+/// 4-byte length, a 4-byte start code's leading zero its own, nothing of
+/// bytes before the first start code; summed in the `int` it counts them in.
 #[test]
-fn the_annex_b_rewrite_is_bounded_by_its_start_codes() {
-  assert_eq!(length_prefixed_bytes(&[0, 0, 1, 9, 9, 0, 0, 1, 8]), 9 + 2);
-  assert_eq!(length_prefixed_bytes(&[0, 0, 0, 1, 9]), 5 + 1);
-  assert_eq!(length_prefixed_bytes(&[1, 2, 3]), 3);
+fn the_annex_b_rewrite_is_counted_exactly() {
+  assert_eq!(
+    nal_rewritten_bytes(&[0, 0, 1, 9, 9, 0, 0, 1, 8]),
+    4 + 2 + 4 + 1
+  );
+  assert_eq!(nal_rewritten_bytes(&[0, 0, 0, 1, 9]), 4 + 1);
+  assert_eq!(nal_rewritten_bytes(&[1, 2, 3]), 0);
+  assert_eq!(super::Bounds::REAL.sum, i32::MAX as u64);
 }
 
 /// **The configurations MP4's trailer refuses are known at open**: FLAC's
@@ -4574,48 +4587,98 @@ fn configuration_rewrites_are_held_where_their_writers_make_them() {
   let mp4 = (Family::Mp4, Audited::Mov(MovMode::Mp4));
   let flv = (Family::Other, Audited::Flv);
   let mkv = (Family::Matroska, Audited::Matroska);
-  // A 4-byte start code, then a 3-byte one: 13 bytes rewritten of 12.
-  let units = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3];
+  // Units every writer keeps: H.264's SPS (0x67), HEVC's PPS of the base
+  // layer (0x44 0x01), VVC's SPS (0x00 0x79), each a kilobyte and more, 4 600
+  // bytes rewritten.
+  let unit = |head: &[u8]| {
+    let mut unit = vec![0, 0, 0, 1];
+    unit.extend_from_slice(head);
+    unit.resize(1150, 0x55);
+    unit
+  };
+  let kept = |codec: CodecId| match codec {
+    c if c == CodecId::H264 => unit(&[0x67, 0x64]),
+    c if c == CodecId::HEVC => unit(&[0x44, 0x01]),
+    _ => unit(&[0x00, 0x79]),
+  };
+  let config = |codec: CodecId| [kept(codec), kept(codec), kept(codec), kept(codec)].concat();
+  // A bound of 4 000: the buffer cut at 3 008 bytes, the third unit and the
+  // fourth taken; of 4 600, whole.
   for family in [mp4, flv, mkv] {
     for codec in [CodecId::H264, CodecId::HEVC, CodecId::VVC] {
       assert!(
-        super::rewrite_cut(family, codec, &units, 12),
-        "{family:?} {codec:?}: a byte below"
+        super::rewrite_cut(family, codec, &config(codec), (4_000, false)),
+        "{family:?} {codec:?}: cut"
       );
       assert!(
-        !super::rewrite_cut(family, codec, &units, 13),
+        !super::rewrite_cut(family, codec, &config(codec), (4_600, false)),
         "{family:?} {codec:?}: at it"
       );
     }
     assert!(
-      !super::rewrite_cut(family, CodecId::AV1, &units, 0),
+      !super::rewrite_cut(family, CodecId::AV1, &config(CodecId::H264), (0, false)),
       "AV1's none"
     );
   }
   assert!(
-    !super::rewrite_cut((Family::Other, Audited::MpegTs), CodecId::H264, &units, 0),
+    !super::rewrite_cut(
+      (Family::Other, Audited::MpegTs),
+      CodecId::H264,
+      &config(CodecId::H264),
+      (0, false)
+    ),
     "MPEG-TS writes no record"
+  );
+  // The cut taking only units the writer leaves out: taken. H.264's SEI
+  // (0x06), HEVC's PPS of a layer neither the base's nor named the alpha's
+  // (layer 1: 0x44 0x09), VVC's slice (0x00 0x08).
+  for (codec, dropped) in [
+    (CodecId::H264, &[0x06, 0x05][..]),
+    (CodecId::HEVC, &[0x44, 0x09][..]),
+    (CodecId::VVC, &[0x00, 0x08][..]),
+  ] {
+    let cut_after = [kept(codec), kept(codec), unit(dropped), unit(dropped)].concat();
+    assert!(
+      !super::rewrite_cut(mp4, codec, &cut_after, (4_000, false)),
+      "{codec:?}: only units the record leaves out cut"
+    );
+  }
+  // HEVC's upper layer, which `lhvC` writes in MP4 of a multilayer stream.
+  let upper = [
+    kept(CodecId::HEVC),
+    kept(CodecId::HEVC),
+    unit(&[0x44, 0x09]),
+    unit(&[0x44, 0x09]),
+  ]
+  .concat();
+  assert!(
+    super::rewrite_cut(mp4, CodecId::HEVC, &upper, (4_000, true)),
+    "the upper layer lhvC keeps"
+  );
+  assert!(
+    !super::rewrite_cut(flv, CodecId::HEVC, &upper, (4_000, true)),
+    "FLV writes no lhvC"
   );
   let avcc = [1, 0x64, 0, 0x1F, 0xFF, 0xE1, 0, 2, 0x67, 0x64];
   assert!(
-    !super::rewrite_cut(mp4, CodecId::H264, &avcc, 0),
+    !super::rewrite_cut(mp4, CodecId::H264, &avcc, (0, false)),
     "an avcC as it is"
   );
   let six = [0, 0, 1, 0x67, 1, 2];
   assert!(
-    !super::rewrite_cut(mp4, CodecId::H264, &six, 0),
+    !super::rewrite_cut(mp4, CodecId::H264, &six, (0, false)),
     "H.264's of 6 bytes refused first"
   );
   assert!(
-    super::rewrite_cut(mp4, CodecId::HEVC, &six, 0),
+    super::rewrite_cut(mp4, CodecId::HEVC, &[0, 0, 1, 0x44, 1, 2], (0, false)),
     "HEVC's of 6 rewritten"
   );
   assert!(
-    super::rewrite_cut(mp4, CodecId::VVC, &six, 0),
+    super::rewrite_cut(mp4, CodecId::VVC, &[0, 0, 1, 0x00, 0x79, 2], (0, false)),
     "VVC's of 6 rewritten"
   );
   assert!(
-    !super::rewrite_cut(mp4, CodecId::HEVC, &six[..5], 0),
+    !super::rewrite_cut(mp4, CodecId::HEVC, &six[..5], (0, false)),
     "of 5 refused first"
   );
 }
@@ -5276,5 +5339,51 @@ fn bit_rates_are_cut_where_movenc_cuts_them() {
   assert_eq!(
     bit_rates_cut(input(1 << 61, 1, None, 0), false, false),
     None
+  );
+}
+
+/// **The MOV family's edit list is counted as movenc counts it** (R22, the
+/// census of exactness; `ff_mov_write_packet`, `movenc.c` 7289–7333;
+/// `av_rescale_rnd`, `libavutil/mathematics.c` 58–130, in FFmpeg 9.0.1):
+/// `start_cts` the first sample's offset, replaced by a later one's only of
+/// a decode time not after zero and smaller; `end_pts` the latest end;
+/// `elst_end_pts` that end as of the last sample not marked discarded, zero
+/// before one; the rescales rounded toward each infinity, a value below
+/// zero by its magnitude's opposite rounding, past `INT64_MAX` answered
+/// `INT64_MIN`.
+#[test]
+fn edit_spans_are_counted_as_movenc_counts_them() {
+  let span = EditSpan::default()
+    .with(-100, 30, 10, false)
+    .with(-90, 20, 10, false)
+    .with(5, 1, 10, false);
+  assert_eq!(span.first, Some(-100));
+  assert_eq!(
+    span.start_cts, 20,
+    "a smaller offset at a decode time not after zero"
+  );
+  assert_eq!(span.end, 16, "the latest end");
+  assert_eq!(span.elst_end, 16);
+  let later = span.with(10, 0, 100, true);
+  assert_eq!(later.start_cts, 20, "not of a decode time after zero");
+  assert_eq!(later.end, 110);
+  assert_eq!(
+    later.elst_end, 16,
+    "a discarded sample's end not the edit's"
+  );
+  assert_eq!(
+    EditSpan::default().with(1000, 0, 40, true).elst_end,
+    0,
+    "zero before a sample not discarded"
+  );
+  assert_eq!(rescale_rounded(-1, 1000, 16_000, true), 0);
+  assert_eq!(rescale_rounded(-1, 1000, 16_000, false), -1);
+  assert_eq!(rescale_rounded(17, 1000, 16_000, true), 2);
+  assert_eq!(rescale_rounded(17, 1000, 16_000, false), 1);
+  assert_eq!(rescale_rounded(16, 1000, 16_000, true), 1);
+  assert_eq!(
+    rescale_rounded(i128::from(i64::MAX), 2, 1, true),
+    i128::from(i64::MIN),
+    "past INT64_MAX"
   );
 }

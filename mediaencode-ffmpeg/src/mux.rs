@@ -317,7 +317,7 @@
 //!
 //! | what | where, and its arithmetic | here |
 //! |---|---|---|
-//! | the Annex B rewrite | MP4 (H.264, HEVC, VVC, LCEVC) and Matroska and WebM (H.264, HEVC, VVC) over an Annex B configuration: each start code becomes a 4-byte length, the size summed in an `int` (`nal_parse_units`, `nal.c` 74–111); MP4's HEVC under `hvc1` through a dynamic buffer of at most `INT_MAX` (`aviobuf.c` 1281–1311) | its upper bound — the packet and a byte for each start code — held to the bound ([`PayloadRule::RewrittenSize`]) |
+//! | the Annex B rewrite | MP4 (H.264, HEVC, VVC, LCEVC) and Matroska and WebM (H.264, HEVC, VVC) over an Annex B configuration: each start code becomes a 4-byte length, the size summed in an `int` (`nal_parse_units`, `nal.c` 74–111); MP4's HEVC under `hvc1` through a dynamic buffer of at most `INT_MAX` with its padding, walked, its parameter sets dropped (`aviobuf.c` 1281–1311; `hevc.c` 1203–1250) | counted exactly, held to the `int` — under `hvc1`, refused where the buffer's cut takes a unit the walk keeps ([`PayloadRule::RewrittenSize`]; R22, the census of exactness) |
 //! | Matroska's cluster | written into a dynamic buffer of at most `INT_MAX`, refused past it and the cluster written cut; a new one once the last passes 5 MiB, two blocks at most written after that check (`matroskaenc.c` 2746–2749, 3213–3271) | each block — the packet as written, or each one its filter puts out, VP9's superframe and PGS's display set with the side data they take, and what the filter holds at the least it can come to — its payload and side data at most half of what is left beside 5 MiB and 64 KiB, less its own elements (`MATROSKA_BLOCK_BYTES_MAX`, [`PayloadRule::ClusterSize`]) |
 //! | WebVTT's lines | Matroska and WebM: the cue, its identifier and its settings summed, refused past `INT_MAX` (`matroskaenc.c` 2828–2853) | within the cluster's bound |
 //! | MP4's joined TTML | libavcodec's TTML encoder's paragraphs, joined at the trailer into one document in a dynamic buffer and then one packet (`movenc_ttml.c` 236–317) | the document's bytes counted — each paragraph and its element, and the header its configuration and language make — and refused at the paragraph that would pass the bound ([`PayloadRule::DocumentSize`]) |
@@ -780,7 +780,7 @@
 //! | the muxer's writes | a refusal by name, the packet handed back | as it was (R15; R20, r1) | the packet-rule laws |
 //! | the muxer's writes | a failure the base answers | failed | L173 |
 //! | the muxer's finish | after a failure | refused by name, the output dropped failed: closed | L173 |
-//! | the muxer's finish | a trailer refused by name before it runs — no frame, a last sample too long, the `moov` past its bound, a bit rate its box cuts | the output abandoned | L195, L198 |
+//! | the muxer's finish | a trailer refused by name before it runs — no frame, a last sample too long, the `moov` past its bound, a bit rate its box cuts, an edit list it writes cut, a fact chunk it counts cut | the output abandoned | L195, L198, L188, L104, L186 |
 //! | the muxer's finish | the trailer's failure; the hand-back's | failed; as the base's `into_sink` | L169 and the base's laws |
 //!
 //! **r2, sizes under budgets the caller raises** (a length that wraps is
@@ -914,8 +914,8 @@
 //! | W11 | FLV's tag time (`put_timestamp`, `flvenc.c` 255–258) | 31 bits of milliseconds, the top bit of the extended byte masked off | refused at the packet ([`FfmpegMuxRefusal::TimeWraps`]) — L187 |
 //! | W13 | Matroska's JPEG 2000 (`matroskaenc.c` 2025–2030, 1258–1270; `ff_put_bmp_header`, `riffenc.c` 265) | the bitmap header's picture bytes in an `int`, a signed overflow past it | refused at open ([`MuxOpenError::Dimensions`]) — L192 |
 //! | W16 | the MOV family's stated bit rates (`calculate_mpeg4_bit_rates`, `movenc.c` 714–763; 802, 1292–1293) | the stream's and its CPB properties' `int64_t`s in the `btrt`'s and the `esds`'s 32 bits, and the CPB buffer's eighth in the `btrt`'s 32 and the `esds`'s 24, which H.266's level 15.5 allows past them — each read where movenc reads it: the CPB average only where no average is counted, then the stated rate, then the CPB maximum; the maximum of the stated rate and the average, then of the CPB maximum; the average written as none of CPB properties of none | refused at `finish`, before the trailer runs, mirrored whole with W21 ([`FfmpegMuxRefusal::BitRates`], the box named; [`FfmpegMuxRefusal::CpbProperties`] of an entry shorter than the fields movenc reads; R22, the coordinator's ruling on W21; Codex R21 3) — the `btrt` where the `write_btrt` option resolves on ([`WriteBtrt`]: MP4's mode alone by default, `WriteBtrt::Off` the remedy), the `esds` of `mp4a`, `mp4v` and DVD subtitles; MP4's chapter track's at open ([`MuxOpenError::ChapterBitRate`]) — L198, `bit_rates_are_cut_where_movenc_cuts_them` |
-//! | W18 | MP4's track header (`mov_write_tkhd_tag`, `movenc.c` 4066–4085) | the display width, the width by the aspect ratio in 16.16, past 32 bits replaced by the width alone | refused at open ([`MuxOpenError::Dimensions`]) — L191 |
-//! | W19 | the MOV family's edit list (`mov_write_edts_tag`, `movenc.c` 4135–4239) | the media time of version 0, the first decode time negated, in 32 bits | refused at the packet that makes the first sample, as libavformat's shift leaves it, as though the track ended there ([`FfmpegMuxRefusal::TimeWraps`]) — L188 |
+//! | W18 | MP4's track header (`mov_write_tkhd_tag`, `movenc.c` 4064–4090) | the display width, the width by the aspect ratio in 16.16, past 32 bits replaced by the width alone; of a video's track and a subtitle's alike — a subtitle's width past 16 bits written as none, its height so, below zero wrapped, a DVD subtitle's of its configuration's size line (8000–8046; R22) | refused at open ([`MuxOpenError::Dimensions`]) — L191, L199 |
+//! | W19 | the MOV family's edit list (`mov_write_edts_tag`, `movenc.c` 4135–4239) | the media time of version 0, the first decode time negated, in 32 bits — version 1 where the edit's span or its delay reaches `INT32_MAX` movie ticks, the whole track's; the span, its delay added, below zero — written wrapped, or of version 1 refused by FFmpeg's reader (`mov.c` 6554–6558) | refused at `finish`, before the trailer runs, of the whole track ([`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::NegativeSpan`]; R22, the census of exactness: judged at the first sample, as though the track ended there, until R22) — L188 |
 //! | W21 | the MOV family's counted average (`compute_avg_bitrate`, `movenc.c` 703–712; 803, 1294) | the samples' bytes by 8 by the timescale over the duration, the product in a `uint64_t`, narrowed into an `unsigned`: cut past 4.29 Gb/s, raw video's among them, and of a product past 64 bits | refused at `finish`, before the trailer runs ([`FfmpegMuxRefusal::BitRates`]; R22, the coordinator's ruling: Codex R21 2): the product in 128 bits, its own wrap refused; the samples' bytes counted as movenc writes them — each rewrite mirrored exactly, read back against the written `stsz` and `stts` (L197) — and `track_duration`, the last sample's decode time and its duration as handed, from the first's — L197, L198 |
 //!
 //! W17, the MOV family's channels in 16 bits outside MOV, and W6's
@@ -926,6 +926,53 @@
 //! (`vvc.c` 383–388), its negation shifted as unsigned, so that the bits
 //! of each position are counted otherwise than H.266 codes them, and the
 //! fields after them read where FFmpeg reads them.
+//!
+//! **Exact both ways** (R22, Codex R21 3, closed by class: every predicate
+//! that mirrors an FFmpeg computation neither looser — a value FFmpeg
+//! wraps, taken — nor stricter — a value FFmpeg never writes, or writes
+//! whole, refused). Each value this module judges was set against the
+//! condition under which FFmpeg reads it, and each value FFmpeg writes
+//! against the condition under which this module judges it: the narrow
+//! writes' rows, the sizes' (S), the omissions' with a selection or a
+//! fallback (A), and every judgment made before the value is whole — at a
+//! packet, of a value the trailer computes of the whole track. Every
+//! condition on the sink's seeking holds: the base's I/O context is made
+//! with a seek callback, so that it seeks (`avio_alloc_context`,
+//! `aviobuf.c`), and each trailer's seekable branch is taken. 29 rows: 7
+//! fixed here; 20 shown exact; 2 bounds named — one ruled, one where
+//! exactness would need libavformat's interleaving mirrored.
+//!
+//! | | the value, and when FFmpeg reads it | here, before R22 | now |
+//! |---|---|---|---|
+//! | W16, W21 | the MOV family's bit rates, of the whole track, at its trailer: the counted average; the CPB average only where none is counted, then the stated rate, then the CPB maximum; the maximum; the buffer in the `btrt`'s 32 bits and the `esds`'s 24 (`movenc.c` 703–763) | the stated rates and the CPB properties at open, whatever the counted average — stricter (Codex R21 3); the counted average unjudged — looser (Codex R21 2) | fixed: mirrored whole at `finish` (the coordinator's ruling; L198) |
+//! | W19 | the edit list's media time of version 0, the version the whole track's span and delay choose (4135–4239) | at the first sample, as though the track ended there — stricter where the track spans `INT32_MAX` movie ticks | fixed: at `finish` (L188) |
+//! | W19′ | the edit list's span, its delay added where not above zero, and the track header's duration, below zero of a track ending before zero or of every sample marked discarded: written wrapped, or refused by FFmpeg's reader (4135–4239, 3990–3994; `mov.c` 6554–6558) | unjudged — looser | fixed: refused at `finish` ([`FfmpegMuxRefusal::NegativeSpan`]; L188) |
+//! | WAV's fact chunk | the last packet's duration, an `int`, and the span with it, at the trailer (`wavenc.c` 409–420, 448–462) | each packet's duration and the span with it, as though each were the last — stricter where a later packet replaces it | fixed: the span alone at the packet, the last duration and the count at `finish` (L104, L186) |
+//! | W18′ | the track header's width and height of a subtitle track, as of a video's — a DVD subtitle's of its configuration's size line (4064–4090; 8000–8046) | a video's alone — looser | fixed: refused at open ([`MuxOpenError::Dimensions`]; L199) |
+//! | S7 | the configuration's Annex B rewrite, cut past its buffer: the record loses a unit only where the cut takes one its walk keeps (`nal.c` 133–144; `avc.c` 67–101; `hevc.c` 862–933; `vvc.c` 898–927) | the cut refused whatever it takes — stricter | fixed: refused where it takes a unit the record keeps, `lhvC`'s upper layers among them ([`records::rewrite_cut_keeps`]; L174, `configuration_rewrites_are_held_where_their_writers_make_them`) |
+//! | the packet rewrite | MP4's and Matroska's Annex B rewrite of a packet, summed in an `int`; MP4's HEVC under `hvc1`, its dynamic buffer cut past `INT_MAX` with its padding, its walk keeping all but the parameter sets (`nal.c` 74–111; `hevc.c` 1203–1250; `movenc.c` 7087–7158) | a byte more counted for each `00 00 01`, held to libavcodec's largest packet — stricter | fixed: counted exactly, against the `int`; under `hvc1` the cut judged as the walk keeps (L200, L159, L164) |
+//! | W4 | `hvcC`'s and `vvcC`'s bit depths, of the SPS the walk parses — the MOV family's, FLV's and Matroska's writers (`hevc.c` 1137–1148; `vvc.c` 711) | refused where the walk writes them, Matroska's too ([`configuration_invalid`]) | exact (L193) |
+//! | W5 | `vvcC`'s picture, of the SPSs the walk parses (`vvc.c` 364–368, 767–771) | as W4 | exact (L193) |
+//! | W1 | IVF's frames, raised at each packet, written at the trailer where the context seeks (`ivfenc.c` 84, 96–104) | at the packet that passes 32 bits | exact: the count only grows (L189) |
+//! | W6 | the RIFF format's fields as `ff_put_wav_header` chooses them — the extensible header and its fields where it takes it (`riffenc.c` 54–233) | [`riff_format_cut`], of the same branches | exact (L190) |
+//! | W11 | FLV's every tag's decode time (`flvenc.c` 255–258, 1356) | at each packet | exact (L187) |
+//! | W13 | Matroska's bitmap header of a codec it names no codec id of, JPEG 2000's among them (`matroskaenc.c` 2025–2030, 1258–1270) | at open, of JPEG 2000 | exact (L192) |
+//! | W18 | a video track's display width outside MOV and AVIF, of an aspect ratio stated (4066–4085); the width alone where the height read is not the coded one — D-10's tags, MOV's alone (8473–8483) | outside MOV and AVIF, of a ratio stated | exact (L191) |
+//! | S3 | VP9's `vpcC` level, of the picture's samples in an `int` where the ticket's level is unknown — MP4's and FLV's records (`vpcc.c` 77–122) | where the level is unknown, in MP4 and FLV | exact (L168) |
+//! | S6 | FLV's sequence header, its 24-bit size (`flvenc.c` 807–914) | of every configuration FLV writes as one | exact (L172) |
+//! | S8 | the `esds` descriptor's 28-bit length, of each sample entry that writes one (`movenc.c` 765–816) | [`esds_carries`] | exact (L175) |
+//! | S9, S10 | MP4's `dvc1` and `lvcC`, of the configurations they parse (`movenc.c` 1102–1184; `lcevc.c` 251–339) | where MP4 writes them | exact (L176) |
+//! | S11, S12 | MPEG-TS's PES sizes and an Opus track's start trim (`mpegtsenc.c` 1277–1279, 1669–2205) | of the tracks it writes so | exact (L177, L178, L182) |
+//! | S13 | FLV's `extract_extradata` split, its list's slots and a unit's positions (`h2645_parse.c` 534–610) | the positions as a fresh filter's — stricter only where an earlier packet's unit made the slot at a size not a power of two | exact in what it refuses: every packet that reaches either is past FLV's tag's 24 bits, refused all the same — the rule named the split's (L183) |
+//! | S14, S15 | FLV's sequence header at the packet; `extract_extradata`'s sums | as their rows | exact (L184); unreachable |
+//! | A1 | the `pssh` boxes of every stream of the MOV family whose coded side data holds encryption initialization, parsed at the `moov` (`movenc.c` 5175–5210, 5449–5451) | the key ids of no bytes refused at open, in the MOV family | exact (L194) |
+//! | A9, A10 | the chapter track's samples, a sample a titled chapter; `mov_text`'s end sample (7727–7815; 9025–9031) | of the modes that make a chapter track; of a cue track | exact (L149) |
+//! | A16 | MPEG-TS's raw AAC: a packet opening on an ADTS sync word taken as it is; any other framed by its nested muxer, of the configuration, else written as it is (`mpegtsenc.c` 1969–2004) | the sync word judged as FFmpeg judges it; framed here, of the configuration; of none, refused | exact (L179, L180) |
+//! | A25 | MP4's TTML of libavcodec's encoder, its paragraphs joined into one document, by the configuration's prefix (`movenc_ttml.c` 289–317) | of that prefix | exact (L197) |
+//! | A26 | FLV's Annex B rewrite, by the configuration as of the packet (`flvenc.c` 1318–1327) | [`flv_rewrites`] | exact (L106) |
+//! | A27 | MP4's HEVC of the `hvc1` tag and an Annex B configuration (`hevc.c` 1203–1250) | as the packet rewrite's row | exact |
+//! | the samples' table | a sample a table entry, the `mov_text` empty sample before a first cue at zero where another track's packet makes it first (7646–7653) | room kept for that sample whatever the interleaving | a bound, stricter by one entry at [`MOV_SAMPLES_MAX`] at most: exactness would mirror libavformat's interleaving, which this release does not ([`PayloadRule::SampleTable`]) |
+//! | S2, the `moov` | the `moov`'s size, of every track's chunks as libavformat's interleaving makes them (5339–5453) | an upper bound | a bound, ruled (R14), stricter past the bound alone ([`PayloadRule::MovieBox`]) |
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -1333,7 +1380,7 @@
 //! | WAV, Wave64, at open (R21, census R20-5) | a RIFF format's block alignment — AAC's 768 a channel among them — bits a sample or IMA ADPCM's samples a block past 16 bits; its bytes a second past 32 bits, PCM's of an `int` product; MS or IMA ADPCM of no samples a block | each written cut, or a signed overflow; refused at the header after the bytes before it (`riffenc.c` 54–233) | [`MuxOpenError::ConfigurationInvalid`] — L190 |
 //! | the MOV family's modes, at open (R21, census R20-5) | outside MOV and AVIF, a video's width by its aspect ratio past 32 bits of 16.16 | the display width written as the width alone (`movenc.c` 4066–4085) | [`MuxOpenError::Dimensions`] — L191 |
 //! | the MOV family's modes, at `finish` (R22, the coordinator's ruling on W21) | a track's bit rates as its trailer computes them — its counted average, the fallbacks, the maximum and the buffer — past the field its `btrt` or `esds` writes them in; CPB properties shorter than the fields it reads | each written cut; the entry read past (`movenc.c` 703–763) | [`FfmpegMuxRefusal::BitRates`], [`FfmpegMuxRefusal::CpbProperties`] — L198 |
-//! | the MOV family's modes but AVIF (R21, census R20-5) | a track's first sample decoded at `-2^31` ticks or before | its edit list's media time written wrapped in 32 bits (`movenc.c` 4135–4239) | [`FfmpegMuxRefusal::TimeWraps`] — L188 |
+//! | the MOV family's modes but AVIF, at `finish` (R21, census R20-5; R22) | a track's first sample decoded at `-2^31` ticks or before, of an edit list of version 0; a track whose edit list's span is below zero — one ending before zero, or of every sample marked discarded | its edit list's media time written wrapped in 32 bits; its span written wrapped, or of version 1 refused by FFmpeg's reader (`movenc.c` 4135–4239; `mov.c` 6554–6558) | [`FfmpegMuxRefusal::TimeWraps`], [`FfmpegMuxRefusal::NegativeSpan`] — L188 |
 //! | Matroska, at open (R21, census R20-5) | JPEG 2000 whose bitmap header's picture bytes pass an `int` | a signed overflow (`matroskaenc.c` 2025–2030; `riffenc.c` 265) | [`MuxOpenError::Dimensions`] — L192 |
 //! | MP4, FLV, at open and as new extradata (R21, census R20-5) | an HEVC SPS of a bit depth of sixteen; a VVC SPS so, or of a picture past 65 535 | the depth written in 3 bits, read back as a depth of 8; the picture cut (`hevc.c` 1137–1148; `vvc.c` 711, 767–771) | [`MuxOpenError::ConfigurationInvalid`], [`PayloadRule::NewExtradata`] — L193 |
 
@@ -2012,6 +2059,10 @@ struct Bounds {
   /// The most frames IVF counts its file's in, an `unsigned` its trailer
   /// writes in its header's 32 bits ([`PayloadRule::FrameCount`]).
   ivf_frames: u64,
+  /// The most bytes `nal_parse_units` counts a packet's rewrite in, the
+  /// `int` it sums each unit's 4 and bytes in ([`PayloadRule::RewrittenSize`];
+  /// R22).
+  sum: u64,
 }
 
 impl Bounds {
@@ -2034,6 +2085,7 @@ impl Bounds {
     positions: records::SplitLimits::SMALL_PADDING.positions,
     obus: AV1_OBU_SLOTS,
     ivf_frames: u32::MAX as u64,
+    sum: i32::MAX as u64,
   };
 }
 
@@ -2210,6 +2262,7 @@ impl MuxOptions {
       positions: self.bounds.positions,
       obus: self.bounds.obus,
       ivf_frames: self.bounds.ivf_frames,
+      sum: self.bounds.sum,
     };
     self
   }
@@ -2315,6 +2368,19 @@ impl MuxOptions {
   pub const fn with_lowered_rewrite_bound(mut self, bytes: u64) -> Self {
     if bytes < self.bounds.rewrite {
       self.bounds.rewrite = bytes;
+    }
+    self
+  }
+
+  /// Lowers the bytes `nal_parse_units` may count a packet's Annex B rewrite
+  /// in — the `int` it sums them in — to `bytes`, never raising it: the
+  /// laws' seam, which shows the bound without two gibibytes of packet
+  /// ([`PayloadRule::RewrittenSize`]).
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_lowered_sum_bound(mut self, bytes: u64) -> Self {
+    if bytes < self.bounds.sum {
+      self.bounds.sum = bytes;
     }
     self
   }
@@ -3682,11 +3748,14 @@ pub enum FfmpegMuxRefusal {
   },
   /// A duration longer than the container counts: MP4's of more than
   /// `i32::MAX` ticks of the stream's time base, which MP4 refuses after
-  /// taking the packet (`movenc.c` 6925–6928); WAV's and Wave64's of more than `i32::MAX` ticks on a
-  /// track whose trailer writes a fact chunk — every codec tag but integer
-  /// PCM's — which WAV keeps the last packet's in, an `int`, and counts the
-  /// fact chunk's samples with, cut (`wavenc.c` 82, 412, 451–462, 608–616),
-  /// judged as though the packet were the last (R21, Codex R20 2).
+  /// taking the packet (`movenc.c` 6925–6928); WAV's and Wave64's of more
+  /// than `i32::MAX` ticks on a track whose trailer writes a fact chunk —
+  /// every codec tag but integer PCM's — which WAV keeps the last packet's
+  /// in, an `int`, and counts the fact chunk's samples with, cut
+  /// (`wavenc.c` 82, 412, 451–462, 608–616; R21, Codex R20 2): the last
+  /// packet's, judged at `finish`, before the trailer runs — a packet a
+  /// later one follows has its duration replaced (R22, the census of
+  /// exactness).
   #[error("track {}: the duration {} is longer than the container counts", .track.get(), .duration.pts())]
   DurationTooLong {
     /// The track.
@@ -3758,17 +3827,38 @@ pub enum FfmpegMuxRefusal {
   /// clock reference, 300 times the
   /// first decode time, in `int64_t` — refused past `i64::MAX / 600`
   /// (`mpegtsenc.c` 1887–1890). And (R21, census R20-5) the MOV family but
-  /// AVIF its edit list's media time, of version 0 the track's
-  /// first decode time negated, in 32 bits — a first sample at `-2^31`
+  /// AVIF its edit list's media time, of version 0 the track's first
+  /// sample's decode time negated, in 32 bits — a first sample at `-2^31`
   /// ticks or before, as libavformat's shift leaves it, written wrapped
-  /// (`mov_write_edts_tag`, `movenc.c` 4135–4239).
+  /// (`mov_write_edts_tag`, `movenc.c` 4135–4239): judged at `finish`, of
+  /// the whole track, before the trailer runs (R22, the census of
+  /// exactness) — of version 1, where the edit's span or its delay reaches
+  /// `INT32_MAX` movie ticks, it is written in 64 bits, whole.
   #[error("track {}: {} lies past what the container counts", .track.get(), .timestamp.pts())]
   TimeWraps {
     /// The track.
     track: TrackIndex,
     /// The time offered: the decode time, or the presentation time where
-    /// the container counts that.
+    /// the container counts that; the edit list's, its first sample's
+    /// decode time.
     timestamp: Timestamp,
+  },
+  /// The MOV family but AVIF: a track whose span its trailer writes below
+  /// zero (R22, the census of exactness): its edit list's duration — the
+  /// end of its last sample not marked discarded, counted from its first
+  /// sample's presentation time, and that time added where it lies before
+  /// zero (`mov_write_edts_tag`, `movenc.c` 4135–4239 in FFmpeg 9.0.1) — of
+  /// a track that ends before zero, or whose samples are all marked
+  /// discarded, which leaves that end at zero: written wrapped in 32 bits,
+  /// or in 64 of version 1, which FFmpeg's reader refuses with the whole
+  /// file (`mov_read_elst`, `mov.c` 6554–6558). The track header's
+  /// duration, the latest end counted from zero (`mov_write_tkhd_tag`,
+  /// `movenc.c` 3990–3994), lies below zero only where that one does.
+  /// Refused at `finish`, before the trailer runs.
+  #[error("track {}: its span, as the container writes it, ends before zero", .track.get())]
+  NegativeSpan {
+    /// The track.
+    track: TrackIndex,
   },
   /// A time libavformat would hand the container before the earliest it
   /// writes. At its first write libavformat moves every stream's times
@@ -4113,7 +4203,9 @@ pub enum PayloadRule {
   /// the latest, with the last packet's duration as libavformat hands it
   /// — which the trailer writes cut (`wav_write_packet`, 409–420;
   /// `wav_write_trailer`, 448–462), and FFmpeg's reader takes as the
-  /// stream's length.
+  /// stream's length: the span alone at the packet that takes it past, and
+  /// with the last packet's duration at `finish`, before the trailer runs,
+  /// as [`FfmpegMuxRefusal::Payload`] (R22, the census of exactness).
   #[error("the packet would take the file past what its header's 32-bit fields count")]
   FileSize,
   /// IVF (R21, census R20-5; a length that wraps is refused): a packet
@@ -4408,10 +4500,13 @@ pub enum PayloadRule {
   DisplaySetSize,
   /// MP4, Matroska and WebM, a track whose packets are rewritten from
   /// Annex B to length prefixes ([`Rewrite::LengthPrefixed`]): a packet
-  /// whose rewritten size — a 4-byte length for each start code — would
-  /// pass what the rewriter counts in its `int` (`nal_parse_units`,
-  /// `nal.c` 74–111) and the dynamic buffer it writes into holds
-  /// (`aviobuf.c` 1281–1311).
+  /// whose rewritten size — each unit behind a 4-byte length, counted
+  /// exactly — would pass what the rewriter counts in its `int`
+  /// (`nal_parse_units`, `nal.c` 74–111); MP4's HEVC under `hvc1`, whose
+  /// rewrite a dynamic buffer holds first, one that buffer would cut where
+  /// the cut takes a unit its walk keeps, not a parameter set
+  /// (`ff_hevc_annexb2mp4`, `hevc.c` 1203–1250; `aviobuf.c` 1281–1311;
+  /// R22, the census of exactness).
   #[error("the packet, rewritten with length prefixes, is larger than the rewriter counts")]
   RewrittenSize,
   /// Matroska and WebM: a packet whose block — its payload as written and
@@ -4984,6 +5079,10 @@ struct TrackState {
   /// WAV's fact chunk: the earliest and latest presentation time written,
   /// in ticks ([`PacketRules::fact_samples`]).
   presented: Option<(i128, i128)>,
+  /// WAV's fact chunk: the last packet's duration, as libavformat hands it
+  /// and as offered, which its trailer counts the chunk with
+  /// ([`PacketRules::fact_samples`]; R22).
+  wav_last: Option<(i128, Option<Timestamp>)>,
   /// Whether a packet has brought the track's configuration — new
   /// extradata, or an ADTS header AAC's filter makes one of — where its
   /// first must ([`PayloadRule::ConfigurationAbsent`]): a configuration's
@@ -5003,6 +5102,9 @@ struct TrackState {
   /// The MOV family: the rates its sample entries write of the track
   /// ([`StatedRates`]; R22).
   rates: Option<StatedRates>,
+  /// The MOV family but AVIF: its edit list's span of the track so far
+  /// ([`EditSpan`]; R22).
+  edit: EditSpan,
 }
 
 /// MP4's joined TTML document, as its trailer writes it
@@ -5756,9 +5858,11 @@ struct PacketRules {
   /// bits ([`PayloadRule::FrameCount`]; R21, census R20-5).
   ivf: bool,
   /// The MOV family's modes that write an edit list — all but AVIF's —
-  /// whose media time, of version 0, the track's first decode
-  /// time negated, is written in 32 bits ([`FfmpegMuxRefusal::TimeWraps`];
-  /// R21, census R20-5).
+  /// whose media time, of version 0, the track's first decode time
+  /// negated, is written in 32 bits ([`FfmpegMuxRefusal::TimeWraps`]; R21,
+  /// census R20-5), and whose span below zero is written wrapped
+  /// ([`FfmpegMuxRefusal::NegativeSpan`]): judged at `finish`, of the whole
+  /// track ([`EditSpan`]; R22).
   edit_list: bool,
   /// The MOV family: how it writes a sample of each packet it is handed,
   /// which its trailer counts the track's average bit rate of
@@ -5931,6 +6035,71 @@ impl Mp4Counts {
   /// `track_duration`: zero before the first sample.
   fn duration(self) -> i128 {
     self.start.map_or(0, |start| self.end - i128::from(start))
+  }
+}
+
+/// The MOV family's edit list of a track, as `ff_mov_write_packet` counts
+/// it sample by sample (`movenc.c` 7289–7333 in FFmpeg 9.0.1; R22, the
+/// census of exactness), in the stream's ticks as libavformat hands them:
+/// the first sample's decode time (`start_dts`, `cluster[0]`); `start_cts`,
+/// the first sample's presentation offset, or a later one's of a decode
+/// time not after zero where smaller (7324–7325); `end_pts`, the latest
+/// end of a sample — its decode time, its offset and its duration, past the
+/// skip samples MP4 reads (7311–7320, 7326–7331); and `elst_end_pts`, that
+/// end as of the last sample not marked discarded, zero before one — the
+/// track's own field, zeroed with it (7332–7333). Judged at `finish`
+/// ([`CarrierMuxer::edit_lists_refused`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EditSpan {
+  first: Option<i128>,
+  start_cts: i128,
+  end: i128,
+  elst_end: i128,
+}
+
+impl EditSpan {
+  /// The span after a sample at `dts`, presented `cts` after it, of
+  /// `duration` ticks as its end counts them, marked discarded where
+  /// `discard` says so.
+  fn with(self, dts: i128, cts: i128, duration: i128, discard: bool) -> Self {
+    let end_here = dts + cts + duration;
+    let (start_cts, end) = match self.first {
+      None => (cts, end_here),
+      Some(_) => (
+        if dts <= 0 && self.start_cts > cts {
+          cts
+        } else {
+          self.start_cts
+        },
+        self.end.max(end_here),
+      ),
+    };
+    Self {
+      first: Some(self.first.unwrap_or(dts)),
+      start_cts,
+      end,
+      elst_end: if discard { self.elst_end } else { end },
+    }
+  }
+}
+
+/// `av_rescale_rnd(a, b, c, AV_ROUND_UP)` where `up`, else of
+/// `AV_ROUND_DOWN` (`libavutil/mathematics.c` 58–130 in FFmpeg 9.0.1): `a`
+/// by `b` over `c`, rounded toward positive or negative infinity, a value
+/// below zero by the opposite rounding of its magnitude, negated; a result
+/// past `INT64_MAX` answered `INT64_MIN`.
+fn rescale_rounded(a: i128, b: i128, c: i128, up: bool) -> i128 {
+  let product = a.saturating_mul(b);
+  let (quotient, remainder) = (product.div_euclid(c), product.rem_euclid(c));
+  let rounded = if up && remainder != 0 {
+    quotient + 1
+  } else {
+    quotient
+  };
+  if (-i128::from(i64::MAX)..=i128::from(i64::MAX)).contains(&rounded) {
+    rounded
+  } else {
+    i128::from(i64::MIN)
   }
 }
 
@@ -6982,12 +7151,20 @@ fn nal_rewritten_bytes(bytes: &[u8]) -> u64 {
 /// `matroskaenc.c` 1173–1180), each rewriting an Annex B configuration it
 /// reaches the rewrite of: H.264's of more than 6 bytes, HEVC's and VVC's
 /// of 6 or more (`avc.c` 40–50; `hevc.c` 1300–1371; `vvc.c` 886–898). Its
-/// bytes are [`nal_rewritten_bytes`]'s, exactly.
+/// bytes are [`nal_rewritten_bytes`]'s, exactly; past the bound, the cut
+/// refused where it takes a unit the writer's walk keeps
+/// ([`records::rewrite_cut_keeps`]; R22, the census of exactness) —
+/// `avcC`'s SPSs, PPSs and SPS extensions (`avc.c` 67–101); `hvcC`'s
+/// parameter sets and SEI of the base layer and the alpha layer, of every
+/// layer in MP4 of a stream handed the multilayer flag, whose `lhvC` walks
+/// the same rewrite (`multilayer`; [`records::hvcc_kept`]); `vvcC`'s
+/// (`vvc.c` 898–927) — and taken where it takes only units the record
+/// leaves out, which it would not miss.
 fn rewrite_cut(
   (family, audited): (Family, Audited),
   codec: CodecId,
   config: &[u8],
-  bound: u64,
+  (bound, multilayer): (u64, bool),
 ) -> bool {
   let writes = family == Family::Mp4 || family == Family::Matroska || audited == Audited::Flv;
   let reaches = if codec == CodecId::H264 {
@@ -6997,7 +7174,23 @@ fn rewrite_cut(
   } else {
     false
   };
-  writes && reaches && annex_b(config) && nal_rewritten_bytes(config) > bound
+  if !(writes && reaches && annex_b(config)) {
+    return false;
+  }
+  if codec == CodecId::H264 {
+    records::rewrite_cut_keeps(config, bound, |_, _, [first, _]| {
+      matches!(first & 0x1F, 7 | 8 | 13)
+    })
+  } else if codec == CodecId::HEVC {
+    let kept = records::hvcc_kept(config, family == Family::Mp4 && multilayer);
+    records::rewrite_cut_keeps(config, bound, |index, _, _| {
+      kept.get(index).copied().unwrap_or(false)
+    })
+  } else {
+    records::rewrite_cut_keeps(config, bound, |_, _, [_, second]| {
+      records::vvcc_keeps(second)
+    })
+  }
 }
 
 /// TSCC2, QCELP and EVRC, which the base names no constant for.
@@ -8064,12 +8257,21 @@ fn skips_below_nothing(
 /// packet's own, or a joined E-AC-3 sample's last packet's (6940) — at
 /// least a frame of `frame_size` samples, each counted in `time_base` from
 /// `sample_rate` as `av_rescale_q` rounds (7311–7320).
-fn end_below_nothing(
+fn end_below_nothing(end: u32, duration: i64, skip: (i32, i32), time_base: Timebase) -> bool {
+  skip_trimmed(end, duration, skip, time_base) < 0
+}
+
+/// A sample's duration as MP4 counts its end by skip samples that drop
+/// `end` samples from it, its duration as handed `duration` — at least a
+/// frame of `frame_size` samples, less the samples dropped, each counted in
+/// `time_base` from `sample_rate` as `av_rescale_q` rounds (`movenc.c`
+/// 7311–7320).
+fn skip_trimmed(
   end: u32,
   duration: i64,
   (frame_size, sample_rate): (i32, i32),
   time_base: Timebase,
-) -> bool {
+) -> i128 {
   let ticks = |samples: i128| {
     rescale_nearest(
       samples,
@@ -8078,7 +8280,18 @@ fn end_below_nothing(
     )
   };
   let longest = ticks(i128::from(frame_size)).max(duration);
-  i128::from(longest) - i128::from(ticks(i128::from(end))) < 0
+  i128::from(longest) - i128::from(ticks(i128::from(end)))
+}
+
+/// A packet's duration as libavformat hands it to the container
+/// (`guess_pkt_duration`, `mux.c` 605–633): as offered where above zero, or
+/// below zero on a subtitle track; else its guess, `guessed`.
+const fn handed_duration(offered: i64, kind: TrackKind, guessed: i64) -> i64 {
+  if offered > 0 || (offered < 0 && matches!(kind, TrackKind::Subtitle)) {
+    offered
+  } else {
+    guessed
+  }
 }
 
 /// Whether a ProRes packet reads back from Matroska as itself: it opens on
@@ -8316,6 +8529,10 @@ struct Ac3Run {
   /// The first packet's skip samples, which the sample carries: the samples
   /// to drop from its end, where the entry is one MP4 reads (7311–7312).
   skip_end: Option<u32>,
+  /// The first packet's presentation offset and discard mark, which the
+  /// sample carries (588; [`EditSpan`]).
+  cts: i64,
+  discard: bool,
 }
 
 /// The last sample MP4 wrote of an AC-3 or E-AC-3 track, as its trailer
@@ -8354,6 +8571,10 @@ struct Ac3Packet<'a> {
   duration: i64,
   offered: Option<i64>,
   skip_end: Option<u32>,
+  /// Its presentation offset, as libavformat hands it.
+  cts: i64,
+  /// Whether it is marked discarded.
+  discard: bool,
 }
 
 /// Holds an MP4 AC-3 (`eac3` false) or E-AC-3 packet to MP4's handling of
@@ -8419,6 +8640,8 @@ fn ac3_packet(
         offered: packet.offered.map(i128::from),
         bytes: len,
         skip_end: packet.skip_end,
+        cts: packet.cts,
+        discard: packet.discard,
       }),
       Ac3Step::Opens,
     ),
@@ -10201,6 +10424,9 @@ struct Learned {
   /// WAV's fact chunk: the earliest and latest presentation times after the
   /// packet.
   presented: Option<(i128, i128)>,
+  /// WAV's fact chunk: the packet's duration as handed and as offered,
+  /// the last.
+  wav_last: Option<(i128, Option<Timestamp>)>,
   /// Whether the packet brings the track's configuration
   /// ([`TrackState::configured`]).
   configured: bool,
@@ -10212,6 +10438,9 @@ struct Learned {
   /// MP4's joined TTML: the paragraphs' bytes and latest end after the
   /// packet.
   ttml: Option<TtmlCounts>,
+  /// The MOV family but AVIF: its edit list's span after the packet
+  /// ([`EditSpan`]).
+  edit: Option<EditSpan>,
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
@@ -10243,6 +10472,9 @@ pub struct CarrierMuxer<W, C: FfmpegCarrier> {
   /// bit rate of, its samples' bytes and its duration
   /// ([`chapter_track_inputs`]); `None` where its mode makes none.
   chapter_counts: Option<(u128, i128)>,
+  /// The MOV family: its movie timescale ([`mp4_movie_timescale`]), which
+  /// its edit lists count their spans in; `None` of another container.
+  movie_timescale: Option<i64>,
   _carrier: PhantomData<fn() -> C>,
 }
 
@@ -10582,7 +10814,10 @@ where
               (family, audited),
               codec.codec(),
               codec.extradata(),
-              bounds.rewrite,
+              (
+                bounds.rewrite,
+                handed_multilayer((family, audited), *road, description),
+              ),
             ) || (esds_carries(audited, codec.codec(), codec.codec_tag())
               && !codec.extradata().is_empty()
               && 32 + codec.extradata().len() as u64 > bounds.descriptor)
@@ -10884,11 +11119,13 @@ where
         buffered: 0,
         flv_rewrites: rules.flv_tag.is_some_and(|tag| tag.rewritten),
         presented: None,
+        wav_last: None,
         configured: false,
         ivf_frames: 0,
         mp4_counts: Mp4Counts::default(),
         ttml,
         rates,
+        edit: EditSpan::default(),
       });
     }
 
@@ -10949,6 +11186,7 @@ where
           _ => None,
         },
         chapter_counts,
+        movie_timescale: matches!(audited, Audited::Mov(_)).then_some(movie_timescale),
         _carrier: PhantomData,
       },
       report,
@@ -11168,6 +11406,16 @@ where
     if let Some(refusal) = self.bit_rates_refused() {
       return Err(self.refuse_trailer(refusal));
     }
+    // Its edit lists, as its trailer writes them of each whole track (R22,
+    // the census of exactness).
+    if let Some(refusal) = self.edit_lists_refused() {
+      return Err(self.refuse_trailer(refusal));
+    }
+    // WAV's fact chunks, of the last packet's duration (R22, the census of
+    // exactness).
+    if let Some(refusal) = self.fact_chunks_refused() {
+      return Err(self.refuse_trailer(refusal));
+    }
     self
       .output
       .write_trailer()
@@ -11224,6 +11472,88 @@ where
       };
       if let Some(written) = bit_rates_cut(input, btrt, rates.esds) {
         return Some(FfmpegMuxRefusal::BitRates { track, written });
+      }
+    }
+    None
+  }
+
+  /// The first WAV or Wave64 track whose fact chunk its trailer would write
+  /// cut (R22, the census of exactness; `wav_write_trailer`, `wavenc.c`
+  /// 448–462, 608–616 in FFmpeg 9.0.1): the last packet's duration, which
+  /// WAV keeps in an `int` (82, 412) — past it,
+  /// [`FfmpegMuxRefusal::DurationTooLong`] — and the presentation span with
+  /// it, past the samples the chunk counts ([`PayloadRule::FileSize`]).
+  fn fact_chunks_refused(&self) -> Option<FfmpegMuxRefusal> {
+    for (index, state) in self.tracks.iter().enumerate() {
+      let (Some(limit), Some((earliest, latest)), Some((handed, offered)), Some((_, time_base))) = (
+        state.rules.fact_samples,
+        state.presented,
+        state.wav_last,
+        state.stream,
+      ) else {
+        continue;
+      };
+      let track = TrackIndex::new(index);
+      if handed > i128::from(i32::MAX) {
+        return Some(FfmpegMuxRefusal::DurationTooLong {
+          track,
+          duration: offered.unwrap_or_else(|| {
+            Timestamp::new(i64::try_from(handed).unwrap_or(i64::MAX), time_base)
+          }),
+        });
+      }
+      if latest - earliest + handed > i128::from(limit) {
+        return Some(FfmpegMuxRefusal::Payload {
+          track,
+          rule: PayloadRule::FileSize,
+        });
+      }
+    }
+    None
+  }
+
+  /// The first track whose edit list the MOV family's trailer would write
+  /// cut, judged of the whole track (R22, the census of exactness;
+  /// `mov_write_edts_tag`, `movenc.c` 4135–4239 in FFmpeg 9.0.1;
+  /// [`EditSpan`]): of each track of a sample but `mov_text`'s and TTML's,
+  /// whose samples lie at zero and after. The edit's span, `elst_end_pts`
+  /// less the first presentation time, `start_dts` and `start_cts`
+  /// (`calc_elst_duration`, `get_pts_range`, 3858–3909), counted in the
+  /// movie timescale rounded up; the delay, that time rounded down; version
+  /// 1 where either reaches `INT32_MAX`. Where the delay is not above zero,
+  /// the media time is the first decode time negated, of version 0 in 32
+  /// bits ([`FfmpegMuxRefusal::TimeWraps`]), and the delay is added to the
+  /// span; the span below zero ([`FfmpegMuxRefusal::NegativeSpan`]).
+  /// Movenc counts the delay of the first sample's own offset where that
+  /// sample is decoded at zero or after and `start_cts` is another's
+  /// (4145–4155): its presentation time then lies at zero or after, and
+  /// `start_cts`'s too, so that no refusal turns on it. The track header's
+  /// duration, `end_pts` from zero rounded up (3990–3994), lies below zero
+  /// only where the edit's does: `end_pts` is no earlier than
+  /// `elst_end_pts`, and `ceil(x − y) + floor(y) ≤ ceil(x)`.
+  fn edit_lists_refused(&self) -> Option<FfmpegMuxRefusal> {
+    let movie = i128::from(self.movie_timescale?);
+    for (index, state) in self.tracks.iter().enumerate() {
+      let (Some(first_dts), Some((_, time_base))) = (state.edit.first, state.stream) else {
+        continue;
+      };
+      let track = TrackIndex::new(index);
+      let scale = i128::from(time_base.den().get());
+      let span = state.edit;
+      // `start_dts` and `start_cts`: the first presentation time.
+      let start = first_dts + span.start_cts;
+      let elst = rescale_rounded(span.elst_end - start, movie, scale, true);
+      let delay = rescale_rounded(start, movie, scale, false);
+      let version = elst >= i128::from(i32::MAX) || delay >= i128::from(i32::MAX);
+      let written = if delay > 0 { elst } else { elst + delay };
+      if written < 0 {
+        return Some(FfmpegMuxRefusal::NegativeSpan { track });
+      }
+      if delay <= 0 && !version && first_dts < -i128::from(i32::MAX) {
+        return Some(FfmpegMuxRefusal::TimeWraps {
+          track,
+          timestamp: Timestamp::new(i64::try_from(first_dts).unwrap_or(i64::MIN), time_base),
+        });
       }
     }
     None
@@ -11883,6 +12213,9 @@ where
     if let Some(presented) = plan.learned.presented {
       state.presented = Some(presented);
     }
+    if let Some(last) = plan.learned.wav_last {
+      state.wav_last = Some(last);
+    }
     state.configured |= plan.learned.configured;
     if let Some(frames) = plan.learned.ivf_frames {
       state.ivf_frames = frames;
@@ -11892,6 +12225,9 @@ where
     }
     if let Some(ttml) = plan.learned.ttml {
       state.ttml = Some(ttml);
+    }
+    if let Some(edit) = plan.learned.edit {
+      state.edit = edit;
     }
     if let Some(sample) = plan.learned.sample {
       state.sample = Some(sample);
@@ -12622,34 +12958,31 @@ fn check_packet_rules<'p>(
   // time, with the last packet's duration as libavformat hands it — a
   // missing one its guess (`mux.c` 605–633) — in samples, WAV's stream
   // counting its sample rate (`wav_write_packet`, `wavenc.c` 409–420;
-  // 448–462): refused at the packet that would have the trailer cut it.
-  let presented = match rules.fact_samples {
+  // 448–462). The span alone, which only grows, refused at the packet that
+  // takes it past the count — the duration added, whatever it is, the
+  // count passes it or that duration is past the `int` WAV keeps it in,
+  // and either is cut. The duration — WAV keeps the last packet's, each
+  // replacing the one before (82, 412) — and the count with it, judged at
+  // `finish` ([`CarrierMuxer::fact_chunks_refused`]; R22, the census of
+  // exactness: judged at each packet as though it were the last, a
+  // duration a later packet replaced was refused).
+  let (presented, wav_last) = match rules.fact_samples {
     Some(limit) => {
       let pts = i128::from(own.pts_ticks.unwrap_or(dts_ticks)) + lift;
       let (earliest, latest) = state.presented.map_or((pts, pts), |(earliest, latest)| {
         (earliest.min(pts), latest.max(pts))
       });
-      let duration = i128::from(if duration_ticks > 0 {
+      if latest - earliest > i128::from(limit) {
+        return refused(PayloadRule::FileSize);
+      }
+      let handed = i128::from(if duration_ticks > 0 {
         duration_ticks
       } else {
         guessed
       });
-      // The trailer counts the span with the last packet's duration, which
-      // WAV keeps in an `int` (`wavenc.c` 82, 412), cut past it: a duration
-      // offered past it, as though the packet were the last — libavformat's
-      // guess is a count of samples at the sample rate WAV's time base is
-      // of, an `int` (R21, Codex R20 2).
-      if let Some(duration) = own.duration
-        && duration_ticks > i64::from(i32::MAX)
-      {
-        return Err(FfmpegMuxRefusal::DurationTooLong { track, duration });
-      }
-      if latest - earliest + duration > i128::from(limit) {
-        return refused(PayloadRule::FileSize);
-      }
-      Some((earliest, latest))
+      (Some((earliest, latest)), Some((handed, own.duration)))
     }
-    None => None,
+    None => (None, None),
   };
   if let Some(frame) = rules.frame_bytes
     && !payload.bytes.len().is_multiple_of(frame as usize)
@@ -12675,6 +13008,8 @@ fn check_packet_rules<'p>(
         duration,
         offered: (duration_ticks > 0).then_some(duration_ticks),
         skip_end: skip_end(payload.side_data),
+        cts: own.pts_ticks.map_or(0, |pts| pts - dts_ticks),
+        discard: payload.flags.contains(PacketFlags::DISCARD),
       };
       match ac3_packet(state.ac3, ac3_rules.eac3, packet, bounds.packet) {
         Ok((learned, ac3_step)) => Some((learned, ac3_step, duration)),
@@ -12903,13 +13238,37 @@ fn check_packet_rules<'p>(
     }
   }
   // The sizes the container's arithmetic holds the packet to, as written.
+  // A packet rewritten from Annex B, each unit behind a 4-byte length,
+  // counted exactly (R22, the census of exactness): MP4's H.264, LCEVC, VVC
+  // and HEVC under `hev1`, and Matroska's, written as the rewriter goes,
+  // its bytes summed in an `int` (`nal_parse_units`, `nal.c` 74–111;
+  // `movenc.c` 7087–7158; `mkv_reformat_h2645`, `matroskaenc.c` 2793–2808);
+  // MP4's HEVC under `hvc1` rewritten into a dynamic buffer first, its
+  // parameter sets dropped as it is walked (`ff_hevc_annexb2mp4`,
+  // `hevc.c` 1203–1250) — cut where the buffer's cut takes a unit the walk
+  // keeps ([`records::rewrite_cut_keeps`]).
   let len = payload.bytes.len() as u64;
   let written = if rules.length_prefixed {
-    let rewritten = length_prefixed_bytes(payload.bytes);
-    if rewritten > bounds.packet {
-      return refused(PayloadRule::RewrittenSize);
+    let filtered = matches!(
+      rules.sample,
+      SampleRule::AnnexB {
+        parameter_sets_dropped: true
+      }
+    );
+    if filtered {
+      if records::rewrite_cut_keeps(payload.bytes, bounds.rewrite, |_, _, [first, _]| {
+        !matches!((first >> 1) & 0x3F, 32..=34)
+      }) {
+        return refused(PayloadRule::RewrittenSize);
+      }
+      hevc_units_kept_bytes(payload.bytes)
+    } else {
+      let rewritten = nal_rewritten_bytes(payload.bytes);
+      if rewritten > bounds.sum {
+        return refused(PayloadRule::RewrittenSize);
+      }
+      rewritten
     }
-    rewritten
   } else {
     len
   };
@@ -12973,27 +13332,53 @@ fn check_packet_rules<'p>(
       }),
     }
   };
-  // The MOV family's edit list (R21, census R20-5): its media time, of
-  // version 0 unless the track's span or its delay passes `INT32_MAX`
-  // movie ticks, the first sample's decode time negated where it lies
-  // before zero, written in 32 bits (`mov_write_edts_tag`, `movenc.c`
-  // 4135–4239): a first decode time at `-2^31` ticks or earlier — moved by
-  // libavformat's shift as far as the packet shows it, which none of these
-  // modes makes — written wrapped; judged at the packet that makes the first sample, or opens
-  // the E-AC-3 run that does, as though the track ended there.
-  let first = match ac3 {
-    Some((_, Ac3Step::Opens, _)) => Some(i128::from(dts_ticks)),
-    _ => sample.map(|sample| i128::from(sample.dts)),
-  };
-  if rules.edit_list
-    && state.sample.is_none()
-    && first.is_some_and(|first| first + lift <= -(1_i128 << 31))
+  // The MOV family's edit list, as its trailer writes it of the whole
+  // track: judged at `finish` (R22, the census of exactness — judged here,
+  // as though the track ended at its first sample, it refused a track whose
+  // span its version writes in 64 bits; [`EditSpan`]). Each sample MP4
+  // writes with the packet counts its decode time and presentation offset
+  // as libavformat hands them, its end — its duration as handed, past the
+  // skip samples MP4 reads (7311–7320) — and whether it is marked
+  // discarded: an E-AC-3 sample its first packet's, its end its last
+  // packet's own duration (6940). `mov_text`'s and TTML's samples lie at
+  // zero and after, and are not counted.
+  let edit = if rules.edit_list && !rules.mov_text && rules.ttml_document.is_none() && !config_only
   {
-    return Err(FfmpegMuxRefusal::TimeWraps {
-      track,
-      timestamp: dts,
-    });
-  }
+    let span = state.edit;
+    let ends = |own: i64, end: Option<u32>| match (rules.skip_samples, end) {
+      (Some(skip), Some(end)) => skip_trimmed(end, own, skip, time_base),
+      _ => i128::from(own),
+    };
+    let discard = payload.flags.contains(PacketFlags::DISCARD);
+    match ac3 {
+      Some((_, Ac3Step::Opens | Ac3Step::Joins, _)) => None,
+      Some((_, Ac3Step::Completes(run), duration)) => Some(span.with(
+        i128::from(run.dts) + lift,
+        i128::from(run.cts),
+        ends(duration, run.skip_end),
+        run.discard,
+      )),
+      Some((_, Ac3Step::Alone, duration)) => Some(span.with(
+        i128::from(dts_ticks) + lift,
+        i128::from(own.pts_ticks.unwrap_or(dts_ticks)) - i128::from(dts_ticks),
+        ends(duration, skip_end(payload.side_data)),
+        discard,
+      )),
+      None => outputs.last().map(|output| {
+        span.with(
+          i128::from(output.dts_ticks) + lift,
+          i128::from(output.pts_ticks.unwrap_or(output.dts_ticks)) - i128::from(output.dts_ticks),
+          ends(
+            handed_duration(output.duration_ticks, state.kind, guessed),
+            skip_end(payload.side_data),
+          ),
+          discard,
+        )
+      }),
+    }
+  } else {
+    None
+  };
   // IVF's frames, an `unsigned` raised at each packet it writes — each its
   // track's filter puts out — and written at its trailer in its header's 32
   // bits (`ivf_write_packet`, `ivfenc.c` 84; `ivf_write_trailer`, 100; R21,
@@ -13052,15 +13437,7 @@ fn check_packet_rules<'p>(
     None
   } else {
     let counts = state.mp4_counts;
-    let handed = |offered: i64| {
-      i128::from(
-        if offered > 0 || (offered < 0 && state.kind == TrackKind::Subtitle) {
-          offered
-        } else {
-          guessed
-        },
-      )
-    };
+    let handed = |offered: i64| i128::from(handed_duration(offered, state.kind, guessed));
     let in_use: &[u8] = match &descriptions {
       Some(choice) if choice.overwrite || choice.append => {
         choice.reaching.as_ref().map_or(&[], Reaching::bytes)
@@ -13146,6 +13523,7 @@ fn check_packet_rules<'p>(
       written,
       flv_rewrites,
       presented,
+      wav_last,
       configured: step.inserted == Some(AutomaticFilter::AacAdtsToAsc)
         || side_data(
           payload.side_data,
@@ -13155,6 +13533,7 @@ fn check_packet_rules<'p>(
       ivf_frames,
       mp4_counts,
       ttml,
+      edit,
     },
     choices,
   ))
@@ -14455,22 +14834,49 @@ fn mov_refusal<D: AsRef<[u8]>>(
   {
     return Some(MuxOpenError::ConfigurationInvalid { track, codec });
   }
-  // Outside MOV and AVIF, the track header's display width is the width
-  // by the aspect ratio in 16.16, and FFmpeg writes the width alone where
-  // that passes 32 bits — or is none, or below zero, as `av_rescale`
-  // answers a ratio of no denominator (`mov_write_tkhd_tag`, `movenc.c`
-  // 4066–4085): the aspect ratio as displayed lost (R21, census R20-5). A
-  // ratio of no numerator is none, and its width the width.
-  if !matches!(mode, MovMode::Mov | MovMode::Avif)
-    && description.kind() == TrackKind::Video
-    && ticket.sample_aspect_ratio().num() != 0
-    && !(1..=i64::from(u32::MAX)).contains(&rescale_near(
-      i64::from(ticket.sample_aspect_ratio().num()),
-      i64::from(ticket.width()) * 0x10000,
-      i64::from(ticket.sample_aspect_ratio().den()),
-    ))
-  {
-    return Some(MuxOpenError::Dimensions { track });
+  // The track header's dimensions, of a video's track and a subtitle's
+  // alike (`mov_write_tkhd_tag`, `movenc.c` 4064–4090): outside MOV and
+  // AVIF, the display width is the width by the aspect ratio in 16.16, and
+  // FFmpeg writes the width alone where that passes 32 bits — or is none,
+  // or below zero, as `av_rescale` answers a ratio of no denominator: the
+  // aspect ratio as displayed lost (R21, census R20-5). A ratio of no
+  // numerator is none, and its width the width. The width alone in 16.16
+  // past 32 bits is written as none, the height past 16 bits so, and
+  // either below zero wrapped: a video's picture past 65535 is refused
+  // above as the start refuses it, of none libavformat's own refusal at
+  // its start (`init_muxer`, `mux.c` 248–254); a subtitle's here, of the
+  // size a DVD subtitle track's configuration states, which MP4 gives its
+  // stream ([`dvd_sub_size`]; R22, the census of exactness).
+  let size = match description.kind() {
+    TrackKind::Video => Some((ticket.width(), ticket.height())),
+    TrackKind::Subtitle => {
+      let config = stream_extradata(description);
+      if codec == CodecId::DVD_SUBTITLE && !config.is_empty() {
+        match dvd_sub_size(config) {
+          Some(size) => Some(size),
+          None => return Some(MuxOpenError::Dimensions { track }),
+        }
+      } else {
+        Some((ticket.width(), ticket.height()))
+      }
+    }
+    _ => None,
+  };
+  if let Some((width, height)) = size {
+    let held = |value: i32| (0..=i32::from(u16::MAX)).contains(&value);
+    let ratio = ticket.sample_aspect_ratio();
+    if !held(width)
+      || !held(height)
+      || (!matches!(mode, MovMode::Mov | MovMode::Avif)
+        && ratio.num() != 0
+        && !(1..=i64::from(u32::MAX)).contains(&rescale_near(
+          i64::from(ratio.num()),
+          i64::from(width) * 0x10000,
+          i64::from(ratio.den()),
+        )))
+    {
+      return Some(MuxOpenError::Dimensions { track });
+    }
   }
   // The bit rates its sample entries write — the `btrt`'s and the
   // `esds`'s — are judged at the trailer, which computes them of the
@@ -15163,6 +15569,98 @@ fn dvd_sub_palette_colours(config: &[u8]) -> Option<Vec<u32>> {
   palette
 }
 
+/// The picture size MP4 gives a DVD subtitle track of the configuration
+/// `config`, which its track header writes (`mov_create_dvd_sub_decoder_specific_info`,
+/// `movenc.c` 8000–8046 in FFmpeg 9.0.1; R22, the census of exactness):
+/// 720 × 480; each line opening on `size:` before the walk has seen a
+/// palette and a size scanned as `sscanf`'s `%dx%d` from after it — white
+/// space skipped, across lines too, a sign, the digits; the `x` at once;
+/// the height so — each value it converts replacing the one before. A
+/// value past an `int`, of which `sscanf` is undefined, answers `None`.
+fn dvd_sub_size(config: &[u8]) -> Option<(i32, i32)> {
+  let text = config.split(|&byte| byte == 0).next().unwrap_or(&[]);
+  let (mut width, mut height) = (720, 480);
+  let (mut palette, mut size) = (false, false);
+  let mut at = 0;
+  while at < text.len() {
+    let end = text[at..]
+      .iter()
+      .position(|&byte| byte == b'\n' || byte == b'\r')
+      .map_or(text.len(), |len| at + len);
+    let line = &text[at..end];
+    if line.starts_with(b"palette:") {
+      palette = true;
+    } else if line.starts_with(b"size:") {
+      let mut scan = at + 5;
+      if let Some(scanned) = scan_int(text, &mut scan)? {
+        width = scanned;
+        if text.get(scan) == Some(&b'x') {
+          scan += 1;
+          if let Some(scanned) = scan_int(text, &mut scan)? {
+            height = scanned;
+          }
+        }
+      }
+      size = true;
+    }
+    if palette && size {
+      break;
+    }
+    at = end;
+    while text
+      .get(at)
+      .is_some_and(|&byte| byte == b'\n' || byte == b'\r')
+    {
+      at += 1;
+    }
+  }
+  Some((width, height))
+}
+
+/// `sscanf`'s `%d` of `text` from `at`, moved past what it converts: white
+/// space skipped (`isspace`), a sign, the digits — `Some(None)` where none
+/// convert, `None` of a value past an `int`, of which `sscanf` is
+/// undefined.
+fn scan_int(text: &[u8], at: &mut usize) -> Option<Option<i32>> {
+  let mut next = *at;
+  while text
+    .get(next)
+    .is_some_and(|byte| b" \t\n\x0b\x0c\r".contains(byte))
+  {
+    next += 1;
+  }
+  let negative = match text.get(next) {
+    Some(b'-') => {
+      next += 1;
+      true
+    }
+    Some(b'+') => {
+      next += 1;
+      false
+    }
+    _ => false,
+  };
+  let digits = text
+    .get(next..)
+    .unwrap_or(&[])
+    .iter()
+    .take_while(|byte| byte.is_ascii_digit())
+    .count();
+  if digits == 0 {
+    return Some(None);
+  }
+  let mut value: i64 = 0;
+  for &digit in &text[next..next + digits] {
+    value = value * 10 + i64::from(digit - b'0');
+    if value > i64::from(i32::MAX) + 1 {
+      return None;
+    }
+  }
+  let value = i32::try_from(if negative { -value } else { value }).ok()?;
+  *at = next + digits;
+  Some(Some(value))
+}
+
 /// Whether MP4's DVD subtitle palette reads back with a colour moved, or
 /// `None` where MP4 writes no palette or one of fewer than sixteen colours
 /// ([`dvd_sub_palette_colours`]): each colour converted to YUV as
@@ -15418,18 +15916,6 @@ fn length_prefixed(family: Family, codec: CodecId, extradata: &[u8]) -> bool {
     },
     Family::Other => false,
   }
-}
-
-/// An upper bound on the bytes the Annex B rewriter makes of `bytes`
-/// (`nal_parse_units`, `nal.c` 74–111): each start code it finds becomes a
-/// 4-byte length, and the bytes between them are kept or trimmed, so the
-/// rewritten packet is its bytes and at most one more for each `00 00 01`.
-fn length_prefixed_bytes(bytes: &[u8]) -> u64 {
-  let starts = bytes
-    .windows(3)
-    .filter(|window| *window == [0, 0, 1])
-    .count();
-  (bytes.len() + starts) as u64
 }
 
 /// Whether Matroska writes a default duration for a timed track of `kind`

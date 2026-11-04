@@ -493,6 +493,66 @@ fn walked<'a>(units: impl Iterator<Item = &'a [u8]>) -> impl Iterator<Item = (&'
   })
 }
 
+/// Whether the dynamic buffer `ff_nal_parse_units_buf` rewrites `bytes`
+/// into — each unit behind a 4-byte length — cuts a unit the walk after it
+/// keeps, `keeps` answering of each unit the walk reads, its index, its
+/// bytes and the two bytes it reads its type from ([`walked`]; R22, the
+/// census of exactness; `nal.c` 133–144; `aviobuf.c` 1281–1311, 1410–1436
+/// in FFmpeg 9.0.1): the rewrite with the 64 bytes of padding the buffer's
+/// close writes past `bound` — `INT_MAX` less them — the buffer refuses the
+/// 1024-byte flush that would pass `INT_MAX` and every one after, and its
+/// close answers what it holds less the padding, `1024 × ⌊(bound + 64) /
+/// 1024⌋ − 64` bytes — `2^31 − 1088` of the real bound — so that a unit
+/// ending past them is walked short, or not at all. A unit the walk keeps
+/// not, so cut, is lost to nothing the walk writes.
+pub(super) fn rewrite_cut_keeps(
+  bytes: &[u8],
+  bound: u64,
+  mut keeps: impl FnMut(usize, &[u8], [u8; 2]) -> bool,
+) -> bool {
+  let total: u64 = nal_units(bytes).map(|unit| 4 + unit.len() as u64).sum();
+  if total <= bound {
+    return false;
+  }
+  let held = ((bound + 64) / 1024 * 1024).saturating_sub(64);
+  let mut end = 0;
+  for (index, (unit, head)) in walked(nal_units(bytes)).enumerate() {
+    end += 4 + unit.len() as u64;
+    if end > held && keeps(index, unit, head) {
+      return true;
+    }
+  }
+  false
+}
+
+/// Of each unit of the Annex B configuration `config` the `hvcC` writer's
+/// walk reads ([`walked`]), whether it keeps it (`hvcc_add_nal_unit`,
+/// `hevc.c` 862–933): of the five kept types, of the base layer or the
+/// alpha layer a VPS extension named before it — of every layer where
+/// `lhvc`, `lhvC`'s walk (R22, the census of exactness).
+pub(super) fn hvcc_kept(config: &[u8], lhvc: bool) -> Vec<bool> {
+  let mut record = Hvcc::default();
+  walked(nal_units(config))
+    .map(|(unit, [first, _])| {
+      let kind = (first >> 1) & 0x3F;
+      HEVC_ARRAYS
+        .iter()
+        .position(|&kept| kept == kind)
+        .is_some_and(|array| {
+          let before = record.counts[array];
+          let _ = hvcc_add(&mut record, unit, array, (true, lhvc));
+          record.counts[array] > before
+        })
+    })
+    .collect()
+}
+
+/// The `vvcC` writer's kept types, by the second byte of a unit's header
+/// (`vvc.c` 898–927).
+pub(super) fn vvcc_keeps(second: u8) -> bool {
+  VVC_ARRAYS.contains(&(second >> 3))
+}
+
 /// The bytes of the RBSP `ff_nal_unit_extract_rbsp` makes of the NAL unit
 /// `nal`: its own, less each emulation prevention byte after its first
 /// `header` (`nal.c` 163–193).
