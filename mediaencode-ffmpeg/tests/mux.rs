@@ -6643,18 +6643,19 @@ fn l72_a_configurations_packet_is_taken_where_the_container_takes_it() {
 
 /// The muxers this release writes, by the names libavformat resolves
 /// (table H of the census): the modern formats the owner keeps (R21).
-const AUDITED: [&str; 20] = [
+const AUDITED: [&str; 19] = [
   "mov", "mp4", "ipod", "avif", "matroska", "webm", "mpegts", "flv", "ivf", "wav", "w64", "adts",
-  "ac3", "eac3", "dts", "flac", "mp3", "h264", "hevc", "obu",
+  "ac3", "eac3", "dts", "flac", "h264", "hevc", "obu",
 ];
 
 /// The muxers this release audited and withholds, each by its reason
 /// (R21, the owner's ruling on letter 1).
-const WITHHELD: [(&str, Withheld); 4] = [
+const WITHHELD: [(&str, Withheld); 5] = [
   ("ogg", Withheld::OggPageBuffering),
   ("oga", Withheld::OggPageBuffering),
   ("ogv", Withheld::OggPageBuffering),
   ("opus", Withheld::OggPageBuffering),
+  ("mp3", Withheld::Mp3XingFrame),
 ];
 
 /// **L73 — a muxer opens only where this release audited it** (table H of
@@ -6671,7 +6672,8 @@ const WITHHELD: [(&str, Withheld); 4] = [
 /// either.
 ///
 /// PLANT: the check skipped: `srt` reaches the table's refusal; the
-/// withholding skipped: `ogg` refused as not supported.
+/// withholding skipped: `ogg` refused as not supported; MP3's reason
+/// another's, `mp3` refused for Ogg's.
 #[test]
 fn l73_a_muxer_opens_only_where_this_release_audited_it() {
   use ffmpeg_next::ffi::{AVFMT_NOFILE, av_muxer_iterate};
@@ -6861,8 +6863,8 @@ fn field_rows(report: &mediaencode_ffmpeg::MuxReport) -> Vec<Uncarried> {
 
 /// **L74 — one well-formed stream round-trips through each raw stream's
 /// muxer, IVF, WAV and Wave64, and the report says what each writes of it**
-/// (table H of the census): raw AC-3, E-AC-3, DTS, MPEG audio layer III
-/// and FLAC read back as the bytes written; ADTS reads back each raw AAC frame behind its header, and an
+/// (table H of the census): raw AC-3, E-AC-3, DTS and FLAC read back as
+/// the bytes written; ADTS reads back each raw AAC frame behind its header, and an
 /// ADTS stream as it was; H.264 and HEVC from Matroska and AV1 as as many
 /// packets as written, the first two converted to Annex B by the filter
 /// their first packet inserts, which writes the configuration; IVF's VP8
@@ -6928,12 +6930,6 @@ fn l74_each_raw_stream_round_trips_through_its_muxer() {
     (
       "dts",
       sine("dts.mkv", "dca", &["-strict", "-2"]),
-      TrackKind::Audio,
-      timeline.clone(),
-    ),
-    (
-      "mp3",
-      sine("mp3.mkv", "libmp3lame", &[]),
       TrackKind::Audio,
       timeline.clone(),
     ),
@@ -7174,10 +7170,10 @@ fn l75_the_adts_muxer_refuses_what_its_headers_cannot_carry() {
   }
 }
 
-/// **L76 — FLAC and MP3 refuse at open what they would not write, and FLAC
-/// takes a STREAMINFO of no payload** (table H): a video track, which
-/// either writes only as one attached picture and this muxer makes none
-/// there ([`MuxOpenError::CodecNotCarried`]); FLAC with no configuration
+/// **L76 — FLAC refuses at open what it would not write, and takes a
+/// STREAMINFO of no payload** (table H): a video track, which it writes
+/// only as one attached picture and this muxer makes none there
+/// ([`MuxOpenError::CodecNotCarried`]); FLAC with no configuration
 /// ([`MuxOpenError::ConfigurationMissing`]), and one opening with the
 /// `fLaC` marker, whose first 34 bytes the header would write as the
 /// STREAMINFO ([`MuxOpenError::ConfigurationInvalid`]). An empty FLAC
@@ -7188,7 +7184,7 @@ fn l75_the_adts_muxer_refuses_what_its_headers_cannot_carry() {
 /// PLANT: the open refusals removed open the track; the configuration's
 /// road closed refuses the STREAMINFO's packet as empty.
 #[test]
-fn l76_flac_and_mp3_refuse_what_they_would_not_write() {
+fn l76_flac_refuses_what_it_would_not_write() {
   use ffmpeg_next::ffi::AVPacketSideDataType as T;
   let Some(corpus) = Corpus::new() else { return };
   let source = corpus.multi_track_mkv();
@@ -7203,15 +7199,10 @@ fn l76_flac_and_mp3_refuse_what_they_would_not_write() {
     )
     .map(drop)
   };
-  for container in ["flac", "mp3"] {
-    assert!(
-      matches!(
-        open("l76-video.out", container, table_of(&source, TrackKind::Video)),
-        Err(MuxOpenError::CodecNotCarried { codec, .. }) if codec == CodecId::H264
-      ),
-      "{container}"
-    );
-  }
+  assert!(matches!(
+    open("l76-video.flac", "flac", table_of(&source, TrackKind::Video)),
+    Err(MuxOpenError::CodecNotCarried { codec, .. }) if codec == CodecId::H264
+  ));
   let streaminfo = table_of(&flac, TrackKind::Audio)[0]
     .side_data()
     .extradata()
@@ -7506,109 +7497,18 @@ fn l79_a_raw_stream_refuses_what_it_would_write_unreadable() {
   muxer.finish().expect("finished");
 }
 
-/// **L80 — the chapters each simple muxer writes, and those it does not**
-/// (table H; table E's chapter rows): MP3's ID3v2 chapters, numbered by
-/// position from 0 and counted in milliseconds — a chapter's id other
-/// than its position reported ([`Uncarried::ChapterId`]), a span off the
-/// millisecond reported ([`Uncarried::ChapterSpan`]), each read back by
-/// its title; WAV's and the raw streams' none, each chapter reported
-/// ([`Uncarried::Chapter`]). MP3's table of contents counts its chapters
-/// in 8 bits (`id3v2enc.c` 274; R9, the class): 255 open, 256 refused by
-/// name ([`MuxOpenError::ChapterCount`]), nothing written.
+/// **L80 — the simple muxers write no chapter, each reported** (table H;
+/// table E's chapter rows): WAV's and the raw streams' none, each chapter
+/// reported ([`Uncarried::Chapter`]).
 ///
-/// PLANT: the chapters a container does not write unreported; MP3's count
-/// unjudged opens the 256.
+/// PLANT: the chapters a container does not write unreported.
 #[test]
-fn l80_the_chapters_each_simple_muxer_writes() {
+fn l80_the_simple_muxers_write_no_chapter() {
   let Some(corpus) = Corpus::new() else { return };
-  let mp3 = audio_file(&corpus, "mp3.mkv", "libmp3lame");
   let chapters = [
     chapter_of(0, 0, 200, Some("first")),
-    Chapter::<Ffmpeg>::new(
-      7,
-      Timebase::new(1, NonZeroI32::new(2000).expect("non-zero")),
-      Timestamp::new(
-        400,
-        Timebase::new(1, NonZeroI32::new(2000).expect("non-zero")),
-      ),
-      Timestamp::new(
-        801,
-        Timebase::new(1, NonZeroI32::new(2000).expect("non-zero")),
-      ),
-    )
-    .with_title(Some("second".into())),
+    chapter_of(7, 200, 400, Some("second")),
   ];
-  let target = output(&corpus, "l80.mp3");
-  let (mut muxer, report) = FfmpegOwnedMuxer::open(
-    File::create(&target).expect("create"),
-    ContainerName::new("mp3"),
-    table_of(&mp3, TrackKind::Audio),
-    &chapters,
-    PacketLimits::default(),
-  )
-  .expect("open");
-  assert_eq!(
-    lines(&report, |line| matches!(
-      line,
-      Uncarried::Chapter { .. } | Uncarried::ChapterId { .. } | Uncarried::ChapterSpan { .. }
-    )),
-    vec![
-      Uncarried::ChapterId { chapter: 1, id: 7 },
-      Uncarried::ChapterSpan { chapter: 1 },
-    ]
-  );
-  let (_, frames) = whole_track(&mp3, TrackKind::Audio);
-  for frame in &frames {
-    muxer
-      .write_audio(audio_on_zero(audio_of(frame)))
-      .map_err(|error| error.map_packet(drop))
-      .expect("a frame");
-  }
-  muxer.finish().expect("finished");
-  let demuxer = FfmpegOwnedDemuxer::open(&target).expect("open");
-  let titles: Vec<_> = demuxer
-    .chapters()
-    .iter()
-    .map(|chapter| chapter.title().map(|title| title.as_str().to_owned()))
-    .collect();
-  assert_eq!(
-    titles,
-    [Some("first".to_owned()), Some("second".to_owned())]
-  );
-  let many = |count: i64| -> Vec<Chapter<Ffmpeg>> {
-    (0..count)
-      .map(|at| chapter_of(at, at * 10, at * 10 + 10, Some("a chapter")))
-      .collect()
-  };
-  for (count, opens) in [(255, true), (256, false)] {
-    let target = output(&corpus, &format!("l80-{count}.mp3"));
-    let opened = FfmpegOwnedMuxer::open(
-      File::create(&target).expect("create"),
-      ContainerName::new("mp3"),
-      table_of(&mp3, TrackKind::Audio),
-      &many(count),
-      PacketLimits::default(),
-    );
-    match opened {
-      Ok((muxer, _)) => {
-        assert!(opens, "{count} opened");
-        muxer.finish().expect("finished");
-      }
-      Err(refusal) => {
-        assert!(!opens, "{count}: {refusal:?}");
-        assert!(
-          matches!(refusal, MuxOpenError::ChapterCount { count: 256 }),
-          "{refusal:?}"
-        );
-        assert_eq!(
-          std::fs::metadata(&target).expect("the file").len(),
-          0,
-          "nothing written"
-        );
-      }
-    }
-  }
-
   for (container, source) in [
     ("wav", pcm_mkv(&corpus)),
     ("ac3", audio_file(&corpus, "ac3.mkv", "ac3")),
@@ -13307,22 +13207,19 @@ fn mastering(chroma: (i32, i32), luminance: (i32, i32)) -> Vec<u8> {
 /// **L144 — a coded side data value the container writes in fewer bits
 /// than it holds, or reads back into fewer, is refused at open** (R11,
 /// Q868; `movenc.c` 2659–2735, 2384–2393; `mov.c` 6684–6814;
-/// `flvdec.c` 63–68; `mp3enc.c` 425–446): MP4's
+/// `flvdec.c` 63–68): MP4's
 /// content light level of 70 000, which it writes in 16 bits and reads
 /// back 4464, and its mastering display's chromaticity of 2, past 65 535
 /// fifty-thousandths; MOV's mastering luminance of 214 749 cd/m², past
 /// `INT_MAX` ten-thousandths, which its reader reads back negative, and
 /// its ambient illuminance of 214 749 lux, past `INT_MAX` ten-thousandths,
 /// and its stereo field of view past `INT_MAX` thousandths of a degree; FLV's
-/// light level of 70 000, which its reader keeps in 16 bits; MP3's
-/// ReplayGain of 52 dB, past its 9-bit field
-/// of tenths, and a peak of 512, past its 32-bit Q23 — each refused by
-/// name (`MuxOpenError::CodedSideData`), nothing written. The bounds
-/// themselves open: 65 535, 214 748, 51 dB, a peak below 512; MP4, which
-/// writes no field of view, opens of one.
+/// light level of 70 000, which its reader keeps in 16 bits — each refused
+/// by name (`MuxOpenError::CodedSideData`), nothing written. The bounds
+/// themselves open: 65 535, 214 748; MP4, which writes no field of view,
+/// opens of one.
 ///
-/// PLANT: MP4's light level unjudged, its first table opened; the MP3
-/// gain's bound a tenth higher, 52 dB taken.
+/// PLANT: MP4's light level unjudged, its first table opened.
 #[test]
 fn l144_a_coded_side_data_value_past_its_field_is_refused() {
   use ffmpeg_next::ffi::AVPacketSideDataType as T;
@@ -13339,15 +13236,8 @@ fn l144_a_coded_side_data_value_past_its_field_is_refused() {
       None,
     )
   };
-  let mp3 = audio_file(&corpus, "l16.mp3", "libmp3lame");
   let light = |cll: i32| words(&[cll, 400]);
   let stereo = |fov: i32| words(&[1, 0, 0, 0, 0, 0, 1, fov, 1]);
-  let gain = |track_gain: i32, peak: u32| {
-    let mut bytes = words(&[track_gain]);
-    bytes.extend(peak.to_ne_bytes());
-    bytes.extend(words(&[i32::MIN, 0]));
-    bytes
-  };
   let refused = |name: &str, container: &str, row: Described, kind: T| {
     let opened = opened_in(&corpus, name, container, vec![row]);
     assert!(
@@ -13362,7 +13252,6 @@ fn l144_a_coded_side_data_value_past_its_field_is_refused() {
   let cll = T::AV_PKT_DATA_CONTENT_LIGHT_LEVEL;
   let mdcv = T::AV_PKT_DATA_MASTERING_DISPLAY_METADATA;
   let stereo3d = T::AV_PKT_DATA_STEREO3D;
-  let rg = T::AV_PKT_DATA_REPLAYGAIN;
   refused(
     "l144-cll.mp4",
     "mp4",
@@ -13424,24 +13313,6 @@ fn l144_a_coded_side_data_value_past_its_field_is_refused() {
     "l144-cll-max.flv",
     "flv",
     with_coded(hevc(), cll, &light(65_535)),
-  );
-  let mp3_row = || table_of(&mp3, TrackKind::Audio).remove(0);
-  refused(
-    "l144-gain.mp3",
-    "mp3",
-    with_coded(mp3_row(), rg, &gain(5_200_000, 0)),
-    rg,
-  );
-  refused(
-    "l144-peak.mp3",
-    "mp3",
-    with_coded(mp3_row(), rg, &gain(0, 51_200_000)),
-    rg,
-  );
-  taken(
-    "l144-gain-max.mp3",
-    "mp3",
-    with_coded(mp3_row(), rg, &gain(5_119_999, 51_199_999)),
   );
 }
 
@@ -15331,127 +15202,6 @@ fn l160_every_allocation_a_commit_makes_refused_hands_the_packet_back() {
   );
 }
 
-/// The size MP3's ID3v2 tag at the start of `path` states, beside its
-/// 10-byte header: its frames and their padding, in 28 syncsafe bits.
-fn id3v2_size(path: &Path) -> u64 {
-  let bytes = std::fs::read(path).expect("the file");
-  assert_eq!(&bytes[..3], b"ID3", "an ID3v2 tag");
-  bytes[6..10]
-    .iter()
-    .fold(0, |size, &byte| size << 7 | u64::from(byte & 0x7F))
-}
-
-/// **L161 — MP3's ID3v2 tag is counted exactly, and refused past the 28
-/// bits its size is written in** (R15b, R15's letter 1 ruled: a length
-/// that wraps is refused; `ff_id3v2_finish`, `id3v2enc.c` 421–443): three
-/// titled chapters — the tag FFmpeg writes measured, its size its frames
-/// and the 10 bytes of padding `ff_id3v2_finish` adds; the bound lowered a
-/// byte below the frames, the table refused by name at its last chapter,
-/// nothing written; lowered to the frames, the table taken and the same
-/// tag written, its chapters read back titled as given. The bound is
-/// therefore the tag's frames to the byte. The real bound, `2^28 - 1`, is
-/// the unit law `the_mp3_id3v2_tag_holds_two_to_the_28_less_one`. An
-/// untitled chapter, which MP3's reader reads back titled with its element
-/// id (`ch1`, as this law first found), is refused by name, nothing written
-/// (R15b, ruled: as the MOV family's).
-///
-/// PLANT: each title's frame counted without its header, the table a byte
-/// past taken; the check dropped, the same; the untitled chapter's rule
-/// dropped, the table taken.
-#[test]
-fn l161_mp3s_id3v2_tag_is_counted_exactly_and_refused_past_its_28_bits() {
-  let Some(corpus) = Corpus::new() else { return };
-  let mp3 = audio_file(&corpus, "mp3.mkv", "libmp3lame");
-  let titled = [
-    chapter_of(0, 0, 200, Some("first")),
-    chapter_of(1, 200, 400, Some("2")),
-    chapter_of(2, 400, 600, Some("the third, its title the longer")),
-  ];
-  let open_of = |name: &str, chapters: &[Chapter<Ffmpeg>], bound: Option<u64>| {
-    let target = output(&corpus, name);
-    let options = bound.map_or_else(MuxOptions::new, |bytes| {
-      MuxOptions::new().with_lowered_tag_bound(bytes)
-    });
-    let opened = FfmpegOwnedMuxer::open_with(
-      File::create(&target).expect("create"),
-      ContainerName::new("mp3"),
-      table_of(&mp3, TrackKind::Audio),
-      chapters,
-      options,
-    );
-    (target, opened)
-  };
-  let open = |name: &str, bound: Option<u64>| open_of(name, &titled, bound);
-  let (_, frames) = whole_track(&mp3, TrackKind::Audio);
-  let write =
-    |name: &str,
-     opened: Result<(FfmpegOwnedMuxer<File>, mediaencode_ffmpeg::MuxReport), MuxOpenError>| {
-      let (mut muxer, _) = opened.unwrap_or_else(|error| panic!("{name}: {error:?}"));
-      for frame in &frames {
-        muxer
-          .write_audio(audio_on_zero(audio_of(frame)))
-          .map_err(|error| error.map_packet(drop))
-          .expect("a frame");
-      }
-      muxer.finish().expect("finished");
-    };
-  // What FFmpeg writes.
-  let (target, opened) = open("l161.mp3", None);
-  write("l161.mp3", opened);
-  let size = id3v2_size(&target);
-  let held = size - 10;
-  // A byte below its frames: refused at the last chapter, nothing written.
-  let (refused, opened) = open("l161-refused.mp3", Some(held - 1));
-  match opened {
-    Err(MuxOpenError::TagTooLarge { chapter }) => {
-      assert_eq!(chapter, 2, "the chapter at which it passes")
-    }
-    other => panic!("expected TagTooLarge, got {:?}", other.map(|_| ())),
-  }
-  assert_eq!(
-    std::fs::metadata(&refused).expect("the sink").len(),
-    0,
-    "nothing written"
-  );
-  // Its frames: taken, the same tag, the chapters read back as given.
-  let (taken, opened) = open("l161-taken.mp3", Some(held));
-  write("l161-taken.mp3", opened);
-  assert_eq!(id3v2_size(&taken), size, "the same tag");
-  let demuxer = FfmpegOwnedDemuxer::open(&taken).expect("open");
-  let titles: Vec<_> = demuxer
-    .chapters()
-    .iter()
-    .map(|chapter| chapter.title().map(|title| title.as_str().to_owned()))
-    .collect();
-  assert_eq!(
-    titles,
-    [
-      Some("first".to_owned()),
-      Some("2".to_owned()),
-      Some("the third, its title the longer".to_owned())
-    ],
-    "the chapters read back"
-  );
-  // An untitled chapter, read back titled `ch1`: refused by name, nothing
-  // written.
-  let untitled = [
-    chapter_of(0, 0, 200, Some("first")),
-    chapter_of(1, 200, 400, None),
-  ];
-  let (refused, opened) = open_of("l161-untitled.mp3", &untitled, None);
-  match opened {
-    Err(MuxOpenError::ChapterWithoutTitle { chapter }) => {
-      assert_eq!(chapter, 1, "the untitled chapter")
-    }
-    other => panic!("expected ChapterWithoutTitle, got {:?}", other.map(|_| ())),
-  }
-  assert_eq!(
-    std::fs::metadata(&refused).expect("the sink").len(),
-    0,
-    "nothing written"
-  );
-}
-
 /// A data track of GoPro metadata (`gpmd`, `AV_CODEC_ID_BIN_DATA`), made of
 /// `row`'s parameters, its time base `row`'s.
 fn gpmd_of(row: &Described) -> Described {
@@ -15767,16 +15517,14 @@ fn titles_through(
 /// loses one; the module's census of chapter titles): untitled, empty, whitespace-only and long titles
 /// through every admitted muxer that writes chapters, each read back by
 /// FFmpeg's reader. MP4 and MOV keep an empty and a whitespace title, an
-/// untitled chapter refused; Matroska and WebM keep all three; MP3 refuses
-/// an empty title as an untitled one — its reader skips a `TIT2` of no
-/// text and titles the chapter `ch0`.
+/// untitled chapter refused, which their chapter track holds not; Matroska
+/// and WebM keep all three.
 ///
-/// PLANT: MP3's empty title taken, read back `ch0`.
+/// PLANT: the chapter track's untitled chapter taken.
 #[test]
 fn l163_every_containers_chapter_title_reads_back_as_given() {
   let Some(corpus) = Corpus::new() else { return };
   let aac = h264_aac(&corpus, "h264-aac.mp4");
-  let mp3 = audio_file(&corpus, "mp3.mkv", "libmp3lame");
   let opus = opus_mkv(&corpus);
   let kept = |titles: &[Option<&str>]| -> Vec<Option<String>> {
     titles
@@ -15816,19 +15564,6 @@ fn l163_every_containers_chapter_title_reads_back_as_given() {
       ("webm", &opus),
       vec![None, Some(""), Some(" ")],
       Ok(kept(&[None, Some(""), Some(" ")])),
-    ),
-    (
-      "mp3",
-      ("mp3", &mp3),
-      vec![Some(" "), Some("a title")],
-      Ok(kept(&[Some(" "), Some("a title")])),
-    ),
-    ("mp3-empty", ("mp3", &mp3), vec![Some("")], Err(untitled())),
-    (
-      "mp3-untitled",
-      ("mp3", &mp3),
-      vec![Some("a title"), None],
-      Err(MuxOpenError::ChapterWithoutTitle { chapter: 1 }),
     ),
   ];
   for (name, through, titles, expected) in cases {

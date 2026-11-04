@@ -17,9 +17,9 @@ crate moves only when it changes.
   lane) implement `Muxer` over libavformat for the containers this
   release audited and keeps (`ContainerName`): the MOV family's MP4, MOV,
   iPod and AVIF, Matroska and WebM, MPEG-TS, FLV, IVF, WAV and Wave64,
-  and the raw streams of ADTS AAC, AC-3, E-AC-3, DTS, FLAC, MPEG audio
-  layer III, H.264, HEVC and AV1 — Ogg, audited, withheld by its name and
-  the reason until the project's own Ogg writer lands
+  and the raw streams of ADTS AAC, AC-3, E-AC-3, DTS, FLAC, H.264, HEVC
+  and AV1 — Ogg and MP3, audited, withheld by name and the reason until
+  the project's own Ogg and MPEG audio writers land
   (`MuxOpenError::ContainerWithheld`, `Withheld`), and any other
   libavformat names refused at open by the muxer's name
   (`MuxOpenError::ContainerNotSupported`). `open` takes the sink, the container, the track
@@ -130,8 +130,8 @@ crate moves only when it changes.
   (`PayloadRule::InBandConfiguration`); ADTS's configurations its header
   cannot write, a second header, a frame past its 13-bit length, a
   headless frame (`MuxOpenError::ConfigurationInvalid`,
-  `PayloadRule::AdtsHeader`, `AdtsFrameLength`, `AdtsFrame`); FLAC's and
-  MP3's video tracks, FLAC's missing or `fLaC`-marked configuration; IVF's
+  `PayloadRule::AdtsHeader`, `AdtsFrameLength`, `AdtsFrame`); FLAC's
+  video tracks, FLAC's missing or `fLaC`-marked configuration; IVF's
   dimensions past 16 bits (`MuxOpenError::Dimensions`); a WAV file past
   4 GiB (`PayloadRule::FileSize`). FLV: a reordering packet with no
   presentation time (`FfmpegMuxRefusal::MissingPts`), a decode time past
@@ -200,9 +200,7 @@ crate moves only when it changes.
   on — and the tag's size judged by it. WAV: of every codec tag but
   integer PCM's, a packet that would take its fact chunk's count past
   2^32 samples refused (`PayloadRule::FileSize`, which now names this
-  too). MP3: a table of more than 255 chapters, which its table of
-  contents counts in 8 bits, refused (`MuxOpenError::ChapterCount`, new).
-  `MuxOpenError::ChapterWithoutTitle`'s message is now any container's.
+  too). `MuxOpenError::ChapterWithoutTitle`'s message is now any container's.
   MPEG-TS writes a language as the codes its descriptors' loops write: an
   audio stream's ISO 639 descriptor each run of three bytes between
   commas, 63 at most — `eng,fra` read back whole, not reported, a 64th
@@ -318,7 +316,7 @@ crate moves only when it changes.
   joined, a `mov_text` cue and the empty samples around it. A chapter
   table past it, which MP4's
   chapter track writes a sample a chapter, refused at open
-  (`MuxOpenError::ChapterCount`). The chunk offsets and the `mdat` widen
+  (`MuxOpenError::ChapterCount`, new). The chunk offsets and the `mdat` widen
   past 32 bits.
 - **MP4's sample descriptions, counted as movenc makes them (R13).** One
   of each configuration a packet brings that none of the track's holds,
@@ -371,19 +369,6 @@ crate moves only when it changes.
   the allocator refuses refuses the packet by name, handed back with
   nothing recorded (`FfmpegMuxRefusal::OutOfMemory`, new). What
   libavformat allocates as it writes the packet is its own.
-- **MP3's ID3v2 tag, within its 28-bit size (R15b).** The mp3 muxer writes
-  the whole tag at its header — this muxer writes no picture into it — and
-  its size, of its frames and their padding, in 28 syncsafe bits, cut past
-  `2^28 - 1`. The tag is counted exactly at open — libavformat's encoder
-  and each chapter's frames — and a table whose chapters would take it
-  past refused, nothing written (`MuxOpenError::TagTooLarge`, new; the
-  laws' seam `MuxOptions::with_lowered_tag_bound`, hidden). An untitled
-  chapter, which MP3's reader reads back titled with its element id, is
-  refused as the MOV family's is (`MuxOpenError::ChapterWithoutTitle`).
-- **Every chapter title read back as given, or refused (R17).** By the
-  census of every muxer that writes chapters: MP3's empty title, whose
-  `TIT2` of no text its reader skips, is refused
-  (`MuxOpenError::ChapterWithoutTitle`).
 - **HDR side data judged against sizes resolved at open (R18).** The
   linked libavutil's HDR10+ and APP5 struct sizes are asked at the open,
   before anything else — their allocation's failure the open's allocation
@@ -426,8 +411,7 @@ crate moves only when it changes.
   mastering chromaticities and ambient light past 65 535
   fifty-thousandths, luminances and illuminance past `INT_MAX`
   ten-thousandths, read back negative; MOV's stereo field of view and
-  disparity; FLV's light level past 65 535; MP3's
-  ReplayGain of a gain past ±51.1 dB or a peak past 512.
+  disparity; FLV's light level past 65 535.
   WebM's stereo 3D of checkerboard, lines or columns, which its check,
   wanting its mask, writes as modes WebM defines not, and of frame
   sequence, which fails its header (`MuxOpenError::StereoMode`, new).
