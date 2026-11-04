@@ -18776,3 +18776,138 @@ fn l194_the_mov_family_refuses_key_ids_of_no_bytes() {
   );
   assert_eq!(pssh_of(&target), [44], "the one of no key ids");
 }
+
+/// **L195 — a trailer the muxer refuses ends the output closed** (R22,
+/// Codex R21 1: no road flushes or writes the sink after a failure): MP4's
+/// trailer refused by name before it runs — its `moov` past the bound,
+/// lowered after the packets by the laws' seam
+/// ([`FfmpegMuxRefusal::MovieBox`]) — abandons the output: no byte and no
+/// flush reach the sink after the refusal, and the sink is dropped once.
+///
+/// PLANT: the refused trailer dropping the output open.
+#[test]
+fn l195_a_trailer_the_muxer_refuses_ends_the_output_closed() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let (table, frames) = first_track(&source, TrackKind::Video, 4);
+  let tally = Arc::new(Tally::default());
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    Tallied {
+      file: File::create(output(&corpus, "l195.mp4")).expect("create"),
+      tally: Arc::clone(&tally),
+    },
+    ContainerName::MP4,
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  for frame in &frames {
+    muxer
+      .write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(frame)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  muxer.lower_movie_bound(1);
+  let (written, flushes) = (
+    tally.written.lock().expect("the tally").len(),
+    tally.flushes.load(Ordering::Relaxed),
+  );
+  let fault = muxer.finish().expect_err("the trailer refused");
+  assert!(
+    matches!(fault.refusal(), Some(FfmpegMuxRefusal::MovieBox)),
+    "{fault:?}"
+  );
+  assert_eq!(
+    (
+      tally.written.lock().expect("the tally").len(),
+      tally.flushes.load(Ordering::Relaxed),
+    ),
+    (written, flushes),
+    "no byte and no flush after the refusal"
+  );
+  assert_eq!(tally.drops.load(Ordering::Relaxed), 1, "dropped once");
+}
+
+const L196_CHILD: &str = "MEDIAENCODE_FFMPEG_L196_CHILD";
+
+/// **L196 — an open that fails after the header ends the output closed**
+/// (R22, Codex R21 1): MP4's cover, its one packet built after the header
+/// is written, of 200 000 bytes — in a process of its own, libavutil's
+/// allocations held below them (`av_max_alloc`, `mem.c` 74–78), so that the
+/// packet's build fails — refuses the open, the muxer's fault at the
+/// cover: the output abandoned, no flush asked of the sink, which is
+/// dropped once.
+///
+/// PLANT: the cover's failure dropping the output open.
+#[test]
+fn l196_an_open_that_fails_after_the_header_ends_the_output_closed() {
+  if std::env::var_os(L196_CHILD).is_some() {
+    return;
+  }
+  let status = std::process::Command::new(std::env::current_exe().expect("the lane"))
+    .args([
+      "--exact",
+      "l196_in_a_process_of_its_own",
+      "--test-threads=1",
+      "--nocapture",
+    ])
+    .env(L196_CHILD, "1")
+    .status()
+    .expect("the process of its own");
+  assert!(status.success(), "the output abandoned closed: {status}");
+}
+
+/// L196's body, in a process of its own (its caller sets [`L196_CHILD`]);
+/// elsewhere nothing.
+#[test]
+fn l196_in_a_process_of_its_own() {
+  if std::env::var_os(L196_CHILD).is_none() {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let same = |_: usize, row: Described| row;
+  let (table, _) = copied_source(&corpus.cover_art_mp3(), &[], &same);
+  let cover = table
+    .into_iter()
+    .find(|row| row.file().is_some())
+    .expect("the MP3's cover");
+  let large = TrackDescription::attachment(
+    millis(),
+    AttachmentTrackParams::new(cover.codec()),
+    AttachedFile::new(AttachmentPacket::new(
+      FfmpegBytes::try_copy_from_slice(&[0x5A; 200_000]).expect("a payload"),
+      AttachmentPacketExtra::new(0),
+    )),
+    cover.side_data().clone(),
+  );
+  let tally = Arc::new(Tally::default());
+  let sink = Tallied {
+    file: File::create(output(&corpus, "l196.mp4")).expect("create"),
+    tally: Arc::clone(&tally),
+  };
+  // SAFETY: a store of the process's cap, which libavutil reads
+  // atomically at every allocation; this process runs this law alone.
+  unsafe { ffmpeg_next::ffi::av_max_alloc(100_000) };
+  let opened = FfmpegOwnedMuxer::open(
+    sink,
+    ContainerName::MP4,
+    vec![large],
+    &[],
+    PacketLimits::default(),
+  )
+  .map(drop);
+  // SAFETY: as above: the cap back at libavutil's own, `INT_MAX`.
+  unsafe { ffmpeg_next::ffi::av_max_alloc(i32::MAX as usize) };
+  assert!(
+    matches!(&opened, Err(MuxOpenError::Fault(fault))
+      if matches!(fault.stage(), MuxStage::Cover { track } if track.get() == 0)),
+    "the cover's build failed: {opened:?}"
+  );
+  assert_eq!(
+    tally.flushes.load(Ordering::Relaxed),
+    0,
+    "no flush asked of the sink"
+  );
+  assert_eq!(tally.drops.load(Ordering::Relaxed), 1, "dropped once");
+}

@@ -756,7 +756,8 @@ fn a_failed_write_is_named_the_sinks_at_the_header_a_packet_and_the_trailer() {
   }
   full.store(true, std::sync::atomic::Ordering::Relaxed);
   named("the trailer", output.write_trailer());
-  assert_eq!(output.phase(), OutputPhase::Finished);
+  // R22, Codex R21 1: `Finished` is the trailer's success alone.
+  assert_eq!(output.phase(), OutputPhase::Failed);
   named("the sink handed back", output.into_sink().map(drop));
 }
 
@@ -1140,6 +1141,12 @@ fn an_audio_packet_framed_reaches_libavformat_behind_its_header() {
 /// An AAC stream's ticket, at 44.1 kHz in stereo, of the configuration
 /// `config`.
 fn aac(config: &[u8]) -> CodecTicket {
+  audio(CodecId::AAC, 44_100, config)
+}
+
+/// A stereo audio stream of `codec` at `rate` Hz, of the configuration
+/// `config`.
+fn audio(codec: CodecId, rate: i32, config: &[u8]) -> CodecTicket {
   let mut parameters = ffmpeg_next::codec::Parameters::new();
   // SAFETY: `Parameters::new` allocated a live `AVCodecParameters` (it is
   // checked non-null first) that nothing else holds; the enums are written
@@ -1152,11 +1159,8 @@ fn aac(config: &[u8]) -> CodecTicket {
       addr_of_mut!((*par).codec_type).cast::<i32>(),
       ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO as i32,
     );
-    write_unaligned(
-      addr_of_mut!((*par).codec_id).cast::<i32>(),
-      CodecId::AAC.raw(),
-    );
-    (*par).sample_rate = 44_100;
+    write_unaligned(addr_of_mut!((*par).codec_id).cast::<i32>(), codec.raw());
+    (*par).sample_rate = rate;
     ffmpeg_next::ffi::av_channel_layout_default(addr_of_mut!((*par).ch_layout), 2);
     let extradata = av_mallocz(config.len() + PADDING).cast::<u8>();
     assert!(!extradata.is_null(), "av_mallocz");
@@ -1176,7 +1180,8 @@ fn aac(config: &[u8]) -> CodecTicket {
 /// the context is dropped, or handed back: no byte and no flush reaches
 /// the sink after the failure — the buffered bytes discarded, the sink's
 /// flush not called — and the sink holds what was written before it; its
-/// hand-back is refused by name, the sink dropped once.
+/// hand-back answers the failure again, libavformat's error kept (R22,
+/// Codex R21 1), the sink dropped once.
 ///
 /// PLANT: `Drop` torn down open; `into_sink` torn down open; the guard's
 /// closing word unread.
@@ -1207,10 +1212,9 @@ fn a_failed_context_writes_nothing_more_into_its_sink() {
       times(0),
       PacketLimits::default(),
     );
-    assert!(
-      matches!(failed, Err(OutputError::Ffmpeg(_))),
-      "{road}: the premise, a failure not the sink's: {failed:?}"
-    );
+    let Err(OutputError::Ffmpeg(code)) = failed else {
+      panic!("{road}: the premise, a failure not the sink's: {failed:?}");
+    };
     assert_eq!(output.phase(), OutputPhase::Failed, "{road}");
     let (written, flushes) = (
       tally.written.lock().expect("the tally").len(),
@@ -1223,14 +1227,10 @@ fn a_failed_context_writes_nothing_more_into_its_sink() {
     if road == "drop" {
       drop(output);
     } else {
+      let handed = output.into_sink().map(drop);
       assert!(
-        matches!(
-          output.into_sink(),
-          Err(OutputError::FailedEarlier {
-            call: OutputCall::IntoSink
-          })
-        ),
-        "{road}: the hand-back refused by name"
+        matches!(handed, Err(OutputError::Ffmpeg(kept)) if kept == code),
+        "{road}: the hand-back answering the failure again: {handed:?}"
       );
     }
     assert_eq!(
@@ -1249,4 +1249,480 @@ fn a_failed_context_writes_nothing_more_into_its_sink() {
       "{road}: the sink dropped once"
     );
   }
+}
+
+/// A buffer that keeps a tally of what reaches it, as [`Counted`] does,
+/// and whose writes fail as a full disk fails them once its switch is
+/// thrown, as [`FillsUp`]'s do.
+#[derive(Debug, Default)]
+struct Tallied {
+  bytes: Cursor<Vec<u8>>,
+  tally: std::sync::Arc<Tally>,
+  full: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Write for Tallied {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    if self.full.load(std::sync::atomic::Ordering::Relaxed) {
+      return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+    }
+    let written = self.bytes.write(buf)?;
+    self
+      .tally
+      .written
+      .lock()
+      .expect("the tally")
+      .extend_from_slice(&buf[..written]);
+    Ok(written)
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    self
+      .tally
+      .flushes
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+  }
+}
+
+impl Seek for Tallied {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.bytes.seek(pos)
+  }
+}
+
+impl Drop for Tallied {
+  fn drop(&mut self) {
+    self
+      .tally
+      .drops
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
+/// What has reached the sink a [`Tally`] counts: its bytes and its flushes.
+fn reached(tally: &Tally) -> (usize, u32) {
+  (
+    tally.written.lock().expect("the tally").len(),
+    tally.flushes.load(std::sync::atomic::Ordering::Relaxed),
+  )
+}
+
+/// **A trailer that failed leaves the context failed, and nothing more
+/// reaches the sink, by either road out** (R22, Codex R21 1: `Finished`
+/// is the trailer's success alone). Two failures: the sink's — Matroska
+/// writes the cluster it holds at its trailer, into a sink that has filled
+/// up — and one not the sink's — MP4 writes an Opus track's `dOps` at its
+/// trailer, and refuses a configuration shorter than an `OpusHead`'s 19
+/// bytes (`mov_write_dops_tag`, `movenc.c` 877–887 in FFmpeg 9.0.1), its
+/// start and its packet taken. Each trailer answers its failure; the
+/// context is failed, a second trailer refused by name. Then it is
+/// dropped, or handed back: no byte and no flush reach the sink after the
+/// call — what libavformat's own trailer flushed within it, as it does
+/// whatever the muxer answered (`mux.c` 1267–1272), counted before — the
+/// hand-back answering the failure again, the sink's, else libavformat's
+/// error kept; and the sink is dropped once.
+///
+/// PLANT: the trailer's phase `Finished` whatever it answered;
+/// libavformat's error not kept, the hand-back refused instead.
+#[test]
+fn a_failed_trailer_ends_the_context_failed_and_writes_nothing_more() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let opus = audio(CodecId::OPUS, 48_000, &[0; 10]);
+  for failure in ["the sink's", "libavformat's"] {
+    for road in ["drop", "into_sink"] {
+      let sink = Tallied::default();
+      let (tally, full) = (
+        std::sync::Arc::clone(&sink.tally),
+        std::sync::Arc::clone(&sink.full),
+      );
+      let mut output = if failure == "the sink's" {
+        let mut output = Output::open(sink, "matroska").expect("open");
+        output
+          .add_stream(&StreamSpec::new(&subrip(), millis()))
+          .expect("a stream");
+        output.write_header().expect("the header");
+        for pts in [0, 1000] {
+          output
+            .write_packet::<crate::Owned>(
+              0,
+              OutputPacket::Subtitle(&cue(b"a cue", pts)),
+              times(pts),
+              PacketLimits::default(),
+            )
+            .expect("a cue");
+        }
+        full.store(true, std::sync::atomic::Ordering::Relaxed);
+        output
+      } else {
+        let mut output = Output::open(sink, "mp4").expect("open");
+        output
+          .add_stream(&StreamSpec::new(&opus, millis()))
+          .expect("a stream");
+        output.write_header().expect("the header");
+        let packet = AudioPacket::new(
+          FfmpegBytes::copy_from_slice(&[0xF8, 0xFF, 0xFE]),
+          AudioPacketExtra::new(0),
+        )
+        .with_pts(Some(ms(0)))
+        .with_dts(Some(ms(0)));
+        output
+          .write_packet::<crate::Owned>(
+            0,
+            OutputPacket::Audio(&packet),
+            PacketTimes::new(Some(0), Some(0), 960),
+            PacketLimits::default(),
+          )
+          .expect("a packet");
+        output
+      };
+      let answered = output.write_trailer();
+      match (failure, &answered) {
+        ("the sink's", Err(OutputError::SinkWrite(error))) => {
+          assert_eq!(*error, enospc(), "{failure}, {road}");
+        }
+        ("libavformat's", Err(OutputError::Ffmpeg(error))) => {
+          assert_eq!(*error, ffmpeg_next::Error::InvalidData, "{failure}, {road}")
+        }
+        _ => panic!("{failure}, {road}: the trailer's failure, got {answered:?}"),
+      }
+      assert_eq!(output.phase(), OutputPhase::Failed, "{failure}, {road}");
+      assert!(
+        matches!(
+          output.write_trailer(),
+          Err(OutputError::FailedEarlier {
+            call: OutputCall::WriteTrailer
+          })
+        ),
+        "{failure}, {road}: a second trailer refused by name"
+      );
+      let before = reached(&tally);
+      if road == "drop" {
+        drop(output);
+      } else {
+        let handed = output.into_sink().map(drop);
+        match (failure, &handed) {
+          ("the sink's", Err(OutputError::SinkWrite(error))) => {
+            assert_eq!(*error, enospc(), "{failure}, {road}: the hand-back");
+          }
+          ("libavformat's", Err(OutputError::Ffmpeg(error))) => assert_eq!(
+            *error,
+            ffmpeg_next::Error::InvalidData,
+            "{failure}, {road}: the hand-back, the error kept"
+          ),
+          _ => panic!("{failure}, {road}: the hand-back answering the failure, got {handed:?}"),
+        }
+      }
+      assert_eq!(
+        reached(&tally),
+        before,
+        "{failure}, {road}: no byte and no flush after the failed trailer"
+      );
+      assert_eq!(
+        tally.drops.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "{failure}, {road}: the sink dropped once"
+      );
+    }
+  }
+}
+
+/// **A context dropped before its header calls nothing of its sink, and
+/// one whose stream libavformat would not add is failed** (R22, Codex R21
+/// 1). Before the header nothing was written, so a drop flushes nothing:
+/// the guard closed as from a failure, the sink dropped once, its flush
+/// never asked — a refusal made before libavformat, a language holding a
+/// NUL, leaving the context as it was. Past the context's `max_streams`,
+/// 1000 by default, libavformat adds no stream (`avformat_new_stream`,
+/// `options.c` 252–257 in FFmpeg 9.0.1): the call answers `ENOMEM`, the
+/// context is failed, a later stream and the header refused by name, and
+/// the hand-back answers the failure again, nothing reaching the sink.
+///
+/// PLANT: `Drop` from `Building` torn down open; the stream libavformat
+/// would not add leaving the context as it was.
+#[test]
+fn a_context_before_its_header_calls_nothing_of_its_sink() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let ticket = subrip();
+  // Dropped while being built, after a refusal.
+  let sink = Tallied::default();
+  let tally = std::sync::Arc::clone(&sink.tally);
+  let mut output = Output::open(sink, "matroska").expect("open");
+  output
+    .add_stream(&StreamSpec::new(&ticket, millis()))
+    .expect("a stream");
+  assert!(
+    matches!(
+      output.add_stream(&StreamSpec::new(&ticket, millis()).with_language(Some("e\0n"))),
+      Err(OutputError::Nul {
+        text: OutputText::Language
+      })
+    ),
+    "a language holding a NUL refused by name"
+  );
+  assert_eq!(output.phase(), OutputPhase::Building, "refused, as it was");
+  drop(output);
+  assert_eq!(
+    reached(&tally),
+    (0, 0),
+    "dropped while built: nothing asked"
+  );
+  assert_eq!(
+    tally.drops.load(std::sync::atomic::Ordering::Relaxed),
+    1,
+    "the sink dropped once"
+  );
+  // Past `max_streams`: failed, by either road out.
+  for road in ["drop", "into_sink"] {
+    let sink = Tallied::default();
+    let tally = std::sync::Arc::clone(&sink.tally);
+    let mut output = Output::open(sink, "matroska").expect("open");
+    for stream in 0..1000 {
+      output
+        .add_stream(&StreamSpec::new(&ticket, millis()))
+        .unwrap_or_else(|error| panic!("{road}: stream {stream}: {error:?}"));
+    }
+    let refused = output.add_stream(&StreamSpec::new(&ticket, millis()));
+    let Err(OutputError::Ffmpeg(code)) = refused else {
+      panic!("{road}: the 1001st stream: {refused:?}");
+    };
+    assert_eq!(
+      code,
+      ffmpeg_next::Error::Other {
+        errno: libc::ENOMEM
+      },
+      "{road}"
+    );
+    assert_eq!(output.phase(), OutputPhase::Failed, "{road}");
+    assert!(
+      matches!(
+        output.write_header(),
+        Err(OutputError::FailedEarlier {
+          call: OutputCall::WriteHeader
+        })
+      ),
+      "{road}: the header refused by name"
+    );
+    if road == "drop" {
+      drop(output);
+    } else {
+      let handed = output.into_sink().map(drop);
+      assert!(
+        matches!(handed, Err(OutputError::Ffmpeg(kept)) if kept == code),
+        "{road}: the hand-back answering the failure again: {handed:?}"
+      );
+    }
+    assert_eq!(reached(&tally), (0, 0), "{road}: nothing asked of the sink");
+    assert_eq!(
+      tally.drops.load(std::sync::atomic::Ordering::Relaxed),
+      1,
+      "{road}: the sink dropped once"
+    );
+  }
+}
+
+/// **An abandoned context writes nothing more into its sink** (R22, Codex
+/// R21 1): [`Output::abandon`], the road a caller whose own judgment ends
+/// the output takes — a trailer it refuses. Two SubRip streams in
+/// Matroska, the header written and a cue held in libavformat's
+/// interleaving queue: abandoned, no byte and no flush reach the sink, and
+/// the sink is dropped once; dropped instead, the sink's flush is asked.
+///
+/// PLANT: `abandon` leaving the phase as it was.
+#[test]
+fn an_abandoned_context_writes_nothing_more_into_its_sink() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let ticket = subrip();
+  for road in ["abandon", "drop"] {
+    let sink = Tallied::default();
+    let tally = std::sync::Arc::clone(&sink.tally);
+    let mut output = Output::open(sink, "matroska").expect("open");
+    for _ in 0..2 {
+      output
+        .add_stream(&StreamSpec::new(&ticket, millis()))
+        .expect("a stream");
+    }
+    output.write_header().expect("the header");
+    output
+      .write_packet::<crate::Owned>(
+        0,
+        OutputPacket::Subtitle(&cue(b"a held cue", 0)),
+        times(0),
+        PacketLimits::default(),
+      )
+      .expect("a cue, held");
+    let (written, flushes) = reached(&tally);
+    if road == "abandon" {
+      output.abandon();
+      assert_eq!(
+        reached(&tally),
+        (written, flushes),
+        "{road}: no byte and no flush"
+      );
+    } else {
+      drop(output);
+      assert_eq!(
+        reached(&tally),
+        (written, flushes + 1),
+        "{road}: the sink's flush asked once"
+      );
+    }
+    assert_eq!(
+      tally.drops.load(std::sync::atomic::Ordering::Relaxed),
+      1,
+      "{road}: the sink dropped once"
+    );
+  }
+}
+
+const ALLOCATION_CHILD: &str = "MEDIAIO_FFMPEG_OUTPUT_ALLOCATION_CHILD";
+
+/// **An allocation's failure leaves the context as its road says, and
+/// nothing reaches the sink after it** (R22, Codex R21 1). In a process of
+/// its own, libavutil's allocations held below a size at each step
+/// (`av_max_alloc`, `mem.c` 74–78 in FFmpeg 9.0.1):
+/// - the I/O context's 32 KiB buffer refused: the open answers `ENOMEM`,
+///   the sink dropped once, nothing asked of it;
+/// - a stream's replaced extradata refused (`replace_extradata`), and its
+///   language's copy (`av_dict_set`): the context failed, libavformat's
+///   error kept and answered again at the hand-back, nothing asked of the
+///   sink;
+/// - a chapter's own allocation refused, and its title's copy: refused,
+///   the context as it was, still being built; the chapters' array's
+///   growth refused, at the fifth chapter (`av_dynarray_add_nofree`, each
+///   growth a doubling): the context failed.
+///
+/// PLANT: the replaced extradata's failure leaving the context as it was;
+/// the array's failure leaving it as it was.
+#[test]
+fn an_allocations_failure_leaves_the_context_as_its_road_says() {
+  if std::env::var_os(ALLOCATION_CHILD).is_some() {
+    return;
+  }
+  let status = std::process::Command::new(std::env::current_exe().expect("the lane"))
+    .args([
+      "--exact",
+      "output::tests::allocation_failures_in_a_process_of_their_own",
+      "--test-threads=1",
+      "--nocapture",
+    ])
+    .env(ALLOCATION_CHILD, "1")
+    .status()
+    .expect("the process of its own");
+  assert!(status.success(), "each road as the census says: {status}");
+}
+
+/// The body of [`an_allocations_failure_leaves_the_context_as_its_road_says`],
+/// in a process of its own (its caller sets [`ALLOCATION_CHILD`]);
+/// elsewhere nothing.
+#[test]
+fn allocation_failures_in_a_process_of_their_own() {
+  if std::env::var_os(ALLOCATION_CHILD).is_none() {
+    return;
+  }
+  ffmpeg_next::init().expect("ffmpeg init");
+  let capped = |cap: usize| {
+    // SAFETY: a store of the process's cap, which libavutil reads
+    // atomically at every allocation; this process runs this law alone.
+    unsafe { ffmpeg_next::ffi::av_max_alloc(cap) };
+  };
+  let uncapped = || {
+    // SAFETY: as above: the cap back at libavutil's own, `INT_MAX`.
+    unsafe { ffmpeg_next::ffi::av_max_alloc(i32::MAX as usize) };
+  };
+  let enomem = ffmpeg_next::Error::Other {
+    errno: libc::ENOMEM,
+  };
+  let ticket = subrip();
+
+  // The I/O context's buffer.
+  let sink = Tallied::default();
+  let tally = std::sync::Arc::clone(&sink.tally);
+  capped(16 * 1024);
+  let opened = Output::open(sink, "matroska").map(drop);
+  uncapped();
+  assert!(
+    matches!(opened, Err(OutputError::Ffmpeg(code)) if code == enomem),
+    "the buffer refused: {opened:?}"
+  );
+  assert_eq!(reached(&tally), (0, 0), "the buffer: nothing asked");
+  assert_eq!(
+    tally.drops.load(std::sync::atomic::Ordering::Relaxed),
+    1,
+    "the buffer: the sink dropped once"
+  );
+
+  // A stream's replaced extradata, and its language's copy.
+  let large = vec![0x5A_u8; 300_000];
+  let language = "x".repeat(300_000);
+  for (what, spec) in [
+    (
+      "the extradata",
+      StreamSpec::new(&ticket, millis()).with_extradata(Some(&large)),
+    ),
+    (
+      "the language",
+      StreamSpec::new(&ticket, millis()).with_language(Some(&language)),
+    ),
+  ] {
+    for road in ["drop", "into_sink"] {
+      let sink = Tallied::default();
+      let tally = std::sync::Arc::clone(&sink.tally);
+      let mut output = Output::open(sink, "matroska").expect("open");
+      capped(200_000);
+      let added = output.add_stream(&spec);
+      uncapped();
+      let Err(OutputError::Ffmpeg(code)) = added else {
+        panic!("{what}, {road}: refused, {added:?}");
+      };
+      assert_eq!(code, enomem, "{what}, {road}");
+      assert_eq!(output.phase(), OutputPhase::Failed, "{what}, {road}");
+      if road == "drop" {
+        drop(output);
+      } else {
+        let handed = output.into_sink().map(drop);
+        assert!(
+          matches!(handed, Err(OutputError::Ffmpeg(kept)) if kept == enomem),
+          "{what}, {road}: the hand-back answering the failure again: {handed:?}"
+        );
+      }
+      assert_eq!(reached(&tally), (0, 0), "{what}, {road}: nothing asked");
+    }
+  }
+
+  // A chapter's own allocation, its title's copy, and the array's growth.
+  let sink = Tallied::default();
+  let tally = std::sync::Arc::clone(&sink.tally);
+  let mut output = Output::open(sink, "matroska").expect("open");
+  output
+    .add_stream(&StreamSpec::new(&ticket, millis()))
+    .expect("a stream");
+  capped(39);
+  let own = output.add_chapter(0, millis(), 0, 1000, None);
+  uncapped();
+  assert!(
+    matches!(own, Err(OutputError::Ffmpeg(code)) if code == enomem),
+    "the chapter's own: {own:?}"
+  );
+  assert_eq!(output.phase(), OutputPhase::Building, "the chapter's own");
+  let title = "t".repeat(100);
+  capped(40);
+  let titled = output.add_chapter(0, millis(), 0, 1000, Some(&title));
+  assert!(
+    matches!(titled, Err(OutputError::Ffmpeg(code)) if code == enomem),
+    "the title's copy: {titled:?}"
+  );
+  assert_eq!(output.phase(), OutputPhase::Building, "the title's copy");
+  for chapter in 0..4 {
+    let added = output.add_chapter(chapter, millis(), 0, 1000, None);
+    assert!(added.is_ok(), "chapter {chapter}: {added:?}");
+  }
+  let fifth = output.add_chapter(4, millis(), 0, 1000, None);
+  uncapped();
+  assert!(
+    matches!(fifth, Err(OutputError::Ffmpeg(code)) if code == enomem),
+    "the array's growth: {fifth:?}"
+  );
+  assert_eq!(output.phase(), OutputPhase::Failed, "the array's growth");
+  drop(output);
+  assert_eq!(reached(&tally), (0, 0), "the chapters: nothing asked");
 }

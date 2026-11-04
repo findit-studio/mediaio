@@ -735,6 +735,54 @@
 //! | FLAC (`flacenc.c`) | `flac_deinit` (350–357): the queued packets, each stream's | nothing |
 //! | IVF, ADTS, the raw muxers (`ivfenc.c`, `adtsenc.c`, `rawenc.c`) | none needed: they allocate nothing past the stream's own parameters — ADTS's new extradata is the stream's (`adtsenc.c` 188) | nothing |
 //!
+//! **The terminal state on every failing call** (R22, Codex R21 1, closed
+//! by class: `Finished` set on success alone, every failure ending the
+//! output failed, its error kept, nothing more reaching the sink): every
+//! fallible call in the life of the base's output and of this muxer, each
+//! road out of it, the state it leaves, and its law. A call that reached
+//! libavformat, or libavutil on what the context holds, and failed leaves
+//! the context failed (`OutputPhase::Failed`), libavformat's error kept and
+//! answered again at the hand-back, and the teardown closed: the guard shut
+//! before the muxer's `deinit`, what the I/O context buffers discarded, no
+//! flush asked of it or of the sink. A refusal made before any of it — a
+//! call out of order, a text holding a NUL, a size refused by name, the
+//! parameters' or a packet's build, a chapter's own allocations, each
+//! freed on its failure before the context holds it — leaves the context
+//! as it was (R20, r1; R15). Within the one failing call libavformat makes
+//! that cannot be so closed, `av_write_trailer`, which flushes the I/O
+//! context after a trailer that failed (`mux.c` 1267–1272), the bytes the
+//! muxer wrote before its failure reach the sink; after it, nothing.
+//!
+//! | the call | its road out | the state it leaves | its law |
+//! |---|---|---|---|
+//! | `Output::open` | a name libavformat does not know, of a NUL, of no byte stream | no context; the sink dropped as given, nothing asked of it | `an_unknown_container_and_one_without_a_byte_stream_are_refused_by_name` |
+//! | `Output::open` | the I/O context's buffer refused | no context; ffmpeg-next drops the sink, nothing asked of it | `an_allocations_failure_leaves_the_context_as_its_road_says` |
+//! | `Output::open` | the context's allocation refused | no context; the guard closed before the I/O context drops, nothing asked of the sink | none: unreached — a cap that refuses the context's allocations refuses the I/O context's 32 KiB buffer, allocated first and no smaller than any of them on the muxers this release writes |
+//! | `add_stream`, `add_chapter`, `set_automatic_filters`, `write_header`, `write_packet`, `write_trailer` | out of order, or after a failure | refused by name, as it was | `a_call_out_of_order_is_refused_by_name`, `a_failed_write_is_named_the_sinks_at_the_header_a_packet_and_the_trailer` |
+//! | `add_stream` | a text holding a NUL; extradata too large; the parameters' rebuild | refused, as it was | `a_context_before_its_header_calls_nothing_of_its_sink`, `a_streams_metadata_disposition_and_attached_file_reach_it` |
+//! | `add_stream` | `avformat_new_stream`: past `max_streams`, or an allocation | failed | `a_context_before_its_header_calls_nothing_of_its_sink` |
+//! | `add_stream` | `avcodec_parameters_copy` | failed | none: unreached — its allocations are the rebuild's own, of the same sizes, made just before and refused first |
+//! | `add_stream` | the replaced extradata; the metadata's copy | failed | `an_allocations_failure_leaves_the_context_as_its_road_says` |
+//! | `add_chapter` | the chapter's own allocation; its title's copy | refused, the chapter freed, as it was | `an_allocations_failure_leaves_the_context_as_its_road_says` |
+//! | `add_chapter` | the chapters' array's growth | failed | `an_allocations_failure_leaves_the_context_as_its_road_says` |
+//! | `write_header` | the sink's fault; libavformat's | failed | `a_failed_write_is_named_the_sinks_at_the_header_a_packet_and_the_trailer`, `a_seek_the_sink_refuses_is_named_and_never_ends_in_ok`, `a_sink_that_panics_is_named_and_never_called_again`, L164 |
+//! | `write_packet` | the packet's build | refused, as it was | `a_packet_reaches_libavformat_as_a_copy_never_the_callers_buffer` |
+//! | `write_packet` | `av_interleaved_write_frame`: the sink's fault; libavformat's | failed | `a_failed_write_is_named_the_sinks_at_the_header_a_packet_and_the_trailer`, `a_failed_context_writes_nothing_more_into_its_sink`, L173 |
+//! | `write_trailer` | the sink's fault; libavformat's — MP4's Opus of a configuration shorter than an `OpusHead` (`movenc.c` 877–887); Matroska's cluster's growth | failed (`Finished` on success alone) | `a_failed_trailer_ends_the_context_failed_and_writes_nothing_more`, L169 |
+//! | `into_sink` | from `Failed` | the sink dropped, nothing asked of it; the sink's fault, else libavformat's error kept, never the sink | `a_failed_context_writes_nothing_more_into_its_sink`, `a_failed_trailer_ends_the_context_failed_and_writes_nothing_more`, `a_context_before_its_header_calls_nothing_of_its_sink` |
+//! | `into_sink` | from `Writing` or `Finished`, its last flush failing | the guard closed before the sink's flush is asked; the sink dropped; the fault named | none: unreached — every call that succeeds flushes the I/O context at its end (`flush_if_needed`, `mux.c` 426–434; the trailer's, 1270), so that the last flush finds nothing to write |
+//! | `into_sink` | the sink's own flush failing | the sink dropped; `Sink` named | `a_failed_write_is_reported_when_the_sink_is_handed_back` |
+//! | `Drop` | from `Building`, whose header wrote nothing; from `Failed` | closed: nothing asked of the sink | `a_context_before_its_header_calls_nothing_of_its_sink`, `a_failed_context_writes_nothing_more_into_its_sink`, `a_failed_trailer_ends_the_context_failed_and_writes_nothing_more` |
+//! | `Drop` | from `Writing` or `Finished` | what the I/O context buffers flushed, the guard closed where that write fails, then the sink's flush | `a_context_dropped_mid_file_frees_once_and_writes_nothing_it_held`, L37; the failing write unreached, as `into_sink`'s |
+//! | `Output::abandon` | any phase | closed, as from a failure | `an_abandoned_context_writes_nothing_more_into_its_sink` |
+//! | the muxer's open | a refusal or failure before the header | the output dropped while built or failed: closed | L73, L194 and every law of a refusal at open (`opened_in`: nothing written) |
+//! | the muxer's open | a failure after the header — a stream's time base or parameters unread, the cover's packet | the output abandoned | L196; the time base and parameters unreached — no muxer this release writes sets a time base of no positive numerator and denominator (`avpriv_set_pts_info` refuses one) |
+//! | the muxer's writes | a refusal by name, the packet handed back | as it was (R15; R20, r1) | the packet-rule laws |
+//! | the muxer's writes | a failure the base answers | failed | L173 |
+//! | the muxer's finish | after a failure | refused by name, the output dropped failed: closed | L173 |
+//! | the muxer's finish | a trailer refused by name before it runs — no frame, a last sample too long, the `moov` past its bound | the output abandoned | L195 |
+//! | the muxer's finish | the trailer's failure; the hand-back's | failed; as the base's `into_sink` | L169 and the base's laws |
+//!
 //! **r2, sizes under budgets the caller raises** (a length that wraps is
 //! refused): a configuration is within the ticket's budget — 16 MiB by
 //! default, the caller's to raise to `INT_MAX` less its padding
@@ -10117,15 +10165,25 @@ where
       let mut ts_pce = Vec::new();
       let stream = match (stream, road) {
         (Some((stream, _)), Road::Timed) => {
-          let time_base = output
-            .stream_time_base(stream)
-            .map_err(|error| MuxFault::new(MuxStage::Header, error))?;
+          // A failure after the header ends the output closed: nothing more
+          // reaches the sink (R22, Codex R21 1).
+          let time_base = match output.stream_time_base(stream) {
+            Ok(time_base) => time_base,
+            Err(error) => {
+              output.abandon();
+              return Err(MuxFault::new(MuxStage::Header, error).into());
+            }
+          };
           // The stream as the header left it: libavformat settles a codec
           // tag of none at its start (`init_muxer`, `mux.c` 288–312), and
           // a muxer's start may set more.
-          let codec = output
-            .stream_codec(stream)
-            .map_err(|error| MuxFault::new(MuxStage::Header, error))?;
+          let codec = match output.stream_codec(stream) {
+            Ok(codec) => codec,
+            Err(error) => {
+              output.abandon();
+              return Err(MuxFault::new(MuxStage::Header, error).into());
+            }
+          };
           // What the file reads the track's channel layout back as, by the
           // codec tag the header settled (table E).
           if kind == TrackKind::Audio {
@@ -10211,15 +10269,16 @@ where
         // here, and nothing after it. (A description of an attachment
         // always carries its file; the guard is the type's, not ours.)
         (Some((stream, _)), Road::Cover) => {
-          if let Some(file) = tracks[index].file() {
-            output
-              .write_packet::<C>(
-                stream,
-                OutputPacket::Cover(file.payload()),
-                PacketTimes::new(Some(0), Some(0), 0),
-                limits,
-              )
-              .map_err(|error| MuxFault::new(MuxStage::Cover { track }, error))?;
+          if let Some(file) = tracks[index].file()
+            && let Err(error) = output.write_packet::<C>(
+              stream,
+              OutputPacket::Cover(file.payload()),
+              PacketTimes::new(Some(0), Some(0), 0),
+              limits,
+            )
+          {
+            output.abandon();
+            return Err(MuxFault::new(MuxStage::Cover { track }, error).into());
           }
           None
         }
@@ -10458,16 +10517,10 @@ where
       };
       let track = TrackIndex::new(index);
       if !state.written {
-        return Err(MuxFault::refused(
-          MuxStage::Trailer,
-          FfmpegMuxRefusal::NoFrame { track },
-        ));
+        return Err(self.refuse_trailer(FfmpegMuxRefusal::NoFrame { track }));
       }
       if rules.durations_read && state.ac3.last.is_some_and(|sample| sample.duration > limit) {
-        return Err(MuxFault::refused(
-          MuxStage::Trailer,
-          FfmpegMuxRefusal::LastSampleTooLong { track },
-        ));
+        return Err(self.refuse_trailer(FfmpegMuxRefusal::LastSampleTooLong { track }));
       }
     }
     for (index, state) in self.tracks.iter().enumerate() {
@@ -10537,10 +10590,7 @@ where
       .movie_bound(None)
       .is_some_and(|bound| bound > self.bounds.movie)
     {
-      return Err(MuxFault::refused(
-        MuxStage::Trailer,
-        FfmpegMuxRefusal::MovieBox,
-      ));
+      return Err(self.refuse_trailer(FfmpegMuxRefusal::MovieBox));
     }
     self
       .output
@@ -10551,6 +10601,15 @@ where
       .into_sink()
       .map_err(|error| MuxFault::new(MuxStage::Finish, error))?;
     Ok((sink, report))
+  }
+
+  /// A trailer refused by name before it runs: the output abandoned closed
+  /// — nothing more reaching the sink (R22, Codex R21 1) — and the refusal
+  /// answered.
+  fn refuse_trailer(self, refusal: FfmpegMuxRefusal) -> MuxFault {
+    let Self { output, .. } = self;
+    output.abandon();
+    MuxFault::refused(MuxStage::Trailer, refusal)
   }
 
   /// Admits a timed packet: judges it ([`Self::decide`]), then pays for its
