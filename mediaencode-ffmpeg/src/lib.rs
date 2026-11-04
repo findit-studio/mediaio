@@ -11,7 +11,7 @@ pub use catalogue::{Admitted, CATALOGUE, EncoderRefusal, Entry, License, encoder
 pub use mux::{
   AutomaticFilter, CarrierMuxer, CodedSideDataReadBack, ContainerName, FfmpegMuxRefusal,
   FfmpegMuxer, FfmpegOwnedMuxer, LayoutReadBack, MuxFault, MuxOpenError, MuxOptions, MuxReport,
-  MuxStage, PayloadRule, Rewrite, SideDataFate, Uncarried,
+  MuxStage, PayloadRule, Rewrite, SideDataFate, Uncarried, Withheld,
 };
 // What a fault and a refusal name, from the base's muxing context. That
 // module is hidden from the base's documentation, but these four are this

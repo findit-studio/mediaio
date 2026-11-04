@@ -16,10 +16,12 @@ crate moves only when it changes.
 - **The muxer**: `FfmpegMuxer` (view lane) and `FfmpegOwnedMuxer` (owned
   lane) implement `Muxer` over libavformat for the containers this
   release audited and keeps (`ContainerName`): the MOV family's MP4, MOV,
-  iPod and AVIF, Matroska and WebM, MPEG-TS, FLV, Ogg, IVF, WAV and
-  Wave64, and the raw streams of ADTS AAC, AC-3, E-AC-3, DTS, FLAC, MPEG
-  audio layer III, H.264, HEVC and AV1 — any other libavformat names is
-  refused at open by the muxer's name
+  iPod and AVIF, Matroska and WebM, MPEG-TS, FLV, IVF, WAV and Wave64,
+  and the raw streams of ADTS AAC, AC-3, E-AC-3, DTS, FLAC, MPEG audio
+  layer III, H.264, HEVC and AV1 — Ogg, audited, withheld by its name and
+  the reason until the project's own Ogg writer lands
+  (`MuxOpenError::ContainerWithheld`, `Withheld`), and any other
+  libavformat names refused at open by the muxer's name
   (`MuxOpenError::ContainerNotSupported`). `open` takes the sink, the container, the track
   table with each track's `CodecTicket`, the chapters and the packet
   limits, refuses by name what the container cannot take
@@ -143,18 +145,7 @@ crate moves only when it changes.
   configuration past the WAVEFORMATEX's 16-bit `cbSize`
   (`MuxOpenError::ConfigurationInvalid`), a configured AAC track's ADTS
   packet (`AdtsHeader`). A subtitle's negative duration is refused only
-  where the container writes a duration. Ogg: no time a packet keeps of its
-  own
-  (`Rewrite::Timeline`), VP8's and Theora's key frames by the bitstream;
-  refused at open a codec but Vorbis, Theora, Speex, FLAC, Opus and VP8,
-  a configuration its start needs or refuses, an audio stream of no sample
-  rate, VP8 past its header's fields; refused in packets an empty packet,
-  which its reader drops, a VP8 or Theora granule past its signed shift,
-  a granule of −1 (`FfmpegMuxRefusal::UnsetGranule`, new), a metadata
-  update that does not unpack (`PayloadRule::MetadataUpdate`, new); a lone
-  stream's later metadata written as a chained stream's tags; chapters in
-  an Opus stream's tags, their starts as its writer rounds them; the
-  language kept. MPEG-TS:
+  where the container writes a duration. MPEG-TS:
   a video, subtitle or data packet's times kept, audio gathered into PES
   packets of a few (`Rewrite::Timeline`), an access unit delimiter put
   before each H.264, HEVC and VVC picture
@@ -389,11 +380,10 @@ crate moves only when it changes.
   laws' seam `MuxOptions::with_lowered_tag_bound`, hidden). An untitled
   chapter, which MP3's reader reads back titled with its element id, is
   refused as the MOV family's is (`MuxOpenError::ChapterWithoutTitle`).
-- **Every chapter title read back as given, or refused, or reported
-  (R17).** By the census of every muxer that writes chapters: MP3's empty
-  title, whose `TIT2` of no text its reader skips, is refused
-  (`MuxOpenError::ChapterWithoutTitle`); Ogg's empty title in Opus tags,
-  read back untitled, is reported (`Uncarried::ChapterTitle`, new).
+- **Every chapter title read back as given, or refused (R17).** By the
+  census of every muxer that writes chapters: MP3's empty title, whose
+  `TIT2` of no text its reader skips, is refused
+  (`MuxOpenError::ChapterWithoutTitle`).
 - **HDR side data judged against sizes resolved at open (R18).** The
   linked libavutil's HDR10+ and APP5 struct sizes are asked at the open,
   before anything else — their allocation's failure the open's allocation
@@ -404,11 +394,7 @@ crate moves only when it changes.
   The MOV family writes a stream's encryption initialization as its
   `pssh` boxes, counted in the `moov`'s bound — an allocation's failure
   where movenc parses it again, which drops the boxes unsaid, rests on the
-  premise the census states (R21). Ogg counts each stream's comment header exactly at open — an Opus
-  stream's chapters among them — and refuses one past the `int`
-  libavformat builds it in, which it would report as a failed allocation
-  (`MuxOpenError::CommentHeaderTooLarge`, new; the laws' seam
-  `MuxOptions::with_lowered_comment_bound`, hidden). AVIF's `moov` is
+  premise the census states (R21). AVIF's `moov` is
   bounded at `INT_MAX`, the null buffer its trailer measures it in
   (`MovieBoxBound::limit`, new, hidden). MP4 and FLV refuse a VP9 track
   of an unknown level whose picture's samples pass an `int`

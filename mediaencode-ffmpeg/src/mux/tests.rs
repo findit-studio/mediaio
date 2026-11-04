@@ -1170,7 +1170,6 @@ fn eac3_track(frame_size: i32) -> TrackState {
       frame_size,
       initial_padding: 0,
       extradata: Vec::new(),
-      alone: false,
     },
     written: false,
     cues: Cues::default(),
@@ -1914,7 +1913,6 @@ fn each_container_keeps_the_side_data_it_has_a_place_for() {
     frame_size: 1024,
     initial_padding: 1024,
     extradata: vec![0x11, 0x90],
-    alone: false,
   };
   let skip = |start: u32, end: u32| {
     let mut bytes = start.to_le_bytes().to_vec();
@@ -2737,9 +2735,9 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
 
   assert_eq!(Shift::of(Family::Mp4, "mp4", false, &[video]), None);
   assert_eq!(
-    Shift::of(Family::Other, "ogg", false, &[audio]),
+    Shift::of(Family::Other, "ac3", false, &[audio]),
     None,
-    "a container that takes negative times"
+    "a container that writes no time"
   );
   assert!(
     of(Family::Matroska, "matroska", &[video, audio])
@@ -2979,49 +2977,6 @@ fn matroska_reserves_aacs_output_rate_as_its_header_writes_it() {
     aac_output_rate_reserved(&[0x2B, 0x11, 0x88, 0x00]),
     "explicit SBR: 24 kHz, its extension 48 kHz"
   );
-}
-
-/// **The Xiph headers, as `avpriv_split_xiph_headers` splits them**
-/// (`libavcodec/xiph.c` 25–66): three lengths of 16 bits, the first the
-/// identification header's; or Xiph lacing, its lengths runs of 255 and a
-/// last byte, the third header the rest; any other refused.
-#[test]
-fn xiph_headers_split_as_libavcodec_splits_them() {
-  let mut sized = vec![0, 30];
-  sized.extend([1; 30]);
-  sized.extend([0, 2, 7, 8, 0, 1, 9]);
-  let headers = xiph_headers(&sized, 30).expect("three sized headers");
-  assert_eq!(headers.map(<[u8]>::len), [30, 2, 1]);
-  assert_eq!(headers[1], [7, 8]);
-  assert!(
-    xiph_headers(&sized, 42).is_none(),
-    "the first length is the header's"
-  );
-  assert!(
-    xiph_headers(&sized[..sized.len() - 1], 30).is_none(),
-    "short"
-  );
-  let mut laced = vec![2, 0xff, 1, 3];
-  laced.extend([5; 256]);
-  laced.extend([6; 3]);
-  laced.extend([7; 4]);
-  let headers = xiph_headers(&laced, 30).expect("laced headers");
-  assert_eq!(headers.map(<[u8]>::len), [256, 3, 4]);
-  assert_eq!(headers[2], [7; 4]);
-  assert!(xiph_headers(&[3, 0, 0], 30).is_none(), "neither form");
-}
-
-/// **libavformat's dictionary, as `av_packet_unpack_dictionary` unpacks
-/// it** (`libavcodec/packet.c` 349–371): empty, or terminated pairs with
-/// no empty key.
-#[test]
-fn a_dictionary_unpacks_as_libavformat_unpacks_it() {
-  assert!(dictionary_unpacks(b""));
-  assert!(dictionary_unpacks(b"title\0hello\0"));
-  assert!(dictionary_unpacks(b"a\0\0b\0c\0"), "an empty value");
-  assert!(!dictionary_unpacks(b"title\0hello"), "unterminated");
-  assert!(!dictionary_unpacks(b"\0hello\0"), "an empty key");
-  assert!(!dictionary_unpacks(b"title\0"), "a key with no value");
 }
 
 /// **MPEG-TS's descriptors' codes, as its loops write them** (R9: Codex R8
@@ -4297,13 +4252,6 @@ fn channel_layouts_read_back_as_each_container_and_decoder_reads_them() {
       mask(0xB),
     ),
     ("FLV PCM stereo", Audited::Flv, pcm, native(0x3), mask(0x3)),
-    (
-      "Ogg FLAC 2.1",
-      Audited::Ogg(OggKind::Ogg),
-      flac,
-      native(0xB),
-      mask(0x7),
-    ),
     ("FLAC 2.1", Audited::Flac, flac, native(0xB), mask(0xB)),
     (
       "FLAC past 0x3FFFF",
@@ -4562,63 +4510,6 @@ fn the_mp3_id3v2_tag_holds_two_to_the_28_less_one() {
     None,
     "a tag of no chapter, the encoder's alone"
   );
-}
-
-/// An Ogg stream's comment header packet holds `INT_MAX` bytes, its codec's
-/// own beside the comments, and FLAC's comments `2^24 - 1` (R19, Codex R18
-/// 2; [`super::ogg_comment_refused`]): libavformat measures the comments in
-/// a null buffer of `INT_MAX` bytes and refuses the packet past `INT_MAX`,
-/// each refusal returned as `ENOMEM` (`ogg_write_vorbiscomment`, `oggenc.c`
-/// 291–319), and writes FLAC's comments' length in 24 bits (352) — so
-/// each codec's packet is taken at the bound and refused a byte past it,
-/// FLAC's at its 24 bits; and each chapter's start is the width `snprintf`
-/// writes, hours of three digits and C's `int` of seconds among them.
-#[test]
-fn an_ogg_comment_header_holds_int_max() {
-  let bound = super::Bounds::REAL.comment;
-  assert_eq!(bound, i32::MAX as u64, "the int libavformat builds it in");
-  for (codec, own) in [
-    (CodecId::OPUS, 8),
-    (CodecId::VORBIS, 8),
-    (super::THEORA, 7),
-    (CodecId::VP8, 7),
-    (super::SPEEX, 0),
-  ] {
-    assert!(
-      !super::ogg_comment_refused(codec, bound - own, bound),
-      "{codec:?}: a packet of INT_MAX bytes taken"
-    );
-    assert!(
-      super::ogg_comment_refused(codec, bound - own + 1, bound),
-      "{codec:?}: a byte more refused"
-    );
-  }
-  assert!(!super::ogg_comment_refused(CodecId::FLAC, 0xFF_FFFF, bound));
-  assert!(
-    super::ogg_comment_refused(CodecId::FLAC, 0x100_0000, bound),
-    "FLAC's comments past their 24 bits"
-  );
-  let ms = Timebase::new(1, NonZeroI32::new(1000).expect("a denominator"));
-  let seconds = Timebase::new(1, NonZeroI32::new(1).expect("a denominator"));
-  for (index, base, start, written) in [
-    (0, ms, 0, "CHAPTER000=00:00:00.000"),
-    // The seconds rounded to the nearest apart from the milliseconds:
-    // 3725.5 s written 01:02:06.500.
-    (7, ms, 3_725_500, "CHAPTER007=01:02:06.500"),
-    (999, ms, 360_000_000, "CHAPTER999=100:00:00.000"),
-    // Rounded to the nearest, each apart: 0.9995 s is a second and 1000
-    // milliseconds' remainder of none.
-    (
-      1,
-      Timebase::new(1, NonZeroI32::new(10_000).expect("a denominator")),
-      9_995,
-      "CHAPTER001=00:00:01.000",
-    ),
-    // Seconds past `INT_MAX`, held in C's `int`: its low 32 bits.
-    (2, seconds, 1 << 31, "CHAPTER002=-596523:-14:-8.000"),
-  ] {
-    assert_eq!(super::ogg_chapter_time(index, base, start), written);
-  }
 }
 
 /// AVIF's `moov` is bounded at `INT_MAX`, the null buffer its trailer
