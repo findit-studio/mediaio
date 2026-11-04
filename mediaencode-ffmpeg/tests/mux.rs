@@ -20208,7 +20208,7 @@ fn l202_matroska_holds_each_end_it_sums_to_int64() {
     padded(),
   );
   wrote(
-    muxer.write_audio(sample(0, max - 8, Some(1))),
+    muxer.write_audio(sample(0, max - 13, Some(6))),
     "its delay and its duration to INT64_MAX",
   );
   muxer.finish().expect("finished");
@@ -20222,11 +20222,11 @@ fn l202_matroska_holds_each_end_it_sums_to_int64() {
       },
     ),
     (
-      max - 8,
-      Some(2),
+      max - 13,
+      Some(7),
       FfmpegMuxRefusal::DurationTooLong {
         track: TrackIndex::new(0),
-        duration: ms(2),
+        duration: ms(7),
       },
     ),
   ] {
@@ -20253,7 +20253,14 @@ fn l202_matroska_holds_each_end_it_sums_to_int64() {
     ContainerName::MATROSKA,
     both(),
   );
-  wrote(muxer.write_video(frame(max - 10, Some(5))), "a frame held");
+  let held = VideoTrackPacket::new(
+    TrackIndex::new(0),
+    video_of(&frames[0])
+      .with_pts(Some(ms(max - 10)))
+      .with_dts(Some(ms(0)))
+      .with_duration(Some(ms(5))),
+  );
+  wrote(muxer.write_video(held), "a frame held");
   let early = sample(1, -10, None);
   let (refusal, back) = by_container(refusing!(muxer.write_audio(early.clone())));
   assert_eq!(
@@ -20622,4 +20629,119 @@ fn l206_mp4s_ttml_document_is_held_to_the_largest_packet_exactly() {
   let (refusal, back) = by_container(refusing!(muxer.write_subtitle(past.clone())));
   assert_eq!(refusal, payload(PayloadRule::DocumentSize), "a byte past");
   untouched!(past, back);
+}
+
+/// L207 (R25, ruled): Matroska's cluster time, a named bound — of PCM of a
+/// 7 ms codec delay beside a frame, a block's time at `INT64_MAX − 6` ms
+/// taken, at `INT64_MAX − 5` refused.
+///
+/// PLANT: the bound unjudged.
+#[test]
+fn l207_matroskas_cluster_time_is_bounded() {
+  let Some(corpus) = Corpus::new() else { return };
+  let max = i64::MAX;
+  let mkv = corpus.multi_track_mkv();
+  let (_, frames) = first_track(&mkv, TrackKind::Video, 1);
+  let pcm = pcm_mov(&corpus);
+  let table = || {
+    let mut table = table_of(&mkv, TrackKind::Video);
+    table.push(reticketed(
+      table_of(&pcm, TrackKind::Audio).remove(0),
+      |par| {
+        par.initial_padding = 312;
+      },
+    ));
+    table
+  };
+  let frame = |at: i64| {
+    VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_of(&frames[0])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(0)))
+        .with_duration(Some(ms(1))),
+    )
+  };
+  let mut muxer = muxer_into(
+    &output(&corpus, "l207-top.mkv"),
+    ContainerName::MATROSKA,
+    table(),
+  );
+  wrote(muxer.write_video(frame(max - 6)), "a block below the bound");
+  let mut muxer = muxer_into(
+    &output(&corpus, "l207-past.mkv"),
+    ContainerName::MATROSKA,
+    table(),
+  );
+  let past = frame(max - 5);
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: ms(max - 5)
+    },
+    "a block at the bound"
+  );
+  untouched!(past, back);
+}
+
+/// L208 (R25, ruled): libavformat's interleaving's delay, a named bound —
+/// of two streams, a decode time of `2^62` microseconds less one
+/// millisecond's room taken, at `2^62` refused; of one stream, taken.
+///
+/// PLANT: the bound unjudged; judged of one stream.
+#[test]
+fn l208_the_interleavings_delay_is_bounded() {
+  let Some(corpus) = Corpus::new() else { return };
+  let edge = (1_i64 << 62) / 1000;
+  let mkv = corpus.multi_track_mkv();
+  let (_, frames) = first_track(&mkv, TrackKind::Video, 1);
+  let pcm = pcm_mov(&corpus);
+  let two = || {
+    let mut table = table_of(&mkv, TrackKind::Video);
+    table.extend(table_of(&pcm, TrackKind::Audio));
+    table
+  };
+  let frame = |at: i64| {
+    VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_of(&frames[0])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at)))
+        .with_duration(Some(ms(1))),
+    )
+  };
+  let mut muxer = muxer_into(
+    &output(&corpus, "l208-two.mkv"),
+    ContainerName::MATROSKA,
+    two(),
+  );
+  wrote(muxer.write_video(frame(edge)), "below 2^62 microseconds");
+  let mut muxer = muxer_into(
+    &output(&corpus, "l208-two-past.mkv"),
+    ContainerName::MATROSKA,
+    two(),
+  );
+  let past = frame(edge + 1);
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: ms(edge + 1)
+    },
+    "at 2^62 microseconds"
+  );
+  untouched!(past, back);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l208-one.mkv"),
+    ContainerName::MATROSKA,
+    table_of(&mkv, TrackKind::Video),
+  );
+  wrote(
+    muxer.write_video(frame(edge + 1)),
+    "one stream, no delay counted",
+  );
+  muxer.finish().expect("finished");
 }

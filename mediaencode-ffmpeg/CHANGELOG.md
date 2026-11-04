@@ -485,6 +485,14 @@ crate moves only when it changes.
   time. MP4's joined TTML document is held to the largest packet of its
   exact bytes (`PayloadRule::DocumentSize`), no longer of an upper bound of
   each paragraph.
+- **The interleaving's sums, bounded (R25).** Two signed sums whose
+  exactness would need libavformat's interleaving mirrored are held to
+  named bounds (`TimeWraps`): Matroska's cluster time, a block's time at
+  `INT64_MAX + 2` less the file's largest codec delay refused; and the
+  interleaving's delay, a decode time outside ±2^62 microseconds refused
+  where two streams or more interleave. Matroska's move of early times in
+  a file of a video codec of no native id is mirrored, of the codec's VFW
+  or QuickTime mode, where such times were refused.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer

@@ -938,8 +938,9 @@
 //! packet, of a value the trailer computes of the whole track. Every
 //! condition on the sink's seeking holds: the base's I/O context is made
 //! with a seek callback, so that it seeks (`avio_alloc_context`,
-//! `aviobuf.c`), and each trailer's seekable branch is taken. 30 rows: 8
-//! fixed — 7 of R22, and W11's held decode time of R24; 19 shown exact; 3
+//! `aviobuf.c`), and each trailer's seekable branch is taken. 31 rows: 9
+//! fixed — 7 of R22, W11's held decode time of R24, and Matroska's shift
+//! of a video codec of no native id of R25; 19 shown exact; 3
 //! bounds named — one ruled (the `moov`), and two where exactness would
 //! need libavformat's interleaving mirrored (the samples' table; Matroska's
 //! cluster, ruled in R24).
@@ -958,6 +959,7 @@
 //! | W1 | IVF's frames, raised at each packet, written at the trailer where the context seeks (`ivfenc.c` 84, 96–104) | at the packet that passes 32 bits | exact: the count only grows (L189) |
 //! | W6 | the RIFF format's fields as `ff_put_wav_header` chooses them — the extensible header and its fields where it takes it (`riffenc.c` 54–233) | [`riff_format_cut`], of the same branches | exact (L190) |
 //! | W11 | FLV's every tag's decode time, as libavformat's shift moves it (`flvenc.c` 255–258, 1356) | at each packet, of the shift as the packet showed it — looser where a packet before the first write moved the shift after a held one (R24, the re-audit of signed arithmetic) | fixed: a held packet's decode time judged again as the shift settles ([`Held::need`]; L187, L203) |
+//! | Matroska's shift | libavformat's move of early times in a Matroska file of a video codec of no native id, by presentation or decode times as the track's VFW or QuickTime mode chooses (`matroskaenc.c` 2063–2081; `mux.c` 636–717) | refused before the earliest, the mode unmirrored — stricter | fixed (R25, ruled): the mode mirrored ([`MATROSKA_QT_VIDEO`]), the times moved as FFmpeg moves them (the unit law of the shift) |
 //! | W13 | Matroska's bitmap header of a codec it names no codec id of, JPEG 2000's among them (`matroskaenc.c` 2025–2030, 1258–1270) | at open, of JPEG 2000 | exact (L192) |
 //! | W18 | a video track's display width outside MOV and AVIF, of an aspect ratio stated (4066–4085); the width alone where the height read is not the coded one — D-10's tags, MOV's alone (8473–8483) | outside MOV and AVIF, of a ratio stated | exact (L191) |
 //! | S3 | VP9's `vpcC` level, of the picture's samples in an `int` where the ticket's level is unknown — MP4's and FLV's records (`vpcc.c` 77–122) | where the level is unknown, in MP4 and FLV | exact (L168) |
@@ -1026,7 +1028,7 @@
 //! later packet before that write whose time moves the shift, or FLV's
 //! first decode time, past a bound a held packet's sum then passes is
 //! refused by that time ([`FfmpegMuxRefusal::TimeWraps`]). 16 rows: 7
-//! fixed, 6 shown exact, 1 unreached, 2 unjudged.
+//! fixed, 6 shown exact, 1 unreached, 2 bounds named (R25, ruled).
 //!
 //! | the sum | of | here |
 //! |---|---|---|
@@ -1035,7 +1037,7 @@
 //! | libavformat's output offset added to each time (`mux.c` 731–738) | none: the muxer asks no `output_ts_offset` | unreached |
 //! | the shift's earliest, a time less its stream's earliest (653, 663) | Matroska's codec delay, the one earliest below zero | exact: within Matroska's first sum below |
 //! | Matroska's and WebM's time and codec delay; its end, the duration added (`matroskaenc.c` 3144, 3194–3195) | each block | fixed ([`EndSum::Matroska`], of [`MATROSKA_QT_VIDEO`] and VFW mode; L202) |
-//! | Matroska's cluster time, a packet's time less the open cluster's, its codec delay added (3214–3219) | each packet, of the cluster the interleaving's order has opened | unjudged: out of `int64_t` only of an audio time below zero after a cluster opened within its codec delay of `INT64_MAX`, or of an empty audio packet — whose sum Matroska makes, though it writes no block of it — whose time and codec delay pass `INT64_MAX` by more than the open cluster's time; exactness would need libavformat's interleaving mirrored (R24, a ruling asked) |
+//! | Matroska's cluster time, a packet's time less the open cluster's, its codec delay added (3214–3219) | each packet, of the cluster the interleaving's order has opened | a bound, ruled (R25): a block's time, its codec delay added, at `INT64_MAX + 2` less the file's largest codec delay or later refused, where that delay is 2 ticks or more; an empty audio packet — a configuration's, others refused empty — judged by Matroska's first sum: exactness would need libavformat's interleaving mirrored ([`EndSum::Matroska`]; L207) |
 //! | Matroska's block reference, the track's last time less this one (3024) | each block in a group | exact: both written at zero and after |
 //! | FLV's end, its delay the first decode time negated (`flvenc.c` 1268, 1455–1456) | each video and audio tag | fixed ([`EndSum::Flv`], held as FLV's first decode time settles; L203) |
 //! | FLV's composition time, `pts − dts` (1415, 1448) | H.264 and MPEG-4 Part 2 | exact: of a decode time in 31 bits and an offset in 24 |
@@ -1045,7 +1047,7 @@
 //! | the MOV family's `track_duration` and presentation offset; its edit list and track header (7321, 7330; 4135–4239, 3990–3994) | each sample; at the trailer | exact: of decode-time gaps under `INT32_MAX` across at most [`MOV_SAMPLES_MAX`] samples, and an offset under it |
 //! | WAV's span and its last duration (`wavenc.c` 410–412, 451, 611) | at the trailer | exact: the span judged at each packet, the count at `finish` (R22) |
 //! | IVF's times (`ivfenc.c` 81–86) | each packet | none signed: `uint64_t` |
-//! | libavformat's interleaving's delay, each stream's last decode time less the head's, in microseconds — a time past what they hold answered `INT64_MIN` (`mux.c` 978–994) | each packet it holds, of two streams it interleaves or more | unjudged: out of `int64_t` only of decode times beyond ±2^62 microseconds, about 146 000 years; exactness would need libavformat's interleaving mirrored (R24, a ruling asked) |
+//! | libavformat's interleaving's delay, each stream's last decode time less the head's, in microseconds — a time past what they hold answered `INT64_MIN` (`mux.c` 978–994) | each packet it holds, of two streams it interleaves or more | a bound, ruled (R25): of two streams it interleaves or more, a decode time outside ±2^62 microseconds refused — exactness would need its interleaving mirrored (L208) |
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -5556,11 +5558,11 @@ impl Shift {
   /// The shift `family`'s muxer, named `muxer`, makes over `tracks` — each
   /// track's kind, codec, and whether it has a stream — where this muxer
   /// mirrors it; `None` where libavformat makes none (MP4's
-  /// `AVFMT_TS_NEGATIVE`), or where this muxer does not mirror it: Matroska
-  /// with a video track of no native Matroska id that is not certainly in
-  /// VFW mode, which may make libavformat judge decode times or
-  /// presentation times (`matroskaenc.c` 2025–2081). There the times
-  /// before the earliest stay refused.
+  /// `AVFMT_TS_NEGATIVE`). Matroska's video tracks of no native id are
+  /// written in VFW mode, of decode times, or in QuickTime mode
+  /// ([`MATROSKA_QT_VIDEO`]; `matroskaenc.c` 2025–2081) — mirrored since
+  /// R25, by ruling: their times before the earliest were refused before,
+  /// stricter than FFmpeg.
   fn of(
     family: Family,
     muxer: &str,
@@ -5580,11 +5582,9 @@ impl Shift {
           }
           // JPEG 2000 is written in VFW mode whatever the table says
           // (2027–2030); any other codec of no native id in VFW or in
-          // QuickTime mode, by tables this muxer does not mirror.
-          if codec == CodecId::JPEG2000 {
+          // QuickTime mode, by the tables mirrored (R25: refused before).
+          if !MATROSKA_QT_VIDEO.contains(&codec) {
             by_pts = false;
-          } else {
-            return None;
           }
         }
         by_pts
@@ -5886,6 +5886,12 @@ enum EndSum {
   Matroska {
     /// The track's codec delay, in its ticks ([`matroska_codec_delay`]).
     delay: i64,
+    /// The least time, its codec delay added, refused as a block's: a
+    /// cluster opened there would take a later audio time below zero past
+    /// `INT64_MIN` in `mkv_write_packet`'s cluster time (3214–3219) — a
+    /// bound, ruled (R25), `INT64_MAX + 2` less the file's largest codec
+    /// delay, where it is 2 ticks or more.
+    top: Option<i128>,
     /// Whether the track writes its decode times: VFW mode.
     by_dts: bool,
   },
@@ -6063,6 +6069,9 @@ struct PacketRules {
   guessed: Option<Guess>,
   /// The end the container sums of each packet it writes ([`EndSum`]).
   end_sum: Option<EndSum>,
+  /// Whether libavformat interleaves two streams or more, whose delay it
+  /// counts in microseconds (R25).
+  interleaves: bool,
   /// libavformat's count of the decode time after each packet
   /// ([`NextDts`]).
   next_dts: Option<NextDts>,
@@ -7839,6 +7848,7 @@ impl PacketRules {
       end_sum: if either_matroska {
         Some(EndSum::Matroska {
           delay: matroska_codec_delay(kind, codec, time_base),
+          top: None,
           by_dts: kind == TrackKind::Video
             && !MATROSKA_NATIVE_VIDEO.contains(&id)
             && !MATROSKA_QT_VIDEO.contains(&id),
@@ -7848,6 +7858,7 @@ impl PacketRules {
       } else {
         None
       },
+      interleaves: false,
       next_dts: match kind {
         TrackKind::Video => Some(NextDts::Video),
         TrackKind::Audio => Some(NextDts::Audio {
@@ -11410,7 +11421,27 @@ where
           && !MATROSKA_NATIVE_VIDEO.contains(&state.sides.codec)
           && state.sides.codec != CodecId::JPEG2000
       });
+    // R25's named bounds of the whole file: Matroska's cluster time, of its
+    // largest codec delay; libavformat's interleaving's delay.
+    let largest = track_states
+      .iter()
+      .filter(|state| state.kind == TrackKind::Audio)
+      .filter_map(|state| match state.rules.end_sum {
+        Some(EndSum::Matroska { delay, .. }) => Some(delay),
+        _ => None,
+      })
+      .max()
+      .filter(|&delay| delay >= 2);
+    let interleaves = track_states
+      .iter()
+      .filter(|state| state.stream.is_some() && state.sides.codec != SMPTE_2038)
+      .count()
+      >= 2;
     for state in &mut track_states {
+      state.rules.interleaves = interleaves;
+      if let Some(EndSum::Matroska { top, .. }) = &mut state.rules.end_sum {
+        *top = largest.map(|delay| i128::from(i64::MAX) + 2 - i128::from(delay));
+      }
       if state.rules.earliest.is_some() && shift.is_none() {
         state.rules.before_zero = Some(if either {
           BeforeZero::RefusedEither
@@ -12973,17 +13004,32 @@ fn check_packet_rules<'p>(
       },
     };
     match rules.end_sum {
-      Some(EndSum::Matroska { delay, by_dts })
-        if state.kind != TrackKind::Audio || !payload.bytes.is_empty() =>
+      // An empty audio packet, of which Matroska writes no block, meets the
+      // first sum alone (R25, ruled).
+      Some(EndSum::Matroska { delay, .. })
+        if state.kind == TrackKind::Audio && payload.bytes.is_empty() =>
       {
+        let time = i128::from(presented) + i128::from(delay);
+        if time + lift > max {
+          return Err(FfmpegMuxRefusal::TimeWraps {
+            track,
+            timestamp: output.pts.unwrap_or(output.dts),
+          });
+        }
+        need = need.max(time - max);
+      }
+      Some(EndSum::Matroska { delay, by_dts, top }) => {
         let (at, timestamp) = if by_dts {
           (output.dts_ticks, output.dts)
         } else {
           (presented, output.pts.unwrap_or(output.dts))
         };
         let time = i128::from(at) + i128::from(delay);
-        if time + lift > max {
+        if time + lift > max || top.is_some_and(|top| time + lift >= top) {
           return Err(FfmpegMuxRefusal::TimeWraps { track, timestamp });
+        }
+        if let Some(top) = top {
+          need = need.max(time - (top - 1));
         }
         let end = time + i128::from(handed.max(0));
         if end + lift > max {
@@ -13002,6 +13048,18 @@ fn check_packet_rules<'p>(
         flv_end = flv_end.max(Some(end));
       }
       _ => {}
+    }
+    // libavformat's interleaving's delay, each stream's last decode time
+    // less the head's in microseconds (`mux.c` 978–994): a bound, ruled
+    // (R25), of two streams it interleaves or more — a decode time outside
+    // ±2^62 microseconds refused.
+    if rules.interleaves
+      && !(-(1_i128 << 62) + 1..1 << 62).contains(&micros(output.dts_ticks, time_base))
+    {
+      return Err(FfmpegMuxRefusal::TimeWraps {
+        track,
+        timestamp: output.dts,
+      });
     }
     needs = needs.max(Some(need));
   }

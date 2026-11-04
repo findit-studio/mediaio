@@ -2788,9 +2788,27 @@ fn libavformats_move_of_early_times_is_settled_by_its_first_write() {
         ),
         audio
       ]
-    ),
-    None,
-    "VFW or QuickTime mode, by tables not mirrored"
+    )
+    .map(|shift| shift.now.by_pts),
+    Some(false),
+    "VFW mode, by the tables mirrored (R25)"
+  );
+  assert_eq!(
+    of(
+      Family::Matroska,
+      "matroska",
+      &[
+        (
+          TrackKind::Video,
+          CodecId::from_raw(ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_QTRLE as i32),
+          true,
+        ),
+        audio
+      ]
+    )
+    .map(|shift| shift.now.by_pts),
+    Some(true),
+    "QuickTime mode (R25)"
   );
   assert!(
     !of(Family::Other, "flv", &[video])
