@@ -18648,3 +18648,131 @@ fn l193_the_records_bit_depths_and_vvcs_picture_are_held() {
     ],
   );
 }
+
+/// **L194 — the MOV family refuses an encryption initialization of key ids
+/// of no bytes** (R22, the coordinator's ruling on A1: a bad declaration,
+/// refused by name): a key id count above zero of a key id size of zero
+/// leaves libavutil's key id array null, and its parse copies each key id
+/// through it (`av_encryption_init_info_alloc`,
+/// `av_encryption_init_info_get_side_data`, `libavutil/encryption_info.c`
+/// 178–214, 231–290), wherever movenc writes a stream's `pssh` boxes
+/// (`movenc.c` 5175–5210), AVIF's measure of its `moov` among them. An
+/// H.264 track's in MP4, MOV and iPod, the second of two initializations,
+/// an AV1 track's in AVIF, an MP4 cover's: each refused at open by name,
+/// nothing written. Matroska, which parses the kind nowhere, takes the
+/// H.264 table and finishes it; MP4 takes and finishes an initialization
+/// whose sizes run past its bytes, where the parse stops before it
+/// (246–260), and writes one of no key ids, of a key id size of zero, as
+/// its `pssh` box.
+///
+/// PLANT: the refusal skipped, MP4's table opened; the family's condition
+/// dropped, Matroska's refused; the parse's stop dropped, the short
+/// initialization refused.
+#[test]
+fn l194_the_mov_family_refuses_key_ids_of_no_bytes() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let refused: &dyn Fn(&MuxOpenError) -> bool =
+    &|error| matches!(error, MuxOpenError::KeyIdWithoutBytes { track } if track.get() == 0);
+  let carrying = |init: &[u8], table: Vec<Described>| -> Vec<Described> {
+    table
+      .into_iter()
+      .enumerate()
+      .map(|(index, row)| {
+        if index == 0 {
+          with_coded(row, T::AV_PKT_DATA_ENCRYPTION_INIT_INFO, init)
+        } else {
+          row
+        }
+      })
+      .collect()
+  };
+  let pssh_of = |path: &Path| -> Vec<u64> {
+    let bytes = std::fs::read(path).expect("the file");
+    match box_in(&bytes, (0, bytes.len()), b"moov") {
+      Some((body, end, _)) => boxes_of(&bytes, body, end)
+        .into_iter()
+        .filter(|(kind, _, _)| kind == b"pssh")
+        .map(|(_, _, size)| size)
+        .collect(),
+      None => Vec::new(),
+    }
+  };
+  // One key id of no bytes, and 8 of data.
+  let empty = encryption_init_info(&[(16, 1, 0, 8)]);
+  let h264 = h264_aac(&corpus, "h264-aac.mp4");
+  for container in ["mp4", "mov", "ipod"] {
+    open_law(
+      &corpus,
+      &format!("l194.{container}"),
+      container,
+      carrying(&empty, whole_table(&h264)),
+      Some(refused),
+    );
+  }
+  // The second of two: one key id of 16 bytes, then two of none.
+  let second = encryption_init_info(&[(16, 1, 16, 0), (16, 2, 0, 0)]);
+  open_law(
+    &corpus,
+    "l194-second.mp4",
+    "mp4",
+    carrying(&second, whole_table(&h264)),
+    Some(refused),
+  );
+  let av1 = av1_mkv(&corpus);
+  open_law(
+    &corpus,
+    "l194.avif",
+    "avif",
+    carrying(&empty, whole_table(&av1)),
+    Some(refused),
+  );
+  let same = |_: usize, row: Described| row;
+  let (table, _) = copied_source(&corpus.cover_art_mp3(), &[], &same);
+  let cover: Vec<Described> = table
+    .into_iter()
+    .filter(|row| row.file().is_some())
+    .collect();
+  assert_eq!(cover.len(), 1, "the MP3's cover");
+  open_law(
+    &corpus,
+    "l194-cover.mp4",
+    "mp4",
+    carrying(&empty, cover),
+    Some(refused),
+  );
+  // Matroska parses the kind nowhere: taken, and finished.
+  let target = output(&corpus, "l194.mkv");
+  remuxed_to_the_end(
+    &h264,
+    &target,
+    "matroska",
+    carrying(&empty, whole_table(&h264)),
+    &[],
+  );
+  // The parse stops before an initialization whose 100 bytes of data run
+  // past the 10 left: taken, finished, no box.
+  let mut short = encryption_init_info(&[(0, 1, 0, 100)]);
+  short.truncate(4 + 16 + 10);
+  let target = output(&corpus, "l194-short.mp4");
+  remuxed_to_the_end(
+    &h264,
+    &target,
+    "mp4",
+    carrying(&short, whole_table(&h264)),
+    &[],
+  );
+  assert_eq!(pssh_of(&target), Vec::<u64>::new(), "the short one's");
+  // No key ids, of a key id size of zero: written, 20 bytes, its system
+  // id's 16 and its data's 8.
+  let none = encryption_init_info(&[(16, 0, 0, 8)]);
+  let target = output(&corpus, "l194-none.mp4");
+  remuxed_to_the_end(
+    &h264,
+    &target,
+    "mp4",
+    carrying(&none, whole_table(&h264)),
+    &[],
+  );
+  assert_eq!(pssh_of(&target), [44], "the one of no key ids");
+}

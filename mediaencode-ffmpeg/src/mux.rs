@@ -633,7 +633,7 @@
 //!
 //! | | where | what is lost, and how | class | its sizes | disposition |
 //! |---|---|---|---|---|---|
-//! | A1 | the MOV family's `pssh` boxes (`mov_write_pssh_tag`, `movenc.c` 5175–5210; 5449–5451) | the encryption initialization parsed again at the `moov`, its allocation's failure answered as none, 0 returned and discarded besides: the file written without its DRM initialization | omission: no entry, no box (5184–5206) | out of reach: the parse's allocations, each within the side data's own bytes — its key ids' array a pointer a key id, of CENC's 16-byte ids at most an eighth of the ticket's budget (`encryption_info.c` 176–211, 231–290; `mov.c` 8082–8083); a key id of no bytes, which no standard's `pssh` carries, leaves that array null and its free reading through it (186–197, 217–220): outside the trust model | the premise (R21, the owner's ruling on letter 1, Q2: lifted, refused at open since R19), its boxes counted in the `moov`'s bound ([`pssh_bytes`]) — L165, L153, L158 |
+//! | A1 | the MOV family's `pssh` boxes (`mov_write_pssh_tag`, `movenc.c` 5175–5210; 5449–5451) | the encryption initialization parsed again at the `moov`, its allocation's failure answered as none, 0 returned and discarded besides: the file written without its DRM initialization | omission: no entry, no box (5184–5206) | out of reach: the parse's allocations, each within the side data's own bytes — its key ids' array a pointer a key id, of CENC's 16-byte ids at most an eighth of the ticket's budget (`encryption_info.c` 176–211, 231–290; `mov.c` 8082–8083); a key id of no bytes leaves that array null, the parse copying each key id through it and the free reading it again (190, 280, 216–229): refused at open by name before any of it is parsed ([`MuxOpenError::KeyIdWithoutBytes`]; R22, the coordinator's ruling: a bad declaration, refused) — L194 | the premise (R21, the owner's ruling on letter 1, Q2: lifted, refused at open since R19), its boxes counted in the `moov`'s bound ([`pssh_bytes`]) — L165, L153, L158 |
 //! | A2 | the MOV family's `stts` (`mov_write_stts_tag`, 3241–3288; discarded at 3411) | its 8 bytes a sample, their allocation's failure returned and discarded: the track written without its time-to-sample table — every track but constant-size audio's, whose one entry's allocation the same | omission: returned before any write (3249–3251, 3257–3259) | out of reach: the table's entries, at most [`MOV_SAMPLES_MAX`] — 29 826 048 × 8 = 238 608 384 bytes, 33 553 408 × 8 = 268 427 264 of 64-byte entries — and `ctts`'s one more (3208) | the premise |
 //! | A3 | AAC's and Opus's roll groups (`mov_preroll_write_stbl_atoms`, 3305–3400; 3436) | `sgpd` and `sbgp` left out | omission: returned before any write (3326–3328) | out of reach: 12 bytes an entry, 357 912 576 at the table's bound, 402 640 896 of 64-byte entries | the premise |
 //! | A4 | the MOV family's configuration records, FLV's beside them (A22) | the helpers' allocations — `hvcC`'s every configuration parsed again, `av1C`'s OBU buffer, `avcC`'s, `vvcC`'s, `evcC`'s and `lvcC`'s of an Annex B configuration, `dvc1`'s unescaped copy — their failures returned to `mov_write_*_tag`, which answers its box's size whatever (1573–1738), and `mov_write_video_tag` discards that besides (2880–2930): the box written empty or cut, the track undecodable; Matroska returns them, its fault at the header — `avcC`'s growth there named a malformed configuration — but for `av1C`'s OBU buffer's growth, its record written cut | omission: each helper returns before it writes, or writes what it parsed; after an Annex B buffer's failed close, `avcC`'s, `hvcC`'s and `vvcC`'s walks sum a null pointer and `-64` (`avc.c` 53–54; `hevc.c` 1377–1378; `vvc.c` 904–905) — arithmetic ISO C leaves undefined, no access: each loop's guard reads `-64` | reachable past a budget the caller raises (`CodecTicket::mirror_with`), a configuration of up to `INT_MAX` less its padding, each bounded exactly at open (r2): the Annex B rewrite, its dynamic buffer's `INT_MAX` with its padding (S7); `dvc1`'s units' bits and its sequence header's reader (S9); LCEVC's split — its RBSP buffer, its list of `INT_MAX` over an `H2645NAL`'s 88 bytes, its units' emulation prevention positions (`h2645_parse.c` 480–606; S10); `hvcC`'s read whole within `init_get_bits8`'s 268 435 391 bytes, mirrored ([`records`]); out of reach whatever the budget: `av1C`'s OBUs, `evcC`'s arrays and `dvc1`'s unescaped copy, each within the configuration's own `int` and the allocation it was copied in | the premise (R21, Q6): after an Annex B buffer's failed close, the walks' arithmetic on the null pointer and `-64` is undefined in ISO C; no memory is read or written, each loop's guard reading `-64`; the record written empty, success answered — an omission the write-side audit catches at `finish`. The remedy, the records built here, is booked (<https://github.com/findit-studio/mediaio/issues/94>) |
@@ -2425,6 +2425,44 @@ fn pssh_bytes(bytes: &[u8]) -> u64 {
     at += 16 + payload as usize;
   }
   total
+}
+
+/// Whether libavutil's parse of `bytes`, a stream's encryption
+/// initialization side data, reaches an initialization of key ids of no
+/// bytes ([`MuxOpenError::KeyIdWithoutBytes`]): each initialization in
+/// turn — a count, then each of 16 bytes and its system id, key ids and
+/// data (`av_encryption_init_info_get_side_data`,
+/// `libavutil/encryption_info.c` 231–290 in FFmpeg 9.0.1) — until one of a
+/// key id count above zero and a key id size of zero, whose key ids the
+/// parse copies through the null array its allocation leaves (190, 280).
+/// The parse stops before it, nothing read through a null pointer, at an
+/// initialization of fewer than 16 bytes or whose sizes run past the bytes
+/// (246–260).
+fn key_ids_without_bytes(bytes: &[u8]) -> bool {
+  let word = |at: usize| {
+    bytes
+      .get(at..at + 4)
+      .map(|word| u64::from(u32::from_be_bytes([word[0], word[1], word[2], word[3]])))
+  };
+  let Some(count) = word(0) else { return false };
+  let mut at = 4_usize;
+  for _ in 0..count {
+    let (Some(system), Some(keys), Some(key), Some(data)) =
+      (word(at), word(at + 4), word(at + 8), word(at + 12))
+    else {
+      return false;
+    };
+    // At most `UINT64_MAX`, as libavutil's comment says.
+    let payload = system + data + keys * key;
+    if ((bytes.len() - at - 16) as u64) < payload {
+      return false;
+    }
+    if keys != 0 && key == 0 {
+      return true;
+    }
+    at += 16 + payload as usize;
+  }
+  false
 }
 
 /// The bytes the MOV family's movie `udta` holds in the dynamic buffer
@@ -4536,6 +4574,24 @@ pub enum MuxOpenError {
   /// [`OPUS_TS_PADDING`]).
   #[error("track {}'s initial padding passes what MPEG-TS counts it in", .track.get())]
   InitialPaddingTooLong {
+    /// The track.
+    track: TrackIndex,
+  },
+  /// The MOV family: a stream whose encryption initialization
+  /// (`AV_PKT_DATA_ENCRYPTION_INIT_INFO`) declares key ids of no bytes — a
+  /// key id count above zero of a key id size of zero. libavutil's
+  /// allocation leaves the key id array null for that size, and its parse
+  /// copies each key id through it (`av_encryption_init_info_alloc`,
+  /// `av_encryption_init_info_get_side_data`, `libavutil/encryption_info.c`
+  /// 178–214, 231–290 in FFmpeg 9.0.1), its free reading through it again
+  /// (216–229): a read through a null pointer, wherever movenc writes each
+  /// stream's `pssh` boxes (`mov_write_pssh_tag`, `movenc.c` 5175–5210;
+  /// 5449–5451), AVIF's measure of its `moov` among them (9178). Refused
+  /// by name before any of it is parsed, nothing written (R22, the
+  /// coordinator's ruling on A1: a bad declaration, refused); a container
+  /// that parses the kind nowhere takes it.
+  #[error("track {}'s encryption initialization declares key ids of no bytes", .track.get())]
+  KeyIdWithoutBytes {
     /// The track.
     track: TrackIndex,
   },
@@ -13017,6 +13073,22 @@ fn judge<W, D: AsRef<[u8]>>(
       Road::Timed
     }
   };
+  // Every stream the MOV family writes has its encryption initialization
+  // parsed at its trailer, a cover's among them (`movenc.c` 5449–5451;
+  // R22, the coordinator's ruling on A1).
+  if family == Family::Mp4
+    && road != Road::NotWritten
+    && description
+      .side_data()
+      .coded_side_data()
+      .iter()
+      .any(|entry| {
+        entry.kind() == AVPacketSideDataType::AV_PKT_DATA_ENCRYPTION_INIT_INFO as i32
+          && key_ids_without_bytes(entry.data())
+      })
+  {
+    return Err(MuxOpenError::KeyIdWithoutBytes { track });
+  }
   Ok((road, losses((family, audited), road, track, description)))
 }
 
