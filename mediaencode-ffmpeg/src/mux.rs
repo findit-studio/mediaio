@@ -15007,9 +15007,7 @@ fn bit_rates_cut(input: BitRateInputs, btrt: bool, esds: bool) -> Option<BitRate
   if !fits(average) || !fits(maximum) {
     return Some(cut);
   }
-  let Some(cpb) = input.cpb else {
-    return None;
-  };
+  let cpb = input.cpb?;
   if !fits(maximum.max(i128::from(cpb.max_bitrate))) {
     return Some(cut);
   }
