@@ -20810,3 +20810,109 @@ fn l209_mpeg_ts_holds_its_decode_time_to_the_clocks_room() {
   );
   muxer.finish().expect("finished");
 }
+
+/// L210 (R26, Codex R25 [high]): MPEG-TS counts the first PES packet of
+/// the stream it writes its clock reference on from a reference a period
+/// before zero (`mpegtsenc.c` 1041–1070, 1569–1571): that stream's first
+/// decode time held to `(i64::MAX − period) / 300`, of 27 MHz ticks. MP2
+/// at 48 kHz alone — a period of 2 592 000, four 1152-sample frames —
+/// first at the bound taken and the file finished; a tick past refused,
+/// the packet untouched. Beside a video stream, which MPEG-TS chooses for
+/// it, the MP2 stream's first at `i64::MAX / 300` taken, and the video's
+/// first a tick past its own period's bound refused, at it taken.
+///
+/// PLANT: the first unjudged; judged of every stream; of the first stream
+/// alone.
+#[test]
+fn l210_mpeg_ts_holds_its_clock_references_first_sum() {
+  let Some(corpus) = Corpus::new() else { return };
+  let room = |period: i64| (i64::MAX - period) / 300;
+  let mp2 = audio_file(&corpus, "mp2.mkv", "mp2");
+  let (_, sounds) = first_track(&mp2, TrackKind::Audio, 1);
+  let ts = || ContainerName::new("mpegts");
+  let at_90k = Timebase::new(1, NonZeroI32::new(90_000).expect("non-zero"));
+  let sound = |track: usize, ticks: i64| {
+    AudioTrackPacket::new(
+      TrackIndex::new(track),
+      audio_of(&sounds[0])
+        .with_pts(Some(Timestamp::new(ticks, at_90k)))
+        .with_dts(Some(Timestamp::new(ticks, at_90k))),
+    )
+  };
+  let alone = room(2_592_000);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l210-alone.ts"),
+    ts(),
+    table_of(&mp2, TrackKind::Audio),
+  );
+  wrote(muxer.write_audio(sound(0, alone)), "the first at the bound");
+  muxer.finish().expect("finished");
+  let mut muxer = muxer_into(
+    &output(&corpus, "l210-alone-past.ts"),
+    ts(),
+    table_of(&mp2, TrackKind::Audio),
+  );
+  let past = sound(0, alone + 1);
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: Timestamp::new(alone + 1, at_90k),
+    },
+    "a tick past the first's room"
+  );
+  untouched!(past, back);
+  wrote(muxer.write_audio(sound(0, alone)), "the first at the bound");
+  muxer.finish().expect("finished");
+
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let mut table = table_of(&mp2, TrackKind::Audio);
+  table.extend(table_of(&source, TrackKind::Video));
+  // The video stream's period, of its frame rate (1059–1065).
+  let period = match table[1].params() {
+    TrackParams::Video(params) => params
+      .frame_rate()
+      .filter(|rate| rate.num() > 0 && rate.den().get() > 0)
+      .map_or(1, |rate| {
+        let num = i64::from(rate.num());
+        let frame = (i64::from(rate.den().get()) * 27_000_000 + num - 1) / num;
+        if frame <= 2_700_000 {
+          frame * (2_700_000 / frame)
+        } else {
+          1
+        }
+      }),
+    _ => unreachable!("a video track"),
+  };
+  let picture = |ticks: i64| {
+    VideoTrackPacket::new(
+      TrackIndex::new(1),
+      video_of(&frames[0])
+        .with_pts(Some(Timestamp::new(ticks, at_90k)))
+        .with_dts(Some(Timestamp::new(ticks, at_90k))),
+    )
+  };
+  let mut muxer = muxer_into(&output(&corpus, "l210-video.ts"), ts(), table);
+  wrote(
+    muxer.write_audio(sound(0, i64::MAX / 300)),
+    "the MP2 stream's first, no reference on it",
+  );
+  let past = picture(room(period) + 1);
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(1),
+      timestamp: Timestamp::new(room(period) + 1, at_90k),
+    },
+    "the video's first a tick past its room"
+  );
+  untouched!(past, back);
+  wrote(
+    muxer.write_video(picture(room(period))),
+    "the video's first at its bound",
+  );
+  muxer.finish().expect("finished");
+}

@@ -960,7 +960,7 @@
 //! | W6 | the RIFF format's fields as `ff_put_wav_header` chooses them — the extensible header and its fields where it takes it (`riffenc.c` 54–233) | [`riff_format_cut`], of the same branches | exact (L190) |
 //! | W11 | FLV's every tag's decode time, as libavformat's shift moves it (`flvenc.c` 255–258, 1356) | at each packet, of the shift as the packet showed it — looser where a packet before the first write moved the shift after a held one (R24, the re-audit of signed arithmetic) | fixed: a held packet's decode time judged again as the shift settles ([`Held::need`]; L187, L203) |
 //! | Matroska's shift | libavformat's move of early times in a Matroska file of a video codec of no native id, by presentation or decode times as the track's VFW or QuickTime mode chooses (`matroskaenc.c` 2063–2081; `mux.c` 636–717) | refused before the earliest, the mode unmirrored — stricter | fixed (R25, ruled): the mode mirrored ([`MATROSKA_QT_VIDEO`]), the times moved as FFmpeg moves them (the unit law of the shift) |
-//! | MPEG-TS's clock | the clock reference of the decode time, 300 times over, in `int64_t`, `max_delay` unset and so zero (`mpegtsenc.c` 1130–1131, 1283, 1526, 1890) | both times held to `i64::MAX / 600` — stricter (Codex R24) | fixed (R25): the decode time alone, moved by the shift, to `i64::MAX / 300` (L96, L209) |
+//! | MPEG-TS's clock | the clock reference of the decode time, 300 times over, in `int64_t`, `max_delay` unset and so zero (`mpegtsenc.c` 1130–1131, 1283, 1526, 1890) | both times held to `i64::MAX / 600` — stricter (Codex R24) | fixed (R25): the decode time alone, moved by the shift, to `i64::MAX / 300` (L96, L209); and (R26, Codex R25 [high]) the first on the reference's stream to `(i64::MAX − period) / 300` (L210; the carried state's census below) |
 //! | W13 | Matroska's bitmap header of a codec it names no codec id of, JPEG 2000's among them (`matroskaenc.c` 2025–2030, 1258–1270) | at open, of JPEG 2000 | exact (L192) |
 //! | W18 | a video track's display width outside MOV and AVIF, of an aspect ratio stated (4066–4085); the width alone where the height read is not the coded one — D-10's tags, MOV's alone (8473–8483) | outside MOV and AVIF, of a ratio stated | exact (L191) |
 //! | S3 | VP9's `vpcC` level, of the picture's samples in an `int` where the ticket's level is unknown — MP4's and FLV's records (`vpcc.c` 77–122) | where the level is unknown, in MP4 and FLV | exact (L168) |
@@ -1052,12 +1052,57 @@
 //! | FLV's end, its delay the first decode time negated (`flvenc.c` 1268, 1455–1456) | each video and audio tag | fixed ([`EndSum::Flv`], held as FLV's first decode time settles; L203) |
 //! | FLV's composition time, `pts − dts` (1415, 1448) | H.264 and MPEG-4 Part 2 | exact: of a decode time in 31 bits and an offset in 24 |
 //! | FLV's decode time, moved by the shift (255–258) | each tag | fixed: held as the shift settles (W11; L203) |
-//! | MPEG-TS's clock reference of the decode time, 300 times over — `first_pcr += dts * 300` and `(dts − delay) * 300`, `max_delay` unset and so zero (`mpegtsenc.c` 1130–1131, 1283, 1526, 1890) — and the delay, zero, added to both times (1896–1898) | each packet | fixed: the decode time, moved by the shift, held to `i64::MAX / 300` as the shift settles; the presentation time to `int64_t` alone (R25, Codex R24: both to `i64::MAX / 600` before, stricter; L96, L209) |
+//! | MPEG-TS's clock reference of the decode time, 300 times over — `first_pcr += dts * 300` and `(dts − delay) * 300`, `max_delay` unset and so zero (`mpegtsenc.c` 1130–1131, 1283, 1526, 1890) — and the delay, zero, added to both times (1896–1898) | each packet | fixed: the decode time, moved by the shift, held to `i64::MAX / 300` as the shift settles; the presentation time to `int64_t` alone (R25, Codex R24: both to `i64::MAX / 600` before, stricter; L96, L209); the reference's first sum, of its period, below (R26) |
 //! | the MOV family's `end_pts` (`movenc.c` 7334–7340) | each sample | fixed (L204) |
 //! | the MOV family's `track_duration` and presentation offset; its edit list and track header (7321, 7330; 4135–4239, 3990–3994) | each sample; at the trailer | exact: of decode-time gaps under `INT32_MAX` across at most [`MOV_SAMPLES_MAX`] samples, and an offset under it |
 //! | WAV's span and its last duration (`wavenc.c` 410–412, 451, 611) | at the trailer | exact: the span judged at each packet, the count at `finish` (R22) |
 //! | IVF's times (`ivfenc.c` 81–86) | each packet | none signed: `uint64_t` |
 //! | libavformat's interleaving's delay, each stream's last decode time less the head's, in microseconds — a time past what they hold answered `INT64_MIN` (`mux.c` 978–994) | each packet it holds, of two streams it interleaves or more | a bound, ruled (R25): of two streams it interleaves or more, a decode time outside ±2^62 microseconds refused — exactness would need its interleaving mirrored (L208) |
+//!
+//! **Every signed sum over a muxer's carried state** (R26, Codex R25
+//! [high], closed by class: a sum over a value a muxer starts or carries
+//! from packet to packet, into which a packet's times are fed, is held as
+//! the packet's own sums are — refused where FFmpeg's would leave `int64_t`,
+//! and nowhere stricter). By grep of each `int64_t` and time-carrying field
+//! of the kept muxers' contexts — `mpegtsenc.c`, `matroskaenc.c`,
+//! `flvenc.c`, `movenc.c`, `ivfenc.c`, `wavenc.c`, `adtsenc.c`, `rawenc.c`,
+//! `flacenc.c` — and each `+`, `-` and `+=` over it. The muxer's options are
+//! FFmpeg's defaults but `write_btrt` ([`MuxOptions`]): no `muxrate`,
+//! `pcr_period`, `max_delay`, `movflags` or `cluster_time_limit` is set,
+//! and the context is opened of no file name. A time a packet is judged in
+//! is its time as libavformat's shift moves it, at or after the earliest
+//! its container writes, zero but in MP4 ([`FfmpegMuxRefusal::BeforeZero`]);
+//! no time is `INT64_MIN`, libavformat's unknown. 25 rows: 1 fixed, 16
+//! shown exact, 3 held as the signed sums' table holds them, 1 bound named
+//! there, 3 unreached, 1 of no signed state.
+//!
+//! | the state, and the sum over it | here |
+//! |---|---|
+//! | MPEG-TS's clock reference's period on the stream it chooses — the first video stream, else the first (`select_pcr_streams`, `mpegtsenc.c` 1072–1100) — the highest multiple of a frame within 100 ms, else a tick (1046–1065), and its reference before the first, `last_pcr = first_pcr − pcr_period`, `first_pcr` zero then (1069, 1283); `pcr − last_pcr` at each PES packet's first TS packet (1569–1571) | fixed (R26, Codex R25 [high]): the stream's first decode time held to `(i64::MAX − period) / 300` ([`ts_pcr_period`]; L210) — R25 held it to `i64::MAX / 300` alone, looser |
+//! | MPEG-TS's reference after the first: `last_pcr = FFMAX(pcr − pcr_period, last_pcr + pcr_period)` (1571), and the next `pcr − last_pcr` | exact: the first answer is at zero or after, every decode time at zero or after, so that each sum lies within `int64_t` |
+//! | MPEG-TS's tables' times, `last_pat_ts`, `last_sdt_ts`, `last_nit_ts`, unknown at the start (1287–1289); `pcr − last_*_ts` (1323–1345) | exact: the first test is of the unknown alone, `||` stopping there; each later time a clock reference at zero or after |
+//! | MPEG-TS's tables' periods (1290–1292) | exact: `av_rescale` of the defaults |
+//! | MPEG-TS's `first_pcr += dts * 300` (1890) | exact: of a zero and the first decode time, within `i64::MAX / 300` (R25) |
+//! | MPEG-TS's delays of `max_delay` (1503, 1877–1878), and the times they move (1896–1898) | exact: zero |
+//! | MPEG-TS's held audio, `dts − payload_dts` against the audio delay (2206–2207) | exact: two decode times at zero or after |
+//! | MPEG-TS's held Opus samples, `opus_queued_samples + opus_samples` (2208, 2231) | exact: at most 5760 and a packet's samples, of 120 ms |
+//! | MPEG-TS's nested ADTS muxer, the decode time rescaled into its stream's time base and libavformat's count after it (1981–2001; `mux.c` 571–599) | exact: of a decode time within `i64::MAX / 300`, at a rate of 96 kHz at most |
+//! | MPEG-TS's clock of the bytes written, `get_pcr`, and the null packets of a set `muxrate` (966–969, 1534–1567); the M2TS arrival times (975–980) | unreached: `muxrate` its default of one, and M2TS mode chosen by a file name, of none (1109–1113) |
+//! | Matroska's cluster time, the block's time less the cluster's, `cluster_pts` the cluster's first time at zero or after (`matroskaenc.c` 3147, 3161–3163, 2888) | exact: of times at zero or after |
+//! | Matroska's cluster time of the interleaving's order, its codec delay added (3214–3219) | a bound, ruled (R25), above |
+//! | Matroska's `last_timestamp − ts` (3024), `duration` and `track->duration` (3194–3195) | exact and fixed, as above |
+//! | Matroska's cues, each block's time and duration (962–990, 3185–3187) | exact: written as they are, compared, unsummed |
+//! | Matroska's chapters, rescaled into nanoseconds (2439–2445) | exact: `av_rescale_q`, compared; each chapter at zero or after and ending no earlier ([`MuxOpenError::ChapterSpan`]) |
+//! | Matroska's DASH cluster limit, `cluster_time_limit` (2746–2752, 3227–3234) | unreached: WebM's `dash` option unset; the limit compared alone |
+//! | FLV's delay, the first decode time negated, and `pkt->dts < −delay` (`flvenc.c` 1267–1270) | exact: of decode times at zero or after |
+//! | FLV's `last_ts`, at −1 before each stream's first (1075), and Speex's `ts − last_ts` (1340) | exact: of a decode time in FLV's 31 bits |
+//! | FLV's file duration, `lasttimestamp` and the keyframes' times (1197, 1455–1467, 925) | fixed (the end, above); doubles and the index's flag, unset, else |
+//! | the MOV family's sample gaps, `pkt->dts − ref`, `ref` the last sample's decode time (`movenc.c` 6901–6915), and `pkt->dts − cluster[0].dts` at each packet (7444) | exact: each gap within `INT32_MAX`, refused past it ([`FfmpegMuxRefusal::DtsGap`]), across at most [`MOV_SAMPLES_MAX`] samples |
+//! | the MOV family's `start_dts`, `start_cts`, `track_duration`, `end_pts` and the edit list's and track header's sums over them (7289–7342, 1249, 3875, 3880–3895, 4141–4214) | exact and fixed, as above: `start_dts + start_cts` a presentation time; `−FFMIN(start_dts, 0)` of no `INT64_MIN`; the last sample's end within `end_pts`'s bound (L204) |
+//! | the MOV family's chapter track, `end − pkt->dts` (7788–7790) | exact: of chapters at zero or after and ending no earlier |
+//! | the MOV family's fragments and negative offsets — `dts_shift`, the fragments' times, `sidx`, `tfdt`, `mfra`, `prft` (6703–6733, 7255–7275, 7406–7409, 7432–7469, 5747–5952) | unreached: no `movflags` set, no fragmenting mode written |
+//! | WAV's `minpts`, at `INT64_MAX` before the first (`wavenc.c` 364–365), and the span (410–412, 451, 611) | exact: the span judged at each packet (R22); of no packet, `−INT64_MAX` |
+//! | IVF's last time and duration (`ivfenc.c` 83–85); ADTS's, FLAC's and the raw writers' contexts | none signed: `uint64_t`; no time carried |
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -3909,9 +3954,11 @@ pub enum FfmpegMuxRefusal {
   /// extended byte, whose top bit it masks off (`put_timestamp`,
   /// `flvenc.c` 255–258, 1356) — so one of 2^31 or more is written cut,
   /// read back as another (`flvdec.c` 1407–1408; R21, by the class); MPEG-TS its
-  /// clock reference, 300 times the
-  /// first decode time, in `int64_t` — refused past `i64::MAX / 600`
-  /// (`mpegtsenc.c` 1887–1890). And (R21, census R20-5) the MOV family but
+  /// clock reference, 300 times each decode time, in `int64_t` — a decode
+  /// time refused past `i64::MAX / 300` (`mpegtsenc.c` 1526, 1890; R25),
+  /// and the first on the stream it writes the reference on past
+  /// `(i64::MAX − period) / 300`, of the reference's period (1041–1069,
+  /// 1569–1571; R26, Codex R25 [high]). And (R21, census R20-5) the MOV family but
   /// AVIF its edit list's media time, of version 0 the track's first
   /// sample's decode time negated, in 32 bits — a first sample at `-2^31`
   /// ticks or before, as libavformat's shift leaves it, written wrapped
@@ -6092,6 +6139,10 @@ struct PacketRules {
   /// MPEG-TS: every decode time within its clock's room
   /// ([`FfmpegMuxRefusal::TimeWraps`]).
   ts_clock: bool,
+  /// MPEG-TS: the period of its clock reference, in 27 MHz ticks, where the
+  /// track's stream is the one it writes the reference on
+  /// ([`ts_pcr_period`]; R26, Codex R25 [high]).
+  ts_pcr_period: Option<i64>,
   /// AVIF: the track's samples counted against the buffer they are written
   /// into ([`PayloadRule::FragmentSize`]).
   buffered: bool,
@@ -7906,6 +7957,7 @@ impl PacketRules {
         delayed: codec.video_delay() > 0,
       }),
       ts_clock: audited == Audited::MpegTs,
+      ts_pcr_period: None,
       buffered: audited == Audited::Mov(MovMode::Avif),
       ivf: audited == Audited::Ivf,
       edit_list: mp4 && audited != Audited::Mov(MovMode::Avif),
@@ -7922,6 +7974,52 @@ impl PacketRules {
 /// config element, which Matroska reserves for an AAC track's
 /// configuration where the track states none.
 const MAX_PCE_SIZE: usize = 320;
+
+/// The period, in 27 MHz ticks, at which MPEG-TS writes its clock reference
+/// on the stream it chooses for it (`enable_pcr_generation_for_stream`,
+/// `mpegtsenc.c` 1041–1070 in FFmpeg 9.0.1), `muxrate` and `pcr_period`
+/// left at their defaults (2368, 2390–2391): the highest multiple of a
+/// frame's duration within 100 ms — an audio frame of `frame_samples`, as
+/// `av_get_audio_frame_duration2` counts one of no bytes, else 512, at
+/// `sample_rate`; a video frame at `frame_rate`, the stream's
+/// `avg_frame_rate`, which the base sets of the track's — each rounded up,
+/// as `av_rescale_rnd` rounds; else, or past 100 ms, one tick.
+fn ts_pcr_period(
+  kind: TrackKind,
+  (frame_samples, sample_rate): (i32, i32),
+  frame_rate: Option<Timebase>,
+) -> i64 {
+  const PCR_TIME_BASE: i128 = 27_000_000;
+  // `av_rescale_rnd(a, PCR_TIME_BASE, c, AV_ROUND_UP)`: `INT64_MIN` of a
+  // divisor not above zero, below zero of `a` below zero (`mathematics.c`
+  // 58–71) — none of them above zero.
+  let up = |a: i128, c: i128| {
+    if c <= 0 || a < 0 {
+      0
+    } else {
+      (a * PCR_TIME_BASE + c - 1) / c
+    }
+  };
+  let frame_period = match kind {
+    TrackKind::Audio => up(
+      i128::from(if frame_samples == 0 {
+        512
+      } else {
+        frame_samples
+      }),
+      i128::from(sample_rate),
+    ),
+    TrackKind::Video => frame_rate.filter(|rate| rate.num() != 0).map_or(0, |rate| {
+      up(i128::from(rate.den().get()), i128::from(rate.num()))
+    }),
+    _ => 0,
+  };
+  if frame_period > 0 && frame_period <= PCR_TIME_BASE / 10 {
+    (frame_period * (PCR_TIME_BASE / 10 / frame_period)) as i64
+  } else {
+    1
+  }
+}
 
 /// An audio track's codec delay in Matroska, in its stream's ticks: its
 /// initial padding counted at its sample rate and rounded to the nearest
@@ -11198,6 +11296,9 @@ where
     let header = output.position();
     let shifts = output.shifts_early_times();
     let mut track_states = Vec::with_capacity(states.len());
+    // MPEG-TS's streams, by index, with their tracks, kinds and the period
+    // of the clock reference on each (R26, Codex R25 [high]).
+    let mut ts_pcr: Vec<(usize, usize, TrackKind, i64)> = Vec::new();
     for (index, (kind, stream, road, filter)) in states.into_iter().enumerate() {
       let track = TrackIndex::new(index);
       let mut rules = PacketRules::default();
@@ -11256,6 +11357,31 @@ where
             (header, bounds.file),
             hdr_sizes,
           );
+          // MPEG-TS's clock reference: its period on the stream, were it the
+          // one MPEG-TS chose, of the parameters as its start read them.
+          if audited == Audited::MpegTs {
+            let samples = if kind == TrackKind::Audio {
+              match output.audio_frame_samples(stream, 0) {
+                Ok(samples) => samples,
+                Err(error) => {
+                  output.abandon();
+                  return Err(MuxFault::new(MuxStage::Header, error).into());
+                }
+              }
+            } else {
+              0
+            };
+            let frame_rate = match tracks[index].params() {
+              TrackParams::Video(params) => params.frame_rate(),
+              _ => None,
+            };
+            ts_pcr.push((
+              stream,
+              index,
+              kind,
+              ts_pcr_period(kind, (samples, codec.sample_rate()), frame_rate),
+            ));
+          }
           // WAV's fact chunk counts the last duration libavformat hands
           // (table H), and the MOV family's trailer every sample's (R22,
           // Codex R21 2); Matroska and FLV sum it into each packet's end
@@ -11447,6 +11573,17 @@ where
       .filter(|state| state.stream.is_some() && state.sides.codec != SMPTE_2038)
       .count()
       >= 2;
+    // MPEG-TS writes its clock reference on one stream: the first video
+    // stream, else the first (`select_pcr_streams`, `mpegtsenc.c`
+    // 1072–1100; one service, of no program).
+    ts_pcr.sort_by_key(|&(stream, ..)| stream);
+    if let Some(&(_, index, _, period)) = ts_pcr
+      .iter()
+      .find(|&&(_, _, kind, _)| kind == TrackKind::Video)
+      .or(ts_pcr.first())
+    {
+      track_states[index].rules.ts_pcr_period = Some(period);
+    }
     for state in &mut track_states {
       state.rules.interleaves = interleaves;
       if let Some(EndSum::Matroska { top, .. }) = &mut state.rules.end_sum {
@@ -12933,7 +13070,11 @@ fn check_packet_rules<'p>(
   // first write settles the shift (R24; [`Held::need`]).
   let mut needs: Option<i128> = None;
   let mut flv_end: Option<i128> = None;
+  // Whether the output is the first the container takes of the track.
+  let mut first = !state.written;
   for output in outputs.iter() {
+    let opening = first;
+    first = false;
     // `check_pkt` counts a packet's gap from the last sample MP4 wrote on the
     // track — not from a packet MP4 holds — and a `mov_text` cue's from the
     // empty sample where MP4 writes it first (table C″).
@@ -13006,6 +13147,25 @@ fn check_packet_rules<'p>(
         });
       }
       need = need.max(dts - i128::from(i64::MAX / 300));
+      // On the stream it writes the reference on, MPEG-TS counts the first
+      // PES packet's from a reference a period before zero — `last_pcr`
+      // starts at `first_pcr − pcr_period`, `first_pcr` zero then (1069,
+      // 1283) — summing `pcr − last_pcr` in `int64_t` (1569–1571): the
+      // first decode time held to `(i64::MAX − period) / 300`. Every later
+      // one's reference lies at zero or after (1571), its sum within
+      // `int64_t` (R26, Codex R25 [high]).
+      if let Some(period) = rules.ts_pcr_period
+        && opening
+      {
+        let room = (i128::from(i64::MAX) - i128::from(period)).div_euclid(300);
+        if dts + lift > room {
+          return Err(FfmpegMuxRefusal::TimeWraps {
+            track,
+            timestamp: output.dts,
+          });
+        }
+        need = need.max(dts - room);
+      }
     }
     // The end the container sums of the packet, in `int64_t` (R24, Codex
     // R23 [high]; [`EndSum`]), of the duration libavformat hands it.
