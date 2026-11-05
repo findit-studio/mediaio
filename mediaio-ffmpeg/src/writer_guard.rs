@@ -44,6 +44,35 @@
 //! that the sink holds the bytes written before the failure, and nothing
 //! after it.
 //!
+//! **And so is a sink that failed a write or a flush** (R27, Codex R26
+//! [medium]). The I/O context keeps a failed write's error and writes
+//! nothing more of its own (`writeout`, `aviobuf.c` 136–166 in FFmpeg
+//! 9.0.1), but other roads still reach the sink: `avio_seek` flushes and
+//! then seeks whatever the flush answered (303–317), and `avio_size` asks
+//! the sink's size (326–347). The guard latches every failure but an
+//! interrupted one — a write that takes no byte of some, or more than it
+//! was handed, among them — and refuses every later write, seek and flush.
+//!
+//! # Every road back into the sink after a failure
+//!
+//! By grep of every call of the I/O context's `write_packet` and `seek`
+//! over `aviobuf.c` and of the guard's entries over ffmpeg-next's
+//! `stream_io.rs`, each road by which one call into libavformat, or the
+//! output's teardown, reaches the sink again after one of its calls failed,
+//! and what stops it:
+//!
+//! | after | the road back | stopped by |
+//! |---|---|---|
+//! | a write failed | `writeout`'s next buffer (136–166) | the I/O context itself, which skips every write once its `error` is set; and the guard |
+//! | a write failed | `avio_seek`'s flush and then its seek (303–317), as the MOV family's `mdat` patch and every trailer's header patch run it; `avio_skip` (321–324) | the guard (R27): the seek refused unasked, kept as no failed seek, the write's error named |
+//! | a write failed | `avio_size`'s size probe and its `SEEK_END` fallback (326–347); ffmpeg-next's `AVSEEK_SIZE`, three seeks (`stream_io.rs` 358–372) | the guard (R27) |
+//! | a write failed | `Output::into_sink`'s flush, and `StreamIo`'s `Drop`'s flush of the sink (270–272) | the output's close (R21) and the guard (R27) |
+//! | a write was interrupted | ffmpeg-next's loop asks it again (333–343) | nothing: by its kind, it did nothing |
+//! | a seek failed | the next write, seek or flush; `avio_size`'s fallback after a failed probe (338–343) | the seek record ([`SeekRecord`]) |
+//! | a flush failed | `StreamIo`'s `Drop`, after `into_sink`'s refusal | the output's close and the guard (R27) |
+//! | a panic | any call | the latch |
+//! | the output failed | its teardown: `deinit`, the last flush, the sink's `flush` | the close ([`SinkClosed`]) |
+//!
 //! # Every entry into the sink
 //!
 //! The guard is the one way into the caller's sink: `Output` builds its
@@ -171,6 +200,10 @@ pub struct GuardedWriter<W> {
   latch: Arc<PanicLatch>,
   seeks: Arc<SeekRecord>,
   closed: Arc<SinkClosed>,
+  /// Whether a write or a flush has failed (R27, Codex R26 [medium]): the
+  /// I/O context keeps the write's error and names it, but `avio_seek`
+  /// still calls the sink's seek after the flush that failed.
+  failed: bool,
 }
 
 impl<W> GuardedWriter<W> {
@@ -186,6 +219,7 @@ impl<W> GuardedWriter<W> {
         latch: Arc::clone(&latch),
         seeks: Arc::clone(&seeks),
         closed: Arc::new(SinkClosed::default()),
+        failed: false,
       },
       latch,
       seeks,
@@ -251,6 +285,11 @@ impl<W> GuardedWriter<W> {
         "the output failed, and nothing more reaches the caller's writer",
       ));
     }
+    if self.failed {
+      return Err(io::Error::other(
+        "the caller's writer failed a write earlier, and is not called again",
+      ));
+    }
     if self.seeks.is_set() {
       Err(io::Error::other(
         "the caller's writer failed a seek earlier, and nothing more is written",
@@ -262,16 +301,34 @@ impl<W> GuardedWriter<W> {
 }
 
 impl<W: Write> Write for GuardedWriter<W> {
+  /// A write that fails — but one interrupted, which did nothing and is
+  /// asked again (`stream_io.rs` 333–343) — or that takes no byte of a
+  /// buffer of some, or more than it was handed, which ffmpeg-next answers
+  /// as failures, latches the sink as failed: every later write, seek and
+  /// flush is refused without reaching it (R27, Codex R26 [medium]).
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
     self.positioned()?;
-    self.guard(|inner| inner.write(buf))
+    let written = self.guard(|inner| inner.write(buf));
+    match &written {
+      Ok(taken) if (*taken == 0 && !buf.is_empty()) || *taken > buf.len() => self.failed = true,
+      Err(error) if error.kind() != io::ErrorKind::Interrupted => self.failed = true,
+      _ => {}
+    }
+    written
   }
 
   /// A flush after a failed seek would commit what the sink buffered at a
-  /// position the failure left unknown: refused, as a write is.
+  /// position the failure left unknown: refused, as a write is. A flush
+  /// that fails latches the sink as a failed write does.
   fn flush(&mut self) -> io::Result<()> {
     self.positioned()?;
-    self.guard(|inner| inner.flush())
+    let flushed = self.guard(|inner| inner.flush());
+    if let Err(error) = &flushed
+      && error.kind() != io::ErrorKind::Interrupted
+    {
+      self.failed = true;
+    }
+    flushed
   }
 }
 
@@ -314,6 +371,67 @@ mod tests {
       guarded.into_inner().into_inner().is_empty(),
       "nothing reached the sink"
     );
+  }
+
+  /// A sink whose first write fails, or takes no byte, and which counts
+  /// every call that reaches it.
+  struct FailsOnce {
+    calls: u32,
+    answer: fn() -> io::Result<usize>,
+  }
+
+  impl Write for FailsOnce {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+      self.calls += 1;
+      (self.answer)()
+    }
+    fn flush(&mut self) -> io::Result<()> {
+      self.calls += 1;
+      Ok(())
+    }
+  }
+
+  impl Seek for FailsOnce {
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+      self.calls += 1;
+      Ok(0)
+    }
+  }
+
+  /// **A failed write is terminal** (R27, Codex R26 [medium]): after a
+  /// write the sink fails — or one that takes no byte of a buffer of some —
+  /// a seek, a write and a flush each answer an error without reaching the
+  /// sink, and none is kept as a failed seek; an interrupted write, which
+  /// did nothing, latches nothing.
+  #[test]
+  fn a_failed_write_is_not_followed_into_the_sink() {
+    for answer in [
+      (|| Err(io::Error::other("full"))) as fn() -> io::Result<usize>,
+      || Ok(0),
+    ] {
+      let (mut guarded, latch, seeks) = GuardedWriter::new(FailsOnce { calls: 0, answer });
+      assert!(matches!(guarded.write(b"bytes"), Err(_) | Ok(0)));
+      assert!(guarded.seek(SeekFrom::Start(0)).is_err());
+      assert!(guarded.write(b"more").is_err());
+      assert!(guarded.flush().is_err());
+      assert!(!seeks.is_set(), "no failed seek kept");
+      assert!(!latch.is_latched(), "no panic latched");
+      assert_eq!(
+        guarded.into_inner().calls,
+        1,
+        "only the failed write reached the sink"
+      );
+    }
+    let (mut guarded, _, _) = GuardedWriter::new(FailsOnce {
+      calls: 0,
+      answer: || Err(io::ErrorKind::Interrupted.into()),
+    });
+    assert!(guarded.write(b"bytes").is_err());
+    assert!(
+      guarded.seek(SeekFrom::Start(0)).is_ok(),
+      "an interrupted write latches nothing"
+    );
+    assert_eq!(guarded.into_inner().calls, 2);
   }
 
   /// A sink that panics in each of its three calls, and counts them.
@@ -498,8 +616,9 @@ mod tests {
 
   /// **An error leaves the guard saying what it said, and owning
   /// nothing**: an OS error keeps its code, any other its kind — all
-  /// ffmpeg-next reads of it — and neither carries a payload out. Nothing
-  /// is latched: an error is not a panic, and the sink stays callable.
+  /// ffmpeg-next reads of it — and neither carries a payload out. No panic
+  /// is latched: an error is not a panic; but the sink is not called again
+  /// (R27, Codex R26 [medium]: before, it stayed callable).
   #[test]
   fn a_returned_error_keeps_its_code_or_kind_and_no_payload() {
     #[derive(Default)]
@@ -523,12 +642,24 @@ mod tests {
     let os = guarded.write(b"bytes").expect_err("the write failed");
     assert_eq!(os.raw_os_error(), Some(28));
     assert!(os.get_ref().is_none(), "no payload leaves the guard");
+    assert!(latch.message().is_none(), "an error is not a panic");
+    assert!(guarded.write(b"again").is_err());
+    assert_eq!(
+      guarded.into_inner().calls,
+      1,
+      "the sink is not called again"
+    );
+    let (mut guarded, latch, _) = GuardedWriter::new(Failing::default());
     let custom = guarded.flush().expect_err("the flush failed");
     assert_eq!(custom.kind(), io::ErrorKind::WriteZero);
     assert!(custom.get_ref().is_none(), "no payload leaves the guard");
     assert!(latch.message().is_none(), "an error is not a panic");
-    assert!(guarded.write(b"again").is_err());
-    assert_eq!(guarded.into_inner().calls, 3, "the sink is called again");
+    assert!(guarded.flush().is_err());
+    assert_eq!(
+      guarded.into_inner().calls,
+      1,
+      "the sink is not called again"
+    );
   }
 
   /// A buffer that refuses to seek back before where it stands, as a
