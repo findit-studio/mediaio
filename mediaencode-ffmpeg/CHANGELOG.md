@@ -499,6 +499,11 @@ crate moves only when it changes.
   past `i64::MAX / 300` ticks is refused (`TimeWraps`, the decode time
   named), and the presentation time is held to `int64_t` alone, where both
   were refused past `i64::MAX / 600`.
+- **MPEG-TS's clock reference, of its period (R26).** On the stream MPEG-TS
+  writes its clock reference on — the first video stream, else the first —
+  the first decode time is held to `(i64::MAX − period) / 300`, of the
+  period FFmpeg chooses of the stream's frame (`TimeWraps`), where FFmpeg's
+  first sum against the reference a period before zero overflowed.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer
