@@ -1203,6 +1203,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     ttml: None,
     rates: None,
     edit: EditSpan::default(),
+    samples: SampleMirror::default(),
   }
 }
 

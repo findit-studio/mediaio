@@ -13,6 +13,25 @@ crate moves only when it changes.
 
 ### Added
 
+- **The write audit** (findit-studio/mediaio#95): what FFmpeg wrote, read
+  as the caller's sink takes it — the base's tap on the writer guard,
+  walking the file in constant memory, keeping no byte and allocating
+  nothing per packet — and judged at `finish` against what the muxer
+  handed it. A difference — an omission or a misreport the census names,
+  which FFmpeg writes where an allocation fails and the failure is
+  swallowed — fails the file by name: the output is abandoned and the sink
+  not handed back (`MuxFault::written_otherwise`, `WrittenOtherwise` of a
+  track, a `WrittenPart` and what was `Found` there — `Counts`, or where
+  the walk could not follow the writer, `Unfollowed` and its `Why`). The
+  MOV family's MP4, MOV and iPod first: each `trak`, its id, its `stts`
+  and `stsz`; movenc's own chapter track; the `mdat`'s size against the
+  payload the sink took. A `mov_text` track's tables are read by one rule
+  on both sides, which the end samples libavformat's interleaving makes
+  movenc write leave unchanged (the coordinator's ruling R5). With the new
+  `test-support` feature, forwarding to the base's:
+  `CarrierMuxer::open_hooked` and `OpenHooks`, what a law runs around the
+  header; hidden: `MuxOptions::with_audit` and
+  `CarrierMuxer::audited_bytes`, the laws' seams.
 - **The muxer**: `FfmpegMuxer` (view lane) and `FfmpegOwnedMuxer` (owned
   lane) implement `Muxer` over libavformat for the containers this
   release audited and keeps (`ContainerName`): the MOV family's MP4, MOV,
