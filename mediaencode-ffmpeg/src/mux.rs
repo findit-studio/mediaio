@@ -370,7 +370,7 @@
 //!
 //! | check | source | here |
 //! |---|---|---|
-//! | `dac3`: a frame parsed; a bit stream id of 8 or less; a bit rate code | `mov_write_ac3_tag` 424–445 | a track that took no frame refused at `finish` ([`FfmpegMuxRefusal::NoFrame`]); a first frame past 8 refused there ([`PayloadRule::Ac3BitStreamId`]); every AC-3 frame's code is its frame size code's (`ac3_parser.c` 324) |
+//! | `dac3`: a frame parsed; a bit stream id of 8 or less; a bit rate code | `mov_write_ac3_tag` 424–445 | a track that took no frame refused at `finish` ([`FfmpegMuxRefusal::NoFrame`]) — of a track whose `trak` movenc writes alone (R27, Codex R26 [medium]: one of no sample, which a file of no fragments leaves out of its `moov`, its `dac3` with it, not judged); a first frame past 8 refused there ([`PayloadRule::Ac3BitStreamId`]); every AC-3 frame's code is its frame size code's (`ac3_parser.c` 324) |
 //! | `dec3`: a frame parsed | 619–623 | [`FfmpegMuxRefusal::NoFrame`] |
 //! | `dfLa`: one 34-byte STREAMINFO | 857–876 | none: the first packet's ([`PayloadRule::ConfigurationAbsent`]; R9: ruling 4a); another: [`MuxOpenError::ConfigurationInvalid`]; new extradata: [`PayloadRule::FlacStreamInfo`] |
 //! | `dOps`: an OpusHead, its mapping table where its family names one | 877–910 | [`MuxOpenError::ConfigurationMissing`], [`ConfigurationInvalid`](MuxOpenError::ConfigurationInvalid), [`PayloadRule::NewExtradata`] |
@@ -1046,8 +1046,8 @@
 //! | libavformat's shift, its move added to each time, a move past `INT64_MAX` answered `INT64_MIN` (`mux.c` 677–679, 688–690) | every packet of a container it moves | fixed, held as it settles (L205) |
 //! | libavformat's output offset added to each time (`mux.c` 731–738) | none: the muxer asks no `output_ts_offset` | unreached |
 //! | the shift's earliest, a time less its stream's earliest (653, 663) | Matroska's codec delay, the one earliest below zero | exact: within Matroska's first sum below |
-//! | Matroska's and WebM's time and codec delay; its end, the duration added (`matroskaenc.c` 3144, 3194–3195) | each block | fixed ([`EndSum::Matroska`], of [`MATROSKA_QT_VIDEO`] and VFW mode; L202) |
-//! | Matroska's cluster time, a packet's time less the open cluster's, its codec delay added (3214–3219) | each packet, of the cluster the interleaving's order has opened | a bound, ruled (R25): a block's time, its codec delay added, at `INT64_MAX + 2` less the file's largest codec delay or later refused, where that delay is 2 ticks or more; an empty audio packet — a configuration's, others refused empty — judged by Matroska's first sum: exactness would need libavformat's interleaving mirrored ([`EndSum::Matroska`]; L207) |
+//! | Matroska's and WebM's time and codec delay; its end, the duration added (`matroskaenc.c` 3144, 3194–3195) | each block | fixed ([`EndSum::Matroska`], of [`MATROSKA_QT_VIDEO`] and VFW mode; L202) — since R27 below the DURATION tag's bound, which Matroska's millisecond time base (`matroskaenc.c` 3604) puts far below `INT64_MAX` (L211) |
+//! | Matroska's cluster time, a packet's time less the open cluster's, its codec delay added (3214–3219) | each packet, of the cluster the interleaving's order has opened | a bound, ruled (R25): a block's time, its codec delay added, at `INT64_MAX + 2` less the file's largest codec delay or later refused, where that delay is 2 ticks or more; an empty audio packet — a configuration's, others refused empty — judged by Matroska's first sum: exactness would need libavformat's interleaving mirrored ([`EndSum::Matroska`]; L207) — kept, fail-closed, but beyond every time the DURATION tag admits since R27 (L207, L211) |
 //! | Matroska's block reference, the track's last time less this one (3024) | each block in a group | exact: both written at zero and after |
 //! | FLV's end, its delay the first decode time negated (`flvenc.c` 1268, 1455–1456) | each video and audio tag | fixed ([`EndSum::Flv`], held as FLV's first decode time settles; L203) |
 //! | FLV's composition time, `pts − dts` (1415, 1448) | H.264 and MPEG-4 Part 2 | exact: of a decode time in 31 bits and an offset in 24 |
@@ -1057,7 +1057,7 @@
 //! | the MOV family's `track_duration` and presentation offset; its edit list and track header (7321, 7330; 4135–4239, 3990–3994) | each sample; at the trailer | exact: of decode-time gaps under `INT32_MAX` across at most [`MOV_SAMPLES_MAX`] samples, and an offset under it |
 //! | WAV's span and its last duration (`wavenc.c` 410–412, 451, 611) | at the trailer | exact: the span judged at each packet, the count at `finish` (R22) |
 //! | IVF's times (`ivfenc.c` 81–86) | each packet | none signed: `uint64_t` |
-//! | libavformat's interleaving's delay, each stream's last decode time less the head's, in microseconds — a time past what they hold answered `INT64_MIN` (`mux.c` 978–994) | each packet it holds, of two streams it interleaves or more | a bound, ruled (R25): of two streams it interleaves or more, a decode time outside ±2^62 microseconds refused — exactness would need its interleaving mirrored (L208) |
+//! | libavformat's interleaving's delay, each stream's last decode time less the head's, in microseconds — a time past what they hold answered `INT64_MIN` (`mux.c` 978–994) | each packet it holds, of two streams it interleaves or more | a bound, ruled (R25): of two streams it interleaves or more, a decode time outside ±2^62 microseconds refused — exactness would need its interleaving mirrored (L208, of MP4 since R27: Matroska's DURATION tag holds its times below it) |
 //!
 //! **Every signed sum over a muxer's carried state** (R26, Codex R25
 //! [high], closed by class: a sum over a value a muxer starts or carries
@@ -1103,6 +1103,61 @@
 //! | the MOV family's fragments and negative offsets — `dts_shift`, the fragments' times, `sidx`, `tfdt`, `mfra`, `prft` (6703–6733, 7255–7275, 7406–7409, 7432–7469, 5747–5952) | unreached: no `movflags` set, no fragmenting mode written |
 //! | WAV's `minpts`, at `INT64_MAX` before the first (`wavenc.c` 364–365), and the span (410–412, 451, 611) | exact: the span judged at each packet (R22); of no packet, `−INT64_MAX` |
 //! | IVF's last time and duration (`ivfenc.c` 83–85); ADTS's, FLAC's and the raw writers' contexts | none signed: `uint64_t`; no time carried |
+//!
+//! **Every narrowing conversion a value of the inputs feeds** (R27, Codex
+//! R26 [high], closed by class: a conversion that is undefined out of
+//! range — a `double` to an integer (C11 6.3.1.4), a signed overflow of an
+//! `int` product — refused where FFmpeg's would leave its type; one that
+//! is implementation-defined or unsigned, as GCC and Clang define it, and
+//! read as written). By grep of every cast to an integer type, every
+//! `double` or `float` the kept muxers make, and every integer they format,
+//! over `mpegtsenc.c`, `matroskaenc.c`, `flvenc.c`, `movenc.c`,
+//! `movenc_ttml.c` with `ttmlenc.c`, `ivfenc.c`, `wavenc.c`, `adtsenc.c`,
+//! `rawenc.c` and `flacenc.c`. The narrowing at a call — an `int64_t`
+//! handed to `avio_wb32` — is the narrow writes' census's (R21). 21 rows:
+//! 2 fixed, 15 shown exact, 4 unreached.
+//!
+//! | the conversion | here |
+//! |---|---|
+//! | Matroska's DURATION tag: each track's latest end in seconds as a `double`, cut to an `int` for its hours and minutes (`matroskaenc.c` 3456–3478), on every timed track of a sink that seeks (2361–2375) | fixed (R27, Codex R26 [high]): an end whose seconds pass `INT_MAX` refused at its packet, by its duration, or by its time where that alone passes ([`matroska_tag_room`]; L211) |
+//! | the MOV family's XDCAM compressor name: the frame rate cut to an `int` (`defined_frame_rate`, `movenc.c` 1898–1905) and doubled for an interlaced picture, `%d` (2761–2763) | fixed (R27): the doubled rate past `INT_MAX` refused at open ([`MuxOpenError::ConfigurationInvalid`]; L212) |
+//! | `defined_frame_rate` itself, and its comparisons in the XDCAM and AVC-Intra codec tags (1912–1960, 1974–2060) | exact: of a rate not below zero over a denominator above zero, at most `INT32_MAX` |
+//! | the MOV family's compressor height, `%d` (2761) | exact: an `int` |
+//! | the MOV family's composition offset, `(int32_t)` of an unsigned difference (6955–6959) | exact: mirrored ([`FfmpegMuxRefusal::PresentationOffset`]) |
+//! | AVIF's extent offsets, `(uint32_t)` (9203) | exact: an unsigned test |
+//! | the MOV family's `gama`, `lrint` of a `double` (2589–2600) | unreached: no `gamma` option set |
+//! | the MOV family's `loci`, `(int32_t)` of three `double`s (4714–4743) | unreached: no `location` tag; the base sets the streams' language, file name and MIME type alone |
+//! | the MOV family's SDP and ISMV manifest lines, `%d` (4285, 5457–5530) | unreached: no hint track, no ISMV |
+//! | Matroska's EBML bytes, `(uint8_t)` of shifts (323, 370, 414, 751) | exact: unsigned |
+//! | Matroska's stereo mode, `(unsigned)` (1704) | exact: an unsigned test |
+//! | Matroska's cluster time, `(int16_t)` (3148) | exact: the test itself, of a sum held to `int64_t` (above), implementation-defined as GCC and Clang define it |
+//! | Matroska's colour, mastering and projection values, and its float elements (1425–1446, 1559–1588, 421, 742) | exact: `double`s written as `double`s, of no integer |
+//! | FLV's frame rate, times and duration as `double`s (`flvenc.c` 1001, 1197, 1463, 925) | exact: written as `double`s, of no integer |
+//! | MPEG-TS's text test, `(unsigned)` of a `char` (`mpegtsenc.c` 940), and its service name, `%02d` (1006) | exact: unsigned; one service |
+//! | WAV's file size, `(uint32_t)` (`wavenc.c` 444) | exact: written where it is at most `UINT32_MAX` (442) |
+//! | WAV's `bext` time and its peak values, `(int)` and `(int16_t)` (274, 394–395) | unreached: no `write_bext` or `write_peak` option set |
+//! | ADTS's frame size, `(unsigned)` (`adtsenc.c` 135) | exact: within its 13 bits ([`PayloadRule::AdtsFrameLength`]) |
+//! | TTML's times, `%02"PRId64` (`ttmlenc.c` 67–80) | exact: `int64_t`s formatted whole ([`ttml_paragraph_bytes`]) |
+//! | FLAC's and Matroska's channel masks, `PRIx64` (`flacenc.c` 256; `matroskaenc.c` 1097) | exact |
+//! | IVF's, the raw writers' and the MPEG-TS tables' other fields | exact: no cast but the narrow writes' |
+//!
+//! **Every judgment at `finish`, against what each muxer writes** (R27,
+//! Codex R26 [medium], closed by class: a trailer's refusal made of what
+//! that trailer writes alone — never of a track, a box or a chunk it leaves
+//! out). Each judgment `finish` makes before the trailer, and the omission
+//! rule of the writer it mirrors. 7 rows: 1 fixed, 4 shown exact, 1
+//! unjudged — a value written cut, a ruling asked — and the report's
+//! lines.
+//!
+//! | the judgment | the writer, and what it leaves out | here |
+//! |---|---|---|
+//! | [`FfmpegMuxRefusal::NoFrame`], [`FfmpegMuxRefusal::LastSampleTooLong`]: MP4's `dac3` and `dec3`, its last E-AC-3 sample's duration | `mov_write_ac3_tag`, `mov_write_eac3_tag`, `get_cluster_duration` (`movenc.c` 418–445, 612–623, 1240–1258), of a `trak` written: a file of no fragments leaves a track of no sample out of its `moov` (5350–5351, 5430–5433) | fixed (R27, Codex R26 [medium]): of a track whose `trak` movenc writes ([`TrackState::trak_written`]; L213, L41) — every AC-3 and E-AC-3 track before |
+//! | [`FfmpegMuxRefusal::MovieBox`]: the `moov`'s bound | the `trak`s written, and the chapter track (5339–5453) | exact: [`TrackState::trak_written`] |
+//! | [`FfmpegMuxRefusal::BitRates`], [`FfmpegMuxRefusal::CpbProperties`]: the `btrt`s and `esds`s | of the `trak`s written; AVIF's `moov` of a track of more than one sample (5441–5448) | exact |
+//! | [`FfmpegMuxRefusal::NegativeSpan`], [`FfmpegMuxRefusal::TimeWraps`]: the edit lists | `mov_write_edts_tag`, of a track of a sample — `start_dts` set — `use_editlist` on in a file of no fragments (4406–4419, 8201–8212); AVIF's of its own | exact: of a track of a sample, AVIF aside |
+//! | [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::FileSize`]: WAV's and Wave64's fact chunk | of a track not PCM (`wavenc.c` 455–462, 608–616), of a sink that seeks | exact: of such a track of a packet |
+//! | WAV's and Wave64's fact chunk of no packet | `maxpts − minpts + last_duration`, of `minpts` at `INT64_MAX`: `−INT64_MAX` samples, written cut in 32 or 64 bits (364–365, 451–462, 611–616) | unjudged: looser — a ruling asked (R27) |
+//! | the report's lines at `finish` — the held packets, MP4's unjoined E-AC-3, its key frames, its last sample's duration | what each writer drops or rewrites | reports, no refusal |
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -4086,7 +4141,10 @@ pub enum FfmpegMuxRefusal {
   /// A track that took no frame when the muxer finished, whose container
   /// fails its trailer — the whole file — without one: MP4 AC-3 or E-AC-3,
   /// whose configuration (`dac3`, `dec3`) MP4 writes from the first frame
-  /// it parsed (`movenc.c` 424–429, 619–623 in FFmpeg 9.0.1). Where a check
+  /// it parsed (`movenc.c` 424–429, 619–623 in FFmpeg 9.0.1), of a track
+  /// whose `trak` it writes (R27, Codex R26 [medium]): a file of no
+  /// fragments leaves a track of no sample out of its `moov` (5350–5351,
+  /// 5430–5433). Where a check
   /// needs the whole stream it is made at the
   /// first packet that decides it; this one no packet decides, so `finish`
   /// makes it, before the trailer, and names it in its fault
@@ -5951,6 +6009,9 @@ enum EndSum {
     top: Option<i128>,
     /// Whether the track writes its decode times: VFW mode.
     by_dts: bool,
+    /// The latest end the trailer's DURATION tag counts, in the track's
+    /// ticks ([`matroska_tag_room`]; R27, Codex R26 [high]).
+    tag: i128,
   },
   /// FLV's file duration (`flvenc.c` 1455–1456): of a video or audio tag,
   /// its presentation time, the delay — the decode time of the first tag
@@ -7913,6 +7974,7 @@ impl PacketRules {
           by_dts: kind == TrackKind::Video
             && !MATROSKA_NATIVE_VIDEO.contains(&id)
             && !MATROSKA_QT_VIDEO.contains(&id),
+          tag: i128::from(matroska_tag_room(time_base)),
         })
       } else if flv && matches!(kind, TrackKind::Video | TrackKind::Audio) {
         Some(EndSum::Flv)
@@ -8026,6 +8088,33 @@ fn ts_pcr_period(
 /// tick, as `av_rescale_q` rounds (`matroskaenc.c` 2089–2104) — the
 /// distance before zero its earliest presentation may lie. Zero for any
 /// other track.
+/// The latest end, in ticks of `time_base`, whose seconds Matroska's
+/// trailer can write in a track's DURATION tag (`mkv_write_trailer`,
+/// `matroskaenc.c` 3456–3478 in FFmpeg 9.0.1): it counts the track's
+/// latest end in seconds as a `double` — `track->duration *
+/// av_q2d(st->time_base)` — and converts that to `int` for its hours and
+/// minutes, undefined where the seconds, cut toward zero, pass `INT_MAX`
+/// (C11 6.3.1.4). Every timed track's tag is reserved on a sink that seeks
+/// (2361–2375), as the base's does. The seconds grow with the ticks, in
+/// the same `double` arithmetic as C's, so the latest is found by halving.
+fn matroska_tag_room(time_base: Timebase) -> i64 {
+  let scale = f64::from(time_base.num()) / f64::from(time_base.den().get());
+  let fits = |ticks: i64| (ticks as f64) * scale < 2_147_483_648.0;
+  if fits(i64::MAX) {
+    return i64::MAX;
+  }
+  let (mut low, mut high) = (0_i64, i64::MAX);
+  while high - low > 1 {
+    let mid = low + (high - low) / 2;
+    if fits(mid) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  low
+}
+
 fn matroska_codec_delay(kind: TrackKind, codec: &StreamCodec, time_base: Timebase) -> i64 {
   let padding = codec.initial_padding();
   if kind != TrackKind::Audio || padding <= 0 || codec.sample_rate() <= 0 {
@@ -11753,6 +11842,15 @@ where
       let Some(rules) = state.rules.ac3 else {
         continue;
       };
+      // Of a track whose `trak` movenc writes alone: a file of no fragments
+      // leaves a track of no sample out of its `moov`, and its `dac3` or
+      // `dec3` with it (R27, Codex R26 [medium]; [`TrackState::trak_written`]).
+      if !state
+        .moov
+        .is_some_and(|shape| state.trak_written(shape, state.mp4_entries, false))
+      {
+        continue;
+      }
       let track = TrackIndex::new(index);
       if !state.written {
         return Err(self.refuse_trailer(FfmpegMuxRefusal::NoFrame { track }));
@@ -13192,7 +13290,12 @@ fn check_packet_rules<'p>(
         }
         need = need.max(time - max);
       }
-      Some(EndSum::Matroska { delay, by_dts, top }) => {
+      Some(EndSum::Matroska {
+        delay,
+        by_dts,
+        top,
+        tag,
+      }) => {
         let (at, timestamp) = if by_dts {
           (output.dts_ticks, output.dts)
         } else {
@@ -13210,6 +13313,18 @@ fn check_packet_rules<'p>(
           return Err(too_long());
         }
         need = need.max(end - max);
+        // The track's latest end, as its trailer's DURATION tag counts it
+        // in seconds cast to `int` (R27, Codex R26 [high];
+        // [`matroska_tag_room`]): refused by the time where the time alone
+        // passes it, else by the duration.
+        if end + lift > tag {
+          return Err(if time + lift > tag {
+            FfmpegMuxRefusal::TimeWraps { track, timestamp }
+          } else {
+            too_long()
+          });
+        }
+        need = need.max(end - tag);
       }
       Some(EndSum::Flv) => {
         // The presentation time and the delay, within FLV's bits; then the
@@ -15473,6 +15588,34 @@ fn vp9_picture_overflows(codec: CodecId, ticket: &CodecTicket) -> bool {
 /// refused outside ISMV (8597–8611); MOV's H.264 of an intra profile, or an
 /// AVC-Intra tag, written with no `avcC` (1970–2030, 2899–2903) —
 /// booked ([`MuxOpenError::CodecNotCarried`]).
+/// Whether the MOV family's compressor name of an XDCAM picture — MPEG-2
+/// video of 1280×720, 1440×1080 or 1920×1080, of no `encoder` tag, which
+/// the base sets none of — counts its rate past an `int` (`find_compressor`,
+/// `movenc.c` 2737–2765 in FFmpeg 9.0.1): the frame rate cut to an `int`
+/// (`defined_frame_rate`, 1898–1905), doubled where the picture is
+/// interlaced, a signed overflow past `INT_MAX` (R27, the class of Codex
+/// R26 [high]). The rate is the stream's `avg_frame_rate`, which the base
+/// sets of the track's, its parts not below zero.
+fn xdcam_rate_overflows(
+  codec: CodecId,
+  ticket: &CodecTicket,
+  params: &TrackParams<Ffmpeg>,
+) -> bool {
+  let xdcam = matches!(
+    (ticket.width(), ticket.height()),
+    (1280, 720) | (1440, 1080) | (1920, 1080)
+  );
+  let interlaced =
+    ticket.field_order() > ffmpeg_next::ffi::AVFieldOrder::AV_FIELD_PROGRESSIVE as i32;
+  let rate = match params {
+    TrackParams::Video(params) => params.frame_rate().map_or(0, |rate| {
+      (f64::from(rate.num()) / f64::from(rate.den().get())) as i64
+    }),
+    _ => 0,
+  };
+  codec == CodecId::MPEG2VIDEO && xdcam && interlaced && rate * 2 > i64::from(i32::MAX)
+}
+
 fn mov_refusal<D: AsRef<[u8]>>(
   mode: MovMode,
   track: TrackIndex,
@@ -15509,6 +15652,7 @@ fn mov_refusal<D: AsRef<[u8]>>(
   }
   if (mode != MovMode::Mov && codec == CodecId::MP3 && ticket.sample_rate() < 16_000)
     || (codec == CodecId::TTML && ticket.codec_tag() == DFXP)
+    || xdcam_rate_overflows(codec, ticket, description.params())
   {
     return Some(MuxOpenError::ConfigurationInvalid { track, codec });
   }

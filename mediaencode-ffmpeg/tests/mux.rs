@@ -3830,21 +3830,16 @@ fn l41_mp4_refuses_the_ac3_its_trailer_would_fail_on() {
   muxer.finish().expect("finished");
   assert_eq!(packets(&target)[0].len(), 2);
 
+  // A track that took no frame has no sample, and a file of no fragments
+  // leaves it out of its `moov`, its `dac3` with it: finished (R27, Codex
+  // R26 [medium]; L213).
   let none = output(&corpus, "l41-none.mp4");
   let muxer = muxer_into(
     &none,
     ContainerName::MP4,
     table_of(&source, TrackKind::Audio),
   );
-  let fault = muxer.finish().expect_err("a track that took no frame");
-  assert_eq!(fault.stage(), MuxStage::Trailer);
-  assert_eq!(
-    fault.refusal(),
-    Some(FfmpegMuxRefusal::NoFrame {
-      track: TrackIndex::new(0)
-    })
-  );
-  assert!(fault.error().is_none(), "no account of the context's");
+  muxer.finish().expect("a track of no sample, left out");
 }
 
 /// Opus in Matroska, made by libavcodec's own Opus encoder.
@@ -20126,23 +20121,27 @@ fn l201_mp4_holds_the_duration_libavformat_hands_it() {
   untouched!(past, back);
 }
 
-/// L202 (R24, Codex R23 [high]): Matroska sums each packet's end in
-/// `int64_t` — the time it writes, its codec delay added, then the
-/// duration libavformat hands it (`matroskaenc.c` 3134–3195) — and each sum
-/// is held to `INT64_MAX` exactly: a video frame ending at `INT64_MAX`
-/// written, one a millisecond longer refused by its duration; PCM of a
-/// 7 ms codec delay written up to it, its time past it with the delay
-/// refused by that time, and its end past it by its duration. Before
-/// libavformat's first write, a packet whose time moves the shift so that
-/// a packet held before it ends past `INT64_MAX` is refused by that time;
-/// one that moves it to `INT64_MAX` taken, and the file finished.
+/// L202 (R24, Codex R23 [high]; R27): Matroska sums each packet's end —
+/// the time it writes, its codec delay added, then the duration
+/// libavformat hands it (`matroskaenc.c` 3134–3195) — into each track's
+/// latest end, which its trailer's DURATION tag holds to an `int` of
+/// seconds (R27; L211): in Matroska's milliseconds that bound,
+/// `2^31 · 1000 − 1`, lies below `INT64_MAX`, and every sum is held to it
+/// exactly: a video frame ending at it written, one a millisecond longer
+/// refused by its duration; PCM of a 7 ms codec delay written up to it,
+/// its time past it with the delay refused by that time, and its end past
+/// it by its duration. Before libavformat's first write, a packet whose
+/// time moves the shift so that a packet held before it ends past it is
+/// refused by that time; one that moves it to the bound taken, and the
+/// file finished.
 ///
 /// PLANT: the duration's sum unjudged; the codec delay left out of the
 /// time; the held packet's end left unjudged as the shift moves.
 #[test]
 fn l202_matroska_holds_each_end_it_sums_to_int64() {
   let Some(corpus) = Corpus::new() else { return };
-  let max = i64::MAX;
+  // The latest end the DURATION tag counts (L211).
+  let max = (1_i64 << 31) * 1000 - 1;
   let mkv = corpus.multi_track_mkv();
   let (_, frames) = first_track(&mkv, TrackKind::Video, 1);
   let video_table = || table_of(&mkv, TrackKind::Video);
@@ -20162,7 +20161,7 @@ fn l202_matroska_holds_each_end_it_sums_to_int64() {
   );
   wrote(
     muxer.write_video(frame(max - 10, Some(10))),
-    "an end at INT64_MAX",
+    "an end at the bound",
   );
   muxer.finish().expect("finished");
   let mut muxer = muxer_into(
@@ -20178,7 +20177,7 @@ fn l202_matroska_holds_each_end_it_sums_to_int64() {
       track: TrackIndex::new(0),
       duration: ms(11),
     },
-    "an end past INT64_MAX"
+    "an end past the bound"
   );
   untouched!(past, back);
 
@@ -20209,7 +20208,7 @@ fn l202_matroska_holds_each_end_it_sums_to_int64() {
   );
   wrote(
     muxer.write_audio(sample(0, max - 13, Some(6))),
-    "its delay and its duration to INT64_MAX",
+    "its delay and its duration to the bound",
   );
   muxer.finish().expect("finished");
   for (at, duration, expected) in [
@@ -20269,12 +20268,12 @@ fn l202_matroska_holds_each_end_it_sums_to_int64() {
       track: TrackIndex::new(1),
       timestamp: ms(-10),
     },
-    "a move of 10 ms takes the held frame's end past INT64_MAX"
+    "a move of 10 ms takes the held frame's end past the bound"
   );
   untouched!(early, back);
   wrote(
     muxer.write_audio(sample(1, -5, None)),
-    "a move of 5 ms takes it to INT64_MAX",
+    "a move of 5 ms takes it to the bound",
   );
   muxer.finish().expect("finished");
 }
@@ -20489,10 +20488,12 @@ fn l204_mp4_holds_each_samples_end_to_int64() {
 /// of a packet's times in `int64_t` (`mux.c`) — the decode time it counts
 /// after each packet (571–599): a video packet's a tick after it (L204's
 /// last rows), an audio packet's its samples after it, the remainder
-/// carried from packet to packet — PCM of 1024 samples a packet at
-/// 48 kHz, counted in milliseconds, its second packet at `INT64_MAX − 22`
-/// taken and at `INT64_MAX − 21` refused, where a count that did not carry
-/// the first packet's remainder would take it; and its shift's move added
+/// carried from packet to packet — AAC of 1024 samples a packet at
+/// 44.1 kHz in ADTS, counted in milliseconds, which ADTS keeps (R27:
+/// Matroska's DURATION tag holds its times far below), its third packet at
+/// `INT64_MAX − 24` taken and at `INT64_MAX − 23` refused, where a count
+/// that did not carry the earlier packets' remainder would take it; and
+/// its shift's move added
 /// to each time (685–688): IVF moved 10 ms by its first packet, a frame
 /// moved to `INT64_MAX` taken, a millisecond later refused.
 ///
@@ -20501,39 +20502,43 @@ fn l204_mp4_holds_each_samples_end_to_int64() {
 fn l205_libavformat_holds_its_own_sums_to_int64() {
   let Some(corpus) = Corpus::new() else { return };
   let max = i64::MAX;
-  let pcm = pcm_mov(&corpus);
-  let (_, samples) = first_track(&pcm, TrackKind::Audio, 1);
-  let table = || table_of(&pcm, TrackKind::Audio);
+  // AAC in milliseconds: ADTS keeps the time base it is handed.
+  let aac = h264_aac(&corpus, "h264-aac.mp4");
+  let (_, samples) = first_track(&aac, TrackKind::Audio, 1);
+  let table = || {
+    let row = table_of(&aac, TrackKind::Audio).remove(0);
+    let extradata = row.extradata().cloned();
+    vec![
+      TrackDescription::new(millis(), row.params().duplicate(), row.side_data().clone())
+        .expect("a description")
+        .with_extradata(extradata),
+    ]
+  };
   let frame = |at: i64| {
     AudioTrackPacket::new(
       TrackIndex::new(0),
-      audio_holding(&audio_of(&samples[0]), &[0x11; 4096])
+      audio_of(&samples[0])
         .with_pts(Some(ms(at)))
         .with_dts(Some(ms(at)))
         .with_duration(Some(ms(1))),
     )
   };
-  let mut muxer = muxer_into(
-    &output(&corpus, "l205-audio.mkv"),
-    ContainerName::MATROSKA,
-    table(),
-  );
+  let adts = || ContainerName::new("adts");
+  let mut muxer = muxer_into(&output(&corpus, "l205-audio.aac"), adts(), table());
   wrote(muxer.write_audio(frame(0)), "the first packet");
-  wrote(muxer.write_audio(frame(max - 22)), "a count to INT64_MAX");
+  wrote(muxer.write_audio(frame(100)), "the second");
+  wrote(muxer.write_audio(frame(max - 24)), "a count to INT64_MAX");
   muxer.finish().expect("finished");
-  let mut muxer = muxer_into(
-    &output(&corpus, "l205-audio-past.mkv"),
-    ContainerName::MATROSKA,
-    table(),
-  );
+  let mut muxer = muxer_into(&output(&corpus, "l205-audio-past.aac"), adts(), table());
   wrote(muxer.write_audio(frame(0)), "the first packet");
-  let past = frame(max - 21);
+  wrote(muxer.write_audio(frame(100)), "the second");
+  let past = frame(max - 23);
   let (refusal, back) = by_container(refusing!(muxer.write_audio(past.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::TimeWraps {
       track: TrackIndex::new(0),
-      timestamp: ms(max - 21),
+      timestamp: ms(max - 23),
     },
     "a count past INT64_MAX"
   );
@@ -20631,11 +20636,15 @@ fn l206_mp4s_ttml_document_is_held_to_the_largest_packet_exactly() {
   untouched!(past, back);
 }
 
-/// L207 (R25, ruled): Matroska's cluster time, a named bound — of PCM of a
-/// 7 ms codec delay beside a frame, a block's time at `INT64_MAX − 6` ms
-/// taken, at `INT64_MAX − 5` refused.
+/// L207 (R25, ruled; R27): Matroska's cluster time, a named bound —
+/// `INT64_MAX + 2` less the file's largest codec delay — kept, fail-closed,
+/// beyond every time Matroska's DURATION tag admits in its milliseconds
+/// (R27; L211): of PCM of a 7 ms codec delay beside a frame, a block's time
+/// at `INT64_MAX − 6` ms, below the cluster's bound, is refused by the
+/// tag's, by its time.
 ///
-/// PLANT: the bound unjudged.
+/// PLANT: the cluster's bound unjudged — vacuous since R27, the tag's
+/// bound below it.
 #[test]
 fn l207_matroskas_cluster_time_is_bounded() {
   let Some(corpus) = Corpus::new() else { return };
@@ -20643,84 +20652,80 @@ fn l207_matroskas_cluster_time_is_bounded() {
   let mkv = corpus.multi_track_mkv();
   let (_, frames) = first_track(&mkv, TrackKind::Video, 1);
   let pcm = pcm_mov(&corpus);
-  let table = || {
-    let mut table = table_of(&mkv, TrackKind::Video);
-    table.push(reticketed(
-      table_of(&pcm, TrackKind::Audio).remove(0),
-      |par| {
-        par.initial_padding = 312;
-      },
-    ));
-    table
-  };
-  let frame = |at: i64| {
-    VideoTrackPacket::new(
-      TrackIndex::new(0),
-      video_of(&frames[0])
-        .with_pts(Some(ms(at)))
-        .with_dts(Some(ms(0)))
-        .with_duration(Some(ms(1))),
-    )
-  };
+  let mut table = table_of(&mkv, TrackKind::Video);
+  table.push(reticketed(
+    table_of(&pcm, TrackKind::Audio).remove(0),
+    |par| {
+      par.initial_padding = 312;
+    },
+  ));
   let mut muxer = muxer_into(
     &output(&corpus, "l207-top.mkv"),
     ContainerName::MATROSKA,
-    table(),
+    table,
   );
-  wrote(muxer.write_video(frame(max - 6)), "a block below the bound");
-  let mut muxer = muxer_into(
-    &output(&corpus, "l207-past.mkv"),
-    ContainerName::MATROSKA,
-    table(),
+  let below = VideoTrackPacket::new(
+    TrackIndex::new(0),
+    video_of(&frames[0])
+      .with_pts(Some(ms(max - 6)))
+      .with_dts(Some(ms(0)))
+      .with_duration(Some(ms(1))),
   );
-  let past = frame(max - 5);
-  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  let (refusal, back) = by_container(refusing!(muxer.write_video(below.clone())));
   assert_eq!(
     refusal,
     FfmpegMuxRefusal::TimeWraps {
       track: TrackIndex::new(0),
-      timestamp: ms(max - 5)
+      timestamp: ms(max - 6)
     },
-    "a block at the bound"
+    "a block below the cluster's bound, past the tag's"
   );
-  untouched!(past, back);
+  untouched!(below, back);
 }
 
-/// L208 (R25, ruled): libavformat's interleaving's delay, a named bound —
-/// of two streams, a decode time of `2^62` microseconds less one
-/// millisecond's room taken, at `2^62` refused; of one stream, taken.
+/// L208 (R25, ruled; R27): libavformat's interleaving's delay, a named
+/// bound — of two streams, MP4's H.264 and AAC, the video at 90 kHz: a
+/// decode time whose microseconds lie below `2^62` taken, a tick later,
+/// at `2^62`, refused; of the video stream alone, taken and the file
+/// finished. In MP4, as Matroska's DURATION tag holds Matroska's times far
+/// below it (R27).
 ///
 /// PLANT: the bound unjudged; judged of one stream.
 #[test]
 fn l208_the_interleavings_delay_is_bounded() {
   let Some(corpus) = Corpus::new() else { return };
-  let edge = (1_i64 << 62) / 1000;
-  let mkv = corpus.multi_track_mkv();
-  let (_, frames) = first_track(&mkv, TrackKind::Video, 1);
-  let pcm = pcm_mov(&corpus);
+  // The latest decode time of 90 kHz whose microseconds, rounded to the
+  // nearest, lie below 2^62.
+  let edge: i64 = 415_051_741_658_464_911;
+  let at_90k = Timebase::new(1, NonZeroI32::new(90_000).expect("non-zero"));
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let video = || {
+    let row = table_of(&source, TrackKind::Video).remove(0);
+    let extradata = row.extradata().cloned();
+    TrackDescription::new(at_90k, row.params().duplicate(), row.side_data().clone())
+      .expect("a description")
+      .with_extradata(extradata)
+  };
   let two = || {
-    let mut table = table_of(&mkv, TrackKind::Video);
-    table.extend(table_of(&pcm, TrackKind::Audio));
+    let mut table = vec![video()];
+    table.extend(table_of(&source, TrackKind::Audio));
     table
   };
   let frame = |at: i64| {
     VideoTrackPacket::new(
       TrackIndex::new(0),
       video_of(&frames[0])
-        .with_pts(Some(ms(at)))
-        .with_dts(Some(ms(at)))
-        .with_duration(Some(ms(1))),
+        .with_pts(Some(Timestamp::new(at, at_90k)))
+        .with_dts(Some(Timestamp::new(at, at_90k)))
+        .with_duration(Some(Timestamp::new(3600, at_90k))),
     )
   };
-  let mut muxer = muxer_into(
-    &output(&corpus, "l208-two.mkv"),
-    ContainerName::MATROSKA,
-    two(),
-  );
+  let mut muxer = muxer_into(&output(&corpus, "l208-two.mp4"), ContainerName::MP4, two());
   wrote(muxer.write_video(frame(edge)), "below 2^62 microseconds");
   let mut muxer = muxer_into(
-    &output(&corpus, "l208-two-past.mkv"),
-    ContainerName::MATROSKA,
+    &output(&corpus, "l208-two-past.mp4"),
+    ContainerName::MP4,
     two(),
   );
   let past = frame(edge + 1);
@@ -20729,15 +20734,15 @@ fn l208_the_interleavings_delay_is_bounded() {
     refusal,
     FfmpegMuxRefusal::TimeWraps {
       track: TrackIndex::new(0),
-      timestamp: ms(edge + 1)
+      timestamp: Timestamp::new(edge + 1, at_90k)
     },
     "at 2^62 microseconds"
   );
   untouched!(past, back);
   let mut muxer = muxer_into(
-    &output(&corpus, "l208-one.mkv"),
-    ContainerName::MATROSKA,
-    table_of(&mkv, TrackKind::Video),
+    &output(&corpus, "l208-one.mp4"),
+    ContainerName::MP4,
+    vec![video()],
   );
   wrote(
     muxer.write_video(frame(edge + 1)),
@@ -20915,4 +20920,159 @@ fn l210_mpeg_ts_holds_its_clock_references_first_sum() {
     "the video's first at its bound",
   );
   muxer.finish().expect("finished");
+}
+
+/// L211 (R27, Codex R26 [high]): Matroska's trailer writes each track's
+/// latest end in its DURATION tag, in seconds as a `double` cut to an `int`
+/// (`matroskaenc.c` 3456–3478): in milliseconds, an end at
+/// `2^31 · 1000 − 1` taken and the file finished; a frame whose duration
+/// takes its end to `2^31` seconds refused by its duration, and one at
+/// `2^31` seconds of none by its time, each untouched.
+///
+/// PLANT: the tag's bound unjudged; judged a tick early.
+#[test]
+fn l211_matroskas_duration_tag_is_held_to_an_int_of_seconds() {
+  let Some(corpus) = Corpus::new() else { return };
+  let edge = (1_i64 << 31) * 1000;
+  let mkv = corpus.multi_track_mkv();
+  let (_, frames) = first_track(&mkv, TrackKind::Video, 1);
+  let frame = |at: i64, duration: i64| {
+    VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_of(&frames[0])
+        .with_pts(Some(ms(at)))
+        .with_dts(Some(ms(at)))
+        .with_duration(Some(ms(duration))),
+    )
+  };
+  let table = || table_of(&mkv, TrackKind::Video);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l211-top.mkv"),
+    ContainerName::MATROSKA,
+    table(),
+  );
+  wrote(muxer.write_video(frame(0, 1)), "the first");
+  wrote(
+    muxer.write_video(frame(edge - 2, 1)),
+    "an end a millisecond short of 2^31 seconds",
+  );
+  muxer.finish().expect("finished");
+  let mut muxer = muxer_into(
+    &output(&corpus, "l211-past.mkv"),
+    ContainerName::MATROSKA,
+    table(),
+  );
+  wrote(muxer.write_video(frame(0, 1)), "the first");
+  let past = frame(edge - 1, 1);
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::DurationTooLong {
+      track: TrackIndex::new(0),
+      duration: ms(1),
+    },
+    "an end at 2^31 seconds"
+  );
+  untouched!(past, back);
+  let past = frame(edge, 0);
+  let (refusal, back) = by_container(refusing!(muxer.write_video(past.clone())));
+  assert_eq!(
+    refusal,
+    FfmpegMuxRefusal::TimeWraps {
+      track: TrackIndex::new(0),
+      timestamp: ms(edge),
+    },
+    "a time at 2^31 seconds"
+  );
+  untouched!(past, back);
+  muxer.finish().expect("finished");
+}
+
+/// L212 (R27, the class of Codex R26 [high]): the MOV family names an
+/// interlaced XDCAM picture — MPEG-2 of 1920×1080 — by its frame rate cut
+/// to an `int` and doubled (`find_compressor`, `movenc.c` 2737–2765): at
+/// `2^30 − 1` frames a second the file opens and finishes; at `2^30`, a
+/// signed overflow, refused at open.
+///
+/// PLANT: the rate unjudged.
+#[test]
+fn l212_mov_holds_an_xdcam_rate_to_an_int() {
+  use mediaencode::mediaspine::demuxer::VideoTrackParams;
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let at = |rate: i32| {
+    let row = recoded(
+      table_of(&source, TrackKind::Video).remove(0),
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MPEG2VIDEO,
+      &[],
+    );
+    let row = reticketed(row, |par| {
+      par.width = 1920;
+      par.height = 1080;
+      par.field_order = ffmpeg_next::ffi::AVFieldOrder::AV_FIELD_TT;
+    });
+    let (timebase, params, _, ticket, language, disposition, _) = row.into_parts_with_disposition();
+    let TrackParams::Video(params) = params else {
+      unreachable!("a video track")
+    };
+    let params = TrackParams::Video(VideoTrackParams::new(
+      params.codec(),
+      1920,
+      1080,
+      params.pixel_format().clone(),
+      Some(Timebase::new(rate, NonZeroI32::new(1).expect("non-zero"))),
+    ));
+    vec![
+      TrackDescription::new(timebase, params, ticket)
+        .expect("a timed track")
+        .with_language(language)
+        .with_disposition(disposition),
+    ]
+  };
+  let muxer = muxer_into(
+    &output(&corpus, "l212.mp4"),
+    ContainerName::MP4,
+    at((1 << 30) - 1),
+  );
+  muxer.finish().expect("finished");
+  let refused = FfmpegOwnedMuxer::open(
+    File::create(output(&corpus, "l212-past.mp4")).expect("create"),
+    ContainerName::MP4,
+    at(1 << 30),
+    &[],
+    PacketLimits::default(),
+  );
+  assert!(matches!(
+    refused,
+    Err(MuxOpenError::ConfigurationInvalid { track, .. }) if track.get() == 0
+  ));
+}
+
+/// L213 (R27, Codex R26 [medium]): an AC-3 track of no frame beside H.264
+/// in MP4, which a file of no fragments leaves out of its `moov`, its
+/// `dac3` with it (`movenc.c` 5350–5351, 5430–5433): the file finished.
+///
+/// PLANT: every AC-3 track judged.
+#[test]
+fn l213_mp4_leaves_a_track_of_no_sample_unjudged() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let mut table = table_of(&source, TrackKind::Video);
+  table.extend(table_of(
+    &audio_file(&corpus, "ac3.mkv", "ac3"),
+    TrackKind::Audio,
+  ));
+  let mut muxer = muxer_into(&output(&corpus, "l213.mp4"), ContainerName::MP4, table);
+  wrote(
+    muxer.write_video(VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_of(&frames[0])
+        .with_pts(Some(ms(0)))
+        .with_dts(Some(ms(0)))
+        .with_duration(Some(ms(40))),
+    )),
+    "a frame",
+  );
+  muxer.finish().expect("finished, the AC-3 track left out");
 }
