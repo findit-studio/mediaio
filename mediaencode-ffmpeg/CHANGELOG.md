@@ -512,6 +512,9 @@ crate moves only when it changes.
   refused at open (`ConfigurationInvalid`). An MP4 AC-3 or E-AC-3 track of
   no sample, which MP4 leaves out of its `moov`, no longer fails `finish`
   (`NoFrame`).
+- **WAV's and Wave64's fact chunk of no packet (R28).** A track of any
+  codec but integer PCM that took no packet is refused at `finish`
+  (`NoFrame`): FFmpeg counts it as `−INT64_MAX` samples, written cut.
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer
