@@ -21,22 +21,22 @@ homepage     = "https://github.com/findit-studio/mediaio"
 
 [workspace.dependencies]
 # Workspace-internal crates — referenced by sibling members via workspace inheritance.
-mediadecode = { version = "0.19", path = "mediadecode", default-features = false }
-mediadecode-ffmpeg = { version = "0.21", path = "mediadecode-ffmpeg", default-features = false }
-mediadecode-webcodecs = { version = "0.19", path = "mediadecode-webcodecs", default-features = false }
-mediaencode = { version = "0.19", path = "mediaencode", default-features = false }
-mediaencode-ffmpeg = { version = "0.21", path = "mediaencode-ffmpeg", default-features = false }
-mediaio-ffmpeg = { version = "0.21", path = "mediaio-ffmpeg", default-features = false }
-mediaio-timeline = { version = "0.4", path = "mediaio-timeline" }
-mediaspine  = { version = "0.1", path = "mediaspine", default-features = false }
-mediaframe  = { version = "0.12", default-features = false, features = ["frame"] }
+mediadecode = { version = "0.20", path = "mediadecode", default-features = false }
+mediadecode-ffmpeg = { version = "0.22", path = "mediadecode-ffmpeg", default-features = false }
+mediadecode-webcodecs = { version = "0.20", path = "mediadecode-webcodecs", default-features = false }
+mediaencode = { version = "0.20", path = "mediaencode", default-features = false }
+mediaencode-ffmpeg = { version = "0.22", path = "mediaencode-ffmpeg", default-features = false }
+mediaio-ffmpeg = { version = "0.22", path = "mediaio-ffmpeg", default-features = false }
+mediaio-timeline = { version = "0.5", path = "mediaio-timeline" }
+mediaspine  = { version = "0.2", path = "mediaspine", default-features = false }
+mediaframe  = { version = "0.13", default-features = false, features = ["frame"] }
 
 # External deps used by more than one member, pinned at the workspace level.
 mediatime   = { version = "0.5", default-features = false }
 bitflags    = { version = "2", default-features = false }
 derive_more = { version = "2", default-features = false }
 thiserror   = { version = "2", default-features = false }
-smol-bytes  = { version = "0.1", default-features = false, features = ["std"] }
+smol-bytes  = { version = "0.2", default-features = false, features = ["std"] }
 triomphe    = { version = "0.1", default-features = false, features = ["std"] }
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format"] }
 # The bindings `ffmpeg-next` builds on, depended on directly by

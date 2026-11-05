@@ -11,6 +11,16 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.20.0] - unreleased
+
+### Changed
+
+- **BREAKING: smol-bytes 0.2 / mediaframe 0.13.** The vocabulary this
+  crate re-exports is `mediaspine` 0.2's, on `mediaframe` 0.13 and its
+  `smol-bytes` 0.2, so a caller holding a `mediaspine` 0.1 or `mediaframe`
+  0.12 value no longer type-checks against this release. No item of this
+  crate's own changed.
+
 ## [0.19.1] - 2026-10-23
 
 ### Added

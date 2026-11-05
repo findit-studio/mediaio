@@ -11,6 +11,17 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.20.0] - unreleased
+
+Tracks `mediadecode` 0.20.0.
+
+### Changed
+
+- **BREAKING: smol-bytes 0.2 / mediaframe 0.13.** The faces this crate
+  implements are `mediadecode` 0.20's, on `mediaspine` 0.2, and the frames
+  and channel layouts it builds are `mediaframe` 0.13's, whose text is
+  `smol-bytes` 0.2's. No item of this crate's own changed.
+
 ## [0.19.0] - 2026-10-16
 
 Tracks `mediadecode` 0.19.0 (see

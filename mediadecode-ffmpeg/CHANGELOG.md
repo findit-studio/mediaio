@@ -9,7 +9,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
-## [0.21.1] - unreleased
+## [0.22.0] - unreleased
 
 ### Added
 
@@ -27,6 +27,15 @@ The backend-agnostic core it adapts has its own log at
   reduced, where it states a valid one, whatever the parameters state,
   else the parameters', reduced, else 0/1 — what a player displays the
   stream at and FFmpeg's tool copies for a stream copy.
+
+### Changed
+
+- **BREAKING: smol-bytes 0.2 / mediaframe 0.13.** The text this crate
+  carries is `smol-bytes` 0.2's `Utf8Bytes` (`ReaderPanic::new` among it),
+  the frames it decodes into are `mediaframe` 0.13's, and the faces it
+  implements are `mediadecode` 0.20's, on `mediaspine` 0.2. Released in
+  lockstep with `mediaio-ffmpeg`, `mediaencode-ffmpeg` and `mediaio`
+  0.22.0.
 
 ## [0.21.0] - 2026-10-24
 

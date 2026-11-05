@@ -9,7 +9,7 @@ The FFmpeg-dependent crates — `mediaio-ffmpeg`, `mediadecode-ffmpeg`,
 `mediaencode-ffmpeg` and `mediaio` — release in lockstep; every other
 crate moves only when it changes.
 
-## [0.21.1] - unreleased
+## [0.22.0] - unreleased
 
 ### Added
 
@@ -651,6 +651,14 @@ crate moves only when it changes.
   the hidden marking there licenses no change this crate's face would
   carry unmarked — a change to them is a change to this crate's API.
 - The encoders arrive in the following releases.
+
+### Changed
+
+- **BREAKING: smol-bytes 0.2 / mediaframe 0.13.** A container's name is
+  `smol-bytes` 0.2's `Utf8Bytes` (`ContainerName`), and the write faces this
+  crate implements are `mediaencode` 0.20's, on `mediaspine` 0.2 and
+  `mediaframe` 0.13. Released in lockstep with `mediaio-ffmpeg`,
+  `mediadecode-ffmpeg` and `mediaio` 0.22.0.
 
 ## [0.21.0] - 2026-10-24
 

@@ -35,7 +35,7 @@ continue to work in native dev loops.
 
 ```toml
 [dependencies]
-mediadecode-webcodecs = "0.18"
+mediadecode-webcodecs = "0.20"
 ```
 
 Built and run via [`wasm-bindgen`](https://crates.io/crates/wasm-bindgen)
