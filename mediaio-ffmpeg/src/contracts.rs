@@ -250,6 +250,64 @@
 //!   unwritten for the life of the process — libavformat's own static
 //!   tables (read for at most 1,024 bytes, stopping at the NUL).
 //!
+//! # Writing a container
+//!
+//! The write side's crossings take no pointer from a caller, so none of
+//! them is an `unsafe fn`: [`Output`](crate::output::Output) owns every
+//! pointer it hands libavformat, and what libavformat is owed is
+//! established inside it. Stated here once all the same, because it is a
+//! contract — the one this crate keeps with libavformat:
+//!
+//! - **the context**: allocated by `avformat_alloc_output_context2`,
+//!   freed exactly once by `avformat_free_context` — always before the
+//!   I/O context its `pb` points at, since the muxer's `deinit` may run
+//!   inside the free and must find `pb` alive — and marked
+//!   `AVFMT_FLAG_CUSTOM_IO`, so libavformat neither closes nor frees that
+//!   I/O context;
+//! - **the order**: streams and chapters only before the header, packets
+//!   only between the header and the trailer, the trailer at most once,
+//!   and nothing after a header that failed. libavformat leaves each of
+//!   these undefined — a second `av_write_trailer` runs a muxer's trailer
+//!   over state the first one freed — so the context keeps the order at
+//!   run time and refuses a call out of it by name;
+//! - **the packets**: built from the portable carriers on the **copy
+//!   road**, their payload and side data in allocations of their own with
+//!   the padding zeroed (`av_new_packet`), and handed over whole —
+//!   `av_interleaved_write_frame` takes the packet's reference and may
+//!   keep it queued past the call, so no buffer a caller holds is ever
+//!   lent to it;
+//! - **the parameters**: rebuilt from a
+//!   [`CodecTicket`](crate::ticket::CodecTicket) and copied into the
+//!   stream with `avcodec_parameters_copy`. An attachment's file replaces
+//!   the extradata in a fresh allocation with the padding zeroed, and
+//!   codec ids and media types are written and read as the integers they
+//!   are stored as, so no bindgen enum is formed from a value the linked
+//!   library may know and the bindings do not;
+//! - **the sink**: driven from `extern "C"` callbacks under the
+//!   [writer guard](crate::writer_guard), so a panic never unwinds into
+//!   C — nor an error's payload: every error the sink returns is reduced
+//!   to its OS code or kind inside the guard's `catch_unwind`, its
+//!   payload dropped there, because ffmpeg-next drops a returned error
+//!   inside the callback. A sink that panicked, or whose error's payload
+//!   did, is latched, and never called again; a write it failed is
+//!   read from the I/O context's `error` when the sink is handed back,
+//!   after the last flush, so a sink missing bytes is reported, never
+//!   returned as a whole one; and a positioning seek it failed, which
+//!   libavformat keeps no record of, is kept by the guard, which writes
+//!   and seeks nothing after it, and named by every call that reached
+//!   libavformat, whatever libavformat answered.
+//!
+//! # `AVOutputFormat`
+//!
+//! - the muxer itself: one `av_guess_format` answered, which points into
+//!   libavformat's static tables and lives for the process;
+//! - `name`: a NUL-terminated literal in those tables, read for at most
+//!   256 bytes;
+//! - `codec_tag`: null, or a null-terminated list of static tag tables,
+//!   searched by `av_codec_get_id` and `av_codec_get_tag2` with the codec
+//!   id and the tag as plain integers;
+//! - *plain*: `flags`.
+//!
 //! # `AVCodecContext`, for the callbacks
 //!
 //! - `opaque`: null, or the [`CallbackState`](#callbackstate) that

@@ -16,6 +16,7 @@ metadata (`DEP_FFMPEG_FFMPEG_9_0`, set from libavcodec 63.1, FFmpeg 9.0's).
 |---|---|
 | the carriers (`FfmpegBytes`, `FfmpegBuffer`, the `Owned` / `View` lanes) and the operations that fill them | the decoders and the demuxer — `mediadecode-ffmpeg` |
 | packet and frame conversion in both directions (`boundary`, `convert`) | the push-style decoder sessions and their hardware probing |
+| the muxing context over a caller's sink, behind the writer guard's panic latch | the muxer and its container rules — `mediaencode-ffmpeg` |
 | `CodecTicket`, `CodecId`, `ContainerFormat`, `SampleFormat`, the channel-layout mapping | |
 | the adapter type `Ffmpeg` and its adapter-trait impls | |
 | `DecoderLimits`, `DemuxLimits`, `FrameLimits`, `PacketLimits` | |
@@ -36,6 +37,14 @@ so no safe function here reads their storage. The machines in
 `mediadecode-ffmpeg` call them with their proofs written beside each
 call. What a consumer holds — a packet, a frame, a carrier — is safe to
 use without any of that.
+
+The write side takes no pointer from a caller, so none of it is
+`unsafe`: the muxing context owns every pointer it hands libavformat,
+copies each packet into an allocation of its own before
+`av_interleaved_write_frame` takes it, keeps libavformat's call order at
+run time, and drives the caller's sink under a guard that turns a panic
+into a latched I/O error instead of an unwind into C
+(`contracts` § "Writing a container").
 
 ## Features
 

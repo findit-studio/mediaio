@@ -9,6 +9,17 @@ The FFmpeg-dependent crates — `mediaio-ffmpeg`, `mediadecode-ffmpeg`,
 `mediaencode-ffmpeg` and `mediaio` — release in lockstep; every other
 crate moves only when it changes.
 
+## [0.19.1] - unreleased
+
+### Added
+
+- **A packet is presented no earlier than it is decoded**:
+  `MuxRefusal::PtsBeforeDts` and `check_presentation_order`, the rule
+  every container keeps over the times as it stores them — libavformat
+  compares the counts it is handed, and refuses only after taking the
+  packet. A backend applies it to its stored representation, not to the
+  instants offered, names it first and hands the packet back.
+
 ## [0.19.0] - 2026-10-16
 
 ### Added

@@ -1,13 +1,13 @@
 [package]
 name        = "mediaencode-ffmpeg"
-version     = "0.21.0"
+version     = "0.21.1"
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 homepage.workspace     = true
 documentation = "https://docs.rs/mediaencode-ffmpeg"
-description = "The FFmpeg write adapter of the mediaio family. In this release: the encoder-by-name catalogue, with GPL encoders reachable only behind the `gpl` feature and refused by name without it."
+description = "The FFmpeg write adapter of the mediaio family: the muxer over libavformat, and the encoder-by-name catalogue, with GPL encoders reachable only behind the `gpl` feature and refused by name without it."
 keywords   = ["ffmpeg", "encoder", "muxer", "mediaio"]
 categories = ["multimedia", "multimedia::video", "multimedia::audio"]
 
@@ -29,6 +29,14 @@ mediaio-ffmpeg = { workspace = true }
 ffmpeg-next    = { workspace = true }
 smol-bytes     = { workspace = true }
 thiserror      = { workspace = true }
+
+[dev-dependencies]
+# The muxer's laws remux real containers: the demuxer reads what the
+# muxer wrote, over media the `ffmpeg` CLI generates at run time — the
+# corpus `mediadecode-ffmpeg/tests/support/mod.rs` makes, shared by path.
+mediadecode        = { workspace = true, features = ["std"] }
+mediadecode-ffmpeg = { workspace = true, features = ["std"] }
+tempfile           = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

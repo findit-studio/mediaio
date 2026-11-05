@@ -19,7 +19,8 @@ use core::fmt::{self, Debug};
 use crate::{
   Timebase,
   demuxer::{
-    AttachmentTrackParams, DemuxAdapter, DemuxAttachmentPacket, TrackInfo, TrackKind, TrackParams,
+    AttachmentTrackParams, DemuxAdapter, DemuxAttachmentPacket, TrackDisposition, TrackInfo,
+    TrackKind, TrackParams,
   },
 };
 
@@ -39,9 +40,10 @@ use crate::{
 ///
 /// What the read side states about a track that a muxer writes back
 /// travels here too, so a remux keeps it: the [language](Self::language)
-/// the container declared, for every kind, and for an attachment track
-/// its [file](Self::file) — the payload the demuxer delivered and the
-/// filename and MIME type it was attached under.
+/// and the [disposition](Self::disposition) the container declared, for
+/// every kind, and for an attachment track its [file](Self::file) — the
+/// payload the demuxer delivered and the filename and MIME type it was
+/// attached under.
 ///
 /// # An attachment's file, exactly once
 ///
@@ -50,7 +52,7 @@ use crate::{
 /// a packet. **An attachment track carries exactly one file, by
 /// construction**: [`Self::attachment`] takes one, [`Self::new`] refuses
 /// an attachment's parameters by name ([`AttachmentWithoutFile`]), and
-/// a description holds no second seat for another.
+/// a description holds no second slot for another.
 ///
 /// No `Clone`, for the reason [`TrackInfo`] has none: the parameters
 /// are not cheap to duplicate, and a consumer that needs to share a
@@ -61,6 +63,7 @@ pub struct TrackDescription<E: DemuxAdapter, D, S> {
   extradata: Option<D>,
   side_data: S,
   language: Option<E::Text>,
+  disposition: TrackDisposition,
   /// `Some` exactly when `params` is the attachment arm: the
   /// constructors are the only writers, and they keep the two in step.
   file: Option<AttachedFile<E, D>>,
@@ -69,7 +72,7 @@ pub struct TrackDescription<E: DemuxAdapter, D, S> {
 impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
   /// Constructs the description of a track of packets — video, audio,
   /// subtitles, timed data, or one the backend could not classify — with
-  /// no extradata and no language.
+  /// no extradata, no language and an empty disposition.
   ///
   /// An attachment track is not one: it is described with its file, by
   /// [`Self::attachment`]. Its parameters are refused here by name, and
@@ -92,12 +95,14 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
       extradata: None,
       side_data,
       language: None,
+      disposition: TrackDisposition::empty(),
       file: None,
     })
   }
 
   /// Constructs the description of an attachment track: its parameters
-  /// and its one file, with no extradata and no language.
+  /// and its one file, with no extradata, no language and an empty
+  /// disposition.
   pub fn attachment(
     timebase: Timebase,
     params: AttachmentTrackParams<E>,
@@ -110,25 +115,27 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
       extradata: None,
       side_data,
       language: None,
+      disposition: TrackDisposition::empty(),
       file: Some(file),
     }
   }
 
   /// The description of a demuxed track, for a remux that copies its
   /// packets — **lossless for everything the two rows share**: the
-  /// timebase, the parameters, the declared language, and for an
-  /// attachment track its file, from `payload` (the packet the demuxer
-  /// delivered for it at open) and the row's filename and MIME type.
+  /// timebase, the parameters, the declared language and disposition,
+  /// and for an attachment track its file, from `payload` (the packet
+  /// the demuxer delivered for it at open) and the row's filename and
+  /// MIME type.
   ///
   /// **The row is borrowed, never consumed.** A demuxer keeps its rows
   /// for its whole session and hands out handles on them — the
   /// `Demuxer::tracks` face of `mediadecode` answers a slice of handles
   /// that dereference to rows — so a remux describes each track from the
   /// handle it holds (`&**handle`), and the session keeps every row. The
-  /// portable fields are copied explicitly: the timebase by `Copy`, the
-  /// parameters by their named [`TrackParams::duplicate`], and the
-  /// language, filename and MIME type by the text carrier's `Clone`, a
-  /// refcount bump.
+  /// portable fields are copied explicitly: the timebase and the
+  /// disposition by `Copy`, the parameters by their named
+  /// [`TrackParams::duplicate`], and the language, filename and MIME type
+  /// by the text carrier's `Clone`, a refcount bump.
   ///
   /// What only the read side states stays on the row: the duration the
   /// library reported, and the backend's extras. Extradata is the
@@ -169,12 +176,15 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
     let timebase = info.timebase();
     let params = info.params().duplicate();
     let language = info.language().cloned();
+    let disposition = info.disposition();
     Ok(match (params, payload) {
       (TrackParams::Attachment(params), Some(payload)) => {
         let file = AttachedFile::new(payload)
           .with_filename(info.filename().cloned())
           .with_mime_type(info.mime_type().cloned());
-        Self::attachment(timebase, params, file, side_data).with_language(language)
+        Self::attachment(timebase, params, file, side_data)
+          .with_language(language)
+          .with_disposition(disposition)
       }
       // Any other kind, with no payload (the reasons above leave nothing
       // else), and no identity to carry.
@@ -184,6 +194,7 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
         extradata: None,
         side_data,
         language,
+        disposition,
         file: None,
       },
     })
@@ -240,6 +251,13 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
     self.language.as_ref()
   }
 
+  /// Returns the track's disposition, exactly as the read side states it
+  /// ([`TrackInfo::disposition`]) — the empty set where none is declared.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn disposition(&self) -> TrackDisposition {
+    self.disposition
+  }
+
   /// Returns an attachment track's file — `Some` exactly when the track
   /// is an attachment.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -279,8 +297,30 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
     self
   }
 
+  /// Sets the declared disposition (consuming builder). Pass the bits
+  /// the container declares; see [`TrackInfo::disposition`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_disposition(mut self, value: TrackDisposition) -> Self {
+    self.disposition = value;
+    self
+  }
+
+  /// Sets the declared disposition in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_disposition(&mut self, value: TrackDisposition) -> &mut Self {
+    self.disposition = value;
+    self
+  }
+
   /// Splits the description into its timebase, parameters, extradata,
   /// side data, language and — for an attachment track — its file.
+  ///
+  /// **The disposition is dropped**: it is not among the parts. Read it
+  /// with [`disposition`](Self::disposition) before the split — it is
+  /// `Copy` — or split with
+  /// [`into_parts_with_disposition`](Self::into_parts_with_disposition),
+  /// which loses nothing.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn into_parts(
     self,
@@ -301,6 +341,43 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
       self.file,
     )
   }
+
+  /// Splits the description into every part it holds, **losslessly**: its
+  /// timebase, parameters, extradata, side data, language, disposition
+  /// and — for an attachment track — its file, in the order a description
+  /// is built in.
+  ///
+  /// ```
+  /// # use mediaspine::{demuxer::DemuxAdapter, track::TrackDescription};
+  /// # fn split<E: DemuxAdapter, D, S>(description: TrackDescription<E, D, S>) {
+  /// let declared = description.disposition();
+  /// let (_timebase, _params, _extradata, _side_data, _language, disposition, _file) =
+  ///   description.into_parts_with_disposition();
+  /// assert_eq!(disposition, declared);
+  /// # }
+  /// ```
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_parts_with_disposition(
+    self,
+  ) -> (
+    Timebase,
+    TrackParams<E>,
+    Option<D>,
+    S,
+    Option<E::Text>,
+    TrackDisposition,
+    Option<AttachedFile<E, D>>,
+  ) {
+    (
+      self.timebase,
+      self.params,
+      self.extradata,
+      self.side_data,
+      self.language,
+      self.disposition,
+      self.file,
+    )
+  }
 }
 
 // `Debug` is hand-written for the reason `TrackInfo`'s is: a derive
@@ -317,6 +394,7 @@ where
       .field("extradata", &self.extradata)
       .field("side_data", &self.side_data)
       .field("language", &self.language)
+      .field("disposition", &self.disposition)
       .field("file", &self.file)
       .finish()
   }
@@ -605,7 +683,9 @@ mod tests {
   }
 
   /// Extradata is absent until it is given, and what goes in comes back
-  /// out of `into_parts` unchanged, with the side data beside it.
+  /// out of `into_parts_with_disposition` unchanged, with the side data
+  /// and the disposition beside it; `into_parts` gives the same, the
+  /// disposition left out.
   #[test]
   fn extradata_is_absent_until_given_and_every_part_comes_back() {
     const AVCC: &[u8] = &[0x01, 0x64, 0x00, 0x28];
@@ -622,13 +702,37 @@ mod tests {
     description.side_data_mut()[1] = 8;
     assert_eq!(description.side_data(), &[7, 8]);
 
-    let (timebase, params, extradata, side_data, language, file) = description.into_parts();
+    let description = description
+      .with_language(Some("eng"))
+      .with_disposition(TrackDisposition::DEFAULT | TrackDisposition::from_u32(0x0040_0000));
+    let (timebase, params, extradata, side_data, language, disposition, file) =
+      description.into_parts_with_disposition();
     assert_eq!(timebase, ms_tb());
     assert_eq!(params.kind(), TrackKind::Video);
     assert_eq!(extradata, Some(AVCC));
     assert_eq!(side_data, [7, 8]);
-    assert_eq!(language, None);
+    assert_eq!(language, Some("eng"));
+    assert_eq!(
+      disposition,
+      TrackDisposition::DEFAULT | TrackDisposition::from_u32(0x0040_0000),
+      "the disposition, an unnamed bit included"
+    );
     assert!(file.is_none(), "a video track carries no file");
+
+    let description = TrackDescription::<Loopback, &[u8], ()>::new(
+      ms_tb(),
+      TrackParams::Video(VideoTrackParams::new(27, 1280, 720, 0, None)),
+      (),
+    )
+    .expect("a video track")
+    .with_extradata(Some(AVCC))
+    .with_disposition(TrackDisposition::DEFAULT);
+    let (timebase, _, extradata, (), language, file) = description.into_parts();
+    assert_eq!(
+      (timebase, extradata, language, file.is_none()),
+      (ms_tb(), Some(AVCC), None, true),
+      "the same parts, the disposition dropped"
+    );
   }
 
   const FONT: &[u8] = b"OTTO, the font's bytes";
@@ -642,6 +746,9 @@ mod tests {
     .with_filename(Some("Noto.otf"))
     .with_mime_type(Some("font/otf"))
     .with_language(Some("und"))
+    // A bit no `TrackDisposition` constant names: carried as the bit it
+    // is.
+    .with_disposition(TrackDisposition::from_u32(0x0040_0000))
   }
 
   fn font_payload() -> DemuxAttachmentPacket<Loopback, &'static [u8]> {
@@ -651,7 +758,8 @@ mod tests {
   /// **An attachment's identity and payload survive the conversion.** The
   /// filename and MIME type the read side states, and the payload the
   /// demuxer delivered — the very bytes, its flags — come through into
-  /// the track's one file, with the track's language beside it.
+  /// the track's one file, with the track's language and disposition
+  /// beside it (an unnamed disposition bit included).
   #[test]
   fn an_attachments_identity_and_payload_survive_the_conversion() {
     let row = font_row();
@@ -661,6 +769,10 @@ mod tests {
     assert_eq!(description.kind(), TrackKind::Attachment);
     assert_eq!(description.codec(), 98_307);
     assert_eq!(description.language(), Some(&"und"));
+    assert_eq!(
+      description.disposition(),
+      TrackDisposition::from_u32(0x0040_0000)
+    );
     let file = description
       .file()
       .expect("an attachment track carries its file");
@@ -698,8 +810,8 @@ mod tests {
   /// **The conversion borrows its row and copies every portable field.**
   /// A row is described twice from one borrow — as a remux describes it
   /// from the handle a demuxer keeps — and both descriptions carry every
-  /// field of every arm's parameters, the timebase and the language, while
-  /// the row stays as it was.
+  /// field of every arm's parameters, the timebase, the language and the
+  /// disposition, while the row stays as it was.
   #[test]
   fn the_conversion_borrows_its_row_and_copies_every_portable_field() {
     let tb = Timebase::new(1, core::num::NonZeroI32::new(90_000).expect("non-zero"));
@@ -714,13 +826,17 @@ mod tests {
       TrackParams::Data(DataTrackParams::new(98_313)),
       TrackParams::Unknown(UnknownTrackParams::new(0)),
     ];
+    let declared = TrackDisposition::DEFAULT | TrackDisposition::FORCED;
     for params in arms {
-      let row = TrackInfo::<Loopback>::new(tb, params, ()).with_language(Some("jpn"));
+      let row = TrackInfo::<Loopback>::new(tb, params, ())
+        .with_language(Some("jpn"))
+        .with_disposition(declared);
       for _ in 0..2 {
         let description = TrackDescription::<Loopback, &[u8], ()>::from_track_info(&row, None, ())
           .expect("a track of packets");
         assert_eq!(description.timebase(), tb);
         assert_eq!(description.language(), Some(&"jpn"));
+        assert_eq!(description.disposition(), declared);
         assert_eq!(description.kind(), row.kind());
         match (description.params(), row.params()) {
           (TrackParams::Video(copy), TrackParams::Video(source)) => {
@@ -751,7 +867,7 @@ mod tests {
 
   /// **An attachment track has exactly one file.** Without one it is
   /// refused by name — by the conversion and by [`TrackDescription::new`]
-  /// alike — and everything given comes back; a second has no seat.
+  /// alike — and everything given comes back; a second has no slot.
   #[test]
   fn an_attachment_track_without_its_file_is_refused_by_name() {
     let row = font_row();

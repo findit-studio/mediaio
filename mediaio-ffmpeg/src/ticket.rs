@@ -755,10 +755,27 @@ impl CodecTicket {
   pub const fn height(&self) -> i32 {
     self.height
   }
-  /// The sample aspect ratio. A zero numerator means unknown.
+  /// The sample aspect ratio. A zero numerator means unknown. The FFmpeg
+  /// demuxer's rows carry libavformat's own guess of the stream's
+  /// (`av_guess_sample_aspect_ratio`): the ratio the demuxer keeps on the
+  /// stream where it states one, else the parameters'.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn sample_aspect_ratio(&self) -> Ratio {
     self.sample_aspect_ratio
+  }
+  /// The ticket, its sample aspect ratio `ratio` — for the FFmpeg
+  /// demuxer's rows, libavformat's own guess of the stream's, which a
+  /// player displays it at and FFmpeg's tool copies for a stream copy
+  /// (`av_guess_sample_aspect_ratio`, `libavformat/avformat.c` 784–805 in
+  /// FFmpeg 9.0.1): the ratio the demuxer keeps on the stream, reduced,
+  /// where it states a valid one — MOV's `pasp`, Matroska's display size —
+  /// whatever the parameters state, else the parameters', reduced, where
+  /// valid, else `0/1`. Every other field stays the parameters'.
+  #[doc(hidden)]
+  #[must_use]
+  pub const fn with_sample_aspect_ratio(mut self, ratio: Ratio) -> Self {
+    self.sample_aspect_ratio = ratio;
+    self
   }
   /// The codec-level frame rate. `0/1` when frames differ in duration
   /// or the value is not known.

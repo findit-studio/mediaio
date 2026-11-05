@@ -9,10 +9,11 @@
 //! at all. It borrows now, and this lane is the proof, written as a user
 //! writes it: no backend type appears in [`remux`].
 //!
-//! The FFmpeg muxer arrives with the write adapter's next release; until
-//! then the muxer here is [`Ledger`], a `Muxer` over this crate's
-//! adapter that keeps the faces' refusals and records what it is given,
-//! so the lane can say what reached it.
+//! The muxer here is [`Ledger`], a `Muxer` over this crate's adapter
+//! that keeps the faces' refusals and records what it is given, so the
+//! lane can say what reached it. The same remux ([`remux`], in the
+//! shared support module) runs over the FFmpeg muxer in
+//! `mediaencode-ffmpeg`'s `mux` lane.
 
 mod support;
 
@@ -21,74 +22,16 @@ use std::{cell::RefCell, rc::Rc};
 use mediadecode::{
   Timestamp,
   demuxer::{
-    AudioTrackPacket, DataTrackPacket, DemuxAttachmentPacket, DemuxedPacket, Demuxer,
-    SubtitleTrackPacket, TrackIndex, TrackKind, VideoTrackPacket,
+    AudioTrackPacket, DataTrackPacket, DemuxedPacket, Demuxer, SubtitleTrackPacket, TrackIndex,
+    TrackKind, VideoTrackPacket,
   },
 };
 use mediadecode_ffmpeg::{Ffmpeg, FfmpegBuffer, FfmpegDemuxer};
 use mediaencode::{
-  MuxError, MuxRefusal, Muxer, check_decode_order, mediaspine::track::TrackDescription,
+  MuxError, MuxRefusal, Muxer, check_decode_order, check_presentation_order,
+  mediaspine::track::TrackDescription,
 };
-use support::Corpus;
-
-/// A remux over the two faces: the attachments the demuxer hands out
-/// first, the table built from the demuxer's own handles — each row
-/// borrowed, none consumed — the muxer opened with it, every timed
-/// packet written, the container finished.
-fn remux<Dm, M>(
-  demuxer: &mut Dm,
-  open: impl FnOnce(Vec<TrackDescription<Dm::Adapter, Dm::Buffer, ()>>) -> M,
-) where
-  Dm: Demuxer,
-  Dm::Error: core::fmt::Debug,
-  M: Muxer<Adapter = Dm::Adapter, Buffer = Dm::Buffer>,
-  M::Refusal: core::fmt::Debug,
-  M::Error: core::fmt::Debug,
-{
-  // A demuxer hands out every attachment before its first timed packet.
-  let mut files: Vec<Option<DemuxAttachmentPacket<Dm::Adapter, Dm::Buffer>>> =
-    demuxer.tracks().iter().map(|_| None).collect();
-  let mut first = None;
-  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
-    match packet {
-      DemuxedPacket::Attachment(attachment) => {
-        let (track, payload) = attachment.into_parts();
-        files[track.get()] = Some(payload);
-      }
-      timed => {
-        first = Some(timed);
-        break;
-      }
-    }
-  }
-
-  // The table, from the handles the session keeps: `&**row` is the row a
-  // handle shares, borrowed.
-  let table = demuxer
-    .tracks()
-    .iter()
-    .zip(files)
-    .map(|(row, file)| TrackDescription::from_track_info(&**row, file, ()))
-    .collect::<Result<Vec<_>, _>>()
-    .expect("every row describes a track");
-
-  // A refusal hands the packet back; the lane only needs to know there
-  // was one, so the packet is dropped from the error before it is shown.
-  let mut muxer = open(table);
-  if let Some(packet) = first {
-    muxer
-      .write_packet(packet)
-      .map_err(|error| error.map_packet(drop))
-      .expect("the first timed packet");
-  }
-  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
-    muxer
-      .write_packet(packet)
-      .map_err(|error| error.map_packet(drop))
-      .expect("a timed packet");
-  }
-  muxer.finish().expect("the container is finished");
-}
+use support::{Corpus, remux};
 
 /// A text carrier's contents, owned — read through its `AsRef<str>`
 /// alone.
@@ -120,8 +63,9 @@ struct Seen {
 /// A muxer that records: the table it was opened with, and every packet
 /// it is asked to write, refusing what every muxer refuses on the face —
 /// a track it does not have, a packet of another kind, a missing decode
-/// time, and one that goes back ([`check_decode_order`], the portable
-/// rule, which admits a repeated one).
+/// time, one that goes back ([`check_decode_order`], the portable rule,
+/// which admits a repeated one), and a presentation before its decode
+/// ([`check_presentation_order`]).
 struct Ledger<B> {
   kinds: Vec<TrackKind>,
   last: Vec<Option<Timestamp>>,
@@ -163,13 +107,13 @@ impl<B: AsRef<[u8]>> Ledger<B> {
     }
   }
 
-  /// The refusal for a packet of `offered` kind on `track` decoded at
-  /// `dts`, if any; otherwise the packet is counted.
+  /// The refusal for a packet of `offered` kind on `track` presented at
+  /// `pts` and decoded at `dts`, if any; otherwise the packet is counted.
   fn admit(
     &mut self,
     track: TrackIndex,
     offered: TrackKind,
-    dts: Option<Timestamp>,
+    (pts, dts): (Option<Timestamp>, Option<Timestamp>),
   ) -> Option<MuxRefusal> {
     let Some(&expected) = self.kinds.get(track.get()) else {
       return Some(MuxRefusal::UnknownTrack { track });
@@ -185,6 +129,9 @@ impl<B: AsRef<[u8]>> Ledger<B> {
       return Some(MuxRefusal::MissingDts { track });
     };
     if let Err(refusal) = check_decode_order(track, self.last[track.get()], dts) {
+      return Some(refusal);
+    }
+    if let Err(refusal) = check_presentation_order(track, pts, dts) {
       return Some(refusal);
     }
     self.last[track.get()] = Some(dts);
@@ -204,8 +151,8 @@ impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
     &mut self,
     packet: VideoTrackPacket<Ffmpeg, B>,
   ) -> Result<(), MuxError<Self::Error, Self::Refusal, VideoTrackPacket<Ffmpeg, B>>> {
-    let dts = packet.packet().dts();
-    match self.admit(packet.track(), TrackKind::Video, dts) {
+    let times = (packet.packet().pts(), packet.packet().dts());
+    match self.admit(packet.track(), TrackKind::Video, times) {
       Some(refusal) => Err(MuxError::Refused { refusal, packet }),
       None => Ok(()),
     }
@@ -215,8 +162,8 @@ impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
     &mut self,
     packet: AudioTrackPacket<Ffmpeg, B>,
   ) -> Result<(), MuxError<Self::Error, Self::Refusal, AudioTrackPacket<Ffmpeg, B>>> {
-    let dts = packet.packet().dts();
-    match self.admit(packet.track(), TrackKind::Audio, dts) {
+    let times = (packet.packet().pts(), packet.packet().dts());
+    match self.admit(packet.track(), TrackKind::Audio, times) {
       Some(refusal) => Err(MuxError::Refused { refusal, packet }),
       None => Ok(()),
     }
@@ -227,8 +174,8 @@ impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
     packet: SubtitleTrackPacket<Ffmpeg, B>,
   ) -> Result<(), MuxError<Self::Error, Self::Refusal, SubtitleTrackPacket<Ffmpeg, B>>> {
     // A subtitle or data packet's decode time is its presentation time.
-    let dts = packet.packet().pts();
-    match self.admit(packet.track(), TrackKind::Subtitle, dts) {
+    let pts = packet.packet().pts();
+    match self.admit(packet.track(), TrackKind::Subtitle, (pts, pts)) {
       Some(refusal) => Err(MuxError::Refused { refusal, packet }),
       None => Ok(()),
     }
@@ -238,8 +185,8 @@ impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
     &mut self,
     packet: DataTrackPacket<Ffmpeg, B>,
   ) -> Result<(), MuxError<Self::Error, Self::Refusal, DataTrackPacket<Ffmpeg, B>>> {
-    let dts = packet.packet().pts();
-    match self.admit(packet.track(), TrackKind::Data, dts) {
+    let pts = packet.packet().pts();
+    match self.admit(packet.track(), TrackKind::Data, (pts, pts)) {
       Some(refusal) => Err(MuxError::Refused { refusal, packet }),
       None => Ok(()),
     }
@@ -279,9 +226,11 @@ fn a_generic_remux_builds_its_table_from_a_live_demuxer() {
     .collect();
 
   let ledger_seen = Rc::clone(&seen);
-  remux(&mut demuxer, move |table| {
-    Ledger::<FfmpegBuffer>::open(table, ledger_seen)
-  });
+  remux(
+    &mut demuxer,
+    |_| (),
+    move |table, _chapters| Ledger::<FfmpegBuffer>::open(table, ledger_seen),
+  );
 
   let seen = seen.borrow();
   assert!(seen.finished, "the container was finished");
@@ -367,9 +316,11 @@ fn a_generic_remux_writes_cues_that_share_an_instant() {
   let seen = Rc::new(RefCell::new(Seen::default()));
   let mut demuxer = FfmpegDemuxer::open(&path).expect("open mkv");
   let ledger_seen = Rc::clone(&seen);
-  remux(&mut demuxer, move |table| {
-    Ledger::<FfmpegBuffer>::open(table, ledger_seen)
-  });
+  remux(
+    &mut demuxer,
+    |_| (),
+    move |table, _chapters| Ledger::<FfmpegBuffer>::open(table, ledger_seen),
+  );
 
   let seen = seen.borrow();
   assert!(seen.finished, "the container was finished");
