@@ -18015,6 +18015,20 @@ fn l185_flvs_257th_track_of_a_kind_is_refused() {
   );
 }
 
+/// The samples the fact chunk of the Wave64 file at `path` counts: the
+/// 64 bits after its GUID and its size (`w64.c` 38–40; `wavenc.c` 584–586).
+fn w64_fact(path: &Path) -> u64 {
+  const FACT: [u8; 16] = [
+    b'f', b'a', b'c', b't', 0xF3, 0xAC, 0xD3, 0x11, 0x8C, 0xD1, 0x00, 0xC0, 0x4F, 0x8E, 0xDB, 0x8A,
+  ];
+  let bytes = std::fs::read(path).expect("the file");
+  let at = bytes
+    .windows(16)
+    .position(|window| window == FACT)
+    .expect("a fact chunk");
+  u64::from_le_bytes(bytes[at + 24..at + 32].try_into().expect("8 bytes"))
+}
+
 /// The samples the fact chunk of the WAV file at `path` counts.
 fn wav_fact(path: &Path) -> u32 {
   let bytes = std::fs::read(path).expect("the file");
@@ -21087,13 +21101,15 @@ fn l213_mp4_leaves_a_track_of_no_sample_unjudged() {
   muxer.finish().expect("finished, the AC-3 track left out");
 }
 
-/// L214 (R28, ruled; Codex R27 [medium]): WAV and Wave64 count a track of
-/// any codec but integer PCM in their fact chunk as `maxpts − minpts +
-/// last_duration`, `minpts` at `INT64_MAX` before the first packet
-/// (`wavenc.c` 364–365, 451–462, 611–616): of no packet, `−INT64_MAX`
-/// samples, written cut — one in WAV's 32 bits, `0x8000000000000001` in
-/// Wave64's 64. Float PCM and IMA ADPCM of no packet, in both, refused at
-/// `finish` by name, nothing written past the refusal; float PCM of one
+/// L214 (R28, ruled; Codex R27 [medium]; R29, Codex R28 [high]): WAV and
+/// Wave64 count a track of any codec but integer PCM in their fact chunk
+/// as `maxpts − minpts + last_duration`, each of its own header's extrema:
+/// WAV's `minpts` at `INT64_MAX` before the first packet (`wavenc.c`
+/// 364–365), so that of no packet it counts `−INT64_MAX` samples, one in
+/// its 32 bits; Wave64's at zero, its header setting neither (565–593), so
+/// that it counts zero. Float PCM and IMA ADPCM of no packet: in WAV
+/// refused at `finish` by name, nothing written past the refusal; in
+/// Wave64 finished, its fact chunk reading back zero. Float PCM of one
 /// packet, its duration stated at the sample rate, written, its fact chunk
 /// reading back the packet's samples; integer PCM of no packet, of no fact
 /// chunk, finished.
@@ -21120,6 +21136,11 @@ fn l214_the_riff_formats_refuse_a_fact_chunk_of_no_packet() {
         ContainerName::new(container),
         table_of(source, TrackKind::Audio),
       );
+      if container == "w64" {
+        muxer.finish().expect("Wave64's zeroed extrema count zero");
+        assert_eq!(w64_fact(&target), 0, "the fact chunk counts zero");
+        continue;
+      }
       let before = std::fs::metadata(&target).expect("the file").len();
       let fault = muxer.finish().expect_err("a fact chunk of no packet");
       assert_eq!(fault.stage(), MuxStage::Trailer, "{container}");
@@ -21167,4 +21188,81 @@ fn l214_the_riff_formats_refuse_a_fact_chunk_of_no_packet() {
   );
   muxer.finish().expect("finished");
   assert_eq!(wav_fact(&target) as usize, samples, "the packet's samples");
+}
+
+/// L215 (R29, Codex R28 [high]): Wave64's fact chunk sums `maxpts −
+/// minpts + last_duration` in `int64_t` over extrema that start at zero
+/// (`wavenc.c` 565–593, 609–613), the last packet's duration replacing
+/// each before it (412). Float PCM at 48 kHz, its packets stating a
+/// duration of twice their samples, so that libavformat's count of the
+/// samples (`mux.c` 581–590) passes: a packet at `INT64_MAX − 2048` of
+/// 2048 ticks finished, its count `INT64_MAX` read back; one at
+/// `INT64_MAX − 2047` refused at `finish`, by its duration, the trailer
+/// unwritten; and one at `INT64_MAX − 2047` that a later packet's shorter
+/// duration replaces, finished — so that the sum is judged at `finish`,
+/// the last duration's to decide (R22).
+///
+/// PLANT: the sum unjudged; Wave64's extrema of WAV's start.
+#[test]
+fn l215_wave64_holds_its_fact_sum_to_int64() {
+  let Some(corpus) = Corpus::new() else { return };
+  let max = i64::MAX;
+  #[rustfmt::skip]
+  let float = generated(&corpus, "l214-f32.mkv", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.2",
+    "-ac", "2", "-c:a", "pcm_f32le",
+  ]);
+  let rate = Timebase::new(1, NonZeroI32::new(48_000).expect("non-zero"));
+  let (_, frames) = first_track(&float, TrackKind::Audio, 1);
+  let samples = audio_of(&frames[0]).data().as_ref().len() as i64 / 8;
+  assert_eq!(samples, 1024, "the premise: 1024 samples a packet");
+  let table = || {
+    let row = table_of(&float, TrackKind::Audio).remove(0);
+    vec![
+      TrackDescription::new(rate, row.params().duplicate(), row.side_data().clone())
+        .expect("a description"),
+    ]
+  };
+  let at = |ticks: i64, duration: i64| {
+    AudioTrackPacket::new(
+      TrackIndex::new(0),
+      audio_of(&frames[0])
+        .with_pts(Some(Timestamp::new(ticks, rate)))
+        .with_dts(Some(Timestamp::new(ticks, rate)))
+        .with_duration(Some(Timestamp::new(duration, rate))),
+    )
+  };
+  let w64 = || ContainerName::new("w64");
+  let target = output(&corpus, "l215-top.w64");
+  let mut muxer = muxer_into(&target, w64(), table());
+  wrote(
+    muxer.write_audio(at(max - 2048, 2048)),
+    "a sum to INT64_MAX",
+  );
+  muxer.finish().expect("finished");
+  assert_eq!(w64_fact(&target), max as u64, "the count, whole");
+  let mut muxer = muxer_into(&output(&corpus, "l215-past.w64"), w64(), table());
+  wrote(
+    muxer.write_audio(at(max - 2047, 2048)),
+    "taken: a later duration may replace it",
+  );
+  let fault = muxer.finish().expect_err("a sum past INT64_MAX");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    fault.refusal(),
+    Some(FfmpegMuxRefusal::DurationTooLong {
+      track: TrackIndex::new(0),
+      duration: Timestamp::new(2048, rate),
+    })
+  );
+  let mut muxer = muxer_into(&output(&corpus, "l215-replaced.w64"), w64(), table());
+  wrote(
+    muxer.write_audio(at(max - 2047, 2048)),
+    "a sum past INT64_MAX, as the last",
+  );
+  wrote(
+    muxer.write_audio(at(max - 1024, 1024)),
+    "a later, shorter last duration",
+  );
+  muxer.finish().expect("finished, the sum within INT64_MAX");
 }

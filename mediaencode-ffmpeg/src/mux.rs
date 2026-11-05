@@ -1028,8 +1028,8 @@
 //! it stands, and what it holds of each bound is kept ([`Held::need`]) — a
 //! later packet before that write whose time moves the shift, or FLV's
 //! first decode time, past a bound a held packet's sum then passes is
-//! refused by that time ([`FfmpegMuxRefusal::TimeWraps`]). 16 rows: 7
-//! fixed, 6 shown exact, 1 unreached, 2 bounds named (R25, ruled). Each
+//! refused by that time ([`FfmpegMuxRefusal::TimeWraps`]). 16 rows: 8
+//! fixed, 5 shown exact, 1 unreached, 2 bounds named (R25, ruled). Each
 //! multiplier and scale a bound uses is the one FFmpeg's line uses (R25,
 //! the class of Codex R24): MPEG-TS's 300, `SYSTEM_CLOCK_FREQUENCY_DIVISOR`
 //! (`mpegts.h` 38; `mpegtsenc.c` 1526, 1890), of a delay of zero; the
@@ -1055,7 +1055,7 @@
 //! | MPEG-TS's clock reference of the decode time, 300 times over — `first_pcr += dts * 300` and `(dts − delay) * 300`, `max_delay` unset and so zero (`mpegtsenc.c` 1130–1131, 1283, 1526, 1890) — and the delay, zero, added to both times (1896–1898) | each packet | fixed: the decode time, moved by the shift, held to `i64::MAX / 300` as the shift settles; the presentation time to `int64_t` alone (R25, Codex R24: both to `i64::MAX / 600` before, stricter; L96, L209); the reference's first sum, of its period, below (R26) |
 //! | the MOV family's `end_pts` (`movenc.c` 7334–7340) | each sample | fixed (L204) |
 //! | the MOV family's `track_duration` and presentation offset; its edit list and track header (7321, 7330; 4135–4239, 3990–3994) | each sample; at the trailer | exact: of decode-time gaps under `INT32_MAX` across at most [`MOV_SAMPLES_MAX`] samples, and an offset under it |
-//! | WAV's span and its last duration (`wavenc.c` 410–412, 451, 611) | at the trailer | exact: the span judged at each packet, the count at `finish` (R22) |
+//! | WAV's and Wave64's `maxpts − minpts + last_duration` (`wavenc.c` 410–412, 451, 611) | at the trailer | fixed (R29, Codex R28 [high]): each of its own header's extrema ([`FactChunk`]) — Wave64's at zero, which R28 gave WAV's start — the span judged at each packet, the sum past `int64_t` and the count at `finish` (R22) |
 //! | IVF's times (`ivfenc.c` 81–86) | each packet | none signed: `uint64_t` |
 //! | libavformat's interleaving's delay, each stream's last decode time less the head's, in microseconds — a time past what they hold answered `INT64_MIN` (`mux.c` 978–994) | each packet it holds, of two streams it interleaves or more | a bound, ruled (R25): of two streams it interleaves or more, a decode time outside ±2^62 microseconds refused — exactness would need its interleaving mirrored (L208, of MP4 since R27: Matroska's DURATION tag holds its times below it) |
 //!
@@ -1072,7 +1072,7 @@
 //! and the context is opened of no file name. A time a packet is judged in
 //! is its time as libavformat's shift moves it, at or after the earliest
 //! its container writes, zero but in MP4 ([`FfmpegMuxRefusal::BeforeZero`]);
-//! no time is `INT64_MIN`, libavformat's unknown. 25 rows: 1 fixed, 16
+//! no time is `INT64_MIN`, libavformat's unknown. 25 rows: 2 fixed, 15
 //! shown exact, 3 held as the signed sums' table holds them, 1 bound named
 //! there, 3 unreached, 1 of no signed state.
 //!
@@ -1101,7 +1101,7 @@
 //! | the MOV family's `start_dts`, `start_cts`, `track_duration`, `end_pts` and the edit list's and track header's sums over them (7289–7342, 1249, 3875, 3880–3895, 4141–4214) | exact and fixed, as above: `start_dts + start_cts` a presentation time; `−FFMIN(start_dts, 0)` of no `INT64_MIN`; the last sample's end within `end_pts`'s bound (L204) |
 //! | the MOV family's chapter track, `end − pkt->dts` (7788–7790) | exact: of chapters at zero or after and ending no earlier |
 //! | the MOV family's fragments and negative offsets — `dts_shift`, the fragments' times, `sidx`, `tfdt`, `mfra`, `prft` (6703–6733, 7255–7275, 7406–7409, 7432–7469, 5747–5952) | unreached: no `movflags` set, no fragmenting mode written |
-//! | WAV's `minpts`, at `INT64_MAX` before the first (`wavenc.c` 364–365), and the span (410–412, 451, 611) | exact: the span judged at each packet (R22); of no packet, `−INT64_MAX` |
+//! | WAV's `minpts`, at `INT64_MAX` before the first, and `maxpts` at zero (`wavenc.c` 364–365); Wave64's both at zero, its header setting neither (565–593); the span over them (410–412, 451, 611) | fixed (R29, Codex R28 [high]): each muxer's own start ([`FactChunk`]); the span judged at each packet, its sum with the last duration at `finish`, WAV's of no packet refused (R28) |
 //! | IVF's last time and duration (`ivfenc.c` 83–85); ADTS's, FLAC's and the raw writers' contexts | none signed: `uint64_t`; no time carried |
 //!
 //! **Every narrowing conversion a value of the inputs feeds** (R27, Codex
@@ -1145,7 +1145,7 @@
 //! Codex R26 [medium], closed by class: a trailer's refusal made of what
 //! that trailer writes alone — never of a track, a box or a chunk it leaves
 //! out). Each judgment `finish` makes before the trailer, and the omission
-//! rule of the writer it mirrors. 7 rows: 2 fixed, 4 shown exact, and
+//! rule of the writer it mirrors. 7 rows: 3 fixed, 3 shown exact, and
 //! the report's lines.
 //!
 //! | the judgment | the writer, and what it leaves out | here |
@@ -1154,9 +1154,25 @@
 //! | [`FfmpegMuxRefusal::MovieBox`]: the `moov`'s bound | the `trak`s written, and the chapter track (5339–5453) | exact: [`TrackState::trak_written`] |
 //! | [`FfmpegMuxRefusal::BitRates`], [`FfmpegMuxRefusal::CpbProperties`]: the `btrt`s and `esds`s | of the `trak`s written; AVIF's `moov` of a track of more than one sample (5441–5448) | exact |
 //! | [`FfmpegMuxRefusal::NegativeSpan`], [`FfmpegMuxRefusal::TimeWraps`]: the edit lists | `mov_write_edts_tag`, of a track of a sample — `start_dts` set — `use_editlist` on in a file of no fragments (4406–4419, 8201–8212); AVIF's of its own | exact: of a track of a sample, AVIF aside |
-//! | [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::FileSize`]: WAV's and Wave64's fact chunk | of a track of any codec but integer PCM — float PCM and the compressed alike (`wavenc.c` 347–349, 455–462, 583, 608–616) — of a sink that seeks | exact: of such a track of a packet |
-//! | WAV's and Wave64's fact chunk of no packet | `maxpts − minpts + last_duration`, of `minpts` at `INT64_MAX`: `−INT64_MAX` samples, written cut in 32 or 64 bits (364–365, 451–462, 611–616) | fixed (R28, ruled; Codex R27 [medium]: a value FFmpeg writes wrong — one sample in WAV, `0x8000000000000001` in Wave64 — refused, R20's class): refused at `finish` of every such track, float PCM and the compressed alike ([`FfmpegMuxRefusal::NoFrame`]; L214) |
+//! | [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::FileSize`]: WAV's and Wave64's fact chunk | of a track of any codec but integer PCM — float PCM and the compressed alike (`wavenc.c` 347–349, 455–462, 583, 608–616) — of a sink that seeks, each of its own header's extrema (364–365; 565–593) | fixed (R29, Codex R28 [high]): of such a track of a packet, Wave64's extrema at zero, its sum held to `int64_t` and its count to `av_rescale`'s ([`FactChunk`]; L215) |
+//! | WAV's fact chunk of no packet; Wave64's | WAV: `maxpts − minpts + last_duration` of `minpts` at `INT64_MAX`, `−INT64_MAX` samples, written cut — one sample in its 32 bits (364–365, 451–462); Wave64: of extrema at zero, zero samples, written whole (565–593, 611–616) | fixed (R28, ruled; Codex R27 [medium]: WAV's, a value FFmpeg writes wrong, refused at `finish`, float PCM and the compressed alike, [`FfmpegMuxRefusal::NoFrame`]; L214). R28 refused Wave64's too, on the premise that it shared WAV's start — the coordinator's error, corrected (R29, Codex R28 [high]): Wave64 of no packet finishes, its count zero (L214) |
 //! | the report's lines at `finish` — the held packets, MP4's unjoined E-AC-3, its key frames, its last sample's duration | what each writer drops or rewrites | reports, no refusal |
+//!
+//! **Every state two kept muxers share and start otherwise** (R29, Codex
+//! R28 [high], closed by class: a mirror of state that two muxers' shared
+//! packet or trailer code carries starts as each muxer's own header starts
+//! it, never as a sibling's). By grep of the kept muxers' `FFOutputFormat`s
+//! for a `write_packet`, `write_trailer` or `init` one shares with another,
+//! and of each one's header and `init` for what it sets of the shared
+//! context. 5 rows: 1 fixed, 3 shown exact, 1 of no state.
+//!
+//! | the shared code, and its muxers | the state | each muxer's start | here |
+//! |---|---|---|---|
+//! | `wav_write_packet` (`wavenc.c` 383–415): WAV and Wave64 (533, 633) | `minpts`, `maxpts`, `last_duration` | WAV: `INT64_MAX`, 0, 0 (`wav_write_header`, 364–365); Wave64: none set — its context zeroed, all 0 (`w64_write_header`, 565–593) | fixed (R29, Codex R28 [high]): [`FactChunk::start`] — R28 gave Wave64 WAV's start, refusing an empty Wave64 that FFmpeg counts zero, and leaving its sum unjudged against `int64_t` (L214, L215) |
+//! | `mov_init`, `ff_mov_write_packet`, `mov_write_trailer` (`movenc.c`): MP4, MOV, iPod and AVIF | each track's `start_dts`, `start_cts`, `end_pts`, `dts_shift` (8471–8474); its timescale (8590–8630); `use_editlist` (8201–8212); the fragment flags (8153–8184) | the same for every kept mode: the times unknown, the timescale the stream's — ISM's of 10 000 000 alone otherwise, not kept — no fragments; AVIF's edit list only where animated (4418–4419) | exact: the stream's time base read after the header; AVIF's own rows ([`MovMode::Avif`]) |
+//! | `mkv_init`, `mkv_write_header`, `mkv_write_packet`, `mkv_write_trailer` (`matroskaenc.c`): Matroska and WebM | `cluster_pos` −1, `cluster_pts`, `duration`, each track's `ts_offset`, `last_timestamp`, `duration` (2741, 2089–2104, 3134–3195); the cluster limits, of `IS_SEEKABLE` (2745–2755) | the same for both: `IS_WEBM` changes the header's elements and the codecs taken (1842–1979, 2157–2172, 2377–2427, 3607), no packet state | exact |
+//! | `mpegts_init`, `mpegts_write_packet`: MPEG-TS, its M2TS mode one muxer's (1109–1113) | the clock, the tables' times (above) | one muxer; M2TS unreached (no file name) | exact |
+//! | `ff_raw_write_packet` (`rawenc.c` 31–35): the raw writers | none | — | no state |
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
 //! (table C′′′; R10, Codex R9 [high]) — every writer the MOV family's
@@ -4143,9 +4159,10 @@ pub enum FfmpegMuxRefusal {
   /// it parsed (`movenc.c` 424–429, 619–623 in FFmpeg 9.0.1), of a track
   /// whose `trak` it writes (R27, Codex R26 [medium]): a file of no
   /// fragments leaves a track of no sample out of its `moov` (5350–5351,
-  /// 5430–5433). And (R28, ruled) WAV or Wave64 of a codec but integer PCM, whose
+  /// 5430–5433). And (R28, ruled) WAV of a codec but integer PCM, whose
   /// fact chunk counts a track of no packet as `−INT64_MAX` samples,
-  /// written cut (`wavenc.c` 364–365, 451–462, 611–616). Where a check
+  /// written cut (`wavenc.c` 364–365, 451–462); not Wave64, whose zeroed
+  /// extrema count zero (565–593, 611–616; R29, Codex R28 [high]). Where a check
   /// needs the whole stream it is made at the
   /// first packet that decides it; this one no packet decides, so `finish`
   /// makes it, before the trailer, and names it in its fault
@@ -6148,7 +6165,9 @@ struct PacketRules {
   /// past none (608–616) — which its reader takes as the stream's length
   /// ([`PayloadRule::FileSize`]); the last packet's duration kept in an
   /// `int` beside it (82, 412; [`FfmpegMuxRefusal::DurationTooLong`]).
-  fact_samples: Option<u64>,
+  /// Each of its own header's extrema ([`FactChunk`]; R29, Codex R28
+  /// [high]).
+  fact_samples: Option<FactChunk>,
   /// A raw stream's codec whose configuration the track states and the
   /// muxer does not write, so that its first packet must carry it in band
   /// ([`PayloadRule::InBandConfiguration`]): H.264's and HEVC's but where
@@ -7945,12 +7964,17 @@ impl PacketRules {
       file_bytes: (audited == Audited::Wav { w64: false })
         .then(|| (file + 8).saturating_sub(u64::try_from(header).unwrap_or(0))),
       // The fact chunk of every tag but integer PCM's, 0x01 (`wavenc.c`
-      // 347–352, 455–462, 608–616): WAV's 32 bits the file bound's,
-      // Wave64's 64 bits none.
+      // 347–352, 455–462, 583, 608–616): WAV's 32 bits the file bound's,
+      // Wave64's `av_rescale`'s `INT64_MAX`.
       fact_samples: match audited {
-        Audited::Wav { w64 } if codec.codec_tag() != 0x0001 => {
-          Some(if w64 { u64::MAX } else { file })
-        }
+        Audited::Wav { w64 } if codec.codec_tag() != 0x0001 => Some(FactChunk {
+          limit: if w64 { i64::MAX as u64 } else { file },
+          w64,
+          scale: (
+            i128::from(codec.sample_rate()) * i128::from(time_base.num()),
+            i128::from(time_base.den().get()),
+          ),
+        }),
         _ => None,
       },
       in_band: (raw && !codec.extradata().is_empty()).then_some(id),
@@ -8030,6 +8054,52 @@ impl PacketRules {
         SampleRule::AsIs
       },
     }
+  }
+}
+
+/// WAV's and Wave64's fact chunk (`wavenc.c` 347–352, 448–462, 583,
+/// 608–616 in FFmpeg 9.0.1): `maxpts − minpts + last_duration` in
+/// `int64_t`, the extrema of each packet's presentation time
+/// (`wav_write_packet`, 409–414, which both muxers share), counted in
+/// samples. Each muxer starts the extrema of its own header (R29, Codex R28
+/// [high]): WAV's `minpts` at `INT64_MAX` and `maxpts` at zero (364–365);
+/// Wave64's header sets neither, its zeroed context leaving both at zero
+/// (`w64_write_header`, 565–593) — so that of no packet WAV counts
+/// `−INT64_MAX` samples, written cut, and Wave64 zero, written whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FactChunk {
+  /// The most samples the chunk counts: WAV's file bound's in its 32 bits;
+  /// Wave64's `INT64_MAX`, past which `av_rescale` answers `INT64_MIN`
+  /// (`mathematics.c` 115–116).
+  limit: u64,
+  /// Wave64: its extrema start at zero.
+  w64: bool,
+  /// Samples a tick, as a ratio: the stream's sample rate by its time
+  /// base's numerator, over its denominator — Wave64's `av_rescale` (611–613)
+  /// and WAV's `av_rescale_q` into its sample rate (451–453) alike, WAV's
+  /// stream counting its sample rate (363).
+  scale: (i128, i128),
+}
+
+impl FactChunk {
+  /// The extrema before the first packet, each muxer's own.
+  const fn start(self) -> (i128, i128) {
+    if self.w64 {
+      (0, 0)
+    } else {
+      (i64::MAX as i128, 0)
+    }
+  }
+
+  /// `ticks` in samples, rounded to the nearest as `av_rescale` rounds,
+  /// `INT64_MIN` past `int64_t`.
+  fn count(self, ticks: i128) -> i128 {
+    i128::from(rescale_near_signed(ticks, self.scale.0, self.scale.1))
+  }
+
+  /// Whether the chunk writes a count of `ticks` whole.
+  fn holds(self, ticks: i128) -> bool {
+    (0..=i128::from(self.limit)).contains(&self.count(ticks))
   }
 }
 
@@ -12017,13 +12087,15 @@ where
   fn fact_chunks_refused(&self) -> Option<FfmpegMuxRefusal> {
     for (index, state) in self.tracks.iter().enumerate() {
       let track = TrackIndex::new(index);
-      // Of no packet, the chunk counts `maxpts − minpts + last_duration` of
-      // `minpts` at `INT64_MAX` — `−INT64_MAX` samples, written cut in 32 or
-      // 64 bits (`wavenc.c` 364–365, 451–462, 611–616): refused (R28, ruled).
-      if state.rules.fact_samples.is_some() && state.wav_last.is_none() {
+      // Of no packet, WAV's chunk counts `maxpts − minpts + last_duration`
+      // of `minpts` at `INT64_MAX` — `−INT64_MAX` samples, written cut
+      // (`wavenc.c` 364–365, 451–462): refused (R28, ruled). Wave64's, of
+      // extrema at zero, counts zero, written whole (R29, Codex R28 [high]:
+      // refused in R28, the coordinator's error).
+      if state.rules.fact_samples.is_some_and(|fact| !fact.w64) && state.wav_last.is_none() {
         return Some(FfmpegMuxRefusal::NoFrame { track });
       }
-      let (Some(limit), Some((earliest, latest)), Some((handed, offered)), Some((_, time_base))) = (
+      let (Some(fact), Some((earliest, latest)), Some((handed, offered)), Some((_, time_base))) = (
         state.rules.fact_samples,
         state.presented,
         state.wav_last,
@@ -12031,7 +12103,9 @@ where
       ) else {
         continue;
       };
-      if handed > i128::from(i32::MAX) {
+      // The last duration past the `int` WAV keeps it in; the sum past
+      // `int64_t`, a signed overflow (R29, Codex R28 [high]).
+      if handed > i128::from(i32::MAX) || latest - earliest + handed > i128::from(i64::MAX) {
         return Some(FfmpegMuxRefusal::DurationTooLong {
           track,
           duration: offered.unwrap_or_else(|| {
@@ -12039,7 +12113,7 @@ where
           }),
         });
       }
-      if latest - earliest + handed > i128::from(limit) {
+      if !fact.holds(latest - earliest + handed) {
         return Some(FfmpegMuxRefusal::Payload {
           track,
           rule: PayloadRule::FileSize,
@@ -13744,12 +13818,12 @@ fn check_packet_rules<'p>(
   // exactness: judged at each packet as though it were the last, a
   // duration a later packet replaced was refused).
   let (presented, wav_last) = match rules.fact_samples {
-    Some(limit) => {
+    Some(fact) => {
       let pts = i128::from(own.pts_ticks.unwrap_or(dts_ticks)) + lift;
-      let (earliest, latest) = state.presented.map_or((pts, pts), |(earliest, latest)| {
-        (earliest.min(pts), latest.max(pts))
-      });
-      if latest - earliest > i128::from(limit) {
+      // Of each muxer's own start (R29, Codex R28 [high]; [`FactChunk`]).
+      let (earliest, latest) = state.presented.unwrap_or(fact.start());
+      let (earliest, latest) = (earliest.min(pts), latest.max(pts));
+      if !fact.holds(latest - earliest) {
         return refused(PayloadRule::FileSize);
       }
       let handed = i128::from(if duration_ticks > 0 {
