@@ -7,6 +7,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with the rest of the family's.
 
+## [0.1.2] - unreleased
+
+### Added
+
+- **The declared disposition on the track row and its description**:
+  `TrackInfo::disposition` and `TrackDescription::disposition` (with
+  their `with_` and `set_` builders) carry the container's
+  `AV_DISPOSITION_*` bits as `mediaframe`'s `TrackDisposition`,
+  re-exported from `mediaspine::demuxer`, whole — an unnamed bit
+  included. `from_track_info` copies it. `into_parts` keeps its shape and
+  drops the disposition, which `disposition()` reads before the split;
+  `TrackDescription::into_parts_with_disposition` splits a description
+  into every part, the disposition among them, losslessly.
+
 ## [0.1.1] - 2026-10-23
 
 ### Added

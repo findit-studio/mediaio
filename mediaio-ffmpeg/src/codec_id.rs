@@ -122,6 +122,100 @@ impl CodecId {
       .map(Utf8Bytes::from_static)
   }
 
+  /// The MIME type libavcodec's descriptor names first for this codec —
+  /// `"image/png"`, `"application/x-truetype-font"` — or `None` where the
+  /// build has no descriptor for the id, or the descriptor names none.
+  ///
+  /// The word Matroska's muxer writes for an attachment whose row names
+  /// no MIME type of its own (`get_mimetype`, `libavformat/matroskaenc.c`
+  /// 2496–2511 in FFmpeg 9.0.1), and so the one a writer asks before it
+  /// opens one: an attachment with neither is refused there. Like
+  /// [`name`](Self::name), an open vocabulary — whatever the linked
+  /// libavcodec's table says.
+  pub fn mime_type(self) -> Option<&'static str> {
+    let descriptor = self.descriptor();
+    if descriptor.is_null() {
+      return None;
+    }
+    // SAFETY: as [`Self::name`]: `descriptor` points into libavcodec's
+    // static table and the field is reached through `addr_of!`, without
+    // forming a reference. `mime_types` is null, or a null-terminated
+    // array of NUL-terminated literals in that same table.
+    let list = unsafe { core::ptr::addr_of!((*descriptor).mime_types).read() };
+    if list.is_null() {
+      return None;
+    }
+    // SAFETY: a non-null `mime_types` holds at least its terminating
+    // null, so its first element is in bounds and initialised.
+    let first = unsafe { list.read() };
+    // SAFETY: `first` is null or a static, NUL-terminated literal, the
+    // reader's contract — a borrow valid for the process.
+    unsafe { crate::ffi::table_text(first, DESCRIPTOR_TEXT_MAX_BYTES) }
+  }
+
+  /// Whether every frame of this codec is a key frame, as libavformat
+  /// judges it when it writes one (`ff_is_intra_only`,
+  /// `libavformat/avformat.c` 903–912 in FFmpeg 9.0.1): a codec whose
+  /// descriptor is neither audio nor video — every subtitle and data codec
+  /// — or one marked `AV_CODEC_PROP_INTRA_ONLY`. `false` where this build
+  /// has no descriptor for the id, as libavformat answers.
+  ///
+  /// libavformat marks every packet of such a codec a key frame on its way
+  /// into a muxer, and every demuxer's packet of it on the way out
+  /// (`libavformat/demux.c` 1168).
+  pub fn intra_only(self) -> bool {
+    let descriptor = self.descriptor();
+    if descriptor.is_null() {
+      return false;
+    }
+    // SAFETY: as [`Self::name`]: `descriptor` points into libavcodec's
+    // static table, and each field is reached through `addr_of!` without
+    // forming a reference; the media type is read as the integer it is
+    // stored as, so no bindgen enum is formed from the linked library's
+    // value.
+    let (media, props) = unsafe {
+      (
+        core::ptr::addr_of!((*descriptor).type_)
+          .cast::<i32>()
+          .read_unaligned(),
+        core::ptr::addr_of!((*descriptor).props).read(),
+      )
+    };
+    let audio_or_video = media == ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO as i32
+      || media == ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO as i32;
+    !audio_or_video || props & ffmpeg_next::ffi::AV_CODEC_PROP_INTRA_ONLY != 0
+  }
+
+  /// The media type libavcodec's descriptor gives this codec —
+  /// `AVMEDIA_TYPE_*`, as the integer `AVCodecDescriptor.type` stores it
+  /// (`avcodec_get_type`) — or `None` where this build has no descriptor
+  /// for the id.
+  pub fn media_type(self) -> Option<i32> {
+    let descriptor = self.descriptor();
+    if descriptor.is_null() {
+      return None;
+    }
+    // SAFETY: as [`Self::intra_only`]: the descriptor is a static table
+    // entry of libavcodec's, its media type read through `addr_of!` as the
+    // integer it is stored as, so no bindgen enum is formed from it.
+    Some(unsafe {
+      core::ptr::addr_of!((*descriptor).type_)
+        .cast::<i32>()
+        .read_unaligned()
+    })
+  }
+
+  /// The bits one sample of this codec takes where its samples have a
+  /// fixed size — 16 for `PCM_S16LE` — else `0`
+  /// (`av_get_bits_per_sample`).
+  pub fn bits_per_sample(self) -> u32 {
+    // SAFETY: the redeclared shim takes a plain `c_int`, so no bindgen
+    // enum is formed from `self.0`, and libavcodec answers every integer
+    // from a `switch`.
+    let bits = unsafe { crate::ffi::c_shims::av_get_bits_per_sample(self.0) };
+    u32::try_from(bits).unwrap_or(0)
+  }
+
   /// libavcodec's descriptor for this id, or null where this build
   /// names no codec for it.
   ///
@@ -184,6 +278,18 @@ impl CodecId {
   pub const VC1: Self = Self(AVCodecID::AV_CODEC_ID_VC1 as i32);
   /// VVC / H.266 (ITU-T H.266).
   pub const VVC: Self = Self(AVCodecID::AV_CODEC_ID_VVC as i32);
+  /// MPEG-5 LCEVC (ISO/IEC 23094-2) enhancement data.
+  pub const LCEVC: Self = Self(AVCodecID::AV_CODEC_ID_LCEVC as i32);
+  /// MPEG-5 EVC (ISO/IEC 23094-1).
+  pub const EVC: Self = Self(AVCodecID::AV_CODEC_ID_EVC as i32);
+  /// APV (Advanced Professional Video).
+  pub const APV: Self = Self(AVCodecID::AV_CODEC_ID_APV as i32);
+  /// RealVideo 1.0.
+  pub const RV10: Self = Self(AVCodecID::AV_CODEC_ID_RV10 as i32);
+  /// RealVideo 2.0.
+  pub const RV20: Self = Self(AVCodecID::AV_CODEC_ID_RV20 as i32);
+  /// RealVideo 3.0.
+  pub const RV30: Self = Self(AVCodecID::AV_CODEC_ID_RV30 as i32);
 
   // --- Audio codecs ----------------------------------------------------
 
@@ -211,12 +317,45 @@ impl CodecId {
   pub const PCM_S16BE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_S16BE as i32);
   /// PCM signed 24-bit little-endian.
   pub const PCM_S24LE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_S24LE as i32);
+  /// PCM signed 24-bit big-endian.
+  pub const PCM_S24BE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_S24BE as i32);
   /// PCM signed 32-bit little-endian.
   pub const PCM_S32LE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_S32LE as i32);
+  /// PCM signed 32-bit big-endian.
+  pub const PCM_S32BE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_S32BE as i32);
   /// PCM 32-bit float little-endian.
   pub const PCM_F32LE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_F32LE as i32);
+  /// PCM 32-bit float big-endian.
+  pub const PCM_F32BE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_F32BE as i32);
   /// PCM 64-bit float little-endian.
   pub const PCM_F64LE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_F64LE as i32);
+  /// PCM 64-bit float big-endian.
+  pub const PCM_F64BE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_F64BE as i32);
+  /// WavPack.
+  pub const WAVPACK: Self = Self(AVCodecID::AV_CODEC_ID_WAVPACK as i32);
+  /// Dolby TrueHD.
+  pub const TRUEHD: Self = Self(AVCodecID::AV_CODEC_ID_TRUEHD as i32);
+  /// Sony ATRAC3.
+  pub const ATRAC3: Self = Self(AVCodecID::AV_CODEC_ID_ATRAC3 as i32);
+  /// RealAudio Cook.
+  pub const COOK: Self = Self(AVCodecID::AV_CODEC_ID_COOK as i32);
+  /// RealAudio 2.0 (28.8 kbit/s).
+  pub const RA_288: Self = Self(AVCodecID::AV_CODEC_ID_RA_288 as i32);
+  /// RealAudio SIPR.
+  pub const SIPR: Self = Self(AVCodecID::AV_CODEC_ID_SIPR as i32);
+
+  // --- Still-image and attachment codecs -------------------------------
+
+  /// PNG — a cover picture's usual codec.
+  pub const PNG: Self = Self(AVCodecID::AV_CODEC_ID_PNG as i32);
+  /// BMP — a cover picture MP4 can carry.
+  pub const BMP: Self = Self(AVCodecID::AV_CODEC_ID_BMP as i32);
+  /// TrueType font — a Matroska attachment.
+  pub const TTF: Self = Self(AVCodecID::AV_CODEC_ID_TTF as i32);
+  /// OpenType font — a Matroska attachment.
+  pub const OTF: Self = Self(AVCodecID::AV_CODEC_ID_OTF as i32);
+  /// Plain text — an attachment Matroska labels `text/plain`.
+  pub const TEXT: Self = Self(AVCodecID::AV_CODEC_ID_TEXT as i32);
 
   // --- Subtitle codecs -------------------------------------------------
 
@@ -234,6 +373,8 @@ impl CodecId {
   pub const HDMV_PGS_SUBTITLE: Self = Self(AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE as i32);
   /// DVD VOBSUB subtitle (bitmap).
   pub const DVD_SUBTITLE: Self = Self(AVCodecID::AV_CODEC_ID_DVD_SUBTITLE as i32);
+  /// TTML (Timed Text Markup Language).
+  pub const TTML: Self = Self(AVCodecID::AV_CODEC_ID_TTML as i32);
 }
 
 impl fmt::Debug for CodecId {
@@ -254,6 +395,12 @@ impl fmt::Debug for CodecId {
       Self::MJPEG => "MJPEG",
       Self::VC1 => "VC1",
       Self::VVC => "VVC",
+      Self::LCEVC => "LCEVC",
+      Self::EVC => "EVC",
+      Self::APV => "APV",
+      Self::RV10 => "RV10",
+      Self::RV20 => "RV20",
+      Self::RV30 => "RV30",
       Self::AAC => "AAC",
       Self::MP3 => "MP3",
       Self::OPUS => "OPUS",
@@ -266,9 +413,19 @@ impl fmt::Debug for CodecId {
       Self::PCM_S16LE => "PCM_S16LE",
       Self::PCM_S16BE => "PCM_S16BE",
       Self::PCM_S24LE => "PCM_S24LE",
+      Self::PCM_S24BE => "PCM_S24BE",
       Self::PCM_S32LE => "PCM_S32LE",
+      Self::PCM_S32BE => "PCM_S32BE",
       Self::PCM_F32LE => "PCM_F32LE",
+      Self::PCM_F32BE => "PCM_F32BE",
       Self::PCM_F64LE => "PCM_F64LE",
+      Self::PCM_F64BE => "PCM_F64BE",
+      Self::WAVPACK => "WAVPACK",
+      Self::TRUEHD => "TRUEHD",
+      Self::ATRAC3 => "ATRAC3",
+      Self::COOK => "COOK",
+      Self::RA_288 => "RA_288",
+      Self::SIPR => "SIPR",
       Self::SUBRIP => "SUBRIP",
       Self::ASS => "ASS",
       Self::WEBVTT => "WEBVTT",
@@ -276,6 +433,7 @@ impl fmt::Debug for CodecId {
       Self::DVB_SUBTITLE => "DVB_SUBTITLE",
       Self::HDMV_PGS_SUBTITLE => "HDMV_PGS_SUBTITLE",
       Self::DVD_SUBTITLE => "DVD_SUBTITLE",
+      Self::TTML => "TTML",
       _ => return write!(f, "CodecId({})", self.0),
     };
     write!(f, "CodecId::{name}")

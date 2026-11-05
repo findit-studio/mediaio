@@ -109,8 +109,9 @@ use mediadecode::{
   demuxer::{
     AttachmentPacket, AttachmentTrackPacket, AttachmentTrackParams, AudioTrackPacket,
     AudioTrackParams, Chapter, ContainerDuration, DataTrackPacket, DataTrackParams, DemuxedPacket,
-    Demuxer, DurationSource, MeasuredEnd, SubtitleTrackPacket, SubtitleTrackParams, TrackIndex,
-    TrackInfo, TrackKind, TrackParams, UnknownTrackParams, VideoTrackPacket, VideoTrackParams,
+    Demuxer, DurationSource, MeasuredEnd, SubtitleTrackPacket, SubtitleTrackParams,
+    TrackDisposition, TrackIndex, TrackInfo, TrackKind, TrackParams, UnknownTrackParams,
+    VideoTrackPacket, VideoTrackParams,
   },
   nal::{NalCodec, NalStream},
   packet::PacketFlags,
@@ -350,7 +351,7 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// the **following** packet. Compressed data and subtitle cues went
   /// missing under memory pressure, quietly.
   ///
-  /// So the read and the conversion are one transaction with a seat
+  /// So the read and the conversion are one transaction with a slot
   /// between them: a transient refusal parks the packet here and the
   /// next pull re-attempts *this* packet before reading another. It is
   /// the same park-then-replay the decode household already runs —
@@ -409,7 +410,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     request: DemuxerOpen,
   ) -> Result<Self, DemuxError> {
     let limits = request.limits();
-    // **The probe knobs, set before libavformat reads a byte.** See
+    // **The probe options, set before libavformat reads a byte.** See
     // [`DemuxLimits::max_probe_bytes`]: `avformat_open_input` and
     // `avformat_find_stream_info` build the attachment, extradata and
     // coded-side-data buffers themselves, so every budget that measures
@@ -447,6 +448,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
   /// as [`DemuxError::ReaderPanic`], carrying the panic's message. The
   /// session is terminal from that point: the `AVIOContext`'s error
   /// state is sticky and the reader's own state is unknown.
+  ///
+  /// An error the reader returns is reduced to its OS code or kind inside
+  /// that same `catch_unwind`, its payload dropped there — ffmpeg-next
+  /// drops a returned error inside its callback — so a payload whose
+  /// `Drop` panics is a reader panic like any other.
   pub(crate) fn open_reader_impl<R: Read + Seek + Send + 'static>(
     reader: R,
     filename: Option<&str>,
@@ -501,9 +507,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
         meter.budget(),
       )));
     }
-    // Open and analysed: the seat bounds *probing*, and reading the
+    // Open and analysed: the slot bounds *probing*, and reading the
     // media itself afterwards is the caller's business, packet by
-    // packet, already bounded by the packet seats.
+    // packet, already bounded by the packet slots.
     meter.release();
     // A panic libavformat tolerated (a failed probe it recovered from)
     // still poisoned the reader; the session must not open over it.
@@ -517,7 +523,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
 
   /// Borrows the wrapped `ffmpeg::format::context::Input` — for
   /// `av_dump_format`, container-level metadata, and anything else the
-  /// portable track and chapter tables have no seat for.
+  /// portable track and chapter tables have no slot for.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) const fn input_impl(&self) -> &Input {
     &self.input
@@ -941,7 +947,7 @@ fn duration_source(method: i32) -> DurationSource {
 ///
 /// # What this bounds
 ///
-/// This is the only seat in the crate that reaches *behind*
+/// This is the only slot in the crate that reaches *behind*
 /// libavformat: `avformat_open_input` and `avformat_find_stream_info`
 /// build the attached picture, the extradata and the coded side data
 /// out of the file themselves, so every budget measuring this crate's
@@ -1352,11 +1358,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       return Err(panicked);
     }
     sought?;
-    // **The seat is cleared by a seek that happened, not by one that
+    // **The slot is cleared by a seek that happened, not by one that
     // was attempted.** A parked packet belongs to the position the
     // session is leaving, so a successful seek discards it. A *failed*
     // one leaves the session where it was — and that packet is off the
-    // wire, so dropping it here would be the same silent loss the seat
+    // wire, so dropping it here would be the same silent loss the slot
     // exists to prevent, with no re-read able to recover it.
     //
     // FFmpeg does not specify where a container sits after a seek that
@@ -1960,8 +1966,8 @@ impl ChapterTitleBudgetExhausted {
 /// exceed what the caller allowed, and a caller answers it by raising
 /// [`DemuxLimits::max_total_chapter_title_bytes`](crate::DemuxLimits::max_total_chapter_title_bytes).
 /// This one means a single value runs past a structural cap this crate
-/// owns and no seat can move — folding the two together would offer a
-/// knob that cannot fix it.
+/// owns and no slot can move — folding the two together would offer an
+/// option that cannot fix it.
 ///
 /// Refused rather than truncated (a truncated title is a different
 /// title), and refused *visibly*: reporting it as an absent title, as
@@ -2653,12 +2659,32 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
     // track, whose only purpose was to sever the tie to the format
     // context. The mirror severs it by being owned Rust, so that copy
     // is gone rather than moved.
+    // The sample aspect ratio libavformat itself would display the stream
+    // at, asked of it: `av_guess_sample_aspect_ratio` (`avformat.c` 784–805
+    // in FFmpeg 9.0.1), the stream's, reduced, where it states a valid one,
+    // whatever the parameters state, else the parameters', reduced, where
+    // valid, else `0/1` — what FFmpeg's tool copies for a stream copy. MOV's
+    // `pasp` and Matroska's display size live on the stream, and a muxer
+    // reads the parameters' alone (R12, ruled; Q869 L11).
+    //
+    // SAFETY: `input` keeps its `AVFormatContext`, and `stream` the
+    // `AVStream`, live for the call, which reads the stream's ratio and its
+    // parameters' into locals and writes through neither pointer, so their
+    // `const` origin is kept; a null frame asks for the parameters' ratio.
+    let guess = unsafe {
+      ffmpeg_next::ffi::av_guess_sample_aspect_ratio(
+        input.as_ptr().cast_mut(),
+        stream.as_ptr().cast_mut(),
+        std::ptr::null_mut(),
+      )
+    };
     let ticket = crate::ticket::CodecTicket::mirror_with(
       &parameters,
       index,
       limits.max_codec_parameter_bytes(),
       extradata_policy,
-    )?;
+    )?
+    .with_sample_aspect_ratio(crate::ticket::Ratio::new(guess.num, guess.den));
     let extra = TrackExtra::new(index as i32, ticket)
       .with_disposition(disposition)
       .with_start_time((raw_start != AV_NOPTS_VALUE).then_some(raw_start))
@@ -2705,7 +2731,12 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
       // wrote is what is read — see
       // [`TrackInfo::language`](mediadecode::demuxer::TrackInfo::language)
       // for why nothing folds it here.
-      .with_language(text(c"language")?);
+      .with_language(text(c"language")?)
+      // The container's own bits, carried whole — the same raw set the
+      // extras keep — so a remux writes back what was declared. The
+      // `c_int` is reinterpreted, not converted: a set with the sign bit
+      // is a set of bits, and `from_u32` keeps every one.
+      .with_disposition(TrackDisposition::from_u32(disposition as u32));
 
     // Capture the attachment payload now, so the queue is complete
     // before a single timed packet has been read. Every attachment
@@ -2782,7 +2813,7 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
 /// passes stay one rule.
 ///
 /// `nb_chapters` is file-controlled and libavformat has no
-/// `max_chapters` knob to bound it with, so this crate judges the count
+/// `max_chapters` option to bound it with, so this crate judges the count
 /// itself before reserving anything —
 /// [`DemuxLimits::max_chapters`](crate::DemuxLimits::max_chapters), the
 /// same posture [`admit_streams`] takes for the track table. Past the
@@ -4321,7 +4352,7 @@ fn admit_streams(input: &Input, limits: DemuxLimits) -> Result<(), DemuxError> {
       //
       // The budget passed here is deliberately `usize::MAX`: the size
       // question belongs to `charge_attachment` below, which answers it
-      // as `AttachmentTooLarge` against the attachment seats rather than
+      // as `AttachmentTooLarge` against the attachment slots rather than
       // as a packet's own ceiling. This call is asked only for the
       // structural answers.
       //
@@ -4427,7 +4458,7 @@ fn stream_timebase(index: usize, declared: Rational) -> Result<Timebase, DemuxEr
 /// stream has no timebase yet" default, which ordinary containers carry
 /// on untimed streams, and passing it through is reporting rather than
 /// guessing. See [`positive_rational_to_timebase`] for the stricter
-/// rule the seats that cannot mean *absent* take.
+/// rule the slots that cannot mean *absent* take.
 ///
 /// # Why this is fallible now
 ///
@@ -4448,9 +4479,9 @@ fn rational_to_timebase(value: Rational) -> Option<Timebase> {
 
 /// [`rational_to_timebase`], and the numerator must be positive too.
 ///
-/// The rule for a seat where a zero numerator cannot mean "absent".
+/// The rule for a slot where a zero numerator cannot mean "absent".
 ///
-/// A chapter's `time_base` is one such seat: `avpriv_new_chapter` takes
+/// A chapter's `time_base` is one such slot: `avpriv_new_chapter` takes
 /// it as an argument, so whatever wrote the chapter wrote its ruler
 /// too, and `0/den` there is not an unset default but a declaration
 /// that every boundary in the table is the same instant — which is the
@@ -5019,6 +5050,72 @@ mod tests {
           Err(DemuxError::ReaderPanic(_)) => {}
           Err(other) => panic!("expected ReaderPanic, got {other:?}"),
           Ok(_) => panic!("a reader that only panics cannot open a container"),
+        }
+      },
+    );
+  }
+
+  /// An error's payload whose destructor panics — safe code, returned
+  /// rather than raised.
+  #[derive(Debug)]
+  struct HostileErrorPayload;
+
+  impl core::fmt::Display for HostileErrorPayload {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      f.write_str("an error whose payload panics when dropped")
+    }
+  }
+
+  impl std::error::Error for HostileErrorPayload {}
+
+  impl Drop for HostileErrorPayload {
+    fn drop(&mut self) {
+      panic!("the error's payload exploded");
+    }
+  }
+
+  /// A reader whose every call returns an error carrying that payload.
+  struct ReturnsAHostileError;
+
+  impl std::io::Read for ReturnsAHostileError {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+      Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        HostileErrorPayload,
+      ))
+    }
+  }
+
+  impl std::io::Seek for ReturnsAHostileError {
+    fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+      Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        HostileErrorPayload,
+      ))
+    }
+  }
+
+  #[test]
+  fn a_reader_error_with_a_hostile_payload_does_not_abort_the_process() {
+    // In its own process, for the reason the law above gives. ffmpeg-next
+    // drops the error a reader returns inside its `extern "C"` read
+    // callback; the guard reduces the error inside its `catch_unwind`
+    // first, so the payload's panic is latched and named as the reader's
+    // panic instead of unwinding into C.
+    mediaio_ffmpeg::test_support::in_subprocess(
+      "demuxer::tests::a_reader_error_with_a_hostile_payload_does_not_abort_the_process",
+      || {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let opened =
+          CarrierDemuxer::<crate::Owned>::open_reader(ReturnsAHostileError, Some("x.mkv"));
+        std::panic::set_hook(previous);
+        match opened {
+          Err(DemuxError::ReaderPanic(panic)) => {
+            assert_eq!(panic.message(), "the error's payload exploded");
+          }
+          Err(other) => panic!("expected ReaderPanic, got {other:?}"),
+          Ok(_) => panic!("a reader that only fails cannot open a container"),
         }
       },
     );
@@ -5621,7 +5718,7 @@ mod tests {
         .map(|tb| (tb.num(), tb.den().get()))
         .ok(),
       Some((0, 1)),
-      "`0/1` is not malformed for a track seat — see the lane below",
+      "`0/1` is not malformed for a track slot — see the lane below",
     );
   }
 
@@ -5629,7 +5726,7 @@ mod tests {
   /// and the disagreement is the point.
   ///
   /// `0/1` is libavformat's own default for a stream whose demuxer
-  /// never set one, so a track seat reads it as the container declaring
+  /// never set one, so a track slot reads it as the container declaring
   /// nothing. A chapter's ruler is written by whatever wrote the
   /// chapter, so the same value there is a claim that every boundary in
   /// the table falls on one instant — malformed, and refused.

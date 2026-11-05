@@ -21,7 +21,7 @@ through, and adapters that implement them.
 | [`mediaencode`](mediaencode/README.md) | write faces, `no_std` | the encoders, the `Muxer`, the encoder settings, the write errors |
 | [`mediaio-ffmpeg`](mediaio-ffmpeg/README.md) | the FFmpeg base | the crossings between FFmpeg's memory and the vocabulary: carriers, packet and frame conversion, codec tickets, limits, the FFmpeg resampler |
 | [`mediadecode-ffmpeg`](mediadecode-ffmpeg/README.md) | read adapter | the FFmpeg decoders and demuxer, with hardware-acceleration probing |
-| [`mediaencode-ffmpeg`](mediaencode-ffmpeg/README.md) | write adapter | the encoder-by-name catalogue and its GPL gate; the muxer and the encoders follow |
+| [`mediaencode-ffmpeg`](mediaencode-ffmpeg/README.md) | write adapter | the FFmpeg muxer, the encoder-by-name catalogue and its GPL gate; the encoders follow |
 | [`mediadecode-webcodecs`](mediadecode-webcodecs/README.md) | read adapter, `wasm32` | the WebCodecs decoders |
 | [`mediaio-timeline`](mediaio-timeline/README.md) | pure model | the editing timeline as data, with OpenTimelineIO export and its exact read-back |
 | [`mediaio`](mediaio/README.md) | umbrella | the family in one dependency, by feature; pure Rust by default |

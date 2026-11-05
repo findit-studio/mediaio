@@ -24,6 +24,15 @@ use crate::{
   packet::{AudioPacket, PacketFlags, SubtitlePacket, VideoPacket},
 };
 
+/// A track's disposition: the `AV_DISPOSITION_*` hints a container
+/// declares for it — the default track of its kind, a forced subtitle
+/// track, commentary, the hearing-impaired variant, cover art.
+///
+/// `mediaframe`'s bit set, carried whole: an unnamed bit round-trips
+/// as the bit it is (`from_u32` keeps every bit), so a container's
+/// newer flag survives a backend older than it.
+pub use mediaframe::disposition::TrackDisposition;
+
 // Nothing in this module owns an allocation: the whole demux tier,
 // `Demuxer` included, is `core`-only. What a session's track table
 // costs is the backend's own choice, made at `Demuxer::TrackHandle`
@@ -97,7 +106,7 @@ pub enum TrackKind {
 ///
 /// Bundles the three decoding families ([`VideoAdapter`],
 /// [`AudioAdapter`], [`SubtitleAdapter`]) that already exist and adds
-/// the seats only a demuxer needs: extras for the two packet kinds that
+/// the slots only a demuxer needs: extras for the two packet kinds that
 /// have no decoder face, extras for a track-table row, and the text
 /// carrier for a track's identity metadata.
 ///
@@ -126,14 +135,14 @@ pub trait DemuxAdapter {
   /// Backend-specific extras carried on every [`AttachmentPacket`].
   type AttachmentExtra;
   /// Backend-specific extras carried on every [`TrackInfo`] — the place
-  /// a backend keeps what the portable row has no seat for (a native
+  /// a backend keeps what the portable row has no slot for (a native
   /// stream index, disposition bits, the container's metadata bag).
   type TrackExtra;
 
   /// Text carrier for a track's identity metadata — the attachment
   /// filename and MIME type on [`TrackInfo`], and its language.
   ///
-  /// A seat rather than a fixed string type so the core stays
+  /// A slot rather than a fixed string type so the core stays
   /// allocator-free: a backend with compile-time names can bind
   /// `&'static str`, one that reads them out of a container binds an
   /// owned inline string.
@@ -180,7 +189,7 @@ pub type DemuxAttachmentPacket<E, D> = AttachmentPacket<<E as DemuxAdapter>::Att
 /// Data tracks are real packet streams: they run along the file's
 /// timeline and carry a payload per timestamp. They are never
 /// reordered, so — like [`SubtitlePacket`] and for the same reason —
-/// there is no DTS seat; a data packet's presentation time is its
+/// there is no DTS slot; a data packet's presentation time is its
 /// decode time.
 ///
 /// `Clone` and `Debug` derive directly — see [`VideoPacket`]'s docs
@@ -776,7 +785,7 @@ impl<E: DemuxAdapter> Debug for TrackParams<E> {
 /// language the container declares for the track, and — for
 /// attachments — the identity the file was attached under.
 ///
-/// Everything a particular backend knows and this row has no seat for
+/// Everything a particular backend knows and this row has no slot for
 /// rides [`DemuxAdapter::TrackExtra`].
 ///
 /// **No `Clone`, on this type or on [`TrackParams`].** The
@@ -803,11 +812,13 @@ pub struct TrackInfo<E: DemuxAdapter> {
   filename: Option<E::Text>,
   mime_type: Option<E::Text>,
   language: Option<E::Text>,
+  disposition: TrackDisposition,
   extra: E::TrackExtra,
 }
 
 impl<E: DemuxAdapter> TrackInfo<E> {
-  /// Constructs a `TrackInfo`. Identity metadata defaults to `None`.
+  /// Constructs a `TrackInfo`. Identity metadata defaults to `None`,
+  /// and the disposition to the empty set.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(timebase: Timebase, params: TrackParams<E>, extra: E::TrackExtra) -> Self {
     Self {
@@ -817,6 +828,7 @@ impl<E: DemuxAdapter> TrackInfo<E> {
       filename: None,
       mime_type: None,
       language: None,
+      disposition: TrackDisposition::empty(),
       extra,
     }
   }
@@ -892,21 +904,33 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   /// 47 does not register — and a crate that owns one is where that
   /// fold belongs. A demux tier that folded early would be a *second*
   /// authority on the same question, disagreeing with the first in
-  /// exactly the cases the registries exist for; and a narrower seat —
+  /// exactly the cases the registries exist for; and a narrower slot —
   /// a three-letter code, say — would have had nowhere to put
-  /// `zh-Hans`, which is a tag Matroska really writes. So the seat
+  /// `zh-Hans`, which is a tag Matroska really writes. So the slot
   /// carries the declaration whole and leaves the fold downstream,
   /// where one door can apply it once.
   ///
   /// # Every kind, not only subtitles
   ///
   /// Containers tag audio tracks as readily as subtitle ones — a dub
-  /// and its captions are the same question asked twice — so the seat
+  /// and its captions are the same question asked twice — so the slot
   /// is on the row rather than on one arm of
   /// [`TrackParams`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn language(&self) -> Option<&E::Text> {
     self.language.as_ref()
+  }
+  /// Returns the track's disposition, as the **container declares**
+  /// it — the empty set where it declares none.
+  ///
+  /// Like [`language`](Self::language), a reading rather than a
+  /// reckoning: the bits the file wrote, carried whole (an unnamed bit
+  /// included), and never inferred — a container that marks no track
+  /// the default leaves every row without
+  /// [`TrackDisposition::DEFAULT`], whatever a player would pick.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn disposition(&self) -> TrackDisposition {
+    self.disposition
   }
   /// Returns the backend-specific extras.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -950,6 +974,13 @@ impl<E: DemuxAdapter> TrackInfo<E> {
     self.language = v;
     self
   }
+  /// Sets the container's declared disposition (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_disposition(mut self, v: TrackDisposition) -> Self {
+    self.disposition = v;
+    self
+  }
 
   /// Sets the duration in place.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -975,6 +1006,12 @@ impl<E: DemuxAdapter> TrackInfo<E> {
     self.language = v;
     self
   }
+  /// Sets the container's declared disposition in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_disposition(&mut self, v: TrackDisposition) -> &mut Self {
+    self.disposition = v;
+    self
+  }
 }
 
 // `Debug` is hand-written for the same reason as `TrackParams`'s:
@@ -996,6 +1033,7 @@ where
       .field("filename", &self.filename)
       .field("mime_type", &self.mime_type)
       .field("language", &self.language)
+      .field("disposition", &self.disposition)
       .field("extra", &self.extra)
       .finish()
   }
@@ -1040,7 +1078,7 @@ where
 /// a clamp applied here would be indistinguishable downstream from a
 /// file that was well-formed all along.
 ///
-/// That is also why the two instants are separate seats rather than
+/// That is also why the two instants are separate slots rather than
 /// one [`TimeRange`](crate::TimeRange): that type's constructor
 /// refuses `end < start`, which is exactly the row this one has to be
 /// able to carry. A consumer that wants a range — and has a policy for
@@ -1054,7 +1092,7 @@ where
 /// chapter is four scalars and the backend's own text carrier, so
 /// copying one costs about what copying a [`Timestamp`] does — there
 /// is no deep copy here for the law to forbid, and no shared-handle
-/// seat is worth minting to avoid one.
+/// slot is worth minting to avoid one.
 pub struct Chapter<E: DemuxAdapter> {
   id: i64,
   timebase: Timebase,
@@ -1170,7 +1208,7 @@ impl<E: DemuxAdapter> Debug for Chapter<E> {
   }
 }
 
-// Seat by seat, each under its own rule. The two instants compare as
+// Slot by slot, each under its own rule. The two instants compare as
 // `Timestamp` compares — by *when* they are, so `1_000` over `1/1000`
 // equals `1_000_000` over `1/1000000` — while the row's own
 // `timebase` compares as the rational it is. Two rows covering the
@@ -1957,7 +1995,7 @@ mod tests {
     assert_eq!(info.duration(), None);
   }
 
-  /// **The language seat carries the declaration, whatever shape it is
+  /// **The language slot carries the declaration, whatever shape it is
   /// in** — and says nothing where the container said nothing.
   ///
   /// The four tags are the four real spellings a container writes for
@@ -1968,7 +2006,7 @@ mod tests {
   /// row that folded here would have made the pair indistinguishable
   /// before that vocabulary ever saw them.
   #[test]
-  fn the_language_seat_keeps_the_containers_own_spelling() {
+  fn the_language_slot_keeps_the_containers_own_spelling() {
     let row = |language| {
       TrackInfo::<Loopback>::new(
         ms_tb(),
@@ -1981,7 +2019,7 @@ mod tests {
     assert_eq!(
       row(None).language().copied(),
       None,
-      "a container that declares no language leaves the seat empty",
+      "a container that declares no language leaves the slot empty",
     );
     for tag in ["ger", "deu", "zh-Hans", "und"] {
       assert_eq!(
@@ -1998,10 +2036,10 @@ mod tests {
     );
   }
 
-  /// The seat has both mutators the row's other identity fields have,
+  /// The slot has both mutators the row's other identity fields have,
   /// and the in-place one can take a declaration back off a row.
   #[test]
-  fn the_language_seat_can_be_set_and_cleared_in_place() {
+  fn the_language_slot_can_be_set_and_cleared_in_place() {
     let mut info = TrackInfo::<Loopback>::new(
       ms_tb(),
       TrackParams::Audio(AudioTrackParams::new(2, 48_000, 2, 3, 4)),
@@ -2017,7 +2055,7 @@ mod tests {
   }
 
   /// The chapter row carries the container's four numbers and its
-  /// title, and the title seat has both mutators the row's other
+  /// title, and the title slot has both mutators the row's other
   /// optional fields have — including the one that can take a title
   /// back off.
   #[test]
@@ -2064,7 +2102,7 @@ mod tests {
   /// clamped it would hand a consumer a well-formed-looking row
   /// indistinguishable from a file that really was well formed.
   ///
-  /// This is also the reason the two instants are separate seats:
+  /// This is also the reason the two instants are separate slots:
   /// [`TimeRange::try_new`](crate::TimeRange::try_new) refuses this
   /// pair, which is the row that has to be carryable.
   #[test]
@@ -2217,7 +2255,7 @@ mod tests {
   }
 
   #[test]
-  fn an_attachment_packet_has_no_timestamp_seat() {
+  fn an_attachment_packet_has_no_timestamp_slot() {
     let mut p: AttachmentPacket<(), &[u8]> = AttachmentPacket::new(&b"\x00\x01TTF"[..], ());
     assert_eq!(p.flags(), PacketFlags::empty());
     p.set_flags(PacketFlags::CORRUPT);

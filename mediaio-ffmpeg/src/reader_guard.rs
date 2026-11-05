@@ -49,7 +49,10 @@ impl PanicLatch {
   /// Records a panic payload. The first one wins: a reader that panics
   /// again after libavformat retried is describing the same fault, and
   /// the first description is the one nearest the cause.
-  fn latch(&self, payload: &(dyn Any + Send)) {
+  ///
+  /// Shared with the writer guard ([`crate::writer_guard`]), which
+  /// latches a sink's panic the same way.
+  pub(crate) fn latch(&self, payload: &(dyn Any + Send)) {
     let message = describe(payload);
     // A poisoned lock means a previous holder panicked while
     // describing a panic. The stored value is still a plain
@@ -61,6 +64,12 @@ impl PanicLatch {
     }
     drop(slot);
     self.latched.store(true, Ordering::Release);
+  }
+
+  /// Whether a panic has been latched: an `Acquire` load, pairing with
+  /// the `Release` store in [`PanicLatch::latch`].
+  pub(crate) fn is_latched(&self) -> bool {
+    self.latched.load(Ordering::Acquire)
   }
 
   /// The latched panic's message, or `None` when no reader has
@@ -96,6 +105,67 @@ fn describe(payload: &(dyn Any + Send)) -> Utf8Bytes {
 /// Stand-in for a payload that is neither `&str` nor `String` — a
 /// caller may panic with any `Any + Send`.
 const UNNAMED: &str = "panicked with a payload of an unknown type";
+
+/// An I/O error a caller's stream returned, reduced to what it says — its
+/// OS code, or else its kind — and holding nothing the caller owned.
+///
+/// **An error's payload is the caller's code too.** `io::Error::new`
+/// boxes any `Error + Send + Sync`, and safe code can give that box a
+/// `Drop` that panics. ffmpeg-next's AVIO callbacks map the error a
+/// stream returns to an `AVERROR` and drop it inside the `extern "C"`
+/// frame (`map_io_error`, `format/context/stream_io.rs` 420–458 in
+/// ffmpeg-next 9.0.0), so a payload that panics there aborts the
+/// process — past a guard that caught every panic the stream raised while
+/// it ran. Both guards therefore reduce each error **inside**
+/// `catch_unwind`, where its payload is dropped: a destructor that panics
+/// is caught there and latched like any other panic, and the error that
+/// leaves the guard is rebuilt from the reduction ([`Self::rebuild`]),
+/// owning nothing.
+///
+/// What C is told is unchanged: ffmpeg-next reads an error's OS code
+/// where it has one and its kind otherwise, and the rebuilt error has
+/// exactly that code, or that kind. Only the payload's message is gone,
+/// and no `AVERROR` carried it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InertError {
+  /// An OS error, by its raw code.
+  Os(i32),
+  /// Any other error, by its kind.
+  Kind(io::ErrorKind),
+}
+
+impl InertError {
+  /// What `error` says. `error` itself — its payload with it — is dropped
+  /// here, so a guard that calls this inside `catch_unwind` catches a
+  /// destructor's panic too.
+  pub(crate) fn reduce(error: io::Error) -> Self {
+    let inert = match error.raw_os_error() {
+      Some(code) => Self::Os(code),
+      None => Self::Kind(error.kind()),
+    };
+    drop(error);
+    inert
+  }
+
+  /// What `error` says, read from it in place: for an error that owns no
+  /// payload of the caller's — one this guard rebuilt — where reading
+  /// runs no caller's code.
+  pub(crate) fn of(error: &io::Error) -> Self {
+    match error.raw_os_error() {
+      Some(code) => Self::Os(code),
+      None => Self::Kind(error.kind()),
+    }
+  }
+
+  /// An error that says the same and owns nothing: the OS code, or the
+  /// bare kind.
+  pub(crate) fn rebuild(self) -> io::Error {
+    match self {
+      Self::Os(code) => io::Error::from_raw_os_error(code),
+      Self::Kind(kind) => io::Error::from(kind),
+    }
+  }
+}
 
 /// A caller's byte source, wrapped so that a panic inside it becomes an
 /// I/O error instead of an abort.
@@ -154,9 +224,9 @@ impl ReadMeter {
   }
   /// Lifts the ceiling once the container is open and analysed.
   ///
-  /// The seat bounds *probing*: reading the media itself afterwards is
+  /// The slot bounds *probing*: reading the media itself afterwards is
   /// the caller's own business, packet by packet, and already bounded
-  /// by the packet seats.
+  /// by the packet slots.
   pub fn release(&self) {
     self.budget.store(u64::MAX, Ordering::Relaxed);
   }
@@ -199,7 +269,8 @@ impl<R> GuardedReader<R> {
     )
   }
 
-  /// Runs one call into the caller's reader under `catch_unwind`.
+  /// Runs one call into the caller's reader under `catch_unwind`, an
+  /// error it returns reduced there ([`InertError`]).
   fn guard<T>(&mut self, call: impl FnOnce(&mut R) -> io::Result<T>) -> io::Result<T> {
     let Self {
       inner,
@@ -211,8 +282,12 @@ impl<R> GuardedReader<R> {
     // makes the session terminal, so nothing reads through this reader
     // again except libavformat, whose own error state is already
     // poisoned by the error returned below.
-    match catch_unwind(AssertUnwindSafe(|| call(inner))) {
-      Ok(result) => result,
+    //
+    // An error the reader returns is reduced inside the catch, so its
+    // payload is dropped here and not in ffmpeg-next's `extern "C"`
+    // callback: a payload whose `Drop` panics takes the path below.
+    match catch_unwind(AssertUnwindSafe(|| call(inner).map_err(InertError::reduce))) {
+      Ok(result) => result.map_err(InertError::rebuild),
       Err(payload) => {
         latch.latch(&*payload);
         // The payload is described and then deliberately forgotten.
@@ -396,6 +471,101 @@ mod tests {
     assert!(quietly(|| guarded.read(&mut buf)).is_err());
     assert_eq!(latch.message().as_deref(), Some(UNNAMED));
     assert!(quietly(|| guarded.seek(SeekFrom::Start(0))).is_err());
+  }
+
+  /// An error's payload whose destructor panics — safe code, returned
+  /// rather than raised.
+  #[derive(Debug)]
+  struct HostilePayload;
+
+  impl core::fmt::Display for HostilePayload {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      f.write_str("an error whose payload panics when dropped")
+    }
+  }
+
+  impl std::error::Error for HostilePayload {}
+
+  impl Drop for HostilePayload {
+    fn drop(&mut self) {
+      panic!("the error's payload exploded");
+    }
+  }
+
+  /// A reader whose every call returns an error carrying that payload.
+  struct ReturnsAHostileError;
+
+  impl Read for ReturnsAHostileError {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+      Err(io::Error::new(io::ErrorKind::InvalidData, HostilePayload))
+    }
+  }
+
+  impl Seek for ReturnsAHostileError {
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+      Err(io::Error::new(io::ErrorKind::InvalidData, HostilePayload))
+    }
+  }
+
+  /// **An error whose payload panics on drop is reduced inside the
+  /// guard: the destructor's panic is latched and named.** ffmpeg-next
+  /// drops a returned error inside its `extern "C"` callback, where that
+  /// panic would abort the process; here it is caught where the error is
+  /// reduced, and what leaves the guard is the guard's own error.
+  #[test]
+  fn an_error_whose_payload_panics_on_drop_is_latched_and_named() {
+    // Each error is forgotten, not dropped: were the guard to hand the
+    // payload out, dropping it while this law fails would panic during
+    // the unwind and abort the test binary instead of naming the defect.
+    let (mut guarded, latch, _meter) = GuardedReader::new(ReturnsAHostileError, u64::MAX);
+    let mut buf = [0u8; 8];
+    let err = quietly(|| guarded.read(&mut buf)).expect_err("the read failed");
+    let said = err.to_string();
+    core::mem::forget(err);
+    assert_eq!(said, "the caller's reader panicked");
+    assert_eq!(
+      latch.message().as_deref(),
+      Some("the error's payload exploded")
+    );
+    let (mut guarded, latch, _meter) = GuardedReader::new(ReturnsAHostileError, u64::MAX);
+    let err = quietly(|| guarded.seek(SeekFrom::Start(0))).expect_err("the seek failed");
+    let said = err.to_string();
+    core::mem::forget(err);
+    assert_eq!(said, "the caller's reader panicked");
+    assert_eq!(
+      latch.message().as_deref(),
+      Some("the error's payload exploded")
+    );
+  }
+
+  /// **An error leaves the guard saying what it said, and owning
+  /// nothing**: an OS error keeps its code, any other its kind — all
+  /// ffmpeg-next reads of it — and neither carries a payload out.
+  #[test]
+  fn a_returned_error_keeps_its_code_or_kind_and_no_payload() {
+    struct Failing(io::ErrorKind);
+    impl Read for Failing {
+      fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(5))
+      }
+    }
+    impl Seek for Failing {
+      fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(self.0, "the reader's own words"))
+      }
+    }
+    let (mut guarded, latch, _meter) =
+      GuardedReader::new(Failing(io::ErrorKind::InvalidData), u64::MAX);
+    let mut buf = [0u8; 8];
+    let os = guarded.read(&mut buf).expect_err("the read failed");
+    assert_eq!(os.raw_os_error(), Some(5));
+    assert!(os.get_ref().is_none(), "no payload leaves the guard");
+    let custom = guarded
+      .seek(SeekFrom::Start(0))
+      .expect_err("the seek failed");
+    assert_eq!(custom.kind(), io::ErrorKind::InvalidData);
+    assert!(custom.get_ref().is_none(), "no payload leaves the guard");
+    assert!(latch.message().is_none(), "an error is not a panic");
   }
 
   #[test]
