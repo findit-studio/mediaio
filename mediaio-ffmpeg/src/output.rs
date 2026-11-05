@@ -446,7 +446,9 @@ pub enum OutputError {
   SinkWrite(#[source] ffmpeg_next::Error),
   /// The tap panicked in a call the writer guard made of it: the guard
   /// calls it no more, and what it saw of the sink stops where it
-  /// panicked ([`SinkTap`]; the [guard](crate::writer_guard)).
+  /// panicked ([`SinkTap`]; the [guard](crate::writer_guard)). A panic in
+  /// the closure [`Output::with_tap`] lends it to poisons it the same way:
+  /// the guard taps nothing after it, and this answers every later lend.
   #[error("the sink's tap panicked, and was not called again")]
   TapPanicked,
   /// [`Output::with_tap`] asked for a tap, and none was set.
@@ -962,6 +964,12 @@ impl<W> Output<W> {
   /// value out of it: the guard writes only within those calls, so the lock
   /// is never contended.
   ///
+  /// A panic in `f` unwinds to the caller and poisons the tap, as a panic
+  /// in the guard's call of it does: the guard taps nothing after it, and
+  /// every later call answers [`OutputError::TapPanicked`]. That fails
+  /// closed; a caller that judges the file in `f` keeps `f` from
+  /// panicking.
+  ///
   /// Refused by name: no tap set ([`OutputError::NoTap`]); a tap that
   /// panicked in a call the guard made of it ([`OutputError::TapPanicked`]),
   /// whose state its panic may have left anywhere; a tap of another type
@@ -983,7 +991,9 @@ impl<W> Output<W> {
   ///
   /// From the next write on, in any phase; a second replaces the first. A
   /// change that panics is named as the sink's panic
-  /// ([`OutputError::SinkPanic`]), and nothing more reaches the sink.
+  /// ([`OutputError::SinkPanic`]), and nothing more reaches the sink. Once
+  /// the position is lost ([`SinkTap::lost`]) no offset is left to hand it,
+  /// and the writes pass unchanged.
   #[cfg(any(test, feature = "test-support"))]
   #[doc(hidden)]
   pub fn set_write_plant(&mut self, change: impl FnMut(u64, &mut [u8]) + Send + 'static) {

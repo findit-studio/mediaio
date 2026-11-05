@@ -5,6 +5,12 @@
 //! its write context after each packet (`flush_if_needed`, `mux.c` 426–434
 //! in FFmpeg 9.0.1), so each packet reaches the sink, and the tap, at
 //! least once; the count the packets make is the same for N and for 2N.
+//!
+//! **The road it measures is the build's.** The gate runs it with the
+//! default features, which measure the production road alone; with
+//! `test-support` on, the measured write also runs the write plant's
+//! prelude — a clone of the slot's `Arc` and its lock, no plant set —
+//! which allocates nothing either.
 
 use std::{
   alloc::{GlobalAlloc, Layout, System},
