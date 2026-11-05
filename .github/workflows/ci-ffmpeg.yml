@@ -137,9 +137,12 @@ jobs:
     - name: The base and the read adapter, with test-support
       run: cargo test -p mediaio-ffmpeg -p mediadecode-ffmpeg --features test-support
     # The write adapter's `gpl` combinations are the GPL lane: against
-    # the full build, its GPL encoders are admitted by name.
+    # the full build, its GPL encoders are admitted by name. Its
+    # `test-support`, as the base's, runs in one lane of its own.
     - name: The write adapter, every feature combination
-      run: cargo hack test -p mediaencode-ffmpeg --feature-powerset --exclude-no-default-features
+      run: cargo hack test -p mediaencode-ffmpeg --feature-powerset --exclude-no-default-features --exclude-features test-support
+    - name: The write adapter, with test-support
+      run: cargo test -p mediaencode-ffmpeg --features test-support
     - name: The umbrella with ffmpeg
       run: cargo test -p mediaio --features ffmpeg
 
