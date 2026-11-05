@@ -1119,7 +1119,7 @@
 //!
 //! | the conversion | here |
 //! |---|---|
-//! | Matroska's DURATION tag: each track's latest end in seconds as a `double`, cut to an `int` for its hours and minutes (`matroskaenc.c` 3456–3478), on every timed track of a sink that seeks (2361–2375) | fixed (R27, Codex R26 [high]): an end whose seconds pass `INT_MAX` refused at its packet, by its duration, or by its time where that alone passes ([`matroska_tag_room`]; L211) |
+//! | Matroska's DURATION tag: each track's latest end in seconds as a `double`, cut to an `int` for its hours and minutes (`matroskaenc.c` 3456–3478), on every timed track where `IS_SEEKABLE` holds — `AVIO_SEEKABLE_NORMAL` and no `live` (90–91, 2351–2375) | fixed (R27, Codex R26 [high]): an end whose seconds pass `INT_MAX` refused at its packet, by its duration, or by its time where that alone passes ([`matroska_tag_room`]; L211). Applied on every road, which is FFmpeg's condition exactly (R28, ruled): the one road open, `Output::open` (`mediaio-ffmpeg/src/output.rs` 1053), builds its I/O context over `StreamIo::from_write_seek` (1076), which hands `avio_alloc_context` a seek callback (ffmpeg-next 9.0.0 `stream_io.rs` 148–160), so that `seekable` is `AVIO_SEEKABLE_NORMAL` (`aviobuf.c` 79), never cleared — the context's `flags` gain `AVFMT_FLAG_CUSTOM_IO` alone (`output.rs` 1115); no private option but `write_btrt` is set (1171), the header asked of none (1401), so that Matroska's `live` keeps its default of zero (`matroskaenc.c` 3680; `is_live` set nowhere else, 257, 91, 2643) and WebM's `dash` sets no `is_live`. The dominated bounds — the R24 end sum and R25's cluster bound (ruling 1a), L202's and L207's — stay as the guard of a road that does not seek or is live, should one open; until then no law reaches them, and their plants (P576, P586) cannot catch |
 //! | the MOV family's XDCAM compressor name: the frame rate cut to an `int` (`defined_frame_rate`, `movenc.c` 1898–1905) and doubled for an interlaced picture, `%d` (2761–2763) | fixed (R27): the doubled rate past `INT_MAX` refused at open ([`MuxOpenError::ConfigurationInvalid`]; L212) |
 //! | `defined_frame_rate` itself, and its comparisons in the XDCAM and AVC-Intra codec tags (1912–1960, 1974–2060) | exact: of a rate not below zero over a denominator above zero, at most `INT32_MAX` |
 //! | the MOV family's compressor height, `%d` (2761) | exact: an `int` |
@@ -1145,9 +1145,8 @@
 //! Codex R26 [medium], closed by class: a trailer's refusal made of what
 //! that trailer writes alone — never of a track, a box or a chunk it leaves
 //! out). Each judgment `finish` makes before the trailer, and the omission
-//! rule of the writer it mirrors. 7 rows: 1 fixed, 4 shown exact, 1
-//! unjudged — a value written cut, a ruling asked — and the report's
-//! lines.
+//! rule of the writer it mirrors. 7 rows: 2 fixed, 4 shown exact, and
+//! the report's lines.
 //!
 //! | the judgment | the writer, and what it leaves out | here |
 //! |---|---|---|
@@ -1155,8 +1154,8 @@
 //! | [`FfmpegMuxRefusal::MovieBox`]: the `moov`'s bound | the `trak`s written, and the chapter track (5339–5453) | exact: [`TrackState::trak_written`] |
 //! | [`FfmpegMuxRefusal::BitRates`], [`FfmpegMuxRefusal::CpbProperties`]: the `btrt`s and `esds`s | of the `trak`s written; AVIF's `moov` of a track of more than one sample (5441–5448) | exact |
 //! | [`FfmpegMuxRefusal::NegativeSpan`], [`FfmpegMuxRefusal::TimeWraps`]: the edit lists | `mov_write_edts_tag`, of a track of a sample — `start_dts` set — `use_editlist` on in a file of no fragments (4406–4419, 8201–8212); AVIF's of its own | exact: of a track of a sample, AVIF aside |
-//! | [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::FileSize`]: WAV's and Wave64's fact chunk | of a track not PCM (`wavenc.c` 455–462, 608–616), of a sink that seeks | exact: of such a track of a packet |
-//! | WAV's and Wave64's fact chunk of no packet | `maxpts − minpts + last_duration`, of `minpts` at `INT64_MAX`: `−INT64_MAX` samples, written cut in 32 or 64 bits (364–365, 451–462, 611–616) | unjudged: looser — a ruling asked (R27) |
+//! | [`FfmpegMuxRefusal::DurationTooLong`], [`PayloadRule::FileSize`]: WAV's and Wave64's fact chunk | of a track of any codec but integer PCM — float PCM and the compressed alike (`wavenc.c` 347–349, 455–462, 583, 608–616) — of a sink that seeks | exact: of such a track of a packet |
+//! | WAV's and Wave64's fact chunk of no packet | `maxpts − minpts + last_duration`, of `minpts` at `INT64_MAX`: `−INT64_MAX` samples, written cut in 32 or 64 bits (364–365, 451–462, 611–616) | fixed (R28, ruled; Codex R27 [medium]: a value FFmpeg writes wrong — one sample in WAV, `0x8000000000000001` in Wave64 — refused, R20's class): refused at `finish` of every such track, float PCM and the compressed alike ([`FfmpegMuxRefusal::NoFrame`]; L214) |
 //! | the report's lines at `finish` — the held packets, MP4's unjoined E-AC-3, its key frames, its last sample's duration | what each writer drops or rewrites | reports, no refusal |
 //!
 //! **MP4 and FLV, the configuration writers whose answers they ignore**
@@ -4144,12 +4143,14 @@ pub enum FfmpegMuxRefusal {
   /// it parsed (`movenc.c` 424–429, 619–623 in FFmpeg 9.0.1), of a track
   /// whose `trak` it writes (R27, Codex R26 [medium]): a file of no
   /// fragments leaves a track of no sample out of its `moov` (5350–5351,
-  /// 5430–5433). Where a check
+  /// 5430–5433). And (R28, ruled) WAV or Wave64 of a codec but integer PCM, whose
+  /// fact chunk counts a track of no packet as `−INT64_MAX` samples,
+  /// written cut (`wavenc.c` 364–365, 451–462, 611–616). Where a check
   /// needs the whole stream it is made at the
   /// first packet that decides it; this one no packet decides, so `finish`
   /// makes it, before the trailer, and names it in its fault
   /// ([`MuxFault::refusal`]).
-  #[error("track {} took no frame, without which the container's trailer fails", .track.get())]
+  #[error("track {} took no frame, without which the container's trailer fails or writes it wrong", .track.get())]
   NoFrame {
     /// The track.
     track: TrackIndex,
@@ -8094,9 +8095,12 @@ fn ts_pcr_period(
 /// latest end in seconds as a `double` — `track->duration *
 /// av_q2d(st->time_base)` — and converts that to `int` for its hours and
 /// minutes, undefined where the seconds, cut toward zero, pass `INT_MAX`
-/// (C11 6.3.1.4). Every timed track's tag is reserved on a sink that seeks
-/// (2361–2375), as the base's does. The seconds grow with the ticks, in
-/// the same `double` arithmetic as C's, so the latest is found by halving.
+/// (C11 6.3.1.4). Every timed track's tag is reserved where `IS_SEEKABLE`
+/// holds — the I/O context `AVIO_SEEKABLE_NORMAL`, and no `live` option
+/// (90–91, 2351–2375) — which every road this muxer opens meets (R28,
+/// ruled; the module's census of narrowing conversions). The seconds grow
+/// with the ticks, in the same `double` arithmetic as C's, so the latest
+/// is found by halving.
 fn matroska_tag_room(time_base: Timebase) -> i64 {
   let scale = f64::from(time_base.num()) / f64::from(time_base.den().get());
   let fits = |ticks: i64| (ticks as f64) * scale < 2_147_483_648.0;
@@ -12012,6 +12016,13 @@ where
   /// it, past the samples the chunk counts ([`PayloadRule::FileSize`]).
   fn fact_chunks_refused(&self) -> Option<FfmpegMuxRefusal> {
     for (index, state) in self.tracks.iter().enumerate() {
+      let track = TrackIndex::new(index);
+      // Of no packet, the chunk counts `maxpts − minpts + last_duration` of
+      // `minpts` at `INT64_MAX` — `−INT64_MAX` samples, written cut in 32 or
+      // 64 bits (`wavenc.c` 364–365, 451–462, 611–616): refused (R28, ruled).
+      if state.rules.fact_samples.is_some() && state.wav_last.is_none() {
+        return Some(FfmpegMuxRefusal::NoFrame { track });
+      }
       let (Some(limit), Some((earliest, latest)), Some((handed, offered)), Some((_, time_base))) = (
         state.rules.fact_samples,
         state.presented,
@@ -12020,7 +12031,6 @@ where
       ) else {
         continue;
       };
-      let track = TrackIndex::new(index);
       if handed > i128::from(i32::MAX) {
         return Some(FfmpegMuxRefusal::DurationTooLong {
           track,

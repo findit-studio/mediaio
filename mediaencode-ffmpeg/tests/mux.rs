@@ -8381,7 +8381,17 @@ fn l87_the_riff_formats_refuse_at_open_what_their_audio_header_cannot_count() {
     );
     match result {
       Ok((muxer, _)) => {
-        muxer.finish().expect("finished");
+        // Of no packet, a track but integer PCM's fact chunk is refused
+        // at `finish` (R28, ruled; L214): the open is this law's.
+        if let Err(fault) = muxer.finish() {
+          assert_eq!(
+            fault.refusal(),
+            Some(FfmpegMuxRefusal::NoFrame {
+              track: TrackIndex::new(0)
+            }),
+            "{name}: finished, or refused a fact chunk of no packet"
+          );
+        }
         Ok(())
       }
       Err(error) => {
@@ -21075,4 +21085,86 @@ fn l213_mp4_leaves_a_track_of_no_sample_unjudged() {
     "a frame",
   );
   muxer.finish().expect("finished, the AC-3 track left out");
+}
+
+/// L214 (R28, ruled; Codex R27 [medium]): WAV and Wave64 count a track of
+/// any codec but integer PCM in their fact chunk as `maxpts − minpts +
+/// last_duration`, `minpts` at `INT64_MAX` before the first packet
+/// (`wavenc.c` 364–365, 451–462, 611–616): of no packet, `−INT64_MAX`
+/// samples, written cut — one in WAV's 32 bits, `0x8000000000000001` in
+/// Wave64's 64. Float PCM and IMA ADPCM of no packet, in both, refused at
+/// `finish` by name, nothing written past the refusal; float PCM of one
+/// packet, its duration stated at the sample rate, written, its fact chunk
+/// reading back the packet's samples; integer PCM of no packet, of no fact
+/// chunk, finished.
+///
+/// PLANT: the track of no packet unjudged; judged of integer PCM too.
+#[test]
+fn l214_the_riff_formats_refuse_a_fact_chunk_of_no_packet() {
+  let Some(corpus) = Corpus::new() else { return };
+  #[rustfmt::skip]
+  let adpcm = generated(&corpus, "adpcm-ima.wav", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000:duration=6",
+    "-ac", "1", "-c:a", "adpcm_ima_wav",
+  ]);
+  #[rustfmt::skip]
+  let float = generated(&corpus, "l214-f32.mkv", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.2",
+    "-ac", "2", "-c:a", "pcm_f32le",
+  ]);
+  for source in [&float, &adpcm] {
+    for container in ["wav", "w64"] {
+      let target = output(&corpus, &format!("l214-none.{container}"));
+      let muxer = muxer_into(
+        &target,
+        ContainerName::new(container),
+        table_of(source, TrackKind::Audio),
+      );
+      let before = std::fs::metadata(&target).expect("the file").len();
+      let fault = muxer.finish().expect_err("a fact chunk of no packet");
+      assert_eq!(fault.stage(), MuxStage::Trailer, "{container}");
+      assert_eq!(
+        fault.refusal(),
+        Some(FfmpegMuxRefusal::NoFrame {
+          track: TrackIndex::new(0)
+        }),
+        "{container}"
+      );
+      assert_eq!(
+        std::fs::metadata(&target).expect("the file").len(),
+        before,
+        "{container}: nothing written past the refusal"
+      );
+    }
+  }
+  // Integer PCM writes no fact chunk (`wavenc.c` 347–349, 455, 583, 608): of no packet,
+  // finished.
+  for container in ["wav", "w64"] {
+    let muxer = muxer_into(
+      &output(&corpus, &format!("l214-integer.{container}")),
+      ContainerName::new(container),
+      table_of(&pcm_mkv(&corpus), TrackKind::Audio),
+    );
+    muxer.finish().expect("no fact chunk to count");
+  }
+  let (_, frames) = first_track(&float, TrackKind::Audio, 1);
+  // Stated exactly, at the sample rate: the chunk counts the duration.
+  let rate = Timebase::new(1, NonZeroI32::new(48_000).expect("non-zero"));
+  let samples = audio_of(&frames[0]).data().as_ref().len() / 8;
+  let packet = audio_of(&frames[0])
+    .with_pts(Some(Timestamp::new(0, rate)))
+    .with_dts(Some(Timestamp::new(0, rate)))
+    .with_duration(Some(Timestamp::new(samples as i64, rate)));
+  let target = output(&corpus, "l214-one.wav");
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::new("wav"),
+    table_of(&float, TrackKind::Audio),
+  );
+  wrote(
+    muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), packet)),
+    "a packet",
+  );
+  muxer.finish().expect("finished");
+  assert_eq!(wav_fact(&target) as usize, samples, "the packet's samples");
 }
