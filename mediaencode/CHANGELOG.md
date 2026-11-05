@@ -9,7 +9,7 @@ The FFmpeg-dependent crates — `mediaio-ffmpeg`, `mediadecode-ffmpeg`,
 `mediaencode-ffmpeg` and `mediaio` — release in lockstep; every other
 crate moves only when it changes.
 
-## [0.19.1] - unreleased
+## [0.20.0] - unreleased
 
 ### Added
 
@@ -19,6 +19,13 @@ crate moves only when it changes.
   compares the counts it is handed, and refuses only after taking the
   packet. A backend applies it to its stored representation, not to the
   instants offered, names it first and hands the packet back.
+
+### Changed
+
+- **BREAKING: smol-bytes 0.2 / mediaframe 0.13.** The `mediaspine` this
+  crate re-exports (`mediaspine` itself, `Received`, `Sent`) is 0.2, on
+  `mediaframe` 0.13 and its `smol-bytes` 0.2. This is why the release is
+  0.20.0 rather than 0.19.1.
 
 ## [0.19.0] - 2026-10-16
 

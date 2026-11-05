@@ -7,7 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with the rest of the family's.
 
-## [0.1.2] - unreleased
+## [0.2.0] - unreleased
 
 ### Added
 
@@ -44,6 +44,12 @@ Its versions are its own: they do not move with the rest of the family's.
 
 ### Changed
 
+- **BREAKING: smol-bytes 0.2 / mediaframe 0.13.** The `mediaframe` this
+  crate re-exports (`cfa`, `color`, `frame`, `demuxer`'s
+  `TrackDisposition`) and whose types its vocabulary carries is 0.13, and
+  its public `smol-bytes` is 0.2, so a caller holding a `mediaframe` 0.12
+  or `smol-bytes` 0.1 value no longer type-checks against this release.
+  This is why the release is 0.2.0 rather than 0.1.2.
 - `KeptReason::MaybeField` names, after a sequence parameter set that lets
   fields in, a slice the reading cannot read for its field, where it named
   every picture of `nal_ref_idc` 0.

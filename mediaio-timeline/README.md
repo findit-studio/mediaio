@@ -514,7 +514,7 @@ and the tests on every combination of the three features.
 Without `std`:
 
 ```toml
-mediaio-timeline = { version = "0.4", default-features = false, features = ["alloc"] }
+mediaio-timeline = { version = "0.5", default-features = false, features = ["alloc"] }
 ```
 
 ## Requirements
