@@ -81,6 +81,12 @@ crate moves only when it changes.
   a context still being built asks nothing of the sink.
   `Output::abandon` (new) ends an output as a failed call does, for a
   caller whose own judgment ends it — a trailer it refuses by name.
+- **A sink that failed a write is not called again (R27).** The writer
+  guard latches every failed write but an interrupted one — one that
+  takes no byte of a buffer of some, or more than it was handed, among
+  them — and every failed flush, and refuses every later write, seek and
+  flush without reaching the sink: `avio_seek` seeks after the flush it
+  failed, and `avio_size` asks the size, inside the same call.
 - `Output::guessed_audio_duration`: the duration libavformat gives an
   audio packet that states none (`guess_pkt_duration`), of the stream's
   parameters and the packet's size, for a muxer that counts durations as

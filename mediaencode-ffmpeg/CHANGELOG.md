@@ -504,6 +504,14 @@ crate moves only when it changes.
   the first decode time is held to `(i64::MAX − period) / 300`, of the
   period FFmpeg chooses of the stream's frame (`TimeWraps`), where FFmpeg's
   first sum against the reference a period before zero overflowed.
+- **Matroska's DURATION tag, and the MOV family's XDCAM name (R27).**
+  Matroska's trailer writes each track's latest end in seconds cut to an
+  `int`: a packet whose end passes `INT_MAX` seconds is refused
+  (`DurationTooLong`, or `TimeWraps` by its time). The MOV family's
+  interlaced XDCAM picture of a frame rate whose double passes an `int` is
+  refused at open (`ConfigurationInvalid`). An MP4 AC-3 or E-AC-3 track of
+  no sample, which MP4 leaves out of its `moov`, no longer fails `finish`
+  (`NoFrame`).
 - **MP4's APV `apvC`, by its parse of the packets (R11).** MP4 records each
   distinct frame information of a PBU type it parses out of the packets
   and counts them in 8 bits, its parse failing at the 256th, its answer
