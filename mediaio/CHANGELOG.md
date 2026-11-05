@@ -11,16 +11,25 @@ crate moves only when it changes.
 
 ## [Unreleased]
 
-## [0.21.1] - unreleased
+## [0.22.0] - unreleased
 
 ### Added
 
-- **The `ffmpeg` feature's write adapter is `mediaencode-ffmpeg` 0.21.1,
+- **The `ffmpeg` feature's write adapter is `mediaencode-ffmpeg` 0.22.0,
   with the FFmpeg muxer** (`ffmpeg::encode`): open a container by name,
   refusals by name, a report of what a container drops, and packets by
-  copy. `encode` is `mediaencode` 0.19.1, whose muxers refuse a packet
+  copy. `encode` is `mediaencode` 0.20.0, whose muxers refuse a packet
   presented before it is decoded (`MuxRefusal::PtsBeforeDts`,
   `check_presentation_order`). See their changelogs.
+
+### Changed
+
+- **BREAKING: smol-bytes 0.2 / mediaframe 0.13.** Every member this crate
+  re-exports moves with them: `spine` is `mediaspine` 0.2, `decode` and
+  `encode` are `mediadecode` and `mediaencode` 0.20, `timeline` is
+  `mediaio-timeline` 0.5, the `ffmpeg` adapters are 0.22, `webcodecs` is
+  `mediadecode-webcodecs` 0.20, and `frame` is `mediaframe` 0.13, whose
+  text is `smol-bytes` 0.2's.
 
 ## [0.21.0] - 2026-10-24
 

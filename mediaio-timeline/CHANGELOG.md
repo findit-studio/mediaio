@@ -7,6 +7,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with `mediadecode`'s.
 
+## [0.5.0] - unreleased
+
+### Changed
+
+- **BREAKING: smol-bytes 0.2 / mediaframe 0.13.** The family moves to
+  both; this crate takes no `mediaframe`, and the text it carries is now
+  `smol-bytes` 0.2's `Utf8Bytes`: `ClipId`, a clip's name, a `MediaRef`'s
+  locator and reel, a marker's name, `Metadata` and `ReaderMetadata`. A
+  caller holding a `smol-bytes` 0.1 value no longer type-checks against
+  this release. No source line changed.
+
 ## [0.4.0] - 2026-10-23
 
 ### Added

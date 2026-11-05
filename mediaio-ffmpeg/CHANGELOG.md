@@ -9,7 +9,7 @@ The FFmpeg-dependent crates — `mediaio-ffmpeg`, `mediadecode-ffmpeg`,
 `mediaencode-ffmpeg` and `mediaio` — release in lockstep; every other
 crate moves only when it changes.
 
-## [0.21.1] - unreleased
+## [0.22.0] - unreleased
 
 ### Added
 
@@ -154,6 +154,15 @@ crate moves only when it changes.
   subsampling and its first component's depth — or `None` where it keeps
   no descriptor for the integer asked, any integer a valid question
   (`av_pix_fmt_desc_get`).
+
+### Changed
+
+- **BREAKING: smol-bytes 0.2 / mediaframe 0.13.** The text this crate
+  hands out is `smol-bytes` 0.2's `Utf8Bytes` (`CodecId::name`,
+  `ContainerFormat::new`, `lossy_text` and the rest), and the frames and
+  vocabulary it converts are `mediaframe` 0.13's and `mediaspine` 0.2's.
+  The FFmpeg crates release in lockstep, so `mediadecode-ffmpeg`,
+  `mediaencode-ffmpeg` and `mediaio` are 0.22.0 as well.
 
 ## [0.21.0] - 2026-10-24
 

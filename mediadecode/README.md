@@ -86,7 +86,7 @@ implementations live in sibling crates:
 
 ```toml
 [dependencies]
-mediadecode = { version = "0.19", default-features = false, features = ["alloc"] }
+mediadecode = { version = "0.20", default-features = false, features = ["alloc"] }
 ```
 
 ## Usage

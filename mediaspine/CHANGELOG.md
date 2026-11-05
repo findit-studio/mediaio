@@ -7,7 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with the rest of the family's.
 
-## [0.1.2] - unreleased
+## [0.2.0] - unreleased
 
 ### Added
 
@@ -20,6 +20,68 @@ Its versions are its own: they do not move with the rest of the family's.
   drops the disposition, which `disposition()` reads before the split;
   `TrackDescription::into_parts_with_disposition` splits a description
   into every part, the disposition among them, losslessly.
+- **`nal`: interlaced H.264, read field by field.** Where a sequence
+  parameter set lets a picture be a field (`frame_mbs_only_flag` 0),
+  `NalStream` no longer keeps every packet. It reads each slice's
+  `field_pic_flag` and `bottom_field_flag` as FFmpeg's decoder does: by the
+  sequence parameter set the slice's picture parameter set was read on,
+  from FFmpeg's parameter-set lists, each entry as far as the reading
+  knows it. It marks a packet that holds a frame — an MBAFF frame among
+  them — or both fields of a pair FFmpeg joins, while no first field may
+  wait at it, and a pair only while no field may have gone unmatched. A
+  pair split across packets, as FFmpeg's parser splits a raw or MPEG-TS
+  stream's, is kept whole, both halves: dropping one moves the other's
+  pairing, and the next frame's. Two slices' parameter sets are held to
+  each other by what FFmpeg compares — a second field's picture parameter
+  set to the active one's `sps_id`, `transform_8x8_mode` and sequence
+  parameter set object, an object FFmpeg keeps only for a set read again
+  byte for byte — never by their ids; and a picture whose sequence
+  parameter set gives the decoder another size, bit depth, chroma format,
+  sample aspect ratio or colour matrix is taken as FFmpeg takes it, its
+  context set up again and flushed.
+- `KeptReason::UnpairedField`, `KeptReason::PendingField` and
+  `KeptReason::UnmatchedFields`: an interlaced packet kept for its fields.
+
+### Changed
+
+- **BREAKING: smol-bytes 0.2 / mediaframe 0.13.** The `mediaframe` this
+  crate re-exports (`cfa`, `color`, `frame`, `demuxer`'s
+  `TrackDisposition`) and whose types its vocabulary carries is 0.13, and
+  its public `smol-bytes` is 0.2, so a caller holding a `mediaframe` 0.12
+  or `smol-bytes` 0.1 value no longer type-checks against this release.
+  This is why the release is 0.2.0 rather than 0.1.2.
+- `KeptReason::MaybeField` names, after a sequence parameter set that lets
+  fields in, a slice the reading cannot read for its field, where it named
+  every picture of `nal_ref_idc` 0.
+- The reference picture and the intra slice an H.264 reading awaits are
+  counted only where FFmpeg decodes them — a picture it starts or joins at
+  a slice before any unit it may stop at under `AV_EF_EXPLODE`, a slice it
+  refuses none — under every sequence parameter set, and the reference
+  picture is awaited again after a picture at which the decoder may set its
+  context up again, which flushes it (`KeptReason::AwaitingReference`).
+- An H.264 sequence parameter set's id is read as FFmpeg's
+  `get_ue_golomb_31` reads it, 31 among the ids FFmpeg takes.
+- An H.264 slice of a picture parameter set that carries redundant counts
+  is read on to its `redundant_pic_cnt`, as FFmpeg reads it, where every
+  such slice was one the reading could not read: a primary picture's
+  slice is counted, and a redundant one, which FFmpeg discards, is no
+  reference picture, no intra slice and no field. A packet of redundant
+  slices alone is marked whatever their `nal_ref_idc`, but where a first
+  field may wait at it, or an IDR slice keeps it.
+- A slice FFmpeg refuses in its header — one naming a picture parameter
+  set it does not hold, among them — makes no picture, and its
+  `nal_ref_idc` counts for nothing, as a discarded redundant slice's: a
+  packet of such slices, or of discarded ones, alone is marked, no rule of
+  a picture holding it (`KeptReason::Referenced`, `AwaitingReference`,
+  `AwaitingIntraSlice`, `IntraOnly`, `FrameNumGaps`, `ReorderUnfixed`, and
+  before any sequence parameter set `MaybeField`), but where a first field
+  may wait at it, or an IDR unit keeps it.
+- The reference picture is awaited again at an IDR unit, which FFmpeg
+  resets at whatever it makes of the slice, and after a packet not read
+  whole that may hold one, or a start that may set the decoder's context
+  up again (`KeptReason::AwaitingReference`); and a packet of slices that
+  start no picture is kept while a first field may wait, which FFmpeg ends
+  again at it (`KeptReason::PendingField`).
 
 ## [0.1.1] - 2026-10-23
 
