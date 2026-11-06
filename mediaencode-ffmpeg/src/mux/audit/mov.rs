@@ -927,7 +927,7 @@ impl MovWalk {
           _ if dsi.tag == 5 && read >= 35 && read - 35 < dsi.len => {
             dsi.word = (dsi.word << 8) | u32::from(byte);
             dsi.read += 1;
-            if dsi.read % 4 == 0 {
+            if dsi.read.is_multiple_of(4) {
               dsi.fold = fold(dsi.fold, u64::from(dsi.word));
             }
           }

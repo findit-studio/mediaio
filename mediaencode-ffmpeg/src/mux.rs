@@ -11188,12 +11188,17 @@ struct Hooks {
   /// A plant over the bytes libavformat hands the sink
   /// ([`Output::set_write_plant`]).
   #[cfg(feature = "test-support")]
-  plant: Option<Box<dyn FnMut(u64, &mut [u8]) + Send>>,
+  plant: Option<WritePlant>,
   /// What runs around libavformat's take of each packet
   /// ([`Output::set_write_hook`]).
   #[cfg(feature = "test-support")]
   packets: Option<Box<dyn FnMut(bool) + Send>>,
 }
+
+/// A plant over the bytes libavformat hands the sink: each run's offset,
+/// and its bytes, rewritten in place ([`Output::set_write_plant`]).
+#[cfg(feature = "test-support")]
+type WritePlant = Box<dyn FnMut(u64, &mut [u8]) + Send>;
 
 /// Test support: what a law runs inside a muxer's open
 /// ([`CarrierMuxer::open_hooked`]).
@@ -12523,9 +12528,7 @@ where
   /// against the tracks' expectations ([`audit::mov_verdict`]). A tap that
   /// panicked saw the file no further: the file is not passed.
   fn written_otherwise(&mut self) -> Option<WrittenOtherwise> {
-    if self.audit.is_none() {
-      return None;
-    }
+    self.audit?;
     let at = u64::try_from(self.output.position()).unwrap_or(0);
     // A still AVIF writes no `moov`: its first stream of one frame
     // (`avif_write_trailer`, `movenc.c` 9164, 9183–9187).
@@ -12646,8 +12649,8 @@ where
       .filter_map(|(index, state)| match state.carried {
         Carried::Palette(colours) => {
           let mut bytes = [0; 64];
-          for (word, colour) in bytes.chunks_exact_mut(4).zip(colours) {
-            word.copy_from_slice(&colour.to_be_bytes());
+          for (word, colour) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(colours) {
+            *word = colour.to_be_bytes();
           }
           Some((TrackIndex::new(index), bytes))
         }
@@ -12671,9 +12674,7 @@ where
   /// no tap is on the output: the laws' seam, which shows the audit runs.
   #[doc(hidden)]
   pub fn audited_bytes(&mut self) -> Option<u64> {
-    if self.audit.is_none() {
-      return None;
-    }
+    self.audit?;
     self
       .output
       .with_tap(|audit: &mut Audit| audit.frontier())
