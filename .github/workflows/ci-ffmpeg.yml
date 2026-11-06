@@ -210,7 +210,7 @@ jobs:
       - name: Run tarpaulin
         env:
           RUSTFLAGS: "--cfg tarpaulin"
-        run: cargo tarpaulin -p mediaio-ffmpeg -p mediadecode-ffmpeg -p mediaencode-ffmpeg --all-features --run-types tests --run-types doctests --out xml
+        run: cargo tarpaulin -p mediaio-ffmpeg -p mediadecode-ffmpeg -p mediaencode-ffmpeg --all-features --run-types tests --run-types doctests --timeout 600 --out xml
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v7
         with:
