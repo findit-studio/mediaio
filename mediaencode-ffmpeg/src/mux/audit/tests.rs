@@ -145,14 +145,19 @@ fn expected(sizes: &[u32]) -> ExpectedTrak {
 
 /// The movie's parts of an MP4 file of no `udta` and no `pssh`: the
 /// synthetic files'.
-fn mp4() -> ExpectedMovie {
+fn mp4() -> ExpectedMovie<'static> {
   ExpectedMovie::default()
 }
 
-/// The movie's parts of an AVIF of `media` bytes of payload.
-fn avif(media: u64) -> ExpectedMovie {
+/// The one map of a file of one stream, track 0's.
+const ONE_STREAM: [TrackIndex; 1] = [TrackIndex::new(0)];
+
+/// The movie's parts of an AVIF of `media` bytes of payload, its one stream
+/// track 0's.
+fn avif(media: u64) -> ExpectedMovie<'static> {
   ExpectedMovie {
     media: Some(media),
+    streams: &ONE_STREAM,
     ..ExpectedMovie::default()
   }
 }
@@ -1429,7 +1434,7 @@ fn aac_groups(samples: u64) -> Option<RollGroups> {
 
 /// The movie's parts the muxer expects: MP4's `udta` of `user_data` bytes
 /// and a `pssh` of each of `pssh`'s payload bytes.
-fn movie_of(user_data: MovieUserData, pssh: &[u64]) -> ExpectedMovie {
+fn movie_of(user_data: MovieUserData, pssh: &[u64]) -> ExpectedMovie<'static> {
   let mut protection = Runs::default();
   for &len in pssh {
     protection.push(len, 1);
@@ -1438,6 +1443,7 @@ fn movie_of(user_data: MovieUserData, pssh: &[u64]) -> ExpectedMovie {
     media: None,
     user_data,
     protection,
+    streams: &ONE_STREAM,
   }
 }
 

@@ -2973,20 +2973,20 @@ fn pssh_written(bytes: &[u8], boxes: &mut Runs) {
 }
 
 /// The MOV family's `pssh` boxes, exactly ([`pssh_written`]): every
-/// stream's in its order — a cover's among them — of each track's
-/// encryption initialization side data (`mov_write_moov_tag`, `movenc.c`
-/// 5449–5451); a track not written is no stream.
-fn protection_written<D, S>(roads: &[Road], tracks: &[TrackDescription<Ffmpeg, D, S>]) -> Runs
+/// stream's in its order — a cover's among them — through the one map
+/// `streams` ([`CarrierMuxer::streams`]), of each track's encryption
+/// initialization side data (`mov_write_moov_tag`, `movenc.c` 5449–5451);
+/// a track not written is no stream.
+fn protection_written<D, S>(
+  streams: &[TrackIndex],
+  tracks: &[TrackDescription<Ffmpeg, D, S>],
+) -> Runs
 where
   D: AsRef<[u8]>,
   S: core::borrow::Borrow<CodecTicket>,
 {
   let mut boxes = Runs::default();
-  for (_, description) in roads
-    .iter()
-    .zip(tracks)
-    .filter(|(road, _)| **road != Road::NotWritten)
-  {
+  for description in streams.iter().map(|track| &tracks[track.get()]) {
     let ticket: &CodecTicket = description.side_data().borrow();
     if let Some(entry) = ticket
       .coded_side_data()
@@ -12142,13 +12142,14 @@ where
       movie_timescale,
     ));
     // The chapter track the write audit expects: its samples made here, as
-    // movenc makes them at its header, its id the streams' count and one
-    // (`mov_setup_track_ids`, `movenc.c` 5270–5279).
+    // movenc makes them at its header, its id the streams' count — the one
+    // map's — and one (`mov_init`, `movenc.c` 8324–8327;
+    // `mov_setup_track_ids`, 5270–5279).
     let chapter_trak = audit_mode
       .filter(|_| audited.chapter_track() && !chapters.is_empty())
       .map(|_| ExpectedTrak {
         track: None,
-        id: u32::try_from(output.streams() + 1).unwrap_or(u32::MAX),
+        id: u32::try_from(streams.len() + 1).unwrap_or(u32::MAX),
         samples: chapter_samples_expected(chapters, &spans, movie_timescale),
         flags: Some(FlagTables::default()),
         ..ExpectedTrak::default()
@@ -12173,32 +12174,36 @@ where
     // The write audit's tap, before the header writes the first byte: of
     // the MOV family, its table made here for every track and the chapter
     // track; of FLV, its audio and video tracks — each its tags' type, its
-    // index among its kind's and its sequence header's bytes before its
+    // number among its kind's and its sequence header's bytes before its
     // record — and the pre-tags it writes (findit-studio/mediaio#95; R11);
     // of Matroska and WebM, its TrackEntries — a stream's each, but an
     // attachment's — each the offset its CodecPrivate is folded from; of
-    // raw FLAC, none.
+    // raw FLAC, none. FLV's tracks and Matroska's TrackEntries in the
+    // streams' order, through the one map.
     match audit_mode {
       Some(Walked::Mov(mode)) => output.set_tap(Audit::mov(mode, tracks.len() + 1)),
       Some(Walked::Flv) => {
-        let flv_tracks: Vec<FlvTrack> = tracks
+        let flv_tracks: Vec<FlvTrack> = streams
           .iter()
-          .zip(&roads)
           .enumerate()
-          .filter(|(_, (description, road))| {
-            **road == Road::Timed
-              && matches!(description.kind(), TrackKind::Audio | TrackKind::Video)
+          .filter(|(_, track)| {
+            roads[track.get()] == Road::Timed
+              && matches!(
+                tracks[track.get()].kind(),
+                TrackKind::Audio | TrackKind::Video
+              )
           })
-          .map(|(index, (description, _))| {
-            let kind_index = kind_index(&tracks, index);
+          .map(|(ordinal, track)| {
+            let description = &tracks[track.get()];
+            let number = flv_number(&tracks, &streams[..ordinal], description.kind());
             FlvTrack {
               kind: if description.kind() == TrackKind::Audio {
                 8
               } else {
                 9
               },
-              index: u8::try_from(kind_index).unwrap_or(u8::MAX),
-              header: flv_sequence_header(description.kind(), description.codec(), kind_index)
+              index: u8::try_from(number).unwrap_or(u8::MAX),
+              header: flv_sequence_header(description.kind(), description.codec(), number)
                 .unwrap_or(0),
               emptiness: description.codec() == CodecId::VVC,
             }
@@ -12207,17 +12212,19 @@ where
         output.set_tap(Audit::flv(&flv_tracks, flv_pre_tags))
       }
       Some(Walked::Mkv) => {
-        let mkv_tracks: Vec<MkvTrack> = tracks
+        let mkv_tracks: Vec<MkvTrack> = streams
           .iter()
-          .zip(&roads)
-          .filter(|(_, road)| **road == Road::Timed)
-          .map(|(description, _)| MkvTrack {
-            fold_from: mkv_comment_mask(
-              audited,
-              description.codec(),
-              LayoutView::of(description.side_data().ch_layout()),
-            )
-            .map(|_| FLAC_HEADER),
+          .filter(|track| roads[track.get()] == Road::Timed)
+          .map(|track| {
+            let description = &tracks[track.get()];
+            MkvTrack {
+              fold_from: mkv_comment_mask(
+                audited,
+                description.codec(),
+                LayoutView::of(description.side_data().ch_layout()),
+              )
+              .map(|_| FLAC_HEADER),
+            }
           })
           .collect();
         output.set_tap(Audit::mkv(&mkv_tracks))
@@ -12245,9 +12252,9 @@ where
     let header = output.position();
     let shifts = output.shifts_early_times();
     let mut track_states = Vec::with_capacity(states.len());
-    // MPEG-TS's streams, by index, with their tracks, kinds and the period
-    // of the clock reference on each (R26, Codex R25 [high]).
-    let mut ts_pcr: Vec<(usize, usize, TrackKind, i64)> = Vec::new();
+    // MPEG-TS: each track's period of the clock reference on its stream, by
+    // the track (R26, Codex R25 [high]).
+    let mut ts_pcr: Vec<Option<i64>> = vec![None; states.len()];
     for (index, (kind, stream, road, filter)) in states.into_iter().enumerate() {
       let track = TrackIndex::new(index);
       let mut rules = PacketRules::default();
@@ -12329,11 +12336,10 @@ where
               TrackParams::Video(params) => params.frame_rate(),
               _ => None,
             };
-            ts_pcr.push((
-              stream,
-              index,
+            ts_pcr[index] = Some(ts_pcr_period(
               kind,
-              ts_pcr_period(kind, (samples, codec.sample_rate()), frame_rate),
+              (samples, codec.sample_rate()),
+              frame_rate,
             ));
           }
           // WAV's fact chunk counts the last duration libavformat hands
@@ -12365,11 +12371,13 @@ where
             );
           }
           if audited == Audited::Flv {
+            // The stream's number among its kind's, through the one map.
+            let number = flv_number(&tracks, &streams[..stream], kind);
             rules.flv_tag = Some(FlvTag::of(
               kind,
               codec.codec(),
               codec.extradata(),
-              kind_index(&tracks, index),
+              number,
               filters && codec.extradata().is_empty(),
             ));
             rules.configuration_absent =
@@ -12379,7 +12387,7 @@ where
             // the header writes of it (A22; R12).
             let extradata = codec.extradata();
             flv.config = (extradata.len() as u64, config_fold(CONFIG_SEED, extradata));
-            if flv_sequence_header(kind, codec.codec(), kind_index(&tracks, index)).is_some() {
+            if flv_sequence_header(kind, codec.codec(), number).is_some() {
               flv.sequences.push(flv_record(codec.codec(), extradata), 1);
               flv.trusted = rules
                 .writer
@@ -12545,7 +12553,7 @@ where
     let (movie_user_data, protection) = match audited {
       Audited::Mov(mode) => (
         movie_user_data(mode, &roads, &tracks, chapters),
-        protection_written(&roads, &tracks),
+        protection_written(&streams, &tracks),
       ),
       _ => (MovieUserData::None, Runs::default()),
     };
@@ -12578,14 +12586,17 @@ where
       >= 2;
     // MPEG-TS writes its clock reference on one stream: the first video
     // stream, else the first (`select_pcr_streams`, `mpegtsenc.c`
-    // 1072–1100; one service, of no program).
-    ts_pcr.sort_by_key(|&(stream, ..)| stream);
-    if let Some(&(_, index, _, period)) = ts_pcr
-      .iter()
-      .find(|&&(_, _, kind, _)| kind == TrackKind::Video)
-      .or(ts_pcr.first())
-    {
-      track_states[index].rules.ts_pcr_period = Some(period);
+    // 1072–1100; one service, of no program) — in the streams' order,
+    // through the one map.
+    let pcr = |video: bool| {
+      streams.iter().copied().find(|track| {
+        ts_pcr[track.get()].is_some()
+          && (!video || track_states[track.get()].kind == TrackKind::Video)
+      })
+    };
+    let pcr = pcr(true).or_else(|| pcr(false));
+    if let Some(track) = pcr {
+      track_states[track.get()].rules.ts_pcr_period = ts_pcr[track.get()];
     }
     for state in &mut track_states {
       state.rules.interleaves = interleaves;
@@ -13063,40 +13074,34 @@ where
       ))
     };
     if walked == Walked::Flac {
-      // Raw FLAC's one audio track; of none, which `flac_init` refuses, a
-      // structure no writer makes, never `Ok` ([`audit::flac_verdict`]).
-      let expected = self
-        .tracks
-        .iter()
-        .enumerate()
+      // Raw FLAC's one audio stream's track, through the one map; of none,
+      // which `flac_init` refuses, a structure no writer makes, never `Ok`
+      // ([`audit::flac_verdict`]).
+      let expected = in_stream_order(&self.tracks, &self.streams)
         .find(|(_, state)| state.stream.is_some() && state.kind == TrackKind::Audio)
-        .map(|(index, state)| (TrackIndex::new(index), state.flac_mask));
+        .map(|(track, state)| (track, state.flac_mask));
       return self
         .output
         .with_tap(|audit: &mut Audit| audit::flac_verdict(audit, expected))
         .unwrap_or_else(|_| panicked());
     }
     if walked == Walked::Mkv {
-      // Matroska's TrackEntries: a stream's each, but an attachment's.
-      let entries = self
-        .tracks
-        .iter()
-        .filter(|state| state.stream.is_some() && state.kind != TrackKind::Attachment)
-        .count() as u64;
-      let expected = self
-        .tracks
-        .iter()
-        .enumerate()
-        .filter(|(_, state)| state.stream.is_some() && state.kind != TrackKind::Attachment)
-        .map(|(index, state)| (TrackIndex::new(index), state.mkv));
+      // Matroska's TrackEntries, in the streams' order through the one map:
+      // a timed stream's each — an attachment's stream writes none.
+      let written = || {
+        in_stream_order(&self.tracks, &self.streams)
+          .filter(|(_, state)| state.stream.is_some() && state.kind != TrackKind::Attachment)
+      };
+      let entries = written().count() as u64;
+      let expected = written().map(|(track, state)| (track, state.mkv));
       return self
         .output
         .with_tap(|audit: &mut Audit| audit::mkv_verdict(audit, expected, entries))
         .unwrap_or_else(|_| panicked());
     }
     if walked == Walked::Flv {
-      let expected = flv_walked(&self.tracks).map(|(index, state)| ExpectedFlv {
-        track: TrackIndex::new(index),
+      let expected = flv_walked(&self.tracks, &self.streams).map(|(track, state)| ExpectedFlv {
+        track,
         sequences: state.flv.sequences.summary(),
         records: !state.flv.trusted,
         frames: state.flv.frames.summary(),
@@ -13116,8 +13121,8 @@ where
         .first()
         .and_then(|track| self.tracks.get(track.get()))
         .is_none_or(|state| state.mp4_entries <= 1);
-    let traks = if still { &[][..] } else { &self.tracks[..] };
-    let expected = expected_traks(traks, self.chapter_trak);
+    let streams = if still { &[][..] } else { &self.streams[..] };
+    let expected = expected_traks(&self.tracks, streams, self.chapter_trak);
     // AVIF's payload: the bytes movenc writes of its track's samples, as
     // their sizes count them ([`SampleMirror`]; `TrackState::buffered`
     // counts the packets as handed, AV1's temporal delimiters among them,
@@ -13125,7 +13130,8 @@ where
     let media = (walked == Walked::Mov(MovMode::Avif))
       .then(|| self.tracks.iter().map(|state| state.samples.bytes()).sum());
     // The movie's `udta` and `pssh` boxes, in its `moov`: none of a still
-    // AVIF.
+    // AVIF. AVIF's items, of a still file or an animated one, each its
+    // stream's: named through the one map.
     let movie = ExpectedMovie {
       media,
       user_data: if still {
@@ -13138,6 +13144,7 @@ where
       } else {
         self.protection
       },
+      streams: &self.streams,
     };
     self
       .output
@@ -13146,12 +13153,13 @@ where
   }
 
   /// Moves each written `trak`'s sample descriptions into the write audit's
-  /// tap, in the order movenc writes the `trak`s and the chapter track's
-  /// last ([`Handed`]; R6): their configurations and APV's frame
-  /// informations, nothing copied and nothing allocated. Nothing reads them
-  /// here after: the trailer writes the descriptions from libavformat's own,
-  /// and the report is whole before it. A tap that panicked takes none, and
-  /// the verdict names it ([`Self::written_otherwise`]).
+  /// tap, in the order movenc writes the `trak`s — the streams', through
+  /// the one map — and the chapter track's last ([`Handed`]; R6): their
+  /// configurations and APV's frame informations, nothing copied and
+  /// nothing allocated. Nothing reads them here after: the trailer writes
+  /// the descriptions from libavformat's own, and the report is whole
+  /// before it. A tap that panicked takes none, and the verdict names it
+  /// ([`Self::written_otherwise`]).
   fn hand_descriptions(&mut self) {
     if !matches!(self.audit, Some(Walked::Mov(_))) {
       return;
@@ -13159,20 +13167,22 @@ where
     let Self {
       output,
       tracks,
+      streams,
       chapter_trak,
       audit: mode,
       ..
     } = self;
     let chapter = chapter_trak.is_some();
     // AVIF's one track is its item's, written as a `trak` of its own or
-    // not: its place the item's.
+    // not: its place the item's, its stream's ordinal.
     let avif = *mode == Some(Walked::Mov(MovMode::Avif));
     let _ = output.with_tap(|audit: &mut Audit| {
       let mut place = 0;
-      for state in tracks
-        .iter_mut()
-        .filter(|state| writes_trak(state) || (avif && state.stream.is_some()))
-      {
+      for track in streams.iter() {
+        let state = &mut tracks[track.get()];
+        if !(writes_trak(state) || (avif && state.stream.is_some())) {
+          continue;
+        }
         audit.hand(
           place,
           Handed::new(
@@ -13291,14 +13301,8 @@ where
   #[cfg(feature = "test-support")]
   #[doc(hidden)]
   pub fn expected_flv_sequences(&mut self) -> Vec<(TrackIndex, u64, u64, u64, bool)> {
-    let mirrors: Vec<(TrackIndex, audit::Summary, bool)> = flv_walked(&self.tracks)
-      .map(|(index, state)| {
-        (
-          TrackIndex::new(index),
-          state.flv.sequences.summary(),
-          state.flv.trusted,
-        )
-      })
+    let mirrors: Vec<(TrackIndex, audit::Summary, bool)> = flv_walked(&self.tracks, &self.streams)
+      .map(|(track, state)| (track, state.flv.sequences.summary(), state.flv.trusted))
       .collect();
     self
       .output
@@ -16788,18 +16792,54 @@ fn formatted<'a>(buf: &'a mut [u8], args: core::fmt::Arguments<'_>) -> &'a [u8] 
   &buf[..usize::try_from(written).unwrap_or(0)]
 }
 
+/// The tracks behind the output's streams, in the streams' order, through
+/// the one map `streams` ([`CarrierMuxer::streams`]): each its index and
+/// its state.
+fn in_stream_order<'a>(
+  tracks: &'a [TrackState],
+  streams: &'a [TrackIndex],
+) -> impl Iterator<Item = (TrackIndex, &'a TrackState)> + Clone + 'a {
+  streams
+    .iter()
+    .map(move |&track| (track, &tracks[track.get()]))
+}
+
 /// FLV's audio and video tracks — of a stream FLV writes, each — in the
-/// order its write audit's walk is told them at open.
-fn flv_walked(tracks: &[TrackState]) -> impl Iterator<Item = (usize, &TrackState)> {
-  tracks.iter().enumerate().filter(|(_, state)| {
+/// streams' order through the one map, the order its write audit's walk is
+/// told them at open.
+fn flv_walked<'a>(
+  tracks: &'a [TrackState],
+  streams: &'a [TrackIndex],
+) -> impl Iterator<Item = (TrackIndex, &'a TrackState)> + 'a {
+  in_stream_order(tracks, streams).filter(|(_, state)| {
     state.stream.is_some()
       && state.rules.flv_tag.is_some()
       && matches!(state.kind, TrackKind::Audio | TrackKind::Video)
   })
 }
 
-/// The track's place among the table's timed tracks of its kind before it:
-/// FLV's `track_idx_map` (`flvenc.c` 993–1060).
+/// FLV's number of a stream among its kind's, through the one map: the
+/// streams of `kind` among `before`, those the map holds before it — FLV's
+/// `track_idx_map`, which counts each media type's streams in their order
+/// (`flvenc.c` 993–1060). FLV writes no cover and no attachment: its
+/// streams are its timed tracks'.
+fn flv_number<D, S>(
+  tracks: &[TrackDescription<Ffmpeg, D, S>],
+  before: &[TrackIndex],
+  kind: TrackKind,
+) -> usize {
+  before
+    .iter()
+    .filter(|track| tracks[track.get()].kind() == kind)
+    .count()
+}
+
+/// FLV's number of the track at `index` among its kind's, judged on the
+/// table before any stream exists (its sequence header's bound, R20): the
+/// table's tracks of its kind before it. Each of them is a stream once the
+/// streams are added, in the table's order — a track of FLV's kinds is
+/// timed or refused — so that the count is [`flv_number`]'s through the one
+/// map: FLV's `track_idx_map` (`flvenc.c` 993–1060).
 fn kind_index<D, S>(tracks: &[TrackDescription<Ffmpeg, D, S>], index: usize) -> usize {
   let kind = tracks[index].kind();
   tracks[..index]
@@ -19378,24 +19418,26 @@ fn mp4_chapter_sample_refused(
 }
 
 /// The `trak`s the write audit expects of `tracks`, in the order movenc
-/// writes them (`mov_write_moov_tag`, `movenc.c` 5430–5433): each track's
+/// writes them (`mov_write_moov_tag`, `movenc.c` 5430–5433) — the streams',
+/// through the one map `streams` ([`CarrierMuxer::streams`]): each track's
 /// whose `trak` movenc writes ([`TrackState::trak_written`]), its id its
-/// stream's index and one (`mov_setup_track_ids`, 5270–5279); then the
+/// stream's ordinal and one (`mov_setup_track_ids`, 5270–5279); then the
 /// chapter track, `chapter`.
-fn expected_traks(
-  tracks: &[TrackState],
+fn expected_traks<'a>(
+  tracks: &'a [TrackState],
+  streams: &'a [TrackIndex],
   chapter: Option<ExpectedTrak>,
-) -> impl Iterator<Item = ExpectedTrak> + Clone + '_ {
-  tracks
+) -> impl Iterator<Item = ExpectedTrak> + Clone + 'a {
+  streams
     .iter()
     .enumerate()
-    .filter_map(|(index, state)| {
-      let (stream, _) = state.stream?;
+    .filter_map(move |(ordinal, &track)| {
+      let state = &tracks[track.get()];
       writes_trak(state).then(|| {
         let samples = state.finished_samples();
         ExpectedTrak {
-          track: Some(TrackIndex::new(index)),
-          id: u32::try_from(stream + 1).unwrap_or(u32::MAX),
+          track: Some(track),
+          id: u32::try_from(ordinal + 1).unwrap_or(u32::MAX),
           flags: state.flag_tables(),
           rolls: state.roll_groups(&samples),
           user_data: state.user_data,

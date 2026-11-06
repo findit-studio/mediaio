@@ -24898,3 +24898,71 @@ fn l247_avif_reads_still_or_animated_by_its_first_output_stream() {
     );
   }
 }
+
+/// **L248 — an AVIF item's failure names its stream's track** (Codex R2
+/// [2]; `mov_write_ipco_tag`, `movenc.c` 3755–3770: an item a stream, in
+/// their order). In a process of its own: the cover, of which AVIF writes
+/// no stream, at track 0, and AV1 at track 1, configured by OBUs — its
+/// sequence header and a metadata OBU of 2 048 bytes — a still AVIF of one
+/// frame, written whole, then again with libavutil's allocations capped at
+/// 1 500 bytes before `finish`. The cap's derivation, L222's: the item's
+/// `av1C` writer opens its metadata's dynamic buffer and grows it once; its
+/// growth to 2 306 bytes is refused, and the record is written of its four
+/// bytes alone — AVIF's of no sequence header (1579–1580) — success
+/// answered; the still file's trailer allocates nothing else past the cap,
+/// `get_moov_size`'s null buffer of about 1.4 KB among it. Named: track 1's
+/// description 0, its record of 4 bytes against 2 052 — the item's track
+/// through the one map.
+///
+/// PLANT P637: the item's ordinal taken for its track.
+#[cfg(feature = "test-support")]
+#[test]
+fn l248_an_avif_items_failure_names_its_streams_track() {
+  in_its_own_process("l248_in_a_process_of_its_own");
+}
+
+/// L248's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l248_in_a_process_of_its_own() {
+  if !alone_for("l248_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let (av1, frames, av1c) = unconfigured_av1(&corpus);
+  let obus = [&av1c[4..], &av1_metadata_obu(2_048)].concat();
+  let write = |name: &str, capped: bool| {
+    let mut table: Vec<Described> = table_of(&av1, TrackKind::Video)
+      .into_iter()
+      .map(|row| row.with_extradata(Some(bytes_of(&obus))))
+      .collect();
+    table.insert(0, cover_row(&corpus));
+    let mut muxer = muxer_into(&output(&corpus, name), ContainerName::new("avif"), table);
+    wrote(
+      muxer.write_video(VideoTrackPacket::new(TrackIndex::new(1), frames[0].clone())),
+      "the frame",
+    );
+    if capped {
+      cap(1_500);
+    }
+    let finished = muxer.finish();
+    uncap();
+    finished
+  };
+  write("l248.avif", false).expect("whole");
+  assert_eq!(
+    avif_item_av1c(&output(&corpus, "l248.avif")).map(|record| record.len()),
+    Some(4 + 2_048),
+    "the premise: the item's record whole, of no sequence header"
+  );
+  let fault = write("l248-capped.avif", true).expect_err("the item's av1C cut, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(1)),
+      WrittenPart::Configuration(0),
+      Finding::Length(4, 2_052)
+    ))
+  );
+}

@@ -1314,7 +1314,7 @@ pub(super) enum MovieUserData {
 
 /// The movie's parts as the muxer expects them ([`mov_verdict`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct ExpectedMovie {
+pub(super) struct ExpectedMovie<'a> {
   /// AVIF's payload: the bytes movenc writes of its track's samples;
   /// `None` of MP4, MOV and iPod, whose `mdat`'s size is judged against
   /// the payload the sink took.
@@ -1324,6 +1324,11 @@ pub(super) struct ExpectedMovie {
   /// The `pssh` boxes, each its payload's bytes, in the order movenc
   /// writes them (`mov_write_pssh_tag`, 5175–5210; 5449–5451; A1).
   pub(super) protection: Runs,
+  /// The muxer's one map from the output's streams back to the table, each
+  /// stream's track at its ordinal: AVIF's items are its streams', in their
+  /// order (`mov_write_ipco_tag`, 3755–3770), each named by its stream's
+  /// track (Codex R2 [2]).
+  pub(super) streams: &'a [TrackIndex],
 }
 
 /// The first way a track's roll groups as read — `sgpd`'s entries, and
@@ -1390,7 +1395,7 @@ fn movie_user_data_found(expected: MovieUserData, written: Option<u64>) -> Optio
 pub(super) fn mov_verdict(
   audit: &Audit,
   expected: impl Iterator<Item = ExpectedTrak> + Clone,
-  movie: &ExpectedMovie,
+  movie: &ExpectedMovie<'_>,
 ) -> Option<WrittenOtherwise> {
   let media = movie.media;
   if let Some(unfollowed) = audit.unfollowed() {
@@ -1522,10 +1527,12 @@ pub(super) fn mov_verdict(
       return Some(WrittenOtherwise::new(trak.track, part, found));
     }
   }
-  // AVIF's items' records, each its track's description.
+  // AVIF's items' records, each its track's description: an item's
+  // ordinal its stream's, named by the track behind it through the one map
+  // (Codex R2 [2]).
   if let Some((item, found)) = walk.item_found() {
     return Some(WrittenOtherwise::new(
-      Some(TrackIndex::new(item)),
+      movie.streams.get(item).copied(),
       WrittenPart::Configuration(0),
       found,
     ));
