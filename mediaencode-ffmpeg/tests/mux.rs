@@ -23040,3 +23040,100 @@ fn gate7_avifs_av1c_reads_back_as_its_mirror_counts_it() {
   );
   assert_eq!(stated, vec![(TrackIndex::new(0), 0, *b"av1C", len)]);
 }
+
+// ---------------------------------------------------------------------------
+//  R2: Opus's roll distance past 32, refused by name.
+// ---------------------------------------------------------------------------
+
+/// MP4 of the corpus's Opus track, its packets the first frame's bytes,
+/// `count` of them `spacing` ticks of 48 kHz apart, each lasting that;
+/// answers the muxer and the packets.
+fn opus_every(
+  corpus: &Corpus,
+  name: &str,
+  spacing: i64,
+  count: usize,
+) -> (
+  FfmpegOwnedMuxer<File>,
+  Vec<AudioTrackPacket<Ffmpeg, FfmpegBytes>>,
+) {
+  let (table, packets) = first_track(&opus_mkv(corpus), TrackKind::Audio, 1);
+  let frame = audio_of(&packets[0]);
+  let packets = (0..count)
+    .map(|index| audio_ticks(&frame, index as i64 * spacing, spacing))
+    .collect();
+  (
+    muxer_into(&output(corpus, name), ContainerName::MP4, table),
+    packets,
+  )
+}
+
+/// **R2 — Opus's first sample past a roll distance of 32 is refused by
+/// name** (the coordinator's ruling on the write audit's F4;
+/// `mov_preroll_write_stbl_atoms`, `movenc.c` 3330–3351, its answer dropped
+/// at 3436): MP4 counts each Opus sample's roll distance, the samples
+/// before it whose durations reach 80 ms — 3 840 ticks at 48 kHz — and
+/// past 32 writes no roll group of the track at all. Packets 100 ticks
+/// apart: the first 39 taken, every one before them reaching less than
+/// 80 ms, a distance of none; the 40th, of a distance of 39, refused by
+/// name (`PayloadRule::RollDistance`), handed back untouched; the file
+/// finished whole.
+///
+/// PLANT P628: the window of 31 samples, not 32.
+#[test]
+fn r2_opus_past_a_roll_distance_of_32_is_refused_by_name() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (mut muxer, packets) = opus_every(&corpus, "r2-past.mp4", 100, 40);
+  for packet in &packets[..39] {
+    wrote(
+      muxer.write_audio(packet.clone()),
+      "a packet within the roll",
+    );
+  }
+  let past = packets[39].clone();
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(past.clone())));
+  assert_eq!(refusal, payload(PayloadRule::RollDistance), "the 40th");
+  untouched!(past, back);
+  muxer.finish().expect("finished");
+}
+
+/// **R2 — a timeline of a roll distance of exactly 32 is taken, its roll
+/// groups written**: Opus packets of 2.5 ms, 120 ticks apart — 32 of them
+/// make 80 ms — every packet taken; the file's `sgpd` holds one group of a
+/// roll distance of −32, and its `sbgp` the runs movenc makes: the first 32
+/// samples of none, then the rest of group 1 (3352–3358, 3374–3396), read
+/// back from the file.
+#[test]
+fn r2_a_roll_distance_of_exactly_32_is_taken() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (mut muxer, packets) = opus_every(&corpus, "r2-32.mp4", 120, 40);
+  for packet in &packets {
+    wrote(muxer.write_audio(packet.clone()), "a packet");
+  }
+  muxer.finish().expect("finished");
+  let bytes = std::fs::read(output(&corpus, "r2-32.mp4")).expect("the file");
+  let (moov, moov_end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("moov");
+  let (trak, trak_end, _) = box_in(&bytes, (moov, moov_end), b"trak").expect("trak");
+  let (mdia, mdia_end, _) = box_in(&bytes, (trak, trak_end), b"mdia").expect("mdia");
+  let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+  let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+  let (sgpd, sgpd_end, _) = box_in(&bytes, (stbl, stbl_end), b"sgpd").expect("sgpd");
+  let (sbgp, sbgp_end, _) = box_in(&bytes, (stbl, stbl_end), b"sbgp").expect("sbgp");
+  let word = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("a word"));
+  // `sgpd`: version and flags, `roll`, the default length, the count, then
+  // each group's distance negated in 16 bits.
+  assert_eq!(&bytes[sgpd + 4..sgpd + 8], b"roll");
+  assert_eq!(word(sgpd + 12), 1, "one group");
+  assert_eq!(
+    &bytes[sgpd + 16..sgpd_end],
+    &(-32_i16).to_be_bytes(),
+    "of a distance of 32"
+  );
+  // `sbgp`: version and flags, `roll`, the count, then each run.
+  assert_eq!(word(sbgp + 8), 2, "two runs");
+  let runs: Vec<(u32, u32)> = (0..2)
+    .map(|run| (word(sbgp + 12 + 8 * run), word(sbgp + 16 + 8 * run)))
+    .collect();
+  assert_eq!(runs, vec![(32, 0), (8, 1)]);
+  assert_eq!(sbgp + 12 + 16, sbgp_end, "nothing after them");
+}

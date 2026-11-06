@@ -1205,6 +1205,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     edit: EditSpan::default(),
     samples: SampleMirror::default(),
     carried: Carried::default(),
+    roll: OpusRoll::default(),
   }
 }
 

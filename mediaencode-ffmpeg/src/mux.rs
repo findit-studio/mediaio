@@ -379,6 +379,7 @@
 //! | `SA3D` | 940–997 | not reached: read from stream metadata the context never sets |
 //! | the video configuration boxes — `avcC`, `hvcC`, `lhvC`, `vvcC`, `evcC`, `lvcC`, `apvC`, `vpcC`, `av1C`, `av3c`, `dvc1` | 2880–2930 | their writers' failures are ignored, the box left as far as it was written: each writer's every condition, table C′′′ — refused where a stream the standards allow reaches it, at open and at the packet bringing the configuration ([`MuxOpenError::ConfigurationInvalid`], [`PayloadRule::NewExtradata`]; R9: ruling 4c — L109; R10 — L114–L121); AV1's and MPEG-4 ALS's absence taken where the first packet brings the configuration ([`PayloadRule::ConfigurationAbsent`] where it does not; R9: ruling 4a), ALAC's and AVS3's refused at open ([`MuxOpenError::ConfigurationMissing`]; 672–676, 765–816, 1599–1626) |
 //! | frame cropping that leaves no picture | 3024–3036 | [`MuxOpenError::Cropping`] |
+//! | Opus's roll groups: each sample's roll distance — the samples before it whose durations reach 80 ms, 3 840 ticks — past 32 answered as invalid, the answer dropped and neither `sgpd` nor `sbgp` of the track written | `mov_preroll_write_stbl_atoms` 3330–3351; 3436 | refused at the packet whose sample passes it, counted as movenc counts it ([`PayloadRule::RollDistance`]; R2) |
 //! | TTML's codec tag | 2259–2280 | not reached: the header refuses `dfxp` outside ISMV first (8603–8609), a fault at open |
 //! | libavcodec's TTML joined into one document: its header strings, its size | `movenc_ttml.c` 236–317; `ttmlenc.c` 82–122 | [`MuxOpenError::ConfigurationInvalid`]; [`PayloadRule::DocumentSize`] |
 //! | the cover: an empty picture skipped | 4823 | table E |
@@ -1453,6 +1454,7 @@
 //! | [`PayloadRule::Ac3BitStreamId`], [`FfmpegMuxRefusal::NoFrame`] | MP4's trailer fails without `dac3`'s or `dec3`'s frame, or over a bit stream id past 8 (`movenc.c` 424–445, 619–623) | refuses after taking: the file |
 //! | [`FfmpegMuxRefusal::DocumentSpan`] | the joined TTML sample past `INT_MAX` fails `check_pkt` at the trailer (`movenc.c` 6925–6928, 9036–9037) | refuses after taking: the file |
 //! | [`FfmpegMuxRefusal::LastSampleTooLong`] | the trailer's `av_assert0` on the last joined E-AC-3 sample's duration (`movenc.c` 1248–1256) | ends the process (round 6) |
+//! | [`PayloadRule::RollDistance`] (R2, the coordinator's ruling on the write audit's F4) | MP4's trailer answers an Opus sample's roll distance past 32 as invalid, and `mov_write_stbl_tag` drops the answer: the track's roll groups are not written, and a reader seeking it decodes with no preroll (`movenc.c` 3330–3351, 3436) | loses |
 //! | [`FfmpegMuxRefusal::DtsGap`], as rounds 5 and 6 count it | `check_pkt` moves the packet one tick past the last sample written and drops its presentation time (`movenc.c` 6897–6923) — a `mov_text` cue's from the empty sample before it, an E-AC-3 packet's from the last sample, not a held packet | corrupts |
 //! | [`FfmpegMuxRefusal::DurationTooLong`], a `mov_text` cue's | `check_pkt` moves the empty sample marking its end where that lies `INT_MAX` or more after it, its duration and the track's start before zero, so that the cue shows one tick (`movenc.c` 6917–6923, 7321, 7652): at the next cue past it, or at the trailer, which the cue alone decides | loses |
 //! | [`FfmpegMuxRefusal::CueOrder`] | an overlapping or replacing cue is written as it is, the last cue shortened (`movenc.c` 7646–7653) — taken and reported (round 6) — unless another track's packet makes MP4 mark the end first and then move the cue (6917–6923), as the `ffmpeg` CLI does beside video: "Packet duration: -1000 / dts: 2000 in stream 1 is out of range". A first cue before zero MP4's writer takes, and its reader drops: its edit list starts the track at zero (4133–4239), and `mov_fix_index` marks a sample before an edit's start discarded and counts every later one from it (`mov.c` 4374–4682) — `ffprobe` reads the CLI's cues at −30 and 20 (`-itsoffset -0.03`) back at −40, marked discarded, and 10. Judged by the round trip, not the writer alone (ruled) | corrupts, or loses, where it is refused |
@@ -4557,6 +4559,17 @@ pub enum PayloadRule {
   /// frame's information (R11, ruling 2).
   #[error("the packet's frame would be one too many for the APV configuration record")]
   ApvFrameInfo,
+  /// The MOV family's Opus: a packet whose sample's roll distance — the
+  /// samples before it whose durations reach its 80 ms of preroll, 3 840
+  /// ticks at 48 kHz — passes 32, where movenc writes no roll group of the
+  /// track at all, its answer dropped (`mov_preroll_write_stbl_atoms`,
+  /// `movenc.c` 3330–3351; 3436): seeking then decodes the track with no
+  /// preroll (R2, the coordinator's ruling on the write audit's F4). The
+  /// distance is counted as movenc counts it, of each sample's duration —
+  /// the next one's decode time less its own — so that a timeline of a
+  /// distance of exactly 32, 2.5 ms packets, is taken.
+  #[error("the packet's sample would need more than 32 samples of preroll")]
+  RollDistance,
   /// MP4 PCM: not a whole number of frames — channels times bytes per
   /// sample. MP4 refuses a packet holding none after taking it, and counts
   /// only the whole frames of another, losing the rest (`movenc.c`
@@ -5369,6 +5382,56 @@ struct TrackState {
   /// The MOV family: what its sample descriptions carry that the write
   /// audit judges ([`Carried`]).
   carried: Carried,
+  /// The MOV family's Opus: the samples' durations a roll distance is
+  /// counted of ([`OpusRoll`]).
+  roll: OpusRoll,
+}
+
+/// The MOV family's Opus: the durations of the last 32 samples whose
+/// durations are known, their sum, and the sum of every one — what the next
+/// sample's roll distance is counted of, as `mov_preroll_write_stbl_atoms`
+/// counts it (`movenc.c` 3330–3351; R2): walking back from a sample, the
+/// samples until their durations reach the preroll; none, where every one
+/// before it reaches it not. Fixed, allocating nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OpusRoll {
+  ring: [u32; 32],
+  head: usize,
+  len: usize,
+  window: u64,
+  total: u128,
+}
+
+impl OpusRoll {
+  /// The preroll movenc walks back over: 80 ms at 48 kHz (3324–3326).
+  const PREROLL: u64 = 3_840;
+
+  /// A sample's duration, known as the next sample's decode time is.
+  fn push(&mut self, duration: u32) {
+    if self.len == self.ring.len() {
+      self.window -= u64::from(self.ring[self.head]);
+    } else {
+      self.len += 1;
+    }
+    self.ring[self.head] = duration;
+    self.window += u64::from(duration);
+    self.head = (self.head + 1) % self.ring.len();
+    self.total += u128::from(duration);
+  }
+
+  /// Whether the roll distance of the sample after those pushed and one
+  /// more of `last` ticks passes 32: its last 32 samples' durations — `last`
+  /// and the newest 31 pushed — reach less than the preroll, and every
+  /// sample's before it reaches it.
+  fn passes(&self, last: u32) -> bool {
+    let oldest = if self.len == self.ring.len() {
+      u64::from(self.ring[self.head])
+    } else {
+      0
+    };
+    let window = u64::from(last) + self.window - oldest;
+    window < Self::PREROLL && self.total + u128::from(last) >= u128::from(Self::PREROLL)
+  }
 }
 
 /// MP4's joined TTML document, as its trailer writes it
@@ -6290,6 +6353,9 @@ struct PacketRules {
   /// The MOV family's APV: the frame informations of each packet recorded
   /// into its `apvC` ([`PayloadRule::ApvFrameInfo`]).
   apv: bool,
+  /// The MOV family's Opus: each sample's roll distance counted
+  /// ([`PayloadRule::RollDistance`]).
+  opus_roll: bool,
   /// The duration libavformat hands a packet that states none
   /// (`guess_pkt_duration`, `mux.c` 605–633), as the track's rules take it
   /// ([`Guess`]): WAV's fact chunk counts it.
@@ -8082,6 +8148,7 @@ impl PacketRules {
         .then(|| mp4_sample_size(codec))
         .flatten(),
       apv: mp4 && id == CodecId::APV,
+      opus_roll: mp4 && id == CodecId::OPUS,
       guessed: None,
       end_sum: if either_matroska {
         Some(EndSum::Matroska {
@@ -11935,6 +12002,7 @@ where
           SampleMirror::default()
         },
         carried,
+        roll: OpusRoll::default(),
       });
     }
 
@@ -13339,6 +13407,13 @@ where
     }
     if let Some(counts) = plan.learned.mp4_counts {
       state.mp4_counts = counts;
+    }
+    // The MOV family's Opus: the last sample's duration, the distance from
+    // its decode time to this one's (R2).
+    if state.rules.opus_roll
+      && let (Some((dts, _)), Some(last)) = (plan.learned.mov_samples[0], state.samples.last())
+    {
+      state.roll.push(dts.wrapping_sub(last) as u32);
     }
     // The write audit's mirror of the sample tables, but constant-size
     // audio's, which its end makes whole (note §2.7).
@@ -14809,6 +14884,14 @@ fn check_packet_rules<'p>(
       },
     })
   };
+  // The MOV family's Opus: the roll distance of the sample the packet makes,
+  // past 32 refused by name (R2).
+  if rules.opus_roll
+    && let (Some((dts, _)), Some(last)) = (mov_samples[0], state.samples.last())
+    && state.roll.passes(dts.wrapping_sub(last) as u32)
+  {
+    return refused(PayloadRule::RollDistance);
+  }
   let durations = outputs.iter().any(|output| output.duration_ticks < 0)
     || cues.is_some_and(|cue| {
       cue.early

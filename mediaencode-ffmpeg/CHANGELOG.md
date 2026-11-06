@@ -42,6 +42,12 @@ crate moves only when it changes.
   packet's take, or a plant over the bytes the sink takes; hidden: `MuxOptions::with_audit`,
   `CarrierMuxer::audited_bytes`, `expected_records`, `expected_palettes`
   and `expected_chapter_samples`, the laws' seams.
+- **Opus's roll distance past 32, refused by name** (the coordinator's
+  ruling R2 on the write audit's F4): MP4 counts each Opus sample's roll
+  distance — the samples before it whose durations reach 80 ms — and past
+  32 writes no roll group of the track, its answer dropped. The packet
+  whose sample passes 32 is refused (`PayloadRule::RollDistance`, new),
+  counted as movenc counts it; a timeline of exactly 32 is taken.
 - **The muxer**: `FfmpegMuxer` (view lane) and `FfmpegOwnedMuxer` (owned
   lane) implement `Muxer` over libavformat for the containers this
   release audited and keeps (`ContainerName`): the MOV family's MP4, MOV,
