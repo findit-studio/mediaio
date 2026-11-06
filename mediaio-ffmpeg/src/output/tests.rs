@@ -1726,3 +1726,465 @@ fn allocation_failures_in_a_process_of_their_own() {
   drop(output);
   assert_eq!(reached(&tally), (0, 0), "the chapters: nothing asked");
 }
+
+/// A tap that keeps every run it is handed, and counts the losses of its
+/// position.
+#[derive(Debug, Default)]
+struct Recorder {
+  runs: Vec<(u64, Vec<u8>)>,
+  lost: u32,
+}
+
+impl SinkTap for Recorder {
+  fn took(&mut self, at: u64, bytes: &[u8]) {
+    self.runs.push((at, bytes.to_vec()));
+  }
+  fn lost(&mut self) {
+    self.lost += 1;
+  }
+}
+
+/// A tap of another type than [`Recorder`].
+struct Other;
+
+impl SinkTap for Other {
+  fn took(&mut self, _at: u64, _bytes: &[u8]) {}
+  fn lost(&mut self) {}
+}
+
+/// The file `runs` make, replayed in order over a blank buffer.
+fn replayed(runs: &[(u64, Vec<u8>)]) -> Vec<u8> {
+  let mut file = Vec::new();
+  for (at, bytes) in runs {
+    let at = usize::try_from(*at).expect("an offset in memory");
+    let end = at + bytes.len();
+    if file.len() < end {
+      file.resize(end, 0);
+    }
+    file[at..end].copy_from_slice(bytes);
+  }
+  file
+}
+
+/// A buffer that counts the writes it takes below its end: the patches
+/// that reached it on their own.
+#[derive(Default)]
+struct Patched {
+  bytes: Cursor<Vec<u8>>,
+  patches: u32,
+}
+
+impl Write for Patched {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    if self.bytes.position() < self.bytes.get_ref().len() as u64 {
+      self.patches += 1;
+    }
+    self.bytes.write(buf)
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    Ok(())
+  }
+}
+
+impl Seek for Patched {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.bytes.seek(pos)
+  }
+}
+
+/// The bytes `runs` carry, counted.
+fn carried(runs: &[(u64, Vec<u8>)]) -> u64 {
+  runs.iter().map(|(_, bytes)| bytes.len() as u64).sum()
+}
+
+/// Where two files first differ, if they do.
+fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+  a.iter()
+    .zip(b)
+    .position(|(x, y)| x != y)
+    .or_else(|| (a.len() != b.len()).then(|| a.len().min(b.len())))
+}
+
+/// MP4 over `sink`, one AAC track and `tap` if any: the header, `packets`
+/// packets of 4 and 5 bytes in turn — sizes that differ, so that the
+/// sample-size table lists each, in 4 bytes: at 10 000 the `moov` passes
+/// the I/O context's 32 KiB, and the sizes of its boxes are patched after
+/// their first bytes reached the sink — and the trailer. Answers the output
+/// and the first failure, if any.
+fn mp4_of<W: Write + Seek + Send + 'static>(
+  sink: W,
+  packets: usize,
+  tap: Option<impl SinkTap>,
+) -> (Output<W>, Result<(), OutputError>) {
+  let ticket = aac(&[0x12, 0x10]);
+  let mut output = Output::open(sink, "mp4").expect("open");
+  output
+    .add_stream(&StreamSpec::new(&ticket, millis()))
+    .expect("a stream");
+  if let Some(tap) = tap {
+    output.set_tap(tap).expect("the tap");
+  }
+  let written = (|| {
+    output.write_header()?;
+    for i in 0..packets {
+      let packet = AudioPacket::new(
+        FfmpegBytes::copy_from_slice(&[0x21; 5][..4 + i % 2]),
+        AudioPacketExtra::new(0),
+      );
+      let at = i as i64 * 20;
+      output.write_packet::<crate::Owned>(
+        0,
+        OutputPacket::Audio(&packet),
+        PacketTimes::new(Some(at), Some(at), 20),
+        PacketLimits::default(),
+      )?;
+    }
+    output.write_trailer()
+  })();
+  (output, written)
+}
+
+/// **B1 — every byte the sink takes reaches the tap, at its offset.** A
+/// recording tap over MP4 whose `moov` passes the I/O context's 32 KiB, so
+/// that the sizes of its boxes — and the `mdat`'s, always, the header
+/// flushing its placeholder (`movenc.c` 8888 in FFmpeg 9.0.1) — reach the
+/// sink as patches of their own, below what it holds: replayed in order
+/// over a blank buffer, the runs the tap saw make the sink's final bytes
+/// exactly. The tap is whole when the trailer answers (`mux.c` 1270): the
+/// hand-back adds no byte.
+///
+/// PLANT P608: a seek does not move the tap's position.
+#[test]
+fn b1_every_byte_the_sink_takes_reaches_the_tap_at_its_offset() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let (mut output, written) = mp4_of(Patched::default(), 10_000, Some(Recorder::default()));
+  written.expect("the file");
+  let (runs, lost) = output
+    .with_tap(|tap: &mut Recorder| (core::mem::take(&mut tap.runs), tap.lost))
+    .expect("the tap, as its own type");
+  let sink = output.into_sink().expect("the sink back");
+  assert!(
+    sink.patches >= 2,
+    "the premise: the mdat's size and the moov's boxes' patched on their own ({})",
+    sink.patches
+  );
+  let bytes = sink.bytes.into_inner();
+  assert_eq!(lost, 0, "the position never lost");
+  let replay = replayed(&runs);
+  assert!(
+    replay == bytes,
+    "the replay is the sink's file: {} and {} bytes, first apart at {:?}",
+    replay.len(),
+    bytes.len(),
+    first_difference(&replay, &bytes)
+  );
+}
+
+/// A sink taking at most 7 bytes of each write, as a pipe may, and
+/// counting what it took.
+#[derive(Default)]
+struct Sips {
+  bytes: Cursor<Vec<u8>>,
+  taken: u64,
+}
+
+impl Write for Sips {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    let taken = self.bytes.write(&buf[..buf.len().min(7)])?;
+    self.taken += taken as u64;
+    Ok(taken)
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    Ok(())
+  }
+}
+
+impl Seek for Sips {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.bytes.seek(pos)
+  }
+}
+
+/// **B2 — a partial write is tapped as it was taken.** The file of
+/// [B1](b1_every_byte_the_sink_takes_reaches_the_tap_at_its_offset) into a
+/// sink taking at most 7 bytes of each write: ffmpeg-next asks again for
+/// the rest (`stream_io.rs` 333–343), and the tap sees each part at its own
+/// offset — no run longer than 7 bytes, the runs carrying exactly the bytes
+/// the sink took, and their replay the sink's file.
+///
+/// PLANT P605: the guard taps the bytes it was handed, not those taken.
+#[test]
+fn b2_a_partial_write_is_tapped_as_the_sink_took_it() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let (mut output, written) = mp4_of(Sips::default(), 10_000, Some(Recorder::default()));
+  written.expect("the file");
+  let runs = output
+    .with_tap(|tap: &mut Recorder| core::mem::take(&mut tap.runs))
+    .expect("the tap");
+  let sink = output.into_sink().expect("the sink back");
+  let longest = runs.iter().map(|(_, bytes)| bytes.len()).max();
+  assert!(
+    longest <= Some(7),
+    "no run past what the sink took: {longest:?}"
+  );
+  assert_eq!(
+    carried(&runs),
+    sink.taken,
+    "the bytes the sink took, no more"
+  );
+  let bytes = sink.bytes.into_inner();
+  let replay = replayed(&runs);
+  assert!(
+    replay == bytes,
+    "the replay is the sink's file: first apart at {:?}",
+    first_difference(&replay, &bytes)
+  );
+}
+
+/// A sink whose `fail_at`-th write fails as a full disk fails it, keeping
+/// its bytes, and its count of them, where the law reads them once the
+/// output has dropped it.
+struct FailsAt {
+  bytes: std::sync::Arc<std::sync::Mutex<(Cursor<Vec<u8>>, u64)>>,
+  writes: u32,
+  fail_at: u32,
+}
+
+impl Write for FailsAt {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    self.writes += 1;
+    if self.writes == self.fail_at {
+      return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+    }
+    let (bytes, taken) = &mut *self.bytes.lock().expect("the bytes");
+    let written = bytes.write(buf)?;
+    *taken += written as u64;
+    Ok(written)
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    Ok(())
+  }
+}
+
+impl Seek for FailsAt {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.bytes.lock().expect("the bytes").0.seek(pos)
+  }
+}
+
+/// **B3 — bytes the sink refused are not tapped.** The file of
+/// [B1](b1_every_byte_the_sink_takes_reaches_the_tap_at_its_offset) into a
+/// sink failing its 40th write: the output fails as the sink's write, and
+/// the tap ends at the sink's last byte taken — the runs carry exactly the
+/// bytes the sink took, and their replay is what it holds.
+///
+/// PLANT P606: the tap called before the sink answered, R27's latch
+/// unread.
+#[test]
+fn b3_bytes_the_sink_refused_are_not_tapped() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let bytes = std::sync::Arc::new(std::sync::Mutex::new((Cursor::new(Vec::new()), 0)));
+  let sink = FailsAt {
+    bytes: std::sync::Arc::clone(&bytes),
+    writes: 0,
+    fail_at: 40,
+  };
+  let (mut output, written) = mp4_of(sink, 10_000, Some(Recorder::default()));
+  assert!(
+    matches!(written, Err(OutputError::SinkWrite(_))),
+    "the premise, the sink's write failed: {written:?}"
+  );
+  let runs = output
+    .with_tap(|tap: &mut Recorder| core::mem::take(&mut tap.runs))
+    .expect("the tap, after the failure");
+  drop(output);
+  let sink = bytes.lock().expect("the bytes");
+  let (held, taken) = &*sink;
+  assert_eq!(carried(&runs), *taken, "the bytes the sink took, no more");
+  let replay = replayed(&runs);
+  assert!(
+    replay.as_slice() == held.get_ref().as_slice(),
+    "the replay is what the sink holds: first apart at {:?}",
+    first_difference(&replay, held.get_ref())
+  );
+}
+
+/// A tap that panics at its `at`-th call, counting every call that
+/// reaches it.
+struct PanicsAt {
+  calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+  at: u32,
+}
+
+impl SinkTap for PanicsAt {
+  fn took(&mut self, _at: u64, _bytes: &[u8]) {
+    let call = self
+      .calls
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+      + 1;
+    if call == self.at {
+      panic!("the tap exploded");
+    }
+  }
+  fn lost(&mut self) {}
+}
+
+/// **B4 — a tap that panics is contained, and not called again.** In a
+/// process of its own, so that a panic past the guard aborts it rather than
+/// the lane: a tap panicking at its 3rd call, inside libavformat's write
+/// callback. The panic stays in the guard: the file is written whole —
+/// byte for byte the file written untapped — the tap is called no more,
+/// [`Output::with_tap`] answers it poisoned by name, and the sink's latch
+/// is clear: the sink did not panic.
+///
+/// PLANT P607: the tap's `catch_unwind` removed (the child aborts).
+#[test]
+fn b4_a_tap_that_panics_is_contained_and_not_called_again() {
+  crate::fault_subprocess::in_subprocess(
+    "output::tests::b4_a_tap_that_panics_is_contained_and_not_called_again",
+    || {
+      ffmpeg_next::init().expect("ffmpeg init");
+      let (untapped, written) = mp4_of(Cursor::new(Vec::new()), 50, None::<Recorder>);
+      written.expect("the untapped file");
+      let whole = untapped.into_sink().expect("the sink back").into_inner();
+      let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+      let tap = PanicsAt {
+        calls: std::sync::Arc::clone(&calls),
+        at: 3,
+      };
+      let (mut output, written) = quietly(|| mp4_of(Cursor::new(Vec::new()), 50, Some(tap)));
+      written.expect("the file, whole");
+      assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "not called again after its panic"
+      );
+      assert!(
+        matches!(
+          output.with_tap(|_: &mut PanicsAt| ()),
+          Err(OutputError::TapPanicked)
+        ),
+        "the poisoned tap answered by name"
+      );
+      assert!(output.sink_panic().is_none(), "the sink's latch is clear");
+      let bytes = output.into_sink().expect("the sink back").into_inner();
+      assert!(
+        bytes == whole,
+        "the file written whole: first apart at {:?}",
+        first_difference(&bytes, &whole)
+      );
+    },
+  );
+}
+
+/// **B5 — the tap is set once, while the context is being built, and lent
+/// back by its type.** No tap is answered by name; a second tap while
+/// building, and a tap after the header, are refused as out of order, and a
+/// tap after a failed call as after a failure; a tap of another type than
+/// the one asked is answered by name, and the one set is lent as its own
+/// type, holding the header's bytes.
+#[test]
+fn b5_the_tap_is_set_once_while_building_and_lent_by_its_type() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let ticket = subrip();
+  let mut output = Output::open(Cursor::new(Vec::new()), "matroska").expect("open");
+  output
+    .add_stream(&StreamSpec::new(&ticket, millis()))
+    .expect("a stream");
+  assert!(
+    matches!(
+      output.with_tap(|_: &mut Recorder| ()),
+      Err(OutputError::NoTap)
+    ),
+    "no tap yet"
+  );
+  output.set_tap(Recorder::default()).expect("the tap");
+  assert!(
+    matches!(
+      output.set_tap(Recorder::default()),
+      Err(OutputError::OutOfOrder {
+        call: OutputCall::Tap,
+        phase: OutputPhase::Building
+      })
+    ),
+    "once"
+  );
+  assert!(
+    matches!(
+      output.with_tap(|_: &mut Other| ()),
+      Err(OutputError::TapMismatch)
+    ),
+    "another type"
+  );
+  output.write_header().expect("the header");
+  assert!(
+    matches!(
+      output.set_tap(Recorder::default()),
+      Err(OutputError::OutOfOrder {
+        call: OutputCall::Tap,
+        phase: OutputPhase::Writing
+      })
+    ),
+    "after the header"
+  );
+  let header = output
+    .with_tap(|tap: &mut Recorder| carried(&tap.runs))
+    .expect("lent as its own type");
+  assert!(header > 0, "the header's bytes tapped");
+
+  // SubRip, which MP4 has no tag for: the header refused.
+  let mut failed = Output::open(Cursor::new(Vec::new()), "mp4").expect("open");
+  failed
+    .add_stream(&StreamSpec::new(&ticket, millis()))
+    .expect("a stream");
+  assert!(
+    failed.write_header().is_err(),
+    "the premise, a failed header"
+  );
+  assert!(
+    matches!(
+      failed.set_tap(Recorder::default()),
+      Err(OutputError::FailedEarlier {
+        call: OutputCall::Tap
+      })
+    ),
+    "after a failure"
+  );
+}
+
+/// **The write hook runs around libavformat's take of each packet** (test
+/// support; the write audit's design gate, condition 5): with `true` just
+/// before `av_interleaved_write_frame`, the packet built, and with `false`
+/// as it answers — three packets, three pairs, and nothing at the header
+/// or the trailer.
+#[test]
+fn the_write_hook_runs_around_each_packets_take() {
+  let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+  let ticket = aac(&[0x12, 0x10]);
+  let mut output = Output::open(Cursor::new(Vec::new()), "mp4").expect("open");
+  output
+    .add_stream(&StreamSpec::new(&ticket, millis()))
+    .expect("a stream");
+  let seen = std::sync::Arc::clone(&calls);
+  output.set_write_hook(move |before| seen.lock().expect("the calls").push(before));
+  output.write_header().expect("the header");
+  for i in 0..3_i64 {
+    let packet = AudioPacket::new(
+      FfmpegBytes::copy_from_slice(&[0x21; 4]),
+      AudioPacketExtra::new(0),
+    );
+    output
+      .write_packet::<crate::Owned>(
+        0,
+        OutputPacket::Audio(&packet),
+        PacketTimes::new(Some(i * 20), Some(i * 20), 20),
+        PacketLimits::default(),
+      )
+      .expect("a packet");
+  }
+  output.write_trailer().expect("the trailer");
+  assert_eq!(
+    *calls.lock().expect("the calls"),
+    vec![true, false, true, false, true, false]
+  );
+}

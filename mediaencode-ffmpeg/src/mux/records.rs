@@ -47,6 +47,8 @@
 
 use mediaio_ffmpeg::ffi::pix_fmt_sampling;
 
+use super::audit::{CONFIG_SEED, config_fold};
+
 /// The most bytes `init_get_bits8` takes: its bits must stay below
 /// `INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE * 8` (`get_bits.h` 517–550 in
 /// FFmpeg 9.0.1).
@@ -666,10 +668,16 @@ fn avcc_config(config: Config<'_>) -> Wrote {
 /// SPS's second byte, other than 66, 77 and 88 — four bytes and each SPS
 /// extension so (111–134).
 pub(super) fn avcc_written_len(config: &[u8]) -> u64 {
+  avcc_written_len_of(Config::Bytes(config))
+}
+
+/// [`avcc_written_len`] of a configuration read in place: FLV's made one's
+/// (R12).
+pub(super) fn avcc_written_len_of(config: Config<'_>) -> u64 {
   if config.len() <= 6 {
     return 0;
   }
-  if !annex_b(config) {
+  if !config.annex_b() {
     return config.len() as u64;
   }
   let (mut sps, mut pps, mut extensions) = (0_u64, 0_u64, 0_u64);
@@ -677,7 +685,7 @@ pub(super) fn avcc_written_len(config: &[u8]) -> u64 {
   // each SPS's 16-bit length, then the SPS (80–81, 112).
   let mut head = [0_u8; 4];
   let mut filled = 0;
-  for (unit, [first, _]) in walked(nal_units(config)) {
+  for (unit, [first, _]) in walked(config.units()) {
     let bytes = 2 + unit.len() as u64;
     match first & 0x1F {
       7 => {
@@ -745,6 +753,10 @@ struct Hvcc {
   /// which `hvcc_write` writes in 3 bits (1137–1148): H.265 allows 8 —
   /// sixteen bits — which reads back as 0 (R21, census R20-5).
   depths: Option<(u8, u8)>,
+  /// An SPS whose parse stopped at a limit only a stream the standard does
+  /// not allow passes ([`Parse::Trusted`]): its record rests on the trust
+  /// model ([`rests_on_trust`]).
+  trusted: bool,
 }
 
 /// How a parse of a parameter set ends, as far as the record needs it.
@@ -808,7 +820,13 @@ fn hvcc_config(config: Config<'_>, complete: bool) -> Wrote {
 /// 23 bytes, and each array of a unit, three and each unit behind its
 /// 16-bit length.
 pub(super) fn hvcc_written_len(config: &[u8]) -> u64 {
-  hvcc_walk(Config::Bytes(config), false).map_or(0, |record| {
+  hvcc_written_len_of(Config::Bytes(config))
+}
+
+/// [`hvcc_written_len`] of a configuration read in place: FLV's made one's
+/// (R12).
+pub(super) fn hvcc_written_len_of(config: Config<'_>) -> u64 {
+  hvcc_walk(config, false).map_or(0, |record| {
     23 + 3 * record.counts.iter().filter(|&&count| count > 0).count() as u64 + record.unit_bytes
   })
 }
@@ -861,6 +879,16 @@ fn lhvc_config(config: Config<'_>, complete: bool) -> Wrote {
   }
 }
 
+/// The bytes `ff_isom_write_lhvc` writes of `config`, a configuration it
+/// writes whole ([`lhvc`]; `hvcc_write`, `hevc.c` 964–1201): the record's
+/// six bytes of a layer past the base's — its version, its spatial
+/// segmentation and parallelism, its temporal layers, its arrays' count —
+/// and each array of such a unit, three and each unit behind its 16-bit
+/// length.
+pub(super) fn lhvc_written_len(config: &[u8]) -> u64 {
+  hvcc_walk(Config::Bytes(config), true).map_or(0, |record| 6 + record.upper_bytes)
+}
+
 /// `write_configuration_record`'s walk of `config` (`hevc.c` 1293–1399),
 /// `lhvc` its `FLAG_IS_LHVC`: the record as it stands before it is
 /// written, or what the writer answers where the walk stops.
@@ -890,10 +918,12 @@ fn hvcc_walk(config: Config<'_>, lhvc: bool) -> Result<Hvcc, Wrote> {
         }
         let start = bits.count() / 8;
         let nal = config.get(start..start + len).unwrap_or(&[]);
-        if let Some(array) = HEVC_ARRAYS.iter().position(|&kept| kept == kind)
-          && hvcc_add(&mut record, nal, array, (false, lhvc)) == Parse::Failed
-        {
-          return Err(Wrote::Failed);
+        if let Some(array) = HEVC_ARRAYS.iter().position(|&kept| kept == kind) {
+          match hvcc_add(&mut record, nal, array, (false, lhvc)) {
+            Parse::Failed => return Err(Wrote::Failed),
+            Parse::Trusted => record.trusted = true,
+            Parse::Done => {}
+          }
         }
         bits.skip_long(len as i64 * 8);
       }
@@ -903,10 +933,12 @@ fn hvcc_walk(config: Config<'_>, lhvc: bool) -> Result<Hvcc, Wrote> {
   } else {
     for (unit, [first, _]) in walked(config.units()) {
       let kind = (first >> 1) & 0x3F;
-      if let Some(array) = HEVC_ARRAYS.iter().position(|&kept| kept == kind)
-        && hvcc_add(&mut record, unit, array, (true, lhvc)) == Parse::Failed
-      {
-        return Err(Wrote::Failed);
+      if let Some(array) = HEVC_ARRAYS.iter().position(|&kept| kept == kind) {
+        match hvcc_add(&mut record, unit, array, (true, lhvc)) {
+          Parse::Failed => return Err(Wrote::Failed),
+          Parse::Trusted => record.trusted = true,
+          Parse::Done => {}
+        }
       }
     }
   }
@@ -1305,15 +1337,24 @@ pub(super) fn vvcc(config: &[u8]) -> Wrote {
 
 /// [`vvcc`] of a configuration read in place.
 fn vvcc_config(config: Config<'_>) -> Wrote {
+  vvcc_walk(config).0
+}
+
+/// [`vvcc`]'s walk: what the writer does with `config`, and whether an
+/// SPS's parse stopped at its sub-layers, past the standard's seven, where
+/// FFmpeg's own parse indexes its arrays past their end
+/// ([`VvcStop::SubLayers`]).
+fn vvcc_walk(config: Config<'_>) -> (Wrote, bool) {
   if config.len() < 6 {
-    return Wrote::Failed;
+    return (Wrote::Failed, false);
   }
   if config.first().is_some_and(|first| first & 0xF8 == 0xF8) {
-    return Wrote::Whole;
+    return (Wrote::Whole, false);
   }
   if !config.annex_b() {
-    return Wrote::Failed;
+    return (Wrote::Failed, false);
   }
+  let mut trusted = false;
   let mut counts = [0_u16; 6];
   let mut cut = false;
   // The profile, tier and level the record writes, and the fields it
@@ -1328,7 +1369,7 @@ fn vvcc_config(config: Config<'_>) -> Wrote {
       continue;
     };
     if nal_rbsp_len(unit, 2) > GET_BITS_BYTES_MAX {
-      return Wrote::Failed;
+      return (Wrote::Failed, trusted);
     }
     let (count, wrapped) = counts[array].overflowing_add(1);
     counts[array] = count;
@@ -1338,23 +1379,27 @@ fn vvcc_config(config: Config<'_>) -> Wrote {
       15 => {
         let mut bits = Reader::of(Bytes::rbsp(unit, 2));
         bits.skip(16);
-        if let Some(sps) = vvc_sps(&mut bits) {
-          ptl |= sps.ptl;
-          wide |= sps.width > u32::from(u16::MAX) || sps.height > u32::from(u16::MAX);
-          depth = Some(sps.depth);
+        match vvc_sps(&mut bits) {
+          Ok(sps) => {
+            ptl |= sps.ptl;
+            wide |= sps.width > u32::from(u16::MAX) || sps.height > u32::from(u16::MAX);
+            depth = Some(sps.depth);
+          }
+          Err(stop) => trusted |= stop == VvcStop::SubLayers,
         }
       }
       _ => {}
     }
   }
   let [_, vps, sps, pps, ..] = counts;
-  if vps > 16 || sps == 0 || sps > 16 || pps == 0 || pps > 64 {
+  let wrote = if vps > 16 || sps == 0 || sps > 16 || pps == 0 || pps > 64 {
     Wrote::Failed
   } else if cut || (ptl && (wide || depth.is_some_and(|depth| depth > 7))) {
     Wrote::Corrupt
   } else {
     Wrote::Whole
-  }
+  };
+  (wrote, trusted)
 }
 
 /// What the record holds of an SPS (`vvcc_parse_sps`, `vvc.c` 333–416) that
@@ -1368,15 +1413,16 @@ fn vvcc_config(config: Config<'_>) -> Wrote {
 /// FFmpeg reads it: the picture's size in coding tree blocks of
 /// `AV_CEIL_RSHIFT` of an `unsigned`, whose negation shifts the wrong way,
 /// and the bits of each position of `av_ceil_log2` of that (383–388) —
-/// what the record holds, of the bits FFmpeg reads. `None` of eight
-/// sub-layers, which the standard caps at seven — the parse indexes its
-/// arrays past their end — of an id length past 16, or of an SPS that runs
-/// out before its fields: the trust model's (table C‴), the parse stopped.
-fn vvc_sps(bits: &mut Reader<'_>) -> Option<VvcSps> {
+/// what the record holds, of the bits FFmpeg reads. Stopped — the trust
+/// model's (table C‴) — of eight sub-layers, which the standard caps at
+/// seven, where the parse indexes its arrays past their end
+/// ([`VvcStop::SubLayers`]); of an id length past 16, or of an SPS that
+/// runs out before its fields ([`VvcStop::Fields`]).
+fn vvc_sps(bits: &mut Reader<'_>) -> Result<VvcSps, VvcStop> {
   bits.skip(8);
   let sub_layers = bits.read(3);
   if sub_layers == 7 {
-    return None;
+    return Err(VvcStop::SubLayers);
   }
   bits.skip(2);
   let ctu = bits.read(2);
@@ -1392,7 +1438,7 @@ fn vvc_sps(bits: &mut Reader<'_>) -> Option<VvcSps> {
   let height = bits.ue_long();
   // An SPS that runs out before its fields are read is the trust model's.
   if bits.left() < 0 {
-    return None;
+    return Err(VvcStop::Fields);
   }
   if bits.read1() == 1 {
     for _ in 0..4 {
@@ -1432,7 +1478,7 @@ fn vvc_sps(bits: &mut Reader<'_>) -> Option<VvcSps> {
     // the length at 16, a longer one the trust model's.
     let id_len = bits.ue_long().wrapping_add(1);
     if !(1..=16).contains(&id_len) {
-      return None;
+      return Err(VvcStop::Fields);
     }
     if bits.read1() == 1 && bits.read1() == 1 {
       let ids = u64::from(subpics) + 1;
@@ -1440,12 +1486,27 @@ fn vvc_sps(bits: &mut Reader<'_>) -> Option<VvcSps> {
     }
   }
   let depth = bits.ue_long() as u8;
-  (bits.left() >= 0).then_some(VvcSps {
+  if bits.left() < 0 {
+    return Err(VvcStop::Fields);
+  }
+  Ok(VvcSps {
     ptl,
     width,
     height,
     depth,
   })
+}
+
+/// Where [`vvc_sps`] stops, the trust model's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VvcStop {
+  /// Eight sub-layers: FFmpeg's parse indexes its arrays past their end
+  /// (`vvc.c` 146–150, 208–216, 706), and what it writes of the record is
+  /// undefined.
+  SubLayers,
+  /// An id length past 16, or fields past the SPS's end: the fields the
+  /// record writes of them unread, the record written.
+  Fields,
 }
 
 /// [`vvc_sps`]'s answer.
@@ -1536,12 +1597,20 @@ const EVC_ARRAYS: [i32; 4] = [24, 25, 26, 28];
 /// too short to read refused, a bit depth past 14 refused — the record
 /// holds three bits of it; no SPS, or more than 16, refused (226–227).
 pub(super) fn evcc(config: &[u8]) -> Wrote {
+  evcc_walk(config).0
+}
+
+/// [`evcc`]'s walk: what the writer does with `config`, and whether an SPS's
+/// parse stopped at a limit only a stream the standard does not allow
+/// passes ([`evc_sps`]'s [`Parse::Trusted`]).
+fn evcc_walk(config: &[u8]) -> (Wrote, bool) {
   if config.len() < 8 {
-    return Wrote::Failed;
+    return (Wrote::Failed, false);
   }
   if config[0] == 1 {
-    return Wrote::Whole;
+    return (Wrote::Whole, false);
   }
+  let mut trusted = false;
   let mut counts = [0_u16; 4];
   let mut cut = false;
   let (mut at, mut left) = (0, config.len());
@@ -1563,26 +1632,31 @@ pub(super) fn evcc(config: &[u8]) -> Wrote {
       -1
     };
     if !(0..=62).contains(&kind) {
-      return Wrote::Failed;
+      return (Wrote::Failed, trusted);
     }
     if let Some(array) = EVC_ARRAYS.iter().position(|&kept| kept == kind) {
       let (count, wrapped) = counts[array].overflowing_add(1);
       counts[array] = count;
       cut |= wrapped || size > usize::from(u16::MAX);
-      if kind == 24 && evc_sps(&config[at..], size) == Parse::Failed {
-        return Wrote::Failed;
+      if kind == 24 {
+        match evc_sps(&config[at..], size) {
+          Parse::Failed => return (Wrote::Failed, trusted),
+          Parse::Trusted => trusted = true,
+          Parse::Done => {}
+        }
       }
     }
     at += size;
     left -= size;
   }
-  if counts[0] == 0 || counts[0] > 16 {
+  let wrote = if counts[0] == 0 || counts[0] > 16 {
     Wrote::Failed
   } else if cut {
     Wrote::Corrupt
   } else {
     Wrote::Whole
-  }
+  };
+  (wrote, trusted)
 }
 
 /// `evcc_parse_sps` (`evc.c` 80–125) of the SPS of `size` bytes opening
@@ -1992,6 +2066,17 @@ pub(super) struct Extracted<'a> {
   kept: &'static [u8],
   /// Its bytes: each set's and its start code's.
   len: usize,
+  /// The fold of those bytes, as FLV compares a new configuration with its
+  /// current one (`flvenc.c` 1250–1264; R12): made in the same pass as its
+  /// length, nothing made.
+  fold: u64,
+}
+
+impl Extracted<'_> {
+  /// Its bytes' count and their fold ([`config_fold`]).
+  pub(super) const fn made(&self) -> (u64, u64) {
+    (self.len as u64, self.fold)
+  }
 }
 
 impl<'a> Extracted<'a> {
@@ -2059,11 +2144,20 @@ pub(super) fn h2645_extracted(
   if sets().next().is_none() || !present(sps) || vps.is_some_and(|vps| !present(vps)) {
     return Ok(None);
   }
+  // Its length and its bytes' fold, one pass: each set behind its start
+  // code.
+  let (len, fold) = sets().fold((0, CONFIG_SEED), |(len, fold), unit| {
+    (
+      len + 4 + unit.raw.len(),
+      config_fold(config_fold(fold, &[0, 0, 0, 1]), unit.raw),
+    )
+  });
   Ok(Some(Extracted {
     bytes,
     units,
     kept,
-    len: sets().map(|unit| 4 + unit.raw.len()).sum(),
+    len,
+    fold,
   }))
 }
 
@@ -2248,6 +2342,37 @@ pub(super) fn lvcc_within(config: &[u8], limits: SplitLimits) -> Wrote {
   }
 }
 
+/// The bytes `ff_isom_write_lvcc` writes of `config`, a configuration it
+/// writes whole ([`lvcc`]; `lcevc.c` 251–339): an `lvcC` as it is; of Annex
+/// B units, the record's fifteen bytes — its version, profile, level,
+/// sampling and depths, a byte of the length size, the picture's width and
+/// height, a byte reserved, the arrays' count — then each array of a unit,
+/// the IDR units' and the others', its type, its 16-bit count, and each
+/// unit as `write_nalu` writes it, its 16-bit length and the bytes it
+/// counts ([`lcevc_unit`]). `None` where a unit rests on the trust model,
+/// its length none the mirror knows. Read in place, nothing allocated.
+pub(super) fn lvcc_written_len(config: &[u8]) -> Option<u64> {
+  if !annex_b(config) {
+    return Some(config.len() as u64);
+  }
+  let split = h2645_split(config, Units::Lcevc, Some(SplitLimits::REAL)).ok()?;
+  let (mut idr, mut other) = ((0_u64, 0_u64), (0_u64, 0_u64));
+  for unit in split {
+    let array = match unit.kind {
+      29 => &mut idr,
+      28 => &mut other,
+      _ => continue,
+    };
+    let LcevcUnit::Length(length) = lcevc_unit(unit) else {
+      return None;
+    };
+    array.0 += 1;
+    array.1 += 2 + length as u64;
+  }
+  let written = |(units, bytes): (u64, u64)| if units > 0 { 3 + bytes } else { 0 };
+  Some(15 + written(idr) + written(other))
+}
+
 /// What `ff_isom_write_vpcc` does with a VP9 track whose stream's pixel
 /// format is `format` and profile `profile`, its configuration — MP4's
 /// first sample where it states none (`movenc.c` 7024–7041) — of `len`
@@ -2299,6 +2424,14 @@ const VC1_SEQUENCE_HEADER: u32 = 0x0000_010F;
 /// carry none, among them. A sequence header of another profile than the
 /// advanced one, which alone writes one, it refuses too: the trust model's.
 pub(super) fn dvc1(config: &[u8]) -> Wrote {
+  dvc1_walk(config).0
+}
+
+/// [`dvc1`]'s walk: what the writer does with `config`, and whether it
+/// stops at a sequence header of another profile than the advanced one,
+/// which `mov_write_dvc1_structs` refuses and the trust model leaves
+/// unrefused (`movenc.c` 1137–1141).
+fn dvc1_walk(config: &[u8]) -> (Wrote, bool) {
   let len = config.len();
   let marker = |from: usize| -> usize {
     if len < from.saturating_add(4) {
@@ -2321,13 +2454,13 @@ pub(super) fn dvc1(config: &[u8]) -> Wrote {
       ]) == VC1_SEQUENCE_HEADER
     {
       if config[start + 4] >> 6 != 3 {
-        return Wrote::Whole;
+        return (Wrote::Whole, true);
       }
       found = true;
     }
     start = next;
   }
-  if found { Wrote::Whole } else { Wrote::Failed }
+  (if found { Wrote::Whole } else { Wrote::Failed }, false)
 }
 
 /// The bits past which `init_get_bits`'s `int` count of a VC-1 unit's
@@ -2472,6 +2605,23 @@ pub(super) fn apv_frame_infos(au: &[u8]) -> ApvFrameInfos<'_> {
   units
 }
 
+/// The bytes `ff_isom_write_apvc` writes of the frame informations
+/// `recorded`, by PBU type (`apv.c` 145–203): its version and its count of
+/// types, then of each type its PBU type and count, and each frame
+/// information's fourteen bytes, four more where it states a colour
+/// description.
+pub(super) fn apvc_written_len(recorded: &[(u8, Vec<ApvFrameInfo>)]) -> u64 {
+  2 + recorded
+    .iter()
+    .map(|(_, infos)| {
+      2 + infos
+        .iter()
+        .map(|info| if info.color.is_some() { 18 } else { 14 })
+        .sum::<u64>()
+    })
+    .sum::<u64>()
+}
+
 /// The PBU opening `rest` — its 4-byte size, at least 8 and within what is
 /// left, its header's reserved byte clear — and what follows it.
 fn apv_unit(rest: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -2565,6 +2715,41 @@ fn apv_frame_info(header: &[u8]) -> Option<ApvFrameInfo> {
     distance,
     color,
   })
+}
+
+/// Whether what `writer` writes of `config` rests on the trust model: its
+/// mirror's own parse stopped at a limit only a stream the standards do not
+/// allow passes (see [the module](self)) — `hvcC`'s and `lhvC`'s SPS of
+/// more than 64 short-term reference picture sets, or of a set whose bits
+/// run past it, where FFmpeg writes the `hvcC` empty and no `lhvC`
+/// (`hevc.c` 739–740, 608–611); `evcC`'s SPS of an id past 15 or a chroma
+/// format past 3, where it writes the `evcC` empty (`evc.c` 95–96,
+/// 112–113); `vvcC`'s SPS of eight sub-layers, where what it writes is
+/// undefined (`vvc.c` 146–150, 208–216, 706); `dvc1`'s sequence header of
+/// another profile than the advanced one, where it writes none (`movenc.c`
+/// 1137–1141); `lvcC`'s unit of a block or picture the standard does not
+/// allow ([`lvcc_written_len`]). The write audit judges such a record not
+/// at all (R8).
+pub(super) fn rests_on_trust(writer: Writer, config: &[u8]) -> bool {
+  rests_on_trust_of(writer, Config::Bytes(config))
+}
+
+/// [`rests_on_trust`] of a configuration as the stream holds it or as
+/// `extract_extradata` makes it of a packet's units, which FLV writes a
+/// sequence header of (R8, R12): `hvcC`'s and `vvcC`'s of either, the
+/// others' of their bytes alone, which no filter makes.
+pub(super) fn rests_on_trust_of(writer: Writer, config: Config<'_>) -> bool {
+  match (writer, config) {
+    (Writer::Hvcc { .. }, config) => [false, true]
+      .into_iter()
+      .any(|lhvc| hvcc_walk(config, lhvc).is_ok_and(|record| record.trusted)),
+    (Writer::Vvcc, config) => vvcc_walk(config).1,
+    (Writer::Evcc, Config::Bytes(config)) => evcc_walk(config).1,
+    (Writer::Dvc1, Config::Bytes(config)) => dvc1_walk(config).1,
+    (Writer::Lvcc, Config::Bytes(config)) => lvcc_written_len(config).is_none(),
+    (Writer::Evcc | Writer::Dvc1 | Writer::Lvcc, Config::Extracted(_))
+    | (Writer::Avcc | Writer::Vpcc { .. } | Writer::Av1c | Writer::Av3c, _) => false,
+  }
 }
 
 /// A configuration writer the MOV family or FLV calls and ignores the

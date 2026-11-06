@@ -137,9 +137,12 @@ jobs:
     - name: The base and the read adapter, with test-support
       run: cargo test -p mediaio-ffmpeg -p mediadecode-ffmpeg --features test-support
     # The write adapter's `gpl` combinations are the GPL lane: against
-    # the full build, its GPL encoders are admitted by name.
+    # the full build, its GPL encoders are admitted by name. Its
+    # `test-support`, as the base's, runs in one lane of its own.
     - name: The write adapter, every feature combination
-      run: cargo hack test -p mediaencode-ffmpeg --feature-powerset --exclude-no-default-features
+      run: cargo hack test -p mediaencode-ffmpeg --feature-powerset --exclude-no-default-features --exclude-features test-support
+    - name: The write adapter, with test-support
+      run: cargo test -p mediaencode-ffmpeg --features test-support
     - name: The umbrella with ffmpeg
       run: cargo test -p mediaio --features ffmpeg
 
@@ -184,7 +187,7 @@ jobs:
           # Audio fixtures live at `tests/fixtures/audio/` as a
           # submodule pointing at `findit-studio/audio-fixtures`.
           # `audio_pcm_fixtures` walks the tree and panics on
-          # missing files, so tarpaulin needs them too — the
+          # missing files, so coverage needs them too — the
           # `test` job above already runs with submodules.
           submodules: recursive
       - name: Cache cargo build and registry
@@ -201,17 +204,19 @@ jobs:
         with:
           variant: full
       - name: Install Rust
-        run: rustup update nightly && rustup default nightly
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
-      - name: Run tarpaulin
-        env:
-          RUSTFLAGS: "--cfg tarpaulin"
-        run: cargo tarpaulin -p mediaio-ffmpeg -p mediadecode-ffmpeg -p mediaencode-ffmpeg --all-features --run-types tests --run-types doctests --out xml
+        run: rustup update nightly && rustup default nightly && rustup component add llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2.88.1
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - name: Run cargo-llvm-cov
+        # Doctests are covered on nightly, the toolchain this job uses.
+        run: cargo llvm-cov -p mediaio-ffmpeg -p mediadecode-ffmpeg -p mediaencode-ffmpeg --all-features --doctests --lcov --output-path lcov.info
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: ${{ github.repository }}
+          files: lcov.info
           fail_ci_if_error: true
           flags: ffmpeg

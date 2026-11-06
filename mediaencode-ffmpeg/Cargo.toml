@@ -23,6 +23,10 @@ std     = ["mediaencode/std", "mediaio-ffmpeg/std"]
 # binary GPL whatever this crate's features say.
 gpl = []
 
+# Test machinery, compiled only on request: the hooks a law runs inside a
+# muxer's open, around its header. Off by default.
+test-support = ["mediaio-ffmpeg/test-support"]
+
 [dependencies]
 mediaencode    = { workspace = true }
 mediaio-ffmpeg = { workspace = true }

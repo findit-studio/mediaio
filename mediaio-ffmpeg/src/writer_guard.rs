@@ -93,17 +93,210 @@
 //!
 //! The guard cannot help under `panic = "abort"`, where no unwind exists
 //! to catch; that is a whole-binary choice the caller makes.
+//!
+//! # The tap
+//!
+//! A muxer that audits what libavformat wrote reads it here, where every
+//! byte reaches the caller's sink ([`SinkTap`], installed by
+//! [`Output::set_tap`](crate::output::Output::set_tap)). The guard calls
+//! the tap on one road alone: a write the sink answered `Ok(n)` with
+//! `0 < n ≤ len`, the road R27's latch leaves standing, and then with the
+//! `n` bytes the sink took and no other. A write the latch marks failed, an
+//! interrupted one, one refused before it reached the sink, and every call
+//! after a panic tap nothing; ffmpeg-next's loop over a partial write
+//! (`stream_io.rs` 333–343) taps each part at its own offset. So the tap
+//! sees exactly the bytes the sink took, in the order it took them.
+//!
+//! **The offset is libavformat's**: the bytes taken since the output's
+//! first, moved by each seek to the offset libavformat asked for.
+//! libavformat reaches the sink's seek only with `SEEK_SET` and an
+//! absolute offset (`avio_seek`, `aviobuf.c` 303–317 in FFmpeg 9.0.1) and
+//! sets its own `s->pos` to that offset, not to the sink's answer; the
+//! guard follows it the same way. A seek of any other kind — from the
+//! end, or by a nonzero distance — leaves libavformat's offsets for good
+//! ([`SinkTap::lost`]).
+//!
+//! **A panic in the tap stays in the guard.** The tap runs inside
+//! ffmpeg-next's `extern "C"` callback, so the guard calls it under a
+//! `catch_unwind` of its own, holding the tap's lock while it runs: a
+//! panic poisons the lock, its payload is forgotten as the sink's is, and
+//! a poisoned tap is not called again. The sink did not panic, so its
+//! write stands and the latch is untouched; the output answers the
+//! poisoned tap by name when it is asked for
+//! ([`OutputError::TapPanicked`](crate::output::OutputError::TapPanicked)).
+//!
+//! **The road allocates nothing.** The tap is set once, while the output
+//! is being built; each write the sink takes then costs a load, an
+//! uncontended lock and a `catch_unwind` frame, which allocates nothing
+//! unless a panic is thrown.
 
 use std::{
+  any::Any,
   io::{self, Seek, SeekFrom, Write},
   panic::{AssertUnwindSafe, catch_unwind},
   sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
   },
 };
 
 use crate::reader_guard::{InertError, PanicLatch};
+
+/// A reader of the bytes the caller's sink takes — each run at
+/// libavformat's offset, in the order the sink took them: what a muxer
+/// audits of what libavformat wrote ([the module](self)).
+///
+/// [`Output::set_tap`](crate::output::Output::set_tap) installs one while
+/// the output is being built, before the header writes its first byte, and
+/// [`Output::with_tap`](crate::output::Output::with_tap) lends it back as
+/// its own type. The guard calls it inside libavformat's write callback,
+/// under a `catch_unwind` of its own: a tap that panics is not called
+/// again, and the sink's write stands.
+pub trait SinkTap: Any + Send {
+  /// The sink took `bytes`, at `at`.
+  ///
+  /// `at` is libavformat's offset from the output's first byte: the bytes
+  /// taken since, moved by each seek to the absolute offset libavformat
+  /// asked for. It follows the request, as libavformat's own `s->pos`
+  /// does, and not the sink's answer (`avio_seek`, `aviobuf.c` 303–317 in
+  /// FFmpeg 9.0.1). Called once for each write the sink answered with some
+  /// of the bytes it was handed — each part of a partial write at its own
+  /// offset — and never for bytes the sink failed, refused, or was not
+  /// asked to take.
+  fn took(&mut self, at: u64, bytes: &[u8]);
+
+  /// The sink's position left libavformat's absolute offsets: a seek from
+  /// the end, or by a nonzero distance from where the sink stands — the
+  /// size probe ffmpeg-next answers `AVSEEK_SIZE` with (`stream_io.rs`
+  /// 358–372), or `avio_size`'s fallback by `SEEK_END`.
+  ///
+  /// Called once, and no [`took`](Self::took) follows, even after a later
+  /// seek to an absolute offset. The probe's own seek back
+  /// (`SeekFrom::Start`) could name the position again, but the guard does
+  /// not take it back: a tap told its position is lost judges the output as
+  /// one it could not follow. That fails closed, and costs no file today:
+  /// none of the writers a tap is installed over asks the sink's size or
+  /// seeks from its end (no `avio_size`, `SEEK_END` or `AVSEEK_SIZE` in
+  /// `movenc.c`, `movenc_ttml.c`, `matroskaenc.c`, `flvenc.c`, `flacenc.c`,
+  /// `mux.c` or `mux_utils.c` in FFmpeg 9.0.1), so a writer that one day
+  /// probes the sink fails every file it writes rather than passing one the
+  /// tap did not see whole.
+  fn lost(&mut self);
+}
+
+/// What the guard and the output that owns it share of the tap: set once,
+/// while the output is being built ([`Self::fill`]), and read by the guard
+/// at each write the sink takes. Shared as the closing word is
+/// ([`GuardedWriter::closer`]): the guard lives inside the I/O context,
+/// where the output reaches it only through libavformat.
+#[derive(Default)]
+pub(crate) struct TapSlot {
+  tap: OnceLock<Mutex<Box<dyn SinkTap>>>,
+  /// What rewrites the bytes libavformat hands the guard before the sink
+  /// and the tap see them: test support ([`Plant`]).
+  #[cfg(any(test, feature = "test-support"))]
+  plant: Mutex<Option<Plant>>,
+  /// What runs around libavformat's take of each packet the output writes:
+  /// test support
+  /// ([`Output::set_write_hook`](crate::output::Output::set_write_hook)).
+  /// Set once, so that an output of none locks nothing, and allocates
+  /// nothing, at its packets.
+  #[cfg(any(test, feature = "test-support"))]
+  hook: OnceLock<Mutex<Box<dyn FnMut(bool) + Send>>>,
+}
+
+impl TapSlot {
+  /// Sets `tap`, unless one is set: whether it was.
+  pub(crate) fn fill(&self, tap: Box<dyn SinkTap>) -> bool {
+    self.tap.set(Mutex::new(tap)).is_ok()
+  }
+
+  /// The tap, under its lock, if one is set.
+  pub(crate) fn tap(&self) -> Option<&Mutex<Box<dyn SinkTap>>> {
+    self.tap.get()
+  }
+
+  /// Sets the packet hook, unless one is set: whether it was. Its lock is
+  /// taken once here, so that the lock's own first allocation falls at
+  /// the set, not at a packet's write.
+  #[cfg(any(test, feature = "test-support"))]
+  pub(crate) fn set_hook(&self, hook: Box<dyn FnMut(bool) + Send>) -> bool {
+    let set = self.hook.set(Mutex::new(hook)).is_ok();
+    if let Some(hook) = self.hook.get() {
+      drop(hook.lock());
+    }
+    set
+  }
+
+  /// Runs the packet hook, where one is set, with `before`.
+  #[cfg(any(test, feature = "test-support"))]
+  pub(crate) fn hook(&self, before: bool) {
+    if let Some(hook) = self.hook.get() {
+      let mut hook = hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+      (*hook)(before);
+    }
+  }
+
+  /// Sets the plant, replacing any.
+  #[cfg(any(test, feature = "test-support"))]
+  pub(crate) fn plant(&self, change: Box<dyn FnMut(u64, &mut [u8]) + Send>) {
+    // A poisoned lock holds a plain `Option`, sound to replace.
+    *self
+      .plant
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Plant {
+      change,
+      scratch: Vec::new(),
+    });
+  }
+}
+
+/// Test support: a change made to the bytes libavformat hands the guard,
+/// in place and keeping their length, before the sink and the tap see them
+/// — libavformat writing otherwise, as a muxer's laws make it
+/// ([`Output::set_write_plant`](crate::output::Output::set_write_plant)).
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct Plant {
+  change: Box<dyn FnMut(u64, &mut [u8]) + Send>,
+  /// The copy the change is made in: libavformat's buffer is not the
+  /// guard's to change.
+  scratch: Vec<u8>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Plant {
+  /// `buf`, written at `at`, as the plant changes it; or the payload of
+  /// the change's panic, which the caller latches as the sink's.
+  fn apply(&mut self, at: u64, buf: &[u8]) -> Result<&[u8], Box<dyn Any + Send>> {
+    let Self { change, scratch } = self;
+    scratch.clear();
+    scratch.extend_from_slice(buf);
+    catch_unwind(AssertUnwindSafe(|| change(at, scratch)))?;
+    Ok(scratch)
+  }
+}
+
+/// Calls `tap` under its lock and a `catch_unwind` of its own: the tap
+/// runs inside ffmpeg-next's `extern "C"` callback, which a panic must not
+/// cross. A panic poisons the lock — its guard drops while the panic
+/// unwinds — and its payload is forgotten, for the reason
+/// [`GuardedWriter::guard`] forgets the sink's; a poisoned tap is not
+/// called again.
+fn call_tap(tap: &Mutex<Box<dyn SinkTap>>, call: impl FnOnce(&mut dyn SinkTap)) {
+  // `AssertUnwindSafe` because the tap is exactly what its own panic may
+  // leave inconsistent — and that is why the poisoned lock is never taken
+  // again.
+  let called = catch_unwind(AssertUnwindSafe(|| {
+    if let Ok(mut tap) = tap.lock() {
+      call(&mut **tap);
+    }
+  }));
+  if let Err(payload) = called {
+    core::mem::forget(payload);
+  }
+}
 
 /// Where a sink's failed seek is kept until the muxing context can name
 /// it.
@@ -204,6 +397,11 @@ pub struct GuardedWriter<W> {
   /// I/O context keeps the write's error and names it, but `avio_seek`
   /// still calls the sink's seek after the flush that failed.
   failed: bool,
+  /// The tap's slot, shared with the output that owns the guard.
+  tap: Arc<TapSlot>,
+  /// Where the next byte the sink takes lands, in libavformat's offsets;
+  /// `None` once the position has left them ([`SinkTap::lost`]).
+  at: Option<u64>,
 }
 
 impl<W> GuardedWriter<W> {
@@ -220,6 +418,8 @@ impl<W> GuardedWriter<W> {
         seeks: Arc::clone(&seeks),
         closed: Arc::new(SinkClosed::default()),
         failed: false,
+        tap: Arc::new(TapSlot::default()),
+        at: Some(0),
       },
       latch,
       seeks,
@@ -230,6 +430,45 @@ impl<W> GuardedWriter<W> {
   /// output that owns the guard.
   pub(crate) fn closer(&self) -> Arc<SinkClosed> {
     Arc::clone(&self.closed)
+  }
+
+  /// A handle on the tap's slot ([`TapSlot`]), for the output that owns
+  /// the guard.
+  pub(crate) fn tap_slot(&self) -> Arc<TapSlot> {
+    Arc::clone(&self.tap)
+  }
+
+  /// The sink took `bytes`, all of them, at the position: the tap is told,
+  /// and the position moves past them. Nothing, once the position is lost.
+  fn took(&mut self, bytes: &[u8]) {
+    let Some(at) = self.at else {
+      return;
+    };
+    if bytes.is_empty() {
+      return;
+    }
+    if let Some(tap) = self.tap.tap() {
+      call_tap(tap, |tap| tap.took(at, bytes));
+    }
+    // libavformat counts its offsets in an `int64_t`, so no sink reaches
+    // the end of a `u64`; were one to, its position is lost, not wrapped.
+    match u64::try_from(bytes.len())
+      .ok()
+      .and_then(|len| at.checked_add(len))
+    {
+      Some(next) => self.at = Some(next),
+      None => self.lose(),
+    }
+  }
+
+  /// The position left libavformat's offsets: the tap is told, once, and
+  /// is told of no byte after it ([`SinkTap::lost`]).
+  fn lose(&mut self) {
+    if self.at.take().is_some()
+      && let Some(tap) = self.tap.tap()
+    {
+      call_tap(tap, |tap| tap.lost());
+    }
   }
 
   /// The caller's sink, handed back.
@@ -306,13 +545,40 @@ impl<W: Write> Write for GuardedWriter<W> {
   /// buffer of some, or more than it was handed, which ffmpeg-next answers
   /// as failures, latches the sink as failed: every later write, seek and
   /// flush is refused without reaching it (R27, Codex R26 [medium]).
+  ///
+  /// The one write the latch leaves standing — `Ok(n)`, `0 < n ≤ len` —
+  /// is the one the tap sees, with the `n` bytes the sink took
+  /// ([the module](self)).
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
     self.positioned()?;
+    #[cfg(any(test, feature = "test-support"))]
+    let slot = Arc::clone(&self.tap);
+    #[cfg(any(test, feature = "test-support"))]
+    let mut plant = slot
+      .plant
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(any(test, feature = "test-support"))]
+    let buf = match (plant.as_mut(), self.at) {
+      (Some(plant), Some(at)) => match plant.apply(at, buf) {
+        Ok(planted) => planted,
+        // A plant that panics is latched as the sink's panic: the output
+        // names it, and nothing more reaches the sink.
+        Err(payload) => {
+          self.latch.latch(&*payload);
+          core::mem::forget(payload);
+          self.failed = true;
+          return Err(io::Error::other("the write plant panicked"));
+        }
+      },
+      _ => buf,
+    };
     let written = self.guard(|inner| inner.write(buf));
     match &written {
       Ok(taken) if (*taken == 0 && !buf.is_empty()) || *taken > buf.len() => self.failed = true,
+      Ok(taken) => self.took(&buf[..*taken]),
       Err(error) if error.kind() != io::ErrorKind::Interrupted => self.failed = true,
-      _ => {}
+      Err(_) => {}
     }
     written
   }
@@ -333,6 +599,9 @@ impl<W: Write> Write for GuardedWriter<W> {
 }
 
 impl<W: Seek> Seek for GuardedWriter<W> {
+  /// The tap's position follows a seek the sink answered: to the offset
+  /// asked, by `SeekFrom::Start`; nowhere, by `SeekFrom::Current(0)`; out
+  /// of libavformat's offsets for good, by any other ([`SinkTap::lost`]).
   fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
     self.positioned()?;
     let sought = self.guard(|inner| inner.seek(pos));
@@ -345,6 +614,19 @@ impl<W: Seek> Seek for GuardedWriter<W> {
       && !self.latch.is_latched()
     {
       self.seeks.record(InertError::of(error));
+    }
+    // A sink that panicked, now or before, is reached no more, and its
+    // position matters to no one.
+    if !self.latch.is_latched() {
+      match pos {
+        SeekFrom::Start(to) => {
+          if sought.is_ok() && self.at.is_some() {
+            self.at = Some(to);
+          }
+        }
+        SeekFrom::Current(0) => {}
+        SeekFrom::Current(_) | SeekFrom::End(_) => self.lose(),
+      }
     }
     sought
   }
@@ -822,6 +1104,118 @@ mod tests {
     assert!(quietly(|| guarded.seek(SeekFrom::Start(0))).is_err());
     assert_eq!(latch.message().as_deref(), Some("seek exploded"));
     assert!(seeks.failure().is_none(), "a panic is not a failed seek");
+  }
+
+  /// What a tap was told, in order.
+  #[derive(Debug, PartialEq, Eq)]
+  enum Told {
+    Took(u64, Vec<u8>),
+    Lost,
+  }
+
+  /// A tap that tells a log the law holds what it is told.
+  struct Logged(Arc<Mutex<Vec<Told>>>);
+
+  impl SinkTap for Logged {
+    fn took(&mut self, at: u64, bytes: &[u8]) {
+      self
+        .0
+        .lock()
+        .expect("the log")
+        .push(Told::Took(at, bytes.to_vec()));
+    }
+    fn lost(&mut self) {
+      self.0.lock().expect("the log").push(Told::Lost);
+    }
+  }
+
+  /// A guard over `inner`, tapped, and the tap's log.
+  fn tapped<W>(inner: W) -> (GuardedWriter<W>, Arc<PanicLatch>, Arc<Mutex<Vec<Told>>>) {
+    let (guarded, latch, _) = GuardedWriter::new(inner);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    assert!(guarded.tap_slot().fill(Box::new(Logged(Arc::clone(&log)))));
+    (guarded, latch, log)
+  }
+
+  fn took(at: u64, bytes: &[u8]) -> Told {
+    Told::Took(at, bytes.to_vec())
+  }
+
+  /// **B6 — a position lost stays lost.** The tap follows a seek to an
+  /// absolute offset and is left where it was by `SeekFrom::Current(0)`; a
+  /// seek from the end loses the position: `lost` is told once, and no byte
+  /// is tapped after it — not even past a later seek to an absolute offset,
+  /// which a size probe's seek back would be. The sink takes every byte all
+  /// the same.
+  #[test]
+  fn b6_a_seek_from_the_end_loses_the_position_once_and_for_good() {
+    let (mut guarded, _, log) = tapped(io::Cursor::new(Vec::new()));
+    guarded.write_all(b"abc").expect("write");
+    guarded.seek(SeekFrom::Start(1)).expect("seek");
+    guarded.write_all(b"X").expect("write");
+    assert_eq!(guarded.stream_position().expect("where"), 2);
+    guarded.write_all(b"Y").expect("write");
+    guarded.seek(SeekFrom::End(0)).expect("seek");
+    guarded.write_all(b"de").expect("write");
+    guarded.seek(SeekFrom::Start(0)).expect("seek");
+    guarded.write_all(b"Z").expect("write");
+    guarded.seek(SeekFrom::End(0)).expect("seek");
+    assert_eq!(
+      *log.lock().expect("the log"),
+      [took(0, b"abc"), took(1, b"X"), took(2, b"Y"), Told::Lost]
+    );
+    assert_eq!(guarded.into_inner().into_inner(), b"ZXYde");
+  }
+
+  /// **A write the latch marks failed taps nothing, and neither does one
+  /// interrupted**: an error, no byte taken of some, and more than handed
+  /// each latch the sink, and none reaches the tap; an interrupted write,
+  /// which did nothing, does not either.
+  #[test]
+  fn a_write_the_latch_marks_failed_taps_nothing() {
+    for answer in [
+      (|| Err(io::Error::other("full"))) as fn() -> io::Result<usize>,
+      || Ok(0),
+      || Ok(1_000),
+      || Err(io::ErrorKind::Interrupted.into()),
+    ] {
+      let (mut guarded, _, log) = tapped(FailsOnce { calls: 0, answer });
+      let answered = guarded.write(b"bytes");
+      assert!(!matches!(answered, Ok(1..=5)), "the premise: {answered:?}");
+      assert!(log.lock().expect("the log").is_empty(), "nothing tapped");
+    }
+  }
+
+  /// **A write plant changes what the sink and the tap see**, at the
+  /// write's offset and keeping its length; a plant that panics is latched
+  /// as the sink's panic, and nothing reaches the sink after it.
+  #[test]
+  fn a_write_plant_changes_what_the_sink_and_the_tap_see() {
+    let (mut guarded, _, log) = tapped(io::Cursor::new(Vec::new()));
+    guarded
+      .tap_slot()
+      .plant(Box::new(|at: u64, bytes: &mut [u8]| {
+        if at == 0 {
+          bytes[1] = b'Q';
+        }
+      }));
+    guarded.write_all(b"abc").expect("write");
+    guarded.write_all(b"de").expect("write");
+    assert_eq!(
+      *log.lock().expect("the log"),
+      [took(0, b"aQc"), took(3, b"de")]
+    );
+    assert_eq!(guarded.into_inner().into_inner(), b"aQcde");
+
+    let (mut guarded, latch, log) = tapped(io::Cursor::new(Vec::new()));
+    guarded.tap_slot().plant(Box::new(|_: u64, _: &mut [u8]| {
+      panic!("the plant exploded")
+    }));
+    assert!(quietly(|| guarded.write(b"abc")).is_err());
+    assert_eq!(latch.message().as_deref(), Some("the plant exploded"));
+    assert!(guarded.write(b"more").is_err());
+    assert!(log.lock().expect("the log").is_empty(), "nothing tapped");
+    assert!(guarded.into_inner().into_inner().is_empty());
   }
 
   #[test]

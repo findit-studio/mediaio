@@ -401,9 +401,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
-        run: rustup update nightly && rustup default nightly
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        run: rustup update nightly && rustup default nightly && rustup component add llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2.88.1
+        with:
+          tool: cargo-llvm-cov@0.9.1
       - name: Cache cargo build and registry
         uses: actions/cache@v6
         with:
@@ -414,14 +416,14 @@ jobs:
           key: ${{ runner.os }}-core-coverage-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-core-coverage-
-      - name: Run tarpaulin
-        env:
-          RUSTFLAGS: "--cfg tarpaulin"
-        run: cargo tarpaulin -p mediaspine -p mediadecode -p mediaencode --all-features --run-types tests --run-types doctests --out xml
+      - name: Run cargo-llvm-cov
+        # Doctests are covered on nightly, the toolchain this job uses.
+        run: cargo llvm-cov -p mediaspine -p mediadecode -p mediaencode --all-features --doctests --lcov --output-path lcov.info
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: ${{ github.repository }}
+          files: lcov.info
           fail_ci_if_error: true
           flags: core

@@ -13,6 +13,25 @@ crate moves only when it changes.
 
 ### Added
 
+- **The tap on the write crossing** (hidden, for the muxer's write audit,
+  findit-studio/mediaio#95): `writer_guard::SinkTap`, handed every run of
+  bytes the caller's sink takes, at libavformat's offset, in the order the
+  sink takes them — on the one road R27's latch leaves standing, a write
+  answered `Ok(n)` with `0 < n ≤ len`, and with those `n` bytes alone —
+  and told once when a seek leaves libavformat's absolute offsets
+  (`SinkTap::lost`). `Output::set_tap` sets one, while the context is
+  being built and once (`OutputCall::Tap`); `Output::with_tap` lends it
+  back as its own type for a closure's extent, refusing by name a tap
+  that panicked (`OutputError::TapPanicked`), none set
+  (`OutputError::NoTap`) and one of another type
+  (`OutputError::TapMismatch`). The tap runs under a `catch_unwind` of its
+  own inside libavformat's callback: a tap that panics is not called
+  again, and the sink's write stands. The tap's lock, its box and the slot
+  the guard shares stay private, and the road allocates nothing. With
+  `test-support`, `Output::set_write_plant` changes the bytes libavformat
+  hands the sink, in place and keeping their length, before the sink and
+  the tap see them, and `Output::set_write_hook` runs a closure around
+  libavformat's take of each packet, after the packet is built.
 - **`hdr_metadata`** (hidden, for the muxer): `check_hdr10_plus` and
   `check_smpte2094_app5` hold an HDR10+ or SMPTE ST 2094 APP5 side-data
   entry — libavutil's struct, not bytes — to everything Matroska's writer

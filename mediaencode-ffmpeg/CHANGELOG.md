@@ -13,6 +13,76 @@ crate moves only when it changes.
 
 ### Added
 
+- **The write audit** (findit-studio/mediaio#95): what FFmpeg wrote, read
+  as the caller's sink takes it — the base's tap on the writer guard,
+  walking the file in constant memory, keeping no byte and allocating
+  nothing per packet — and judged at `finish` against what the muxer
+  handed it. A difference — an omission or a misreport the census names,
+  which FFmpeg writes where an allocation fails and the failure is
+  swallowed — fails the file by name: the output is abandoned and the sink
+  not handed back (`MuxFault::written_otherwise`, `WrittenOtherwise` of a
+  track, a `WrittenPart` and what was `Found` there — `Counts`, or where
+  the walk could not follow the writer, `Unfollowed` and its `Why`). The
+  MOV family's MP4, MOV and iPod first: each `trak`, its id, its `stts`
+  and `stsz`; movenc's own chapter track; the `mdat`'s size against the
+  payload the sink took; each sample description's configuration record
+  — `avcC`, `hvcC` and `lhvC`, `vvcC`, `evcC`, `lvcC`, `av1C`, `dvc1`,
+  `apvC` — present and as long as its writer makes it, E-AC-3's `dec3` in
+  MOV's `wave`, and DVD subtitles' palette, each named by its index
+  (`WrittenPart::Configuration`, `WrittenPart::Palette`); AVIF's `mdat`
+  against its samples' bytes, its first item's extent offset and an
+  animated track's first chunk offset against the payload's first byte,
+  and its item's `av1C` (`WrittenPart::MediaData`,
+  `WrittenPart::ItemLocation`, `WrittenPart::ChunkOffsets`); each track's
+  sync samples and their dependencies, `stss` and `sdtp`, each sample's
+  flags as its packet reaches movenc (`WrittenPart::SyncSamples`,
+  `WrittenPart::Dependencies`) — VC-1's, which movenc reads from its
+  bitstream, judged not at all; each track's
+  roll groups, `sgpd` and `sbgp` — AAC's one group, Opus's distances as
+  movenc counts them (`WrittenPart::RollGroups`) — and MP4's track `udta`
+  of its DASH roles (`WrittenPart::TrackUserData`); the movie's `udta`,
+  MP4's and iPod's exactly, MOV's of its Nero list with libavformat's own
+  `©swr` or without, by the owner's ruling on letter 1
+  (`WrittenPart::MovieUserData`); and the `pssh` boxes, each stream's
+  encryption initializations as libavutil parses them, all or none
+  (`WrittenPart::ProtectionHeaders`). Then FLV: its header and the VP6A
+  pre-tags it writes of each stream libavformat's init leaves VP6A's tag
+  (the coordinator's ruling R11), every tag's PreviousTagSize, and each
+  size it writes again — a placeholder, HDR metadata's (R10), a script
+  tag's — closed where its writer closes it; each track's sequence
+  headers, every one FLV writes, the header's and each new
+  configuration's that differs from the current (R12), their records as
+  long as their writers make them, VVC's present
+  (`WrittenPart::Configuration`), and its frames' tag sizes
+  (`WrittenPart::Frames`). Then Matroska and WebM: the Segment's size
+  against its bytes, the regions the trailer writes again — the SeekHead's
+  room, Info, Tracks and Tags — each rewritten in order and once, and
+  Tracks read as the trailer writes it: an AV1 track's `av1C` as long as
+  its writer makes it (`WrittenPart::Configuration`), a FLAC track's
+  channel mask comment (`WrittenPart::ChannelMask`). Then raw FLAC: its
+  STREAMINFO, rewritten once, and its VORBIS_COMMENT's channel mask entry
+  (`WrittenPart::ChannelMask`), libavformat's own `encoder` entry outside
+  the contract. With it, the premise R21 rested the muxer on — that
+  libavutil's allocations succeed — is retired: no row of the census rests
+  on it, each detected at `finish` by its check and its law; the audit
+  allocates nothing a packet, and its trailer's work is its tables', not
+  its samples'. A `mov_text`
+  track's tables are read by one rule on both sides, which the end samples
+  libavformat's interleaving makes movenc write leave unchanged (the
+  coordinator's ruling R5). With the new `test-support` feature,
+  forwarding to the base's: `CarrierMuxer::open_hooked` and `OpenHooks`,
+  what a law runs inside the open — around the header, around each
+  packet's take, or a plant over the bytes the sink takes; hidden: `MuxOptions::with_audit`,
+  `CarrierMuxer::audited_bytes`, `expected_records`, `expected_palettes`,
+  `expected_chapter_samples`, `expected_movie_user_data`,
+  `expected_protection`, `expected_roll_groups` and
+  `expected_flv_sequences` and `audit_pushes`, the laws' seams.
+- **Opus's roll distance past 32, refused by name** (the coordinator's
+  ruling R2 on the write audit's F4): MP4 counts each Opus sample's roll
+  distance — the samples before it whose durations reach 80 ms — and past
+  32 writes no roll group of the track, its answer dropped. The packet
+  whose sample passes 32 is refused (`PayloadRule::RollDistance`, new),
+  counted as movenc counts it; a timeline of exactly 32 is taken.
 - **The muxer**: `FfmpegMuxer` (view lane) and `FfmpegOwnedMuxer` (owned
   lane) implement `Muxer` over libavformat for the containers this
   release audited and keeps (`ContainerName`): the MOV family's MP4, MOV,

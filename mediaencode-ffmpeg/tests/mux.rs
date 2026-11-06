@@ -168,8 +168,8 @@ use mediaencode::{
 };
 use mediaencode_ffmpeg::{
   AutomaticFilter, BitRateBox, ContainerName, FfmpegMuxRefusal, FfmpegMuxer, FfmpegOwnedMuxer,
-  LayoutReadBack, MuxOpenError, MuxOptions, MuxStage, OutputError, OutputText, PayloadRule,
-  Rewrite, SideDataFate, Uncarried, Withheld, WriteBtrt,
+  Found, LayoutReadBack, MuxFault, MuxOpenError, MuxOptions, MuxStage, OutputError, OutputText,
+  PayloadRule, Rewrite, SideDataFate, Uncarried, Why, Withheld, WriteBtrt, WrittenPart,
 };
 use mediaio_ffmpeg::{
   CodecTicket, FfmpegBytes, PacketLimits,
@@ -10062,7 +10062,12 @@ fn configuration_law(
 /// frames rewritten from length prefixes to start codes, and its SPS and
 /// PPS read off its `avcC`.
 fn h264_fixture(corpus: &Corpus) -> (Described, Vec<Video>, Vec<u8>, Vec<u8>) {
-  let (mut table, packets) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 3);
+  h264_fixture_of(&corpus.multi_track_mkv())
+}
+
+/// [`h264_fixture`], of the H.264 source `path`.
+fn h264_fixture_of(path: &Path) -> (Described, Vec<Video>, Vec<u8>, Vec<u8>) {
+  let (mut table, packets) = first_track(path, TrackKind::Video, 3);
   let row = table.remove(0);
   let record = stream_extradata_of(&row);
   assert_eq!(
@@ -21265,4 +21270,3699 @@ fn l215_wave64_holds_its_fact_sum_to_int64() {
     "a later, shorter last duration",
   );
   muxer.finish().expect("finished, the sum within INT64_MAX");
+}
+
+// ---------------------------------------------------------------------------
+//  The write audit (findit-studio/mediaio#95): what FFmpeg wrote, judged at
+//  `finish` against what it was handed.
+// ---------------------------------------------------------------------------
+
+/// The variable that tells a law's body it runs in its own process, and
+/// which: libavutil's allocation cap is the process's.
+const AUDIT_CHILD: &str = "MEDIAENCODE_FFMPEG_AUDIT_CHILD";
+
+/// Runs the law `body` in a process of its own, alone, and asserts it ran
+/// and passed there; nothing in the process of its own.
+fn in_its_own_process(body: &str) {
+  if std::env::var_os(AUDIT_CHILD).is_some() {
+    return;
+  }
+  let output = std::process::Command::new(std::env::current_exe().expect("the lane"))
+    .args(["--exact", body, "--test-threads=1", "--nocapture"])
+    .env(AUDIT_CHILD, body)
+    .output()
+    .expect("the process of its own");
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success() && stdout.contains("1 passed"),
+    "{body} in its own process: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+    output.status
+  );
+}
+
+/// Whether this process runs the law `body` alone ([`in_its_own_process`]).
+fn alone_for(body: &str) -> bool {
+  std::env::var(AUDIT_CHILD).as_deref() == Ok(body)
+}
+
+/// Holds every allocation of libavutil's to `bytes` at most
+/// (`av_max_alloc`, `mem.c` 74–78 in FFmpeg 9.0.1).
+fn cap(bytes: usize) {
+  // SAFETY: a store of the process's cap, which libavutil reads atomically
+  // at every allocation; the law runs alone in a process of its own.
+  unsafe { ffmpeg_next::ffi::av_max_alloc(bytes) };
+}
+
+/// The cap back at libavutil's own, `INT_MAX`.
+fn uncap() {
+  // SAFETY: as [`cap`]; raising the cap fails no allocation.
+  unsafe { ffmpeg_next::ffi::av_max_alloc(i32::MAX as usize) };
+}
+
+/// What a write audit's finding found, as the laws compare it: its kind,
+/// and what was written against what was handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Finding {
+  Omitted,
+  Length(u64, u64),
+  Count(u64, u64),
+  Value(u64, u64),
+  Content,
+  Unfollowed(u64, Why),
+  Other,
+}
+
+impl Finding {
+  fn of(found: Found) -> Self {
+    match found {
+      Found::Omitted => Self::Omitted,
+      Found::Length(counts) => Self::Length(counts.written(), counts.expected()),
+      Found::Count(counts) => Self::Count(counts.written(), counts.expected()),
+      Found::Value(counts) => Self::Value(counts.written(), counts.expected()),
+      Found::Content => Self::Content,
+      Found::Unfollowed(unfollowed) => Self::Unfollowed(unfollowed.at(), unfollowed.why()),
+      _ => Self::Other,
+    }
+  }
+}
+
+/// What the write audit found, its track, its part and what was found
+/// there — or `None` of another fault.
+fn written(fault: &MuxFault) -> Option<(Option<TrackIndex>, WrittenPart, Finding)> {
+  fault
+    .written_otherwise()
+    .map(|found| (found.track(), found.part(), Finding::of(found.found())))
+}
+
+/// Each `trak`'s time-to-sample runs and sample sizes FFmpeg wrote into
+/// `path`, in order: each run its count and duration, as the `stts` lists
+/// them; each sample's size, a uniform one repeated its count
+/// (`mov_write_stts_tag`, `mov_write_stsz_tag`, `movenc.c` 3241–3288,
+/// 221–255).
+fn written_tables(path: &Path) -> Vec<(Vec<(u32, u32)>, Vec<u32>)> {
+  let bytes = std::fs::read(path).expect("the file");
+  let word = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+  let (body, end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("a moov");
+  boxes_of(&bytes, body, end)
+    .into_iter()
+    .filter(|(kind, _, _)| kind == b"trak")
+    .map(|(_, body, size)| {
+      let end = body - 8 + size as usize;
+      let (mdia, mdia_end, _) = box_in(&bytes, (body, end), b"mdia").expect("mdia");
+      let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+      let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+      let (stts, _, _) = box_in(&bytes, (stbl, stbl_end), b"stts").expect("stts");
+      let runs = (0..word(stts + 4) as usize)
+        .map(|at| (word(stts + 8 + 8 * at), word(stts + 12 + 8 * at)))
+        .collect();
+      let (stsz, _, _) = box_in(&bytes, (stbl, stbl_end), b"stsz").expect("stsz");
+      let (uniform, count) = (word(stsz + 4), word(stsz + 8));
+      let sizes = (0..count as usize)
+        .map(|at| {
+          if uniform != 0 {
+            uniform
+          } else {
+            word(stsz + 12 + 4 * at)
+          }
+        })
+        .collect();
+      (runs, sizes)
+    })
+    .collect()
+}
+
+/// AAC of three minutes: a `moov` past the I/O context's 32 KiB, its
+/// sample sizes' 4 bytes each alone more than 32 KiB, so that the sizes of
+/// its boxes are patched after their first bytes reached the sink.
+#[rustfmt::skip]
+fn long_aac(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "long.m4a", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=180",
+    "-ac", "2", "-c:a", "aac",
+  ])
+}
+
+/// **L216 — the write audit passes every file FFmpeg writes whole**
+/// (findit-studio/mediaio#95; gate condition 9): the corpus's sources,
+/// remuxed whole into MP4, MOV and iPod — H.264 and AAC, HEVC of an Annex
+/// B configuration, AV1 (and into AVIF, animated, and a still AVIF of its
+/// first frame), VP9, AC-3, E-AC-3, PCM of a constant size, Opus,
+/// `mov_text` in milliseconds and in microseconds, TTML, AAC long enough
+/// that its `moov` passes 32 KiB, chapters — MOV's Nero list beside
+/// libavformat's `©swr` among them — a DASH role in a track's `udta`, and
+/// frames of no duration, whose last libavformat guesses — and into FLV,
+/// H.264 and AAC, HEVC naming its matrix (its HDR metadata's tag, R10),
+/// AV1, VP9, AC-3 and Opus; into Matroska, H.264 and AAC, HEVC, AV1, VP9,
+/// Opus and FLAC, and into WebM, AV1, VP9 and Opus; FLAC into raw FLAC —
+/// each finishes `Ok`, the audit's tap having walked the file. Every other law of this lane writes with the audit on
+/// as well, so that each file one writes whole passes it too: their
+/// passing is the rest of this law.
+///
+/// PLANT P613: a size of 0 read as final. PLANT P614: the last duration
+/// taken as offered, not handed. PLANT P615: AAC's roll groups not
+/// expected. PLANT P617: `udta_bytes` without `©too`.
+#[test]
+fn l216_the_write_audit_passes_every_file_ffmpeg_writes_whole() {
+  let Some(corpus) = Corpus::new() else { return };
+  for (name, source, containers) in [
+    (
+      "h264-aac",
+      h264_aac(&corpus, "l216-h264-aac.mp4"),
+      &["mp4", "mov", "ipod", "flv", "matroska"][..],
+    ),
+    ("hevc", hevc_annexb(&corpus), &["mp4", "matroska"][..]),
+    ("hevc-bt709", hevc_bt709(&corpus), &["flv"][..]),
+    (
+      "av1",
+      av1_mkv(&corpus),
+      &["mp4", "avif", "matroska", "webm"][..],
+    ),
+    ("vp9", vp9_webm(&corpus), &["mp4", "matroska", "webm"][..]),
+    (
+      "ac3",
+      audio_file(&corpus, "l216.ac3", "ac3"),
+      &["mp4", "mov", "ipod", "flv"][..],
+    ),
+    (
+      "eac3",
+      audio_file(&corpus, "l216.eac3", "eac3"),
+      &["mp4", "mov"][..],
+    ),
+    ("pcm", pcm_mov(&corpus), &["mp4"][..]),
+    (
+      "opus",
+      opus_mkv(&corpus),
+      &["mp4", "flv", "matroska", "webm"][..],
+    ),
+    (
+      "flac",
+      audio_file(&corpus, "l216.flac", "flac"),
+      &["matroska", "flac"][..],
+    ),
+    (
+      "movtext",
+      mov_text_mp4(&corpus),
+      &["mp4", "mov", "ipod"][..],
+    ),
+    ("movtext-ms", mov_text_ms_mp4(&corpus), &["mp4"][..]),
+    ("ttml", ttml_mp4(&corpus), &["mp4"][..]),
+    ("long-aac", long_aac(&corpus), &["mp4"][..]),
+  ] {
+    for container in containers {
+      remux_through_ffmpeg(
+        &source,
+        ContainerName::new(*container),
+        &output(&corpus, &format!("l216-{name}.{container}")),
+      );
+    }
+  }
+
+  // AV1 and VP9 into FLV, each row restated to name its matrix, which FLV
+  // states and refuses a track of none for (L143).
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  for (name, source, codec) in [
+    ("av1", av1_mkv(&corpus), Id::AV_CODEC_ID_AV1),
+    ("vp9", vp9_webm(&corpus), Id::AV_CODEC_ID_VP9),
+  ] {
+    let (table, packets) = whole_track(&source, TrackKind::Video);
+    let config = stream_extradata_of(&table[0]);
+    let mut muxer = muxer_into(
+      &output(&corpus, &format!("l216-{name}.flv")),
+      ContainerName::new("flv"),
+      vec![restated(&table[0], codec, &config, None, None)],
+    );
+    for packet in &packets {
+      wrote(
+        muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(packet))),
+        "a frame",
+      );
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|fault| panic!("{name} into FLV: {fault:?}"));
+  }
+
+  // The tap walks from the header on.
+  let aac = audio_file(&corpus, "l216-aac.mkv", "aac");
+  let (table, packets) = whole_track(&aac, TrackKind::Audio);
+  let chapters = [
+    chapter_of(0, 0, 100, Some("one")),
+    chapter_of(1, 100, 300, Some("the second chapter")),
+    chapter_of(2, 300, 450, Some("")),
+  ];
+  let mut muxer = FfmpegOwnedMuxer::open(
+    File::create(output(&corpus, "l216-chapters.mp4")).expect("create"),
+    ContainerName::MP4,
+    table,
+    &chapters,
+    PacketLimits::default(),
+  )
+  .expect("open")
+  .0;
+  assert!(
+    muxer.audited_bytes().is_some_and(|bytes| bytes > 0),
+    "the tap walked the header"
+  );
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+  }
+  muxer.finish().expect("chapters, finished");
+
+  // MOV's movie `udta`: libavformat's `©swr` beside the Nero list (the
+  // owner's ruling on letter 1, (b)).
+  let (table, packets) = whole_track(&aac, TrackKind::Audio);
+  let mut muxer = FfmpegOwnedMuxer::open(
+    File::create(output(&corpus, "l216-chapters.mov")).expect("create"),
+    ContainerName::new("mov"),
+    table,
+    &chapters,
+    PacketLimits::default(),
+  )
+  .expect("open")
+  .0;
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+  }
+  muxer.finish().expect("MOV's chapters, finished");
+
+  // MP4's track `udta`: a DASH role's `kind` box.
+  let (table, packets) = whole_track(&aac, TrackKind::Audio);
+  let table = table
+    .into_iter()
+    .map(|row| {
+      let disposition = row.disposition();
+      row.with_disposition(disposition | TrackDisposition::CAPTIONS)
+    })
+    .collect();
+  let mut muxer = muxer_into(&output(&corpus, "l216-role.mp4"), ContainerName::MP4, table);
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+  }
+  muxer.finish().expect("a DASH role, finished");
+
+  // Frames of no duration: the last's is libavformat's guess.
+  let (table, frames) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 10);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l216-guessed.mp4"),
+    ContainerName::MP4,
+    table,
+  );
+  for (index, frame) in frames.iter().enumerate() {
+    let at = index as i64 * 40;
+    wrote(
+      muxer.write_video(video_at(&video_of(frame).with_duration(None), Some(at), at)),
+      "a frame of no duration",
+    );
+  }
+  muxer.finish().expect("guessed, finished");
+
+  // A still AVIF: one frame, of no `moov`.
+  let (table, frames) = first_track(&av1_mkv(&corpus), TrackKind::Video, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l216-still.avif"),
+    ContainerName::new("avif"),
+    table,
+  );
+  wrote(
+    muxer.write_video(VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_of(&frames[0]),
+    )),
+    "the frame",
+  );
+  muxer.finish().expect("a still AVIF, finished");
+}
+
+/// **L217 — A2: an `stts` movenc leaves out is named, the file not passed**
+/// (findit-studio/mediaio#95). In a process of its own: AC-3 into MP4,
+/// more than 1 000 frames, then libavutil's allocations capped at 7 999
+/// bytes before `finish`. At the trailer movenc allocates the table's
+/// entries at their worst, 8 bytes a sample (`mov_write_stts_tag`,
+/// `movenc.c` 3257–3259) — 8 bytes times the frames, past the cap — and
+/// writes the `stbl` without its `stts`, answering success (3411). The
+/// trailer's other allocations stay under the cap: the movie `udta`'s
+/// dynamic buffer, its 1 024-byte buffer and context (`aviobuf.c`
+/// 1281–1311), and AC-3's `dac3`, of none. Named: track 0's time-to-sample
+/// table, omitted.
+///
+/// PLANT P609: the verdict skips `TimeToSample`.
+#[test]
+fn l217_an_stts_movenc_leaves_out_is_named() {
+  in_its_own_process("l217_in_a_process_of_its_own");
+}
+
+/// L217's body, alone in its process.
+#[test]
+fn l217_in_a_process_of_its_own() {
+  if !alone_for("l217_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let ac3 = generated(
+    &corpus,
+    "l217.ac3",
+    &[
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:sample_rate=48000:duration=33",
+      "-ac",
+      "2",
+      "-c:a",
+      "ac3",
+    ],
+  );
+  let (table, packets) = whole_track(&ac3, TrackKind::Audio);
+  assert!(
+    packets.len() >= 1_000,
+    "the premise: {} frames",
+    packets.len()
+  );
+  assert!(packets.len() * 8 > 7_999, "the entries past the cap");
+  let mut muxer = muxer_into(&output(&corpus, "l217.mp4"), ContainerName::MP4, table);
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AC-3 frame",
+    );
+  }
+  cap(7_999);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the stts left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::TimeToSample,
+      Finding::Omitted
+    ))
+  );
+}
+
+/// **L218 — A25: MP4's joined TTML of a document its buffer could not hold
+/// is named by its sample's size** (findit-studio/mediaio#95). In a process
+/// of its own: 600 paragraphs of about 2 000 bytes from libavcodec's TTML
+/// encoder into MP4, joined at the trailer into one document of about 1.2
+/// MB, which a TTML muxer writes into a dynamic buffer (`movenc_ttml.c`
+/// 100–317). That muxer reads the buffer's error after every frame and its
+/// trailer (`write_packet`, `mux.c` 748–752; 1268–1272), so a growth
+/// refused while the paragraphs are written fails movenc's trailer, as
+/// reported; the one growth no one reads is the close's, for its 64 bytes
+/// of padding (`avio_close_dyn_buf`, `aviobuf.c` 1410–1436): refused, the
+/// buffer is freed and the close answers a null buffer and `-64`, which
+/// movenc writes as the sample (`movenc.c` 7231, 7373). movenc records it
+/// as 4 294 967 232 bytes, and its `stsz`, of one sample, writes the
+/// uniform size `FFMAX(1, (int)(4294967232 / 1))` — 1 (241–246). **The
+/// cap's derivation:** the buffer grows by half and a byte at a time
+/// (`dyn_buf_write`, 1281–1311), so the largest allocation the success path
+/// makes before the close is its last growth, found here as the smallest cap
+/// under which the finish is not a fault libavformat reports — every other
+/// allocation of the trailer far below it (the tables' entries, the TTML
+/// track's index of 73 728 bytes, the TTML muxer's context); the close's
+/// growth past it is the row's allocation, refused at that cap where the
+/// document ends within 64 bytes of its buffer's end — the last
+/// paragraph grown, where it does not, so that it ends 32 bytes before.
+/// Named: track 0's sample sizes, 1 byte written against the document's
+/// bytes, which the same file written without the cap holds.
+#[test]
+fn l218_a_joined_ttml_document_its_buffer_could_not_hold_is_named() {
+  in_its_own_process("l218_in_a_process_of_its_own");
+}
+
+/// L218's body, alone in its process.
+#[test]
+fn l218_in_a_process_of_its_own() {
+  if !alone_for("l218_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let ttml = ttml_mp4(&corpus);
+  let target = output(&corpus, "l218.mp4");
+  // The file, its last paragraph `extra` bytes longer, finished under `held`.
+  let write = |extra: usize, held: Option<usize>| {
+    let (table, paragraphs) = first_track(&ttml, TrackKind::Subtitle, 1);
+    let row = &table[0];
+    let mut row =
+      TrackDescription::new(millis(), row.params().duplicate(), row.side_data().clone())
+        .expect("a description");
+    row.set_extradata(Some(bytes_of(b"lavc-ttmlenc")));
+    let paragraph = subtitle_of(&paragraphs[0]);
+    let mut muxer = muxer_into(&target, ContainerName::MP4, vec![row]);
+    for index in 0..600 {
+      let len = if index == 599 { 2_000 + extra } else { 2_000 };
+      wrote(
+        muxer.write_subtitle(subtitle_ticks(
+          &subtitle_holding(&paragraph, &vec![b'x'; len]),
+          millis(),
+          index * 1_000,
+          1_000,
+        )),
+        "a paragraph",
+      );
+    }
+    if let Some(held) = held {
+      cap(held);
+    }
+    let finished = muxer.finish();
+    uncap();
+    finished
+  };
+  let reported = |extra: usize, held: usize| matches!(write(extra, Some(held)), Err(fault) if fault.written_otherwise().is_none());
+  let mut extra = 0;
+  for _ in 0..4 {
+    write(extra, None).expect("the document, whole");
+    let document = written_tables(&target)[0].1[0] as usize;
+    assert!(document > 1024 * 1024, "the premise: {document} bytes");
+    let (mut low, mut high) = (document / 2, 2 * document + 4_096);
+    assert!(
+      reported(extra, low) && !reported(extra, high),
+      "the premise: a growth refused below, none above"
+    );
+    while high - low > 1 {
+      let mid = low + (high - low) / 2;
+      if reported(extra, mid) {
+        low = mid;
+      } else {
+        high = mid;
+      }
+    }
+    match write(extra, Some(high)) {
+      Err(fault) => {
+        assert_eq!(fault.stage(), MuxStage::Trailer);
+        assert_eq!(
+          written(&fault),
+          Some((
+            Some(TrackIndex::new(0)),
+            WrittenPart::SampleSizes,
+            Finding::Length(1, document as u64)
+          )),
+          "the cap at the last growth before the close, {high} bytes"
+        );
+        return;
+      }
+      // The document ends 64 bytes or more before its buffer's end: no growth
+      // at the close.
+      Ok(()) => extra += high - 32 - document,
+    }
+  }
+  panic!("no document ended within 64 bytes of its buffer's end");
+}
+
+/// **L224 — A27: MP4's HEVC under `hvc1` of an Annex B configuration, a
+/// packet its rewrite buffer could not hold, is named by its sizes' sum**
+/// (findit-studio/mediaio#95; gate condition 5: the packet queued at
+/// `finish`). In a process of its own: x265's frames under `hvc1` beside
+/// AAC, the last of them grown past 4 KiB by a unit of filler data, handed
+/// after every AAC frame, so that libavformat's interleaving still holds it
+/// when `finish` runs (`ff_interleave_packet_per_dts`, `mux.c` 940–1003),
+/// and libavutil's allocations capped at 3 000 bytes before `finish`. The
+/// trailer flushes it to movenc, which rewrites it through a dynamic buffer
+/// to drop its parameter sets (`ff_hevc_annexb2mp4`, `hevc.c` 1203–1250):
+/// the buffer's 1 024-byte buffer and its growths to 1 024 and 2 306 bytes
+/// within the cap, its growth to 3 460 past it (`aviobuf.c` 1281–1311); the
+/// close answers `-64`, the walk writes nothing, and the sample is written
+/// of no bytes. The trailer's other allocations — the tables' entries of a
+/// few samples, the `hvcC`'s parse of a small configuration, the `udta`'s
+/// buffer — stay under the cap. Named: track 0's sample sizes, their sum
+/// short by the packet's bytes, which the same file written without the cap
+/// holds.
+#[test]
+fn l224_an_hvc1_packet_its_rewrite_buffer_could_not_hold_is_named() {
+  in_its_own_process("l224_in_a_process_of_its_own");
+}
+
+/// L224's body, alone in its process.
+#[test]
+fn l224_in_a_process_of_its_own() {
+  if !alone_for("l224_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let hevc = hevc_annexb(&corpus);
+  let aac = audio_file(&corpus, "l224.aac", "aac");
+  let write = |target: &Path, capped: bool| {
+    let (mut table, frames) = whole_track(&hevc, TrackKind::Video);
+    let row = table.remove(0);
+    table.push(reticketed(row, |par| {
+      par.codec_tag = u32::from_le_bytes(*b"hvc1");
+    }));
+    let (audio, sounds) = whole_track(&aac, TrackKind::Audio);
+    table.extend(audio);
+    let mut muxer = muxer_into(target, ContainerName::MP4, table);
+    let video = |frame: &Video, at: i64| {
+      VideoTrackPacket::new(
+        TrackIndex::new(0),
+        frame.clone().with_pts(Some(ms(at))).with_dts(Some(ms(at))),
+      )
+    };
+    let sound =
+      |packet: &Audio, at: i64| AudioTrackPacket::new(TrackIndex::new(1), audio_of_at(packet, at));
+    let frames: Vec<Video> = frames.iter().map(video_of).collect();
+    let last = frames.len() - 1;
+    for (index, frame) in frames[..last].iter().enumerate() {
+      wrote(
+        muxer.write_video(video(frame, index as i64 * 40)),
+        "a frame",
+      );
+    }
+    for (index, packet) in sounds.iter().enumerate() {
+      wrote(
+        muxer.write_audio(sound(&audio_of(packet), index as i64 * 20)),
+        "an AAC frame",
+      );
+    }
+    let mut grown = frames[last].data().as_ref().to_vec();
+    grown.extend_from_slice(&[0, 0, 0, 1, 38 << 1, 1]);
+    grown.extend(core::iter::repeat_n(0xFF, 4_096));
+    grown.push(0x80);
+    let grown = video_holding(&frames[last], &grown);
+    wrote(
+      muxer.write_video(video(&grown, 5_000)),
+      "the last frame, queued",
+    );
+    if capped {
+      cap(3_000);
+    }
+    let finished = muxer.finish();
+    uncap();
+    finished
+  };
+  let whole = output(&corpus, "l224-whole.mp4");
+  write(&whole, false).expect("the file, whole");
+  let sizes = &written_tables(&whole)[0].1;
+  let (sum, last) = (
+    sizes.iter().map(|&size| u64::from(size)).sum::<u64>(),
+    u64::from(*sizes.last().expect("a sample")),
+  );
+  assert!(last > 4_096, "the premise: the last sample of {last} bytes");
+  let fault = write(&output(&corpus, "l224.mp4"), true).expect_err("the sample of no bytes");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::SampleSizes,
+      Finding::Length(sum - last, sum)
+    ))
+  );
+}
+
+/// `packet` decoded and presented at `at` milliseconds.
+fn audio_of_at(packet: &Audio, at: i64) -> Audio {
+  packet.clone().with_pts(Some(ms(at))).with_dts(Some(ms(at)))
+}
+
+/// **L229 — A9: the chapter track whose samples movenc could not index is
+/// named** (findit-studio/mediaio#95; gate condition 5: the cap around the
+/// header, through the open's hook). In a process of its own: AAC into MP4
+/// with three titled chapters, libavutil's allocations capped at 70 000
+/// bytes around the header alone. At the header movenc makes the chapter
+/// track's samples (`mov_create_chapter_track`, `movenc.c` 7727–7815), each
+/// written and then its index grown — 1 024 entries at the first, of 72
+/// bytes each (`MOVIentry`), 73 728 bytes, past the cap (7234–7243) — its
+/// answer dropped (7807): no sample is indexed, and movenc writes no `trak`
+/// for the chapter track (5430–5433). The header's other allocations stay
+/// under the cap: the track table, the chapter track's parameters and its
+/// 46-byte configuration, each title's sample of its bytes and 14, the
+/// I/O context's buffer made at the open, before the cap. Below the cap of
+/// 74 000 the same file is written whole. Named: the chapter track,
+/// omitted.
+#[cfg(feature = "test-support")]
+#[test]
+fn l229_a_chapter_track_movenc_could_not_index_is_named() {
+  in_its_own_process("l229_in_a_process_of_its_own");
+}
+
+/// L229's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l229_in_a_process_of_its_own() {
+  if !alone_for("l229_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let aac = audio_file(&corpus, "l229.mkv", "aac");
+  let chapters = [
+    chapter_of(0, 0, 100, Some("one")),
+    chapter_of(1, 100, 300, Some("two")),
+    chapter_of(2, 300, 450, Some("three")),
+  ];
+  let write = |name: &str, header_cap: usize| {
+    let (table, packets) = whole_track(&aac, TrackKind::Audio);
+    let hooks = mediaencode_ffmpeg::mux::OpenHooks::default().with_header(move |before| {
+      if before {
+        cap(header_cap);
+      } else {
+        uncap();
+      }
+    });
+    let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+      File::create(output(&corpus, name)).expect("create"),
+      ContainerName::MP4,
+      table,
+      &chapters,
+      MuxOptions::new(),
+      hooks,
+    )
+    .expect("open");
+    for packet in &packets {
+      wrote(
+        muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+        "an AAC frame",
+      );
+    }
+    muxer.finish()
+  };
+  write("l229-whole.mp4", 74_000).expect("whole above the index's growth");
+  let fault = write("l229.mp4", 70_000).expect_err("the chapter track left out");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((None, WrittenPart::ChapterTrack, Finding::Omitted))
+  );
+}
+
+/// **L230 — A10: the end sample `mov_text`'s trailer could not index is
+/// named** (findit-studio/mediaio#95). In a process of its own: 1 024 cues
+/// into MP4, alone and contiguous, so that movenc writes no end sample
+/// between them and their 1 024 samples fill the index's first growth;
+/// libavutil's allocations capped at 100 000 bytes before `finish`. The
+/// trailer writes the last cue's end sample (`movenc.c` 9025–9031): its 2
+/// bytes, then its index's growth to 2 048 entries of 72 bytes, 147 456
+/// bytes, past the cap (7234–7243), the answer dropped. The trailer's other
+/// allocations stay under the cap: the `stts`'s entries, 8 bytes a sample.
+/// Named, by R5's rule (the cue tables read whatever end samples the
+/// interleaving makes): track 0's time-to-sample table, judged before its
+/// sizes, of 1 024 samples counted against 1 025 — the last cue's own
+/// duration last, where the trailer's end of none was handed.
+#[test]
+fn l230_an_end_sample_mov_texts_trailer_could_not_index_is_named() {
+  in_its_own_process("l230_in_a_process_of_its_own");
+}
+
+/// L230's body, alone in its process.
+#[test]
+fn l230_in_a_process_of_its_own() {
+  if !alone_for("l230_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let (table, cues) = first_track(&mov_text_ms_mp4(&corpus), TrackKind::Subtitle, 1);
+  let cue = subtitle_holding(&subtitle_of(&cues[0]), b"\0\x05cue!!");
+  let mut muxer = muxer_into(&output(&corpus, "l230.mp4"), ContainerName::MP4, table);
+  for index in 0..1_024 {
+    wrote(
+      muxer.write_subtitle(cue_on(0, &cue, millis(), (index * 100, 100))),
+      "a cue",
+    );
+  }
+  cap(100_000);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the end sample unindexed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::TimeToSample,
+      Finding::Count(1_024, 1_025)
+    ))
+  );
+}
+
+/// Three contiguous cues of 7, 8 and 7 bytes, a second each, on `track`.
+fn three_cues(cue: &Subtitle, track: usize) -> [SubtitleTrackPacket<Ffmpeg, FfmpegBytes>; 3] {
+  [
+    (&b"\0\x05first"[..], 0),
+    (b"\0\x06second", 1_000),
+    (b"\0\x05third", 2_000),
+  ]
+  .map(|(text, at)| cue_on(track, &subtitle_holding(cue, text), millis(), (at, 1_000)))
+}
+
+/// **L243 — R5: a `mov_text` track passes the audit whatever end samples
+/// libavformat's interleaving makes movenc write** (the coordinator's
+/// ruling on the end samples, findit-studio/mediaio#95). movenc writes a
+/// 2-byte, zero-duration sample at a cue's end before any packet of any
+/// track whose decode time, in its own ticks, passes it (`movenc.c`
+/// 7646–7653): beside video, which MP4 counts in sixteenths of a
+/// millisecond, three contiguous cues in milliseconds get one at each
+/// boundary but the first — the shape the `ffmpeg` CLI writes; alone, none;
+/// beside video handed only at 0 and 1.5 s, none at the first boundary and
+/// one at the second. Each shape read back as predicted, and each file
+/// passes the audit.
+///
+/// PLANT: the trailer's end sample left out of the mirror; one cue left out
+/// of the mirror.
+#[test]
+fn l243_r5_a_mov_text_track_passes_whatever_end_samples_the_interleaving_makes() {
+  let Some(corpus) = Corpus::new() else { return };
+  let cues_source = mov_text_ms_mp4(&corpus);
+  let (_, cues) = first_track(&cues_source, TrackKind::Subtitle, 1);
+  let cue = subtitle_of(&cues[0]);
+  let mkv = corpus.multi_track_mkv();
+  let (_, frames) = first_track(&mkv, TrackKind::Video, 10);
+  let frames: Vec<Video> = frames.iter().map(video_of).collect();
+  type Shape = (Vec<(u32, u32)>, Vec<u32>);
+  let cases: [(&str, Vec<i64>, Shape); 3] = [
+    (
+      "beside",
+      (0..=75).map(|frame| frame * 40).collect(),
+      (
+        vec![(1, 1000), (1, 0), (1, 1000), (1, 0), (1, 1000), (1, 0)],
+        vec![7, 2, 8, 2, 7, 2],
+      ),
+    ),
+    (
+      "alone",
+      Vec::new(),
+      (vec![(3, 1000), (1, 0)], vec![7, 8, 7, 2]),
+    ),
+    (
+      "mixed",
+      vec![0, 1_500],
+      (
+        vec![(2, 1000), (1, 0), (1, 1000), (1, 0)],
+        vec![7, 8, 2, 7, 2],
+      ),
+    ),
+  ];
+  for (name, video, shape) in cases {
+    let mut table = if video.is_empty() {
+      Vec::new()
+    } else {
+      table_of(&mkv, TrackKind::Video)
+    };
+    let cue_track = table.len();
+    table.extend(table_of(&cues_source, TrackKind::Subtitle));
+    let target = output(&corpus, &format!("l243-{name}.mp4"));
+    let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+    // Handed in decode order, the video first at an instant both share.
+    let mut handed: Vec<(i64, bool)> = video
+      .iter()
+      .map(|&at| (at, true))
+      .chain([0, 1_000, 2_000].map(|at| (at, false)))
+      .collect();
+    handed.sort_by_key(|&(at, video)| (at, !video));
+    let mut cues = three_cues(&cue, cue_track).into_iter();
+    for (index, (at, video)) in handed.into_iter().enumerate() {
+      if video {
+        wrote(
+          muxer.write_video(video_at(&frames[index % frames.len()], Some(at), at)),
+          "a frame",
+        );
+      } else {
+        wrote(muxer.write_subtitle(cues.next().expect("a cue")), "a cue");
+      }
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|fault| panic!("{name}: the audit passes it: {fault:?}"));
+    let tables = written_tables(&target);
+    assert_eq!(
+      tables.last(),
+      Some(&shape),
+      "{name}: the cue track's stts and stsz"
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  The write audit's sample descriptions (findit-studio/mediaio#95, R6):
+//  each record judged as its writer makes it, by index.
+// ---------------------------------------------------------------------------
+
+/// The sample entries of each `trak` FFmpeg wrote into `path`, in order:
+/// each entry's FourCC and its children — each box's FourCC and payload —
+/// after the `fixed` bytes of its own (a video entry's 78, `mp4s`'s 8).
+fn written_entries(path: &Path, fixed: usize) -> Vec<Vec<([u8; 4], Vec<([u8; 4], Vec<u8>)>)>> {
+  let bytes = std::fs::read(path).expect("the file");
+  let (body, end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("a moov");
+  boxes_of(&bytes, body, end)
+    .into_iter()
+    .filter(|(kind, _, _)| kind == b"trak")
+    .map(|(_, body, size)| {
+      let end = body - 8 + size as usize;
+      let (mdia, mdia_end, _) = box_in(&bytes, (body, end), b"mdia").expect("mdia");
+      let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+      let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+      let (stsd, stsd_end, _) = box_in(&bytes, (stbl, stbl_end), b"stsd").expect("stsd");
+      boxes_of(&bytes, stsd + 8, stsd_end)
+        .into_iter()
+        .map(|(kind, body, size)| {
+          let end = body - 8 + size as usize;
+          let children = boxes_of(&bytes, body + fixed, end)
+            .into_iter()
+            .map(|(child, at, size)| (child, bytes[at..at - 8 + size as usize].to_vec()))
+            .collect();
+          (kind, children)
+        })
+        .collect()
+    })
+    .collect()
+}
+
+/// The payload of the first trak's first entry's child `fourcc` in `path`.
+fn written_record(path: &Path, fourcc: &[u8; 4]) -> Option<Vec<u8>> {
+  written_entries(path, 78)[0][0]
+    .1
+    .iter()
+    .find(|(kind, _)| kind == fourcc)
+    .map(|(_, payload)| payload.clone())
+}
+
+/// A write plant over the bytes FFmpeg hands the sink: `fourcc` matched
+/// across the writes as the sink takes them, and at its `nth` match —
+/// each, where `None` — the byte `distance` past its last changed by
+/// `change`, 0 its last byte itself.
+#[cfg(feature = "test-support")]
+fn planting(
+  fourcc: [u8; 4],
+  nth: Option<usize>,
+  distance: u64,
+  change: fn(u8) -> u8,
+) -> impl FnMut(u64, &mut [u8]) + Send + 'static {
+  let (mut matched, mut seen, mut target) = (0_usize, 0_usize, None::<u64>);
+  move |at, bytes| {
+    for (index, byte) in bytes.iter_mut().enumerate() {
+      let offset = at + index as u64;
+      if target == Some(offset) {
+        *byte = change(*byte);
+        target = None;
+      }
+      matched = if *byte == fourcc[matched] {
+        matched + 1
+      } else {
+        usize::from(*byte == fourcc[0])
+      };
+      if matched == 4 {
+        matched = 0;
+        if nth.is_none_or(|nth| nth == seen) {
+          if distance == 0 {
+            *byte = change(*byte);
+          } else {
+            target = Some(offset + distance);
+          }
+        }
+        seen += 1;
+      }
+    }
+  }
+}
+
+/// **L221 — A4: a record movenc writes empty is named, the file not
+/// passed** (findit-studio/mediaio#95; the design gate's condition 1). In a
+/// process of its own: H.264, HEVC and VVC of Annex B configurations into
+/// MP4, each written whole, then again with libavutil's allocations capped
+/// at 1 000 bytes before `finish`. The cap's derivation: the trailer's
+/// largest allocation under it is a track's `stts`, 8 bytes a sample, of a
+/// few frames (`mov_write_stts_tag`, `movenc.c` 3257–3259); each record
+/// writer's Annex B rewrite opens a dynamic buffer of `FFIOContext`,
+/// `DynBuffer` and 1 024 bytes in one allocation (`url_open_dyn_buf_internal`,
+/// `aviobuf.c` 1343–1361; `nal.c` 133–144), refused, and the record is
+/// written of no byte, success answered. Named: track 0's description 0 —
+/// `avcC` and `hvcC` of no byte against the length the whole file's holds;
+/// `vvcC` of its header alone, left out, its length not mirrored.
+#[test]
+fn l221_a_record_movenc_writes_empty_is_named() {
+  in_its_own_process("l221_in_a_process_of_its_own");
+}
+
+/// L221's tracks, each Annex B: H.264 of the corpus's SPS and PPS, start
+/// coded; HEVC of x265's in MPEG-TS; VVC of an SPS and a PPS — and their
+/// frames.
+fn l221_track(corpus: &Corpus, name: &str) -> (Described, Vec<Video>) {
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  match name {
+    "h264" => {
+      let (row, frames, sps, pps) = h264_fixture(corpus);
+      let config = start_coded(&[&sps, &pps]);
+      (
+        restated(&row, Id::AV_CODEC_ID_H264, &config, None, None),
+        frames,
+      )
+    }
+    "hevc" => {
+      let (mut table, packets) = whole_track(&hevc_annexb(corpus), TrackKind::Video);
+      (table.remove(0), packets.iter().map(video_of).collect())
+    }
+    _ => {
+      let (row, frames) = recoded_fixture(corpus, &start_coded(&[&vvc_unit(8)]));
+      let config = vvc_sets(0, 1, 1);
+      (
+        restated(&row, Id::AV_CODEC_ID_VVC, &config, None, None),
+        frames,
+      )
+    }
+  }
+}
+
+/// L221's body, alone in its process.
+#[test]
+fn l221_in_a_process_of_its_own() {
+  if !alone_for("l221_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  for (name, record, exact) in [
+    ("h264", *b"avcC", true),
+    ("hevc", *b"hvcC", true),
+    ("vvc", *b"vvcC", false),
+  ] {
+    let write = |target: &Path, capped: bool| {
+      let (row, frames) = l221_track(&corpus, name);
+      let mut muxer = muxer_into(target, ContainerName::MP4, vec![row]);
+      for frame in &frames {
+        wrote(
+          muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone())),
+          "a frame",
+        );
+      }
+      if capped {
+        cap(1_000);
+      }
+      let finished = muxer.finish();
+      uncap();
+      finished
+    };
+    let whole = output(&corpus, &format!("l221-{name}.mp4"));
+    write(&whole, false).unwrap_or_else(|fault| panic!("{name}, whole: {fault:?}"));
+    let len = written_record(&whole, &record).expect("the record").len() as u64;
+    let fault = write(&output(&corpus, &format!("l221-{name}-capped.mp4")), true)
+      .expect_err("the record written empty, not passed");
+    assert_eq!(fault.stage(), MuxStage::Trailer, "{name}");
+    let found = if exact {
+      Finding::Length(0, len)
+    } else {
+      Finding::Omitted
+    };
+    assert_eq!(
+      written(&fault),
+      Some((
+        Some(TrackIndex::new(0)),
+        WrittenPart::Configuration(0),
+        found
+      )),
+      "{name}: its record whole of {len} bytes"
+    );
+  }
+}
+
+/// **L222 — A4's cut: an `av1C` movenc writes without its metadata OBUs is
+/// named** (`ff_isom_write_av1c`, `av1.c` 398–502). In a process of its
+/// own: AV1 configured by OBUs — its sequence header and a metadata OBU of
+/// 2 048 bytes — written whole, then again with libavutil's allocations
+/// capped at 1 500 bytes before `finish`. The cap's derivation: the
+/// metadata's dynamic buffer opens (`FFIOContext`, `DynBuffer` and 1 024
+/// bytes, about 1.4 KB, in one allocation) and grows once to 1 024 bytes;
+/// its growth to 2 306 (1 024, then 1 537, then 2 306: `dyn_buf_write`,
+/// `aviobuf.c` 1280–1304) is refused, the buffer answers none, and the
+/// record is written of its four bytes and the sequence header alone,
+/// success answered. Named: track 0's description 0, its record of 17
+/// bytes against 2 065.
+///
+/// PLANT P611: the record's length compared as no longer than handed.
+#[test]
+fn l222_an_av1c_movenc_writes_cut_is_named() {
+  in_its_own_process("l222_in_a_process_of_its_own");
+}
+
+/// L222's body, alone in its process.
+#[test]
+fn l222_in_a_process_of_its_own() {
+  if !alone_for("l222_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let (av1, frames, av1c) = unconfigured_av1(&corpus);
+  let obus = [&av1c[4..], &av1_metadata_obu(2_048)].concat();
+  let write = |name: &str, capped: bool| {
+    let table = table_of(&av1, TrackKind::Video)
+      .into_iter()
+      .map(|row| row.with_extradata(Some(bytes_of(&obus))))
+      .collect();
+    let mut muxer = muxer_into(&output(&corpus, name), ContainerName::MP4, table);
+    for frame in &frames {
+      wrote(
+        muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone())),
+        "an AV1 frame",
+      );
+    }
+    if capped {
+      cap(1_500);
+    }
+    let finished = muxer.finish();
+    uncap();
+    finished
+  };
+  write("l222.mp4", false).expect("whole");
+  assert_eq!(
+    written_record(&output(&corpus, "l222.mp4"), b"av1C").map(|record| record.len()),
+    Some(4 + 13 + 2_048),
+    "the premise: the record whole"
+  );
+  let fault = write("l222-capped.mp4", true).expect_err("the av1C cut, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::Configuration(0),
+      Finding::Length(17, 2_065)
+    ))
+  );
+}
+
+/// **L226 — A8: E-AC-3's `dec3` left out of MOV's `wave` is named**
+/// (`mov_write_wave_tag`, `movenc.c` 1059–1100; 1087's answer dropped): E-AC-3
+/// into MOV, the write plant renaming the `dec3` FFmpeg writes, as its
+/// buffer's refusal leaves it out. Named: track 0's description 0, its
+/// configuration omitted.
+#[cfg(feature = "test-support")]
+#[test]
+fn l226_a_dec3_left_out_of_movs_wave_is_named() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = audio_file(&corpus, "l226.eac3", "eac3");
+  let (table, packets) = whole_track(&source, TrackKind::Audio);
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(output(&corpus, "l226.mov")).expect("create"),
+    ContainerName::new("mov"),
+    table,
+    &[],
+    MuxOptions::new(),
+    mediaencode_ffmpeg::mux::OpenHooks::default().with_plant(planting(*b"dec3", None, 0, |_| b'4')),
+  )
+  .expect("open");
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an E-AC-3 frame",
+    );
+  }
+  let fault = muxer.finish().expect_err("the dec3 left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::Configuration(0),
+      Finding::Omitted
+    ))
+  );
+}
+
+/// **L227 — A5: an `apvC` left out is named** (`mov_write_apvc_tag`,
+/// `movenc.c` 1725–1738): APV into MP4, three frames, the write plant
+/// renaming the `apvC` FFmpeg writes. Named: track 0's description 0, its
+/// configuration omitted.
+#[cfg(feature = "test-support")]
+#[test]
+fn l227_an_apvc_left_out_is_named() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "h264-aac.mp4");
+  let (table, video) = first_track(&source, TrackKind::Video, 1);
+  let table: Vec<_> = table
+    .into_iter()
+    .map(|row| recoded(row, ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_APV, &[]))
+    .collect();
+  let carrier = video_of(&video[0]);
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(output(&corpus, "l227.mp4")).expect("create"),
+    ContainerName::MP4,
+    table,
+    &[],
+    MuxOptions::new(),
+    mediaencode_ffmpeg::mux::OpenHooks::default().with_plant(planting(*b"apvC", None, 0, |_| b'X')),
+  )
+  .expect("open");
+  for distance in 0..3_u8 {
+    let at = i64::from(distance) * 40;
+    wrote(
+      muxer.write_video(VideoTrackPacket::new(
+        TrackIndex::new(0),
+        video_holding(&carrier, &apv_au(distance))
+          .with_pts(Some(ms(at)))
+          .with_dts(Some(ms(at)))
+          .with_flags(PacketFlags::KEY),
+      )),
+      "an APV frame",
+    );
+  }
+  let fault = muxer.finish().expect_err("the apvC left out, not passed");
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::Configuration(0),
+      Finding::Omitted
+    ))
+  );
+}
+
+/// The DVD subtitle track of the configuration `config`, over the corpus's
+/// two ASS cues, and the cues.
+#[cfg(feature = "test-support")]
+fn dvd_fixture(corpus: &Corpus, config: &str) -> (Described, Vec<Subtitle>) {
+  #[rustfmt::skip]
+  let ass = generated(corpus, "ass.mkv", &[
+    "-i",
+    written_text(corpus, "two.srt", "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n2\n00:00:01,000 --> 00:00:02,000\nworld\n\n")
+      .to_str().expect("utf-8 path"),
+    "-c:s", "ass",
+  ]);
+  let row = recoded(
+    table_of(&ass, TrackKind::Subtitle).remove(0),
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_DVD_SUBTITLE,
+    config.as_bytes(),
+  );
+  let (_, cues) = whole_track(&ass, TrackKind::Subtitle);
+  (row, cues.iter().map(subtitle_of).collect())
+}
+
+/// **L228 — A11: DVD subtitles' palette left out is named**
+/// (`mov_create_dvd_sub_decoder_specific_info`, `movenc.c` 8000–8048;
+/// 8752's answer dropped): the palette's sixteen colours into MP4, the
+/// write plant turning the `esds`'s decoder-specific information's tag,
+/// at its payload's offset 30, from 5 to 7 — the `esds` as movenc writes it
+/// of no palette. Named: track 0's description 0, its palette omitted.
+#[cfg(feature = "test-support")]
+#[test]
+fn l228_a_dvd_palette_left_out_is_named() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, cues) = dvd_fixture(
+    &corpus,
+    &format!("size: 720x480\npalette: {}\n", ["101010"; 16].join(", ")),
+  );
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(output(&corpus, "l228.mp4")).expect("create"),
+    ContainerName::MP4,
+    vec![row],
+    &[],
+    MuxOptions::new(),
+    mediaencode_ffmpeg::mux::OpenHooks::default().with_plant(planting(*b"esds", None, 31, |tag| {
+      if tag == 5 { 7 } else { tag }
+    })),
+  )
+  .expect("open");
+  for cue in &cues {
+    wrote(
+      muxer.write_subtitle(SubtitleTrackPacket::new(TrackIndex::new(0), cue.clone())),
+      "a cue",
+    );
+  }
+  let fault = muxer
+    .finish()
+    .expect_err("the palette left out, not passed");
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::Palette(0),
+      Finding::Omitted
+    ))
+  );
+}
+
+/// An H.264 track of 1 024 sample descriptions, `MOV_DESCRIPTIONS_MAX`:
+/// the corpus's `avcC`, then 1 023 more, each the record and two bytes of
+/// its own, brought as new extradata by a packet each (`movenc.c`
+/// 7044–7074); its packets, each the corpus's first frame.
+fn many_descriptions(corpus: &Corpus) -> (Described, Vec<VideoTrackPacket<Ffmpeg, FfmpegBytes>>) {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let (mut table, packets) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 1);
+  let row = table.remove(0);
+  let record = stream_extradata_of(&row);
+  assert_eq!(record[0], 1, "the premise: an avcC");
+  let frame = video_of(&packets[0]);
+  assert!(
+    !frame.data().as_ref().windows(4).any(|word| word == b"avcC"),
+    "the premise: no avcC among the frame's bytes"
+  );
+  let packets = (0..1_024_u16)
+    .map(|k| {
+      let mut packet = frame.clone();
+      if k > 0 {
+        packet.extra_mut().set_side_data(vec![side(
+          T::AV_PKT_DATA_NEW_EXTRADATA,
+          &[&record[..], &k.to_be_bytes()].concat(),
+        )]);
+      }
+      let at = i64::from(k) * 40;
+      video_at(&packet, Some(at), at)
+    })
+    .collect();
+  (row, packets)
+}
+
+/// **R6 (d) — a difference at the 1 024th description is named by its
+/// index**: H.264 of 1 024 descriptions into MP4, the write plant renaming
+/// the 1 024th `avcC` FFmpeg writes. Named: track 0's description 1 023,
+/// its configuration omitted.
+#[cfg(feature = "test-support")]
+#[test]
+fn r6_the_1024th_descriptions_record_left_out_is_named() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, packets) = many_descriptions(&corpus);
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(output(&corpus, "r6-1024.mp4")).expect("create"),
+    ContainerName::MP4,
+    vec![row],
+    &[],
+    MuxOptions::new(),
+    mediaencode_ffmpeg::mux::OpenHooks::default().with_plant(planting(
+      *b"avcC",
+      Some(1_023),
+      0,
+      |_| b'X',
+    )),
+  )
+  .expect("open");
+  for packet in &packets {
+    wrote(muxer.write_video(packet.clone()), "a frame");
+  }
+  let fault = muxer.finish().expect_err("the 1 024th record left out");
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::Configuration(1_023),
+      Finding::Omitted
+    ))
+  );
+}
+
+/// **R6 (b) and (c) — the descriptions' move allocates nothing and leaves
+/// the report as it is**: the 1 024 descriptions' file, finished with the
+/// write audit on and off. `finish` allocates as many bytes either way,
+/// counted on this thread by the lane's allocator: the move of every
+/// description into the tap, the walk of an `stsd` of 1 024 entries, each
+/// judged by its record's mirror, and the verdict allocate nothing. Nothing
+/// reads the descriptions after the move: the reports are equal, and the
+/// files byte for byte.
+#[test]
+fn r6_the_descriptions_move_allocates_nothing_and_leaves_the_report() {
+  let Some(corpus) = Corpus::new() else { return };
+  let finished = |name: &str, audit: bool| {
+    let (row, packets) = many_descriptions(&corpus);
+    let target = output(&corpus, name);
+    let mut muxer = muxer_with(
+      &target,
+      ContainerName::MP4,
+      vec![row],
+      MuxOptions::new().with_audit(audit),
+    );
+    for packet in &packets {
+      wrote(muxer.write_video(packet.clone()), "a frame");
+    }
+    let before = allocated();
+    let report = muxer.finish().expect("finished");
+    (
+      allocated() - before,
+      report,
+      std::fs::read(&target).expect("the file"),
+    )
+  };
+  let (on, report_on, file_on) = finished("r6-on.mp4", true);
+  let (off, report_off, file_off) = finished("r6-off.mp4", false);
+  assert_eq!(on, off, "the bytes finish allocates, the audit on and off");
+  assert_eq!(report_on, report_off, "the report after the trailer");
+  assert!(file_on == file_off, "the files, byte for byte");
+}
+
+/// **Gate condition 7 — `hvcC` and `lhvC` read back as their mirrors
+/// count them, at an edge the corpus holds not**: HEVC flagged multilayer
+/// into MP4, its Annex B configuration of a prefix and a suffix SEI and the
+/// units of a second layer, which `hvcC` skips and `lhvC` writes. Each
+/// record's payload, read from the file, is what the write audit's mirror
+/// states of it (`records::hvcc_written_len`, `records::lhvc_written_len`).
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_hvcc_and_lhvc_read_back_as_their_mirrors_count_them() {
+  let Some(corpus) = Corpus::new() else { return };
+  let config = start_coded(&[
+    &hevc_vps(0, None),
+    &hevc_sps(0, 0, 1, None),
+    &hevc_pps(),
+    &hevc_sps(1, 0, 0, None),
+    &hevc_pps_of(1),
+    &sized(&hevc_header(39, 0), 24),
+    &sized(&hevc_header(40, 0), 40),
+  ]);
+  let slice = start_coded(&[&escaped(&hevc_header(19, 0), &[0xAF, 0x88, 0x42])]);
+  let (row, frames) = recoded_fixture(&corpus, &slice);
+  let row = restated(
+    &row,
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+    &config,
+    Some(b"hev1"),
+    None,
+  );
+  let flags = row.disposition() | multilayer();
+  let row = row.with_disposition(flags);
+  let target = output(&corpus, "gate7-hevc.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, vec![row]);
+  let stated = muxer.expected_records();
+  for frame in &frames {
+    wrote(
+      muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone())),
+      "a frame",
+    );
+  }
+  muxer.finish().expect("finished");
+  let read: Vec<_> = [*b"hvcC", *b"lhvC"]
+    .into_iter()
+    .map(|fourcc| {
+      let len = written_record(&target, &fourcc).expect("the record").len() as u64;
+      (TrackIndex::new(0), 0, fourcc, len)
+    })
+    .collect();
+  assert_eq!(stated, read);
+}
+
+/// **Gate condition 7 — `avcC` reads back as its mirror counts it, of SPS
+/// extensions**: H.264 of an Annex B configuration of its SPS, of profile
+/// 100, its PPS and an SPS extension, which `avcC` writes after them
+/// (`avc.c` 111–134). The record's payload, read from the file, is what the
+/// write audit's mirror states (`records::avcc_written_len`).
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_avcc_reads_back_as_its_mirror_counts_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  #[rustfmt::skip]
+  let high = generated(&corpus, "high-ip.mkv", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25:duration=0.2",
+    "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p", "-bf", "0",
+  ]);
+  let (row, frames, sps, pps) = h264_fixture_of(&high);
+  assert_eq!(sps[1], 100, "the premise: the High profile");
+  let row = restated(
+    &row,
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+    &start_coded(&[&sps, &pps, &[0x6D, 0x80]]),
+    None,
+    None,
+  );
+  let target = output(&corpus, "gate7-avcc.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, vec![row]);
+  let stated = muxer.expected_records();
+  for frame in &frames {
+    wrote(
+      muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone())),
+      "a frame",
+    );
+  }
+  muxer.finish().expect("finished");
+  let len = written_record(&target, b"avcC").expect("the record").len() as u64;
+  assert_eq!(stated, vec![(TrackIndex::new(0), 0, *b"avcC", len)]);
+}
+
+/// **Gate condition 7 — `av1C` reads back as its mirror counts it, of two
+/// metadata OBUs**: AV1 configured by OBUs, its sequence header and two
+/// metadata OBUs, each written after the record's four bytes (`av1.c`
+/// 478–495). The record's payload, read from the file, is what the write
+/// audit's mirror states (`av1c_written_len`).
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_av1c_reads_back_as_its_mirror_counts_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (av1, frames, av1c) = unconfigured_av1(&corpus);
+  let obus = [&av1c[4..], &av1_metadata_obu(200), &av1_metadata_obu(300)].concat();
+  let table = table_of(&av1, TrackKind::Video)
+    .into_iter()
+    .map(|row| row.with_extradata(Some(bytes_of(&obus))))
+    .collect();
+  let target = output(&corpus, "gate7-av1c.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  let stated = muxer.expected_records();
+  for frame in &frames {
+    wrote(
+      muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone())),
+      "an AV1 frame",
+    );
+  }
+  muxer.finish().expect("finished");
+  let len = written_record(&target, b"av1C").expect("the record").len() as u64;
+  assert_eq!(len, 4 + 13 + 200 + 300, "the premise: both OBUs written");
+  assert_eq!(stated, vec![(TrackIndex::new(0), 0, *b"av1C", len)]);
+}
+
+/// **Gate condition 7 — DVD subtitles' palette reads back as its mirror
+/// converts it, at the range's ends**: black, white, the primaries and
+/// their mixes into MP4. The gate asks for colours `rgb_to_yuv` clips; none
+/// of 8-bit channels is one — luma lies within 16 to 235, chroma within 16
+/// to 239 — so the law takes the ends of the range, what can be shown (the
+/// coordinator's word on condition 7). The `esds`'s decoder-specific
+/// information, read from the file, is the sixteen colours the write
+/// audit's mirror converts (`rgb_to_yuv`, `movenc.c` 7976–7988).
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_the_dvd_palette_reads_back_as_its_mirror_converts_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let colours = [
+    "000000", "ffffff", "ff0000", "00ff00", "0000ff", "ffff00", "00ffff", "ff00ff", "808080",
+    "7f7f7f", "010101", "fefefe", "ff8000", "0080ff", "80ff00", "8000ff",
+  ];
+  let (row, cues) = dvd_fixture(
+    &corpus,
+    &format!("size: 720x480\npalette: {}\n", colours.join(", ")),
+  );
+  let target = output(&corpus, "gate7-dvd.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, vec![row]);
+  let stated = muxer.expected_palettes();
+  for cue in &cues {
+    wrote(
+      muxer.write_subtitle(SubtitleTrackPacket::new(TrackIndex::new(0), cue.clone())),
+      "a cue",
+    );
+  }
+  muxer.finish().expect("finished");
+  let entries = written_entries(&target, 8);
+  let (_, esds) = entries[0][0]
+    .1
+    .iter()
+    .find(|(kind, _)| kind == b"esds")
+    .expect("the esds");
+  assert_eq!(esds[30], 5, "the decoder-specific information's tag");
+  assert_eq!(&esds[31..35], &[0x80, 0x80, 0x80, 64], "its length");
+  let read: [u8; 64] = esds[35..99].try_into().expect("64 bytes");
+  assert_eq!(stated, vec![(TrackIndex::new(0), read)]);
+}
+
+/// **Gate condition 7 — the chapter track reads back as its mirror makes
+/// it, of titles of different lengths** (`mov_create_chapter_track`,
+/// `movenc.c` 7727–7815): an AAC track and three chapters, titled of 1, 0
+/// and 31 bytes, into MP4. The chapter track's samples, read from the
+/// file's last `trak` — each size, and each duration, the next start less
+/// its own and the last's end less its start — are those the write audit's
+/// mirror makes (the muxer's `chapter_track_samples`).
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_the_chapter_track_reads_back_as_its_mirror_makes_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let aac = audio_file(&corpus, "gate7-chapters.mkv", "aac");
+  let (table, packets) = whole_track(&aac, TrackKind::Audio);
+  let chapters = [
+    chapter_of(0, 0, 120, Some("a")),
+    chapter_of(1, 120, 310, Some("")),
+    chapter_of(2, 310, 455, Some("the third chapter's long title.")),
+  ];
+  let target = output(&corpus, "gate7-chapters.mp4");
+  let mut muxer = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table,
+    &chapters,
+    PacketLimits::default(),
+  )
+  .expect("open")
+  .0;
+  let stated = muxer.expected_chapter_samples().to_vec();
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+  }
+  muxer.finish().expect("finished");
+  let (runs, sizes) = written_tables(&target).pop().expect("the chapter track");
+  let durations: Vec<u64> = runs
+    .iter()
+    .flat_map(|&(count, duration)| core::iter::repeat_n(u64::from(duration), count as usize))
+    .collect();
+  let made_durations: Vec<u64> = stated
+    .iter()
+    .zip(
+      stated
+        .iter()
+        .skip(1)
+        .map(|&(start, _, _)| start)
+        .chain([stated[2].2]),
+    )
+    .map(|(&(start, _, _), next)| (next - start) as u64)
+    .collect();
+  let made_sizes: Vec<u32> = stated.iter().map(|&(_, bytes, _)| bytes as u32).collect();
+  assert_eq!(
+    made_sizes,
+    vec![15, 14, 45],
+    "the premise: the titles' bytes and 14"
+  );
+  assert_eq!((sizes, durations), (made_sizes, made_durations));
+}
+
+/// An R8 law's file: `config` of `codec` — its writer's mirror stopped at
+/// the trust model's limit, the muxer refusing nothing — into MP4 over the
+/// corpus's H.264 track recoded, its frames holding `frame`, finished:
+/// `finish` answers `Ok`, the write audit claiming nothing of the record
+/// (R8). Answers the record `record` as the file holds it.
+fn r8_written(
+  name: &str,
+  codec: ffmpeg_next::ffi::AVCodecID,
+  (config, frame): (&[u8], &[u8]),
+  record: &[u8; 4],
+) -> Option<Option<Vec<u8>>> {
+  let corpus = Corpus::new()?;
+  let (row, frames) = recoded_fixture(&corpus, frame);
+  let row = restated(&row, codec, config, None, None);
+  let target = output(&corpus, &format!("r8-{name}.mp4"));
+  let mut muxer = muxer_into(&target, ContainerName::MP4, vec![row]);
+  for frame in &frames {
+    wrote(
+      muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone())),
+      "a frame",
+    );
+  }
+  muxer
+    .finish()
+    .unwrap_or_else(|fault| panic!("{name}: the trust stop judged: {fault:?}"));
+  Some(written_record(&target, record))
+}
+
+/// **R8 — `hvcC` at its trust stop is judged not at all**: an HEVC SPS of
+/// 65 short-term reference picture sets, past the standard's 64, which the
+/// muxer takes (L122); FFmpeg refuses it and writes the `hvcC` empty
+/// (`hevc.c` 739–740), success answered. `finish` answers `Ok`.
+///
+/// PLANT P625: the predicate removed — L122 red.
+#[test]
+fn r8_an_hvcc_at_its_trust_stop_is_judged_not_at_all() {
+  let config = start_coded(&[&hevc_vps(0, None), &hevc_sps(0, 0, 65, None), &hevc_pps()]);
+  let slice = start_coded(&[&escaped(&hevc_header(19, 0), &[0xAF, 0x88, 0x42])]);
+  let Some(record) = r8_written(
+    "hvcc",
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+    (&config, &slice),
+    b"hvcC",
+  ) else {
+    return;
+  };
+  assert_eq!(
+    record,
+    Some(Vec::new()),
+    "the hvcC FFmpeg writes there, empty"
+  );
+}
+
+/// An EVC SPS of the id `id`, its bit depths of 10.
+fn evc_sps_of(id: u32) -> Vec<u8> {
+  let syntax = Syntax::default()
+    .ue(id)
+    .u(1, 8)
+    .u(51, 8)
+    .u(0, 32)
+    .u(0, 32)
+    .ue(1)
+    .ue(64)
+    .ue(64)
+    .ue(2)
+    .ue(2)
+    .u(0, 1);
+  [&evc_header(24)[..], &syntax.rbsp()].concat()
+}
+
+/// **R8 — `evcC` at its trust stop is judged not at all**: an EVC SPS of
+/// id 16, past the standard's 15, which the muxer takes; FFmpeg refuses it
+/// and writes the `evcC` empty (`evc.c` 94–95), success answered. `finish`
+/// answers `Ok`.
+#[test]
+fn r8_an_evcc_at_its_trust_stop_is_judged_not_at_all() {
+  let pps = [&evc_header(25)[..], &[0x80]].concat();
+  let config = length_prefixed_units(&[&evc_sps_of(16), &pps]);
+  let frame = length_prefixed_units(&[&[&evc_header(1)[..], &[0x80]].concat()]);
+  let Some(record) = r8_written(
+    "evcc",
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_EVC,
+    (&config, &frame),
+    b"evcC",
+  ) else {
+    return;
+  };
+  assert_eq!(
+    record,
+    Some(Vec::new()),
+    "the evcC FFmpeg writes there, empty"
+  );
+}
+
+/// **R8 — `dvc1` at its trust stop is judged not at all**: a VC-1
+/// sequence header of the main profile, which the muxer takes; FFmpeg's
+/// `mov_write_dvc1_structs` refuses it and the sample entry is written of
+/// no `dvc1` (`movenc.c` 1137–1141), success answered. `finish` answers
+/// `Ok`. (`vvcC`'s stop, an SPS of eight sub-layers, is a unit law alone:
+/// FFmpeg's parse of it writes past its arrays, `vvc.c` 146–150, 208–216,
+/// which no law provokes.)
+#[test]
+fn r8_a_dvc1_at_its_trust_stop_is_judged_not_at_all() {
+  let Some(record) = r8_written(
+    "dvc1",
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_VC1,
+    (&[0, 0, 1, 0x0F, 0x48, 0x0A], &[0, 0, 1, 0x0D, 0x11]),
+    b"dvc1",
+  ) else {
+    return;
+  };
+  assert_eq!(record, None, "no dvc1 written there");
+}
+
+// ---------------------------------------------------------------------------
+//  AVIF audited (A13).
+// ---------------------------------------------------------------------------
+
+/// An AV1 temporal unit of a payload past 100 KB: the corpus's temporal
+/// unit, then seven metadata OBUs of 16 000 bytes each, which AVIF's
+/// writer keeps (`ff_av1_filter_obus`, `av1.c` 89–122).
+#[cfg(feature = "test-support")]
+fn large_av1_unit(frame: &Video) -> Video {
+  let mut bytes = frame.data().as_ref().to_vec();
+  for _ in 0..7 {
+    bytes.extend(av1_metadata_obu(16_000));
+  }
+  video_holding(frame, &bytes)
+}
+
+/// **L219 — A13a: AVIF's sample its buffer could not hold is named**
+/// (`mov_write_single_packet`, `movenc.c` 6961–6981; `avif_write_trailer`,
+/// 9189–9198). In a process of its own: a still AVIF of one frame of more
+/// than 100 KB, written whole, then again with libavutil's allocations
+/// capped at 100 000 bytes around libavformat's take of the packet alone
+/// (the base's write hook, the design gate's condition 5). The cap's
+/// derivation: the packet's write opens the samples' dynamic buffer (about
+/// 1.4 KB) and grows it, 1 024 bytes a flush, through 88 712 bytes, then
+/// allocates the track's sample index of 1 024 entries of 72 bytes (73 728;
+/// 7235–7243), each under the cap; the buffer's growth to 133 069
+/// (`dyn_buf_write`, `aviobuf.c` 1280–1304) is refused, the buffer keeps
+/// its error and writes nothing more, and the packet's write answers
+/// success. Uncapped, the trailer's `avio_get_dyn_buf` answers 0 bytes: an
+/// `mdat` of no sample. Named: the media data, 0 bytes against the
+/// frame's.
+#[cfg(feature = "test-support")]
+#[test]
+fn l219_avifs_sample_its_buffer_could_not_hold_is_named() {
+  in_its_own_process("l219_in_a_process_of_its_own");
+}
+
+/// L219's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l219_in_a_process_of_its_own() {
+  if !alone_for("l219_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let av1 = av1_mkv(&corpus);
+  let write = |name: &str, capped: bool| {
+    let (table, frames) = first_track(&av1, TrackKind::Video, 1);
+    let frame = large_av1_unit(&video_of(&frames[0]));
+    let mut hooks = mediaencode_ffmpeg::mux::OpenHooks::default();
+    if capped {
+      hooks = hooks.with_packets(|before| if before { cap(100_000) } else { uncap() });
+    }
+    let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+      File::create(output(&corpus, name)).expect("create"),
+      ContainerName::new("avif"),
+      table,
+      &[],
+      MuxOptions::new(),
+      hooks,
+    )
+    .expect("open");
+    wrote(
+      muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frame)),
+      "the frame",
+    );
+    muxer.finish()
+  };
+  write("l219.avif", false).expect("whole");
+  let bytes = std::fs::read(output(&corpus, "l219.avif")).expect("the file");
+  let (_, _, size) = box_in(&bytes, (0, bytes.len()), b"mdat").expect("the mdat");
+  let payload = size - 8;
+  assert!(payload > 100_000, "the premise: {payload} bytes");
+  let fault = write("l219-capped.avif", true).expect_err("the sample lost, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((None, WrittenPart::MediaData, Finding::Length(0, payload)))
+  );
+}
+
+/// **L220 — A13b: an animated AVIF's chunk offsets moved by its `moov`'s
+/// measure are named** (`get_moov_size`, `movenc.c` 8905–8916;
+/// `avif_write_trailer`, 9179–9181). In a process of its own: an animated
+/// AVIF of the corpus's ten frames, 270 bytes in all — held in the samples'
+/// dynamic buffer's own 1 024 bytes, so that its close allocates nothing —
+/// with libavutil's allocations capped at 1 000 bytes before `finish`. The
+/// cap's derivation: the trailer's largest allocation under it is the
+/// `stts`'s entries, 8 bytes a sample (80); `get_moov_size`'s null buffer
+/// opens of `FFIOContext`, `DynBuffer` and 1 024 bytes in one allocation,
+/// refused, and its error is taken as the `moov`'s size: every chunk's
+/// offset moved by it. Named: track 0's chunk offsets, its first against
+/// the payload's first byte.
+#[test]
+fn l220_an_animated_avifs_moved_chunk_offsets_are_named() {
+  in_its_own_process("l220_in_a_process_of_its_own");
+}
+
+/// L220's body, alone in its process.
+#[test]
+fn l220_in_a_process_of_its_own() {
+  if !alone_for("l220_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let av1 = av1_mkv(&corpus);
+  let (table, frames) = whole_track(&av1, TrackKind::Video);
+  let target = output(&corpus, "l220.avif");
+  let mut muxer = muxer_into(&target, ContainerName::new("avif"), table);
+  for frame in &frames {
+    wrote(
+      muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(frame))),
+      "a frame",
+    );
+  }
+  cap(1_000);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the chunk offsets moved, not passed");
+  let bytes = std::fs::read(&target).expect("the file");
+  let (_, _, size) = box_in(&bytes, (0, bytes.len()), b"mdat").expect("the mdat");
+  let start = bytes.len() as u64 - size + 8;
+  let (moov, moov_end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("the moov");
+  let (trak, trak_end, _) = box_in(&bytes, (moov, moov_end), b"trak").expect("a trak");
+  let (mdia, mdia_end, _) = box_in(&bytes, (trak, trak_end), b"mdia").expect("mdia");
+  let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+  let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+  let (stco, _, _) = box_in(&bytes, (stbl, stbl_end), b"stco").expect("stco");
+  let first = u64::from(u32::from_be_bytes(
+    bytes[stco + 8..stco + 12].try_into().expect("a word"),
+  ));
+  assert_ne!(first, start, "the premise: the offset moved");
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::ChunkOffsets,
+      Finding::Value(first, start)
+    ))
+  );
+}
+
+/// The payload of the `av1C` AVIF's `meta` holds among its first item's
+/// properties, in `path` (`mov_write_iprp_tag`, `movenc.c` 3796–3840).
+#[cfg(feature = "test-support")]
+fn avif_item_av1c(path: &Path) -> Option<Vec<u8>> {
+  let bytes = std::fs::read(path).expect("the file");
+  let (meta, meta_end, _) = box_in(&bytes, (0, bytes.len()), b"meta")?;
+  let (iprp, iprp_end, _) = box_in(&bytes, (meta + 4, meta_end), b"iprp")?;
+  let (ipco, ipco_end, _) = box_in(&bytes, (iprp, iprp_end), b"ipco")?;
+  let (av1c, av1c_end, _) = box_in(&bytes, (ipco, ipco_end), b"av1C")?;
+  Some(bytes[av1c..av1c_end].to_vec())
+}
+
+/// **Gate condition 7 — AVIF's `av1C` reads back as its mirror counts it,
+/// of no sequence header**: AV1 configured by OBUs, its sequence header
+/// and a metadata OBU of 200 bytes, into a still AVIF, whose writer leaves
+/// the sequence header out (`mov_write_av1c_tag`, `movenc.c` 1572–1581).
+/// The item's record, read from the file, is what the write audit's mirror
+/// states (`av1c_written_len` of no sequence header): 4 + 200.
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_avifs_av1c_reads_back_as_its_mirror_counts_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (av1, frames, av1c) = unconfigured_av1(&corpus);
+  let obus = [&av1c[4..], &av1_metadata_obu(200)].concat();
+  let table = table_of(&av1, TrackKind::Video)
+    .into_iter()
+    .map(|row| row.with_extradata(Some(bytes_of(&obus))))
+    .collect();
+  let target = output(&corpus, "gate7-avif.avif");
+  let mut muxer = muxer_into(&target, ContainerName::new("avif"), table);
+  let stated = muxer.expected_records();
+  wrote(
+    muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frames[0].clone())),
+    "the frame",
+  );
+  muxer.finish().expect("finished");
+  let len = avif_item_av1c(&target).expect("the item's av1C").len() as u64;
+  assert_eq!(
+    len,
+    4 + 200,
+    "the premise: the metadata written, no sequence header"
+  );
+  assert_eq!(stated, vec![(TrackIndex::new(0), 0, *b"av1C", len)]);
+}
+
+// ---------------------------------------------------------------------------
+//  R2: Opus's roll distance past 32, refused by name.
+// ---------------------------------------------------------------------------
+
+/// MP4 of the corpus's Opus track, its packets the first frame's bytes,
+/// `count` of them `spacing` ticks of 48 kHz apart, each lasting that;
+/// answers the muxer and the packets.
+fn opus_every(
+  corpus: &Corpus,
+  name: &str,
+  spacing: i64,
+  count: usize,
+) -> (
+  FfmpegOwnedMuxer<File>,
+  Vec<AudioTrackPacket<Ffmpeg, FfmpegBytes>>,
+) {
+  let (table, packets) = first_track(&opus_mkv(corpus), TrackKind::Audio, 1);
+  let frame = audio_of(&packets[0]);
+  let packets = (0..count)
+    .map(|index| audio_ticks(&frame, index as i64 * spacing, spacing))
+    .collect();
+  (
+    muxer_into(&output(corpus, name), ContainerName::MP4, table),
+    packets,
+  )
+}
+
+/// **R2 — Opus's first sample past a roll distance of 32 is refused by
+/// name** (the coordinator's ruling on the write audit's F4;
+/// `mov_preroll_write_stbl_atoms`, `movenc.c` 3330–3351, its answer dropped
+/// at 3436): MP4 counts each Opus sample's roll distance, the samples
+/// before it whose durations reach 80 ms — 3 840 ticks at 48 kHz — and
+/// past 32 writes no roll group of the track at all. Packets 100 ticks
+/// apart: the first 39 taken, every one before them reaching less than
+/// 80 ms, a distance of none; the 40th, of a distance of 39, refused by
+/// name (`PayloadRule::RollDistance`), handed back untouched; the file
+/// finished whole.
+///
+/// PLANT P628: the window of 31 samples, not 32.
+#[test]
+fn r2_opus_past_a_roll_distance_of_32_is_refused_by_name() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (mut muxer, packets) = opus_every(&corpus, "r2-past.mp4", 100, 40);
+  for packet in &packets[..39] {
+    wrote(
+      muxer.write_audio(packet.clone()),
+      "a packet within the roll",
+    );
+  }
+  let past = packets[39].clone();
+  let (refusal, back) = by_container(refusing!(muxer.write_audio(past.clone())));
+  assert_eq!(refusal, payload(PayloadRule::RollDistance), "the 40th");
+  untouched!(past, back);
+  muxer.finish().expect("finished");
+}
+
+/// **R2 — a timeline of a roll distance of exactly 32 is taken, its roll
+/// groups written**: Opus packets of 2.5 ms, 120 ticks apart — 32 of them
+/// make 80 ms — every packet taken; the file's `sgpd` holds one group of a
+/// roll distance of −32, and its `sbgp` the runs movenc makes: the first 32
+/// samples of none, then the rest of group 1 (3352–3358, 3374–3396), read
+/// back from the file.
+#[test]
+fn r2_a_roll_distance_of_exactly_32_is_taken() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (mut muxer, packets) = opus_every(&corpus, "r2-32.mp4", 120, 40);
+  for packet in &packets {
+    wrote(muxer.write_audio(packet.clone()), "a packet");
+  }
+  muxer.finish().expect("finished");
+  let bytes = std::fs::read(output(&corpus, "r2-32.mp4")).expect("the file");
+  let (moov, moov_end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("moov");
+  let (trak, trak_end, _) = box_in(&bytes, (moov, moov_end), b"trak").expect("trak");
+  let (mdia, mdia_end, _) = box_in(&bytes, (trak, trak_end), b"mdia").expect("mdia");
+  let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+  let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+  let (sgpd, sgpd_end, _) = box_in(&bytes, (stbl, stbl_end), b"sgpd").expect("sgpd");
+  let (sbgp, sbgp_end, _) = box_in(&bytes, (stbl, stbl_end), b"sbgp").expect("sbgp");
+  let word = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("a word"));
+  // `sgpd`: version and flags, `roll`, the default length, the count, then
+  // each group's distance negated in 16 bits.
+  assert_eq!(&bytes[sgpd + 4..sgpd + 8], b"roll");
+  assert_eq!(word(sgpd + 12), 1, "one group");
+  assert_eq!(
+    &bytes[sgpd + 16..sgpd_end],
+    &(-32_i16).to_be_bytes(),
+    "of a distance of 32"
+  );
+  // `sbgp`: version and flags, `roll`, the count, then each run.
+  assert_eq!(word(sbgp + 8), 2, "two runs");
+  let runs: Vec<(u32, u32)> = (0..2)
+    .map(|run| (word(sbgp + 12 + 8 * run), word(sbgp + 16 + 8 * run)))
+    .collect();
+  assert_eq!(runs, vec![(32, 0), (8, 1)]);
+  assert_eq!(sbgp + 12 + 16, sbgp_end, "nothing after them");
+}
+
+// ---------------------------------------------------------------------------
+//  The protection headers, the user data and the roll groups audited (A1,
+//  A6, A7, A3).
+// ---------------------------------------------------------------------------
+
+/// The first `trak`'s roll groups FFmpeg wrote into `path`: `sgpd`'s
+/// distances as written, negated, and `sbgp`'s runs, each its samples and
+/// its group's index; empty where the box is not written
+/// (`mov_preroll_write_stbl_atoms`, `movenc.c` 3373–3396).
+#[cfg(feature = "test-support")]
+fn written_rolls(path: &Path) -> (Vec<i16>, Vec<(u32, u32)>) {
+  let bytes = std::fs::read(path).expect("the file");
+  let word = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("a word"));
+  let (moov, moov_end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("moov");
+  let (trak, trak_end, _) = box_in(&bytes, (moov, moov_end), b"trak").expect("trak");
+  let (mdia, mdia_end, _) = box_in(&bytes, (trak, trak_end), b"mdia").expect("mdia");
+  let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+  let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+  let distances = box_in(&bytes, (stbl, stbl_end), b"sgpd").map_or_else(Vec::new, |(sgpd, ..)| {
+    (0..word(sgpd + 12) as usize)
+      .map(|at| i16::from_be_bytes([bytes[sgpd + 16 + 2 * at], bytes[sgpd + 17 + 2 * at]]))
+      .collect()
+  });
+  let runs = box_in(&bytes, (stbl, stbl_end), b"sbgp").map_or_else(Vec::new, |(sbgp, ..)| {
+    (0..word(sbgp + 8) as usize)
+      .map(|at| (word(sbgp + 12 + 8 * at), word(sbgp + 16 + 8 * at)))
+      .collect()
+  });
+  (distances, runs)
+}
+
+/// The first `count` AAC frames of three minutes' AAC into MP4 at `name`,
+/// the track's row as `edit` makes it: the muxer, and the frames written.
+fn aac_written(
+  corpus: &Corpus,
+  name: &str,
+  count: usize,
+  edit: impl Fn(Described) -> Described,
+) -> FfmpegOwnedMuxer<File> {
+  let (table, packets) = first_track(&long_aac(corpus), TrackKind::Audio, count);
+  assert_eq!(packets.len(), count, "the premise: {count} frames");
+  let mut muxer = muxer_into(
+    &output(corpus, name),
+    ContainerName::MP4,
+    table.into_iter().map(edit).collect(),
+  );
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+  }
+  muxer
+}
+
+/// **L225 — A1: a `pssh` movenc leaves out is named, the file not passed**
+/// (findit-studio/mediaio#95). In a process of its own: 50 AAC frames into
+/// MP4, the track's ticket carrying one encryption initialization of no key
+/// id and 102 400 bytes of data, then libavutil's allocations capped at
+/// 51 200 bytes before `finish`. At the trailer movenc parses the side data
+/// again and copies its data, past the cap: the parse answers none, and no
+/// `pssh` is written, success answered (`av_encryption_init_info_alloc`,
+/// `libavutil/encryption_info.c` 193; 264–268; `mov_write_pssh_tag`,
+/// `movenc.c` 5184). The trailer's other allocations stay under the cap:
+/// `stts`'s entries, 8 bytes a sample (400), AAC's roll groups', 12 (600),
+/// each `udta`'s dynamic buffer, one block of its I/O context, its state
+/// and 1 024 bytes (`aviobuf.c` 1344–1362), and the parse's own info and
+/// system id. Named: the protection headers, by their count — none of one.
+#[cfg(feature = "test-support")]
+#[test]
+fn l225_a_pssh_movenc_leaves_out_is_named() {
+  in_its_own_process("l225_in_a_process_of_its_own");
+}
+
+/// L225's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l225_in_a_process_of_its_own() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  if !alone_for("l225_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let init = encryption_init_info(&[(16, 0, 16, 102_400)]);
+  let muxer = aac_written(&corpus, "l225.mp4", 50, |row| {
+    with_coded(row, T::AV_PKT_DATA_ENCRYPTION_INIT_INFO, &init)
+  });
+  assert_eq!(
+    muxer.expected_protection(),
+    (1, 12 + 16 + 102_400),
+    "the premise: one pssh, its payload past the cap"
+  );
+  cap(51_200);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the pssh left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((None, WrittenPart::ProtectionHeaders, Finding::Count(0, 1)))
+  );
+}
+
+/// **L231 — A7: a movie `udta` movenc leaves out is named, the file not
+/// passed** (findit-studio/mediaio#95). In a process of its own: 50 AAC
+/// frames into MP4, of no role, then libavutil's allocations capped at
+/// 1 000 bytes before `finish`. At the trailer movenc opens the movie
+/// `udta`'s dynamic buffer — one block of its I/O context, its state and
+/// 1 024 bytes of buffer (`url_open_dyn_buf_internal`, `aviobuf.c`
+/// 1344–1362) — past the cap: the open's failure is returned and discarded
+/// (`mov_write_udta_tag`, `movenc.c` 5072–5074; 5448), and the `moov` holds
+/// no `udta`, its iTunes metadata lost. The track's `udta`, of no role, is
+/// none either way; `stts`'s 400 bytes and AAC's roll groups' 600 stay
+/// under the cap. Named: the movie's user data, omitted.
+#[test]
+fn l231_a_movie_udta_movenc_leaves_out_is_named() {
+  in_its_own_process("l231_in_a_process_of_its_own");
+}
+
+/// L231's body, alone in its process.
+#[test]
+fn l231_in_a_process_of_its_own() {
+  if !alone_for("l231_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let muxer = aac_written(&corpus, "l231.mp4", 50, |row| row);
+  cap(1_000);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the udta left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((None, WrittenPart::MovieUserData, Finding::Omitted))
+  );
+}
+
+/// **L232 — A6: a track `udta` movenc leaves out is named, before the
+/// movie's** (findit-studio/mediaio#95). In a process of its own: L231's
+/// file, its AAC track of the captions disposition, which MP4 writes as the
+/// DASH role `caption` in a `kind` box of the track's `udta`
+/// (`mov_write_track_kinds`, `movenc.c` 4338–4356; `isom.c` 450–452), the
+/// same cap: the track's dynamic buffer refused first, its open's failure
+/// returned and discarded (4369–4371; 4441), the `trak` written without its
+/// `udta`, the role lost; the movie's after it, lost as L231's. Named: the
+/// track's user data, omitted — the track's part before the movie's.
+#[test]
+fn l232_a_track_udta_movenc_leaves_out_is_named() {
+  in_its_own_process("l232_in_a_process_of_its_own");
+}
+
+/// L232's body, alone in its process.
+#[test]
+fn l232_in_a_process_of_its_own() {
+  if !alone_for("l232_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let muxer = aac_written(&corpus, "l232.mp4", 50, |row| {
+    let disposition = row.disposition();
+    row.with_disposition(disposition | TrackDisposition::CAPTIONS)
+  });
+  cap(1_000);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the track's udta left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::TrackUserData,
+      Finding::Omitted
+    ))
+  );
+}
+
+/// **L233 — A3: roll groups movenc leaves out are named**
+/// (findit-studio/mediaio#95). In a process of its own: 200 AAC frames into
+/// MP4, then libavutil's allocations capped at 2 000 bytes before
+/// `finish`. At the trailer movenc allocates the roll groups' entries, 12
+/// bytes a sample — 2 400, past the cap — and writes neither `sgpd` nor
+/// `sbgp`, its answer dropped (`mov_preroll_write_stbl_atoms`, `movenc.c`
+/// 3326–3328; 3436): seeking the track decodes it with no preroll. `stts`'s
+/// entries, 1 600 bytes, stay under the cap; each `udta`'s dynamic buffer,
+/// under it or not, is named after the track's groups. Named: track 0's
+/// roll groups, omitted.
+#[test]
+fn l233_roll_groups_movenc_leaves_out_are_named() {
+  in_its_own_process("l233_in_a_process_of_its_own");
+}
+
+/// L233's body, alone in its process.
+#[test]
+fn l233_in_a_process_of_its_own() {
+  if !alone_for("l233_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let muxer = aac_written(&corpus, "l233.mp4", 200, |row| row);
+  cap(2_000);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the roll groups left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::RollGroups,
+      Finding::Omitted
+    ))
+  );
+}
+
+/// **A3 — Opus's roll groups as movenc counts them, each new run its own
+/// group** (findit-studio/mediaio#95; `mov_preroll_write_stbl_atoms`,
+/// `movenc.c` 3330–3396): 30 Opus packets into MP4, decoded at steps of
+/// 960 ticks (nine), 1 280 (ten), then 960 (ten), each lasting its step —
+/// 3 840 ticks reached by four steps of 960 or three of 1 280 — so that
+/// their distances run none four times, 4 eight times, 3 eight and 4 ten,
+/// the last run's 4 a group of its own beside the first's (3352–3358):
+/// every packet taken, the muxer's mirror counting three groups and four
+/// runs; `finish` `Ok`, the audit agreeing; the file's `sgpd` holding −4,
+/// −3 and −4, its `sbgp` the runs (4, 0), (8, 1), (8, 2) and (10, 3), read
+/// back.
+///
+/// PLANT P616: a run of a distance seen before keeps its first group's
+/// index.
+#[cfg(feature = "test-support")]
+#[test]
+fn a3_opus_roll_groups_each_new_run_its_own_group() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (table, packets) = first_track(&opus_mkv(&corpus), TrackKind::Audio, 1);
+  let frame = audio_of(&packets[0]);
+  let target = output(&corpus, "a3-opus.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  let mut dts = 0;
+  for step in [960; 9].into_iter().chain([1_280; 10]).chain([960; 11]) {
+    wrote(
+      muxer.write_audio(audio_ticks(&frame, dts, step)),
+      "a packet",
+    );
+    dts += step;
+  }
+  // The mirror's count, read before `finish`, which the audit judges
+  // first.
+  let mirrored = muxer.expected_roll_groups();
+  muxer.finish().expect("finished");
+  assert_eq!(mirrored, vec![(TrackIndex::new(0), 3, 4)]);
+  assert_eq!(
+    written_rolls(&target),
+    (vec![-4, -3, -4], vec![(4, 0), (8, 1), (8, 2), (10, 3)])
+  );
+}
+
+/// **Gate condition 7 — Opus's roll groups' mirror against the bytes
+/// FFmpeg wrote, at a distance of exactly 32 and a run of none at the
+/// start** (`mov_preroll_write_stbl_atoms`, `movenc.c` 3330–3396): R2's
+/// timeline of 2.5 ms packets, 120 ticks apart: the muxer's mirror counts
+/// one group and two runs, as the file's `sgpd` and `sbgp` read back hold
+/// them — −32, and (32, 0), (8, 1).
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_opus_roll_groups_read_back_as_their_mirror_counts_them() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (mut muxer, packets) = opus_every(&corpus, "gate7-opus.mp4", 120, 40);
+  for packet in &packets {
+    wrote(muxer.write_audio(packet.clone()), "a packet");
+  }
+  let mirrored = muxer.expected_roll_groups();
+  muxer.finish().expect("finished");
+  assert_eq!(mirrored, vec![(TrackIndex::new(0), 1, 2)]);
+  assert_eq!(
+    written_rolls(&output(&corpus, "gate7-opus.mp4")),
+    (vec![-32], vec![(32, 0), (8, 1)])
+  );
+}
+
+/// **Gate condition 7 — the movie `udta`'s mirror against the bytes
+/// FFmpeg wrote, of two covers and 300 chapters** (`udta_bytes`;
+/// `mov_write_udta_tag`, `movenc.c` 5066–5122; `mov_write_chpl_tag`,
+/// 5040–5064): an MP3's cover twice and 300 chapters whose titles run 0,
+/// 1, 255 and 300 bytes in turn — the Nero list cut at 255 chapters and
+/// each title at 255 bytes — into MP4: the muxer's count of the `udta`'s
+/// payload equals the `udta` FFmpeg wrote, read back from the file, less
+/// its 8 bytes; `finish` `Ok`, the audit agreeing.
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_the_movie_udta_reads_back_as_its_mirror_counts_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (table, packets) = two_covers(&corpus.cover_art_mp3());
+  let (long, longer) = ("t".repeat(255), "u".repeat(300));
+  let titles = ["", "a", long.as_str(), longer.as_str()];
+  let chapters: Vec<Chapter<Ffmpeg>> = (0..300)
+    .map(|index| {
+      chapter_of(
+        index,
+        index * 10,
+        index * 10 + 10,
+        Some(titles[index as usize % 4]),
+      )
+    })
+    .collect();
+  let target = output(&corpus, "gate7-udta.mp4");
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table,
+    &chapters,
+    PacketLimits::default(),
+  )
+  .expect("open");
+  let counted = muxer.expected_movie_user_data().expect("MP4's, exact");
+  for packet in packets {
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  muxer.finish().expect("finished");
+  assert_eq!(written_udta(&target) - 8, counted);
+}
+
+/// **Gate condition 7 — the `pssh` boxes' mirror against the bytes FFmpeg
+/// wrote, of two streams carrying the same side data and an initialization
+/// of no key ids and no data** (`pssh_written`; `mov_write_pssh_tag`,
+/// `movenc.c` 5175–5210; 5449–5451): H.264 and AAC into MP4, each track's
+/// ticket carrying three initializations — one key id of 16 bytes and 64
+/// of data, none and none (skipped, 5190), none and 32 of data: the
+/// muxer's count, four boxes, and their payloads' bytes equal the `pssh`
+/// boxes read back from the `moov`; `finish` `Ok`, the audit agreeing.
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_the_pssh_boxes_read_back_as_their_mirror_counts_them() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let init = encryption_init_info(&[(16, 1, 16, 64), (16, 0, 16, 0), (16, 0, 16, 32)]);
+  let h264 = h264_aac(&corpus, "h264-aac.mp4");
+  let target = output(&corpus, "gate7-pssh.mp4");
+  let table: Vec<Described> = whole_table(&h264)
+    .into_iter()
+    .map(|row| with_coded(row, T::AV_PKT_DATA_ENCRYPTION_INIT_INFO, &init))
+    .collect();
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  let counted = muxer.expected_protection();
+  let mut demuxer = FfmpegOwnedDemuxer::open(&h264).expect("open");
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  muxer.finish().expect("finished");
+  let bytes = std::fs::read(&target).expect("the file");
+  let (body, end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("a moov");
+  let boxes: Vec<u64> = boxes_of(&bytes, body, end)
+    .into_iter()
+    .filter(|(kind, _, _)| kind == b"pssh")
+    .map(|(_, _, size)| size - 8)
+    .collect();
+  assert_eq!(boxes, [108, 60, 108, 60], "two streams' two boxes each");
+  assert_eq!(counted, (4, boxes.iter().sum::<u64>()));
+}
+
+// ---------------------------------------------------------------------------
+//  The MOV family's sync and dependency flags audited (the flags).
+// ---------------------------------------------------------------------------
+
+/// The first `trak`'s flag tables FFmpeg wrote into `path`: `stss`'s sample
+/// indices and `sdtp`'s bytes, each empty where the box is not written
+/// (`mov_write_stss_tag`, `mov_write_sdtp_tag`, `movenc.c` 292–336).
+fn written_flags(path: &Path) -> (Vec<u32>, Vec<u8>) {
+  let bytes = std::fs::read(path).expect("the file");
+  let word = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("a word"));
+  let (moov, moov_end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("moov");
+  let (trak, trak_end, _) = box_in(&bytes, (moov, moov_end), b"trak").expect("trak");
+  let (mdia, mdia_end, _) = box_in(&bytes, (trak, trak_end), b"mdia").expect("mdia");
+  let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+  let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+  let sync = box_in(&bytes, (stbl, stbl_end), b"stss").map_or_else(Vec::new, |(body, end, _)| {
+    (body + 8..end).step_by(4).map(word).collect()
+  });
+  let dependencies = box_in(&bytes, (stbl, stbl_end), b"sdtp")
+    .map_or_else(Vec::new, |(body, end, _)| bytes[body + 4..end].to_vec());
+  (sync, dependencies)
+}
+
+/// **L239 — the flags: an `stss` entry FFmpeg wrote otherwise is named**
+/// (findit-studio/mediaio#95; `mov_write_stss_tag`, `movenc.c` 292–313):
+/// H.264 of a key frame every 25, AAC beside it, into MP4, the write plant
+/// raising the first `stss` entry's last byte by one as the sink takes it
+/// — a sync sample's index moved, its count kept — and `finish` fails:
+/// track 0's sync samples, by their content.
+#[cfg(feature = "test-support")]
+#[test]
+fn l239_an_stss_entry_written_otherwise_is_named() {
+  let Some(corpus) = Corpus::new() else { return };
+  let h264 = h264_aac(&corpus, "h264-aac.mp4");
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(output(&corpus, "l239.mp4")).expect("create"),
+    ContainerName::MP4,
+    whole_table(&h264),
+    &[],
+    MuxOptions::new(),
+    mediaencode_ffmpeg::mux::OpenHooks::default().with_plant(planting(
+      *b"stss",
+      Some(0),
+      12,
+      |byte| byte.wrapping_add(1),
+    )),
+  )
+  .expect("open");
+  let mut demuxer = FfmpegOwnedDemuxer::open(&h264).expect("open");
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  let fault = muxer.finish().expect_err("an stss entry moved, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::SyncSamples,
+      Finding::Content
+    ))
+  );
+}
+
+/// **The flags: `stss` and `sdtp` as the mirror counts them, read back**
+/// (`mov_write_stss_tag`, `mov_write_sdtp_tag`, `movenc.c` 292–336;
+/// 3412–3420): twelve frames of the corpus's H.264 into MP4, the first and
+/// the seventh marked key frames, every third marked disposable — the
+/// flags movenc takes as the packets reach it (7344–7363). `finish` `Ok`,
+/// the audit agreeing; the file's `stss` lists the first and seventh
+/// samples, and its `sdtp` holds each sample's byte: 0x20 of a key frame,
+/// 0x10 of another, 0x08 beside it of a disposable one.
+#[test]
+fn the_flags_read_back_as_their_mirror_counts_them() {
+  let Some(corpus) = Corpus::new() else { return };
+  let h264 = h264_aac(&corpus, "h264-aac.mp4");
+  let (table, frames) = first_track(&h264, TrackKind::Video, 12);
+  let target = output(&corpus, "flags.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  let mut expected = Vec::new();
+  for (index, frame) in frames.iter().enumerate() {
+    let (key, disposable) = (index % 6 == 0, index % 3 == 2);
+    let mut flags = PacketFlags::empty();
+    if key {
+      flags |= PacketFlags::KEY;
+    }
+    if disposable {
+      flags |= PacketFlags::DISPOSABLE;
+    }
+    let at = index as i64 * 40;
+    wrote(
+      muxer.write_video(video_at(&video_of(frame).with_flags(flags), Some(at), at)),
+      "a frame",
+    );
+    expected.push(if key { 0x20 } else { 0x10 } | if disposable { 0x08 } else { 0 });
+  }
+  muxer.finish().expect("finished, the audit agreeing");
+  assert_eq!(written_flags(&target), (vec![1, 7], expected));
+}
+
+// ---------------------------------------------------------------------------
+//  FLV audited (A22, A26; R10, R11, R12).
+// ---------------------------------------------------------------------------
+
+/// Each tag of the FLV file at `path` past its header and pre-tags: its
+/// offset, its type, and its data.
+fn flv_tags(path: &Path) -> Vec<(usize, u8, Vec<u8>)> {
+  let bytes = std::fs::read(path).expect("the file");
+  let mut at = 13;
+  while bytes.get(at..at + 15) == Some(&[8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11][..]) {
+    at += 15;
+  }
+  let mut tags = Vec::new();
+  while at + 11 <= bytes.len() {
+    let size = u32::from_be_bytes([0, bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+    let data = at + 11;
+    let end = (data + size).min(bytes.len());
+    tags.push((at, bytes[at], bytes[data..end].to_vec()));
+    at = data + size + 4;
+  }
+  tags
+}
+
+/// The sequence starts among an FLV file's video tags: each its data.
+fn flv_sequence_starts(path: &Path) -> Vec<Vec<u8>> {
+  flv_tags(path)
+    .into_iter()
+    .filter(|(_, kind, data)| {
+      *kind == 9
+        && match data.first() {
+          // The extended header's packet type, or legacy H.264's.
+          Some(first) if first & 0x80 != 0 => first & 0x0F == 0,
+          Some(_) => data.get(1) == Some(&0),
+          None => false,
+        }
+    })
+    .map(|(_, _, data)| data)
+    .collect()
+}
+
+/// **L234 — A22: a sequence header FLV writes of no record is named**
+/// (findit-studio/mediaio#95). In a process of its own: HEVC of the
+/// corpus's Annex B configuration into FLV, libavutil's allocations capped
+/// at 1 000 bytes around `write_header` (the header hook). Derivation: the
+/// header's other allocations stay under it — the context's tables of a
+/// stream, its dictionary's entries; `ff_isom_write_hvcc`'s Annex B rewrite
+/// opens a dynamic buffer of one block — its I/O context, its state and
+/// 1 024 bytes (`aviobuf.c` 1344–1362) — past it, refused, its failure
+/// ignored (`flvenc.c` 886–899): the sequence header written of no record.
+/// Named: track 0's configuration, its record 0 bytes against the `hvcC`
+/// its uncapped twin writes.
+#[cfg(feature = "test-support")]
+#[test]
+fn l234_a_sequence_header_flv_writes_of_no_record_is_named() {
+  in_its_own_process("l234_in_a_process_of_its_own");
+}
+
+/// L234's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l234_in_a_process_of_its_own() {
+  if !alone_for("l234_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let hevc = hevc_annexb(&corpus);
+  let write = |name: &str, capped: bool| {
+    let (table, packets) = first_track(&hevc, TrackKind::Video, 2);
+    // The row restated to name its matrix, which FLV states (L143).
+    let config = stream_extradata_of(&table[0]);
+    let table = vec![restated(
+      &table[0],
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+      &config,
+      None,
+      None,
+    )];
+    let mut hooks = mediaencode_ffmpeg::mux::OpenHooks::default();
+    if capped {
+      hooks = hooks.with_header(|before| if before { cap(1_000) } else { uncap() });
+    }
+    let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+      File::create(output(&corpus, name)).expect("create"),
+      ContainerName::new("flv"),
+      table,
+      &[],
+      MuxOptions::new(),
+      hooks,
+    )
+    .expect("open");
+    for packet in &packets {
+      wrote(
+        muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(packet))),
+        "an HEVC frame",
+      );
+    }
+    muxer.finish()
+  };
+  write("l234-twin.flv", false).expect("the twin, finished");
+  let record = flv_sequence_starts(&output(&corpus, "l234-twin.flv"))[0].len() as u64 - 5;
+  assert!(record > 0, "the premise: an hvcC");
+  let fault = write("l234.flv", true).expect_err("the record left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::Configuration(0),
+      Finding::Length(0, record)
+    ))
+  );
+}
+
+/// **L235 — A26: a tag FLV writes of a rewrite that failed is named, the
+/// file unfollowed past it** (findit-studio/mediaio#95). In a process of
+/// its own: H.264 of an Annex B configuration into FLV, its first frame
+/// grown past 4 KiB by filler units, libavutil's allocations capped at
+/// 2 000 bytes around that packet's take (the write hook). Derivation: the
+/// rewrite's dynamic buffer opens — one block, its context, state and
+/// 1 024 bytes — and grows to 1 024 under it; its next growth, to 2 306,
+/// past it, refused; its close then answers −64 bytes and no buffer, which
+/// FLV writes as a tag of a data size of 0xFFFFC5, its five flag bytes and
+/// none of the frame (`flvenc.c` 1318–1355, 1452–1454; `nal.c` 133–144).
+/// Named: the file's structure, the walk ending inside that tag, at its
+/// offset.
+#[cfg(feature = "test-support")]
+#[test]
+fn l235_a_tag_of_a_failed_rewrite_is_named() {
+  in_its_own_process("l235_in_a_process_of_its_own");
+}
+
+/// L235's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l235_in_a_process_of_its_own() {
+  if !alone_for("l235_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, frames, sps, pps) = h264_fixture(&corpus);
+  let config = start_coded(&[&sps, &pps]);
+  let row = restated(
+    &row,
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+    &config,
+    None,
+    None,
+  );
+  let filler = [vec![0x0C], vec![0xFF; 5_000], vec![0x80]].concat();
+  let grown = [frames[0].data().as_ref(), &start_coded(&[&filler])].concat();
+  let target = output(&corpus, "l235.flv");
+  let hooks = mediaencode_ffmpeg::mux::OpenHooks::default()
+    .with_packets(|before| if before { cap(2_000) } else { uncap() });
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(&target).expect("create"),
+    ContainerName::new("flv"),
+    vec![row],
+    &[],
+    MuxOptions::new(),
+    hooks,
+  )
+  .expect("open");
+  wrote(
+    muxer.write_video(VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_holding(&frames[0], &grown),
+    )),
+    "the grown frame",
+  );
+  let fault = muxer
+    .finish()
+    .expect_err("the tag's rewrite failed, not passed");
+  let bytes = std::fs::read(&target).expect("the file");
+  let at = flv_tags(&target)
+    .into_iter()
+    .find(|(at, kind, _)| *kind == 9 && bytes[at + 1..at + 4] == [0xFF, 0xFF, 0xC5])
+    .map(|(at, ..)| at as u64);
+  assert!(at.is_some(), "the premise: a tag of a size of 0xFFFFC5");
+  assert_eq!(
+    written(&fault),
+    Some((
+      None,
+      WrittenPart::Structure,
+      Finding::Unfollowed(at.expect("the tag"), Why::Truncated)
+    ))
+  );
+}
+
+/// **R11 — a VP6A stream gets FLV's header pre-tag whatever its ticket's
+/// tag** (the coordinator's ruling, as amended; `flv_write_header`,
+/// `flvenc.c` 1096–1104; `init_muxer`, `mux.c` 304–324): a VP6A stream of
+/// a ticket of tag 0 — the base's settle leaves it, libavformat's init makes
+/// it 5 — of VP6's 4 — settle clears it, init makes it 5 — and of 5 — settle
+/// keeps it — into FLV, two frames each: `finish` `Ok`, the audit told one
+/// pre-tag and agreeing; the file holds it at offset 13.
+///
+/// PLANT P631: the pre-tags counted of settle's result alone.
+#[test]
+fn r11_a_vp6a_stream_gets_its_pre_tag_whatever_its_tickets_tag() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (table, frames) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 2);
+  for (name, tag) in [
+    ("r11-tag0.flv", [0, 0, 0, 0]),
+    ("r11-tag4.flv", [4, 0, 0, 0]),
+    ("r11-tag5.flv", [5, 0, 0, 0]),
+  ] {
+    let row = restated(
+      &table[0],
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_VP6A,
+      &[],
+      Some(&tag),
+      None,
+    );
+    let target = output(&corpus, name);
+    let mut muxer = muxer_into(&target, ContainerName::new("flv"), vec![row]);
+    for (index, frame) in frames.iter().enumerate() {
+      let at = index as i64 * 40;
+      wrote(
+        muxer.write_video(video_at(
+          &video_holding(&video_of(frame), &[0x21; 32]),
+          Some(at),
+          at,
+        )),
+        "a VP6A frame",
+      );
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|fault| panic!("{name}: {fault:?}"));
+    let bytes = std::fs::read(&target).expect("the file");
+    assert_eq!(
+      bytes[13..28],
+      [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11],
+      "{name}: the pre-tag"
+    );
+  }
+}
+
+/// H.264 into FLV at `name`, its configuration `config` — none, under
+/// `extract_extradata` — of `frames`' bytes, each its frame's and side data
+/// beside: `finish` `Ok`, the audit agreeing; the file's sequence starts.
+fn h264_into_flv(
+  corpus: &Corpus,
+  name: &str,
+  config: &[u8],
+  frames: &[(Vec<u8>, Option<Vec<u8>>)],
+) -> Vec<Vec<u8>> {
+  let (row, template, ..) = h264_fixture(corpus);
+  let row = restated(
+    &row,
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+    config,
+    None,
+    None,
+  );
+  let target = output(corpus, name);
+  let mut muxer = muxer_with(&target, ContainerName::new("flv"), vec![row], filters(true));
+  for (index, (bytes, new)) in frames.iter().enumerate() {
+    let at = index as i64 * 40;
+    let mut frame = video_holding(&template[0], bytes);
+    if let Some(new) = new {
+      frame.extra_mut().set_side_data(vec![side(
+        ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+        new,
+      )]);
+    }
+    wrote(
+      muxer.write_video(video_at(&frame, Some(at), at)),
+      "an H.264 frame",
+    );
+  }
+  muxer
+    .finish()
+    .unwrap_or_else(|fault| panic!("{name}: {fault:?}"));
+  flv_sequence_starts(&target)
+}
+
+/// **R12 — FLV writes a sequence header of the caller's new extradata only
+/// where it differs from the current** (the coordinator's ruling;
+/// `flvenc.c` 1250–1264): H.264 of an `avcC` into FLV, its second frame
+/// carrying new extradata equal to it — no sequence header written, the
+/// file's one the header's — and again carrying the `avcC` of another
+/// level — a second; each `finish` `Ok`, the audit agreeing.
+#[test]
+fn r12_the_callers_new_extradata_writes_a_header_only_where_it_differs() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, ..) = h264_fixture(&corpus);
+  let avcc = stream_extradata_of(&row);
+  let mut other = avcc.clone();
+  other[3] = other[3].wrapping_add(1);
+  // The source's frames as it holds them, behind 4-byte lengths, as the
+  // `avcC` says.
+  let (_, packets) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 2);
+  let bytes = |index: usize| video_of(&packets[index]).data().as_ref().to_vec();
+  let equal = h264_into_flv(
+    &corpus,
+    "r12-equal.flv",
+    &avcc,
+    &[(bytes(0), None), (bytes(1), Some(avcc.clone()))],
+  );
+  assert_eq!(equal.len(), 1, "equal: the header's alone");
+  let changed = h264_into_flv(
+    &corpus,
+    "r12-changed.flv",
+    &avcc,
+    &[(bytes(0), None), (bytes(1), Some(other.clone()))],
+  );
+  assert_eq!(changed.len(), 2, "changed: a second");
+}
+
+/// **R12 — `extract_extradata`'s made configurations: a sequence header of
+/// each that differs**: H.264 of no configuration into FLV under the
+/// filter, three frames each opening on its SPS and PPS — the same three
+/// times: the header's sequence start of no record and one of the made
+/// sets; the third frame's PPS changed: one more. Each `finish` `Ok`, the
+/// audit agreeing.
+///
+/// PLANT P632: R12's comparison removed, a header expected at every new
+/// configuration.
+#[test]
+fn r12_extract_extradatas_made_sets_write_a_header_where_they_differ() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (_, frames, sps, pps) = h264_fixture(&corpus);
+  let mut changed_pps = pps.clone();
+  let last = changed_pps.len() - 1;
+  changed_pps[last] ^= 0x01;
+  let carrying = |index: usize, pps: &[u8]| {
+    let frame = frames[index].data().as_ref();
+    let slices: Vec<&[u8]> = nal_units_of(frame)
+      .into_iter()
+      .filter(|unit| unit[0] & 0x1F != 7 && unit[0] & 0x1F != 8)
+      .collect();
+    (start_coded(&[vec![&sps[..], pps], slices].concat()), None)
+  };
+  let repeated = h264_into_flv(
+    &corpus,
+    "r12-repeated.flv",
+    &[],
+    &[carrying(0, &pps), carrying(1, &pps), carrying(2, &pps)],
+  );
+  assert_eq!(repeated.len(), 2, "the header's and the made sets'");
+  let changed = h264_into_flv(
+    &corpus,
+    "r12-changed-sets.flv",
+    &[],
+    &[
+      carrying(0, &pps),
+      carrying(1, &pps),
+      carrying(2, &changed_pps),
+    ],
+  );
+  assert_eq!(changed.len(), 3, "one more of the changed sets");
+}
+
+/// **R12 — the comparison allocates nothing**: H.264 of no configuration
+/// into FLV under the filter, 24 frames each opening on its sets, the PPS
+/// changing at every frame — a sequence header each — or the same at every
+/// frame — none after the first: the bytes their writes after the first
+/// allocate, by this lane's counting allocator, are the same.
+#[test]
+fn r12_the_comparison_allocates_nothing() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, frames, sps, pps) = h264_fixture(&corpus);
+  let mut other = pps.clone();
+  let last = other.len() - 1;
+  other[last] ^= 0x01;
+  let slices: Vec<&[u8]> = nal_units_of(frames[0].data().as_ref())
+    .into_iter()
+    .filter(|unit| unit[0] & 0x1F != 7 && unit[0] & 0x1F != 8)
+    .collect();
+  let carrying = |pps: &[u8]| {
+    video_holding(
+      &frames[0],
+      &start_coded(&[vec![&sps[..], pps], slices.clone()].concat()),
+    )
+  };
+  let allocated_by = |name: &str, changing: bool| {
+    let row = restated(
+      &row,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+      &[],
+      None,
+      None,
+    );
+    let mut muxer = muxer_with(
+      &output(&corpus, name),
+      ContainerName::new("flv"),
+      vec![row],
+      filters(true),
+    );
+    let packets: Vec<_> = (0..24_i64)
+      .map(|index| {
+        let pps = if changing && index % 2 == 1 {
+          &other
+        } else {
+          &pps
+        };
+        video_at(&carrying(pps), Some(index * 40), index * 40)
+      })
+      .collect();
+    let mut packets = packets.into_iter();
+    wrote(
+      muxer.write_video(packets.next().expect("the first")),
+      "the first frame",
+    );
+    let before = allocated();
+    for packet in packets {
+      wrote(muxer.write_video(packet), "an H.264 frame");
+    }
+    let during = allocated() - before;
+    muxer.finish().expect("finished");
+    during
+  };
+  assert_eq!(
+    allocated_by("r12-alloc-changing.flv", true),
+    allocated_by("r12-alloc-same.flv", false)
+  );
+}
+
+/// **Gate condition 7 — FLV's sequence header of a multitrack audio track
+/// reads back as its mirror counts it** (findit-studio/mediaio#95): two AAC
+/// tracks into FLV — the first's sequence header behind its legacy flags
+/// and packet type, 2 bytes; the second's behind the extended header of a
+/// multitrack — its packet type, its track's type, its FourCC and its
+/// index, 7 bytes (`flvenc.c` 835–856) — each track's sequence starts read
+/// back from the file, not through the audit: their count, and their data
+/// less the bytes the walk is told precede the record, summed, as the
+/// muxer expects each.
+#[cfg(feature = "test-support")]
+#[test]
+fn condition_7_flvs_multitrack_audio_sequence_header_reads_back_as_its_mirror() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "c7-flv-source.mkv");
+  let (audio_table, audio) = first_track(&source, TrackKind::Audio, 3);
+  let aac = stream_extradata_of(&audio_table[0]);
+  let row = || {
+    restated(
+      &audio_table[0],
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_AAC,
+      &aac,
+      None,
+      None,
+    )
+  };
+  let target = output(&corpus, "c7-flv-multitrack.flv");
+  let mut muxer = muxer_into(&target, ContainerName::new("flv"), vec![row(), row()]);
+  for packet in &audio {
+    for track in 0..2 {
+      wrote(
+        muxer.write_audio(AudioTrackPacket::new(
+          TrackIndex::new(track),
+          audio_of(packet),
+        )),
+        "an AAC frame",
+      );
+    }
+  }
+  let expected = muxer.expected_flv_sequences();
+  muxer.finish().expect("finished");
+  // The file's audio sequence starts: each its track's index and its data's
+  // size — legacy AAC's packet type 0; the extended header's own, or a
+  // multitrack's after its type, its FourCC and its index.
+  let starts: Vec<(u8, u64)> = flv_tags(&target)
+    .into_iter()
+    .filter(|(_, kind, _)| *kind == 8)
+    .filter_map(|(_, _, data)| {
+      let first = *data.first()?;
+      let start = match first >> 4 {
+        9 if first & 0x0F == 5 => (data.get(1)? & 0x0F == 0).then(|| data[6]),
+        9 => (first & 0x0F == 0).then_some(0),
+        10 => (data.get(1) == Some(&0)).then_some(0),
+        _ => None,
+      };
+      start.map(|index| (index, data.len() as u64))
+    })
+    .collect();
+  assert_eq!(expected.len(), 2, "the walk told of two audio tracks");
+  for (index, (track, header, count, records, trusted)) in expected.into_iter().enumerate() {
+    assert_eq!(track, TrackIndex::new(index));
+    assert!(!trusted, "track {index}: conforming, its records judged");
+    assert_eq!(
+      header,
+      if index == 0 { 2 } else { 7 },
+      "track {index}: the bytes before the record"
+    );
+    let written: Vec<u64> = starts
+      .iter()
+      .filter(|(at, _)| usize::from(*at) == index)
+      .map(|(_, size)| size - header)
+      .collect();
+    assert_eq!(
+      (written.len() as u64, written.iter().sum::<u64>()),
+      (count, records),
+      "track {index}: the sequence starts, and their records' bytes"
+    );
+  }
+}
+
+/// HEVC naming its matrix, which FLV's metadata states: L216's, a file of
+/// its own.
+#[rustfmt::skip]
+fn hevc_bt709(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "l216-hevc-bt709.mkv", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25:duration=0.2",
+    "-c:v", "libx265", "-x265-params", "bframes=0:log-level=none",
+    "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+  ])
+}
+
+/// **R13 — FLV's made sets past the trust stop turn the track's records
+/// unjudged from there** (the coordinator's ruling R13 on R8 in FLV):
+/// HEVC of no configuration into FLV under `extract_extradata`, three
+/// frames each opening on its VPS, SPS and PPS — the HEVC laws' conforming
+/// SPS twice, then one of 65 short-term reference picture sets, past the
+/// standard's 64, whose `hvcC` FLV writes empty (`hevc.c` 714–716,
+/// 739–740; `flvenc.c` 886–899). The seam after each frame: the header's
+/// sequence start of no record and the made sets', untrusted; the same
+/// sets again, no header more; the third's, trusted from there. `finish`
+/// `Ok`, the file's sequence starts three, the last its 5 bytes of header
+/// alone.
+///
+/// PLANT P633: `trusted` never set — L122 red at its FLV open road.
+#[cfg(feature = "test-support")]
+#[test]
+fn r13_made_sets_past_the_trust_stop_turn_the_track_trusted() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, template, ..) = h264_fixture(&corpus);
+  let row = restated(
+    &row,
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+    &[],
+    None,
+    None,
+  );
+  let slice = escaped(&hevc_header(19, 0), &[0xAF, 0x88, 0x42]);
+  let target = output(&corpus, "r13-made-sets.flv");
+  let mut muxer = muxer_with(&target, ContainerName::new("flv"), vec![row], filters(true));
+  let mut seen = Vec::new();
+  for (index, sets) in [1, 1, 65].into_iter().enumerate() {
+    let units = start_coded(&[
+      &hevc_vps(0, None),
+      &hevc_sps(0, 0, sets, None),
+      &hevc_pps(),
+      &slice,
+    ]);
+    let at = index as i64 * 40;
+    wrote(
+      muxer.write_video(video_at(&video_holding(&template[0], &units), Some(at), at)),
+      "an HEVC frame",
+    );
+    let expected = muxer.expected_flv_sequences();
+    seen.push((expected[0].2, expected[0].4));
+  }
+  assert_eq!(seen, [(2, false), (2, false), (3, true)]);
+  muxer.finish().expect("trusted from the third, finished");
+  let starts = flv_sequence_starts(&target);
+  assert_eq!(starts.len(), 3, "the header's, the made sets', the third's");
+  assert_eq!(starts[2].len(), 5, "the third's record written empty");
+}
+
+// ---------------------------------------------------------------------------
+//  Matroska and WebM audited (A21, A4's part).
+// ---------------------------------------------------------------------------
+
+/// The offset, in the Matroska file at `path`, of the first byte of the
+/// count of FLAC's mask comment — the 4 bytes before the entry's length,
+/// the entry `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=…` (`ff_vorbiscomment_write`,
+/// `vorbiscomment.c` 78–90).
+#[cfg(feature = "test-support")]
+fn mask_count_offset(path: &Path) -> u64 {
+  let bytes = std::fs::read(path).expect("the file");
+  let entry = b"WAVEFORMATEXTENSIBLE_CHANNEL_MASK=";
+  let at = bytes
+    .windows(entry.len())
+    .position(|window| window == entry)
+    .expect("the premise: a mask comment");
+  assert_eq!(
+    bytes[at - 8..at - 4],
+    [1, 0, 0, 0],
+    "the premise: a count of 1"
+  );
+  (at - 8) as u64
+}
+
+/// FLAC of a 2.1 layout — a mask comment, `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0xb`
+/// — of a second of noise: a Matroska file of it past the I/O context's
+/// 32 KiB, so that its header reaches the sink before its trailer writes
+/// Tracks again.
+#[cfg(feature = "test-support")]
+#[rustfmt::skip]
+fn flac_two_one(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "mkv-2.1.flac", &[
+    "-f", "lavfi", "-i", "anoisesrc=sample_rate=48000:duration=1:amplitude=0.5",
+    "-af", "pan=2.1|c0=c0|c1=c0|c2=c0", "-c:a", "flac",
+  ])
+}
+
+/// FLAC of a 2.1 layout ([`flac_two_one`]) written whole into Matroska at
+/// `name`: the count of
+/// its mask comment, at `count`, set to 0 in the `nth` write over it, from
+/// 1 — none of none; its last packet carrying `streaminfo` as new
+/// extradata, of some.
+#[cfg(feature = "test-support")]
+fn flac_into_matroska(
+  corpus: &Corpus,
+  name: &str,
+  count: Option<(u64, usize)>,
+  streaminfo: Option<&[u8]>,
+) -> Result<(), MuxFault> {
+  let (table, packets) = whole_track(&flac_two_one(corpus), TrackKind::Audio);
+  let mut hooks = mediaencode_ffmpeg::mux::OpenHooks::default();
+  if let Some((offset, nth)) = count {
+    let mut seen = 0;
+    hooks = hooks.with_plant(move |at, bytes| {
+      if (at..at + bytes.len() as u64).contains(&offset) {
+        seen += 1;
+        if seen == nth {
+          bytes[usize::try_from(offset - at).expect("an index")] = 0;
+        }
+      }
+    });
+  }
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(output(corpus, name)).expect("create"),
+    ContainerName::MATROSKA,
+    table,
+    &[],
+    MuxOptions::new(),
+    hooks,
+  )
+  .expect("open");
+  let last = packets.len() - 1;
+  for (index, packet) in packets.iter().enumerate() {
+    let mut audio = audio_of(packet);
+    if index == last
+      && let Some(streaminfo) = streaminfo
+    {
+      audio.extra_mut().set_side_data(vec![side(
+        ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+        streaminfo,
+      )]);
+    }
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio)),
+      "a FLAC frame",
+    );
+  }
+  muxer.finish()
+}
+
+/// **L236 — A21: Matroska's FLAC channel mask comment is judged as the
+/// trailer writes Tracks** (findit-studio/mediaio#95): FLAC of a 2.1 layout
+/// into Matroska — a mask comment, `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0xb`
+/// (`put_flac_codecpriv`, `matroskaenc.c` 1077–1114) — the write plant
+/// setting the comment's count from 1 to 0 in the trailer's rewrite of
+/// Tracks, the second write over its offset (3448–3450), as A21's road
+/// leaves the block of no count. Named: track 0's channel mask, by its
+/// content.
+#[cfg(feature = "test-support")]
+#[test]
+fn l236_matroskas_flac_mask_comment_is_judged() {
+  let Some(corpus) = Corpus::new() else { return };
+  flac_into_matroska(&corpus, "l236-twin.mkv", None, None).expect("the twin, finished");
+  let count = mask_count_offset(&output(&corpus, "l236-twin.mkv"));
+  assert!(
+    std::fs::metadata(output(&corpus, "l236-twin.mkv"))
+      .expect("the twin")
+      .len()
+      > 32 * 1024,
+    "the premise: the header flushed before the trailer"
+  );
+  let fault = flac_into_matroska(&corpus, "l236.mkv", Some((count, 2)), None)
+    .expect_err("the comment's count changed, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::ChannelMask,
+      Finding::Content
+    ))
+  );
+}
+
+/// **L237 — A4's Matroska part: an `av1C` Matroska writes without its
+/// metadata OBUs is named** (findit-studio/mediaio#95; `ff_isom_write_av1c`,
+/// `av1.c` 398–502; `mkv_assemble_native_codecprivate`, `matroskaenc.c`
+/// 1160–1165). In a process of its own: AV1 configured by OBUs — its
+/// sequence header and a metadata OBU of 2 048 bytes — into Matroska,
+/// libavutil's allocations capped at 1 500 bytes around `write_header`
+/// (the header hook). The cap's derivation: the header's other allocations
+/// stay under it — each dynamic buffer's open block (its context, its state
+/// and 1 024 bytes, about 1.4 KB, `aviobuf.c` 1344–1362), the tracks'
+/// table; the metadata's buffer's growth past 1 024 (L222's) is refused,
+/// its error never read, and the record is written of its four bytes and
+/// the sequence header alone, into the CodecPrivate the trailer writes
+/// again. Named: track 0's configuration, its CodecPrivate of 17 bytes
+/// against 2 065.
+#[cfg(feature = "test-support")]
+#[test]
+fn l237_an_av1c_matroska_writes_cut_is_named() {
+  in_its_own_process("l237_in_a_process_of_its_own");
+}
+
+/// L237's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l237_in_a_process_of_its_own() {
+  if !alone_for("l237_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let (av1, frames, av1c) = unconfigured_av1(&corpus);
+  let obus = [&av1c[4..], &av1_metadata_obu(2_048)].concat();
+  let write = |name: &str, capped: bool| {
+    let table = table_of(&av1, TrackKind::Video)
+      .into_iter()
+      .map(|row| row.with_extradata(Some(bytes_of(&obus))))
+      .collect();
+    let mut hooks = mediaencode_ffmpeg::mux::OpenHooks::default();
+    if capped {
+      hooks = hooks.with_header(|before| if before { cap(1_500) } else { uncap() });
+    }
+    let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+      File::create(output(&corpus, name)).expect("create"),
+      ContainerName::MATROSKA,
+      table,
+      &[],
+      MuxOptions::new(),
+      hooks,
+    )
+    .expect("open");
+    for frame in &frames {
+      wrote(
+        muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone())),
+        "an AV1 frame",
+      );
+    }
+    muxer.finish()
+  };
+  write("l237-twin.mkv", false).expect("whole");
+  let fault = write("l237.mkv", true).expect_err("the av1C cut, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::Configuration(0),
+      Finding::Length(17, 2_065)
+    ))
+  );
+}
+
+/// **L241 — Matroska's Tracks is judged as the trailer writes it again**
+/// (findit-studio/mediaio#95; the note's windows): FLAC of a 2.1 layout
+/// into Matroska, its last packet carrying new STREAMINFO — its 34 bytes,
+/// its MD5 changed — which Matroska writes into Tracks' buffer
+/// (`mkv_check_new_extra_data`, `matroskaenc.c` 3090–3097) and the trailer
+/// writes again: `finish` `Ok`, the file's CodecPrivate holding the new
+/// STREAMINFO; and L236's plant on the header's Tracks alone, the first
+/// write over the count's offset: `finish` `Ok`, the trailer's rewrite the
+/// one judged.
+///
+/// PLANT P619: Tracks not read again at its rewrite.
+#[cfg(feature = "test-support")]
+#[test]
+fn l241_matroskas_tracks_is_judged_as_the_trailer_writes_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (table, _) = whole_track(&flac_two_one(&corpus), TrackKind::Audio);
+  let mut streaminfo = stream_extradata_of(&table[0]);
+  assert_eq!(streaminfo.len(), 34, "the premise: STREAMINFO");
+  streaminfo[33] ^= 0xFF;
+  flac_into_matroska(&corpus, "l241.mkv", None, Some(&streaminfo))
+    .expect("new STREAMINFO, finished");
+  let bytes = std::fs::read(output(&corpus, "l241.mkv")).expect("the file");
+  let at = bytes
+    .windows(4)
+    .position(|window| window == b"fLaC")
+    .expect("the CodecPrivate");
+  assert_eq!(
+    bytes[at + 8..at + 42],
+    streaminfo[..],
+    "the new STREAMINFO written"
+  );
+  let count = mask_count_offset(&output(&corpus, "l241.mkv"));
+  flac_into_matroska(&corpus, "l241-header.mkv", Some((count, 1)), None)
+    .expect("the header's Tracks planted alone, finished");
+}
+
+// ---------------------------------------------------------------------------
+//  Raw FLAC audited (A23).
+// ---------------------------------------------------------------------------
+
+/// **L238 — A23: raw FLAC's channel mask comment is judged**
+/// (findit-studio/mediaio#95): FLAC of a 2.1 layout into raw FLAC — the
+/// mask entry `flac_init` sets, `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0xb`
+/// (`flacenc.c` 244–259) — the write plant flipping the first byte of the
+/// entry's key in the header's VORBIS_COMMENT, as A23's road leaves the
+/// comment without it. Named: track 0's channel mask, omitted.
+#[cfg(feature = "test-support")]
+#[test]
+fn l238_raw_flacs_mask_comment_is_judged() {
+  let Some(corpus) = Corpus::new() else { return };
+  let layouts = Layouts::of(&corpus);
+  let (table, packets) = whole_track(&layouts.flac, TrackKind::Audio);
+  let key = b"WAVEFORMATEXTENSIBLE_CHANNEL_MASK=";
+  let hooks = mediaencode_ffmpeg::mux::OpenHooks::default().with_plant(move |_, bytes| {
+    if let Some(at) = bytes.windows(key.len()).position(|window| window == key) {
+      bytes[at] ^= 0x01;
+    }
+  });
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(output(&corpus, "l238.flac")).expect("create"),
+    ContainerName::new("flac"),
+    table,
+    &[],
+    MuxOptions::new(),
+    hooks,
+  )
+  .expect("open");
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "a FLAC frame",
+    );
+  }
+  let fault = muxer.finish().expect_err("the mask entry gone, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::ChannelMask,
+      Finding::Omitted
+    ))
+  );
+}
+
+// ---------------------------------------------------------------------------
+//  The allocation premise retired: the owner's bar, by law.
+// ---------------------------------------------------------------------------
+
+/// **L240 — the trailer's work is the tables', not the samples'**
+/// (findit-studio/mediaio#95; the owner's bar: trailer work in O(moov)):
+/// PCM of a constant size into MP4 — its `stts` one run and its `stsz` one
+/// size, a table's entry each however many its samples (`mov_write_stts_tag`,
+/// `movenc.c` 3248–3256; `mov_write_stsz_tag`, 225–259) — the runs the
+/// muxer and the walk push inside `finish`, counted on the thread (test
+/// support): as many of a million samples as of a thousand, a handful.
+///
+/// PLANT P620: PCM's sample sizes expanded a sample at a time.
+#[cfg(feature = "test-support")]
+#[test]
+fn l240_the_trailers_work_is_the_tables() {
+  let Some(corpus) = Corpus::new() else { return };
+  let pushed = |name: &str, samples: u32| {
+    let source = generated(
+      &corpus,
+      &format!("{name}.wav"),
+      &[
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000",
+        "-af",
+        &format!("atrim=end_sample={samples}"),
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+      ],
+    );
+    let (table, packets) = whole_track(&source, TrackKind::Audio);
+    let mut muxer = muxer_into(
+      &output(&corpus, &format!("{name}.mp4")),
+      ContainerName::MP4,
+      table,
+    );
+    for packet in &packets {
+      wrote(
+        muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+        "a PCM packet",
+      );
+    }
+    let before = mediaencode_ffmpeg::mux::audit_pushes();
+    muxer.finish().expect("finished");
+    mediaencode_ffmpeg::mux::audit_pushes() - before
+  };
+  let few = pushed("l240-thousand", 1_000);
+  let many = pushed("l240-million", 1_000_000);
+  assert_eq!(
+    few, many,
+    "the runs pushed at the trailer, of 10^3 samples and 10^6"
+  );
+  assert!(many <= 8, "a handful: {many}");
+}
+
+/// **L242 — the write audit allocates nothing a packet**
+/// (findit-studio/mediaio#95; the owner's bar: no allocation a packet):
+/// H.264 into MP4, FLV and Matroska — the fixture's key frame, timed 40
+/// ticks apart — and FLAC into raw FLAC, N and 2N packets each, with the
+/// audit on and off (`MuxOptions::with_audit`): the bytes allocated from
+/// the second packet through `finish`, by this lane's counting allocator,
+/// grow from N to 2N by as many with the audit on as off. The muxer's
+/// mirrors run either way, fields of each track's own (R12's law counts
+/// them); the tap and its walk are what the audit adds.
+///
+/// PLANT P621: a push into the FLV walk's own record at each frame.
+#[test]
+fn l242_the_write_audit_allocates_nothing_a_packet() {
+  let Some(corpus) = Corpus::new() else { return };
+  let flac = audio_file(&corpus, "l242.flac", "flac");
+  let flac_packets = whole_track(&flac, TrackKind::Audio).1.len();
+  for container in ["mp4", "flv", "matroska", "flac"] {
+    let half = if container == "flac" {
+      flac_packets / 2
+    } else {
+      12
+    };
+    assert!(half >= 4, "{container}: the premise: packets enough");
+    let spent = |audit: bool, count: usize| {
+      let target = output(&corpus, &format!("l242-{audit}-{count}.{container}"));
+      let options = MuxOptions::new().with_audit(audit);
+      let mut before = 0;
+      if container == "flac" {
+        let (table, packets) = whole_track(&flac, TrackKind::Audio);
+        let mut muxer = muxer_with(&target, ContainerName::new(container), table, options);
+        for (index, packet) in packets.iter().take(count).enumerate() {
+          if index == 1 {
+            before = allocated();
+          }
+          muxer
+            .write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet)))
+            .map_err(|error| error.map_packet(drop))
+            .expect("a FLAC packet");
+        }
+        muxer.finish().expect("finished");
+      } else {
+        let (row, frames, ..) = h264_fixture(&corpus);
+        let mut muxer = muxer_with(&target, ContainerName::new(container), vec![row], options);
+        for index in 0..count {
+          if index == 1 {
+            before = allocated();
+          }
+          let at = index as i64 * 40;
+          muxer
+            .write_video(video_at(&frames[0], Some(at), at))
+            .map_err(|error| error.map_packet(drop))
+            .expect("an H.264 frame");
+        }
+        muxer.finish().expect("finished");
+      }
+      allocated() - before
+    };
+    let grown = |audit: bool| spent(audit, 2 * half) - spent(audit, half);
+    assert_eq!(
+      grown(true),
+      grown(false),
+      "{container}: the bytes N more packets allocate, the audit on and off"
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Codex round 1 and the R3 gate's conditions.
+// ---------------------------------------------------------------------------
+
+/// **L244 — the chapter track's first sample is stored at zero** (Codex
+/// R1 [1]): movenc's chapter track is zero-initialized — `mov_init` sets
+/// `start_dts` to `AV_NOPTS_VALUE` for the streams' tracks alone
+/// (`movenc.c` 8448–8474) — so `ff_mov_write_packet` stores its first
+/// sample at `start_dts + track_duration`, 0 (7254–7261), that sample's
+/// duration running to the next chapter's start, and the last to its end
+/// (7313). AAC into MP4 beside chapters of 100 to 250 ms and of 250 to
+/// 450 ms: `finish` `Ok`, the audit agreeing; the chapter track's `stts`
+/// read back, (1, 250) and (1, 200) in the movie timescale.
+///
+/// PLANT P634: the first sample at its chapter's start.
+#[test]
+fn l244_the_chapter_tracks_first_sample_is_stored_at_zero() {
+  let Some(corpus) = Corpus::new() else { return };
+  let aac = audio_file(&corpus, "l244-aac.mkv", "aac");
+  let (table, packets) = whole_track(&aac, TrackKind::Audio);
+  let chapters = [
+    chapter_of(0, 100, 250, Some("first")),
+    chapter_of(1, 250, 450, Some("second")),
+  ];
+  let target = output(&corpus, "l244.mp4");
+  let mut muxer = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table,
+    &chapters,
+    PacketLimits::default(),
+  )
+  .expect("open")
+  .0;
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+  }
+  muxer
+    .finish()
+    .expect("a chapter track starting past zero, finished");
+  let tables = written_tables(&target);
+  assert_eq!(
+    tables.len(),
+    2,
+    "the premise: the audio trak and the chapter trak"
+  );
+  assert_eq!(
+    tables[1].0,
+    [(1, 250), (1, 200)],
+    "the chapter track's stts"
+  );
+}
+
+/// A GoPro metadata packet of `bytes` at `at` milliseconds, lasting 100,
+/// on the data track `track`.
+fn gpmd_packet(
+  track: usize,
+  at: i64,
+  bytes: &[u8],
+) -> mediaencode::mediaspine::demuxer::DataTrackPacket<Ffmpeg, FfmpegBytes> {
+  use mediaencode::mediaspine::demuxer::{DataPacket, DataTrackPacket};
+  DataTrackPacket::new(
+    TrackIndex::new(track),
+    DataPacket::new(
+      bytes_of(bytes),
+      mediaio_ffmpeg::extras::DataPacketExtra::new(i32::try_from(track).expect("an index")),
+    )
+    .with_pts(Some(ms(at)))
+    .with_duration(Some(ms(100)))
+    .with_flags(PacketFlags::KEY),
+  )
+}
+
+/// **L245 — a GoPro metadata track's `gmhd` is followed** (Codex R1 [2]):
+/// AAC and a data track of `AV_CODEC_ID_BIN_DATA` — `gpmd` in MP4's tag
+/// table (`movenc.c` 9268), admitted — of three packets, into MP4: `finish`
+/// `Ok`, the audit having walked the track's `minf`'s `gmhd` and the `gpmd`
+/// of a placeholder size inside it (3488–3537, 3847–3848), which the file
+/// holds.
+///
+/// PLANT P635 (with the synth law): `gmhd` kept opaque.
+#[test]
+fn l245_a_gopro_metadata_tracks_gmhd_is_followed() {
+  let Some(corpus) = Corpus::new() else { return };
+  let aac = audio_file(&corpus, "l245-aac.mkv", "aac");
+  let (mut table, packets) = whole_track(&aac, TrackKind::Audio);
+  let (rows, _) = whole_track(&aac, TrackKind::Audio);
+  table.push(gpmd_of(&rows[0]));
+  let target = output(&corpus, "l245.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  for (index, packet) in packets.iter().enumerate() {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+    if index < 3 {
+      muxer
+        .write_data(gpmd_packet(1, index as i64 * 100, &[0x47; 24]))
+        .map_err(|error| error.map_packet(drop))
+        .expect("a GoPro metadata packet");
+    }
+  }
+  muxer.finish().expect("a gpmd track, finished");
+  let bytes = std::fs::read(&target).expect("the file");
+  let holds = |fourcc: &[u8; 4]| bytes.windows(4).any(|window| window == fourcc);
+  assert!(
+    holds(b"gmhd") && holds(b"gpmd"),
+    "the premise: gmhd and its gpmd written"
+  );
+}
+
+/// A timecode track as FFmpeg's MOV reader reads one: a data track of no
+/// codec and of the tag `tmcd` (`ff_codec_movdata_tags`, `isom.c` 82–85,
+/// naming `gpmd` alone), made of `row`'s parameters.
+fn tmcd_of(row: &Described) -> Described {
+  use ffmpeg_next::ffi::{AVCodecID, AVMediaType};
+  use mediaencode::mediaspine::demuxer::DataTrackParams;
+  let index = row.side_data().stream_index();
+  let mut parameters = row.side_data().rebuild().expect("the parameters");
+  // SAFETY: `parameters` owns its `AVCodecParameters`, live for the
+  // writes; the media type and the codec id each a value of its own enum,
+  // the tag a plain integer.
+  unsafe {
+    let par = parameters.as_mut_ptr();
+    (*par).codec_type = AVMediaType::AVMEDIA_TYPE_DATA;
+    (*par).codec_id = AVCodecID::AV_CODEC_ID_NONE;
+    (*par).codec_tag = u32::from_le_bytes(*b"tmcd");
+  }
+  let ticket = CodecTicket::mirror(&parameters, index, usize::MAX).expect("the ticket");
+  TrackDescription::new(
+    row.timebase(),
+    TrackParams::Data(DataTrackParams::new(CodecId::from_raw(
+      AVCodecID::AV_CODEC_ID_NONE as i32,
+    ))),
+    ticket,
+  )
+  .expect("a timed track")
+}
+
+/// **L246 — a timecode track is refused at open** (the R3 gate's
+/// condition 2: excluded by admission): a timecode track as FFmpeg's MOV
+/// reader reads one, into MP4 and MOV: `CodecNotCarried`, nothing written,
+/// so that no `gmhd`'s `tmcd` child (`movenc.c` 3524–3529) reaches the walk
+/// — and the base sets no `timecode` metadata, of which `mov_init` would
+/// make a `tmcd` track of its own (8339–8370).
+#[test]
+fn l246_a_timecode_track_is_refused_at_open() {
+  let Some(corpus) = Corpus::new() else { return };
+  let aac = audio_file(&corpus, "l246-aac.mkv", "aac");
+  for (container, extension) in [
+    (ContainerName::MP4, "mp4"),
+    (ContainerName::new("mov"), "mov"),
+  ] {
+    let (table, _) = whole_track(&aac, TrackKind::Audio);
+    let target = output(&corpus, &format!("l246.{extension}"));
+    let opened = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      container,
+      vec![tmcd_of(&table[0])],
+      &[],
+      PacketLimits::default(),
+    );
+    assert!(
+      matches!(opened, Err(MuxOpenError::CodecNotCarried { .. })),
+      "{extension}: {:?}",
+      opened.map(drop)
+    );
+    assert_eq!(
+      std::fs::metadata(&target).expect("the file").len(),
+      0,
+      "{extension}: nothing written"
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Codex round 2: the one map from the output's streams back to the table.
+// ---------------------------------------------------------------------------
+
+/// The corpus's cover art as a row of its own, with its file: an
+/// attachment, of which AVIF writes no stream, reported
+/// ([`Uncarried::Attachment`]).
+fn cover_row(corpus: &Corpus) -> Described {
+  table_with_files(&aac_cover_mp4(corpus))
+    .into_iter()
+    .find(|row| row.kind() == TrackKind::Attachment)
+    .expect("the premise: a cover track")
+}
+
+/// **L247 — AVIF reads still or animated by the track behind its first
+/// output stream** (Codex R2 [1]; `avif_write_trailer`, `movenc.c` 9164,
+/// of `s->streams[0]->nb_frames`): the cover, of which AVIF writes no
+/// stream, at track 0, and AV1 at track 1, its stream the first — a still
+/// AVIF of one frame and an animated one of three, each `finish` `Ok`, the
+/// audit agreeing; the animated file of a `moov`, the still of none.
+///
+/// PLANT P636: the table's track 0 read for the first stream.
+#[test]
+fn l247_avif_reads_still_or_animated_by_its_first_output_stream() {
+  let Some(corpus) = Corpus::new() else { return };
+  let av1 = av1_mkv(&corpus);
+  for (name, count) in [("l247-still.avif", 1), ("l247-animated.avif", 3)] {
+    let (mut table, frames) = first_track(&av1, TrackKind::Video, count);
+    table.insert(0, cover_row(&corpus));
+    let target = output(&corpus, name);
+    let (mut muxer, report) = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new("avif"),
+      table,
+      &[],
+      PacketLimits::default(),
+    )
+    .expect("open");
+    assert!(
+      report.uncarried().contains(&Uncarried::Attachment {
+        track: TrackIndex::new(0)
+      }),
+      "{name}: the premise, the cover of no stream: {report:?}"
+    );
+    for frame in &frames {
+      wrote(
+        muxer.write_video(VideoTrackPacket::new(TrackIndex::new(1), video_of(frame))),
+        "an AV1 frame",
+      );
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|fault| panic!("{name}: {:?}", written(&fault)));
+    let bytes = std::fs::read(&target).expect("the file");
+    assert_eq!(
+      box_in(&bytes, (0, bytes.len()), b"moov").is_some(),
+      count > 1,
+      "{name}: the premise, a moov of the animated file alone"
+    );
+  }
+}
+
+/// **L248 — an AVIF item's failure names its stream's track** (Codex R2
+/// [2]; `mov_write_ipco_tag`, `movenc.c` 3755–3770: an item a stream, in
+/// their order). In a process of its own: the cover, of which AVIF writes
+/// no stream, at track 0, and AV1 at track 1, configured by OBUs — its
+/// sequence header and a metadata OBU of 2 048 bytes — a still AVIF of one
+/// frame, written whole, then again with libavutil's allocations capped at
+/// 1 500 bytes before `finish`. The cap's derivation, L222's: the item's
+/// `av1C` writer opens its metadata's dynamic buffer and grows it once; its
+/// growth to 2 306 bytes is refused, and the record is written of its four
+/// bytes alone — AVIF's of no sequence header (1579–1580) — success
+/// answered; the still file's trailer allocates nothing else past the cap,
+/// `get_moov_size`'s null buffer of about 1.4 KB among it. Named: track 1's
+/// description 0, its record of 4 bytes against 2 052 — the item's track
+/// through the one map.
+///
+/// PLANT P637: the item's ordinal taken for its track.
+#[cfg(feature = "test-support")]
+#[test]
+fn l248_an_avif_items_failure_names_its_streams_track() {
+  in_its_own_process("l248_in_a_process_of_its_own");
+}
+
+/// L248's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l248_in_a_process_of_its_own() {
+  if !alone_for("l248_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let (av1, frames, av1c) = unconfigured_av1(&corpus);
+  let obus = [&av1c[4..], &av1_metadata_obu(2_048)].concat();
+  let write = |name: &str, capped: bool| {
+    let mut table: Vec<Described> = table_of(&av1, TrackKind::Video)
+      .into_iter()
+      .map(|row| row.with_extradata(Some(bytes_of(&obus))))
+      .collect();
+    table.insert(0, cover_row(&corpus));
+    let mut muxer = muxer_into(&output(&corpus, name), ContainerName::new("avif"), table);
+    wrote(
+      muxer.write_video(VideoTrackPacket::new(TrackIndex::new(1), frames[0].clone())),
+      "the frame",
+    );
+    if capped {
+      cap(1_500);
+    }
+    let finished = muxer.finish();
+    uncap();
+    finished
+  };
+  write("l248.avif", false).expect("whole");
+  assert_eq!(
+    avif_item_av1c(&output(&corpus, "l248.avif")).map(|record| record.len()),
+    Some(4 + 2_048),
+    "the premise: the item's record whole, of no sequence header"
+  );
+  let fault = write("l248-capped.avif", true).expect_err("the item's av1C cut, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(1)),
+      WrittenPart::Configuration(0),
+      Finding::Length(4, 2_052)
+    ))
+  );
 }

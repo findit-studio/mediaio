@@ -88,6 +88,12 @@
 //! libavformat answered ([`OutputError::SinkSeek`]) — so a container
 //! whose patches went missing never ends in `Ok`.
 //!
+//! **A tap reads what the sink takes.** [`Output::set_tap`] sets a
+//! [`SinkTap`] the guard hands each run of bytes the sink took, at
+//! libavformat's offset, in the order it took them — what a muxer audits
+//! of what libavformat wrote. It costs a writer that sets none nothing
+//! but a load at each write ([the guard](crate::writer_guard)).
+//!
 //! **The order, at every call that reached libavformat:** a panic first,
 //! then a failed seek, then a failed write, then libavformat's own error.
 //! The guard refuses every write after a panic or a failed seek, and the
@@ -114,6 +120,7 @@
 //! | the `AVIOContext` and its buffer | `StreamIo::from_write_seek` (ffmpeg-next): `av_mallocz` (32 KiB), `avio_alloc_context` | the `StreamIo`, held in `ManuallyDrop` by the `Output`; `ctx.pb` borrows it, and `AVFMT_FLAG_CUSTOM_IO` keeps libavformat from closing or freeing it | `StreamIo`'s `Drop` (`avio_flush`, the sink's flush through the guard, `av_freep` of the buffer, `avio_context_free`), dropped after the context; or `StreamIo::into_inner` in [`Output::into_sink`] |
 //! | the opaque: the boxed [`GuardedWriter`] over the caller's sink | `Box::into_raw`, inside `StreamIo` | the `StreamIo` | `Box::from_raw` in `StreamIo`'s `Drop`, dropping the sink; or in `into_inner`, which hands the sink back |
 //! | the panic latch and the seek record | `GuardedWriter::new` | shared by the guard and the `Output` (`Arc`: two owners) | the last of the two |
+//! | the tap's slot, and the tap in it | `GuardedWriter::new`; the tap boxed by [`Output::set_tap`] | shared by the guard and the `Output` (`Arc`: two owners), the tap behind the slot's lock | the last of the two, the tap with it |
 //! | a packet | the boundary's builders on the copy road ([`BodyRoute::Copy`]): `av_new_packet` and the payload copied, `av_packet_new_side_data` for each entry | this crate, until `av_interleaved_write_frame` takes its reference into the interleaving queue, which leaves the packet blank, even on error | the blank `Packet` drops; libavformat frees the queued reference when it writes it, at the trailer, or in `avformat_free_context` |
 //!
 //! **Every road out:**
@@ -181,10 +188,11 @@
 //!
 //! An [`OutputError`] says whose a failure is: the caller's sink
 //! (`SinkPanic`, `SinkSeek`, `SinkWrite`, `Sink`), libavformat's own
-//! answer (`Ffmpeg`), or a refusal this crate makes of the caller's input
-//! before libavformat is reached (`UnknownContainer`, `NoByteStream`,
-//! `Nul`, `ExtradataTooLarge`, `TooManyChapters`, `NoSuchStream`,
-//! `OutOfOrder`, `FailedEarlier`, `TimeBase`, `Build`, `Parameters`). A call that reached
+//! answer (`Ffmpeg`), the tap's (`TapPanicked`), or a refusal this crate
+//! makes of the caller's input before libavformat is reached
+//! (`UnknownContainer`, `NoByteStream`, `Nul`, `ExtradataTooLarge`,
+//! `TooManyChapters`, `NoSuchStream`, `OutOfOrder`, `FailedEarlier`,
+//! `TimeBase`, `Build`, `Parameters`, `NoTap`, `TapMismatch`). A call that reached
 //! the sink names the sink's fault before libavformat's answer: a panic
 //! first, then a failed seek, then a failed write, whatever libavformat
 //! answered.
@@ -225,6 +233,7 @@ use core::{
   ptr::{self, NonNull, addr_of, addr_of_mut, read_unaligned, write_unaligned},
 };
 use std::{
+  any::Any,
   ffi::CString,
   io::{self, Seek, Write},
   sync::Arc,
@@ -266,7 +275,7 @@ use crate::{
   limits::PacketLimits,
   reader_guard::PanicLatch,
   ticket::CodecTicket,
-  writer_guard::{GuardedWriter, SeekRecord, SinkClosed},
+  writer_guard::{GuardedWriter, SeekRecord, SinkClosed, SinkTap, TapSlot},
 };
 
 /// `AVMEDIA_TYPE_VIDEO`, as the integer `AVCodecParameters.codec_type`
@@ -317,6 +326,8 @@ pub enum OutputCall {
   /// [`Output::into_sink`], after a call that failed: the context freed,
   /// and the sink not handed back as a whole one.
   IntoSink,
+  /// [`Output::set_tap`]: once, while the context is being built.
+  Tap,
 }
 
 /// A text handed to libavformat as a C string.
@@ -433,6 +444,20 @@ pub enum OutputError {
   /// handed it to C (see [the module](self)).
   #[error("a write into the sink failed, so bytes meant for it are missing: {0}")]
   SinkWrite(#[source] ffmpeg_next::Error),
+  /// The tap panicked in a call the writer guard made of it: the guard
+  /// calls it no more, and what it saw of the sink stops where it
+  /// panicked ([`SinkTap`]; the [guard](crate::writer_guard)). A panic in
+  /// the closure [`Output::with_tap`] lends it to poisons it the same way:
+  /// the guard taps nothing after it, and this answers every later lend.
+  #[error("the sink's tap panicked, and was not called again")]
+  TapPanicked,
+  /// [`Output::with_tap`] asked for a tap, and none was set.
+  #[error("no tap was set on the output")]
+  NoTap,
+  /// [`Output::with_tap`] asked for a tap of another type than the one
+  /// set.
+  #[error("the tap set on the output is not of the type asked for")]
+  TapMismatch,
   /// libavformat's own error.
   #[error(transparent)]
   Ffmpeg(#[from] ffmpeg_next::Error),
@@ -734,6 +759,8 @@ pub struct Output<W> {
   /// The word that closes the sink, said as a context whose call failed is
   /// torn down ([`SinkClosed`]).
   closed: Arc<SinkClosed>,
+  /// The tap's slot, shared with the guard ([`Self::set_tap`]).
+  tap: Arc<TapSlot>,
   phase: OutputPhase,
   /// libavformat's error the call that failed answered, kept for
   /// [`Self::into_sink`] (R22, Codex R21 1); the sink's own faults are read
@@ -749,7 +776,8 @@ pub struct Output<W> {
 // methods read fields libavformat writes only inside `&mut self` calls —
 // so moving an `Output` to another thread moves exclusive ownership of
 // both. The sink inside the I/O context is a `W: Send` (`open` demands
-// it). `Sync` is not implemented.
+// it), and the tap the guard and this value share a `SinkTap: Send`
+// behind a lock. `Sync` is not implemented.
 unsafe impl<W: Send> Send for Output<W> {}
 
 impl<W> Output<W> {
@@ -905,6 +933,85 @@ impl<W> Output<W> {
   /// The panic the sink raised, if it raised one.
   pub fn sink_panic(&self) -> Option<Utf8Bytes> {
     self.latch.message()
+  }
+
+  /// Sets the tap over every byte the sink takes ([`SinkTap`]): from the
+  /// header's first byte to the last the output writes, each run at
+  /// libavformat's offset, in the order the sink takes them.
+  ///
+  /// Only while the context is being built, and once — the header writes
+  /// the first byte — otherwise refused, the tap dropped:
+  /// [`OutputError::OutOfOrder`] of [`OutputCall::Tap`], or
+  /// [`OutputError::FailedEarlier`] after a call that failed.
+  pub fn set_tap<T: SinkTap>(&mut self, tap: T) -> Result<(), OutputError> {
+    self.require(OutputCall::Tap, OutputPhase::Building)?;
+    // Judged before the tap is boxed, so that a refusal allocates nothing;
+    // `&mut self` keeps the slot as judged until it is filled.
+    if self.tap.tap().is_some() || !self.tap.fill(Box::new(tap)) {
+      return Err(OutputError::OutOfOrder {
+        call: OutputCall::Tap,
+        phase: self.phase,
+      });
+    }
+    Ok(())
+  }
+
+  /// Lends the tap [`Self::set_tap`] set to `f`, as its own type `T`, and
+  /// answers what `f` does — in any phase, for the extent of `f` alone.
+  ///
+  /// The tap's lock, which the writer guard takes at each write, is held
+  /// only while `f` runs, and `&mut self` keeps every other call of this
+  /// value out of it: the guard writes only within those calls, so the lock
+  /// is never contended.
+  ///
+  /// A panic in `f` unwinds to the caller and poisons the tap, as a panic
+  /// in the guard's call of it does: the guard taps nothing after it, and
+  /// every later call answers [`OutputError::TapPanicked`]. That fails
+  /// closed; a caller that judges the file in `f` keeps `f` from
+  /// panicking.
+  ///
+  /// Refused by name: no tap set ([`OutputError::NoTap`]); a tap that
+  /// panicked in a call the guard made of it ([`OutputError::TapPanicked`]),
+  /// whose state its panic may have left anywhere; a tap of another type
+  /// ([`OutputError::TapMismatch`]).
+  pub fn with_tap<T: SinkTap, R>(&mut self, f: impl FnOnce(&mut T) -> R) -> Result<R, OutputError> {
+    let tap = self.tap.tap().ok_or(OutputError::NoTap)?;
+    let mut tap = tap.lock().map_err(|_| OutputError::TapPanicked)?;
+    let tap: &mut dyn Any = &mut **tap;
+    let tap = tap.downcast_mut::<T>().ok_or(OutputError::TapMismatch)?;
+    Ok(f(tap))
+  }
+
+  /// Test support: runs `hook` around libavformat's take of each packet
+  /// [`Self::write_packet`] writes — with `true` just before
+  /// `av_interleaved_write_frame`, the packet built, and with `false` as
+  /// it answers — so that a law holds libavutil's allocations to a size
+  /// during a packet's write alone (the write audit's design gate,
+  /// condition 5). Set once: a second is ignored. An output of none locks
+  /// and allocates nothing for it.
+  #[cfg(any(test, feature = "test-support"))]
+  #[doc(hidden)]
+  pub fn set_write_hook(&mut self, hook: impl FnMut(bool) + Send + 'static) {
+    // A second hook is a law's error; the first stands.
+    let _ = self.tap.set_hook(Box::new(hook));
+  }
+
+  /// Test support: `change` rewrites the bytes libavformat hands the sink,
+  /// in place and keeping their length, before the sink and the tap see
+  /// them — libavformat writing otherwise, as a muxer's laws make it. It
+  /// is handed each write's offset (as [`SinkTap::took`] is) and its bytes,
+  /// a copy of libavformat's, and should depend on nothing else: the part
+  /// of a write the sink did not take is handed again at its own offset.
+  ///
+  /// From the next write on, in any phase; a second replaces the first. A
+  /// change that panics is named as the sink's panic
+  /// ([`OutputError::SinkPanic`]), and nothing more reaches the sink. Once
+  /// the position is lost ([`SinkTap::lost`]) no offset is left to hand it,
+  /// and the writes pass unchanged.
+  #[cfg(any(test, feature = "test-support"))]
+  #[doc(hidden)]
+  pub fn set_write_plant(&mut self, change: impl FnMut(u64, &mut [u8]) + Send + 'static) {
+    self.tap.plant(Box::new(change));
   }
 
   /// Whether libavformat moves every stream's times when the first one it
@@ -1073,6 +1180,7 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
 
     let (guarded, latch, seeks) = GuardedWriter::new(sink);
     let closed = guarded.closer();
+    let tap = guarded.tap_slot();
     let mut io = StreamIo::from_write_seek(guarded)?;
     // `from_write_seek` answers a live I/O context or an error, so the
     // pointer is never null; checked rather than assumed, before anything
@@ -1121,6 +1229,7 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
       latch,
       seeks,
       closed,
+      tap,
       phase: OutputPhase::Building,
       failure: None,
       _sink: PhantomData,
@@ -1451,11 +1560,15 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     // SAFETY: `av_packet` owns a live `AVPacket`; `stream_index` is a
     // plain field, set to a stream of this context.
     unsafe { (*av_packet.as_mut_ptr()).stream_index = index };
+    #[cfg(any(test, feature = "test-support"))]
+    self.tap.hook(true);
     // SAFETY: `ctx` is live and writing; `av_packet` is a refcounted
     // packet this call built, which `av_interleaved_write_frame` takes
     // over — it moves the reference into its queue and leaves the packet
     // blank, which then drops here.
     let status = unsafe { av_interleaved_write_frame(self.ctx.as_ptr(), av_packet.as_mut_ptr()) };
+    #[cfg(any(test, feature = "test-support"))]
+    self.tap.hook(false);
     drop(av_packet);
     // A failed write is not continued from: the muxer's state may be one
     // no later write or trailer is safe over (see [the module](self)).
@@ -1548,14 +1661,16 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     // SAFETY: `pb` is the live I/O context `io` owns; `error` a plain field.
     let kept = unsafe { (*this.pb.as_ptr()).error };
     // SAFETY: `this` is never dropped, so each field is moved out exactly
-    // once here, and none is used through `this` again.
-    let (ctx, io, latch, seeks, closed) = unsafe {
+    // once here, and none is used through `this` again. The tap's slot is
+    // moved out only to be dropped with this call's other handles.
+    let (ctx, io, latch, seeks, closed, _tap) = unsafe {
       (
         this.ctx,
         ptr::read(&this.io),
         ptr::read(&this.latch),
         ptr::read(&this.seeks),
         ptr::read(&this.closed),
+        ptr::read(&this.tap),
       )
     };
     // A context whose call failed is torn down closed (R21, Codex R20 3):
