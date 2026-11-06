@@ -24658,3 +24658,59 @@ fn l242_the_write_audit_allocates_nothing_a_packet() {
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+//  Codex round 1 and the R3 gate's conditions.
+// ---------------------------------------------------------------------------
+
+/// **L244 — the chapter track's first sample is stored at zero** (Codex
+/// R1 [1]): movenc's chapter track is zero-initialized — `mov_init` sets
+/// `start_dts` to `AV_NOPTS_VALUE` for the streams' tracks alone
+/// (`movenc.c` 8448–8474) — so `ff_mov_write_packet` stores its first
+/// sample at `start_dts + track_duration`, 0 (7254–7261), that sample's
+/// duration running to the next chapter's start, and the last to its end
+/// (7313). AAC into MP4 beside chapters of 100 to 250 ms and of 250 to
+/// 450 ms: `finish` `Ok`, the audit agreeing; the chapter track's `stts`
+/// read back, (1, 250) and (1, 200) in the movie timescale.
+///
+/// PLANT P634: the first sample at its chapter's start.
+#[test]
+fn l244_the_chapter_tracks_first_sample_is_stored_at_zero() {
+  let Some(corpus) = Corpus::new() else { return };
+  let aac = audio_file(&corpus, "l244-aac.mkv", "aac");
+  let (table, packets) = whole_track(&aac, TrackKind::Audio);
+  let chapters = [
+    chapter_of(0, 100, 250, Some("first")),
+    chapter_of(1, 250, 450, Some("second")),
+  ];
+  let target = output(&corpus, "l244.mp4");
+  let mut muxer = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table,
+    &chapters,
+    PacketLimits::default(),
+  )
+  .expect("open")
+  .0;
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+  }
+  muxer
+    .finish()
+    .expect("a chapter track starting past zero, finished");
+  let tables = written_tables(&target);
+  assert_eq!(
+    tables.len(),
+    2,
+    "the premise: the audio trak and the chapter trak"
+  );
+  assert_eq!(
+    tables[1].0,
+    [(1, 250), (1, 200)],
+    "the chapter track's stts"
+  );
+}

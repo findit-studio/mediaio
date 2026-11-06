@@ -19424,9 +19424,10 @@ fn carried_of(audited: Audited, codec: &StreamCodec, writer: Option<Writer>) -> 
 /// (`mov_create_chapter_track`, `movenc.c` 7727–7815): a sample a titled
 /// chapter — every chapter is titled in a mode that makes the track
 /// ([`MuxOpenError::ChapterWithoutTitle`]) — of its title's bytes and 14,
-/// at its start counted in `movie_timescale`, rounded to the nearest; the
-/// last lasting to its end. The track starts at zero (8448–8474), and
-/// `check_pkt` moves no sample [`mp4_chapter_sample_refused`] takes.
+/// at its start counted in `movie_timescale`, rounded to the nearest, but
+/// the first, stored at zero ([`chapter_track_samples`]); the last lasting
+/// to its end. `check_pkt` moves no sample [`mp4_chapter_sample_refused`]
+/// takes.
 fn chapter_samples_expected(
   chapters: &[Chapter<Ffmpeg>],
   spans: &[(i64, i64)],
@@ -19447,7 +19448,14 @@ fn chapter_samples_expected(
 /// The chapter track's samples as movenc makes them at its header
 /// ([`chapter_samples_expected`]): of each titled chapter its start and its
 /// end, counted in `movie_timescale` and rounded to the nearest, and its
-/// sample's bytes, its title's and 14.
+/// sample's bytes, its title's and 14 — the first's start stored at zero.
+/// movenc's chapter track is zero-initialized: `mov_init` sets `start_dts`
+/// to `AV_NOPTS_VALUE` for the streams' tracks alone (`movenc.c` 8448–8474),
+/// so `ff_mov_write_packet` stores the track's first sample at
+/// `start_dts + track_duration`, 0 (7254–7261), its duration running to the
+/// next chapter's start, and counts `track_duration` of each sample's own
+/// decode time and duration (7313), the last's end the chapter's (Codex
+/// R1 [1]).
 fn chapter_track_samples<'c>(
   chapters: &'c [Chapter<Ffmpeg>],
   spans: &'c [(i64, i64)],
@@ -19468,6 +19476,8 @@ fn chapter_track_samples<'c>(
       };
       Some((count(start), title.as_str().len() as u64 + 14, count(end)))
     })
+    .enumerate()
+    .map(|(index, (start, bytes, end))| (if index == 0 { 0 } else { start }, bytes, end))
 }
 
 /// What MP4's trailer computes the chapter track's bit rates of
