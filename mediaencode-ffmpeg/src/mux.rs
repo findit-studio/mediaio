@@ -1623,8 +1623,8 @@ mod audit;
 mod records;
 
 use audit::{
-  Audit, Carried, ExpectedMovie, ExpectedTrak, Handed, MovieUserData, RollGroups, RollMirror, Runs,
-  SampleMirror,
+  Audit, Carried, ExpectedMovie, ExpectedTrak, FlagTables, FlagsMirror, Handed, MovieUserData,
+  RollGroups, RollMirror, Runs, SampleMirror,
 };
 pub use audit::{Counts, Found, Unfollowed, Why, WrittenOtherwise, WrittenPart};
 use records::{Units, Writer, Wrote};
@@ -5529,6 +5529,9 @@ struct TrackState {
   /// MP4's track `udta`, its payload's bytes: its DASH roles' `kind`
   /// boxes; 0 where movenc writes none ([`track_user_data_bytes`]; A6).
   user_data: u64,
+  /// The MOV family: each sample's sync flag and dependency, as movenc
+  /// sets them ([`FlagsMirror`]).
+  flags: FlagsMirror,
 }
 
 /// The MOV family's Opus: each sample's roll distance, counted as
@@ -5696,6 +5699,17 @@ impl TrackState {
   /// where `check_pkt` moves it (6897–6930, 9025–9031); any other track's
   /// last sample lasting its own duration as libavformat handed it
   /// (`get_cluster_duration`, 1240–1258).
+  /// The track's flag tables as movenc writes them ([`FlagsMirror`]);
+  /// `None` of VC-1, whose flags movenc derives from the bitstream after
+  /// the fact (`mov_parse_vc1_frame`, `movenc.c` 6475–6532): unjudged.
+  fn flag_tables(&self) -> Option<FlagTables> {
+    (self.sides.codec != CodecId::VC1).then(|| {
+      self
+        .flags
+        .written(self.rules.syncs, self.kind == TrackKind::Video)
+    })
+  }
+
   /// The track's roll groups as movenc writes them, of its sample tables
   /// `samples` (A3; `mov_preroll_write_stbl_atoms`, `movenc.c` 3305–3400):
   /// AAC's one group of every sample, of a distance of 1 (3359–3366);
@@ -11339,6 +11353,10 @@ struct Learned {
   /// decode time and bytes — a `mov_text` cue's empty sample before it, and
   /// the cue — for the write audit's tables ([`SampleMirror`]).
   mov_samples: [Option<(i64, u64)>; 2],
+  /// The MOV family: whether the sample the packet makes on its own road,
+  /// one a packet, is a sync sample and whether it is disposable — for the
+  /// write audit's flag tables ([`FlagsMirror`]).
+  mov_flag: Option<(bool, bool)>,
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
@@ -11937,6 +11955,7 @@ where
         track: None,
         id: u32::try_from(output.streams() + 1).unwrap_or(u32::MAX),
         samples: chapter_samples_expected(chapters, &spans, movie_timescale),
+        flags: Some(FlagTables::default()),
         ..ExpectedTrak::default()
       });
     #[cfg(feature = "test-support")]
@@ -12227,6 +12246,7 @@ where
         carried,
         roll: OpusRoll::default(),
         user_data,
+        flags: FlagsMirror::default(),
       });
     }
 
@@ -13703,6 +13723,10 @@ where
         .roll
         .settle(last.map(|last| dts.wrapping_sub(last) as u32));
     }
+    // The sample's flags.
+    if let Some((sync, disposable)) = plan.learned.mov_flag {
+      state.flags.sample(sync, disposable);
+    }
     // The write audit's mirror of the sample tables, but constant-size
     // audio's, which its end makes whole (note §2.7).
     if !state.rules.mp4_constant.is_some_and(|size| size > 0) {
@@ -15172,6 +15196,20 @@ fn check_packet_rules<'p>(
       },
     })
   };
+  // The MOV family: the flags movenc gives the sample the packet makes on
+  // its own road, as `ff_mov_write_packet` sets them (`movenc.c`
+  // 7344–7363): a sync sample of a packet reaching it marked a key frame —
+  // libavformat marks every one of an intra-only codec (`mux.c` 820–821) —
+  // and disposable where marked so. MOV's MPEG-2, whose key packets movenc
+  // scans (7349–7353), is refused at open ([`mov_admitted`]); VC-1's and
+  // TrueHD's flags movenc reads from their bitstream, VC-1's unjudged and
+  // TrueHD refused at open.
+  let mov_flag = (cues.is_none() && ac3.is_none() && mov_samples[0].is_some()).then(|| {
+    (
+      owns && (payload.key || rules.marks_key),
+      owns && payload.flags.contains(PacketFlags::DISPOSABLE),
+    )
+  });
   // The MOV family's Opus: the roll distance of the sample the packet makes,
   // past 32 refused by name (R2).
   if rules.opus_roll
@@ -15227,6 +15265,7 @@ fn check_packet_rules<'p>(
       ttml,
       edit,
       mov_samples,
+      mov_flag,
     },
     choices,
   ))
@@ -18760,6 +18799,7 @@ fn expected_traks(
         ExpectedTrak {
           track: Some(TrackIndex::new(index)),
           id: u32::try_from(stream + 1).unwrap_or(u32::MAX),
+          flags: state.flag_tables(),
           rolls: state.roll_groups(&samples),
           user_data: state.user_data,
           samples,

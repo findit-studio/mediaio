@@ -24,7 +24,10 @@
 //! payload offset 12 of version 0 and 20 of version 1) and `mdia`'s `hdlr`
 //! handler type (payload offset 8), which says how its sample entries are
 //! laid out; each `stts` and `stsz` ([`Runs`], and R5's [`CueTables`]);
-//! each `sgpd` and `sbgp`, the roll groups (`mov_preroll_write_stbl_atoms`,
+//! each `stss`, its sample indices after its version and its count — a
+//! field rewritten at the box's end, accepted at any value (292–313) — and
+//! each `sdtp`, a byte a sample after its version (316–336), each folded
+//! ([`Runs`]); each `sgpd` and `sbgp`, the roll groups (`mov_preroll_write_stbl_atoms`,
 //! 3373–3396): `sgpd`'s entries of 2 bytes after its version, grouping
 //! type, default length and count, `sbgp`'s of 8 after its version,
 //! grouping type and count, each folded ([`Runs`]); the `udta` of the
@@ -143,6 +146,10 @@ enum Leaf {
   /// An animated AVIF's chunk offsets, of 32 bits, or of 64.
   Stco,
   Co64,
+  /// A sync sample table.
+  Stss,
+  /// The samples' dependencies.
+  Sdtp,
   /// A roll group description: AAC's or Opus's roll distances.
   Sgpd,
   /// The samples' roll groups: runs of samples, each its group's index.
@@ -245,6 +252,9 @@ pub(in crate::mux) struct TrakSeen {
   descriptions: Option<(u32, Described, Found)>,
   /// An animated AVIF's: its first chunk's offset.
   first_chunk: Option<u64>,
+  /// Its `stss`'s indices and its `sdtp`'s bytes ([`Runs`]).
+  sync: Option<Summary>,
+  dependencies: Option<Summary>,
   /// Its `sgpd`'s entries ([`Runs`]).
   groups: Option<Summary>,
   /// Its `sbgp`'s count and samples, by their group's index ([`Runs`]).
@@ -278,6 +288,11 @@ impl TrakSeen {
   /// Its first chunk's offset, where read: an animated AVIF's.
   pub(in crate::mux) const fn first_chunk(&self) -> Option<u64> {
     self.first_chunk
+  }
+
+  /// Its flag tables, as read: `stss`'s indices, `sdtp`'s bytes.
+  pub(in crate::mux) const fn flags(&self) -> (Option<Summary>, Option<Summary>) {
+    (self.sync, self.dependencies)
   }
 
   /// Its roll groups, as read: `sgpd`'s entries, and `sbgp`'s count and
@@ -803,6 +818,8 @@ impl MovWalk {
       (b"stbl", b"stsd") => Role::Boxes { prefix: 8 },
       (b"stbl", b"stts") => Role::Leaf(Leaf::Stts),
       (b"stbl", b"stsz") => Role::Leaf(Leaf::Stsz),
+      (b"stbl", b"stss") => Role::Leaf(Leaf::Stss),
+      (b"stbl", b"sdtp") => Role::Leaf(Leaf::Sdtp),
       (b"stbl", b"sgpd") => Role::Leaf(Leaf::Sgpd),
       (b"stbl", b"sbgp") => Role::Leaf(Leaf::Sbgp),
       (b"stbl", b"stco") if self.mode == MovMode::Avif => Role::Leaf(Leaf::Stco),
@@ -1001,6 +1018,29 @@ impl MovWalk {
           fields.tail = Some(byte);
         }
       }
+      Leaf::Stss => {
+        // Version and flags, and the count — a registered field — then
+        // each sample's index from 1 (292–313).
+        if read < 8 {
+          return Ok(());
+        }
+        table.entry[table.have] = byte;
+        table.have += 1;
+        if table.have == 4 {
+          table.have = 0;
+          table.read += 1;
+          let entry = table.entry;
+          let index = u64::from(u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]));
+          table.plain.push(index, 1);
+        }
+      }
+      Leaf::Sdtp => {
+        // Version and flags, then each sample's byte (316–336).
+        if read >= 4 {
+          table.read += 1;
+          table.plain.push(u64::from(byte), 1);
+        }
+      }
       Leaf::Sgpd | Leaf::Sbgp => {
         // Version and flags, the grouping type, `sgpd`'s default length
         // (version 1), the count; then the entries, `sgpd`'s each a
@@ -1131,6 +1171,21 @@ impl MovWalk {
             trak.times = Some(summaries);
           } else {
             trak.sizes = Some(summaries);
+          }
+        }
+      }
+      Role::Leaf(leaf @ (Leaf::Stss | Leaf::Sdtp)) => {
+        let table = &self.table;
+        let fields = if leaf == Leaf::Sdtp { 4 } else { 8 };
+        if frame.read < fields || table.have != 0 {
+          return Err(structure);
+        }
+        let summary = Some(table.plain.summary());
+        if let Some(trak) = self.trak.and_then(|trak| self.traks.get_mut(trak)) {
+          if leaf == Leaf::Stss {
+            trak.sync = summary;
+          } else {
+            trak.dependencies = summary;
           }
         }
       }

@@ -1367,6 +1367,8 @@ fn sbgp(runs: &[(u32, u32)]) -> Vec<u8> {
 /// groups' boxes, its `udta`'s payload, the movie's, and each `pssh`'s.
 #[derive(Clone, Default)]
 struct Parts {
+  stss: Option<Vec<u32>>,
+  sdtp: Option<Vec<u8>>,
   sgpd: Option<Vec<u16>>,
   sbgp: Option<Vec<(u32, u32)>>,
   track: Option<usize>,
@@ -1384,13 +1386,16 @@ fn whole_with(sizes: &[u32], parts: &Parts) -> Sink {
   let payload: u32 = sizes.iter().sum();
   sink.append(&vec![0x21; payload as usize]);
   sink.close(mdat);
-  let mut stbl = [
-    boxed(b"stsd", &[0; 8]),
-    stts(&[(sizes.len() as u32, 1)]),
-    stsz(sizes),
-    boxed(b"stco", &[0; 8]),
-  ]
-  .concat();
+  let mut stbl = [boxed(b"stsd", &[0; 8]), stts(&[(sizes.len() as u32, 1)])].concat();
+  // The flags after `stts`, as movenc orders them (3410–3422).
+  if let Some(indices) = &parts.stss {
+    stbl.extend(sync_table(b"stss", indices));
+  }
+  if let Some(bytes) = &parts.sdtp {
+    stbl.extend(boxed(b"sdtp", &[&[0, 0, 0, 0][..], bytes].concat()));
+  }
+  stbl.extend(stsz(sizes));
+  stbl.extend(boxed(b"stco", &[0; 8]));
   if let Some(distances) = &parts.sgpd {
     stbl.extend(sgpd(distances));
   }
@@ -1453,6 +1458,7 @@ fn the_roll_groups_user_data_and_protection_headers_are_judged() {
     track: Some(44),
     movie: Some(100),
     pssh: vec![60, 70],
+    ..Parts::default()
   };
   let trak = || ExpectedTrak {
     rolls: aac_groups(3),
@@ -1638,6 +1644,116 @@ fn the_roll_groups_are_judged_by_count_runs_then_content() {
   sink.close(mdat);
   let stbl = [boxed(b"stsd", &[0; 8]), stts(&[(1, 1)]), stsz(&[4]), short].concat();
   let mdia = [hdlr(b"soun"), boxed(b"minf", &boxed(b"stbl", &stbl))].concat();
+  let trak = [tkhd(1), boxed(b"mdia", &mdia)].concat();
+  sink.append(&boxed(b"moov", &boxed(b"trak", &trak)));
+  assert_eq!(
+    sink
+      .walked()
+      .unfollowed()
+      .map(|unfollowed| unfollowed.why()),
+    Some(Why::Structure)
+  );
+}
+
+/// A sync sample table `fourcc` of `indices`, each from 1
+/// (`mov_write_stss_tag`, `movenc.c` 292–313).
+fn sync_table(fourcc: &[u8; 4], indices: &[u32]) -> Vec<u8> {
+  let mut payload = vec![0; 4];
+  payload.extend_from_slice(&(indices.len() as u32).to_be_bytes());
+  for index in indices {
+    payload.extend_from_slice(&index.to_be_bytes());
+  }
+  boxed(fourcc, &payload)
+}
+
+/// The flag tables the muxer counts of samples of `flags`, each whether it
+/// is a sync sample and whether it is disposable, of a video track.
+fn flag_tables(flags: &[(bool, bool)]) -> Option<FlagTables> {
+  let mut mirror = FlagsMirror::default();
+  for &(sync, disposable) in flags {
+    mirror.sample(sync, disposable);
+  }
+  Some(mirror.written(true, true))
+}
+
+/// **The flags are judged by their entries' count, then their content**:
+/// a video track of samples sync, disposable and sync again — its
+/// `stss` of the first and third, its `sdtp` of each — passes as handed;
+/// `stss` left out is the sync samples omitted, of one entry their count,
+/// of another index their content; `sdtp` left out is the dependencies
+/// omitted, of another byte their content; an `stss` where every sample is
+/// a sync sample, which movenc writes none of, is named by its count; and a
+/// track whose flags are unjudged, VC-1's, passes whatever it holds.
+#[test]
+fn the_flags_are_judged_by_count_then_content() {
+  let (sync, neither) = (true, false);
+  let sizes = [4, 5, 4];
+  let whole = Parts {
+    stss: Some(vec![1, 3]),
+    sdtp: Some(vec![0x20, 0x18, 0x20]),
+    ..Parts::default()
+  };
+  let judged = |parts: &Parts, flags: Option<FlagTables>| {
+    let audit = whole_with(&sizes, parts).walked();
+    assert_eq!(audit.unfollowed(), None);
+    let trak = ExpectedTrak {
+      flags,
+      ..expected(&sizes)
+    };
+    mov_verdict(&audit, [trak].into_iter(), &mp4())
+  };
+  let handed = flag_tables(&[(sync, false), (neither, true), (sync, false)]);
+  assert_eq!(judged(&whole, handed), None);
+  let with = |change: fn(&mut Parts)| {
+    let mut parts = whole.clone();
+    change(&mut parts);
+    judged(&parts, handed)
+  };
+  assert_eq!(
+    with(|parts| parts.stss = None),
+    named(WrittenPart::SyncSamples, Found::Omitted)
+  );
+  assert_eq!(
+    with(|parts| parts.stss = Some(vec![1])),
+    named(WrittenPart::SyncSamples, Found::Count(Counts::new(1, 2)))
+  );
+  assert_eq!(
+    with(|parts| parts.stss = Some(vec![1, 2])),
+    named(WrittenPart::SyncSamples, Found::Content)
+  );
+  assert_eq!(
+    with(|parts| parts.sdtp = None),
+    named(WrittenPart::Dependencies, Found::Omitted)
+  );
+  assert_eq!(
+    with(|parts| parts.sdtp = Some(vec![0x20, 0x10, 0x20])),
+    named(WrittenPart::Dependencies, Found::Content)
+  );
+  let every = flag_tables(&[(sync, false), (sync, false), (sync, false)]);
+  let listed = Parts {
+    stss: Some(vec![1, 2, 3]),
+    ..Parts::default()
+  };
+  assert_eq!(
+    judged(&listed, every),
+    named(WrittenPart::SyncSamples, Found::Count(Counts::new(3, 0)))
+  );
+  assert_eq!(judged(&listed, None), None, "unjudged");
+}
+
+/// **An `stss` whose payload holds no whole number of entries is a
+/// structure no writer makes**.
+#[test]
+fn an_stss_of_part_of_an_entry_is_a_structure() {
+  let mut sink = Sink::default();
+  let mdat = header(&mut sink);
+  sink.append(&[0x21; 4]);
+  sink.close(mdat);
+  let mut cut = sync_table(b"stss", &[1]);
+  cut.extend_from_slice(&[0, 0]);
+  cut[3] += 2;
+  let stbl = [boxed(b"stsd", &[0; 8]), stts(&[(1, 1)]), cut, stsz(&[4])].concat();
+  let mdia = [hdlr(b"vide"), boxed(b"minf", &boxed(b"stbl", &stbl))].concat();
   let trak = [tkhd(1), boxed(b"mdia", &mdia)].concat();
   sink.append(&boxed(b"moov", &boxed(b"trak", &trak)));
   assert_eq!(

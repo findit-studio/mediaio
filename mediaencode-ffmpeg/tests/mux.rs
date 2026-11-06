@@ -23550,3 +23550,106 @@ fn gate7_the_pssh_boxes_read_back_as_their_mirror_counts_them() {
   assert_eq!(boxes, [108, 60, 108, 60], "two streams' two boxes each");
   assert_eq!(counted, (4, boxes.iter().sum::<u64>()));
 }
+
+// ---------------------------------------------------------------------------
+//  The MOV family's sync and dependency flags audited (the flags).
+// ---------------------------------------------------------------------------
+
+/// The first `trak`'s flag tables FFmpeg wrote into `path`: `stss`'s sample
+/// indices and `sdtp`'s bytes, each empty where the box is not written
+/// (`mov_write_stss_tag`, `mov_write_sdtp_tag`, `movenc.c` 292–336).
+fn written_flags(path: &Path) -> (Vec<u32>, Vec<u8>) {
+  let bytes = std::fs::read(path).expect("the file");
+  let word = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("a word"));
+  let (moov, moov_end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("moov");
+  let (trak, trak_end, _) = box_in(&bytes, (moov, moov_end), b"trak").expect("trak");
+  let (mdia, mdia_end, _) = box_in(&bytes, (trak, trak_end), b"mdia").expect("mdia");
+  let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+  let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+  let sync = box_in(&bytes, (stbl, stbl_end), b"stss").map_or_else(Vec::new, |(body, end, _)| {
+    (body + 8..end).step_by(4).map(word).collect()
+  });
+  let dependencies = box_in(&bytes, (stbl, stbl_end), b"sdtp")
+    .map_or_else(Vec::new, |(body, end, _)| bytes[body + 4..end].to_vec());
+  (sync, dependencies)
+}
+
+/// **L239 — the flags: an `stss` entry FFmpeg wrote otherwise is named**
+/// (findit-studio/mediaio#95; `mov_write_stss_tag`, `movenc.c` 292–313):
+/// H.264 of a key frame every 25, AAC beside it, into MP4, the write plant
+/// raising the first `stss` entry's last byte by one as the sink takes it
+/// — a sync sample's index moved, its count kept — and `finish` fails:
+/// track 0's sync samples, by their content.
+#[cfg(feature = "test-support")]
+#[test]
+fn l239_an_stss_entry_written_otherwise_is_named() {
+  let Some(corpus) = Corpus::new() else { return };
+  let h264 = h264_aac(&corpus, "h264-aac.mp4");
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(output(&corpus, "l239.mp4")).expect("create"),
+    ContainerName::MP4,
+    whole_table(&h264),
+    &[],
+    MuxOptions::new(),
+    mediaencode_ffmpeg::mux::OpenHooks::default().with_plant(planting(
+      *b"stss",
+      Some(0),
+      12,
+      |byte| byte.wrapping_add(1),
+    )),
+  )
+  .expect("open");
+  let mut demuxer = FfmpegOwnedDemuxer::open(&h264).expect("open");
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  let fault = muxer.finish().expect_err("an stss entry moved, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::SyncSamples,
+      Finding::Content
+    ))
+  );
+}
+
+/// **The flags: `stss` and `sdtp` as the mirror counts them, read back**
+/// (`mov_write_stss_tag`, `mov_write_sdtp_tag`, `movenc.c` 292–336;
+/// 3412–3420): twelve frames of the corpus's H.264 into MP4, the first and
+/// the seventh marked key frames, every third marked disposable — the
+/// flags movenc takes as the packets reach it (7344–7363). `finish` `Ok`,
+/// the audit agreeing; the file's `stss` lists the first and seventh
+/// samples, and its `sdtp` holds each sample's byte: 0x20 of a key frame,
+/// 0x10 of another, 0x08 beside it of a disposable one.
+#[test]
+fn the_flags_read_back_as_their_mirror_counts_them() {
+  let Some(corpus) = Corpus::new() else { return };
+  let h264 = h264_aac(&corpus, "h264-aac.mp4");
+  let (table, frames) = first_track(&h264, TrackKind::Video, 12);
+  let target = output(&corpus, "flags.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  let mut expected = Vec::new();
+  for (index, frame) in frames.iter().enumerate() {
+    let (key, disposable) = (index % 6 == 0, index % 3 == 2);
+    let mut flags = PacketFlags::empty();
+    if key {
+      flags |= PacketFlags::KEY;
+    }
+    if disposable {
+      flags |= PacketFlags::DISPOSABLE;
+    }
+    let at = index as i64 * 40;
+    wrote(
+      muxer.write_video(video_at(&video_of(frame).with_flags(flags), Some(at), at)),
+      "a frame",
+    );
+    expected.push(if key { 0x20 } else { 0x10 } | if disposable { 0x08 } else { 0 });
+  }
+  muxer.finish().expect("finished, the audit agreeing");
+  assert_eq!(written_flags(&target), (vec![1, 7], expected));
+}

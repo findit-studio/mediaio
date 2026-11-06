@@ -34,6 +34,10 @@ crate moves only when it changes.
   animated track's first chunk offset against the payload's first byte,
   and its item's `av1C` (`WrittenPart::MediaData`,
   `WrittenPart::ItemLocation`, `WrittenPart::ChunkOffsets`); each track's
+  sync samples and their dependencies, `stss` and `sdtp`, each sample's
+  flags as its packet reaches movenc (`WrittenPart::SyncSamples`,
+  `WrittenPart::Dependencies`) — VC-1's, which movenc reads from its
+  bitstream, judged not at all; each track's
   roll groups, `sgpd` and `sbgp` — AAC's one group, Opus's distances as
   movenc counts them (`WrittenPart::RollGroups`) — and MP4's track `udta`
   of its DASH roles (`WrittenPart::TrackUserData`); the movie's `udta`,

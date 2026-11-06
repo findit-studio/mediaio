@@ -66,6 +66,15 @@
 //!   sequence header of another profile than the advanced one, left out;
 //!   `lvcC` of a block or a picture the standard does not allow, written
 //!   empty ([`records::rests_on_trust`]).
+//! - **VC-1's and TrueHD's sync flags.** movenc derives VC-1's from the
+//!   bitstream after the fact, its scan of each packet able to clear every
+//!   earlier sample's flag (`mov_parse_vc1_frame`, `movenc.c` 6475–6532):
+//!   a VC-1 track's `stss` and `sdtp` are judged not at all. TrueHD's it
+//!   reads from the bitstream too (7344–7348), and the MOV family refuses
+//!   TrueHD at open. Every other track's flags are judged, each sample's as
+//!   its packet reaches movenc. MOV's MPEG-2 is refused at open
+//!   ([`mov_admitted`](super::mov_admitted)); its scan, `stps` and report
+//!   row arrive with its own admission audit.
 //! - **The bytes of the `udta`s and the `pssh` boxes.** Each is judged by
 //!   its presence and its payload's length — a `pssh` box's in order,
 //!   folded — as the census's roads leave each out whole (A1, A6, A7).
@@ -101,8 +110,9 @@
 //! it could not follow, a file that ends inside a structure, a panicked
 //! tap; then each track's own box, in the order the file holds them; then
 //! each track's sample descriptions — the first that differs — its
-//! tables and, of an animated AVIF, its first chunk's offset, then its
-//! roll groups and its user data, in track order; then AVIF's items'
+//! tables, its sync samples and their dependencies and, of an animated
+//! AVIF, its first chunk's offset, then its roll groups and its user data,
+//! in track order; then AVIF's items'
 //! records; then the file's parts: the media data, the movie's user data,
 //! the protection headers, and AVIF's first item's location. A track's
 //! omission is named before the file's sizes it shortens, so that the most
@@ -206,6 +216,10 @@ pub enum WrittenPart {
   TimeToSample,
   /// A track's sample sizes: the MOV family's `stsz`.
   SampleSizes,
+  /// A track's sync samples: the MOV family's `stss`.
+  SyncSamples,
+  /// A track's samples' dependencies: the MOV family's `sdtp`.
+  Dependencies,
   /// A track's roll groups: the MOV family's `sgpd` and `sbgp`, AAC's one
   /// group of every sample or Opus's roll distances.
   RollGroups,
@@ -236,6 +250,8 @@ impl fmt::Display for WrittenPart {
       Self::ChunkOffsets => "its chunk offsets",
       Self::TimeToSample => "its time-to-sample table",
       Self::SampleSizes => "its sample sizes",
+      Self::SyncSamples => "its sync samples",
+      Self::Dependencies => "its samples' dependencies",
       Self::RollGroups => "its roll groups",
       Self::TrackUserData => "its user data",
       Self::MovieUserData => "the movie's user data",
@@ -782,6 +798,73 @@ impl SampleMirror {
   }
 }
 
+/// A track's sync and dependency flags as compared, each table `None`
+/// where movenc writes none: `stss`'s sync samples, each its index from 1,
+/// and `sdtp`'s byte of each sample (`mov_write_stss_tag`,
+/// `mov_write_sdtp_tag`, `movenc.c` 292–336 in FFmpeg 9.0.1), each folded
+/// ([`Runs`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct FlagTables {
+  sync: Option<Summary>,
+  dependencies: Option<Summary>,
+}
+
+/// What the muxer counts of a track's flags, sample by sample, as movenc
+/// sets them ([`FlagTables`]). Fields of the track's own, allocating
+/// nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct FlagsMirror {
+  samples: u64,
+  sync: Runs,
+  dependencies: Runs,
+  disposable: u64,
+}
+
+impl FlagsMirror {
+  /// A sample movenc writes, a sync sample where `sync` — its packet
+  /// reaching movenc marked a key frame (7344–7359) — and disposable where
+  /// `disposable` (7360–7363): its index listed in `stss` where a sync
+  /// sample, and its `sdtp` byte — depending on others but where it is a
+  /// sync sample, referenced by none where it is disposable (316–336).
+  pub(super) fn sample(&mut self, sync: bool, disposable: bool) {
+    self.samples += 1;
+    if sync {
+      self.sync.push(self.samples, 1);
+    }
+    let dependent: u64 = if sync { 2 } else { 1 };
+    let referenced: u64 = if disposable { 2 } else { 0 };
+    self.dependencies.push(dependent << 4 | referenced << 2, 1);
+    self.disposable += u64::from(disposable);
+  }
+
+  /// The tables movenc writes of the samples (3412–3420): `stss` of a track
+  /// whose kind writes one (`syncs`: video, MPEG-H 3D Audio, USAC AAC)
+  /// where some but not all samples are sync samples; `sdtp` of `video`
+  /// where any sample is disposable.
+  pub(super) fn written(&self, syncs: bool, video: bool) -> FlagTables {
+    let sync = self.sync.summary();
+    FlagTables {
+      sync: (syncs && sync.count > 0 && sync.count < self.samples).then_some(sync),
+      dependencies: (video && self.disposable > 0).then(|| self.dependencies.summary()),
+    }
+  }
+}
+
+/// The first way a flag table as read differs from `expected`, `None` where
+/// movenc writes none: written where none is, left out, its entries'
+/// count, then their content.
+fn flags_found(expected: Option<Summary>, written: Option<Summary>) -> Option<Found> {
+  match (expected, written) {
+    (None, None) => None,
+    (None, Some(written)) => Some(Found::Count(Counts::new(written.count, 0))),
+    (Some(_), None) => Some(Found::Omitted),
+    (Some(wanted), Some(written)) if written.count != wanted.count => {
+      Some(Found::Count(Counts::new(written.count, wanted.count)))
+    }
+    (Some(wanted), Some(written)) => (written != wanted).then_some(Found::Content),
+  }
+}
+
 /// A track's roll groups as compared (`mov_preroll_write_stbl_atoms`,
 /// `movenc.c` 3305–3400 in FFmpeg 9.0.1): the groups `sgpd` holds — one a
 /// run of samples of a roll distance other than none, its distance
@@ -1065,6 +1148,8 @@ pub(super) struct ExpectedTrak {
   pub(super) id: u32,
   /// Its sample tables.
   pub(super) samples: SampleMirror,
+  /// Its flag tables; `None` where they are unjudged, VC-1's.
+  pub(super) flags: Option<FlagTables>,
   /// Its roll groups, where movenc writes them (A3).
   pub(super) rolls: Option<RollGroups>,
   /// Its `udta`'s payload bytes, 0 where movenc writes none (A6).
@@ -1249,6 +1334,24 @@ pub(super) fn mov_verdict(
           (Some(_), part) => part,
         };
         return Some(WrittenOtherwise::new(trak.track, part, found));
+      }
+    }
+    // Its sync samples and their dependencies, unjudged of VC-1's.
+    if let Some(flags) = trak.flags {
+      let (sync, dependencies) = seen.flags();
+      let tables = [
+        (WrittenPart::SyncSamples, flags.sync, sync),
+        (WrittenPart::Dependencies, flags.dependencies, dependencies),
+      ];
+      for (part, wanted, written) in tables {
+        if let Some(found) = flags_found(wanted, written) {
+          let part = if trak.track.is_some() {
+            part
+          } else {
+            WrittenPart::ChapterTrack
+          };
+          return Some(WrittenOtherwise::new(trak.track, part, found));
+        }
       }
     }
     // An animated AVIF's first chunk: its samples' first byte, the
