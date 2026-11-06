@@ -2551,3 +2551,57 @@ fn a_raw_flac_structure_no_writer_makes_is_named() {
     Some(Unfollowed::new(4, Why::Structure))
   );
 }
+
+/// **A `gmhd`'s placeholder children are followed** (Codex R1 [2]): GoPro
+/// metadata's `gmhd` — `gmin` and `text` of fixed sizes, then a `gpmd` of
+/// a placeholder size, patched once its version is written
+/// (`mov_write_gmhd_tag`, `movenc.c` 3488–3537) — its header and its child
+/// flushed before their patches, each patch a write of its own closing its
+/// box at the frontier, innermost first: followed; a `tmcd` child (3524–3529)
+/// the same; and the in-buffer face, every size final, followed.
+///
+/// PLANT P635: `gmhd` kept opaque.
+#[test]
+fn a_gmhds_placeholder_children_are_followed() {
+  let flushed = |child: &[u8; 4], payload: &[u8]| {
+    let mut sink = Sink::default();
+    let mdat = header(&mut sink);
+    sink.close(mdat);
+    let moov = sink.append(&placeholder(b"moov", &[]));
+    let trak = sink.append(&placeholder(b"trak", &[]));
+    let mdia = sink.append(&placeholder(b"mdia", &[]));
+    sink.append(&hdlr(b"meta"));
+    let minf = sink.append(&placeholder(b"minf", &[]));
+    let gmhd = sink.append(&placeholder(b"gmhd", &[]));
+    sink.append(&boxed(b"gmin", &[0; 16]));
+    sink.append(&boxed(b"text", &[0; 36]));
+    let at = sink.append(&placeholder(child, payload));
+    sink.close(at);
+    sink.close(gmhd);
+    sink.append(&boxed(b"dinf", &boxed(b"dref", &[0; 8])));
+    for open in [minf, mdia, trak, moov] {
+      sink.close(open);
+    }
+    (sink, at)
+  };
+  let (gpmd, _) = flushed(b"gpmd", &[0; 4]);
+  assert_eq!(unfollowed(&gpmd), None, "gpmd");
+  let (tmcd, _) = flushed(b"tmcd", &boxed(b"tcmi", &[0; 12]));
+  assert_eq!(unfollowed(&tmcd), None, "tmcd");
+  let mut whole = Sink::default();
+  let mdat = header(&mut whole);
+  whole.close(mdat);
+  let gmhd = boxed(
+    b"gmhd",
+    &[
+      boxed(b"gmin", &[0; 16]),
+      boxed(b"text", &[0; 36]),
+      boxed(b"gpmd", &[0; 4]),
+    ]
+    .concat(),
+  );
+  let minf = boxed(b"minf", &gmhd);
+  let mdia = boxed(b"mdia", &[hdlr(b"meta"), minf].concat());
+  whole.append(&boxed(b"moov", &boxed(b"trak", &mdia)));
+  assert_eq!(unfollowed(&whole), None, "in-buffer");
+}

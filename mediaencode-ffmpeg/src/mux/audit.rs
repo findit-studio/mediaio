@@ -80,6 +80,16 @@
 //!   its packet reaches movenc. MOV's MPEG-2 is refused at open
 //!   ([`mov_admitted`](super::mov_admitted)); its scan, `stps` and report
 //!   row arrive with its own admission audit.
+//! - **Timecode tracks, excluded by admission.** movenc writes a `tmcd`
+//!   track's `gmhd` with a `tmcd` child of a placeholder size (3524–3529),
+//!   which the walk follows as it follows GoPro metadata's `gpmd`; but no
+//!   such track reaches it: movenc makes one of its own only of a stream or
+//!   a context stating `timecode` metadata (`mov_init`, 8339–8370), which
+//!   the base never sets — a stream's keys are `language`, `filename` and
+//!   `mimetype` alone — and a copied `tmcd` track, a data stream of no codec
+//!   as FFmpeg's MOV reader makes it (`ff_codec_movdata_tags`, `isom.c`
+//!   82–85, naming `gpmd` alone), is refused at open as a codec MP4 and MOV
+//!   do not carry ([`MuxOpenError::CodecNotCarried`](super::MuxOpenError::CodecNotCarried); L246).
 //! - **The bytes of the `udta`s and the `pssh` boxes.** Each is judged by
 //!   its presence and its payload's length — a `pssh` box's in order,
 //!   folded — as the census's roads leave each out whole (A1, A6, A7).

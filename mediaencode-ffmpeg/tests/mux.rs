@@ -24714,3 +24714,125 @@ fn l244_the_chapter_tracks_first_sample_is_stored_at_zero() {
     "the chapter track's stts"
   );
 }
+
+/// A GoPro metadata packet of `bytes` at `at` milliseconds, lasting 100,
+/// on the data track `track`.
+fn gpmd_packet(
+  track: usize,
+  at: i64,
+  bytes: &[u8],
+) -> mediaencode::mediaspine::demuxer::DataTrackPacket<Ffmpeg, FfmpegBytes> {
+  use mediaencode::mediaspine::demuxer::{DataPacket, DataTrackPacket};
+  DataTrackPacket::new(
+    TrackIndex::new(track),
+    DataPacket::new(
+      bytes_of(bytes),
+      mediaio_ffmpeg::extras::DataPacketExtra::new(i32::try_from(track).expect("an index")),
+    )
+    .with_pts(Some(ms(at)))
+    .with_duration(Some(ms(100)))
+    .with_flags(PacketFlags::KEY),
+  )
+}
+
+/// **L245 — a GoPro metadata track's `gmhd` is followed** (Codex R1 [2]):
+/// AAC and a data track of `AV_CODEC_ID_BIN_DATA` — `gpmd` in MP4's tag
+/// table (`movenc.c` 9268), admitted — of three packets, into MP4: `finish`
+/// `Ok`, the audit having walked the track's `minf`'s `gmhd` and the `gpmd`
+/// of a placeholder size inside it (3488–3537, 3847–3848), which the file
+/// holds.
+///
+/// PLANT P635 (with the synth law): `gmhd` kept opaque.
+#[test]
+fn l245_a_gopro_metadata_tracks_gmhd_is_followed() {
+  let Some(corpus) = Corpus::new() else { return };
+  let aac = audio_file(&corpus, "l245-aac.mkv", "aac");
+  let (mut table, packets) = whole_track(&aac, TrackKind::Audio);
+  let (rows, _) = whole_track(&aac, TrackKind::Audio);
+  table.push(gpmd_of(&rows[0]));
+  let target = output(&corpus, "l245.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  for (index, packet) in packets.iter().enumerate() {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+    if index < 3 {
+      muxer
+        .write_data(gpmd_packet(1, index as i64 * 100, &[0x47; 24]))
+        .map_err(|error| error.map_packet(drop))
+        .expect("a GoPro metadata packet");
+    }
+  }
+  muxer.finish().expect("a gpmd track, finished");
+  let bytes = std::fs::read(&target).expect("the file");
+  let holds = |fourcc: &[u8; 4]| bytes.windows(4).any(|window| window == fourcc);
+  assert!(
+    holds(b"gmhd") && holds(b"gpmd"),
+    "the premise: gmhd and its gpmd written"
+  );
+}
+
+/// A timecode track as FFmpeg's MOV reader reads one: a data track of no
+/// codec and of the tag `tmcd` (`ff_codec_movdata_tags`, `isom.c` 82–85,
+/// naming `gpmd` alone), made of `row`'s parameters.
+fn tmcd_of(row: &Described) -> Described {
+  use ffmpeg_next::ffi::{AVCodecID, AVMediaType};
+  use mediaencode::mediaspine::demuxer::DataTrackParams;
+  let index = row.side_data().stream_index();
+  let mut parameters = row.side_data().rebuild().expect("the parameters");
+  // SAFETY: `parameters` owns its `AVCodecParameters`, live for the
+  // writes; the media type and the codec id each a value of its own enum,
+  // the tag a plain integer.
+  unsafe {
+    let par = parameters.as_mut_ptr();
+    (*par).codec_type = AVMediaType::AVMEDIA_TYPE_DATA;
+    (*par).codec_id = AVCodecID::AV_CODEC_ID_NONE;
+    (*par).codec_tag = u32::from_le_bytes(*b"tmcd");
+  }
+  let ticket = CodecTicket::mirror(&parameters, index, usize::MAX).expect("the ticket");
+  TrackDescription::new(
+    row.timebase(),
+    TrackParams::Data(DataTrackParams::new(CodecId::from_raw(
+      AVCodecID::AV_CODEC_ID_NONE as i32,
+    ))),
+    ticket,
+  )
+  .expect("a timed track")
+}
+
+/// **L246 — a timecode track is refused at open** (the R3 gate's
+/// condition 2: excluded by admission): a timecode track as FFmpeg's MOV
+/// reader reads one, into MP4 and MOV: `CodecNotCarried`, nothing written,
+/// so that no `gmhd`'s `tmcd` child (`movenc.c` 3524–3529) reaches the walk
+/// — and the base sets no `timecode` metadata, of which `mov_init` would
+/// make a `tmcd` track of its own (8339–8370).
+#[test]
+fn l246_a_timecode_track_is_refused_at_open() {
+  let Some(corpus) = Corpus::new() else { return };
+  let aac = audio_file(&corpus, "l246-aac.mkv", "aac");
+  for (container, extension) in [
+    (ContainerName::MP4, "mp4"),
+    (ContainerName::new("mov"), "mov"),
+  ] {
+    let (table, _) = whole_track(&aac, TrackKind::Audio);
+    let target = output(&corpus, &format!("l246.{extension}"));
+    let opened = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      container,
+      vec![tmcd_of(&table[0])],
+      &[],
+      PacketLimits::default(),
+    );
+    assert!(
+      matches!(opened, Err(MuxOpenError::CodecNotCarried { .. })),
+      "{extension}: {:?}",
+      opened.map(drop)
+    );
+    assert_eq!(
+      std::fs::metadata(&target).expect("the file").len(),
+      0,
+      "{extension}: nothing written"
+    );
+  }
+}

@@ -10,12 +10,15 @@
 //! context's buffer. A child's patch then lands inside its parent, so the
 //! walk descends into every box movenc writes children of placeholder size
 //! into — `moov`, `trak`, `mdia`, `minf`, `stbl`, `stsd`, each sample
-//! entry, and the entries' `wave`, `sv3d` and `vexu` — and steps over any
-//! other by its size, or, while its size is a placeholder, takes every
-//! byte into it until its patch: each of those holds no child of a
-//! placeholder size of its own (`udta` is written whole from a dynamic
-//! buffer, 5066–5122; `dinf`, `gmhd`, `tapt`, `tref`, `proj` and `eyes`
-//! hold children of fixed sizes). A raw subtitle entry — `tx3g`, `text`,
+//! entry, the entries' `wave`, `sv3d` and `vexu`, and `minf`'s `gmhd`,
+//! whose `gpmd` of a GoPro metadata track — an MP4 data track of
+//! `AV_CODEC_ID_BIN_DATA`, admitted — and `tmcd` of a timecode track are
+//! of placeholder sizes (`mov_write_gmhd_tag`, 3488–3537; Codex R1 [2]) —
+//! and steps over any other by its size, or, while its size is a
+//! placeholder, takes every byte into it until its patch: each of those
+//! holds no child of a placeholder size of its own (`udta` is written whole
+//! from a dynamic buffer, 5066–5122; `dinf`, `tapt`, `tref`, `proj` and
+//! `eyes` hold children of fixed sizes, as `gmhd`'s `gmin` and `text` are). A raw subtitle entry — `tx3g`, `text`,
 //! `stpp` — holds its configuration's bytes, then a `btrt` of 20 bytes
 //! whose size is a placeholder of its own (1279–1294, 2282–2286): that one
 //! patch is admitted where it falls, at the frontier less 20.
@@ -810,9 +813,10 @@ impl MovWalk {
       };
     };
     match (&parent.fourcc, &fourcc) {
-      (b"moov", b"trak") | (b"trak", b"mdia") | (b"mdia", b"minf") | (b"minf", b"stbl") => {
-        Role::Boxes { prefix: 0 }
-      }
+      (b"moov", b"trak")
+      | (b"trak", b"mdia")
+      | (b"mdia", b"minf")
+      | (b"minf", b"stbl" | b"gmhd") => Role::Boxes { prefix: 0 },
       (b"trak", b"tkhd") => Role::Leaf(Leaf::Tkhd),
       (b"mdia", b"hdlr") => Role::Leaf(Leaf::Hdlr),
       (b"stbl", b"stsd") => Role::Boxes { prefix: 8 },
