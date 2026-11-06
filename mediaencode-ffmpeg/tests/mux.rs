@@ -24836,3 +24836,65 @@ fn l246_a_timecode_track_is_refused_at_open() {
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+//  Codex round 2: the one map from the output's streams back to the table.
+// ---------------------------------------------------------------------------
+
+/// The corpus's cover art as a row of its own, with its file: an
+/// attachment, of which AVIF writes no stream, reported
+/// ([`Uncarried::Attachment`]).
+fn cover_row(corpus: &Corpus) -> Described {
+  table_with_files(&aac_cover_mp4(corpus))
+    .into_iter()
+    .find(|row| row.kind() == TrackKind::Attachment)
+    .expect("the premise: a cover track")
+}
+
+/// **L247 — AVIF reads still or animated by the track behind its first
+/// output stream** (Codex R2 [1]; `avif_write_trailer`, `movenc.c` 9164,
+/// of `s->streams[0]->nb_frames`): the cover, of which AVIF writes no
+/// stream, at track 0, and AV1 at track 1, its stream the first — a still
+/// AVIF of one frame and an animated one of three, each `finish` `Ok`, the
+/// audit agreeing; the animated file of a `moov`, the still of none.
+///
+/// PLANT P636: the table's track 0 read for the first stream.
+#[test]
+fn l247_avif_reads_still_or_animated_by_its_first_output_stream() {
+  let Some(corpus) = Corpus::new() else { return };
+  let av1 = av1_mkv(&corpus);
+  for (name, count) in [("l247-still.avif", 1), ("l247-animated.avif", 3)] {
+    let (mut table, frames) = first_track(&av1, TrackKind::Video, count);
+    table.insert(0, cover_row(&corpus));
+    let target = output(&corpus, name);
+    let (mut muxer, report) = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      ContainerName::new("avif"),
+      table,
+      &[],
+      PacketLimits::default(),
+    )
+    .expect("open");
+    assert!(
+      report.uncarried().contains(&Uncarried::Attachment {
+        track: TrackIndex::new(0)
+      }),
+      "{name}: the premise, the cover of no stream: {report:?}"
+    );
+    for frame in &frames {
+      wrote(
+        muxer.write_video(VideoTrackPacket::new(TrackIndex::new(1), video_of(frame))),
+        "an AV1 frame",
+      );
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|fault| panic!("{name}: {:?}", written(&fault)));
+    let bytes = std::fs::read(&target).expect("the file");
+    assert_eq!(
+      box_in(&bytes, (0, bytes.len()), b"moov").is_some(),
+      count > 1,
+      "{name}: the premise, a moov of the animated file alone"
+    );
+  }
+}

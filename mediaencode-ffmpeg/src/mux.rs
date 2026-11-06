@@ -11528,6 +11528,13 @@ pub struct CarrierMuxer<W, C: FfmpegCarrier> {
   output: Output<W>,
   container: ContainerName,
   tracks: Vec<TrackState>,
+  /// The one map from the output's streams back to the table, made at
+  /// open: each stream's track at its ordinal, as `add_stream` answered
+  /// it — libavformat numbers each new stream the count before it
+  /// (`avformat_new_stream`, `options.c` 305, 322 in FFmpeg 9.0.1). Every
+  /// crossing between the table and an order libavformat makes of the
+  /// streams goes through it (Codex R2).
+  streams: Box<[TrackIndex]>,
   limits: PacketLimits,
   bounds: Bounds,
   /// What the open answered, then what writing has learned.
@@ -12084,6 +12091,21 @@ where
       }
       states.push((kind, stream, *road, filter));
     }
+    // The one map, from `add_stream`'s answers: each stream's track at its
+    // ordinal ([`CarrierMuxer::streams`]).
+    let streams: Box<[TrackIndex]> = {
+      let mut streams: Vec<(usize, TrackIndex)> = states
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, stream, ..))| {
+          stream
+            .as_ref()
+            .map(|(stream, _)| (*stream, TrackIndex::new(index)))
+        })
+        .collect();
+      streams.sort_unstable_by_key(|&(stream, _)| stream);
+      streams.into_iter().map(|(_, track)| track).collect()
+    };
     // The MOV family's `moov` before any sample (R15, Codex R14 2): what its
     // trailer writes whatever the packets — the movie's own boxes, the
     // covers', the chapters', every stream's `pssh`, each timed track's `stsd` and its tables of no sample but the two a
@@ -12584,6 +12606,7 @@ where
         output,
         container,
         tracks: track_states,
+        streams,
         limits,
         bounds,
         report: report.clone(),
@@ -13083,12 +13106,15 @@ where
         .with_tap(|audit: &mut Audit| audit::flv_verdict(audit, expected))
         .unwrap_or_else(|_| panicked());
     }
-    // A still AVIF writes no `moov`: its first stream of one frame
-    // (`avif_write_trailer`, `movenc.c` 9164, 9183–9187).
+    // A still AVIF writes no `moov`: its first stream of one frame — the
+    // track behind the first output stream, through the one map, as movenc
+    // reads `s->streams[0]` (`avif_write_trailer`, `movenc.c` 9164,
+    // 9183–9187; Codex R2 [1]).
     let still = walked == Walked::Mov(MovMode::Avif)
       && self
-        .tracks
+        .streams
         .first()
+        .and_then(|track| self.tracks.get(track.get()))
         .is_none_or(|state| state.mp4_entries <= 1);
     let traks = if still { &[][..] } else { &self.tracks[..] };
     let expected = expected_traks(traks, self.chapter_trak);
