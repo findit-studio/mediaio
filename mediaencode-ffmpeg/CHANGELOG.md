@@ -62,7 +62,11 @@ crate moves only when it changes.
   channel mask comment (`WrittenPart::ChannelMask`). Then raw FLAC: its
   STREAMINFO, rewritten once, and its VORBIS_COMMENT's channel mask entry
   (`WrittenPart::ChannelMask`), libavformat's own `encoder` entry outside
-  the contract. A `mov_text`
+  the contract. With it, the premise R21 rested the muxer on — that
+  libavutil's allocations succeed — is retired: no row of the census rests
+  on it, each detected at `finish` by its check and its law; the audit
+  allocates nothing a packet, and its trailer's work is its tables', not
+  its samples'. A `mov_text`
   track's tables are read by one rule on both sides, which the end samples
   libavformat's interleaving makes movenc write leave unchanged (the
   coordinator's ruling R5). With the new `test-support` feature,
@@ -72,7 +76,7 @@ crate moves only when it changes.
   `CarrierMuxer::audited_bytes`, `expected_records`, `expected_palettes`,
   `expected_chapter_samples`, `expected_movie_user_data`,
   `expected_protection`, `expected_roll_groups` and
-  `expected_flv_sequences`, the laws' seams.
+  `expected_flv_sequences` and `audit_pushes`, the laws' seams.
 - **Opus's roll distance past 32, refused by name** (the coordinator's
   ruling R2 on the write audit's F4): MP4 counts each Opus sample's roll
   distance — the samples before it whose durations reach 80 ms — and past

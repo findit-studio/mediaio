@@ -2,9 +2,11 @@
 //! and judged at `finish` against what the muxer handed it
 //! (findit-studio/mediaio#95).
 //!
-//! The census's premise rows (see [the module](super)) are what FFmpeg's
-//! writers put in a file when an allocation fails and the failure is
-//! swallowed: a box left out, a size written otherwise, success answered.
+//! The census's omission and misreport rows (see [the module](super)) are
+//! what FFmpeg's writers put in a file when an allocation fails and the
+//! failure is swallowed: a box left out, a size written otherwise, success
+//! answered — the rows the release once rested on a premise for (R21),
+//! which this audit retires.
 //! The muxer cannot see a swallowed failure, but it can see the file: the
 //! writer guard hands every run of bytes the sink takes to a tap
 //! ([`SinkTap`]), and the tap here walks them in constant memory, keeping
@@ -146,7 +148,7 @@ use mkv::MkvWalk;
 use mov::{Described, MovWalk};
 
 /// What FFmpeg wrote otherwise than it was handed, answering success: an
-/// omission or a misreport (the census's premise rows), found by the write
+/// omission or a misreport (the census's rows of those classes), found by the write
 /// audit once the trailer is written (findit-studio/mediaio#95).
 ///
 /// Its parts say what is wrong, and where: the track, where the part is a
@@ -467,9 +469,24 @@ impl Default for Runs {
   }
 }
 
+#[cfg(feature = "test-support")]
+std::thread_local! {
+  /// The runs pushed on this thread ([`Runs::push`]): the laws' count of
+  /// the trailer's work.
+  static PUSHES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// The runs pushed on this thread so far: the laws' seam (L240).
+#[cfg(feature = "test-support")]
+pub(super) fn pushes() -> u64 {
+  PUSHES.with(core::cell::Cell::get)
+}
+
 impl Runs {
   /// `count` values of `value`, after those pushed before.
   pub(super) fn push(&mut self, value: u64, count: u64) {
+    #[cfg(feature = "test-support")]
+    PUSHES.with(|pushes| pushes.set(pushes.get() + 1));
     if count == 0 {
       return;
     }

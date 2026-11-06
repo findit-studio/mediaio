@@ -24533,3 +24533,128 @@ fn l238_raw_flacs_mask_comment_is_judged() {
     ))
   );
 }
+
+// ---------------------------------------------------------------------------
+//  The allocation premise retired: the owner's bar, by law.
+// ---------------------------------------------------------------------------
+
+/// **L240 — the trailer's work is the tables', not the samples'**
+/// (findit-studio/mediaio#95; the owner's bar: trailer work in O(moov)):
+/// PCM of a constant size into MP4 — its `stts` one run and its `stsz` one
+/// size, a table's entry each however many its samples (`mov_write_stts_tag`,
+/// `movenc.c` 3248–3256; `mov_write_stsz_tag`, 225–259) — the runs the
+/// muxer and the walk push inside `finish`, counted on the thread (test
+/// support): as many of a million samples as of a thousand, a handful.
+///
+/// PLANT P620: PCM's sample sizes expanded a sample at a time.
+#[cfg(feature = "test-support")]
+#[test]
+fn l240_the_trailers_work_is_the_tables() {
+  let Some(corpus) = Corpus::new() else { return };
+  let pushed = |name: &str, samples: u32| {
+    let source = generated(
+      &corpus,
+      &format!("{name}.wav"),
+      &[
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000",
+        "-af",
+        &format!("atrim=end_sample={samples}"),
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+      ],
+    );
+    let (table, packets) = whole_track(&source, TrackKind::Audio);
+    let mut muxer = muxer_into(
+      &output(&corpus, &format!("{name}.mp4")),
+      ContainerName::MP4,
+      table,
+    );
+    for packet in &packets {
+      wrote(
+        muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+        "a PCM packet",
+      );
+    }
+    let before = mediaencode_ffmpeg::mux::audit_pushes();
+    muxer.finish().expect("finished");
+    mediaencode_ffmpeg::mux::audit_pushes() - before
+  };
+  let few = pushed("l240-thousand", 1_000);
+  let many = pushed("l240-million", 1_000_000);
+  assert_eq!(
+    few, many,
+    "the runs pushed at the trailer, of 10^3 samples and 10^6"
+  );
+  assert!(many <= 8, "a handful: {many}");
+}
+
+/// **L242 — the write audit allocates nothing a packet**
+/// (findit-studio/mediaio#95; the owner's bar: no allocation a packet):
+/// H.264 into MP4, FLV and Matroska — the fixture's key frame, timed 40
+/// ticks apart — and FLAC into raw FLAC, N and 2N packets each, with the
+/// audit on and off (`MuxOptions::with_audit`): the bytes allocated from
+/// the second packet through `finish`, by this lane's counting allocator,
+/// grow from N to 2N by as many with the audit on as off. The muxer's
+/// mirrors run either way, fields of each track's own (R12's law counts
+/// them); the tap and its walk are what the audit adds.
+///
+/// PLANT P621: a push into the FLV walk's own record at each frame.
+#[test]
+fn l242_the_write_audit_allocates_nothing_a_packet() {
+  let Some(corpus) = Corpus::new() else { return };
+  let flac = audio_file(&corpus, "l242.flac", "flac");
+  let flac_packets = whole_track(&flac, TrackKind::Audio).1.len();
+  for container in ["mp4", "flv", "matroska", "flac"] {
+    let half = if container == "flac" {
+      flac_packets / 2
+    } else {
+      12
+    };
+    assert!(half >= 4, "{container}: the premise: packets enough");
+    let spent = |audit: bool, count: usize| {
+      let target = output(&corpus, &format!("l242-{audit}-{count}.{container}"));
+      let options = MuxOptions::new().with_audit(audit);
+      let mut before = 0;
+      if container == "flac" {
+        let (table, packets) = whole_track(&flac, TrackKind::Audio);
+        let mut muxer = muxer_with(&target, ContainerName::new(container), table, options);
+        for (index, packet) in packets.iter().take(count).enumerate() {
+          if index == 1 {
+            before = allocated();
+          }
+          muxer
+            .write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet)))
+            .map_err(|error| error.map_packet(drop))
+            .expect("a FLAC packet");
+        }
+        muxer.finish().expect("finished");
+      } else {
+        let (row, frames, ..) = h264_fixture(&corpus);
+        let mut muxer = muxer_with(&target, ContainerName::new(container), vec![row], options);
+        for index in 0..count {
+          if index == 1 {
+            before = allocated();
+          }
+          let at = index as i64 * 40;
+          muxer
+            .write_video(video_at(&frames[0], Some(at), at))
+            .map_err(|error| error.map_packet(drop))
+            .expect("an H.264 frame");
+        }
+        muxer.finish().expect("finished");
+      }
+      allocated() - before
+    };
+    let grown = |audit: bool| spent(audit, 2 * half) - spent(audit, half);
+    assert_eq!(
+      grown(true),
+      grown(false),
+      "{container}: the bytes N more packets allocate, the audit on and off"
+    );
+  }
+}
