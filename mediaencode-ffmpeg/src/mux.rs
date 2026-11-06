@@ -13029,6 +13029,9 @@ where
   fn written_otherwise(&mut self) -> Option<WrittenOtherwise> {
     let walked = self.audit?;
     let at = u64::try_from(self.output.position()).unwrap_or(0);
+    // A tap that panicked, or one that cannot be read back — none, or of
+    // another type, which no output reaches — named at the file's end
+    // ([`Why::Panicked`]), never `Ok`.
     let panicked = || {
       Some(WrittenOtherwise::new(
         None,

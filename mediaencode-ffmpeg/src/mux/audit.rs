@@ -370,7 +370,9 @@ impl Unfollowed {
   }
 
   /// The offset in the file: the run's, or the frontier's where the run
-  /// lay past it or the file ended.
+  /// lay past it or the file ended. Of a tap that panicked
+  /// ([`Why::Panicked`]), the file's end as libavformat counts it after the
+  /// trailer, not where the tap stopped.
   pub const fn at(&self) -> u64 {
     self.at
   }
@@ -406,7 +408,10 @@ pub enum Why {
   /// The sink's position left libavformat's offsets, so the bytes after
   /// it could not be placed (`SinkTap::lost`).
   Position,
-  /// The tap panicked, and saw no byte after it.
+  /// The tap panicked, and saw no byte after it. The muxer names so, too,
+  /// a tap it could not read back at all — none on the output, or one of
+  /// another type — which no output reaches: the tap is set at open or the
+  /// open fails, and the audit's is the one type ever set.
   Panicked,
 }
 
@@ -428,7 +433,13 @@ impl fmt::Display for Why {
 /// on both sides: the state xored with the value, then splitmix64's
 /// finalizer. Order-sensitive and not cryptographic — no input is chosen
 /// to collide (the trust model) — it holds the content exact where the
-/// counts and lengths compared before it already agree.
+/// counts and lengths compared before it already agree. One use decides an
+/// expectation rather than checks one: FLV's comparison of a new
+/// configuration with its current one, which FLV makes by size and bytes
+/// and the muxer by length and fold (R12, [`config_fold`]); two
+/// configurations of one length that differ fold alike with a chance of
+/// about 2^-64, the mirror then expecting no sequence header where FLV
+/// writes one — a `Count` named, never a pass — within the trust model.
 pub(super) const fn fold(state: u64, value: u64) -> u64 {
   let mut z = state ^ value;
   z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
