@@ -66,6 +66,13 @@
 //!   sequence header of another profile than the advanced one, left out;
 //!   `lvcC` of a block or a picture the standard does not allow, written
 //!   empty ([`records::rests_on_trust`]).
+//! - **The bytes of the `udta`s and the `pssh` boxes.** Each is judged by
+//!   its presence and its payload's length — a `pssh` box's in order,
+//!   folded — as the census's roads leave each out whole (A1, A6, A7).
+//! - **libavformat's own name in MOV's movie `udta`** — `©swr`, the
+//!   context's `encoder` (`movenc.c` 5093): present, of exactly
+//!   `LIBAVFORMAT_IDENT`, or absent, the `udta` judged either way (the
+//!   owner's ruling on letter 1, (b): the tag stays outside the contract).
 //! - **What the muxer does not mirror, and no census row writes:** chunk
 //!   offsets and `stsc`, which libavformat's interleaving decides; `ctts`,
 //!   edit lists — judged before the trailer, not read back — and the
@@ -94,9 +101,10 @@
 //! it could not follow, a file that ends inside a structure, a panicked
 //! tap; then each track's own box, in the order the file holds them; then
 //! each track's sample descriptions — the first that differs — its
-//! tables and, of an animated AVIF, its first chunk's offset, in track
-//! order; then AVIF's items' records; then the file's parts: the media
-//! data, and AVIF's first item's location. A track's
+//! tables and, of an animated AVIF, its first chunk's offset, then its
+//! roll groups and its user data, in track order; then AVIF's items'
+//! records; then the file's parts: the media data, the movie's user data,
+//! the protection headers, and AVIF's first item's location. A track's
 //! omission is named before the file's sizes it shortens, so that the most
 //! specific name wins.
 
@@ -198,6 +206,19 @@ pub enum WrittenPart {
   TimeToSample,
   /// A track's sample sizes: the MOV family's `stsz`.
   SampleSizes,
+  /// A track's roll groups: the MOV family's `sgpd` and `sbgp`, AAC's one
+  /// group of every sample or Opus's roll distances.
+  RollGroups,
+  /// A track's user data: MP4's track `udta`, the `kind` box of each DASH
+  /// role its disposition names.
+  TrackUserData,
+  /// The movie's user data: the MOV family's `udta` of its `moov` — MP4's
+  /// and iPod's iTunes metadata, their covers and the Nero chapter list;
+  /// MOV's Nero list.
+  MovieUserData,
+  /// The protection headers: the MOV family's `pssh` boxes, each an
+  /// encryption initialization of a stream's.
+  ProtectionHeaders,
 }
 
 impl fmt::Display for WrittenPart {
@@ -215,6 +236,10 @@ impl fmt::Display for WrittenPart {
       Self::ChunkOffsets => "its chunk offsets",
       Self::TimeToSample => "its time-to-sample table",
       Self::SampleSizes => "its sample sizes",
+      Self::RollGroups => "its roll groups",
+      Self::TrackUserData => "its user data",
+      Self::MovieUserData => "the movie's user data",
+      Self::ProtectionHeaders => "the protection headers",
     };
     f.write_str(name)
   }
@@ -448,8 +473,14 @@ pub(super) struct Summary {
 }
 
 impl Summary {
+  /// The values' count: the laws' seam.
+  #[cfg(feature = "test-support")]
+  pub(super) const fn count(self) -> u64 {
+    self.count
+  }
+
   /// The values' sum, as a length: saturated where no file's could reach.
-  fn sum(self) -> u64 {
+  pub(super) fn sum(self) -> u64 {
     u64::try_from(self.sum).unwrap_or(u64::MAX)
   }
 }
@@ -744,6 +775,95 @@ impl SampleMirror {
   pub(super) fn bytes(&self) -> u64 {
     self.sizes().sum()
   }
+
+  /// The samples movenc writes, as the sample sizes count them.
+  pub(super) fn count(&self) -> u64 {
+    self.sizes().count
+  }
+}
+
+/// A track's roll groups as compared (`mov_preroll_write_stbl_atoms`,
+/// `movenc.c` 3305–3400 in FFmpeg 9.0.1): the groups `sgpd` holds — one a
+/// run of samples of a roll distance other than none, its distance
+/// written negated in 16 bits — and the runs `sbgp` holds, each its
+/// samples and its group's index, none of a run of no distance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RollGroups {
+  /// `sgpd`'s entries, each a value ([`Runs`]).
+  distances: Summary,
+  /// `sbgp`'s entries.
+  runs: u64,
+  /// `sbgp`'s samples, by their group's index ([`Runs`]).
+  samples: Summary,
+}
+
+impl RollGroups {
+  /// What the walk read: `sgpd`'s entries, and `sbgp`'s count and samples.
+  pub(super) const fn read(distances: Summary, runs: u64, samples: Summary) -> Self {
+    Self {
+      distances,
+      runs,
+      samples,
+    }
+  }
+
+  /// The groups `sgpd` holds: the laws' seam.
+  #[cfg(feature = "test-support")]
+  pub(super) const fn groups(&self) -> u64 {
+    self.distances.count
+  }
+
+  /// The runs `sbgp` holds: the laws' seam.
+  #[cfg(feature = "test-support")]
+  pub(super) const fn runs(&self) -> u64 {
+    self.runs
+  }
+}
+
+/// What the muxer counts of a track's roll groups, sample by sample, as
+/// movenc counts them ([`RollGroups`]): a run of samples of one distance
+/// each, a new run of a distance other than none taking the next group's
+/// index — of a distance seen before as well (3352–3358) — and one of none
+/// the index 0. Fields of the track's own, allocating nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct RollMirror {
+  distances: Runs,
+  groups: u64,
+  runs: u64,
+  samples: Runs,
+  /// The open run's distance.
+  open: Option<u16>,
+}
+
+impl RollMirror {
+  /// `count` samples of a roll distance of `distance`, after those before:
+  /// AAC's every sample, of a distance of 1 (3359–3366); Opus's each.
+  pub(super) fn samples(&mut self, distance: u16, count: u64) {
+    if count == 0 {
+      return;
+    }
+    if self.open != Some(distance) {
+      self.open = Some(distance);
+      self.runs += 1;
+      if distance != 0 {
+        self.groups += 1;
+        // `avio_wb16` of the distance negated (3383).
+        self.distances.push(u64::from(distance.wrapping_neg()), 1);
+      }
+    }
+    let index = if distance == 0 { 0 } else { self.groups };
+    self.samples.push(index, count);
+  }
+
+  /// The groups as movenc writes them: `None` where it writes neither box —
+  /// every distance none, or no sample (3323, 3369–3372).
+  pub(super) fn written(&self) -> Option<RollGroups> {
+    (self.groups > 0).then(|| RollGroups {
+      distances: self.distances.summary(),
+      runs: self.runs,
+      samples: self.samples.summary(),
+    })
+  }
 }
 
 /// What a track's sample descriptions carry that the audit judges, by its
@@ -935,7 +1055,7 @@ fn av1c_record_len(config: &[u8], sequence: bool) -> u64 {
 
 /// A track's `trak` as the muxer expects it, in the order movenc writes
 /// them: a track of the muxer's, or movenc's chapter track.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct ExpectedTrak {
   /// The muxer's track, or `None` for the chapter track.
   pub(super) track: Option<TrackIndex>,
@@ -945,6 +1065,99 @@ pub(super) struct ExpectedTrak {
   pub(super) id: u32,
   /// Its sample tables.
   pub(super) samples: SampleMirror,
+  /// Its roll groups, where movenc writes them (A3).
+  pub(super) rolls: Option<RollGroups>,
+  /// Its `udta`'s payload bytes, 0 where movenc writes none (A6).
+  pub(super) user_data: u64,
+}
+
+/// The movie's `udta` as the muxer expects it, by the mode
+/// (`mov_write_udta_tag`, `movenc.c` 5066–5122): its payload's bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum MovieUserData {
+  /// None: AVIF's `moov` holds none (5446–5447), a still AVIF no `moov`.
+  #[default]
+  None,
+  /// MP4's and iPod's: exactly these bytes — the iTunes metadata, the
+  /// covers and the Nero list.
+  Exact(u64),
+  /// MOV's: the Nero list's `len` bytes, and beside them libavformat's
+  /// name in `©swr`, its `name` bytes, or not — the owner's ruling on
+  /// letter 1, (b) — none at all where both are none.
+  NameOptional { len: u64, name: u64 },
+}
+
+/// The movie's parts as the muxer expects them ([`mov_verdict`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ExpectedMovie {
+  /// AVIF's payload: the bytes movenc writes of its track's samples;
+  /// `None` of MP4, MOV and iPod, whose `mdat`'s size is judged against
+  /// the payload the sink took.
+  pub(super) media: Option<u64>,
+  /// The movie's `udta` (A7).
+  pub(super) user_data: MovieUserData,
+  /// The `pssh` boxes, each its payload's bytes, in the order movenc
+  /// writes them (`mov_write_pssh_tag`, 5175–5210; 5449–5451; A1).
+  pub(super) protection: Runs,
+}
+
+/// The first way a track's roll groups as read — `sgpd`'s entries, and
+/// `sbgp`'s count and samples — differ from `expected`: their count, the
+/// runs', the samples' the runs cover, then their content; one box of the
+/// two, the other left out.
+fn rolls_found(
+  expected: Option<RollGroups>,
+  (groups, runs): (Option<Summary>, Option<(u64, Summary)>),
+) -> Option<Found> {
+  let written = match (groups, runs) {
+    (None, None) => None,
+    (Some(distances), Some((runs, samples))) => Some(RollGroups::read(distances, runs, samples)),
+    _ if expected.is_none() => return Some(Found::Count(Counts::new(1, 0))),
+    _ => return Some(Found::Omitted),
+  };
+  let count = |written: u64, wanted: u64| Found::Count(Counts::new(written, wanted));
+  match (expected, written) {
+    (None, None) => None,
+    (None, Some(written)) => Some(count(written.distances.count, 0)),
+    (Some(_), None) => Some(Found::Omitted),
+    (Some(wanted), Some(written)) if written.distances.count != wanted.distances.count => {
+      Some(count(written.distances.count, wanted.distances.count))
+    }
+    (Some(wanted), Some(written)) if written.runs != wanted.runs => {
+      Some(count(written.runs, wanted.runs))
+    }
+    (Some(wanted), Some(written)) if written.samples.count != wanted.samples.count => {
+      Some(count(written.samples.count, wanted.samples.count))
+    }
+    (Some(wanted), Some(written)) => (written != wanted).then_some(Found::Content),
+  }
+}
+
+/// The first way a `udta` as read, its payload's bytes, differs from
+/// `expected`, 0 where none is: written where none is expected, left out,
+/// or of another length.
+fn user_data_found(expected: u64, written: Option<u64>) -> Option<Found> {
+  match (expected, written) {
+    (0, None) => None,
+    (0, Some(_)) => Some(Found::Count(Counts::new(1, 0))),
+    (_, None) => Some(Found::Omitted),
+    (expected, Some(written)) => {
+      (written != expected).then(|| Found::Length(Counts::new(written, expected)))
+    }
+  }
+}
+
+/// The first way the movie's `udta` as read differs from `expected`
+/// ([`MovieUserData`]).
+fn movie_user_data_found(expected: MovieUserData, written: Option<u64>) -> Option<Found> {
+  match (expected, written) {
+    (MovieUserData::None, written) => user_data_found(0, written),
+    (MovieUserData::Exact(len), written) => user_data_found(len, written),
+    (MovieUserData::NameOptional { len, .. }, None) => (len > 0).then_some(Found::Omitted),
+    (MovieUserData::NameOptional { len, name }, Some(written)) => (written != len
+      && written != len + name)
+      .then(|| Found::Length(Counts::new(written, len + name))),
+  }
 }
 
 /// The first difference between what the MOV walk read and what the muxer
@@ -952,8 +1165,9 @@ pub(super) struct ExpectedTrak {
 pub(super) fn mov_verdict(
   audit: &Audit,
   expected: impl Iterator<Item = ExpectedTrak> + Clone,
-  media: Option<u64>,
+  movie: &ExpectedMovie,
 ) -> Option<WrittenOtherwise> {
+  let media = movie.media;
   if let Some(unfollowed) = audit.unfollowed() {
     return Some(WrittenOtherwise::new(
       None,
@@ -1049,6 +1263,21 @@ pub(super) fn mov_verdict(
         Found::Value(Counts::new(first, start)),
       ));
     }
+    // Its roll groups (A3), then its user data (A6).
+    let found = rolls_found(trak.rolls, seen.rolls())
+      .map(|found| (WrittenPart::RollGroups, found))
+      .or_else(|| {
+        user_data_found(trak.user_data, seen.user_data())
+          .map(|found| (WrittenPart::TrackUserData, found))
+      });
+    if let Some((part, found)) = found {
+      let part = if trak.track.is_some() {
+        part
+      } else {
+        WrittenPart::ChapterTrack
+      };
+      return Some(WrittenOtherwise::new(trak.track, part, found));
+    }
   }
   // AVIF's items' records, each its track's description.
   if let Some((item, found)) = walk.item_found() {
@@ -1070,6 +1299,29 @@ pub(super) fn mov_verdict(
         Found::Length(Counts::new(declared, wanted)),
       ));
     }
+  }
+  // The movie's user data (A7), then its protection headers (A1).
+  if let Some(found) = movie_user_data_found(movie.user_data, walk.user_data()) {
+    return Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::MovieUserData,
+      found,
+    ));
+  }
+  let (written, wanted) = (walk.protection(), movie.protection.summary());
+  let found = if written.count != wanted.count {
+    Some(Found::Count(Counts::new(written.count, wanted.count)))
+  } else if written.sum != wanted.sum {
+    Some(Found::Length(Counts::new(written.sum(), wanted.sum())))
+  } else {
+    (written.fold != wanted.fold).then_some(Found::Content)
+  };
+  if let Some(found) = found {
+    return Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::ProtectionHeaders,
+      found,
+    ));
   }
   // AVIF's first item, its extent at the payload's first byte (9192–9195).
   if media.is_some()

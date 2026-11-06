@@ -1206,6 +1206,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     samples: SampleMirror::default(),
     carried: Carried::default(),
     roll: OpusRoll::default(),
+    user_data: 0,
   }
 }
 

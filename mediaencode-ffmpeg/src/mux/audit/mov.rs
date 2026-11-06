@@ -23,8 +23,15 @@
 //! **What it parses:** each `trak`'s `tkhd` id (`mov_write_tkhd_tag`, at
 //! payload offset 12 of version 0 and 20 of version 1) and `mdia`'s `hdlr`
 //! handler type (payload offset 8), which says how its sample entries are
-//! laid out; each `stts` and `stsz` ([`Runs`], and R5's [`CueTables`]); the
-//! `mdat`'s size and the payload the sink took after its header.
+//! laid out; each `stts` and `stsz` ([`Runs`], and R5's [`CueTables`]);
+//! each `sgpd` and `sbgp`, the roll groups (`mov_preroll_write_stbl_atoms`,
+//! 3373–3396): `sgpd`'s entries of 2 bytes after its version, grouping
+//! type, default length and count, `sbgp`'s of 8 after its version,
+//! grouping type and count, each folded ([`Runs`]); the `udta` of the
+//! `moov` and of each `trak`, their payloads' bytes, each written whole
+//! from a dynamic buffer (4380–4384, 5113–5117); each `pssh` of the
+//! `moov`, its payload's bytes (5175–5210); the `mdat`'s size and the
+//! payload the sink took after its header.
 //!
 //! **Each sample description,** as its entry's last byte is read, against
 //! what the muxer handed the tap of it before the trailer ([`Handed`]; R6):
@@ -136,6 +143,10 @@ enum Leaf {
   /// An animated AVIF's chunk offsets, of 32 bits, or of 64.
   Stco,
   Co64,
+  /// A roll group description: AAC's or Opus's roll distances.
+  Sgpd,
+  /// The samples' roll groups: runs of samples, each its group's index.
+  Sbgp,
 }
 
 /// An open box.
@@ -234,6 +245,12 @@ pub(in crate::mux) struct TrakSeen {
   descriptions: Option<(u32, Described, Found)>,
   /// An animated AVIF's: its first chunk's offset.
   first_chunk: Option<u64>,
+  /// Its `sgpd`'s entries ([`Runs`]).
+  groups: Option<Summary>,
+  /// Its `sbgp`'s count and samples, by their group's index ([`Runs`]).
+  runs: Option<(u64, Summary)>,
+  /// Its `udta`'s payload's bytes.
+  user_data: Option<u64>,
 }
 
 /// What of a sample description a difference is in.
@@ -261,6 +278,17 @@ impl TrakSeen {
   /// Its first chunk's offset, where read: an animated AVIF's.
   pub(in crate::mux) const fn first_chunk(&self) -> Option<u64> {
     self.first_chunk
+  }
+
+  /// Its roll groups, as read: `sgpd`'s entries, and `sbgp`'s count and
+  /// samples.
+  pub(in crate::mux) const fn rolls(&self) -> (Option<Summary>, Option<(u64, Summary)>) {
+    (self.groups, self.runs)
+  }
+
+  /// Its `udta`'s payload's bytes, where one is written.
+  pub(in crate::mux) const fn user_data(&self) -> Option<u64> {
+    self.user_data
   }
 
   /// The time-to-sample table, read by R5's rule where `cues`.
@@ -390,6 +418,9 @@ pub(in crate::mux) struct MovWalk {
   media_data: Option<(u64, u64)>,
   /// Whether the `moov` closed.
   moov: bool,
+  /// The `moov`'s `udta`, its payload's bytes; its `pssh` boxes', each.
+  user_data: Option<u64>,
+  protection: Runs,
   /// AVIF's items, as `iloc` holds them: each extent's offset, as read or
   /// patched, and its length; and each item's `av1C` against its track's
   /// description, the first difference.
@@ -422,6 +453,8 @@ impl MovWalk {
       mdat: None,
       media_data: None,
       moov: false,
+      user_data: None,
+      protection: Runs::default(),
       items: [None; ITEMS],
       items_seen: 0,
       item_records: 0,
@@ -467,6 +500,16 @@ impl MovWalk {
   /// and what was found.
   pub(in crate::mux) const fn item_found(&self) -> Option<(usize, Found)> {
     self.item_found
+  }
+
+  /// The `moov`'s `udta`, its payload's bytes, where one is written.
+  pub(in crate::mux) const fn user_data(&self) -> Option<u64> {
+    self.user_data
+  }
+
+  /// The `moov`'s `pssh` boxes, each its payload's bytes.
+  pub(in crate::mux) fn protection(&self) -> Summary {
+    self.protection.summary()
   }
 
   /// The payload's offset in the file: the `mdat`'s first byte past its
@@ -760,6 +803,8 @@ impl MovWalk {
       (b"stbl", b"stsd") => Role::Boxes { prefix: 8 },
       (b"stbl", b"stts") => Role::Leaf(Leaf::Stts),
       (b"stbl", b"stsz") => Role::Leaf(Leaf::Stsz),
+      (b"stbl", b"sgpd") => Role::Leaf(Leaf::Sgpd),
+      (b"stbl", b"sbgp") => Role::Leaf(Leaf::Sbgp),
       (b"stbl", b"stco") if self.mode == MovMode::Avif => Role::Leaf(Leaf::Stco),
       (b"stbl", b"co64") if self.mode == MovMode::Avif => Role::Leaf(Leaf::Co64),
       (b"meta", b"iloc") if self.depth == 1 => Role::Leaf(Leaf::Iloc),
@@ -956,6 +1001,43 @@ impl MovWalk {
           fields.tail = Some(byte);
         }
       }
+      Leaf::Sgpd | Leaf::Sbgp => {
+        // Version and flags, the grouping type, `sgpd`'s default length
+        // (version 1), the count; then the entries, `sgpd`'s each a
+        // distance of 2 bytes, `sbgp`'s each its samples and its group's
+        // index (3373–3396).
+        let (fields, width) = if leaf == Leaf::Sgpd { (16, 2) } else { (12, 8) };
+        if read < fields {
+          if read >= fields - 4 {
+            table.entry[(read + 4 - fields) as usize] = byte;
+          }
+          if read + 1 == fields {
+            let entry = table.entry;
+            table.stated = u64::from(u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]));
+          }
+          return Ok(());
+        }
+        if table.read == table.stated {
+          // Past the entries the box states: no writer's.
+          return Err(Unfollowed::new(pos, Why::Structure));
+        }
+        table.entry[table.have] = byte;
+        table.have += 1;
+        if table.have == width {
+          table.have = 0;
+          table.read += 1;
+          let entry = table.entry;
+          if leaf == Leaf::Sgpd {
+            table
+              .plain
+              .push(u64::from(u16::from_be_bytes([entry[0], entry[1]])), 1);
+          } else {
+            let samples = u64::from(u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]));
+            let index = u64::from(u32::from_be_bytes([entry[4], entry[5], entry[6], entry[7]]));
+            table.plain.push(index, samples);
+          }
+        }
+      }
       Leaf::Stts | Leaf::Stsz => {
         // Version and flags; `stsz`'s uniform size; the count; then the
         // entries.
@@ -1051,6 +1133,39 @@ impl MovWalk {
             trak.sizes = Some(summaries);
           }
         }
+      }
+      Role::Leaf(leaf @ (Leaf::Sgpd | Leaf::Sbgp)) => {
+        let table = &self.table;
+        let fields = if leaf == Leaf::Sgpd { 16 } else { 12 };
+        if frame.read < fields || table.have != 0 || table.read != table.stated {
+          return Err(structure);
+        }
+        let summary = table.plain.summary();
+        let stated = table.stated;
+        if let Some(trak) = self.trak.and_then(|trak| self.traks.get_mut(trak)) {
+          if leaf == Leaf::Sgpd {
+            trak.groups = Some(summary);
+          } else {
+            trak.runs = Some((stated, summary));
+          }
+        }
+      }
+      // The `udta` of the `moov` and of a `trak`, one each at most, and the
+      // `moov`'s `pssh` boxes: their payloads' bytes.
+      Role::Opaque if &frame.fourcc == b"udta" && self.parent_of(index, b"moov") => {
+        if self.user_data.replace(frame.read).is_some() {
+          return Err(structure);
+        }
+      }
+      Role::Opaque if &frame.fourcc == b"udta" && self.parent_of(index, b"trak") => {
+        if let Some(trak) = self.trak.and_then(|trak| self.traks.get_mut(trak))
+          && trak.user_data.replace(frame.read).is_some()
+        {
+          return Err(structure);
+        }
+      }
+      Role::Opaque if &frame.fourcc == b"pssh" && self.parent_of(index, b"moov") => {
+        self.protection.push(frame.read, 1);
       }
       // MP4's `mdat` is closed by its patch alone, which records it; AVIF's
       // is written of its size, read as it closes.

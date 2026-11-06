@@ -139,6 +139,21 @@ fn expected(sizes: &[u32]) -> ExpectedTrak {
     track: Some(TrackIndex::new(0)),
     id: 1,
     samples,
+    ..ExpectedTrak::default()
+  }
+}
+
+/// The movie's parts of an MP4 file of no `udta` and no `pssh`: the
+/// synthetic files'.
+fn mp4() -> ExpectedMovie {
+  ExpectedMovie::default()
+}
+
+/// The movie's parts of an AVIF of `media` bytes of payload.
+fn avif(media: u64) -> ExpectedMovie {
+  ExpectedMovie {
+    media: Some(media),
+    ..ExpectedMovie::default()
   }
 }
 
@@ -155,11 +170,11 @@ fn a_whole_file_passes_and_its_tables_are_judged() {
   assert_eq!(unfollowed(&sink), None);
   let audit = sink.walked();
   assert_eq!(
-    mov_verdict(&audit, [expected(&[4, 5, 4])].into_iter(), None),
+    mov_verdict(&audit, [expected(&[4, 5, 4])].into_iter(), &mp4()),
     None
   );
   assert_eq!(
-    mov_verdict(&audit, [expected(&[4, 6, 4])].into_iter(), None),
+    mov_verdict(&audit, [expected(&[4, 6, 4])].into_iter(), &mp4()),
     Some(WrittenOtherwise::new(
       Some(TrackIndex::new(0)),
       WrittenPart::SampleSizes,
@@ -167,7 +182,7 @@ fn a_whole_file_passes_and_its_tables_are_judged() {
     ))
   );
   assert_eq!(
-    mov_verdict(&audit, [expected(&[5, 4, 4])].into_iter(), None),
+    mov_verdict(&audit, [expected(&[5, 4, 4])].into_iter(), &mp4()),
     Some(WrittenOtherwise::new(
       Some(TrackIndex::new(0)),
       WrittenPart::SampleSizes,
@@ -195,7 +210,7 @@ fn a_table_or_a_trak_left_out_is_named() {
   let audit = sink.walked();
   assert_eq!(audit.unfollowed(), None);
   assert_eq!(
-    mov_verdict(&audit, [expected(&[4, 4])].into_iter(), None),
+    mov_verdict(&audit, [expected(&[4, 4])].into_iter(), &mp4()),
     Some(WrittenOtherwise::new(
       Some(TrackIndex::new(0)),
       WrittenPart::TimeToSample,
@@ -207,10 +222,10 @@ fn a_table_or_a_trak_left_out_is_named() {
   let chapters = ExpectedTrak {
     track: None,
     id: 2,
-    samples: SampleMirror::default(),
+    ..ExpectedTrak::default()
   };
   assert_eq!(
-    mov_verdict(&audit, [expected(&[4, 4]), chapters].into_iter(), None),
+    mov_verdict(&audit, [expected(&[4, 4]), chapters].into_iter(), &mp4()),
     Some(WrittenOtherwise::new(
       None,
       WrittenPart::ChapterTrack,
@@ -218,7 +233,7 @@ fn a_table_or_a_trak_left_out_is_named() {
     ))
   );
   assert_eq!(
-    mov_verdict(&audit, core::iter::empty(), None),
+    mov_verdict(&audit, core::iter::empty(), &mp4()),
     Some(WrittenOtherwise::new(
       None,
       WrittenPart::Structure,
@@ -245,7 +260,7 @@ fn the_mdats_size_is_judged_against_the_payload_taken() {
   let audit = short.walked();
   assert_eq!(audit.unfollowed(), None, "followed: the size judged later");
   assert_eq!(
-    mov_verdict(&audit, [expected(&[36, 36])].into_iter(), None),
+    mov_verdict(&audit, [expected(&[36, 36])].into_iter(), &mp4()),
     Some(WrittenOtherwise::new(
       None,
       WrittenPart::MediaData,
@@ -638,7 +653,7 @@ fn judged_with(sink: &Sink, mode: MovMode, handed: Handed) -> Option<WrittenOthe
   mov_verdict(
     &sink.walked_with(mode, handed),
     [expected(&[4])].into_iter(),
-    None,
+    &mp4(),
   )
 }
 
@@ -1198,9 +1213,9 @@ fn avifs_file_is_walked_and_its_parts_judged() {
   let (sink, start) = still_avif(27, None, &av1c);
   let audit = avif_walked(&sink, handed());
   assert_eq!(audit.unfollowed(), None);
-  assert_eq!(mov_verdict(&audit, core::iter::empty(), Some(27)), None);
+  assert_eq!(mov_verdict(&audit, core::iter::empty(), &avif(27)), None);
   assert_eq!(
-    mov_verdict(&audit, core::iter::empty(), Some(28)),
+    mov_verdict(&audit, core::iter::empty(), &avif(28)),
     Some(WrittenOtherwise::new(
       None,
       WrittenPart::MediaData,
@@ -1212,7 +1227,7 @@ fn avifs_file_is_walked_and_its_parts_judged() {
     mov_verdict(
       &avif_walked(&moved, handed()),
       core::iter::empty(),
-      Some(27)
+      &avif(27)
     ),
     Some(WrittenOtherwise::new(
       None,
@@ -1222,7 +1237,7 @@ fn avifs_file_is_walked_and_its_parts_judged() {
   );
   let (cut, _) = still_avif(27, None, &av1c[..2]);
   assert_eq!(
-    mov_verdict(&avif_walked(&cut, handed()), core::iter::empty(), Some(27)),
+    mov_verdict(&avif_walked(&cut, handed()), core::iter::empty(), &avif(27)),
     named(
       WrittenPart::Configuration(0),
       Found::Length(Counts::new(2, 4))
@@ -1245,7 +1260,7 @@ fn avifs_extent_offset_is_patched_where_it_lies() {
   sink.patch(at + extent, &(start as u32).to_be_bytes());
   let audit = avif_walked(&sink, None);
   assert_eq!(audit.unfollowed(), None);
-  assert_eq!(mov_verdict(&audit, core::iter::empty(), Some(27)), None);
+  assert_eq!(mov_verdict(&audit, core::iter::empty(), &avif(27)), None);
   // In two parts, as a sink takes it.
   let mut parts = Sink::default();
   parts.append(&boxed(b"ftyp", b"avifmif1miafMA1B"));
@@ -1299,19 +1314,337 @@ fn an_animated_avifs_first_chunk_is_judged() {
       track: Some(TrackIndex::new(0)),
       id: 1,
       samples,
+      ..ExpectedTrak::default()
     }]
     .into_iter()
   };
   let (whole, start) = file(None);
   let audit = avif_walked(&whole, None);
   assert_eq!(audit.unfollowed(), None);
-  assert_eq!(mov_verdict(&audit, expected(), Some(8)), None);
+  assert_eq!(mov_verdict(&audit, expected(), &avif(8)), None);
   let (moved, _) = file(Some(start as u32 - 20));
   assert_eq!(
-    mov_verdict(&avif_walked(&moved, None), expected(), Some(8)),
+    mov_verdict(&avif_walked(&moved, None), expected(), &avif(8)),
     named(
       WrittenPart::ChunkOffsets,
       Found::Value(Counts::new(start - 20, start))
     )
+  );
+}
+
+// ---------------------------------------------------------------------------
+//  The protection headers, the user data and the roll groups (A1, A6, A7,
+//  A3).
+// ---------------------------------------------------------------------------
+
+/// An `sgpd` of roll `distances`, each written negated in 16 bits, of
+/// version 1 and a default length of 2 (`movenc.c` 3373–3385).
+fn sgpd(distances: &[u16]) -> Vec<u8> {
+  let mut payload = vec![1, 0, 0, 0];
+  payload.extend_from_slice(b"roll");
+  payload.extend_from_slice(&2u32.to_be_bytes());
+  payload.extend_from_slice(&(distances.len() as u32).to_be_bytes());
+  for distance in distances {
+    payload.extend_from_slice(&distance.wrapping_neg().to_be_bytes());
+  }
+  boxed(b"sgpd", &payload)
+}
+
+/// An `sbgp` of `runs`, each its samples and its group's index
+/// (3387–3396).
+fn sbgp(runs: &[(u32, u32)]) -> Vec<u8> {
+  let mut payload = vec![0; 4];
+  payload.extend_from_slice(b"roll");
+  payload.extend_from_slice(&(runs.len() as u32).to_be_bytes());
+  for &(samples, index) in runs {
+    payload.extend_from_slice(&samples.to_be_bytes());
+    payload.extend_from_slice(&index.to_be_bytes());
+  }
+  boxed(b"sbgp", &payload)
+}
+
+/// What a synthetic file holds beside one audio track's tables: its roll
+/// groups' boxes, its `udta`'s payload, the movie's, and each `pssh`'s.
+#[derive(Clone, Default)]
+struct Parts {
+  sgpd: Option<Vec<u16>>,
+  sbgp: Option<Vec<(u32, u32)>>,
+  track: Option<usize>,
+  movie: Option<usize>,
+  pssh: Vec<usize>,
+}
+
+/// A whole MP4 file of one audio track of `sizes`, each sample one tick, and
+/// `parts`, in movenc's order: the roll groups last in the `stbl`, the
+/// track's `udta` last in its `trak`, the movie's after the `trak`s, then
+/// the `pssh` boxes (4380–4441, 5446–5451).
+fn whole_with(sizes: &[u32], parts: &Parts) -> Sink {
+  let mut sink = Sink::default();
+  let mdat = header(&mut sink);
+  let payload: u32 = sizes.iter().sum();
+  sink.append(&vec![0x21; payload as usize]);
+  sink.close(mdat);
+  let mut stbl = [
+    boxed(b"stsd", &[0; 8]),
+    stts(&[(sizes.len() as u32, 1)]),
+    stsz(sizes),
+    boxed(b"stco", &[0; 8]),
+  ]
+  .concat();
+  if let Some(distances) = &parts.sgpd {
+    stbl.extend(sgpd(distances));
+  }
+  if let Some(runs) = &parts.sbgp {
+    stbl.extend(sbgp(runs));
+  }
+  let minf = [boxed(b"smhd", &[0; 8]), boxed(b"stbl", &stbl)].concat();
+  let mdia = [hdlr(b"soun"), boxed(b"minf", &minf)].concat();
+  let mut trak = [tkhd(1), boxed(b"mdia", &mdia)].concat();
+  if let Some(len) = parts.track {
+    trak.extend(boxed(b"udta", &vec![0x55; len]));
+  }
+  let mut moov = boxed(b"trak", &trak);
+  if let Some(len) = parts.movie {
+    moov.extend(boxed(b"udta", &vec![0x56; len]));
+  }
+  for &len in &parts.pssh {
+    moov.extend(boxed(b"pssh", &vec![0x57; len]));
+  }
+  sink.append(&boxed(b"moov", &moov));
+  sink
+}
+
+/// AAC's roll groups of `samples` samples, as the muxer counts them: one
+/// group of a distance of 1.
+fn aac_groups(samples: u64) -> Option<RollGroups> {
+  let mut groups = RollMirror::default();
+  groups.samples(1, samples);
+  groups.written()
+}
+
+/// The movie's parts the muxer expects: MP4's `udta` of `user_data` bytes
+/// and a `pssh` of each of `pssh`'s payload bytes.
+fn movie_of(user_data: MovieUserData, pssh: &[u64]) -> ExpectedMovie {
+  let mut protection = Runs::default();
+  for &len in pssh {
+    protection.push(len, 1);
+  }
+  ExpectedMovie {
+    media: None,
+    user_data,
+    protection,
+  }
+}
+
+/// **The roll groups, a track's and the movie's user data and the
+/// protection headers are each judged, a part left out named** (A3, A6,
+/// A7, A1): a file of AAC's roll groups, a track `udta` of a DASH role, the
+/// movie's `udta` and two `pssh` boxes passes as handed; without the roll
+/// groups, the track's roll groups are named, omitted; without its `udta`,
+/// the track's user data; without the movie's, the movie's user data;
+/// without a `pssh`, the protection headers by their count, and one of
+/// another length by their bytes. A track's parts are named before the
+/// movie's.
+#[test]
+fn the_roll_groups_user_data_and_protection_headers_are_judged() {
+  let whole = Parts {
+    sgpd: Some(vec![1]),
+    sbgp: Some(vec![(3, 1)]),
+    track: Some(44),
+    movie: Some(100),
+    pssh: vec![60, 70],
+  };
+  let trak = || ExpectedTrak {
+    rolls: aac_groups(3),
+    user_data: 44,
+    ..expected(&[4, 5, 4])
+  };
+  let movie = movie_of(MovieUserData::Exact(100), &[60, 70]);
+  let judged = |parts: &Parts| {
+    let audit = whole_with(&[4, 5, 4], parts).walked();
+    assert_eq!(audit.unfollowed(), None);
+    mov_verdict(&audit, [trak()].into_iter(), &movie)
+  };
+  assert_eq!(judged(&whole), None);
+  let without = |change: fn(&mut Parts)| {
+    let mut parts = whole.clone();
+    change(&mut parts);
+    judged(&parts)
+  };
+  assert_eq!(
+    without(|parts| (parts.sgpd, parts.sbgp) = (None, None)),
+    named(WrittenPart::RollGroups, Found::Omitted)
+  );
+  assert_eq!(
+    without(|parts| parts.track = None),
+    named(WrittenPart::TrackUserData, Found::Omitted)
+  );
+  assert_eq!(
+    without(|parts| (parts.track, parts.movie) = (None, None)),
+    named(WrittenPart::TrackUserData, Found::Omitted),
+    "the track's first"
+  );
+  let file = |part: WrittenPart, found: Found| Some(WrittenOtherwise::new(None, part, found));
+  assert_eq!(
+    without(|parts| parts.movie = None),
+    file(WrittenPart::MovieUserData, Found::Omitted)
+  );
+  assert_eq!(
+    without(|parts| parts.movie = Some(99)),
+    file(
+      WrittenPart::MovieUserData,
+      Found::Length(Counts::new(99, 100))
+    )
+  );
+  assert_eq!(
+    without(|parts| parts.pssh = vec![60]),
+    file(
+      WrittenPart::ProtectionHeaders,
+      Found::Count(Counts::new(1, 2))
+    )
+  );
+  assert_eq!(
+    without(|parts| parts.pssh = vec![60, 71]),
+    file(
+      WrittenPart::ProtectionHeaders,
+      Found::Length(Counts::new(131, 130))
+    )
+  );
+  assert_eq!(
+    without(|parts| parts.pssh = vec![70, 60]),
+    file(WrittenPart::ProtectionHeaders, Found::Content)
+  );
+}
+
+/// **MOV's movie `udta` passes with libavformat's name or without** (the
+/// owner's ruling on letter 1, (b)): of its Nero list alone, or of the list
+/// and the name, it passes; of another length it is named against both;
+/// left out, where the list is some, it is omitted; where the list is
+/// none, no `udta` at all passes, as does one of the name alone.
+#[test]
+fn movs_movie_udta_passes_with_libavformats_name_or_without() {
+  let judged = |movie: Option<usize>, len: u64| {
+    let parts = Parts {
+      movie,
+      ..Parts::default()
+    };
+    let audit = whole_with(&[4], &parts).walked();
+    let expected = movie_of(MovieUserData::NameOptional { len, name: 24 }, &[]);
+    mov_verdict(&audit, [expected_one(4)].into_iter(), &expected)
+  };
+  assert_eq!(judged(Some(20), 20), None, "the Nero list alone");
+  assert_eq!(judged(Some(44), 20), None, "the list and the name");
+  assert_eq!(
+    judged(Some(30), 20),
+    Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::MovieUserData,
+      Found::Length(Counts::new(30, 44))
+    ))
+  );
+  assert_eq!(
+    judged(None, 20),
+    Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::MovieUserData,
+      Found::Omitted
+    ))
+  );
+  assert_eq!(judged(None, 0), None, "no list, no name: none");
+  assert_eq!(judged(Some(24), 0), None, "the name alone");
+}
+
+/// The expectation of one sample of `size` bytes, as [`whole_with`] writes
+/// it.
+fn expected_one(size: u32) -> ExpectedTrak {
+  expected(&[size])
+}
+
+/// **The roll groups are judged by their groups' count, their runs', then
+/// their content** (A3): groups where the muxer expects none are named by
+/// their count; one run moved into two, by the runs'; a group of another
+/// distance, by the content; the `sgpd` without its `sbgp`, omitted; and
+/// an `sgpd` stating more entries than its payload holds is a structure no
+/// writer makes.
+#[test]
+fn the_roll_groups_are_judged_by_count_runs_then_content() {
+  let judged = |parts: &Parts, rolls: Option<RollGroups>| {
+    let audit = whole_with(&[4, 5, 4], parts).walked();
+    assert_eq!(audit.unfollowed(), None);
+    let trak = ExpectedTrak {
+      rolls,
+      ..expected(&[4, 5, 4])
+    };
+    mov_verdict(&audit, [trak].into_iter(), &mp4())
+  };
+  let aac = Parts {
+    sgpd: Some(vec![1]),
+    sbgp: Some(vec![(3, 1)]),
+    ..Parts::default()
+  };
+  assert_eq!(judged(&aac, aac_groups(3)), None);
+  assert_eq!(
+    judged(&aac, None),
+    named(WrittenPart::RollGroups, Found::Count(Counts::new(1, 0)))
+  );
+  let split = Parts {
+    sbgp: Some(vec![(2, 1), (1, 1)]),
+    ..aac.clone()
+  };
+  assert_eq!(
+    judged(&split, aac_groups(3)),
+    named(WrittenPart::RollGroups, Found::Count(Counts::new(2, 1)))
+  );
+  let other = Parts {
+    sgpd: Some(vec![2]),
+    ..aac.clone()
+  };
+  assert_eq!(
+    judged(&other, aac_groups(3)),
+    named(WrittenPart::RollGroups, Found::Content)
+  );
+  let lone = Parts {
+    sbgp: None,
+    ..aac.clone()
+  };
+  assert_eq!(
+    judged(&lone, aac_groups(3)),
+    named(WrittenPart::RollGroups, Found::Omitted)
+  );
+  // Opus's: distances 0, 4, 4, 3 and 4 again, a group a run of a distance
+  // other than none, the second 4 its own.
+  let mut opus = RollMirror::default();
+  for distance in [0, 0, 4, 4, 3, 4] {
+    opus.samples(distance, 1);
+  }
+  let parts = Parts {
+    sgpd: Some(vec![4, 3, 4]),
+    sbgp: Some(vec![(2, 0), (2, 1), (1, 2), (1, 3)]),
+    ..Parts::default()
+  };
+  let audit = whole_with(&[4, 4, 4, 4, 4, 4], &parts).walked();
+  let trak = ExpectedTrak {
+    rolls: opus.written(),
+    ..expected(&[4, 4, 4, 4, 4, 4])
+  };
+  assert_eq!(mov_verdict(&audit, [trak].into_iter(), &mp4()), None);
+  // More entries stated than the payload holds.
+  let mut short = sgpd(&[1, 1]);
+  // The count's last byte: the box's header, then 15 bytes of fields.
+  short[23] = 3;
+  let mut sink = Sink::default();
+  let mdat = header(&mut sink);
+  sink.append(&[0x21; 4]);
+  sink.close(mdat);
+  let stbl = [boxed(b"stsd", &[0; 8]), stts(&[(1, 1)]), stsz(&[4]), short].concat();
+  let mdia = [hdlr(b"soun"), boxed(b"minf", &boxed(b"stbl", &stbl))].concat();
+  let trak = [tkhd(1), boxed(b"mdia", &mdia)].concat();
+  sink.append(&boxed(b"moov", &boxed(b"trak", &trak)));
+  assert_eq!(
+    sink
+      .walked()
+      .unfollowed()
+      .map(|unfollowed| unfollowed.why()),
+    Some(Why::Structure)
   );
 }

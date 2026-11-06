@@ -33,15 +33,24 @@ crate moves only when it changes.
   against its samples' bytes, its first item's extent offset and an
   animated track's first chunk offset against the payload's first byte,
   and its item's `av1C` (`WrittenPart::MediaData`,
-  `WrittenPart::ItemLocation`, `WrittenPart::ChunkOffsets`). A `mov_text`
+  `WrittenPart::ItemLocation`, `WrittenPart::ChunkOffsets`); each track's
+  roll groups, `sgpd` and `sbgp` — AAC's one group, Opus's distances as
+  movenc counts them (`WrittenPart::RollGroups`) — and MP4's track `udta`
+  of its DASH roles (`WrittenPart::TrackUserData`); the movie's `udta`,
+  MP4's and iPod's exactly, MOV's of its Nero list with libavformat's own
+  `©swr` or without, by the owner's ruling on letter 1
+  (`WrittenPart::MovieUserData`); and the `pssh` boxes, each stream's
+  encryption initializations as libavutil parses them, all or none
+  (`WrittenPart::ProtectionHeaders`). A `mov_text`
   track's tables are read by one rule on both sides, which the end samples
   libavformat's interleaving makes movenc write leave unchanged (the
   coordinator's ruling R5). With the new `test-support` feature,
   forwarding to the base's: `CarrierMuxer::open_hooked` and `OpenHooks`,
   what a law runs inside the open — around the header, around each
   packet's take, or a plant over the bytes the sink takes; hidden: `MuxOptions::with_audit`,
-  `CarrierMuxer::audited_bytes`, `expected_records`, `expected_palettes`
-  and `expected_chapter_samples`, the laws' seams.
+  `CarrierMuxer::audited_bytes`, `expected_records`, `expected_palettes`,
+  `expected_chapter_samples`, `expected_movie_user_data`,
+  `expected_protection` and `expected_roll_groups`, the laws' seams.
 - **Opus's roll distance past 32, refused by name** (the coordinator's
   ruling R2 on the write audit's F4): MP4 counts each Opus sample's roll
   distance — the samples before it whose durations reach 80 ms — and past

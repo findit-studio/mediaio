@@ -21409,14 +21409,16 @@ fn long_aac(corpus: &Corpus) -> PathBuf {
 /// B configuration, AV1 (and into AVIF, animated, and a still AVIF of its
 /// first frame), VP9, AC-3, E-AC-3, PCM of a constant size, Opus,
 /// `mov_text` in milliseconds and in microseconds, TTML, AAC long enough
-/// that its `moov` passes 32 KiB, chapters, and frames of no duration,
-/// whose last libavformat guesses — each finishes `Ok`, the audit's tap
-/// having walked the file. Every other law of this lane writes with the
+/// that its `moov` passes 32 KiB, chapters — MOV's Nero list beside
+/// libavformat's `©swr` among them — a DASH role in a track's `udta`, and
+/// frames of no duration, whose last libavformat guesses — each finishes
+/// `Ok`, the audit's tap having walked the file. Every other law of this lane writes with the
 /// audit on as well, so that each file one writes whole passes it too:
 /// their passing is the rest of this law.
 ///
 /// PLANT P613: a size of 0 read as final. PLANT P614: the last duration
-/// taken as offered, not handed.
+/// taken as offered, not handed. PLANT P615: AAC's roll groups not
+/// expected. PLANT P617: `udta_bytes` without `©too`.
 #[test]
 fn l216_the_write_audit_passes_every_file_ffmpeg_writes_whole() {
   let Some(corpus) = Corpus::new() else { return };
@@ -21487,6 +21489,44 @@ fn l216_the_write_audit_passes_every_file_ffmpeg_writes_whole() {
     );
   }
   muxer.finish().expect("chapters, finished");
+
+  // MOV's movie `udta`: libavformat's `©swr` beside the Nero list (the
+  // owner's ruling on letter 1, (b)).
+  let (table, packets) = whole_track(&aac, TrackKind::Audio);
+  let mut muxer = FfmpegOwnedMuxer::open(
+    File::create(output(&corpus, "l216-chapters.mov")).expect("create"),
+    ContainerName::new("mov"),
+    table,
+    &chapters,
+    PacketLimits::default(),
+  )
+  .expect("open")
+  .0;
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+  }
+  muxer.finish().expect("MOV's chapters, finished");
+
+  // MP4's track `udta`: a DASH role's `kind` box.
+  let (table, packets) = whole_track(&aac, TrackKind::Audio);
+  let table = table
+    .into_iter()
+    .map(|row| {
+      let disposition = row.disposition();
+      row.with_disposition(disposition | TrackDisposition::CAPTIONS)
+    })
+    .collect();
+  let mut muxer = muxer_into(&output(&corpus, "l216-role.mp4"), ContainerName::MP4, table);
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+  }
+  muxer.finish().expect("a DASH role, finished");
 
   // Frames of no duration: the last's is libavformat's guess.
   let (table, frames) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 10);
@@ -23136,4 +23176,377 @@ fn r2_a_roll_distance_of_exactly_32_is_taken() {
     .collect();
   assert_eq!(runs, vec![(32, 0), (8, 1)]);
   assert_eq!(sbgp + 12 + 16, sbgp_end, "nothing after them");
+}
+
+// ---------------------------------------------------------------------------
+//  The protection headers, the user data and the roll groups audited (A1,
+//  A6, A7, A3).
+// ---------------------------------------------------------------------------
+
+/// The first `trak`'s roll groups FFmpeg wrote into `path`: `sgpd`'s
+/// distances as written, negated, and `sbgp`'s runs, each its samples and
+/// its group's index; empty where the box is not written
+/// (`mov_preroll_write_stbl_atoms`, `movenc.c` 3373–3396).
+#[cfg(feature = "test-support")]
+fn written_rolls(path: &Path) -> (Vec<i16>, Vec<(u32, u32)>) {
+  let bytes = std::fs::read(path).expect("the file");
+  let word = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("a word"));
+  let (moov, moov_end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("moov");
+  let (trak, trak_end, _) = box_in(&bytes, (moov, moov_end), b"trak").expect("trak");
+  let (mdia, mdia_end, _) = box_in(&bytes, (trak, trak_end), b"mdia").expect("mdia");
+  let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+  let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+  let distances = box_in(&bytes, (stbl, stbl_end), b"sgpd").map_or_else(Vec::new, |(sgpd, ..)| {
+    (0..word(sgpd + 12) as usize)
+      .map(|at| i16::from_be_bytes([bytes[sgpd + 16 + 2 * at], bytes[sgpd + 17 + 2 * at]]))
+      .collect()
+  });
+  let runs = box_in(&bytes, (stbl, stbl_end), b"sbgp").map_or_else(Vec::new, |(sbgp, ..)| {
+    (0..word(sbgp + 8) as usize)
+      .map(|at| (word(sbgp + 12 + 8 * at), word(sbgp + 16 + 8 * at)))
+      .collect()
+  });
+  (distances, runs)
+}
+
+/// The first `count` AAC frames of three minutes' AAC into MP4 at `name`,
+/// the track's row as `edit` makes it: the muxer, and the frames written.
+fn aac_written(
+  corpus: &Corpus,
+  name: &str,
+  count: usize,
+  edit: impl Fn(Described) -> Described,
+) -> FfmpegOwnedMuxer<File> {
+  let (table, packets) = first_track(&long_aac(corpus), TrackKind::Audio, count);
+  assert_eq!(packets.len(), count, "the premise: {count} frames");
+  let mut muxer = muxer_into(
+    &output(corpus, name),
+    ContainerName::MP4,
+    table.into_iter().map(edit).collect(),
+  );
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "an AAC frame",
+    );
+  }
+  muxer
+}
+
+/// **L225 — A1: a `pssh` movenc leaves out is named, the file not passed**
+/// (findit-studio/mediaio#95). In a process of its own: 50 AAC frames into
+/// MP4, the track's ticket carrying one encryption initialization of no key
+/// id and 102 400 bytes of data, then libavutil's allocations capped at
+/// 51 200 bytes before `finish`. At the trailer movenc parses the side data
+/// again and copies its data, past the cap: the parse answers none, and no
+/// `pssh` is written, success answered (`av_encryption_init_info_alloc`,
+/// `libavutil/encryption_info.c` 193; 264–268; `mov_write_pssh_tag`,
+/// `movenc.c` 5184). The trailer's other allocations stay under the cap:
+/// `stts`'s entries, 8 bytes a sample (400), AAC's roll groups', 12 (600),
+/// each `udta`'s dynamic buffer, one block of its I/O context, its state
+/// and 1 024 bytes (`aviobuf.c` 1344–1362), and the parse's own info and
+/// system id. Named: the protection headers, by their count — none of one.
+#[cfg(feature = "test-support")]
+#[test]
+fn l225_a_pssh_movenc_leaves_out_is_named() {
+  in_its_own_process("l225_in_a_process_of_its_own");
+}
+
+/// L225's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l225_in_a_process_of_its_own() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  if !alone_for("l225_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let init = encryption_init_info(&[(16, 0, 16, 102_400)]);
+  let muxer = aac_written(&corpus, "l225.mp4", 50, |row| {
+    with_coded(row, T::AV_PKT_DATA_ENCRYPTION_INIT_INFO, &init)
+  });
+  assert_eq!(
+    muxer.expected_protection(),
+    (1, 12 + 16 + 102_400),
+    "the premise: one pssh, its payload past the cap"
+  );
+  cap(51_200);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the pssh left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((None, WrittenPart::ProtectionHeaders, Finding::Count(0, 1)))
+  );
+}
+
+/// **L231 — A7: a movie `udta` movenc leaves out is named, the file not
+/// passed** (findit-studio/mediaio#95). In a process of its own: 50 AAC
+/// frames into MP4, of no role, then libavutil's allocations capped at
+/// 1 000 bytes before `finish`. At the trailer movenc opens the movie
+/// `udta`'s dynamic buffer — one block of its I/O context, its state and
+/// 1 024 bytes of buffer (`url_open_dyn_buf_internal`, `aviobuf.c`
+/// 1344–1362) — past the cap: the open's failure is returned and discarded
+/// (`mov_write_udta_tag`, `movenc.c` 5072–5074; 5448), and the `moov` holds
+/// no `udta`, its iTunes metadata lost. The track's `udta`, of no role, is
+/// none either way; `stts`'s 400 bytes and AAC's roll groups' 600 stay
+/// under the cap. Named: the movie's user data, omitted.
+#[test]
+fn l231_a_movie_udta_movenc_leaves_out_is_named() {
+  in_its_own_process("l231_in_a_process_of_its_own");
+}
+
+/// L231's body, alone in its process.
+#[test]
+fn l231_in_a_process_of_its_own() {
+  if !alone_for("l231_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let muxer = aac_written(&corpus, "l231.mp4", 50, |row| row);
+  cap(1_000);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the udta left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((None, WrittenPart::MovieUserData, Finding::Omitted))
+  );
+}
+
+/// **L232 — A6: a track `udta` movenc leaves out is named, before the
+/// movie's** (findit-studio/mediaio#95). In a process of its own: L231's
+/// file, its AAC track of the captions disposition, which MP4 writes as the
+/// DASH role `caption` in a `kind` box of the track's `udta`
+/// (`mov_write_track_kinds`, `movenc.c` 4338–4356; `isom.c` 450–452), the
+/// same cap: the track's dynamic buffer refused first, its open's failure
+/// returned and discarded (4369–4371; 4441), the `trak` written without its
+/// `udta`, the role lost; the movie's after it, lost as L231's. Named: the
+/// track's user data, omitted — the track's part before the movie's.
+#[test]
+fn l232_a_track_udta_movenc_leaves_out_is_named() {
+  in_its_own_process("l232_in_a_process_of_its_own");
+}
+
+/// L232's body, alone in its process.
+#[test]
+fn l232_in_a_process_of_its_own() {
+  if !alone_for("l232_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let muxer = aac_written(&corpus, "l232.mp4", 50, |row| {
+    let disposition = row.disposition();
+    row.with_disposition(disposition | TrackDisposition::CAPTIONS)
+  });
+  cap(1_000);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the track's udta left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::TrackUserData,
+      Finding::Omitted
+    ))
+  );
+}
+
+/// **L233 — A3: roll groups movenc leaves out are named**
+/// (findit-studio/mediaio#95). In a process of its own: 200 AAC frames into
+/// MP4, then libavutil's allocations capped at 2 000 bytes before
+/// `finish`. At the trailer movenc allocates the roll groups' entries, 12
+/// bytes a sample — 2 400, past the cap — and writes neither `sgpd` nor
+/// `sbgp`, its answer dropped (`mov_preroll_write_stbl_atoms`, `movenc.c`
+/// 3326–3328; 3436): seeking the track decodes it with no preroll. `stts`'s
+/// entries, 1 600 bytes, stay under the cap; each `udta`'s dynamic buffer,
+/// under it or not, is named after the track's groups. Named: track 0's
+/// roll groups, omitted.
+#[test]
+fn l233_roll_groups_movenc_leaves_out_are_named() {
+  in_its_own_process("l233_in_a_process_of_its_own");
+}
+
+/// L233's body, alone in its process.
+#[test]
+fn l233_in_a_process_of_its_own() {
+  if !alone_for("l233_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let muxer = aac_written(&corpus, "l233.mp4", 200, |row| row);
+  cap(2_000);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the roll groups left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::RollGroups,
+      Finding::Omitted
+    ))
+  );
+}
+
+/// **A3 — Opus's roll groups as movenc counts them, each new run its own
+/// group** (findit-studio/mediaio#95; `mov_preroll_write_stbl_atoms`,
+/// `movenc.c` 3330–3396): 30 Opus packets into MP4, decoded at steps of
+/// 960 ticks (nine), 1 280 (ten), then 960 (ten), each lasting its step —
+/// 3 840 ticks reached by four steps of 960 or three of 1 280 — so that
+/// their distances run none four times, 4 eight times, 3 eight and 4 ten,
+/// the last run's 4 a group of its own beside the first's (3352–3358):
+/// every packet taken, the muxer's mirror counting three groups and four
+/// runs; `finish` `Ok`, the audit agreeing; the file's `sgpd` holding −4,
+/// −3 and −4, its `sbgp` the runs (4, 0), (8, 1), (8, 2) and (10, 3), read
+/// back.
+///
+/// PLANT P616: a run of a distance seen before keeps its first group's
+/// index.
+#[cfg(feature = "test-support")]
+#[test]
+fn a3_opus_roll_groups_each_new_run_its_own_group() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (table, packets) = first_track(&opus_mkv(&corpus), TrackKind::Audio, 1);
+  let frame = audio_of(&packets[0]);
+  let target = output(&corpus, "a3-opus.mp4");
+  let mut muxer = muxer_into(&target, ContainerName::MP4, table);
+  let mut dts = 0;
+  for step in [960; 9].into_iter().chain([1_280; 10]).chain([960; 11]) {
+    wrote(
+      muxer.write_audio(audio_ticks(&frame, dts, step)),
+      "a packet",
+    );
+    dts += step;
+  }
+  // The mirror's count, read before `finish`, which the audit judges
+  // first.
+  let mirrored = muxer.expected_roll_groups();
+  muxer.finish().expect("finished");
+  assert_eq!(mirrored, vec![(TrackIndex::new(0), 3, 4)]);
+  assert_eq!(
+    written_rolls(&target),
+    (vec![-4, -3, -4], vec![(4, 0), (8, 1), (8, 2), (10, 3)])
+  );
+}
+
+/// **Gate condition 7 — Opus's roll groups' mirror against the bytes
+/// FFmpeg wrote, at a distance of exactly 32 and a run of none at the
+/// start** (`mov_preroll_write_stbl_atoms`, `movenc.c` 3330–3396): R2's
+/// timeline of 2.5 ms packets, 120 ticks apart: the muxer's mirror counts
+/// one group and two runs, as the file's `sgpd` and `sbgp` read back hold
+/// them — −32, and (32, 0), (8, 1).
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_opus_roll_groups_read_back_as_their_mirror_counts_them() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (mut muxer, packets) = opus_every(&corpus, "gate7-opus.mp4", 120, 40);
+  for packet in &packets {
+    wrote(muxer.write_audio(packet.clone()), "a packet");
+  }
+  let mirrored = muxer.expected_roll_groups();
+  muxer.finish().expect("finished");
+  assert_eq!(mirrored, vec![(TrackIndex::new(0), 1, 2)]);
+  assert_eq!(
+    written_rolls(&output(&corpus, "gate7-opus.mp4")),
+    (vec![-32], vec![(32, 0), (8, 1)])
+  );
+}
+
+/// **Gate condition 7 — the movie `udta`'s mirror against the bytes
+/// FFmpeg wrote, of two covers and 300 chapters** (`udta_bytes`;
+/// `mov_write_udta_tag`, `movenc.c` 5066–5122; `mov_write_chpl_tag`,
+/// 5040–5064): an MP3's cover twice and 300 chapters whose titles run 0,
+/// 1, 255 and 300 bytes in turn — the Nero list cut at 255 chapters and
+/// each title at 255 bytes — into MP4: the muxer's count of the `udta`'s
+/// payload equals the `udta` FFmpeg wrote, read back from the file, less
+/// its 8 bytes; `finish` `Ok`, the audit agreeing.
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_the_movie_udta_reads_back_as_its_mirror_counts_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (table, packets) = two_covers(&corpus.cover_art_mp3());
+  let (long, longer) = ("t".repeat(255), "u".repeat(300));
+  let titles = ["", "a", long.as_str(), longer.as_str()];
+  let chapters: Vec<Chapter<Ffmpeg>> = (0..300)
+    .map(|index| {
+      chapter_of(
+        index,
+        index * 10,
+        index * 10 + 10,
+        Some(titles[index as usize % 4]),
+      )
+    })
+    .collect();
+  let target = output(&corpus, "gate7-udta.mp4");
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table,
+    &chapters,
+    PacketLimits::default(),
+  )
+  .expect("open");
+  let counted = muxer.expected_movie_user_data().expect("MP4's, exact");
+  for packet in packets {
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  muxer.finish().expect("finished");
+  assert_eq!(written_udta(&target) - 8, counted);
+}
+
+/// **Gate condition 7 — the `pssh` boxes' mirror against the bytes FFmpeg
+/// wrote, of two streams carrying the same side data and an initialization
+/// of no key ids and no data** (`pssh_written`; `mov_write_pssh_tag`,
+/// `movenc.c` 5175–5210; 5449–5451): H.264 and AAC into MP4, each track's
+/// ticket carrying three initializations — one key id of 16 bytes and 64
+/// of data, none and none (skipped, 5190), none and 32 of data: the
+/// muxer's count, four boxes, and their payloads' bytes equal the `pssh`
+/// boxes read back from the `moov`; `finish` `Ok`, the audit agreeing.
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_the_pssh_boxes_read_back_as_their_mirror_counts_them() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let init = encryption_init_info(&[(16, 1, 16, 64), (16, 0, 16, 0), (16, 0, 16, 32)]);
+  let h264 = h264_aac(&corpus, "h264-aac.mp4");
+  let target = output(&corpus, "gate7-pssh.mp4");
+  let table: Vec<Described> = whole_table(&h264)
+    .into_iter()
+    .map(|row| with_coded(row, T::AV_PKT_DATA_ENCRYPTION_INIT_INFO, &init))
+    .collect();
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  let counted = muxer.expected_protection();
+  let mut demuxer = FfmpegOwnedDemuxer::open(&h264).expect("open");
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  muxer.finish().expect("finished");
+  let bytes = std::fs::read(&target).expect("the file");
+  let (body, end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("a moov");
+  let boxes: Vec<u64> = boxes_of(&bytes, body, end)
+    .into_iter()
+    .filter(|(kind, _, _)| kind == b"pssh")
+    .map(|(_, _, size)| size - 8)
+    .collect();
+  assert_eq!(boxes, [108, 60, 108, 60], "two streams' two boxes each");
+  assert_eq!(counted, (4, boxes.iter().sum::<u64>()));
 }
