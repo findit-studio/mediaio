@@ -645,8 +645,9 @@ enum Walk {
   Mov(Box<MovWalk>),
   /// FLV's tags.
   Flv(FlvWalk),
-  /// Matroska's and WebM's elements.
-  Mkv(MkvWalk),
+  /// Matroska's and WebM's elements: its regions and its Tracks' reading,
+  /// boxed, once, at open, as the MOV family's walk is.
+  Mkv(Box<MkvWalk>),
   /// Raw FLAC's metadata blocks.
   Flac(FlacWalk),
 }
@@ -679,7 +680,7 @@ impl Audit {
     Self {
       frontier: 0,
       unfollowed: None,
-      walk: Walk::Mkv(MkvWalk::new(tracks)),
+      walk: Walk::Mkv(Box::new(MkvWalk::new(tracks))),
     }
   }
 
@@ -730,7 +731,7 @@ impl Audit {
   /// The Matroska walk, where this tap walks Matroska or WebM.
   pub(super) fn mkv_walk(&self) -> Option<&MkvWalk> {
     match &self.walk {
-      Walk::Mkv(walk) => Some(walk),
+      Walk::Mkv(walk) => Some(walk.as_ref()),
       Walk::Mov(_) | Walk::Flv(_) | Walk::Flac(_) => None,
     }
   }
