@@ -132,12 +132,15 @@ use super::{
 };
 
 mod flv;
+mod mkv;
 mod mov;
 #[cfg(test)]
 mod tests;
 
 pub(super) use flv::FlvTrack;
 use flv::FlvWalk;
+pub(super) use mkv::MkvTrack;
+use mkv::MkvWalk;
 use mov::{Described, MovWalk};
 
 /// What FFmpeg wrote otherwise than it was handed, answering success: an
@@ -231,6 +234,9 @@ pub enum WrittenPart {
   Dependencies,
   /// A track's frames: FLV's tags of coded frames, each its data size.
   Frames,
+  /// A track's channel mask: FLAC's `WAVEFORMATEXTENSIBLE_CHANNEL_MASK`
+  /// comment, which Matroska writes in the track's CodecPrivate.
+  ChannelMask,
   /// A track's roll groups: the MOV family's `sgpd` and `sbgp`, AAC's one
   /// group of every sample or Opus's roll distances.
   RollGroups,
@@ -262,6 +268,7 @@ impl fmt::Display for WrittenPart {
       Self::TimeToSample => "its time-to-sample table",
       Self::SampleSizes => "its sample sizes",
       Self::Frames => "its frames",
+      Self::ChannelMask => "its channel mask",
       Self::SyncSamples => "its sync samples",
       Self::Dependencies => "its samples' dependencies",
       Self::RollGroups => "its roll groups",
@@ -617,6 +624,8 @@ enum Walk {
   Mov(MovWalk),
   /// FLV's tags.
   Flv(FlvWalk),
+  /// Matroska's and WebM's elements.
+  Mkv(MkvWalk),
 }
 
 impl Audit {
@@ -641,6 +650,16 @@ impl Audit {
     }
   }
 
+  /// A tap over a Matroska or WebM file of `tracks`, in TrackEntry order:
+  /// its table allocated here, at open.
+  pub(super) fn mkv(tracks: &[MkvTrack]) -> Self {
+    Self {
+      frontier: 0,
+      unfollowed: None,
+      walk: Walk::Mkv(MkvWalk::new(tracks)),
+    }
+  }
+
   /// The bytes appended so far.
   pub(super) const fn frontier(&self) -> u64 {
     self.frontier
@@ -655,6 +674,7 @@ impl Audit {
     match &self.walk {
       Walk::Mov(walk) => walk.unfinished(self.frontier),
       Walk::Flv(walk) => walk.unfinished(self.frontier),
+      Walk::Mkv(walk) => walk.unfinished(self.frontier),
     }
   }
 
@@ -662,7 +682,7 @@ impl Audit {
   pub(super) fn mov_walk(&self) -> Option<&MovWalk> {
     match &self.walk {
       Walk::Mov(walk) => Some(walk),
-      Walk::Flv(_) => None,
+      Walk::Flv(_) | Walk::Mkv(_) => None,
     }
   }
 
@@ -670,7 +690,15 @@ impl Audit {
   pub(super) fn flv_walk(&self) -> Option<&FlvWalk> {
     match &self.walk {
       Walk::Flv(walk) => Some(walk),
-      Walk::Mov(_) => None,
+      Walk::Mov(_) | Walk::Mkv(_) => None,
+    }
+  }
+
+  /// The Matroska walk, where this tap walks Matroska or WebM.
+  pub(super) fn mkv_walk(&self) -> Option<&MkvWalk> {
+    match &self.walk {
+      Walk::Mkv(walk) => Some(walk),
+      Walk::Mov(_) | Walk::Flv(_) => None,
     }
   }
 
@@ -693,6 +721,7 @@ impl SinkTap for Audit {
       let appended = match &mut self.walk {
         Walk::Mov(walk) => walk.append(at, bytes),
         Walk::Flv(walk) => walk.append(at, bytes),
+        Walk::Mkv(walk) => walk.append(at, bytes),
       };
       self.frontier = end;
       appended
@@ -700,6 +729,7 @@ impl SinkTap for Audit {
       match &mut self.walk {
         Walk::Mov(walk) => walk.patch(self.frontier, at, bytes),
         Walk::Flv(walk) => walk.patch(self.frontier, at, bytes),
+        Walk::Mkv(walk) => walk.patch(self.frontier, at, bytes),
       }
     } else if at > self.frontier {
       Err(Unfollowed::new(self.frontier, Why::Gap))
@@ -714,6 +744,9 @@ impl SinkTap for Audit {
           .patch(frontier, at, patched)
           .and_then(|()| walk.append(frontier, appended)),
         Walk::Flv(walk) => walk
+          .patch(frontier, at, patched)
+          .and_then(|()| walk.append(frontier, appended)),
+        Walk::Mkv(walk) => walk
           .patch(frontier, at, patched)
           .and_then(|()| walk.append(frontier, appended)),
       };
@@ -1561,3 +1594,88 @@ pub(super) fn config_fold(state: u64, bytes: &[u8]) -> u64 {
 
 /// The fold of an empty configuration.
 pub(super) const CONFIG_SEED: u64 = FOLD_SEED;
+
+/// What the muxer expects of a Matroska or WebM track's CodecPrivate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MkvPrivate {
+  /// Nothing judged.
+  Unjudged,
+  /// Its length: AV1's `av1C` as `ff_isom_write_av1c` writes it (A4).
+  Length(u64),
+  /// FLAC's: its length, and the fold of its bytes past `fLaC` and the
+  /// STREAMINFO block — the VORBIS_COMMENT block of the channel mask's one
+  /// comment, its header among them (A21).
+  Comment { len: u64, fold: u64 },
+}
+
+/// The bytes of a FLAC CodecPrivate before its comment block: `fLaC`, and
+/// the STREAMINFO block's header and its 34 bytes (`ff_flac_write_header`,
+/// `flacenc_header.c` 29–48).
+pub(super) const FLAC_HEADER: u64 = 42;
+
+/// The first difference between what the Matroska walk read and what the
+/// muxer expects: the tap's own state; the TrackEntries' count; then, per
+/// track in TrackEntry order, its CodecPrivate where judged — AV1's length
+/// (`Configuration(0)`), FLAC's channel mask comment's (`ChannelMask`:
+/// left out, its CodecPrivate's length, then the comment's fold); then the
+/// Segment's size against the bytes after its header (`Structure`).
+pub(super) fn mkv_verdict(
+  audit: &Audit,
+  expected: impl Iterator<Item = (TrackIndex, MkvPrivate)>,
+  entries: u64,
+) -> Option<WrittenOtherwise> {
+  if let Some(unfollowed) = audit.unfollowed() {
+    return Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::Structure,
+      Found::Unfollowed(unfollowed),
+    ));
+  }
+  let walk = audit.mkv_walk()?;
+  if walk.entries() != entries {
+    return Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::Structure,
+      Found::Count(Counts::new(walk.entries(), entries)),
+    ));
+  }
+  for ((track, wanted), seen) in expected.zip(walk.tracks()) {
+    let written = seen.codec_private;
+    let found = match wanted {
+      MkvPrivate::Unjudged => None,
+      MkvPrivate::Length(len) => match written {
+        None => Some((WrittenPart::Configuration(0), Found::Omitted)),
+        Some((written, _)) if written != len => Some((
+          WrittenPart::Configuration(0),
+          Found::Length(Counts::new(written, len)),
+        )),
+        Some(_) => None,
+      },
+      MkvPrivate::Comment { len, fold } => match written {
+        None => Some((WrittenPart::ChannelMask, Found::Omitted)),
+        Some((written, _)) if written <= FLAC_HEADER => {
+          Some((WrittenPart::ChannelMask, Found::Omitted))
+        }
+        Some((written, _)) if written != len => Some((
+          WrittenPart::ChannelMask,
+          Found::Length(Counts::new(written, len)),
+        )),
+        Some((_, written)) => {
+          (written != fold).then_some((WrittenPart::ChannelMask, Found::Content))
+        }
+      },
+    };
+    if let Some((part, found)) = found {
+      return Some(WrittenOtherwise::new(Some(track), part, found));
+    }
+  }
+  let (at, size) = walk.segment()?;
+  let taken = audit.frontier().saturating_sub(at);
+  (size != taken).then(|| {
+    WrittenOtherwise::new(
+      None,
+      WrittenPart::Structure,
+      Found::Length(Counts::new(size, taken)),
+    )
+  })
+}

@@ -2083,3 +2083,310 @@ fn on_meta_datas_window_admits_its_rewrites() {
     Some(Why::Rewrite)
   );
 }
+
+// ---------------------------------------------------------------------------
+//  Matroska's and WebM's walk (A21, A4's part).
+// ---------------------------------------------------------------------------
+
+/// An EBML element of `id` holding `payload`, its size in one byte.
+fn ebml(id: &[u8], payload: &[u8]) -> Vec<u8> {
+  let mut bytes = id.to_vec();
+  bytes.push(0x80 | u8::try_from(payload.len()).expect("a one-byte size"));
+  bytes.extend_from_slice(payload);
+  bytes
+}
+
+/// The EBML element IDs the synthetic files use.
+const EBML_ID: [u8; 4] = [0x1A, 0x45, 0xDF, 0xA3];
+const SEGMENT_ID: [u8; 4] = [0x18, 0x53, 0x80, 0x67];
+const INFO_ID: [u8; 4] = [0x15, 0x49, 0xA9, 0x66];
+const TRACKS_ID: [u8; 4] = [0x16, 0x54, 0xAE, 0x6B];
+const TAGS_ID: [u8; 4] = [0x12, 0x54, 0xC3, 0x67];
+const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+
+/// Tracks of one TrackEntry per CodecPrivate in `privates`.
+fn tracks_of(privates: &[&[u8]]) -> Vec<u8> {
+  let entries: Vec<u8> = privates
+    .iter()
+    .flat_map(|private| {
+      ebml(
+        &[0xAE],
+        &[ebml(&[0xD7], &[1]), ebml(&[0x63, 0xA2], private)].concat(),
+      )
+    })
+    .collect();
+  ebml(&TRACKS_ID, &entries)
+}
+
+/// A Matroska file as its header and a packet write it: the EBML header;
+/// the Segment of its unknown size; the SeekHead's Void, Info, `tracks`,
+/// Tags; then a Cluster. Answers the sink and each window's offset.
+fn mkv_file(tracks: &[u8]) -> (Sink, [u64; 4]) {
+  let mut sink = Sink::default();
+  sink.append(&ebml(&EBML_ID, &[0x42, 0x82, 0x81, 0x01]));
+  sink.append(
+    &[
+      SEGMENT_ID.as_slice(),
+      &[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+    ]
+    .concat(),
+  );
+  let void = sink.append(&ebml(&[0xEC], &[0; 20]));
+  let info = sink.append(&ebml(&INFO_ID, &[0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40]));
+  let tracks = sink.append(tracks);
+  let tags = sink.append(&ebml(&TAGS_ID, &[0xEC, 0x82, 0, 0]));
+  sink.append(&ebml(
+    &CLUSTER_ID,
+    &[0xE7, 0x81, 0x00, 0xA3, 0x84, 0x81, 0, 0, 0x80],
+  ));
+  (sink, [void, info, tracks, tags])
+}
+
+/// The trailer's rewrite of `file`, in one run from the Segment's size: its
+/// size of `size` bytes, the SeekHead's Void, Info, `tracks` and Tags, each
+/// as long as its window.
+fn rewrite(sink: &mut Sink, windows: [u64; 4], size: u64, tracks: &[u8]) {
+  let segment = windows[0];
+  let mut run = vec![0x01];
+  run.extend_from_slice(&size.to_be_bytes()[1..]);
+  run.extend_from_slice(&ebml(&[0xEC], &[0; 20]));
+  run.extend_from_slice(&ebml(&INFO_ID, &[0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40]));
+  run.extend_from_slice(tracks);
+  run.extend_from_slice(&ebml(&TAGS_ID, &[0xEC, 0x82, 0, 0]));
+  sink.patch(segment - 8, &run);
+}
+
+/// A FLAC CodecPrivate as Matroska writes it: `fLaC`, a STREAMINFO block,
+/// then a VORBIS_COMMENT block of a 9-byte vendor and, of a `count` or an
+/// `entry`, the count and the entry; of neither, the vendor alone (A21's
+/// road).
+fn flac_private(count: u8, entry: &[u8]) -> Vec<u8> {
+  let mut block = 9_u32.to_le_bytes().to_vec();
+  block.extend_from_slice(b"Lavf62.3.");
+  if count > 0 || !entry.is_empty() {
+    block.extend_from_slice(&u32::from(count).to_le_bytes());
+    block.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+    block.extend_from_slice(entry);
+  }
+  let mut private = b"fLaC\0\0\0\x22".to_vec();
+  private.extend_from_slice(&[0x11; 34]);
+  private.push(0x84);
+  private.extend_from_slice(&(block.len() as u32).to_be_bytes()[1..]);
+  private.extend_from_slice(&block);
+  private
+}
+
+/// FLAC's mask comment entry of a 2.1 layout.
+const MASK_ENTRY: &[u8] = b"WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0xb";
+
+/// The Matroska walk of `tracks`' fold offsets over `sink`'s runs.
+fn mkv_walked(sink: &Sink, folds: &[Option<u64>]) -> Audit {
+  let tracks: Vec<MkvTrack> = folds
+    .iter()
+    .map(|&fold_from| MkvTrack { fold_from })
+    .collect();
+  let mut audit = Audit::mkv(&tracks);
+  for (at, bytes) in &sink.runs {
+    audit.took(*at, bytes);
+  }
+  audit
+}
+
+/// The verdict of `audit` of one TrackEntry expected `private`.
+fn mkv_judged(audit: &Audit, private: MkvPrivate) -> Option<WrittenOtherwise> {
+  mkv_verdict(audit, [(TrackIndex::new(0), private)].into_iter(), 1)
+}
+
+/// **A Matroska file and its trailer's rewrite are followed, the rewrite's
+/// Tracks the one judged**: the header's FLAC CodecPrivate of a count of
+/// 0, the rewrite's of 1, in one run from the Segment's size across the
+/// SeekHead's Void, Info, Tracks and Tags; the Segment's size its bytes.
+#[test]
+fn a_matroska_file_and_its_trailers_rewrite_are_followed() {
+  let (header, rewritten) = (flac_private(0, MASK_ENTRY), flac_private(1, MASK_ENTRY));
+  let (mut sink, windows) = mkv_file(&tracks_of(&[&header]));
+  let taken = sink.frontier - windows[0];
+  let expected = |private: &[u8]| MkvPrivate::Comment {
+    len: private.len() as u64,
+    fold: config_fold(CONFIG_SEED, &private[42..]),
+  };
+  assert_eq!(
+    mkv_judged(
+      &mkv_walked(&sink, &[Some(FLAC_HEADER)]),
+      expected(&rewritten)
+    ),
+    Some(WrittenOtherwise::new(
+      Some(TrackIndex::new(0)),
+      WrittenPart::ChannelMask,
+      Found::Content
+    )),
+    "the header's, before the rewrite"
+  );
+  rewrite(&mut sink, windows, taken, &tracks_of(&[&rewritten]));
+  let audit = mkv_walked(&sink, &[Some(FLAC_HEADER)]);
+  assert_eq!(audit.unfollowed(), None);
+  assert_eq!(
+    mkv_judged(&audit, expected(&rewritten)),
+    None,
+    "the rewrite's"
+  );
+  assert_eq!(
+    mkv_judged(&audit, MkvPrivate::Length(header.len() as u64)),
+    None
+  );
+}
+
+/// **The Segment's size is judged against the bytes after its header**:
+/// written one short, named; never written, the unknown size named.
+#[test]
+fn the_segments_size_is_judged() {
+  let (sink, windows) = mkv_file(&tracks_of(&[&[1]]));
+  let taken = sink.frontier - windows[0];
+  let mut short = Sink {
+    runs: sink.runs.clone(),
+    frontier: sink.frontier,
+  };
+  rewrite(&mut short, windows, taken - 1, &tracks_of(&[&[1]]));
+  assert_eq!(
+    mkv_judged(&mkv_walked(&short, &[None]), MkvPrivate::Unjudged),
+    Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::Structure,
+      Found::Length(Counts::new(taken - 1, taken))
+    ))
+  );
+  // No trailer at all: the size stays unknown.
+  assert_eq!(
+    mkv_judged(&mkv_walked(&sink, &[None]), MkvPrivate::Unjudged),
+    Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::Structure,
+      Found::Length(Counts::new((1 << 56) - 1, taken))
+    ))
+  );
+}
+
+/// **The windows are rewritten in order and once; nothing else is**: Info
+/// rewritten a second time, a write inside the Cluster, and Tracks
+/// rewritten part way at the end.
+#[test]
+fn a_matroska_window_is_rewritten_once_and_nothing_else_is() {
+  let tracks = tracks_of(&[&[1, 2]]);
+  let (base, windows) = mkv_file(&tracks);
+  let taken = base.frontier - windows[0];
+  let whole = || {
+    let mut sink = Sink {
+      runs: base.runs.clone(),
+      frontier: base.frontier,
+    };
+    rewrite(&mut sink, windows, taken, &tracks);
+    sink
+  };
+  let why = |sink: &Sink| mkv_walked(sink, &[None]).unfollowed();
+  let mut twice = whole();
+  twice.patch(
+    windows[1],
+    &ebml(&INFO_ID, &[0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40]),
+  );
+  assert_eq!(why(&twice), Some(Unfollowed::new(windows[1], Why::Rewrite)));
+  let mut inside = whole();
+  inside.patch(base.frontier - 3, &[0]);
+  assert_eq!(
+    why(&inside),
+    Some(Unfollowed::new(base.frontier - 3, Why::Rewrite))
+  );
+  let mut part = Sink {
+    runs: base.runs.clone(),
+    frontier: base.frontier,
+  };
+  part.patch(windows[2], &tracks[..3]);
+  assert_eq!(
+    why(&part),
+    Some(Unfollowed::new(windows[2], Why::Unresolved))
+  );
+}
+
+/// **A Matroska file ending inside an element is truncated at it; an ID of
+/// five bytes is no writer's.**
+#[test]
+fn a_matroska_file_ending_inside_a_cluster_is_truncated_at_it() {
+  let (mut sink, _) = mkv_file(&tracks_of(&[&[1]]));
+  let cluster = sink.append(&[CLUSTER_ID.as_slice(), &[0x88, 0xE7, 0x81]].concat());
+  assert_eq!(
+    mkv_walked(&sink, &[None]).unfollowed(),
+    Some(Unfollowed::new(cluster, Why::Truncated))
+  );
+  let (mut five, _) = mkv_file(&tracks_of(&[&[1]]));
+  let at = five.append(&[0x08, 1, 2, 3, 4, 0x80]);
+  assert_eq!(
+    mkv_walked(&five, &[None]).unfollowed(),
+    Some(Unfollowed::new(at, Why::Structure))
+  );
+}
+
+/// **FLAC's channel mask comment and AV1's `av1C` are judged from the final
+/// Tracks** (A21, A4): the comment equal passes; its count 0, named by its
+/// content; cut to the vendor alone, by its length; AV1's of another length
+/// named; one TrackEntry where two streams are, by the count.
+#[test]
+fn flacs_comment_and_av1s_record_are_judged() {
+  let written = |private: &[u8]| {
+    let tracks = tracks_of(&[private]);
+    let (mut sink, windows) = mkv_file(&tracks);
+    let taken = sink.frontier - windows[0];
+    rewrite(&mut sink, windows, taken, &tracks);
+    mkv_walked(&sink, &[Some(FLAC_HEADER)])
+  };
+  let whole = flac_private(1, MASK_ENTRY);
+  let expected = MkvPrivate::Comment {
+    len: whole.len() as u64,
+    fold: config_fold(CONFIG_SEED, &whole[42..]),
+  };
+  let named = |found| {
+    Some(WrittenOtherwise::new(
+      Some(TrackIndex::new(0)),
+      WrittenPart::ChannelMask,
+      found,
+    ))
+  };
+  assert_eq!(mkv_judged(&written(&whole), expected), None);
+  assert_eq!(
+    mkv_judged(&written(&flac_private(0, MASK_ENTRY)), expected),
+    named(Found::Content)
+  );
+  let cut = flac_private(0, &[]);
+  assert_eq!(
+    mkv_judged(&written(&cut), expected),
+    named(Found::Length(Counts::new(
+      cut.len() as u64,
+      whole.len() as u64
+    )))
+  );
+  // The Segment's size left unknown: the CodecPrivate's finding comes
+  // first.
+  let (sink, _) = mkv_file(&tracks_of(&[&[0x81, 0x00, 0x0C, 0x00, 1, 2]]));
+  assert_eq!(
+    mkv_judged(&mkv_walked(&sink, &[None]), MkvPrivate::Length(17)),
+    Some(WrittenOtherwise::new(
+      Some(TrackIndex::new(0)),
+      WrittenPart::Configuration(0),
+      Found::Length(Counts::new(6, 17))
+    ))
+  );
+  assert_eq!(
+    mkv_verdict(
+      &mkv_walked(&sink, &[None, None]),
+      [
+        (TrackIndex::new(0), MkvPrivate::Unjudged),
+        (TrackIndex::new(1), MkvPrivate::Unjudged),
+      ]
+      .into_iter(),
+      2
+    ),
+    Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::Structure,
+      Found::Count(Counts::new(1, 2))
+    ))
+  );
+}

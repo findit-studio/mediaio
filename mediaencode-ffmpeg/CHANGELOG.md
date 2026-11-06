@@ -54,7 +54,12 @@ crate moves only when it changes.
   configuration's that differs from the current (R12), their records as
   long as their writers make them, VVC's present
   (`WrittenPart::Configuration`), and its frames' tag sizes
-  (`WrittenPart::Frames`). A `mov_text`
+  (`WrittenPart::Frames`). Then Matroska and WebM: the Segment's size
+  against its bytes, the regions the trailer writes again — the SeekHead's
+  room, Info, Tracks and Tags — each rewritten in order and once, and
+  Tracks read as the trailer writes it: an AV1 track's `av1C` as long as
+  its writer makes it (`WrittenPart::Configuration`), a FLAC track's
+  channel mask comment (`WrittenPart::ChannelMask`). A `mov_text`
   track's tables are read by one rule on both sides, which the end samples
   libavformat's interleaving makes movenc write leave unchanged (the
   coordinator's ruling R5). With the new `test-support` feature,

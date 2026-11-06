@@ -637,7 +637,7 @@
 //! | A1 | the MOV family's `pssh` boxes (`mov_write_pssh_tag`, `movenc.c` 5175–5210; 5449–5451) | the encryption initialization parsed again at the `moov`, its allocation's failure answered as none, 0 returned and discarded besides: the file written without its DRM initialization | omission: no entry, no box (5184–5206) | out of reach: the parse's allocations, each within the side data's own bytes — its key ids' array a pointer a key id, of CENC's 16-byte ids at most an eighth of the ticket's budget (`encryption_info.c` 176–211, 231–290; `mov.c` 8082–8083); a key id of no bytes leaves that array null, the parse copying each key id through it and the free reading it again (190, 280, 216–229): refused at open by name before any of it is parsed ([`MuxOpenError::KeyIdWithoutBytes`]; R22, the coordinator's ruling: a bad declaration, refused) — L194 | detected at `finish` by the write audit (#95): the `moov`'s `pssh` boxes, their count and bytes against each stream's initializations as libavutil parses them, all or none ([`WrittenPart::ProtectionHeaders`]; [`pssh_written`]) — L225; lifted by R21, the owner's ruling on letter 1, Q2 (refused at open since R19), its boxes counted in the `moov`'s bound ([`pssh_bytes`]) — L165, L153, L158 |
 //! | A2 | the MOV family's `stts` (`mov_write_stts_tag`, 3241–3288; discarded at 3411) | its 8 bytes a sample, their allocation's failure returned and discarded: the track written without its time-to-sample table — every track but constant-size audio's, whose one entry's allocation the same | omission: returned before any write (3249–3251, 3257–3259) | out of reach: the table's entries, at most [`MOV_SAMPLES_MAX`] — 29 826 048 × 8 = 238 608 384 bytes, 33 553 408 × 8 = 268 427 264 of 64-byte entries — and `ctts`'s one more (3208) | detected at `finish` by the write audit (#95): every `stbl` written holds its `stts`, its runs folded against the muxer's ([`WrittenPart::TimeToSample`]) — L217 |
 //! | A3 | AAC's and Opus's roll groups (`mov_preroll_write_stbl_atoms`, 3305–3400; 3436) | `sgpd` and `sbgp` left out | omission: returned before any write (3326–3328) | out of reach: 12 bytes an entry, 357 912 576 at the table's bound, 402 640 896 of 64-byte entries | detected at `finish` by the write audit (#95): each `stbl`'s `sgpd` and `sbgp`, against AAC's one group or Opus's distances as movenc counts them ([`WrittenPart::RollGroups`]) — L233 |
-//! | A4 | the MOV family's configuration records, FLV's beside them (A22) | the helpers' allocations — `hvcC`'s every configuration parsed again, `av1C`'s OBU buffer, `avcC`'s, `vvcC`'s, `evcC`'s and `lvcC`'s of an Annex B configuration, `dvc1`'s unescaped copy — their failures returned to `mov_write_*_tag`, which answers its box's size whatever (1573–1738), and `mov_write_video_tag` discards that besides (2880–2930): the box written empty or cut, the track undecodable; Matroska returns them, its fault at the header — `avcC`'s growth there named a malformed configuration — but for `av1C`'s OBU buffer's growth, its record written cut | omission: each helper returns before it writes, or writes what it parsed; after an Annex B buffer's failed close, `avcC`'s, `hvcC`'s and `vvcC`'s walks sum a null pointer and `-64` (`avc.c` 53–54; `hevc.c` 1377–1378; `vvc.c` 904–905) — arithmetic ISO C leaves undefined, no access: each loop's guard reads `-64` | reachable past a budget the caller raises (`CodecTicket::mirror_with`), a configuration of up to `INT_MAX` less its padding, each bounded exactly at open (r2): the Annex B rewrite, its dynamic buffer's `INT_MAX` with its padding (S7); `dvc1`'s units' bits and its sequence header's reader (S9); LCEVC's split — its RBSP buffer, its list of `INT_MAX` over an `H2645NAL`'s 88 bytes, its units' emulation prevention positions (`h2645_parse.c` 480–606; S10); `hvcC`'s read whole within `init_get_bits8`'s 268 435 391 bytes, mirrored ([`records`]); out of reach whatever the budget: `av1C`'s OBUs, `evcC`'s arrays and `dvc1`'s unescaped copy, each within the configuration's own `int` and the allocation it was copied in | the premise (R21, Q6): after an Annex B buffer's failed close, the walks' arithmetic on the null pointer and `-64` is undefined in ISO C; no memory is read or written, each loop's guard reading `-64`; the record written empty, success answered — the MOV family's part detected at `finish` by the write audit (#95): each sample description's record, present and as long as its writer makes it of the description's configuration, `vvcC` and `evcC` longer than their header, AVIF's item's `av1C` of no sequence header among them ([`WrittenPart::Configuration`]) — L221, L222, L223; `lhvC`'s rewind past its flushed header unfollowed (F6); Matroska's cut `av1C` the premise. The remedy, the records built here, is booked (<https://github.com/findit-studio/mediaio/issues/94>) |
+//! | A4 | the MOV family's configuration records, FLV's beside them (A22) | the helpers' allocations — `hvcC`'s every configuration parsed again, `av1C`'s OBU buffer, `avcC`'s, `vvcC`'s, `evcC`'s and `lvcC`'s of an Annex B configuration, `dvc1`'s unescaped copy — their failures returned to `mov_write_*_tag`, which answers its box's size whatever (1573–1738), and `mov_write_video_tag` discards that besides (2880–2930): the box written empty or cut, the track undecodable; Matroska returns them, its fault at the header — `avcC`'s growth there named a malformed configuration — but for `av1C`'s OBU buffer's growth, its record written cut | omission: each helper returns before it writes, or writes what it parsed; after an Annex B buffer's failed close, `avcC`'s, `hvcC`'s and `vvcC`'s walks sum a null pointer and `-64` (`avc.c` 53–54; `hevc.c` 1377–1378; `vvc.c` 904–905) — arithmetic ISO C leaves undefined, no access: each loop's guard reads `-64` | reachable past a budget the caller raises (`CodecTicket::mirror_with`), a configuration of up to `INT_MAX` less its padding, each bounded exactly at open (r2): the Annex B rewrite, its dynamic buffer's `INT_MAX` with its padding (S7); `dvc1`'s units' bits and its sequence header's reader (S9); LCEVC's split — its RBSP buffer, its list of `INT_MAX` over an `H2645NAL`'s 88 bytes, its units' emulation prevention positions (`h2645_parse.c` 480–606; S10); `hvcC`'s read whole within `init_get_bits8`'s 268 435 391 bytes, mirrored ([`records`]); out of reach whatever the budget: `av1C`'s OBUs, `evcC`'s arrays and `dvc1`'s unescaped copy, each within the configuration's own `int` and the allocation it was copied in | the premise (R21, Q6): after an Annex B buffer's failed close, the walks' arithmetic on the null pointer and `-64` is undefined in ISO C; no memory is read or written, each loop's guard reading `-64`; the record written empty, success answered — the MOV family's part detected at `finish` by the write audit (#95): each sample description's record, present and as long as its writer makes it of the description's configuration, `vvcC` and `evcC` longer than their header, AVIF's item's `av1C` of no sequence header among them ([`WrittenPart::Configuration`]) — L221, L222, L223; `lhvC`'s rewind past its flushed header unfollowed (F6); Matroska's and WebM's cut `av1C` detected too: the AV1 track's CodecPrivate, read as the trailer writes Tracks again, as long as its writer makes it ([`WrittenPart::Configuration`]) — L237. The remedy, the records built here, is booked (<https://github.com/findit-studio/mediaio/issues/94>) |
 //! | A5 | APV's `apvC` entries (`ff_isom_parse_apvc`, `apv.c` 217–245; discarded at `movenc.c` 7199) | an entry's allocation at a packet: the record written without it | omission: the array kept, returned before the write (`apv.c` 474–478, 496–500) | out of reach: five entries (473) of 255 informations (493) | detected at `finish` by the write audit (#95): the `apvC`'s length, of every frame information the packets recorded ([`WrittenPart::Configuration`]) — L227 |
 //! | A6 | MP4's track `udta` (4358–4389; discarded at 4441) | its buffer's open: the DASH roles left out, the dispositions read back without them | omission: no box (4369–4371, 4381) | out of reach: the roles' fixed strings alone — the base sets a stream no title (`Output::add_stream`) | detected at `finish` by the write audit (#95): each `trak`'s `udta`, of its DASH roles' `kind` boxes exactly, or none ([`WrittenPart::TrackUserData`]) — L232 |
 //! | A7 | the movie `udta` (5066–5122; discarded at 5448) | its buffer's open, its growth past 1024 bytes read as none (5114): the covers, the Nero list and the iTunes metadata left out; its `INT_MAX` bounded exactly at open ([`MuxOpenError::CoversTooLarge`]) | omission: no box (5114) | bounded exactly at open ([`UDTA_BYTES_MAX`]) | detected at `finish` by the write audit (#95): the `moov`'s `udta` — MP4's and iPod's of exactly [`udta_bytes`], MOV's of its Nero list, libavformat's `©swr` beside it or not by the owner's ruling on letter 1, (b) ([`WrittenPart::MovieUserData`]) — L231 |
@@ -652,7 +652,7 @@
 //! | A16 | MPEG-TS's raw AAC, through its nested ADTS muxer (`mpegtsenc.c` 1980–2003) | the nested buffer closed unchecked: a null buffer and `-64` bytes copied into the PES payload (2232) | memory fault: `memcpy` of a null buffer and `SIZE_MAX - 63` bytes (2232) — avoided where the muxer frames each packet in ADTS itself, which MPEG-TS takes as it is (1977) | out of reach: an ADTS frame of at most 8191 bytes ([`PayloadRule::AdtsFrame`]) | closed by r3 (R20, ruled): this muxer frames each raw packet in ADTS itself, of the configuration, as FFmpeg's ADTS writer frames it, and MPEG-TS takes the frame as it is, its nested muxer never fed ([`AdtsFraming`]) — L179, L180, `adts_frames_are_made_as_ffmpegs_adts_writer_makes_them` |
 //! | A17 | MP3's Xing frame (`mp3enc.c` 145–286; discarded at 632) | its buffer's open discarded after the frame's offset is set, its close unchecked: the trailer writing into a null frame (400–469) | memory fault: the frame's fields written through the null frame and its offset (412–466), its CRC read through it (465) — avoided by `write_xing` off (161–162, 515–516) | out of reach: one frame of at most 1440 bytes (205–220) | MP3 withheld at open (R21, the owner's ruling on letter 1, Q4: [`MuxOpenError::ContainerWithheld`], [`Withheld::Mp3XingFrame`]) until the project's own MPEG audio writer, findit-studio/mpegoat, lands — the row its evidence; no Xing reservation built |
 //! | A18 | MP3's ID3v2 frames (`id3v2enc.c` 66–98, 259–329) | each frame made in a dynamic buffer, its growth read as none: a title's frame and the table of contents written empty; a chapter written empty while the tag's size, the writers' own sum (`ff_id3v2_finish`, 421–443), counts its element id, times and title — the reader taking the first audio frames as the tag's; a text frame's open failure taken for no match and written again as a `TXXX` frame | omission and misreport: 0 bytes and a null buffer written as none (85–94, 279–285, 317–323) | bounded exactly at open until R21, MP3 withheld since | a withheld muxer's (Q4), its evidence |
-//! | A21 | Matroska's FLAC channel mask (`matroskaenc.c` 1077–1114) | `av_dict_set` discarded: the comment block of no count and no mask, the layout read back otherwise | misreport: a block of no comment | out of reach: a mask of 18 bits | the premise |
+//! | A21 | Matroska's FLAC channel mask (`matroskaenc.c` 1077–1114) | `av_dict_set` discarded: the comment block of no count and no mask, the layout read back otherwise | misreport: a block of no comment | out of reach: a mask of 18 bits | detected at `finish` by the write audit (#95): the FLAC track's CodecPrivate, read as the trailer writes Tracks again, its comment block's length and bytes against the muxer's ([`WrittenPart::ChannelMask`]) — L236, L241 |
 //! | A22 | FLV's configuration records (`flv_write_codec_header`, `flvenc.c` 807–914) | as A4's, the record written empty | omission, as A4's | the helpers' as A4's, the Annex B rewrite bounded exactly at open (S7, r2); the sequence header's 24-bit size: reachable, bounded exactly at open (S6) | the premise (R21, Q6): after an Annex B buffer's failed close, the walks' arithmetic on the null pointer and `-64` is undefined in ISO C; no memory is read or written, each loop's guard reading `-64`; FLV's record written empty, success answered — detected at `finish` by the write audit (#95): each track's sequence headers, every one FLV writes — the header's and each new configuration's that differs from the current, the caller's or a filter's (R12) — their records' lengths folded against the muxer's, VVC's by their emptiness ([`WrittenPart::Configuration`]) — L234. The remedy, the records built here, is booked (<https://github.com/findit-studio/mediaio/issues/94>) |
 //! | A23 | raw FLAC's channel mask (`flacenc.c` 244–259) | as A21 | misreport, as A21's | out of reach, as A21's | the premise |
 //! | A25 | MP4's joined TTML (`movenc_ttml.c` 289–317) | its buffer closed unchecked: a packet of a null payload and `-64` bytes written as the sample; its writes' failures, `avio_printf`'s, the buffer's error unread — the document cut | misreport: `avio_write` of `-64` bytes writes none (`movenc.c` 7231), the sample counted of them | bounded: the document ([`PayloadRule::DocumentSize`]) | detected at `finish` by the write audit (#95): the TTML sample's size against the document's exact bytes ([`WrittenPart::SampleSizes`]; [`TtmlCounts`]); the `mdat`'s size against the payload the sink took, short by 64 (F8; [`WrittenPart::MediaData`]) — L218 |
@@ -1623,8 +1623,9 @@ mod audit;
 mod records;
 
 use audit::{
-  Audit, CONFIG_SEED, Carried, ExpectedFlv, ExpectedMovie, ExpectedTrak, FlagTables, FlagsMirror,
-  FlvTrack, Handed, MovieUserData, RollGroups, RollMirror, Runs, SampleMirror, config_fold,
+  Audit, CONFIG_SEED, Carried, ExpectedFlv, ExpectedMovie, ExpectedTrak, FLAC_HEADER, FlagTables,
+  FlagsMirror, FlvTrack, Handed, MkvPrivate, MkvTrack, MovieUserData, RollGroups, RollMirror, Runs,
+  SampleMirror, config_fold,
 };
 pub use audit::{Counts, Found, Unfollowed, Why, WrittenOtherwise, WrittenPart};
 use records::{Units, Writer, Wrote};
@@ -5534,6 +5535,9 @@ struct TrackState {
   flags: FlagsMirror,
   /// FLV: what the write audit expects of the track's tags ([`FlvMirror`]).
   flv: FlvMirror,
+  /// Matroska and WebM: what the write audit expects of the track's
+  /// CodecPrivate ([`mkv_private`]).
+  mkv: MkvPrivate,
 }
 
 /// FLV: what the write audit expects of a track's tags, kept at open and at
@@ -11483,14 +11487,19 @@ struct Learned {
   /// rests on the trust model (R8) — which it writes a sequence header of
   /// where it differs from its current one (R12).
   flv_config: Option<(u64, u64, u64, bool)>,
+  /// Matroska and WebM AV1 of no configuration: what the write audit
+  /// expects of the CodecPrivate the packet's new extradata makes
+  /// ([`ExtradataRule::MatroskaAv1`]).
+  mkv_private: Option<MkvPrivate>,
 }
 
 /// The write audit's walk of a written file (findit-studio/mediaio#95):
-/// the MOV family's, in its mode, or FLV's.
+/// the MOV family's, in its mode, FLV's, or Matroska's and WebM's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Walked {
   Mov(MovMode),
   Flv,
+  Mkv,
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
@@ -11757,6 +11766,7 @@ where
     let audit_mode = match audited {
       Audited::Mov(mode) if options.audit => Some(Walked::Mov(mode)),
       Audited::Flv if options.audit => Some(Walked::Flv),
+      Audited::Matroska | Audited::WebM if options.audit => Some(Walked::Mkv),
       _ => None,
     };
     // AVIF measures its `moov` in a null buffer of `INT_MAX` bytes at its
@@ -12120,7 +12130,9 @@ where
     // the MOV family, its table made here for every track and the chapter
     // track; of FLV, its audio and video tracks — each its tags' type, its
     // index among its kind's and its sequence header's bytes before its
-    // record — and the pre-tags it writes (findit-studio/mediaio#95; R11).
+    // record — and the pre-tags it writes (findit-studio/mediaio#95; R11);
+    // of Matroska and WebM, its TrackEntries — a stream's each, but an
+    // attachment's — each the offset its CodecPrivate is folded from.
     match audit_mode {
       Some(Walked::Mov(mode)) => output.set_tap(Audit::mov(mode, tracks.len() + 1)),
       Some(Walked::Flv) => {
@@ -12148,6 +12160,22 @@ where
           })
           .collect();
         output.set_tap(Audit::flv(&flv_tracks, flv_pre_tags))
+      }
+      Some(Walked::Mkv) => {
+        let mkv_tracks: Vec<MkvTrack> = tracks
+          .iter()
+          .zip(&roads)
+          .filter(|(_, road)| **road == Road::Timed)
+          .map(|(description, _)| MkvTrack {
+            fold_from: mkv_comment_mask(
+              audited,
+              description.codec(),
+              LayoutView::of(description.side_data().ch_layout()),
+            )
+            .map(|_| FLAC_HEADER),
+          })
+          .collect();
+        output.set_tap(Audit::mkv(&mkv_tracks))
       }
       None => Ok(()),
     }
@@ -12186,6 +12214,7 @@ where
       let mut stsd = 0;
       let mut user_data = 0;
       let mut flv = FlvMirror::default();
+      let mut mkv = MkvPrivate::Unjudged;
       let mut ts_pce = Vec::new();
       let stream = match (stream, road) {
         (Some((stream, _)), Road::Timed) => {
@@ -12276,6 +12305,14 @@ where
           if codec.extradata().is_empty() && first_packet_configures(family, audited, codec.codec())
           {
             rules.configuration_absent = true;
+          }
+          if matches!(audited, Audited::Matroska | Audited::WebM) {
+            mkv = mkv_private(
+              audited,
+              codec.codec(),
+              codec.extradata(),
+              LayoutView::of(tracks[index].side_data().ch_layout()),
+            );
           }
           if audited == Audited::Flv {
             rules.flv_tag = Some(FlvTag::of(
@@ -12429,6 +12466,7 @@ where
         user_data,
         flags: FlagsMirror::default(),
         flv,
+        mkv,
       });
     }
 
@@ -12969,6 +13007,24 @@ where
         Found::Unfollowed(Unfollowed::new(at, Why::Panicked)),
       ))
     };
+    if walked == Walked::Mkv {
+      // Matroska's TrackEntries: a stream's each, but an attachment's.
+      let entries = self
+        .tracks
+        .iter()
+        .filter(|state| state.stream.is_some() && state.kind != TrackKind::Attachment)
+        .count() as u64;
+      let expected = self
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| state.stream.is_some() && state.kind != TrackKind::Attachment)
+        .map(|(index, state)| (TrackIndex::new(index), state.mkv));
+      return self
+        .output
+        .with_tap(|audit: &mut Audit| audit::mkv_verdict(audit, expected, entries))
+        .unwrap_or_else(|_| panicked());
+    }
     if walked == Walked::Flv {
       let expected = flv_walked(&self.tracks).map(|(index, state)| ExpectedFlv {
         track: TrackIndex::new(index),
@@ -13970,6 +14026,9 @@ where
     if let Some(frame) = plan.learned.flv_frame {
       state.flv.frames.push(frame, 1);
     }
+    if let Some(private) = plan.learned.mkv_private {
+      state.mkv = private;
+    }
     if let Some((len, fold, record, trusted)) = plan.learned.flv_config
       && (len, fold) != state.flv.config
     {
@@ -14879,6 +14938,21 @@ fn check_packet_rules<'p>(
         None => None,
       }
     });
+  // Matroska and WebM AV1 of no configuration: the first packet's new
+  // extradata, which Matroska writes as the track's CodecPrivate, every
+  // later one ignored (`mkv_check_new_extra_data`, `matroskaenc.c`
+  // 3098–3108; A4) — an `av1C` of the room's, judged above.
+  let mkv_private =
+    (owns && rules.new_extradata == ExtradataRule::MatroskaAv1 && !state.configured)
+      .then(|| {
+        side_data(
+          payload.side_data,
+          AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+        )
+      })
+      .flatten()
+      .filter(|new| !new.is_empty())
+      .map(|new| MkvPrivate::Length(av1c_written_len(new, true) as u64));
   // FLV AAC with no configuration, and the tracks MP4 and Matroska take
   // their first packet's configuration for: the first packet must bring
   // one — an ADTS header the filter it inserts makes one of, or new
@@ -15593,6 +15667,7 @@ fn check_packet_rules<'p>(
       mov_flag,
       flv_frame,
       flv_config,
+      mkv_private,
     },
     choices,
   ))
@@ -16526,6 +16601,101 @@ fn riff_format_cut(stream: &StreamCodec, bit_rate: i64) -> bool {
   }
   // IMA ADPCM's samples a block (179–182); GSM's are 320.
   is(Id::AV_CODEC_ID_ADPCM_IMA_WAV) && frame_size.is_some_and(|samples| !sixteen.contains(&samples))
+}
+
+/// The mask of FLAC's channel mask comment Matroska writes in a track's
+/// CodecPrivate — for a native layout within `0x3FFFF` FLAC's own order
+/// does not name (`put_flac_codecpriv`, `matroskaenc.c` 1077–1114;
+/// [`flac_comment_layout`]) — or `None`: WebM carries no FLAC.
+fn mkv_comment_mask(audited: Audited, codec: CodecId, layout: LayoutView<'_>) -> Option<u64> {
+  match flac_comment_layout(layout) {
+    LayoutReadBack::Native { mask } if audited == Audited::Matroska && codec == CodecId::FLAC => {
+      Some(mask)
+    }
+    _ => None,
+  }
+}
+
+/// What the write audit expects of a Matroska or WebM track's CodecPrivate
+/// as the header writes it ([`MkvPrivate`]): AV1's `av1C` of the stream's
+/// configuration (A4; `mkv_assemble_native_codecprivate`, `matroskaenc.c`
+/// 1160–1165) — of none, nothing until the first packet brings one; FLAC's
+/// channel mask comment where Matroska writes one (A21;
+/// [`mkv_comment_mask`], [`flac_mask_comment`]); nothing of another codec.
+fn mkv_private(
+  audited: Audited,
+  codec: CodecId,
+  extradata: &[u8],
+  layout: LayoutView<'_>,
+) -> MkvPrivate {
+  if codec == CodecId::AV1 && !extradata.is_empty() {
+    return MkvPrivate::Length(av1c_written_len(extradata, true) as u64);
+  }
+  match mkv_comment_mask(audited, codec, layout) {
+    Some(mask) => {
+      let (len, fold) = flac_mask_comment(mask);
+      MkvPrivate::Comment { len, fold }
+    }
+    None => MkvPrivate::Unjudged,
+  }
+}
+
+/// FLAC's channel mask comment as Matroska writes it in a track's
+/// CodecPrivate after `fLaC` and the STREAMINFO block (`put_flac_codecpriv`,
+/// `matroskaenc.c` 1077–1114; `ff_vorbiscomment_write`, `vorbiscomment.c`
+/// 62–100): the block's header — 0x84, the last block, a VORBIS_COMMENT —
+/// and its length in 24 bits; then the vendor, `LIBAVFORMAT_IDENT`, after
+/// its length; the count, 1; and the entry
+/// `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0x…`, the mask in lowercase
+/// hexadecimal (`PRIx64`), after its length — each length 32 bits,
+/// little-endian. The CodecPrivate's length, and the fold of those bytes
+/// ([`config_fold`]), made on the stack.
+fn flac_mask_comment(mask: u64) -> (u64, u64) {
+  let version = ffmpeg_next::format::version();
+  let mut ident = [0_u8; 32];
+  let ident = formatted(
+    &mut ident,
+    format_args!(
+      "Lavf{}.{}.{}",
+      version >> 16,
+      (version >> 8) & 0xFF,
+      version & 0xFF
+    ),
+  );
+  let mut entry = [0_u8; 64];
+  let entry = flac_mask_text(&mut entry, mask);
+  let block = 4 + ident.len() + 4 + 4 + entry.len();
+  let length = |len: usize| u32::try_from(len).unwrap_or(u32::MAX).to_le_bytes();
+  let mut fold = config_fold(CONFIG_SEED, &[0x84]);
+  fold = config_fold(
+    fold,
+    &u32::try_from(block).unwrap_or(u32::MAX).to_be_bytes()[1..],
+  );
+  fold = config_fold(fold, &length(ident.len()));
+  fold = config_fold(fold, ident);
+  fold = config_fold(fold, &1_u32.to_le_bytes());
+  fold = config_fold(fold, &length(entry.len()));
+  fold = config_fold(fold, entry);
+  (FLAC_HEADER + 4 + block as u64, fold)
+}
+
+/// FLAC's channel mask comment of `mask`, as raw FLAC and Matroska write
+/// it: `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0x…`, the mask in lowercase
+/// hexadecimal (`PRIx64`; `flacenc.c` 256; `matroskaenc.c` 1097).
+fn flac_mask_text(buf: &mut [u8; 64], mask: u64) -> &[u8] {
+  formatted(
+    buf,
+    format_args!("WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0x{mask:x}"),
+  )
+}
+
+/// `args` written into `buf`, which they fit, as text: its bytes.
+fn formatted<'a>(buf: &'a mut [u8], args: core::fmt::Arguments<'_>) -> &'a [u8] {
+  use std::io::Write as _;
+  let mut cursor = std::io::Cursor::new(&mut *buf);
+  // The caller's buffer holds the text: no write runs out of room.
+  let written = cursor.write_fmt(args).map_or(0, |()| cursor.position());
+  &buf[..usize::try_from(written).unwrap_or(0)]
 }
 
 /// FLV's audio and video tracks — of a stream FLV writes, each — in the

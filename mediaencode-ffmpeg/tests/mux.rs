@@ -21413,8 +21413,9 @@ fn long_aac(corpus: &Corpus) -> PathBuf {
 /// libavformat's `©swr` among them — a DASH role in a track's `udta`, and
 /// frames of no duration, whose last libavformat guesses — and into FLV,
 /// H.264 and AAC, HEVC naming its matrix (its HDR metadata's tag, R10),
-/// AV1, VP9, AC-3 and Opus — each finishes `Ok`, the audit's tap having
-/// walked the file. Every other law of this lane writes with the audit on
+/// AV1, VP9, AC-3 and Opus; into Matroska, H.264 and AAC, HEVC, AV1, VP9,
+/// Opus and FLAC, and into WebM, AV1, VP9 and Opus — each finishes `Ok`,
+/// the audit's tap having walked the file. Every other law of this lane writes with the audit on
 /// as well, so that each file one writes whole passes it too: their
 /// passing is the rest of this law.
 ///
@@ -21428,12 +21429,16 @@ fn l216_the_write_audit_passes_every_file_ffmpeg_writes_whole() {
     (
       "h264-aac",
       h264_aac(&corpus, "l216-h264-aac.mp4"),
-      &["mp4", "mov", "ipod", "flv"][..],
+      &["mp4", "mov", "ipod", "flv", "matroska"][..],
     ),
-    ("hevc", hevc_annexb(&corpus), &["mp4"][..]),
+    ("hevc", hevc_annexb(&corpus), &["mp4", "matroska"][..]),
     ("hevc-bt709", hevc_bt709(&corpus), &["flv"][..]),
-    ("av1", av1_mkv(&corpus), &["mp4", "avif"][..]),
-    ("vp9", vp9_webm(&corpus), &["mp4"][..]),
+    (
+      "av1",
+      av1_mkv(&corpus),
+      &["mp4", "avif", "matroska", "webm"][..],
+    ),
+    ("vp9", vp9_webm(&corpus), &["mp4", "matroska", "webm"][..]),
     (
       "ac3",
       audio_file(&corpus, "l216.ac3", "ac3"),
@@ -21445,7 +21450,16 @@ fn l216_the_write_audit_passes_every_file_ffmpeg_writes_whole() {
       &["mp4", "mov"][..],
     ),
     ("pcm", pcm_mov(&corpus), &["mp4"][..]),
-    ("opus", opus_mkv(&corpus), &["mp4", "flv"][..]),
+    (
+      "opus",
+      opus_mkv(&corpus),
+      &["mp4", "flv", "matroska", "webm"][..],
+    ),
+    (
+      "flac",
+      audio_file(&corpus, "l216.flac", "flac"),
+      &["matroska"][..],
+    ),
     (
       "movtext",
       mov_text_mp4(&corpus),
@@ -24240,4 +24254,233 @@ fn r13_made_sets_past_the_trust_stop_turn_the_track_trusted() {
   let starts = flv_sequence_starts(&target);
   assert_eq!(starts.len(), 3, "the header's, the made sets', the third's");
   assert_eq!(starts[2].len(), 5, "the third's record written empty");
+}
+
+// ---------------------------------------------------------------------------
+//  Matroska and WebM audited (A21, A4's part).
+// ---------------------------------------------------------------------------
+
+/// The offset, in the Matroska file at `path`, of the first byte of the
+/// count of FLAC's mask comment — the 4 bytes before the entry's length,
+/// the entry `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=…` (`ff_vorbiscomment_write`,
+/// `vorbiscomment.c` 78–90).
+#[cfg(feature = "test-support")]
+fn mask_count_offset(path: &Path) -> u64 {
+  let bytes = std::fs::read(path).expect("the file");
+  let entry = b"WAVEFORMATEXTENSIBLE_CHANNEL_MASK=";
+  let at = bytes
+    .windows(entry.len())
+    .position(|window| window == entry)
+    .expect("the premise: a mask comment");
+  assert_eq!(
+    bytes[at - 8..at - 4],
+    [1, 0, 0, 0],
+    "the premise: a count of 1"
+  );
+  (at - 8) as u64
+}
+
+/// FLAC of a 2.1 layout — a mask comment, `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0xb`
+/// — of a second of noise: a Matroska file of it past the I/O context's
+/// 32 KiB, so that its header reaches the sink before its trailer writes
+/// Tracks again.
+#[cfg(feature = "test-support")]
+#[rustfmt::skip]
+fn flac_two_one(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "mkv-2.1.flac", &[
+    "-f", "lavfi", "-i", "anoisesrc=sample_rate=48000:duration=1:amplitude=0.5",
+    "-af", "pan=2.1|c0=c0|c1=c0|c2=c0", "-c:a", "flac",
+  ])
+}
+
+/// FLAC of a 2.1 layout ([`flac_two_one`]) written whole into Matroska at
+/// `name`: the count of
+/// its mask comment, at `count`, set to 0 in the `nth` write over it, from
+/// 1 — none of none; its last packet carrying `streaminfo` as new
+/// extradata, of some.
+#[cfg(feature = "test-support")]
+fn flac_into_matroska(
+  corpus: &Corpus,
+  name: &str,
+  count: Option<(u64, usize)>,
+  streaminfo: Option<&[u8]>,
+) -> Result<(), MuxFault> {
+  let (table, packets) = whole_track(&flac_two_one(corpus), TrackKind::Audio);
+  let mut hooks = mediaencode_ffmpeg::mux::OpenHooks::default();
+  if let Some((offset, nth)) = count {
+    let mut seen = 0;
+    hooks = hooks.with_plant(move |at, bytes| {
+      if (at..at + bytes.len() as u64).contains(&offset) {
+        seen += 1;
+        if seen == nth {
+          bytes[usize::try_from(offset - at).expect("an index")] = 0;
+        }
+      }
+    });
+  }
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(output(corpus, name)).expect("create"),
+    ContainerName::MATROSKA,
+    table,
+    &[],
+    MuxOptions::new(),
+    hooks,
+  )
+  .expect("open");
+  let last = packets.len() - 1;
+  for (index, packet) in packets.iter().enumerate() {
+    let mut audio = audio_of(packet);
+    if index == last
+      && let Some(streaminfo) = streaminfo
+    {
+      audio.extra_mut().set_side_data(vec![side(
+        ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+        streaminfo,
+      )]);
+    }
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio)),
+      "a FLAC frame",
+    );
+  }
+  muxer.finish()
+}
+
+/// **L236 — A21: Matroska's FLAC channel mask comment is judged as the
+/// trailer writes Tracks** (findit-studio/mediaio#95): FLAC of a 2.1 layout
+/// into Matroska — a mask comment, `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0xb`
+/// (`put_flac_codecpriv`, `matroskaenc.c` 1077–1114) — the write plant
+/// setting the comment's count from 1 to 0 in the trailer's rewrite of
+/// Tracks, the second write over its offset (3448–3450), as A21's road
+/// leaves the block of no count. Named: track 0's channel mask, by its
+/// content.
+#[cfg(feature = "test-support")]
+#[test]
+fn l236_matroskas_flac_mask_comment_is_judged() {
+  let Some(corpus) = Corpus::new() else { return };
+  flac_into_matroska(&corpus, "l236-twin.mkv", None, None).expect("the twin, finished");
+  let count = mask_count_offset(&output(&corpus, "l236-twin.mkv"));
+  assert!(
+    std::fs::metadata(output(&corpus, "l236-twin.mkv"))
+      .expect("the twin")
+      .len()
+      > 32 * 1024,
+    "the premise: the header flushed before the trailer"
+  );
+  let fault = flac_into_matroska(&corpus, "l236.mkv", Some((count, 2)), None)
+    .expect_err("the comment's count changed, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::ChannelMask,
+      Finding::Content
+    ))
+  );
+}
+
+/// **L237 — A4's Matroska part: an `av1C` Matroska writes without its
+/// metadata OBUs is named** (findit-studio/mediaio#95; `ff_isom_write_av1c`,
+/// `av1.c` 398–502; `mkv_assemble_native_codecprivate`, `matroskaenc.c`
+/// 1160–1165). In a process of its own: AV1 configured by OBUs — its
+/// sequence header and a metadata OBU of 2 048 bytes — into Matroska,
+/// libavutil's allocations capped at 1 500 bytes around `write_header`
+/// (the header hook). The cap's derivation: the header's other allocations
+/// stay under it — each dynamic buffer's open block (its context, its state
+/// and 1 024 bytes, about 1.4 KB, `aviobuf.c` 1344–1362), the tracks'
+/// table; the metadata's buffer's growth past 1 024 (L222's) is refused,
+/// its error never read, and the record is written of its four bytes and
+/// the sequence header alone, into the CodecPrivate the trailer writes
+/// again. Named: track 0's configuration, its CodecPrivate of 17 bytes
+/// against 2 065.
+#[cfg(feature = "test-support")]
+#[test]
+fn l237_an_av1c_matroska_writes_cut_is_named() {
+  in_its_own_process("l237_in_a_process_of_its_own");
+}
+
+/// L237's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l237_in_a_process_of_its_own() {
+  if !alone_for("l237_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let (av1, frames, av1c) = unconfigured_av1(&corpus);
+  let obus = [&av1c[4..], &av1_metadata_obu(2_048)].concat();
+  let write = |name: &str, capped: bool| {
+    let table = table_of(&av1, TrackKind::Video)
+      .into_iter()
+      .map(|row| row.with_extradata(Some(bytes_of(&obus))))
+      .collect();
+    let mut hooks = mediaencode_ffmpeg::mux::OpenHooks::default();
+    if capped {
+      hooks = hooks.with_header(|before| if before { cap(1_500) } else { uncap() });
+    }
+    let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+      File::create(output(&corpus, name)).expect("create"),
+      ContainerName::MATROSKA,
+      table,
+      &[],
+      MuxOptions::new(),
+      hooks,
+    )
+    .expect("open");
+    for frame in &frames {
+      wrote(
+        muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frame.clone())),
+        "an AV1 frame",
+      );
+    }
+    muxer.finish()
+  };
+  write("l237-twin.mkv", false).expect("whole");
+  let fault = write("l237.mkv", true).expect_err("the av1C cut, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::Configuration(0),
+      Finding::Length(17, 2_065)
+    ))
+  );
+}
+
+/// **L241 — Matroska's Tracks is judged as the trailer writes it again**
+/// (findit-studio/mediaio#95; the note's windows): FLAC of a 2.1 layout
+/// into Matroska, its last packet carrying new STREAMINFO — its 34 bytes,
+/// its MD5 changed — which Matroska writes into Tracks' buffer
+/// (`mkv_check_new_extra_data`, `matroskaenc.c` 3090–3097) and the trailer
+/// writes again: `finish` `Ok`, the file's CodecPrivate holding the new
+/// STREAMINFO; and L236's plant on the header's Tracks alone, the first
+/// write over the count's offset: `finish` `Ok`, the trailer's rewrite the
+/// one judged.
+///
+/// PLANT P619: Tracks not read again at its rewrite.
+#[cfg(feature = "test-support")]
+#[test]
+fn l241_matroskas_tracks_is_judged_as_the_trailer_writes_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (table, _) = whole_track(&flac_two_one(&corpus), TrackKind::Audio);
+  let mut streaminfo = stream_extradata_of(&table[0]);
+  assert_eq!(streaminfo.len(), 34, "the premise: STREAMINFO");
+  streaminfo[33] ^= 0xFF;
+  flac_into_matroska(&corpus, "l241.mkv", None, Some(&streaminfo))
+    .expect("new STREAMINFO, finished");
+  let bytes = std::fs::read(output(&corpus, "l241.mkv")).expect("the file");
+  let at = bytes
+    .windows(4)
+    .position(|window| window == b"fLaC")
+    .expect("the CodecPrivate");
+  assert_eq!(
+    bytes[at + 8..at + 42],
+    streaminfo[..],
+    "the new STREAMINFO written"
+  );
+  let count = mask_count_offset(&output(&corpus, "l241.mkv"));
+  flac_into_matroska(&corpus, "l241-header.mkv", Some((count, 1)), None)
+    .expect("the header's Tracks planted alone, finished");
 }
