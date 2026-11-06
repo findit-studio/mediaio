@@ -572,3 +572,545 @@ fn r7_a_run_across_the_frontier_whose_part_below_is_no_field_is_a_rewrite() {
     Some(Unfollowed::new(end - 2, Why::Rewrite))
   );
 }
+
+// ---------------------------------------------------------------------------
+//  The sample descriptions (R6): each entry judged as its last byte is read,
+//  against what the muxer handed the tap of it.
+// ---------------------------------------------------------------------------
+
+/// `bytes` written at `at`, which may lie below the frontier and run past
+/// it: the frontier moved to its end where it does.
+impl Sink {
+  fn write(&mut self, at: u64, bytes: &[u8]) {
+    self.runs.push((at, bytes.to_vec()));
+    self.frontier = self.frontier.max(at + bytes.len() as u64);
+  }
+
+  /// The MOV walk over the runs, of a file in `mode`, handed `handed`
+  /// before any run, as the muxer hands it before the trailer.
+  fn walked_with(&self, mode: MovMode, handed: Handed) -> Audit {
+    let mut audit = Audit::mov(mode, 4);
+    audit.hand(0, handed);
+    for (at, bytes) in &self.runs {
+      audit.took(*at, bytes);
+    }
+    audit
+  }
+}
+
+/// A video sample entry `fourcc`: its 78 bytes, then `children`.
+fn video_entry(fourcc: &[u8; 4], children: &[Vec<u8>]) -> Vec<u8> {
+  boxed(fourcc, &[vec![0; 78], children.concat()].concat())
+}
+
+/// An `stsd` of `entries`.
+fn stsd(entries: &[Vec<u8>]) -> Vec<u8> {
+  let mut payload = vec![0; 4];
+  payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+  payload.extend(entries.concat());
+  boxed(b"stsd", &payload)
+}
+
+/// A whole file of one track of the handler `kind`, its `stsd` of
+/// `entries`, of one sample of 4 bytes; the `moov` written in one buffer.
+fn described(kind: &[u8; 4], entries: &[Vec<u8>]) -> Sink {
+  let mut sink = Sink::default();
+  let mdat = header(&mut sink);
+  sink.append(&[0x21; 4]);
+  sink.close(mdat);
+  let stbl = [
+    stsd(entries),
+    stts(&[(1, 1)]),
+    stsz(&[4]),
+    boxed(b"stco", &[0; 8]),
+  ]
+  .concat();
+  let minf = [boxed(b"vmhd", &[0; 12]), boxed(b"stbl", &stbl)].concat();
+  let mdia = [hdlr(kind), boxed(b"minf", &minf)].concat();
+  let trak = [tkhd(1), boxed(b"mdia", &mdia)].concat();
+  sink.append(&boxed(b"moov", &boxed(b"trak", &trak)));
+  sink
+}
+
+/// The verdict on `sink`, walked in `mode` and handed `handed`, against
+/// the expectation of its one sample.
+fn judged_with(sink: &Sink, mode: MovMode, handed: Handed) -> Option<WrittenOtherwise> {
+  mov_verdict(
+    &sink.walked_with(mode, handed),
+    [expected(&[4])].into_iter(),
+  )
+}
+
+/// An `avcC` configuration, as a record: written as it is
+/// ([`records::avcc_written_len`]).
+fn avcc_config(tag: u8) -> Vec<u8> {
+  vec![
+    1, 0x64, 0, 0x1F, 0xFF, 0xE1, 0, 4, 0x67, 0x64, 0, 0x1F, 1, 0, 2, 0x68, tag,
+  ]
+}
+
+/// H.264's descriptions as handed, of `configs`.
+fn avc_handed(configs: &[Vec<u8>]) -> Handed {
+  Handed::new(
+    Carried::Record(Writer::Avcc),
+    configs.iter().cloned().map(Some).collect(),
+    Vec::new(),
+  )
+}
+
+fn named(part: WrittenPart, found: Found) -> Option<WrittenOtherwise> {
+  Some(WrittenOtherwise::new(Some(TrackIndex::new(0)), part, found))
+}
+
+/// **A description judged whole passes, and each difference is named by
+/// its index**: an `avcC` as its writer writes the configuration passes; one
+/// cut, one empty — its placeholder patched to 8 bytes, as FFmpeg's helper
+/// leaves it — and one left out are named against the configuration's
+/// length; the second of two, by index 1; a count short or long, by the
+/// first index past the shorter.
+#[test]
+fn a_description_judged_whole_passes_and_each_difference_is_named() {
+  let config = avcc_config(0xEB);
+  let len = config.len() as u64;
+  let handed = || avc_handed(&[config.clone()]);
+  let entry = |record: Vec<u8>| video_entry(b"avc1", &[record]);
+  let whole = described(b"vide", &[entry(boxed(b"avcC", &config))]);
+  assert_eq!(judged_with(&whole, MovMode::Mp4, handed()), None);
+  let cut = described(b"vide", &[entry(boxed(b"avcC", &config[..10]))]);
+  assert_eq!(
+    judged_with(&cut, MovMode::Mp4, handed()),
+    named(
+      WrittenPart::Configuration(0),
+      Found::Length(Counts::new(10, len))
+    )
+  );
+  let left_out = described(b"vide", &[video_entry(b"avc1", &[boxed(b"pasp", &[0; 8])])]);
+  assert_eq!(
+    judged_with(&left_out, MovMode::Mp4, handed()),
+    named(WrittenPart::Configuration(0), Found::Omitted)
+  );
+  // An empty record, its header flushed before its size's patch.
+  let mut empty = Sink::default();
+  let mdat = header(&mut empty);
+  empty.append(&[0x21; 4]);
+  empty.close(mdat);
+  let [moov, trak, mdia, minf, stbl] = opened_to_stbl(&mut empty, b"vide");
+  let stsd_at = empty.append(&placeholder(b"stsd", &[0, 0, 0, 0, 0, 0, 0, 1]));
+  let avc1 = empty.append(&placeholder(b"avc1", &[0; 78]));
+  let avcc = empty.append(&placeholder(b"avcC", &[]));
+  empty.close(avcc);
+  empty.close(avc1);
+  empty.close(stsd_at);
+  empty.append(&stts(&[(1, 1)]));
+  empty.append(&stsz(&[4]));
+  empty.append(&boxed(b"stco", &[0; 8]));
+  for at in [stbl, minf, mdia] {
+    empty.close(at);
+  }
+  // The track header after the media box, as no writer orders it, is
+  // the walk's alone: it reads the id wherever the `trak` holds it.
+  empty.append(&tkhd(1));
+  empty.close(trak);
+  empty.close(moov);
+  assert_eq!(
+    empty.walked().unfollowed(),
+    None,
+    "the empty record followed"
+  );
+  assert_eq!(
+    judged_with(&empty, MovMode::Mp4, handed()),
+    named(
+      WrittenPart::Configuration(0),
+      Found::Length(Counts::new(0, len))
+    )
+  );
+  // The second of two descriptions, cut.
+  let other = avcc_config(0xEC);
+  let two = described(
+    b"vide",
+    &[
+      entry(boxed(b"avcC", &config)),
+      entry(boxed(b"avcC", &other[..12])),
+    ],
+  );
+  assert_eq!(
+    judged_with(
+      &two,
+      MovMode::Mp4,
+      avc_handed(&[config.clone(), other.clone()])
+    ),
+    named(
+      WrittenPart::Configuration(1),
+      Found::Length(Counts::new(12, other.len() as u64))
+    )
+  );
+  // A count short, then long.
+  let one = described(b"vide", &[entry(boxed(b"avcC", &config))]);
+  assert_eq!(
+    judged_with(
+      &one,
+      MovMode::Mp4,
+      avc_handed(&[config.clone(), other.clone()])
+    ),
+    named(
+      WrittenPart::Configuration(1),
+      Found::Count(Counts::new(1, 2))
+    )
+  );
+  let both = described(
+    b"vide",
+    &[
+      entry(boxed(b"avcC", &config)),
+      entry(boxed(b"avcC", &other)),
+    ],
+  );
+  assert_eq!(
+    judged_with(&both, MovMode::Mp4, handed()),
+    named(
+      WrittenPart::Configuration(1),
+      Found::Count(Counts::new(2, 1))
+    )
+  );
+}
+
+/// **R6 (d): a difference at the 1 024th description is named
+/// `Configuration(1023)`**: 1 024 descriptions handed and written, the last
+/// one's record cut.
+#[test]
+fn r6_the_1024th_description_is_named_by_its_index() {
+  let configs: Vec<Vec<u8>> = (0..1024_u32)
+    .map(|k| [avcc_config(0xEB), k.to_be_bytes().to_vec()].concat())
+    .collect();
+  let entries: Vec<Vec<u8>> = configs
+    .iter()
+    .enumerate()
+    .map(|(index, config)| {
+      let record = if index == 1023 {
+        &config[..config.len() - 1]
+      } else {
+        &config[..]
+      };
+      video_entry(b"avc1", &[boxed(b"avcC", record)])
+    })
+    .collect();
+  let sink = described(b"vide", &entries);
+  let len = configs[1023].len() as u64;
+  assert_eq!(
+    judged_with(&sink, MovMode::Mp4, avc_handed(&configs)),
+    named(
+      WrittenPart::Configuration(1023),
+      Found::Length(Counts::new(len - 1, len))
+    )
+  );
+  let entries: Vec<Vec<u8>> = configs
+    .iter()
+    .map(|config| video_entry(b"avc1", &[boxed(b"avcC", config)]))
+    .collect();
+  assert_eq!(
+    judged_with(
+      &described(b"vide", &entries),
+      MovMode::Mp4,
+      avc_handed(&configs)
+    ),
+    None,
+    "the 1 024 written whole"
+  );
+}
+
+/// **Gate condition 1: a `vvcC` of its header alone is named left out**:
+/// `vvcC`'s writer writes its record whole or not at all, after the box's
+/// own version and flags (`mov_write_vvcc_tag`, `movenc.c` 1708–1723), so
+/// a box of 12 bytes holds none; one byte past its header passes.
+#[test]
+fn a_vvcc_of_its_header_alone_is_named_left_out() {
+  let handed = || {
+    Handed::new(
+      Carried::Record(Writer::Vvcc),
+      vec![Some(vec![0, 0, 0, 1, 0x00, 0x79, 0x80])],
+      Vec::new(),
+    )
+  };
+  let empty = described(b"vide", &[video_entry(b"vvc1", &[boxed(b"vvcC", &[0; 4])])]);
+  assert_eq!(boxed(b"vvcC", &[0; 4]).len(), 12);
+  assert_eq!(
+    judged_with(&empty, MovMode::Mp4, handed()),
+    named(WrittenPart::Configuration(0), Found::Omitted)
+  );
+  let written = described(b"vide", &[video_entry(b"vvc1", &[boxed(b"vvcC", &[0; 5])])]);
+  assert_eq!(judged_with(&written, MovMode::Mp4, handed()), None);
+}
+
+/// An HEVC configuration flagged multilayer: a VPS, the base layer's SPS,
+/// layer 1's SPS, which `hvcC` skips and `lhvC` writes, and a PPS.
+fn layered_hevc() -> Vec<u8> {
+  use crate::mux::tests::{hevc_pps, hevc_sps, hevc_vps, start_coded};
+  start_coded(&[
+    &hevc_vps(0, None),
+    &hevc_sps(0, 0, 1, None),
+    &hevc_sps(1, 0, 0, None),
+    &hevc_pps(),
+  ])
+}
+
+/// **L223 and gate condition 3: `lhvC`'s rewind, both faces** (`movenc.c`
+/// 1654–1674). Where the buffer absorbs it, the entry reads with its `hvcC`
+/// and no `lhvC`: named left out, its configuration's `lhvC` expected.
+/// Where its header was flushed first — its size's placeholder, then its
+/// FourCC, then the next box written from its offset across the frontier
+/// — the walk cannot follow: that box's size, written at the open `lhvC`'s
+/// size field, does not end it at the frontier (the coordinator's ruling on
+/// L223: `Structure`, by §2.3's closing rule and gate condition 2).
+#[test]
+fn l223_lhvcs_rewind_is_named_on_both_faces() {
+  let config = layered_hevc();
+  assert_eq!(
+    records::lhvc(&config, false),
+    records::Wrote::Whole,
+    "the premise: an lhvC writes"
+  );
+  let hvcc_len = records::hvcc_written_len(&config) as usize;
+  let lhvc_len = records::lhvc_written_len(&config) as usize;
+  assert!(lhvc_len >= 8, "the premise: {lhvc_len}");
+  let handed = || {
+    Handed::new(
+      Carried::Record(Writer::Hvcc {
+        complete: false,
+        lhvc: true,
+      }),
+      vec![Some(config.clone())],
+      Vec::new(),
+    )
+  };
+  let hvcc = boxed(b"hvcC", &vec![0; hvcc_len]);
+  let lhvc = boxed(b"lhvC", &vec![0; lhvc_len]);
+  let both = described(b"vide", &[video_entry(b"hvc1", &[hvcc.clone(), lhvc])]);
+  assert_eq!(judged_with(&both, MovMode::Mp4, handed()), None);
+  let absorbed = described(b"vide", &[video_entry(b"hvc1", &[hvcc.clone()])]);
+  assert_eq!(
+    judged_with(&absorbed, MovMode::Mp4, handed()),
+    named(WrittenPart::Configuration(0), Found::Omitted)
+  );
+  // The flushed face.
+  let mut flushed = Sink::default();
+  let mdat = header(&mut flushed);
+  flushed.append(&[0x21; 4]);
+  flushed.close(mdat);
+  opened_to_stbl(&mut flushed, b"vide");
+  flushed.append(&placeholder(b"stsd", &[0, 0, 0, 0, 0, 0, 0, 1]));
+  flushed.append(&placeholder(b"hvc1", &[0; 78]));
+  flushed.append(&hvcc);
+  let at = flushed.append(&[0, 0, 0, 0]);
+  flushed.append(b"lhvC");
+  flushed.write(at, &boxed(b"btrt", &[0; 12]));
+  assert_eq!(
+    flushed.walked().unfollowed(),
+    Some(Unfollowed::new(at, Why::Structure))
+  );
+}
+
+/// **Gate condition 3: `avio_flush`'s seek-back** (`aviobuf.c` 238–245): a
+/// flush that leaves the sink behind the frontier — the writer having gone
+/// back inside its buffer — then a write there, where no field lies: the
+/// walk cannot follow it.
+#[test]
+fn a_write_behind_the_frontier_after_a_flush_is_a_rewrite() {
+  let mut sink = Sink::default();
+  let mdat = header(&mut sink);
+  sink.append(&[0x21; 4]);
+  sink.close(mdat);
+  opened_to_stbl(&mut sink, b"vide");
+  sink.append(&placeholder(b"stsd", &[0, 0, 0, 0, 0, 0, 0, 1]));
+  sink.append(&placeholder(b"avc1", &[0; 78]));
+  let pasp = sink.append(&boxed(b"pasp", &[0; 8]));
+  // Behind the frontier, inside the closed `pasp`, and on past it.
+  sink.write(pasp + 8, &[1; 16]);
+  assert_eq!(
+    sink.walked().unfollowed(),
+    Some(Unfollowed::new(pasp + 8, Why::Rewrite))
+  );
+}
+
+/// A MOV-mode audio entry of version 0, E-AC-3's: its 28 bytes, then a
+/// `wave` of `frma`, `dec3` of `dec3`'s payload where given, and the
+/// terminator (`mov_write_wave_tag`, `movenc.c` 1059–1100).
+fn eac3_entry(dec3: Option<&[u8]>) -> Vec<u8> {
+  let mut wave = boxed(b"frma", b"ec-3");
+  if let Some(payload) = dec3 {
+    wave.extend(boxed(b"dec3", payload));
+  }
+  wave.extend(sized(8, &[0; 4], &[]));
+  boxed(b"ec-3", &[vec![0; 28], boxed(b"wave", &wave)].concat())
+}
+
+/// **A `dec3` is judged against its own fields** (`mov_write_eac3_tag`,
+/// 612–666): one independent substream of no dependent ones, its five
+/// bytes, passes; with the complexity index after them, seven; a substream
+/// naming dependent ones, its four bytes; a byte past them, or a `dec3`
+/// left out, is named.
+#[test]
+fn a_dec3_is_judged_against_its_own_fields() {
+  let handed = || Handed::new(Carried::Dec3, vec![Some(Vec::new())], Vec::new());
+  let audio = |dec3: Option<&[u8]>| described(b"soun", &[eac3_entry(dec3)]);
+  let one = [0x0C, 0x00, 0x20, 0x0F, 0x00];
+  assert_eq!(
+    judged_with(&audio(Some(&one)), MovMode::Mov, handed()),
+    None
+  );
+  let tail = [&one[..], &[0x01, 0x10]].concat();
+  assert_eq!(
+    judged_with(&audio(Some(&tail)), MovMode::Mov, handed()),
+    None
+  );
+  // Two substreams, the second naming dependent ones: 2 + 3 + 4.
+  let two = [0x0C, 0x01, 0x20, 0x0F, 0x00, 0x20, 0x0F, 0x02, 0x80];
+  assert_eq!(
+    judged_with(&audio(Some(&two)), MovMode::Mov, handed()),
+    None
+  );
+  let past = [&one[..], &[0x00]].concat();
+  assert_eq!(
+    judged_with(&audio(Some(&past)), MovMode::Mov, handed()),
+    named(
+      WrittenPart::Configuration(0),
+      Found::Length(Counts::new(6, 5))
+    )
+  );
+  assert_eq!(
+    judged_with(&audio(None), MovMode::Mov, handed()),
+    named(WrittenPart::Configuration(0), Found::Omitted)
+  );
+}
+
+/// An `mp4s` entry whose `esds` holds the decoder-specific information
+/// `dsi` behind the tag `tag` (`mov_write_esds_tag`, 765–816): 30 bytes
+/// before it, then its tag, its length in four bytes of seven bits, its
+/// bytes, and the SL descriptor.
+fn dvd_entry(tag: u8, dsi: &[u8]) -> Vec<u8> {
+  let len = dsi.len() as u32;
+  let mut esds = vec![0; 30];
+  esds.push(tag);
+  esds.extend([
+    ((len >> 21) as u8) | 0x80,
+    ((len >> 14) as u8) | 0x80,
+    ((len >> 7) as u8) | 0x80,
+    (len & 0x7F) as u8,
+  ]);
+  esds.extend_from_slice(dsi);
+  esds.extend([0x06, 0x80, 0x80, 0x80, 0x01, 0x02]);
+  boxed(b"mp4s", &[vec![0; 8], boxed(b"esds", &esds)].concat())
+}
+
+/// **DVD subtitles' palette is judged by its colours** (8000–8048): the
+/// sixteen colours as movenc converts them pass; one other is named by
+/// the content, a palette of another length by its length, and a
+/// decoder-specific information left out — its tag not at offset 30 —
+/// as omitted.
+#[test]
+fn a_dvd_palette_is_judged_by_its_colours() {
+  let colours: [u32; 16] = core::array::from_fn(|at| 0x10_8080 + at as u32 * 0x0B_0000);
+  let bytes: Vec<u8> = colours
+    .iter()
+    .flat_map(|colour| colour.to_be_bytes())
+    .collect();
+  let handed = || Handed::new(Carried::Palette(colours), vec![None], Vec::new());
+  let subtitles = |entry: Vec<u8>| described(b"subp", &[entry]);
+  assert_eq!(
+    judged_with(&subtitles(dvd_entry(5, &bytes)), MovMode::Mp4, handed()),
+    None
+  );
+  let mut other = bytes.clone();
+  other[17] ^= 1;
+  assert_eq!(
+    judged_with(&subtitles(dvd_entry(5, &other)), MovMode::Mp4, handed()),
+    named(WrittenPart::Palette(0), Found::Content)
+  );
+  assert_eq!(
+    judged_with(
+      &subtitles(dvd_entry(5, &bytes[..60])),
+      MovMode::Mp4,
+      handed()
+    ),
+    named(WrittenPart::Palette(0), Found::Length(Counts::new(60, 64)))
+  );
+  assert_eq!(
+    judged_with(&subtitles(dvd_entry(7, &bytes)), MovMode::Mp4, handed()),
+    named(WrittenPart::Palette(0), Found::Omitted)
+  );
+}
+
+/// **R8: a record whose configuration rests on the trust model is judged
+/// not at all, and its writer's record of a conforming configuration still
+/// is**: for each writer whose mirror stops at the trust model's limit —
+/// `hvcC` (an SPS of 65 short-term reference picture sets), `evcC` (an SPS
+/// of id 16), `vvcC` (an SPS of eight sub-layers), `dvc1` (a main profile's
+/// sequence header) — an entry of no record: of the conforming twin, named
+/// left out, as on A4's road; of the trust stop's, no finding.
+#[test]
+fn r8_a_record_at_a_trust_stop_is_judged_not_at_all() {
+  use crate::mux::tests::{
+    evc_header, evc_sps, hevc_pps, hevc_sps, hevc_vps, length_prefixed_units, start_coded, vvc_unit,
+  };
+  let evc_pps = [&evc_header(25)[..], &[0x80]].concat();
+  // An SPS of its ids' byte, then eight sub-layers less one in 3 bits.
+  let vvc_eight = vec![0x00, (15 << 3) | 1, 0x00, 0xE0];
+  let vc1 = |profile: u8| vec![0, 0, 1, 0x0F, (profile << 6) | 0x08, 0x0A];
+  let hevc = |short_term: u32| {
+    start_coded(&[
+      &hevc_vps(0, None),
+      &hevc_sps(0, 0, short_term, None),
+      &hevc_pps(),
+    ])
+  };
+  let cases = [
+    (
+      "hvcC",
+      Writer::Hvcc {
+        complete: false,
+        lhvc: false,
+      },
+      hevc(1),
+      hevc(65),
+    ),
+    (
+      "evcC",
+      Writer::Evcc,
+      length_prefixed_units(&[&evc_sps(0, 1, 2, 2), &evc_pps]),
+      length_prefixed_units(&[&evc_sps(16, 1, 2, 2), &evc_pps]),
+    ),
+    (
+      "vvcC",
+      Writer::Vvcc,
+      start_coded(&[&vvc_unit(15), &vvc_unit(16)]),
+      start_coded(&[&vvc_eight, &vvc_unit(16)]),
+    ),
+    ("dvc1", Writer::Dvc1, vc1(3), vc1(1)),
+  ];
+  for (name, writer, conforming, trusted) in cases {
+    assert!(
+      !records::rests_on_trust(writer, &conforming),
+      "{name}: the conforming twin"
+    );
+    assert!(
+      records::rests_on_trust(writer, &trusted),
+      "{name}: the trust stop"
+    );
+    let handed = |config: &[u8]| {
+      Handed::new(
+        Carried::Record(writer),
+        vec![Some(config.to_vec())],
+        Vec::new(),
+      )
+    };
+    let sink = described(b"vide", &[video_entry(b"avc1", &[boxed(b"pasp", &[0; 8])])]);
+    assert_eq!(
+      judged_with(&sink, MovMode::Mp4, handed(&conforming)),
+      named(WrittenPart::Configuration(0), Found::Omitted),
+      "{name}: a conforming record left out"
+    );
+    assert_eq!(
+      judged_with(&sink, MovMode::Mp4, handed(&trusted)),
+      None,
+      "{name}: no claim at the trust stop"
+    );
+  }
+}

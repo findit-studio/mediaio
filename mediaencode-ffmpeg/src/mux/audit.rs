@@ -46,6 +46,26 @@
 //! - **Payload content.** The samples' bytes in the `mdat` are counted,
 //!   never read: no census row changes a payload byte without changing a
 //!   size the audit counts.
+//! - **A configuration record's bytes.** Each sample description's record
+//!   is judged by its presence and its length, as its writer makes it of
+//!   the description's configuration ([`entry_expected`]): every road of
+//!   the census's A4, A5 and A8 leaves a record out, empty or cut. `vvcC`'s
+//!   and `evcC`'s length are not mirrored — each is judged longer than its
+//!   own header, as its writer writes all or nothing — and `dec3`'s against
+//!   its own fields. DVD subtitles' palette alone is judged by its content,
+//!   the fold of its sixteen colours.
+//! - **A record whose configuration rests on the trust model** (R8): where
+//!   its writer's mirror stopped at a limit only a stream the standards do
+//!   not allow passes, the record is judged not at all, neither its
+//!   presence nor its length, as the muxer refused nothing there — `hvcC`
+//!   and `lhvC` of an SPS of more than 64 short-term reference picture sets
+//!   or of a set whose bits run past it, written empty and left out;
+//!   `evcC` of an SPS of an id past 15 or a chroma format past 3, written
+//!   empty; `vvcC` of an SPS of eight sub-layers, of what FFmpeg writes
+//!   undefined, its parse indexing its arrays past their end; `dvc1` of a
+//!   sequence header of another profile than the advanced one, left out;
+//!   `lvcC` of a block or a picture the standard does not allow, written
+//!   empty ([`records::rests_on_trust`]).
 //! - **What the muxer does not mirror, and no census row writes:** chunk
 //!   offsets and `stsc`, which libavformat's interleaving decides; `ctts`,
 //!   edit lists — judged before the trailer, not read back — and the
@@ -73,7 +93,8 @@
 //! The first difference in a fixed order: the tap's own state — a rewrite
 //! it could not follow, a file that ends inside a structure, a panicked
 //! tap; then each track's own box, in the order the file holds them; then
-//! each track's tables, in track order; then the file's parts. A track's
+//! each track's sample descriptions — the first that differs — and its
+//! tables, in track order; then the file's parts. A track's
 //! omission is named before the file's sizes it shortens, so that the most
 //! specific name wins.
 
@@ -82,13 +103,16 @@ use core::fmt;
 use mediaencode::mediaspine::demuxer::TrackIndex;
 use mediaio_ffmpeg::writer_guard::SinkTap;
 
-use super::MovMode;
+use super::{
+  MovMode, av1c_written, av1c_written_len,
+  records::{self, ApvFrameInfo, Writer},
+};
 
 mod mov;
 #[cfg(test)]
 mod tests;
 
-use mov::MovWalk;
+use mov::{Described, MovWalk};
 
 /// What FFmpeg wrote otherwise than it was handed, answering success: an
 /// omission or a misreport (the census's premise rows), found by the write
@@ -153,6 +177,15 @@ pub enum WrittenPart {
   /// The MOV family's chapter track, which movenc makes of the chapters
   /// itself and which has no track index of the muxer's.
   ChapterTrack,
+  /// A track's sample description, the `index`-th its `stsd` holds, and
+  /// the configuration it carries: the MOV family's record box — `avcC`,
+  /// `hvcC` and `lhvC`, `vvcC`, `evcC`, `lvcC`, `av1C`, `dvc1`, `apvC` — or
+  /// E-AC-3's `dec3` in MOV's `wave`; where the descriptions are counted
+  /// otherwise than handed, the first one past the shorter count.
+  Configuration(u32),
+  /// A DVD subtitle track's sample description, the `index`-th, and the
+  /// palette its `esds` carries as its decoder-specific information.
+  Palette(u32),
   /// A track's time-to-sample table: the MOV family's `stts`.
   TimeToSample,
   /// A track's sample sizes: the MOV family's `stsz`.
@@ -161,14 +194,19 @@ pub enum WrittenPart {
 
 impl fmt::Display for WrittenPart {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.write_str(match self {
+    let name = match self {
       Self::Structure => "the file's structure",
       Self::MediaData => "the media data",
       Self::Track => "its track box",
       Self::ChapterTrack => "the chapter track",
+      Self::Configuration(index) => {
+        return write!(f, "its sample description {index}'s configuration");
+      }
+      Self::Palette(index) => return write!(f, "its sample description {index}'s palette"),
       Self::TimeToSample => "its time-to-sample table",
       Self::SampleSizes => "its sample sizes",
-    })
+    };
+    f.write_str(name)
   }
 }
 
@@ -316,6 +354,15 @@ pub(super) const fn fold(state: u64, value: u64) -> u64 {
 /// The fold of an empty sequence: not zero, so that zeros folded from it
 /// move it.
 const FOLD_SEED: u64 = 0x6A09_E667_F3BC_C908;
+
+/// The fold of a palette's colours, each a word: the muxer's of the colours
+/// movenc converts, the walk's — the same — of the words the `esds`'s
+/// decoder-specific information holds.
+pub(super) fn palette_fold(colours: impl IntoIterator<Item = u32>) -> u64 {
+  colours
+    .into_iter()
+    .fold(FOLD_SEED, |state, colour| fold(state, u64::from(colour)))
+}
 
 /// What [`CueTables`] folds for the trailer's end sample of a `mov_text`
 /// track, where the track's last sample is one.
@@ -535,6 +582,14 @@ impl Audit {
       Walk::Mov(walk) => Some(walk),
     }
   }
+
+  /// Takes the sample descriptions of the `place`-th `trak` the file
+  /// holds, which the muxer moves here before the trailer writes them (R6).
+  pub(super) fn hand(&mut self, place: usize, handed: Handed) {
+    match &mut self.walk {
+      Walk::Mov(walk) => walk.hand(place, handed),
+    }
+  }
 }
 
 impl SinkTap for Audit {
@@ -675,6 +730,181 @@ impl SampleMirror {
   }
 }
 
+/// What a track's sample descriptions carry that the audit judges, by its
+/// codec and the configuration writer movenc calls for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Carried {
+  /// Nothing but their count.
+  #[default]
+  Count,
+  /// The record box the writer makes of each description's configuration
+  /// (`movenc.c` 1573–1738, 1102–1201; [`Writer`]).
+  Record(Writer),
+  /// APV's `apvC`, of the track's frame informations, in each description
+  /// alike (1725–1738; `apv.c` 145–203).
+  Apv,
+  /// E-AC-3's `dec3`, in MOV's `wave` (1059–1100; 612–666).
+  Dec3,
+  /// DVD subtitles' palette: its sixteen colours, as movenc converts them
+  /// (`mov_create_dvd_sub_decoder_specific_info`, 8000–8048).
+  Palette([u32; 16]),
+}
+
+/// A track's sample descriptions as the muxer hands them to the tap before
+/// the trailer writes them (R6): moved, nothing copied and nothing
+/// allocated, and read by nothing else after it.
+#[derive(Debug, Default)]
+pub(super) struct Handed {
+  carried: Carried,
+  /// Each description's configuration as movenc keeps it, `None` of the
+  /// one it makes itself: DVD subtitles' first.
+  entries: Vec<Option<Vec<u8>>>,
+  /// APV's frame informations, by PBU type.
+  apv: Vec<(u8, Vec<ApvFrameInfo>)>,
+  /// How many descriptions movenc writes.
+  count: usize,
+}
+
+impl Handed {
+  /// A track's descriptions, as the muxer kept them.
+  pub(super) fn new(
+    carried: Carried,
+    entries: Vec<Option<Vec<u8>>>,
+    apv: Vec<(u8, Vec<ApvFrameInfo>)>,
+  ) -> Self {
+    Self {
+      carried,
+      count: entries.len(),
+      entries,
+      apv,
+    }
+  }
+
+  /// The chapter track's: its one text description, judged by its count.
+  pub(super) fn chapter_track() -> Self {
+    Self {
+      count: 1,
+      ..Self::default()
+    }
+  }
+
+  /// How many descriptions movenc writes.
+  pub(super) const fn count(&self) -> usize {
+    self.count
+  }
+
+  /// What the `index`-th description is expected to carry.
+  pub(super) fn entry(&self, index: usize) -> EntryExpected {
+    entry_expected(
+      self.carried,
+      self.entries.get(index).and_then(Option::as_deref),
+      &self.apv,
+    )
+  }
+}
+
+/// What a sample description is expected to carry ([`entry_expected`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct EntryExpected {
+  /// Its record box, where one is judged.
+  record: Option<RecordExpected>,
+  /// `lhvC` beside its `hvcC`, judged of every HEVC description: its
+  /// payload's bytes where movenc writes one — a stream flagged multilayer,
+  /// of a configuration `ff_isom_write_lhvc` writes — `None` where none.
+  layers: Option<Option<u64>>,
+  /// DVD subtitles' palette, its fold.
+  palette: Option<u64>,
+}
+
+impl EntryExpected {
+  /// Its record box's FourCC and payload's bytes, where they are mirrored
+  /// exactly; and `lhvC`'s beside it: the laws' seam.
+  #[cfg(feature = "test-support")]
+  pub(super) fn records(self) -> impl Iterator<Item = ([u8; 4], u64)> {
+    let record = match self.record {
+      Some(RecordExpected::Exact(fourcc, len)) => Some((fourcc, len)),
+      _ => None,
+    };
+    record
+      .into_iter()
+      .chain(self.layers.flatten().map(|len| (*b"lhvC", len)))
+  }
+}
+
+/// A record box, as a sample description is expected to carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecordExpected {
+  /// A box `fourcc` whose payload is `len` bytes.
+  Exact([u8; 4], u64),
+  /// A box `fourcc` whose payload is longer than `len` bytes, its own
+  /// header's: of a writer that writes its record whole or not at all, its
+  /// length not mirrored (`vvc.c` 879–936, `evc.c` 298–385; the design
+  /// gate's condition 1).
+  Longer([u8; 4], u64),
+  /// E-AC-3's `dec3`, as long as its own fields say.
+  Dec3,
+}
+
+/// What a sample description of a track whose descriptions carry
+/// `carried`, of the configuration `config` — `None` of the one movenc
+/// makes itself — is expected to carry, of a track of the APV frame
+/// informations `apv`: its record as the writer writes the configuration,
+/// which the muxer took only where the writer writes it whole (table C′′′
+/// of the census, [`Writer::writes`]) — `avcC`, `hvcC` and `lhvC` beside
+/// it, `lvcC`, `av1C` as their writers make them, `dvc1` of its seven
+/// bytes and the configuration (1186–1201), of a configuration at all;
+/// `vvcC` and `evcC` longer than their header; `apvC` of its header's four
+/// bytes and the frame informations' record; E-AC-3's `dec3`; DVD
+/// subtitles' palette — and nothing of a record whose writer's mirror
+/// stopped at the trust model's limit ([`records::rests_on_trust`]; R8). The walk calls it of each entry as the entry's last
+/// byte is read, the laws' seam of each description the muxer holds: one
+/// function, so that no mirror is copied (R6).
+pub(super) fn entry_expected(
+  carried: Carried,
+  config: Option<&[u8]>,
+  apv: &[(u8, Vec<ApvFrameInfo>)],
+) -> EntryExpected {
+  let exact = |fourcc: &[u8; 4], len: u64| Some(RecordExpected::Exact(*fourcc, len));
+  let mut expected = EntryExpected::default();
+  match (carried, config) {
+    (Carried::Count, _) | (Carried::Record(_), None) => {}
+    // A record that rests on the trust model: judged not at all (R8).
+    (Carried::Record(writer), Some(config)) if records::rests_on_trust(writer, config) => {}
+    (Carried::Apv, _) => expected.record = exact(b"apvC", 4 + records::apvc_written_len(apv)),
+    (Carried::Dec3, _) => expected.record = Some(RecordExpected::Dec3),
+    (Carried::Palette(colours), _) => expected.palette = Some(palette_fold(colours)),
+    (Carried::Record(writer), Some(config)) => {
+      expected.record = match writer {
+        Writer::Avcc => exact(b"avcC", records::avcc_written_len(config)),
+        Writer::Hvcc { complete, lhvc } => {
+          expected.layers = Some(
+            (lhvc && records::lhvc(config, complete).whole())
+              .then(|| records::lhvc_written_len(config)),
+          );
+          exact(b"hvcC", records::hvcc_written_len(config))
+        }
+        Writer::Vvcc => Some(RecordExpected::Longer(*b"vvcC", 4)),
+        Writer::Evcc => Some(RecordExpected::Longer(*b"evcC", 0)),
+        // A configuration whose units rest on the trust model, whose
+        // length is none of the mirror's: judged by nothing.
+        Writer::Lvcc => records::lvcc_written_len(config).and_then(|len| exact(b"lvcC", len)),
+        Writer::Av1c => exact(
+          b"av1C",
+          if av1c_written(config) {
+            av1c_written_len(config) as u64
+          } else {
+            0
+          },
+        ),
+        Writer::Dvc1 if config.is_empty() => None,
+        Writer::Dvc1 => exact(b"dvc1", 7 + config.len() as u64),
+        Writer::Vpcc { .. } | Writer::Av3c => None,
+      };
+    }
+  }
+  expected
+}
+
 /// A track's `trak` as the muxer expects it, in the order movenc writes
 /// them: a track of the muxer's, or movenc's chapter track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -734,8 +964,16 @@ pub(super) fn mov_verdict(
       Found::Count(Counts::new(walk.traks_seen() as u64, wanted as u64)),
     ));
   }
-  // Each track's tables, in track order.
+  // Each track's descriptions, then its tables, in track order.
   for (trak, seen) in expected.zip(traks) {
+    if let Some((index, described, found)) = seen.descriptions() {
+      let part = match (trak.track, described) {
+        (None, _) => WrittenPart::ChapterTrack,
+        (Some(_), Described::Configuration) => WrittenPart::Configuration(index),
+        (Some(_), Described::Palette) => WrittenPart::Palette(index),
+      };
+      return Some(WrittenOtherwise::new(trak.track, part, found));
+    }
     let cues = trak.samples.reads_cues();
     let table = |part, written: Option<Summary>, wanted: Summary| {
       let Some(written) = written else {

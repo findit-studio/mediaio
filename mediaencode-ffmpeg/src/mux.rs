@@ -636,14 +636,14 @@
 //! | A1 | the MOV family's `pssh` boxes (`mov_write_pssh_tag`, `movenc.c` 5175–5210; 5449–5451) | the encryption initialization parsed again at the `moov`, its allocation's failure answered as none, 0 returned and discarded besides: the file written without its DRM initialization | omission: no entry, no box (5184–5206) | out of reach: the parse's allocations, each within the side data's own bytes — its key ids' array a pointer a key id, of CENC's 16-byte ids at most an eighth of the ticket's budget (`encryption_info.c` 176–211, 231–290; `mov.c` 8082–8083); a key id of no bytes leaves that array null, the parse copying each key id through it and the free reading it again (190, 280, 216–229): refused at open by name before any of it is parsed ([`MuxOpenError::KeyIdWithoutBytes`]; R22, the coordinator's ruling: a bad declaration, refused) — L194 | the premise (R21, the owner's ruling on letter 1, Q2: lifted, refused at open since R19), its boxes counted in the `moov`'s bound ([`pssh_bytes`]) — L165, L153, L158 |
 //! | A2 | the MOV family's `stts` (`mov_write_stts_tag`, 3241–3288; discarded at 3411) | its 8 bytes a sample, their allocation's failure returned and discarded: the track written without its time-to-sample table — every track but constant-size audio's, whose one entry's allocation the same | omission: returned before any write (3249–3251, 3257–3259) | out of reach: the table's entries, at most [`MOV_SAMPLES_MAX`] — 29 826 048 × 8 = 238 608 384 bytes, 33 553 408 × 8 = 268 427 264 of 64-byte entries — and `ctts`'s one more (3208) | detected at `finish` by the write audit (#95): every `stbl` written holds its `stts`, its runs folded against the muxer's ([`WrittenPart::TimeToSample`]) — L217 |
 //! | A3 | AAC's and Opus's roll groups (`mov_preroll_write_stbl_atoms`, 3305–3400; 3436) | `sgpd` and `sbgp` left out | omission: returned before any write (3326–3328) | out of reach: 12 bytes an entry, 357 912 576 at the table's bound, 402 640 896 of 64-byte entries | the premise |
-//! | A4 | the MOV family's configuration records, FLV's beside them (A22) | the helpers' allocations — `hvcC`'s every configuration parsed again, `av1C`'s OBU buffer, `avcC`'s, `vvcC`'s, `evcC`'s and `lvcC`'s of an Annex B configuration, `dvc1`'s unescaped copy — their failures returned to `mov_write_*_tag`, which answers its box's size whatever (1573–1738), and `mov_write_video_tag` discards that besides (2880–2930): the box written empty or cut, the track undecodable; Matroska returns them, its fault at the header — `avcC`'s growth there named a malformed configuration — but for `av1C`'s OBU buffer's growth, its record written cut | omission: each helper returns before it writes, or writes what it parsed; after an Annex B buffer's failed close, `avcC`'s, `hvcC`'s and `vvcC`'s walks sum a null pointer and `-64` (`avc.c` 53–54; `hevc.c` 1377–1378; `vvc.c` 904–905) — arithmetic ISO C leaves undefined, no access: each loop's guard reads `-64` | reachable past a budget the caller raises (`CodecTicket::mirror_with`), a configuration of up to `INT_MAX` less its padding, each bounded exactly at open (r2): the Annex B rewrite, its dynamic buffer's `INT_MAX` with its padding (S7); `dvc1`'s units' bits and its sequence header's reader (S9); LCEVC's split — its RBSP buffer, its list of `INT_MAX` over an `H2645NAL`'s 88 bytes, its units' emulation prevention positions (`h2645_parse.c` 480–606; S10); `hvcC`'s read whole within `init_get_bits8`'s 268 435 391 bytes, mirrored ([`records`]); out of reach whatever the budget: `av1C`'s OBUs, `evcC`'s arrays and `dvc1`'s unescaped copy, each within the configuration's own `int` and the allocation it was copied in | the premise (R21, Q6): after an Annex B buffer's failed close, the walks' arithmetic on the null pointer and `-64` is undefined in ISO C; no memory is read or written, each loop's guard reading `-64`; the record written empty, success answered — an omission the write-side audit catches at `finish`. The remedy, the records built here, is booked (<https://github.com/findit-studio/mediaio/issues/94>) |
-//! | A5 | APV's `apvC` entries (`ff_isom_parse_apvc`, `apv.c` 217–245; discarded at `movenc.c` 7199) | an entry's allocation at a packet: the record written without it | omission: the array kept, returned before the write (`apv.c` 474–478, 496–500) | out of reach: five entries (473) of 255 informations (493) | the premise |
+//! | A4 | the MOV family's configuration records, FLV's beside them (A22) | the helpers' allocations — `hvcC`'s every configuration parsed again, `av1C`'s OBU buffer, `avcC`'s, `vvcC`'s, `evcC`'s and `lvcC`'s of an Annex B configuration, `dvc1`'s unescaped copy — their failures returned to `mov_write_*_tag`, which answers its box's size whatever (1573–1738), and `mov_write_video_tag` discards that besides (2880–2930): the box written empty or cut, the track undecodable; Matroska returns them, its fault at the header — `avcC`'s growth there named a malformed configuration — but for `av1C`'s OBU buffer's growth, its record written cut | omission: each helper returns before it writes, or writes what it parsed; after an Annex B buffer's failed close, `avcC`'s, `hvcC`'s and `vvcC`'s walks sum a null pointer and `-64` (`avc.c` 53–54; `hevc.c` 1377–1378; `vvc.c` 904–905) — arithmetic ISO C leaves undefined, no access: each loop's guard reads `-64` | reachable past a budget the caller raises (`CodecTicket::mirror_with`), a configuration of up to `INT_MAX` less its padding, each bounded exactly at open (r2): the Annex B rewrite, its dynamic buffer's `INT_MAX` with its padding (S7); `dvc1`'s units' bits and its sequence header's reader (S9); LCEVC's split — its RBSP buffer, its list of `INT_MAX` over an `H2645NAL`'s 88 bytes, its units' emulation prevention positions (`h2645_parse.c` 480–606; S10); `hvcC`'s read whole within `init_get_bits8`'s 268 435 391 bytes, mirrored ([`records`]); out of reach whatever the budget: `av1C`'s OBUs, `evcC`'s arrays and `dvc1`'s unescaped copy, each within the configuration's own `int` and the allocation it was copied in | the premise (R21, Q6): after an Annex B buffer's failed close, the walks' arithmetic on the null pointer and `-64` is undefined in ISO C; no memory is read or written, each loop's guard reading `-64`; the record written empty, success answered — the MOV family's part detected at `finish` by the write audit (#95): each sample description's record, present and as long as its writer makes it of the description's configuration, `vvcC` and `evcC` longer than their header ([`WrittenPart::Configuration`]) — L221, L222, L223; `lhvC`'s rewind past its flushed header unfollowed (F6); Matroska's cut `av1C` the premise. The remedy, the records built here, is booked (<https://github.com/findit-studio/mediaio/issues/94>) |
+//! | A5 | APV's `apvC` entries (`ff_isom_parse_apvc`, `apv.c` 217–245; discarded at `movenc.c` 7199) | an entry's allocation at a packet: the record written without it | omission: the array kept, returned before the write (`apv.c` 474–478, 496–500) | out of reach: five entries (473) of 255 informations (493) | detected at `finish` by the write audit (#95): the `apvC`'s length, of every frame information the packets recorded ([`WrittenPart::Configuration`]) — L227 |
 //! | A6 | MP4's track `udta` (4358–4389; discarded at 4441) | its buffer's open: the DASH roles left out, the dispositions read back without them | omission: no box (4369–4371, 4381) | out of reach: the roles' fixed strings alone — the base sets a stream no title (`Output::add_stream`) | the premise |
 //! | A7 | the movie `udta` (5066–5122; discarded at 5448) | its buffer's open, its growth past 1024 bytes read as none (5114): the covers, the Nero list and the iTunes metadata left out; its `INT_MAX` bounded exactly at open ([`MuxOpenError::CoversTooLarge`]) | omission: no box (5114) | bounded exactly at open ([`UDTA_BYTES_MAX`]) | the premise |
-//! | A8 | MOV's `wave` (1059–1100) | E-AC-3's `dec3`, its allocation discarded (1087) | omission: returned before any write (627–630) | out of reach: at most 36 bytes (626) | the premise |
+//! | A8 | MOV's `wave` (1059–1100) | E-AC-3's `dec3`, its allocation discarded (1087) | omission: returned before any write (627–630) | out of reach: at most 36 bytes (626) | detected at `finish` by the write audit (#95): each E-AC-3 description's `wave` holds a `dec3` as long as its own fields say ([`WrittenPart::Configuration`]) — L226 |
 //! | A9 | the chapter track's samples (`mov_create_chapter_track`, 7727–7815) | each sample's write discarded (7807): the track of fewer samples than chapters | omission: the sample's allocation checked (7799–7803), its write's answer dropped | out of reach: a title of at most 65 535 bytes ([`MuxOpenError::ChapterTitleTooLong`]), its sample 65 549; the samples within the table ([`MuxOpenError::ChapterCount`]) | detected at `finish` by the write audit (#95): the chapter track's `trak`, its samples' sizes and durations as movenc makes them at its header ([`WrittenPart::ChapterTrack`]); the `mdat`'s size, which the lost samples' bytes leave short (F10) — L229 |
 //! | A10 | `mov_text`'s end sample (9025–9031) | its write discarded: the last cue's end lost | omission: a 2-byte sample (7484–7494) | out of reach: its entry within the table's bound, which keeps its room ([`PayloadRule::SampleTable`]) | detected at `finish` by the write audit (#95): the cue track's tables, read by R5's rule, their last sample the trailer's end ([`WrittenPart::TimeToSample`]); the `mdat`'s size, which its 2 bytes leave short (F10) — L230 |
-//! | A11 | DVD subtitles' palette (8000–8048; discarded at 8752) | the `esds` written of no palette | omission: returned before any write (8035–8037) | out of reach: 128 bytes | the premise |
+//! | A11 | DVD subtitles' palette (8000–8048; discarded at 8752) | the `esds` written of no palette | omission: returned before any write (8035–8037) | out of reach: 128 bytes | detected at `finish` by the write audit (#95): the `esds`'s decoder-specific information, its sixteen colours as movenc converts them ([`WrittenPart::Palette`]) — L228 |
 //! | — | a note: the `tfra` index of a fragmented MOV-family output — A12, ISMV's fragments, gone with ISMV (R21, the owner's ruling on letter 1, Q5) | every fragmented output of the MOV family collects the same `tfra` index: its count raised before the growth whose failure frees and nulls it, the answer discarded, the trailer's `mfra` reading every entry through the null index (`mov_add_tfra_entries`, `movenc.c` 5803–5840; 6107, 6850, 9127–9129) | memory fault | — | none written: no mode this release writes fragments. The pending fragmented-MP4 design meets it, `+skip_trailer` — no `mfra` written — the road there |
 //! | A13 | AVIF (9154–9213) | its sample buffer's growth read as none, an `mdat` of no sample written; its `moov`'s null buffer's open answered as the size, every chunk's offset moved by it | omission and misreport: 0 bytes and a null buffer written as none (9189–9198); the open's code taken as the size (8911–8912, 9179–9181) | bounded: the samples ([`FRAGMENT_BYTES_MAX`]), the `moov` (S2) | the premise |
 //! | A14 | Ogg's pages (`ogg_buffer_page`, `oggenc.c` 189–212) | a page's list node, its failure discarded at every call: the page left full and the next segment count, less one, handed to `memset` as `SIZE_MAX` (247–253) | memory fault: `memset` of `SIZE_MAX` bytes past the page's segments (252), then `segments[255]` (256) — every page buffered through `ogg_buffer_page` (233–234, 239–242, 275–280, 285–286), a page whose buffering fails taking the next segments until it is full: no road avoids it | out of reach: the node's and the page's fixed sizes; the comment header bounded exactly at open until R21 (S1), Ogg withheld since | Ogg withheld at open (R21, the owner's ruling on letter 1, Q3: [`MuxOpenError::ContainerWithheld`], [`Withheld::OggPageBuffering`]) until the project's own Ogg writer, findit-studio/oggoat, lands — the row its evidence |
@@ -1620,7 +1620,7 @@ use smol_bytes::Utf8Bytes;
 mod audit;
 mod records;
 
-use audit::{Audit, ExpectedTrak, SampleMirror};
+use audit::{Audit, Carried, ExpectedTrak, Handed, SampleMirror};
 pub use audit::{Counts, Found, Unfollowed, Why, WrittenOtherwise, WrittenPart};
 use records::{Units, Writer, Wrote};
 
@@ -5366,6 +5366,9 @@ struct TrackState {
   /// The MOV family: what the write audit expects of the track's sample
   /// tables, of each sample movenc writes ([`SampleMirror`]).
   samples: SampleMirror,
+  /// The MOV family: what its sample descriptions carry that the write
+  /// audit judges ([`Carried`]).
+  carried: Carried,
 }
 
 /// MP4's joined TTML document, as its trailer writes it
@@ -11100,6 +11103,10 @@ pub struct CarrierMuxer<W, C: FfmpegCarrier> {
   /// The MOV family's chapter track as the write audit expects it, made at
   /// open from the chapters; `None` where its mode makes none.
   chapter_trak: Option<ExpectedTrak>,
+  /// The chapter track's samples as the write audit expects them, for the
+  /// laws' seam ([`Self::expected_chapter_samples`]).
+  #[cfg(feature = "test-support")]
+  chapter_track: Vec<(i64, u64, i64)>,
   _carrier: PhantomData<fn() -> C>,
 }
 
@@ -11108,6 +11115,10 @@ pub struct CarrierMuxer<W, C: FfmpegCarrier> {
 #[derive(Default)]
 struct Hooks {
   header: Option<Box<dyn FnMut(bool)>>,
+  /// A plant over the bytes libavformat hands the sink
+  /// ([`Output::set_write_plant`]).
+  #[cfg(feature = "test-support")]
+  plant: Option<Box<dyn FnMut(u64, &mut [u8]) + Send>>,
 }
 
 /// Test support: what a law runs inside a muxer's open
@@ -11125,6 +11136,16 @@ impl OpenHooks {
   #[must_use]
   pub fn with_header(mut self, header: impl FnMut(bool) + 'static) -> Self {
     self.0.header = Some(Box::new(header));
+    self
+  }
+
+  /// Plants `change` over the bytes libavformat hands the sink, from the
+  /// header on, before the sink and the write audit's tap see them
+  /// ([`Output::set_write_plant`]): where a law writes a file otherwise
+  /// than FFmpeg does, to show the audit names it.
+  #[must_use]
+  pub fn with_plant(mut self, change: impl FnMut(u64, &mut [u8]) + Send + 'static) -> Self {
+    self.0.plant = Some(Box::new(change));
     self
   }
 }
@@ -11615,6 +11636,12 @@ where
         id: u32::try_from(output.streams() + 1).unwrap_or(u32::MAX),
         samples: chapter_samples_expected(chapters, &spans, movie_timescale),
       });
+    #[cfg(feature = "test-support")]
+    let chapter_track = if chapter_trak.is_some() {
+      chapter_track_samples(chapters, &spans, movie_timescale).collect()
+    } else {
+      Vec::new()
+    };
     for (index, (chapter, (start, end))) in chapters.iter().zip(spans).enumerate() {
       output
         .add_chapter(
@@ -11633,6 +11660,10 @@ where
       output
         .set_tap(Audit::mov(mode, tracks.len() + 1))
         .map_err(|error| MuxFault::new(MuxStage::Open, error))?;
+    }
+    #[cfg(feature = "test-support")]
+    if let Some(plant) = hooks.plant.take() {
+      output.set_write_plant(plant);
     }
     if let Some(header) = hooks.header.as_mut() {
       header(true);
@@ -11653,6 +11684,7 @@ where
       let mut rules = PacketRules::default();
       let mut sides = SideRules::unclaimed();
       let mut descriptions = Descriptions::default();
+      let mut carried = Carried::default();
       let mut moov = None;
       let mut ttml = None;
       let mut rates = None;
@@ -11798,6 +11830,7 @@ where
           }
           if family == Family::Mp4 {
             descriptions = Descriptions::of(&codec);
+            carried = carried_of(audited, &codec, rules.writer);
           }
           // What the `moov` its trailer writes holds of the track (R14).
           if family == Family::Mp4 {
@@ -11878,6 +11911,7 @@ where
         } else {
           SampleMirror::default()
         },
+        carried,
       });
     }
 
@@ -11972,6 +12006,8 @@ where
         movie_timescale: matches!(audited, Audited::Mov(_)).then_some(movie_timescale),
         audited: audit_mode.is_some(),
         chapter_trak,
+        #[cfg(feature = "test-support")]
+        chapter_track,
         _carrier: PhantomData,
       },
       report,
@@ -12210,6 +12246,9 @@ where
     if let Some(refusal) = self.fact_chunks_refused() {
       return Err(self.refuse_trailer(refusal));
     }
+    // The write audit's sample descriptions, moved into its tap before the
+    // trailer writes them (R6).
+    self.hand_descriptions();
     self
       .output
       .write_trailer()
@@ -12408,6 +12447,112 @@ where
           Found::Unfollowed(Unfollowed::new(at, Why::Panicked)),
         ))
       })
+  }
+
+  /// Moves each written `trak`'s sample descriptions into the write audit's
+  /// tap, in the order movenc writes the `trak`s and the chapter track's
+  /// last ([`Handed`]; R6): their configurations and APV's frame
+  /// informations, nothing copied and nothing allocated. Nothing reads them
+  /// here after: the trailer writes the descriptions from libavformat's own,
+  /// and the report is whole before it. A tap that panicked takes none, and
+  /// the verdict names it ([`Self::written_otherwise`]).
+  fn hand_descriptions(&mut self) {
+    if !self.audited {
+      return;
+    }
+    let Self {
+      output,
+      tracks,
+      chapter_trak,
+      ..
+    } = self;
+    let chapter = chapter_trak.is_some();
+    let _ = output.with_tap(|audit: &mut Audit| {
+      let mut place = 0;
+      for state in tracks.iter_mut().filter(|state| writes_trak(state)) {
+        audit.hand(
+          place,
+          Handed::new(
+            state.carried,
+            core::mem::take(&mut state.descriptions.entries),
+            core::mem::take(&mut state.apv),
+          ),
+        );
+        place += 1;
+      }
+      if chapter {
+        audit.hand(place, Handed::chapter_track());
+      }
+    });
+  }
+
+  /// The record boxes the write audit expects of each track's sample
+  /// descriptions, those it mirrors exactly — of each track and
+  /// description, the FourCC and the payload's bytes its writer makes
+  /// ([`audit::entry_expected`]) — or of none once `finish` has moved them:
+  /// the laws' seam, which reads the written records back against them
+  /// (the design gate's condition 7).
+  #[cfg(feature = "test-support")]
+  #[doc(hidden)]
+  pub fn expected_records(&self) -> Vec<(TrackIndex, u32, [u8; 4], u64)> {
+    self
+      .tracks
+      .iter()
+      .enumerate()
+      .flat_map(|(index, state)| {
+        state
+          .descriptions
+          .entries
+          .iter()
+          .enumerate()
+          .flat_map(move |(entry, config)| {
+            audit::entry_expected(state.carried, config.as_deref(), &state.apv)
+              .records()
+              .map(move |(fourcc, len)| {
+                (
+                  TrackIndex::new(index),
+                  u32::try_from(entry).unwrap_or(u32::MAX),
+                  fourcc,
+                  len,
+                )
+              })
+          })
+      })
+      .collect()
+  }
+
+  /// The palette the write audit expects of each DVD subtitle track's
+  /// description, its sixteen colours as movenc converts and writes them,
+  /// four bytes each ([`dvd_sub_palette_yuv`]): the laws' seam.
+  #[cfg(feature = "test-support")]
+  #[doc(hidden)]
+  pub fn expected_palettes(&self) -> Vec<(TrackIndex, [u8; 64])> {
+    self
+      .tracks
+      .iter()
+      .enumerate()
+      .filter_map(|(index, state)| match state.carried {
+        Carried::Palette(colours) => {
+          let mut bytes = [0; 64];
+          for (word, colour) in bytes.chunks_exact_mut(4).zip(colours) {
+            word.copy_from_slice(&colour.to_be_bytes());
+          }
+          Some((TrackIndex::new(index), bytes))
+        }
+        _ => None,
+      })
+      .collect()
+  }
+
+  /// The chapter track's samples the write audit expects, as movenc makes
+  /// them at its header — each its start counted in the movie timescale,
+  /// its bytes and its end ([`chapter_track_samples`]) — none where it
+  /// expects no chapter track: the laws' seam (the design gate's condition
+  /// 7).
+  #[cfg(feature = "test-support")]
+  #[doc(hidden)]
+  pub fn expected_chapter_samples(&self) -> &[(i64, u64, i64)] {
+    &self.chapter_track
   }
 
   /// The bytes the write audit's tap has walked so far, or `None` where
@@ -16831,10 +16976,10 @@ fn dvd_sub_palette(config: &[u8]) -> Option<bool> {
   let fix = |x: f64| (x * 1024.0 + 0.5) as i32;
   let clip = |v: i32| v.clamp(0, 255);
   Some(colours.iter().any(|&rgb| {
-    let [r, g, b] = [(rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF].map(|c| c as i32);
-    let y = clip((16_000 + 257 * r + 504 * g + 98 * b) / 1000);
-    let cb = clip((128_000 - 148 * r - 291 * g + 439 * b) / 1000) - 128;
-    let cr = clip((128_000 + 439 * r - 368 * g - 71 * b) / 1000) - 128;
+    let yuv = rgb_to_yuv(rgb);
+    let y = (yuv >> 16) as i32;
+    let cr = ((yuv >> 8) & 0xFF) as i32 - 128;
+    let cb = (yuv & 0xFF) as i32 - 128;
     let r_add = fix(1.402 * 255.0 / 224.0) * cr + 512;
     let g_add = -fix(0.34414 * 255.0 / 224.0) * cb - fix(0.71414 * 255.0 / 224.0) * cr + 512;
     let b_add = fix(1.772 * 255.0 / 224.0) * cb + 512;
@@ -16842,6 +16987,33 @@ fn dvd_sub_palette(config: &[u8]) -> Option<bool> {
     let back = [r_add, g_add, b_add].map(|add| clip((y + add - 1024) >> 10) as u32);
     (back[0] << 16 | back[1] << 8 | back[2]) != rgb
   }))
+}
+
+/// A colour's luma and two chroma as movenc's `rgb_to_yuv` makes them of
+/// its red, green and blue (`movenc.c` 7976–7988 in FFmpeg 9.0.1), packed
+/// as it packs them: luma, then red chroma, then blue chroma, a byte each,
+/// each clipped to its byte — which no colour of 8-bit channels passes:
+/// luma lies within 16 to 235, chroma within 16 to 239.
+fn rgb_to_yuv(rgb: u32) -> u32 {
+  let [r, g, b] = [(rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF].map(|c| c as i32);
+  let clip = |v: i32| v.clamp(0, 255) as u32;
+  let y = clip((16_000 + 257 * r + 504 * g + 98 * b) / 1000);
+  let cb = clip((128_000 - 148 * r - 291 * g + 439 * b) / 1000);
+  let cr = clip((128_000 + 439 * r - 368 * g - 71 * b) / 1000);
+  (y << 16) | (cr << 8) | cb
+}
+
+/// The sixteen colours MP4's DVD subtitle writer makes of `config`'s
+/// palette line, as it converts them ([`rgb_to_yuv`]), or `None` where it
+/// writes none or fewer ([`dvd_sub_palette_colours`]): the palette its
+/// `esds` carries (8037–8043).
+fn dvd_sub_palette_yuv(config: &[u8]) -> Option<[u32; 16]> {
+  let colours = dvd_sub_palette_colours(config).filter(|colours| colours.len() == 16)?;
+  let mut converted = [0; 16];
+  for (slot, &rgb) in converted.iter_mut().zip(&colours) {
+    *slot = rgb_to_yuv(rgb);
+  }
+  Some(converted)
 }
 
 /// MPEG-4 ALS, which the base names no constant for.
@@ -18157,17 +18329,52 @@ fn expected_traks(
     .iter()
     .enumerate()
     .filter_map(|(index, state)| {
-      let shape = state.moov?;
       let (stream, _) = state.stream?;
-      state
-        .trak_written(shape, state.mp4_entries, false)
-        .then(|| ExpectedTrak {
-          track: Some(TrackIndex::new(index)),
-          id: u32::try_from(stream + 1).unwrap_or(u32::MAX),
-          samples: state.finished_samples(),
-        })
+      writes_trak(state).then(|| ExpectedTrak {
+        track: Some(TrackIndex::new(index)),
+        id: u32::try_from(stream + 1).unwrap_or(u32::MAX),
+        samples: state.finished_samples(),
+      })
     })
     .chain(chapter)
+}
+
+/// Whether movenc writes `state`'s track a `trak` of its own: a timed
+/// track of the MOV family whose `trak` it writes
+/// ([`TrackState::trak_written`]), in the order of the tracks.
+fn writes_trak(state: &TrackState) -> bool {
+  state.stream.is_some()
+    && state
+      .moov
+      .is_some_and(|shape| state.trak_written(shape, state.mp4_entries, false))
+}
+
+/// What a track of `codec` writes in its sample descriptions that the write
+/// audit judges in `audited`, the MOV family's MP4, MOV and iPod
+/// ([`Carried`]): APV's `apvC`; E-AC-3's `dec3` in MOV's `wave` alone —
+/// MP4's mode reads its writer's answer (`movenc.c` 1530–1531); DVD
+/// subtitles' palette, where movenc makes one ([`dvd_sub_palette_yuv`]);
+/// and the record its configuration writer makes ([`config_writer`]).
+fn carried_of(audited: Audited, codec: &StreamCodec, writer: Option<Writer>) -> Carried {
+  let id = codec.codec();
+  if !matches!(
+    audited,
+    Audited::Mov(MovMode::Mp4 | MovMode::Mov | MovMode::Ipod)
+  ) {
+    Carried::Count
+  } else if id == CodecId::APV {
+    Carried::Apv
+  } else if id == CodecId::EAC3 {
+    if audited == Audited::Mov(MovMode::Mov) {
+      Carried::Dec3
+    } else {
+      Carried::Count
+    }
+  } else if id == CodecId::DVD_SUBTITLE {
+    dvd_sub_palette_yuv(codec.extradata()).map_or(Carried::Count, Carried::Palette)
+  } else {
+    writer.map_or(Carried::Count, Carried::Record)
+  }
 }
 
 /// The chapter track's sample tables, as movenc makes them at its header
@@ -18184,25 +18391,40 @@ fn chapter_samples_expected(
 ) -> SampleMirror {
   let mut mirror = SampleMirror::default();
   let mut last_end = None;
-  for (chapter, &(start, end)) in chapters.iter().zip(spans) {
-    let Some(title) = chapter.title() else {
-      continue;
-    };
-    let base = chapter.timebase();
-    let count = |ticks: i64| {
-      rescale_nearest(
-        i128::from(ticks),
-        i128::from(base.num()) * i128::from(movie_timescale),
-        i128::from(base.den().get()),
-      )
-    };
-    mirror.sample(count(start), title.as_str().len() as u64 + 14);
-    last_end = Some(count(end));
+  for (start, bytes, end) in chapter_track_samples(chapters, spans, movie_timescale) {
+    mirror.sample(start, bytes);
+    last_end = Some(end);
   }
   if let (Some(end), Some(last)) = (last_end, mirror.last()) {
     mirror.end(end.saturating_sub(last));
   }
   mirror
+}
+
+/// The chapter track's samples as movenc makes them at its header
+/// ([`chapter_samples_expected`]): of each titled chapter its start and its
+/// end, counted in `movie_timescale` and rounded to the nearest, and its
+/// sample's bytes, its title's and 14.
+fn chapter_track_samples<'c>(
+  chapters: &'c [Chapter<Ffmpeg>],
+  spans: &'c [(i64, i64)],
+  movie_timescale: i64,
+) -> impl Iterator<Item = (i64, u64, i64)> + 'c {
+  chapters
+    .iter()
+    .zip(spans)
+    .filter_map(move |(chapter, &(start, end))| {
+      let title = chapter.title()?;
+      let base = chapter.timebase();
+      let count = |ticks: i64| {
+        rescale_nearest(
+          i128::from(ticks),
+          i128::from(base.num()) * i128::from(movie_timescale),
+          i128::from(base.den().get()),
+        )
+      };
+      Some((count(start), title.as_str().len() as u64 + 14, count(end)))
+    })
 }
 
 /// What MP4's trailer computes the chapter track's bit rates of

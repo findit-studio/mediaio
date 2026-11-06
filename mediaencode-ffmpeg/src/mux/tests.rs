@@ -1204,6 +1204,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     rates: None,
     edit: EditSpan::default(),
     samples: SampleMirror::default(),
+    carried: Carried::default(),
   }
 }
 
@@ -3318,7 +3319,7 @@ fn escaped(header: &[u8], rbsp: &[u8]) -> Vec<u8> {
 }
 
 /// `units`, each behind a 4-byte start code.
-fn start_coded(units: &[&[u8]]) -> Vec<u8> {
+pub(super) fn start_coded(units: &[&[u8]]) -> Vec<u8> {
   units
     .iter()
     .flat_map(|unit| [&[0_u8, 0, 0, 1][..], unit].concat())
@@ -3441,7 +3442,7 @@ fn hevc_general_ptl(syntax: Syntax) -> Syntax {
 
 /// An HEVC VPS `id` of one layer, or of two whose second, `alpha`, its
 /// extension names an auxiliary alpha layer.
-fn hevc_vps(id: u8, alpha: Option<u8>) -> Vec<u8> {
+pub(super) fn hevc_vps(id: u8, alpha: Option<u8>) -> Vec<u8> {
   let syntax = Syntax::default()
     .u(u64::from(id), 4)
     .u(1, 1)
@@ -3479,7 +3480,7 @@ fn hevc_vps(id: u8, alpha: Option<u8>) -> Vec<u8> {
 /// An HEVC SPS of the base layer, or of `layer` as its VPS `vps`'s
 /// multilayer extension, of `short_term` short-term reference picture
 /// sets and `long_term` long-term reference pictures where any.
-fn hevc_sps(layer: u8, vps: u8, short_term: u32, long_term: Option<u32>) -> Vec<u8> {
+pub(super) fn hevc_sps(layer: u8, vps: u8, short_term: u32, long_term: Option<u32>) -> Vec<u8> {
   let mut syntax = Syntax::default().u(u64::from(vps), 4);
   if layer == 0 {
     syntax = hevc_general_ptl(syntax.u(0, 3).u(1, 1))
@@ -3526,7 +3527,7 @@ fn hevc_sps(layer: u8, vps: u8, short_term: u32, long_term: Option<u32>) -> Vec<
 }
 
 /// An HEVC PPS.
-fn hevc_pps() -> Vec<u8> {
+pub(super) fn hevc_pps() -> Vec<u8> {
   let syntax = Syntax::default()
     .ue(0)
     .ue(0)
@@ -3674,7 +3675,7 @@ fn hevcs_configuration_is_judged_as_ff_isom_write_hvcc_writes_it() {
 }
 
 /// A VVC NAL unit of `kind`, of a byte past its header.
-fn vvc_unit(kind: u8) -> Vec<u8> {
+pub(super) fn vvc_unit(kind: u8) -> Vec<u8> {
   vec![0x00, (kind << 3) | 1, 0x80]
 }
 
@@ -3729,7 +3730,7 @@ fn vvcs_configuration_is_judged_as_ff_isom_write_vvcc_writes_it() {
 }
 
 /// EVC units, each behind its 4-byte length.
-fn length_prefixed_units(units: &[&[u8]]) -> Vec<u8> {
+pub(super) fn length_prefixed_units(units: &[&[u8]]) -> Vec<u8> {
   units
     .iter()
     .flat_map(|unit| {
@@ -3743,13 +3744,13 @@ fn length_prefixed_units(units: &[&[u8]]) -> Vec<u8> {
 }
 
 /// An EVC NAL unit header of `kind`.
-fn evc_header(kind: u8) -> [u8; 2] {
+pub(super) fn evc_header(kind: u8) -> [u8; 2] {
   [(kind + 1) << 1, 0]
 }
 
 /// An EVC SPS `id` of `chroma` and bit depths `luma` and `chroma_depth`
 /// less eight.
-fn evc_sps(id: u32, chroma: u32, luma: u32, chroma_depth: u32) -> Vec<u8> {
+pub(super) fn evc_sps(id: u32, chroma: u32, luma: u32, chroma_depth: u32) -> Vec<u8> {
   let syntax = Syntax::default()
     .ue(id)
     .u(1, 8)

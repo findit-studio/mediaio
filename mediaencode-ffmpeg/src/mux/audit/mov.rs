@@ -26,6 +26,18 @@
 //! laid out; each `stts` and `stsz` ([`Runs`], and R5's [`CueTables`]); the
 //! `mdat`'s size and the payload the sink took after its header.
 //!
+//! **Each sample description,** as its entry's last byte is read, against
+//! what the muxer handed the tap of it before the trailer ([`Handed`]; R6):
+//! its configuration record's presence and payload length — the record
+//! boxes `avcC`, `hvcC`, `lhvC`, `vvcC`, `evcC`, `lvcC`, `av1C`, `dvc1` and
+//! `apvC`, counted as they stream and never kept — E-AC-3's `dec3` in MOV's
+//! `wave`, against its own fields, and DVD subtitles' palette, the `esds`'s
+//! decoder-specific information, whose tag `put_descr` writes at payload
+//! offset 30, its length in four bytes of seven bits (694–701, 765–816),
+//! its bytes folded a word at a time ([`palette_fold`]); and, as the `stsd`
+//! closes, their count. Each `trak` keeps its first difference, of fixed
+//! size, so that the walk's memory stays the table's at open.
+//!
 //! **The fields patched beside the boxes' sizes:** `stsc`'s, `stss`'s and
 //! `stps`'s entry counts at box offset 12, rewritten before their boxes'
 //! sizes (283–286, 308–311); `stsd`'s version at box offset 8, rewritten
@@ -36,8 +48,26 @@
 //! while its target was buffered never reaches the sink on its own — and
 //! each may reach it in parts, where the sink takes a write in parts.
 
-use super::{CueTables, Runs, Summary, Unfollowed, Why};
+use super::{
+  Counts, CueTables, EntryExpected, FOLD_SEED, Found, Handed, RecordExpected, Runs, Summary,
+  Unfollowed, Why, fold,
+};
 use crate::mux::MovMode;
+
+/// The record boxes a sample entry carries its configuration in, which the
+/// walk counts (`movenc.c` 1573–1738, 1102–1201).
+const RECORDS: [[u8; 4]; 9] = [
+  *b"avcC", *b"hvcC", *b"lhvC", *b"vvcC", *b"evcC", *b"lvcC", *b"av1C", *b"dvc1", *b"apvC",
+];
+
+/// The bytes of an `esds`'s payload before its decoder-specific
+/// information's tag: its version and flags, the ES descriptor's header of
+/// five, the track id and flags, the decoder configuration descriptor's
+/// header of five and its thirteen bytes (`mov_write_esds_tag`, 765–816).
+const DSI_TAG_AT: u64 = 30;
+
+/// DVD subtitles' palette: sixteen colours of four bytes (8037–8043).
+const PALETTE_BYTES: u64 = 64;
 
 /// The deepest the walk descends: `moov`, `trak`, `mdia`, `minf`, `stbl`,
 /// `stsd`, an entry, its `wave`, and a box in that; FFmpeg writes no
@@ -61,6 +91,8 @@ enum Role {
   RawEntry,
   /// The media data, counted.
   MediaData,
+  /// A sample entry's configuration record, counted ([`RECORDS`]).
+  Record,
   /// A box the walk parses.
   Leaf(Leaf),
   /// A box the walk steps over.
@@ -78,6 +110,10 @@ enum Leaf {
   Stts,
   /// A sample-size table.
   Stsz,
+  /// An `mp4s` entry's `esds`: its decoder-specific information.
+  Esds,
+  /// E-AC-3's `dec3` in MOV's `wave`.
+  Dec3,
 }
 
 /// An open box.
@@ -168,12 +204,31 @@ pub(in crate::mux) struct TrakSeen {
   times: Option<(Summary, Summary)>,
   /// Its `stsz`, read plainly and by R5's rule.
   sizes: Option<(Summary, Summary)>,
+  /// The first of its sample descriptions read otherwise than handed: its
+  /// index, what it carries, and what was found.
+  descriptions: Option<(u32, Described, Found)>,
+}
+
+/// What of a sample description a difference is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::mux) enum Described {
+  /// Its configuration record, or its count.
+  Configuration,
+  /// DVD subtitles' palette.
+  Palette,
 }
 
 impl TrakSeen {
   /// The track header's id.
   pub(in crate::mux) const fn id(&self) -> Option<u32> {
     self.id
+  }
+
+  /// The first sample description read otherwise than handed, its index,
+  /// and what was found; `None` where every one was read as handed, or the
+  /// walk was handed none of the track's.
+  pub(in crate::mux) const fn descriptions(&self) -> Option<(u32, Described, Found)> {
+    self.descriptions
   }
 
   /// The time-to-sample table, read by R5's rule where `cues`.
@@ -206,6 +261,68 @@ struct Table {
   uniform: u64,
   plain: Runs,
   cues: CueTables,
+  /// A `dec3`'s fields, as they are read.
+  dec3: Dec3Fields,
+  /// An `esds`'s decoder-specific information, as it is read.
+  dsi: DsiFields,
+}
+
+/// A `dec3`'s payload, read against its own fields (`mov_write_eac3_tag`,
+/// 612–666): two bytes — the data rate and the independent substreams
+/// less one — then each substream's three bytes, four where it names
+/// dependent substreams (its third byte's bits 1 to 4), then, where the
+/// complexity index is written, a byte of its flag, 1, and the index.
+#[derive(Debug, Clone, Copy, Default)]
+struct Dec3Fields {
+  /// The substreams still to read, the current among them.
+  left: u8,
+  /// Where the current substream starts, and its bytes.
+  start: u64,
+  len: u64,
+  /// The bytes the fields before the complexity index say, once all read.
+  implied: Option<u64>,
+  /// The first byte past them.
+  tail: Option<u8>,
+}
+
+/// An `esds`'s decoder-specific information: its tag at payload offset 30,
+/// its length in the four bytes after it, and its bytes, folded a word at a
+/// time.
+#[derive(Debug, Clone, Copy)]
+struct DsiFields {
+  tag: u8,
+  len: u64,
+  read: u64,
+  word: u32,
+  fold: u64,
+}
+
+impl Default for DsiFields {
+  fn default() -> Self {
+    Self {
+      tag: 0,
+      len: 0,
+      read: 0,
+      word: 0,
+      fold: FOLD_SEED,
+    }
+  }
+}
+
+/// What the walk read of the sample entry being read.
+#[derive(Debug, Clone, Copy, Default)]
+struct EntrySeen {
+  /// Its first record box, of [`RECORDS`] but `lhvC`: its FourCC and its
+  /// payload's bytes.
+  record: Option<([u8; 4], u64)>,
+  /// Its `lhvC`'s payload's bytes.
+  layers: Option<u64>,
+  /// Its `dec3`'s payload's bytes, those its fields say, and whether it is
+  /// as long as they say.
+  dec3: Option<(u64, u64, bool)>,
+  /// Its `esds`'s decoder-specific information: its length, the bytes of
+  /// it read and their fold; `None` where its tag is not at offset 30.
+  dsi: Option<(u64, u64, u64)>,
 }
 
 /// The MOV family's walk (see [the module](self)).
@@ -223,6 +340,13 @@ pub(in crate::mux) struct MovWalk {
   /// The open `trak`'s place in `traks`, and its entries' layout.
   trak: Option<usize>,
   class: Class,
+  /// The descriptions the muxer handed, by the place of their `trak`: the
+  /// table allocated at open, its slots filled by moves (R6).
+  handed: Box<[Option<Handed>]>,
+  /// The open `stsd`'s entries read, and what the walk read of the entry
+  /// being read.
+  entries: usize,
+  entry: EntrySeen,
   /// The last top-level box, where an 8-byte `free` or `wide`: its offset.
   wide: Option<u64>,
   /// That box, where it lay right before the `mdat`: what the `mdat`'s
@@ -251,11 +375,23 @@ impl MovWalk {
       traks_seen: 0,
       trak: None,
       class: Class::Unknown,
+      handed: (0..tracks).map(|_| None).collect(),
+      entries: 0,
+      entry: EntrySeen::default(),
       wide: None,
       mdat_wide: None,
       mdat: None,
       media_data: None,
       moov: false,
+    }
+  }
+
+  /// Takes the descriptions of the `place`-th `trak` the file holds,
+  /// handed before the trailer writes them; a place past the table's is
+  /// none movenc writes.
+  pub(in crate::mux) fn hand(&mut self, place: usize, handed: Handed) {
+    if let Some(slot) = self.handed.get_mut(place) {
+      *slot = Some(handed);
     }
   }
 
@@ -360,7 +496,7 @@ impl MovWalk {
         Ok(self.own_bytes(bytes, fixed - top.read))
       }
       Role::Entry { .. } => self.header_bytes(pos, bytes),
-      Role::RawEntry | Role::Opaque | Role::MediaData => {
+      Role::RawEntry | Role::Opaque | Role::MediaData | Role::Record => {
         let index = self.depth - 1;
         self.stack[index].read = self.stack[index].read.saturating_add(bytes.len() as u64);
         Ok(bytes.len())
@@ -471,10 +607,14 @@ impl MovWalk {
         self.trak = Some(self.traks_seen);
         self.class = Class::Unknown;
       }
+      (Role::Boxes { .. }, b"stsd") => self.entries = 0,
       (Role::Leaf(_), _) => {
         self.table = Table::default();
       }
       _ => {}
+    }
+    if matches!(role, Role::Entry { .. } | Role::RawEntry) {
+      self.entry = EntrySeen::default();
     }
     match &fourcc {
       b"stsd" if self.parent_is(b"stbl") => {
@@ -513,6 +653,23 @@ impl MovWalk {
     self.top().is_some_and(|top| &top.fourcc == fourcc)
   }
 
+  /// Whether the box at `index` of the stack lies in a `fourcc`.
+  fn parent_of(&self, index: usize, fourcc: &[u8; 4]) -> bool {
+    index
+      .checked_sub(1)
+      .is_some_and(|parent| &self.stack[parent].fourcc == fourcc)
+  }
+
+  /// Keeps the open `trak`'s first sample description read otherwise than
+  /// handed.
+  fn noted(&mut self, index: usize, described: Described, found: Found) {
+    if let Some(trak) = self.trak.and_then(|trak| self.traks.get_mut(trak)) {
+      trak
+        .descriptions
+        .get_or_insert((u32::try_from(index).unwrap_or(u32::MAX), described, found));
+    }
+  }
+
   /// What the walk does with a box `fourcc`, where it opens.
   fn role(&self, fourcc: [u8; 4]) -> Role {
     let Some(parent) = self.top() else {
@@ -540,6 +697,18 @@ impl MovWalk {
       },
       (_, b"wave" | b"sv3d" | b"vexu") if matches!(parent.role, Role::Entry { .. }) => {
         Role::Boxes { prefix: 0 }
+      }
+      (_, record) if matches!(parent.role, Role::Entry { .. }) && RECORDS.contains(record) => {
+        Role::Record
+      }
+      (b"mp4s", b"esds") if matches!(parent.role, Role::Entry { .. }) => Role::Leaf(Leaf::Esds),
+      (b"wave", b"dec3")
+        if self
+          .depth
+          .checked_sub(2)
+          .is_some_and(|entry| matches!(self.stack[entry].role, Role::Entry { .. })) =>
+      {
+        Role::Leaf(Leaf::Dec3)
       }
       _ => Role::Opaque,
     }
@@ -609,6 +778,44 @@ impl MovWalk {
               _ => Class::Other,
             };
           }
+        }
+      }
+      Leaf::Esds => {
+        let dsi = &mut table.dsi;
+        match read {
+          DSI_TAG_AT => dsi.tag = byte,
+          // `put_descr`'s length: four bytes of seven bits (694–701).
+          31..=34 => dsi.len = (dsi.len << 7) | u64::from(byte & 0x7F),
+          _ if dsi.tag == 5 && read >= 35 && read - 35 < dsi.len => {
+            dsi.word = (dsi.word << 8) | u32::from(byte);
+            dsi.read += 1;
+            if dsi.read % 4 == 0 {
+              dsi.fold = fold(dsi.fold, u64::from(dsi.word));
+            }
+          }
+          _ => {}
+        }
+      }
+      Leaf::Dec3 => {
+        let fields = &mut table.dec3;
+        if read == 1 {
+          // The independent substreams less one, in the low 3 bits.
+          (fields.left, fields.start, fields.len) = ((byte & 7) + 1, 2, 3);
+        } else if read >= 2 && fields.left > 0 {
+          if read == fields.start + 2 && (byte >> 1) & 0xF != 0 {
+            // Dependent substreams named: their locations, 9 bits.
+            fields.len = 4;
+          }
+          if read + 1 == fields.start + fields.len {
+            fields.left -= 1;
+            fields.start += fields.len;
+            fields.len = 3;
+            if fields.left == 0 {
+              fields.implied = Some(fields.start);
+            }
+          }
+        } else if fields.implied == Some(read) {
+          fields.tail = Some(byte);
         }
       }
       Leaf::Stts | Leaf::Stsz => {
@@ -710,7 +917,60 @@ impl MovWalk {
       Role::MediaData => {
         // Closed by its patch alone, which records it.
       }
+      Role::Record if &frame.fourcc == b"lhvC" => self.entry.layers = Some(frame.read),
+      Role::Record => {
+        self.entry.record.get_or_insert((frame.fourcc, frame.read));
+      }
+      Role::Leaf(Leaf::Esds) => {
+        let dsi = self.table.dsi;
+        self.entry.dsi =
+          (dsi.tag == 5 && frame.read > DSI_TAG_AT + 4).then_some((dsi.len, dsi.read, dsi.fold));
+      }
+      Role::Leaf(Leaf::Dec3) => {
+        let fields = self.table.dec3;
+        let written = frame.read;
+        // What its fields say, at least, where they run past its end: its
+        // two bytes and a substream's three where it ends before them.
+        let implied = fields.implied.unwrap_or(match fields.left {
+          0 => 5,
+          left => fields.start + fields.len + 3 * u64::from(left - 1),
+        });
+        let whole = fields.implied.is_some()
+          && (written == implied || (written == implied + 2 && fields.tail == Some(1)));
+        self.entry.dec3 = Some((written, implied, whole));
+      }
       _ => {}
+    }
+    // A sample entry read whole: judged against its description as handed.
+    if matches!(frame.role, Role::Entry { .. } | Role::RawEntry) && self.parent_of(index, b"stsd") {
+      let index = self.entries;
+      self.entries += 1;
+      let found = self
+        .trak
+        .and_then(|trak| self.handed.get(trak))
+        .and_then(Option::as_ref)
+        .filter(|handed| index < handed.count())
+        .and_then(|handed| judged(handed.entry(index), &self.entry));
+      if let Some((described, found)) = found {
+        self.noted(index, described, found);
+      }
+    }
+    // The descriptions' count, as the `stsd` closes.
+    if &frame.fourcc == b"stsd" && matches!(frame.role, Role::Boxes { .. }) {
+      let entries = self.entries;
+      if let Some(count) = self
+        .trak
+        .and_then(|trak| self.handed.get(trak))
+        .and_then(Option::as_ref)
+        .map(Handed::count)
+        .filter(|&count| count != entries)
+      {
+        self.noted(
+          entries.min(count),
+          Described::Configuration,
+          Found::Count(Counts::new(entries as u64, count as u64)),
+        );
+      }
     }
     match &frame.fourcc {
       b"trak" if self.depth == 2 => {
@@ -860,4 +1120,46 @@ impl MovWalk {
       }
     }
   }
+}
+
+/// The first way `seen`, a sample entry as read, differs from `expected`,
+/// what the muxer's description of it says ([`EntryExpected`]): its record
+/// box left out, written of another length — no longer than its header, of
+/// the writers whose length is not mirrored — or, of `dec3`, of another
+/// length than its fields say; `lhvC` beside it; DVD subtitles' palette
+/// left out, of another length, or of other colours.
+fn judged(expected: EntryExpected, seen: &EntrySeen) -> Option<(Described, Found)> {
+  let length = |written: u64, len: u64| Found::Length(Counts::new(written, len));
+  let record = expected.record.and_then(|record| match record {
+    RecordExpected::Exact(fourcc, len) => match seen.record {
+      Some((read, written)) if read == fourcc => (written != len).then(|| length(written, len)),
+      _ => Some(Found::Omitted),
+    },
+    RecordExpected::Longer(fourcc, len) => match seen.record {
+      Some((read, written)) if read == fourcc && written > len => None,
+      _ => Some(Found::Omitted),
+    },
+    RecordExpected::Dec3 => match seen.dec3 {
+      None => Some(Found::Omitted),
+      Some((written, implied, whole)) => (!whole).then(|| length(written, implied)),
+    },
+  });
+  let layers = expected
+    .layers
+    .and_then(|layers| match (seen.layers, layers) {
+      (None, None) => None,
+      (Some(written), Some(len)) => (written != len).then(|| length(written, len)),
+      (None, Some(_)) => Some(Found::Omitted),
+      (Some(_), None) => Some(Found::Count(Counts::new(1, 0))),
+    });
+  let palette = expected.palette.and_then(|colours| match seen.dsi {
+    None => Some(Found::Omitted),
+    Some((len, _, _)) if len != PALETTE_BYTES => Some(length(len, PALETTE_BYTES)),
+    Some((_, read, _)) if read != PALETTE_BYTES => Some(length(read, PALETTE_BYTES)),
+    Some((_, _, folded)) => (folded != colours).then_some(Found::Content),
+  });
+  record
+    .or(layers)
+    .map(|found| (Described::Configuration, found))
+    .or(palette.map(|found| (Described::Palette, found)))
 }
