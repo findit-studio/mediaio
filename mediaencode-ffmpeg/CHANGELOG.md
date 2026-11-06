@@ -29,13 +29,17 @@ crate moves only when it changes.
   — `avcC`, `hvcC` and `lhvC`, `vvcC`, `evcC`, `lvcC`, `av1C`, `dvc1`,
   `apvC` — present and as long as its writer makes it, E-AC-3's `dec3` in
   MOV's `wave`, and DVD subtitles' palette, each named by its index
-  (`WrittenPart::Configuration`, `WrittenPart::Palette`). A `mov_text`
+  (`WrittenPart::Configuration`, `WrittenPart::Palette`); AVIF's `mdat`
+  against its samples' bytes, its first item's extent offset and an
+  animated track's first chunk offset against the payload's first byte,
+  and its item's `av1C` (`WrittenPart::MediaData`,
+  `WrittenPart::ItemLocation`, `WrittenPart::ChunkOffsets`). A `mov_text`
   track's tables are read by one rule on both sides, which the end samples
   libavformat's interleaving makes movenc write leave unchanged (the
   coordinator's ruling R5). With the new `test-support` feature,
   forwarding to the base's: `CarrierMuxer::open_hooked` and `OpenHooks`,
-  what a law runs inside the open — around the header, or a plant over
-  the bytes the sink takes; hidden: `MuxOptions::with_audit`,
+  what a law runs inside the open — around the header, around each
+  packet's take, or a plant over the bytes the sink takes; hidden: `MuxOptions::with_audit`,
   `CarrierMuxer::audited_bytes`, `expected_records`, `expected_palettes`
   and `expected_chapter_samples`, the laws' seams.
 - **The muxer**: `FfmpegMuxer` (view lane) and `FfmpegOwnedMuxer` (owned

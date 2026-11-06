@@ -21406,7 +21406,8 @@ fn long_aac(corpus: &Corpus) -> PathBuf {
 /// **L216 — the write audit passes every file FFmpeg writes whole**
 /// (findit-studio/mediaio#95; gate condition 9): the corpus's sources,
 /// remuxed whole into MP4, MOV and iPod — H.264 and AAC, HEVC of an Annex
-/// B configuration, AV1, VP9, AC-3, E-AC-3, PCM of a constant size, Opus,
+/// B configuration, AV1 (and into AVIF, animated, and a still AVIF of its
+/// first frame), VP9, AC-3, E-AC-3, PCM of a constant size, Opus,
 /// `mov_text` in milliseconds and in microseconds, TTML, AAC long enough
 /// that its `moov` passes 32 KiB, chapters, and frames of no duration,
 /// whose last libavformat guesses — each finishes `Ok`, the audit's tap
@@ -21426,7 +21427,7 @@ fn l216_the_write_audit_passes_every_file_ffmpeg_writes_whole() {
       &["mp4", "mov", "ipod"][..],
     ),
     ("hevc", hevc_annexb(&corpus), &["mp4"][..]),
-    ("av1", av1_mkv(&corpus), &["mp4"][..]),
+    ("av1", av1_mkv(&corpus), &["mp4", "avif"][..]),
     ("vp9", vp9_webm(&corpus), &["mp4"][..]),
     (
       "ac3",
@@ -21502,6 +21503,22 @@ fn l216_the_write_audit_passes_every_file_ffmpeg_writes_whole() {
     );
   }
   muxer.finish().expect("guessed, finished");
+
+  // A still AVIF: one frame, of no `moov`.
+  let (table, frames) = first_track(&av1_mkv(&corpus), TrackKind::Video, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l216-still.avif"),
+    ContainerName::new("avif"),
+    table,
+  );
+  wrote(
+    muxer.write_video(VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_of(&frames[0]),
+    )),
+    "the frame",
+  );
+  muxer.finish().expect("a still AVIF, finished");
 }
 
 /// **L217 — A2: an `stts` movenc leaves out is named, the file not passed**
@@ -22835,4 +22852,191 @@ fn r8_a_dvc1_at_its_trust_stop_is_judged_not_at_all() {
     return;
   };
   assert_eq!(record, None, "no dvc1 written there");
+}
+
+// ---------------------------------------------------------------------------
+//  AVIF audited (A13).
+// ---------------------------------------------------------------------------
+
+/// An AV1 temporal unit of a payload past 100 KB: the corpus's temporal
+/// unit, then seven metadata OBUs of 16 000 bytes each, which AVIF's
+/// writer keeps (`ff_av1_filter_obus`, `av1.c` 89–122).
+#[cfg(feature = "test-support")]
+fn large_av1_unit(frame: &Video) -> Video {
+  let mut bytes = frame.data().as_ref().to_vec();
+  for _ in 0..7 {
+    bytes.extend(av1_metadata_obu(16_000));
+  }
+  video_holding(frame, &bytes)
+}
+
+/// **L219 — A13a: AVIF's sample its buffer could not hold is named**
+/// (`mov_write_single_packet`, `movenc.c` 6961–6981; `avif_write_trailer`,
+/// 9189–9198). In a process of its own: a still AVIF of one frame of more
+/// than 100 KB, written whole, then again with libavutil's allocations
+/// capped at 100 000 bytes around libavformat's take of the packet alone
+/// (the base's write hook, the design gate's condition 5). The cap's
+/// derivation: the packet's write opens the samples' dynamic buffer (about
+/// 1.4 KB) and grows it, 1 024 bytes a flush, through 88 712 bytes, then
+/// allocates the track's sample index of 1 024 entries of 72 bytes (73 728;
+/// 7235–7243), each under the cap; the buffer's growth to 133 069
+/// (`dyn_buf_write`, `aviobuf.c` 1280–1304) is refused, the buffer keeps
+/// its error and writes nothing more, and the packet's write answers
+/// success. Uncapped, the trailer's `avio_get_dyn_buf` answers 0 bytes: an
+/// `mdat` of no sample. Named: the media data, 0 bytes against the
+/// frame's.
+#[cfg(feature = "test-support")]
+#[test]
+fn l219_avifs_sample_its_buffer_could_not_hold_is_named() {
+  in_its_own_process("l219_in_a_process_of_its_own");
+}
+
+/// L219's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l219_in_a_process_of_its_own() {
+  if !alone_for("l219_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let av1 = av1_mkv(&corpus);
+  let write = |name: &str, capped: bool| {
+    let (table, frames) = first_track(&av1, TrackKind::Video, 1);
+    let frame = large_av1_unit(&video_of(&frames[0]));
+    let mut hooks = mediaencode_ffmpeg::mux::OpenHooks::default();
+    if capped {
+      hooks = hooks.with_packets(|before| if before { cap(100_000) } else { uncap() });
+    }
+    let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+      File::create(output(&corpus, name)).expect("create"),
+      ContainerName::new("avif"),
+      table,
+      &[],
+      MuxOptions::new(),
+      hooks,
+    )
+    .expect("open");
+    wrote(
+      muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frame)),
+      "the frame",
+    );
+    muxer.finish()
+  };
+  write("l219.avif", false).expect("whole");
+  let bytes = std::fs::read(output(&corpus, "l219.avif")).expect("the file");
+  let (_, _, size) = box_in(&bytes, (0, bytes.len()), b"mdat").expect("the mdat");
+  let payload = size - 8;
+  assert!(payload > 100_000, "the premise: {payload} bytes");
+  let fault = write("l219-capped.avif", true).expect_err("the sample lost, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((None, WrittenPart::MediaData, Finding::Length(0, payload)))
+  );
+}
+
+/// **L220 — A13b: an animated AVIF's chunk offsets moved by its `moov`'s
+/// measure are named** (`get_moov_size`, `movenc.c` 8905–8916;
+/// `avif_write_trailer`, 9179–9181). In a process of its own: an animated
+/// AVIF of the corpus's ten frames, 270 bytes in all — held in the samples'
+/// dynamic buffer's own 1 024 bytes, so that its close allocates nothing —
+/// with libavutil's allocations capped at 1 000 bytes before `finish`. The
+/// cap's derivation: the trailer's largest allocation under it is the
+/// `stts`'s entries, 8 bytes a sample (80); `get_moov_size`'s null buffer
+/// opens of `FFIOContext`, `DynBuffer` and 1 024 bytes in one allocation,
+/// refused, and its error is taken as the `moov`'s size: every chunk's
+/// offset moved by it. Named: track 0's chunk offsets, its first against
+/// the payload's first byte.
+#[test]
+fn l220_an_animated_avifs_moved_chunk_offsets_are_named() {
+  in_its_own_process("l220_in_a_process_of_its_own");
+}
+
+/// L220's body, alone in its process.
+#[test]
+fn l220_in_a_process_of_its_own() {
+  if !alone_for("l220_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let av1 = av1_mkv(&corpus);
+  let (table, frames) = whole_track(&av1, TrackKind::Video);
+  let target = output(&corpus, "l220.avif");
+  let mut muxer = muxer_into(&target, ContainerName::new("avif"), table);
+  for frame in &frames {
+    wrote(
+      muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(frame))),
+      "a frame",
+    );
+  }
+  cap(1_000);
+  let finished = muxer.finish();
+  uncap();
+  let fault = finished.expect_err("the chunk offsets moved, not passed");
+  let bytes = std::fs::read(&target).expect("the file");
+  let (_, _, size) = box_in(&bytes, (0, bytes.len()), b"mdat").expect("the mdat");
+  let start = bytes.len() as u64 - size + 8;
+  let (moov, moov_end, _) = box_in(&bytes, (0, bytes.len()), b"moov").expect("the moov");
+  let (trak, trak_end, _) = box_in(&bytes, (moov, moov_end), b"trak").expect("a trak");
+  let (mdia, mdia_end, _) = box_in(&bytes, (trak, trak_end), b"mdia").expect("mdia");
+  let (minf, minf_end, _) = box_in(&bytes, (mdia, mdia_end), b"minf").expect("minf");
+  let (stbl, stbl_end, _) = box_in(&bytes, (minf, minf_end), b"stbl").expect("stbl");
+  let (stco, _, _) = box_in(&bytes, (stbl, stbl_end), b"stco").expect("stco");
+  let first = u64::from(u32::from_be_bytes(
+    bytes[stco + 8..stco + 12].try_into().expect("a word"),
+  ));
+  assert_ne!(first, start, "the premise: the offset moved");
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::ChunkOffsets,
+      Finding::Value(first, start)
+    ))
+  );
+}
+
+/// The payload of the `av1C` AVIF's `meta` holds among its first item's
+/// properties, in `path` (`mov_write_iprp_tag`, `movenc.c` 3796–3840).
+#[cfg(feature = "test-support")]
+fn avif_item_av1c(path: &Path) -> Option<Vec<u8>> {
+  let bytes = std::fs::read(path).expect("the file");
+  let (meta, meta_end, _) = box_in(&bytes, (0, bytes.len()), b"meta")?;
+  let (iprp, iprp_end, _) = box_in(&bytes, (meta + 4, meta_end), b"iprp")?;
+  let (ipco, ipco_end, _) = box_in(&bytes, (iprp, iprp_end), b"ipco")?;
+  let (av1c, av1c_end, _) = box_in(&bytes, (ipco, ipco_end), b"av1C")?;
+  Some(bytes[av1c..av1c_end].to_vec())
+}
+
+/// **Gate condition 7 — AVIF's `av1C` reads back as its mirror counts it,
+/// of no sequence header**: AV1 configured by OBUs, its sequence header
+/// and a metadata OBU of 200 bytes, into a still AVIF, whose writer leaves
+/// the sequence header out (`mov_write_av1c_tag`, `movenc.c` 1572–1581).
+/// The item's record, read from the file, is what the write audit's mirror
+/// states (`av1c_written_len` of no sequence header): 4 + 200.
+#[cfg(feature = "test-support")]
+#[test]
+fn gate7_avifs_av1c_reads_back_as_its_mirror_counts_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (av1, frames, av1c) = unconfigured_av1(&corpus);
+  let obus = [&av1c[4..], &av1_metadata_obu(200)].concat();
+  let table = table_of(&av1, TrackKind::Video)
+    .into_iter()
+    .map(|row| row.with_extradata(Some(bytes_of(&obus))))
+    .collect();
+  let target = output(&corpus, "gate7-avif.avif");
+  let mut muxer = muxer_into(&target, ContainerName::new("avif"), table);
+  let stated = muxer.expected_records();
+  wrote(
+    muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), frames[0].clone())),
+    "the frame",
+  );
+  muxer.finish().expect("finished");
+  let len = avif_item_av1c(&target).expect("the item's av1C").len() as u64;
+  assert_eq!(
+    len,
+    4 + 200,
+    "the premise: the metadata written, no sequence header"
+  );
+  assert_eq!(stated, vec![(TrackIndex::new(0), 0, *b"av1C", len)]);
 }

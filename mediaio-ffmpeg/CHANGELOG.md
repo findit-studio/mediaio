@@ -30,7 +30,8 @@ crate moves only when it changes.
   the guard shares stay private, and the road allocates nothing. With
   `test-support`, `Output::set_write_plant` changes the bytes libavformat
   hands the sink, in place and keeping their length, before the sink and
-  the tap see them.
+  the tap see them, and `Output::set_write_hook` runs a closure around
+  libavformat's take of each packet, after the packet is built.
 - **`hdr_metadata`** (hidden, for the muxer): `check_hdr10_plus` and
   `check_smpte2094_app5` hold an HDR10+ or SMPTE ST 2094 APP5 side-data
   entry — libavutil's struct, not bytes — to everything Matroska's writer

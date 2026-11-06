@@ -2151,3 +2151,40 @@ fn b5_the_tap_is_set_once_while_building_and_lent_by_its_type() {
     "after a failure"
   );
 }
+
+/// **The write hook runs around libavformat's take of each packet** (test
+/// support; the write audit's design gate, condition 5): with `true` just
+/// before `av_interleaved_write_frame`, the packet built, and with `false`
+/// as it answers — three packets, three pairs, and nothing at the header
+/// or the trailer.
+#[test]
+fn the_write_hook_runs_around_each_packets_take() {
+  let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+  let ticket = aac(&[0x12, 0x10]);
+  let mut output = Output::open(Cursor::new(Vec::new()), "mp4").expect("open");
+  output
+    .add_stream(&StreamSpec::new(&ticket, millis()))
+    .expect("a stream");
+  let seen = std::sync::Arc::clone(&calls);
+  output.set_write_hook(move |before| seen.lock().expect("the calls").push(before));
+  output.write_header().expect("the header");
+  for i in 0..3_i64 {
+    let packet = AudioPacket::new(
+      FfmpegBytes::copy_from_slice(&[0x21; 4]),
+      AudioPacketExtra::new(0),
+    );
+    output
+      .write_packet::<crate::Owned>(
+        0,
+        OutputPacket::Audio(&packet),
+        PacketTimes::new(Some(i * 20), Some(i * 20), 20),
+        PacketLimits::default(),
+      )
+      .expect("a packet");
+  }
+  output.write_trailer().expect("the trailer");
+  assert_eq!(
+    *calls.lock().expect("the calls"),
+    vec![true, false, true, false, true, false]
+  );
+}

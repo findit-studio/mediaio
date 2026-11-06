@@ -196,6 +196,13 @@ pub(crate) struct TapSlot {
   /// and the tap see them: test support ([`Plant`]).
   #[cfg(any(test, feature = "test-support"))]
   plant: Mutex<Option<Plant>>,
+  /// What runs around libavformat's take of each packet the output writes:
+  /// test support
+  /// ([`Output::set_write_hook`](crate::output::Output::set_write_hook)).
+  /// Set once, so that an output of none locks nothing, and allocates
+  /// nothing, at its packets.
+  #[cfg(any(test, feature = "test-support"))]
+  hook: OnceLock<Mutex<Box<dyn FnMut(bool) + Send>>>,
 }
 
 impl TapSlot {
@@ -207,6 +214,29 @@ impl TapSlot {
   /// The tap, under its lock, if one is set.
   pub(crate) fn tap(&self) -> Option<&Mutex<Box<dyn SinkTap>>> {
     self.tap.get()
+  }
+
+  /// Sets the packet hook, unless one is set: whether it was. Its lock is
+  /// taken once here, so that the lock's own first allocation falls at
+  /// the set, not at a packet's write.
+  #[cfg(any(test, feature = "test-support"))]
+  pub(crate) fn set_hook(&self, hook: Box<dyn FnMut(bool) + Send>) -> bool {
+    let set = self.hook.set(Mutex::new(hook)).is_ok();
+    if let Some(hook) = self.hook.get() {
+      drop(hook.lock());
+    }
+    set
+  }
+
+  /// Runs the packet hook, where one is set, with `before`.
+  #[cfg(any(test, feature = "test-support"))]
+  pub(crate) fn hook(&self, before: bool) {
+    if let Some(hook) = self.hook.get() {
+      let mut hook = hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+      (*hook)(before);
+    }
   }
 
   /// Sets the plant, replacing any.

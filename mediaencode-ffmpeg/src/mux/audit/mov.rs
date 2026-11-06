@@ -38,6 +38,15 @@
 //! closes, their count. Each `trak` keeps its first difference, of fixed
 //! size, so that the walk's memory stays the table's at open.
 //!
+//! **AVIF** (`avif_write_trailer`, 9154–9213) writes its whole file at the
+//! trailer: `ftyp`; `meta`, a container after its version and flags, whose
+//! `iloc` the walk parses — its items' extents, each offset a field
+//! patched once the payload is written (3660–3681, 9200–9210) — and whose
+//! `iprp`'s `ipco` holds each item's `av1C`, counted as a record; an
+//! animated image's `moov`, walked as MP4's, its first `trak`'s first
+//! chunk offset read; then the `mdat`, its size known as it opens, its
+//! payload counted to its end. No `moov` but an animated image's.
+//!
 //! **The fields patched beside the boxes' sizes:** `stsc`'s, `stss`'s and
 //! `stps`'s entry counts at box offset 12, rewritten before their boxes'
 //! sizes (283–286, 308–311); `stsd`'s version at box offset 8, rewritten
@@ -47,6 +56,8 @@
 //! at any value and judged by the verdict. Each is optional — a patch made
 //! while its target was buffered never reaches the sink on its own — and
 //! each may reach it in parts, where the sink takes a write in parts.
+//! AVIF's extent offsets, each accepted at any value and judged by the
+//! verdict, like the `mdat`'s.
 
 use super::{
   Counts, CueTables, EntryExpected, FOLD_SEED, Found, Handed, RecordExpected, Runs, Summary,
@@ -68,6 +79,10 @@ const DSI_TAG_AT: u64 = 30;
 
 /// DVD subtitles' palette: sixteen colours of four bytes (8037–8043).
 const PALETTE_BYTES: u64 = 64;
+
+/// The items AVIF writes, its color plane's and its alpha plane's
+/// (3660–3681): one a stream, at most two.
+const ITEMS: usize = 2;
 
 /// The deepest the walk descends: `moov`, `trak`, `mdia`, `minf`, `stbl`,
 /// `stsd`, an entry, its `wave`, and a box in that; FFmpeg writes no
@@ -93,6 +108,8 @@ enum Role {
   MediaData,
   /// A sample entry's configuration record, counted ([`RECORDS`]).
   Record,
+  /// AVIF's `av1C` of an item, in its `ipco`, counted.
+  ItemRecord,
   /// A box the walk parses.
   Leaf(Leaf),
   /// A box the walk steps over.
@@ -114,6 +131,11 @@ enum Leaf {
   Esds,
   /// E-AC-3's `dec3` in MOV's `wave`.
   Dec3,
+  /// AVIF's item locations.
+  Iloc,
+  /// An animated AVIF's chunk offsets, of 32 bits, or of 64.
+  Stco,
+  Co64,
 }
 
 /// An open box.
@@ -177,6 +199,9 @@ enum FieldKind {
   Version,
   /// A raw subtitle entry's trailing `btrt`'s size.
   Btrt,
+  /// AVIF's extent offset of the item at this index, written 0, then
+  /// patched once its payload is placed.
+  Extent(usize),
 }
 
 /// How a sample entry of a track is laid out, by its `mdia`'s handler.
@@ -207,6 +232,8 @@ pub(in crate::mux) struct TrakSeen {
   /// The first of its sample descriptions read otherwise than handed: its
   /// index, what it carries, and what was found.
   descriptions: Option<(u32, Described, Found)>,
+  /// An animated AVIF's: its first chunk's offset.
+  first_chunk: Option<u64>,
 }
 
 /// What of a sample description a difference is in.
@@ -229,6 +256,11 @@ impl TrakSeen {
   /// walk was handed none of the track's.
   pub(in crate::mux) const fn descriptions(&self) -> Option<(u32, Described, Found)> {
     self.descriptions
+  }
+
+  /// Its first chunk's offset, where read: an animated AVIF's.
+  pub(in crate::mux) const fn first_chunk(&self) -> Option<u64> {
+    self.first_chunk
   }
 
   /// The time-to-sample table, read by R5's rule where `cues`.
@@ -358,6 +390,13 @@ pub(in crate::mux) struct MovWalk {
   media_data: Option<(u64, u64)>,
   /// Whether the `moov` closed.
   moov: bool,
+  /// AVIF's items, as `iloc` holds them: each extent's offset, as read or
+  /// patched, and its length; and each item's `av1C` against its track's
+  /// description, the first difference.
+  items: [Option<(u64, u64)>; ITEMS],
+  items_seen: usize,
+  item_records: usize,
+  item_found: Option<(usize, Found)>,
 }
 
 impl MovWalk {
@@ -383,6 +422,10 @@ impl MovWalk {
       mdat: None,
       media_data: None,
       moov: false,
+      items: [None; ITEMS],
+      items_seen: 0,
+      item_records: 0,
+      item_found: None,
     }
   }
 
@@ -411,13 +454,40 @@ impl MovWalk {
     self.media_data
   }
 
+  /// AVIF's items, as its `iloc` holds them — each its extent's offset,
+  /// as read or patched, and its length — in order.
+  pub(in crate::mux) fn items(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+    self.items[..self.items_seen.min(ITEMS)]
+      .iter()
+      .flatten()
+      .copied()
+  }
+
+  /// AVIF's first item whose `av1C` differs from its track's description,
+  /// and what was found.
+  pub(in crate::mux) const fn item_found(&self) -> Option<(usize, Found)> {
+    self.item_found
+  }
+
+  /// The payload's offset in the file: the `mdat`'s first byte past its
+  /// header.
+  pub(in crate::mux) const fn payload_start(&self) -> Option<u64> {
+    self.mdat
+  }
+
   /// Why a file the walk ended at `frontier` is not whole, or `None`: a
-  /// box open, a header part read, a field part written, or no `moov`.
+  /// box open, a header part read, a field part written, or no `moov` —
+  /// of AVIF, no `mdat`, which it writes last.
   pub(in crate::mux) fn unfinished(&self, frontier: u64) -> Option<Unfollowed> {
     if self.fields.iter().flatten().any(|field| field.filled > 0) {
       return Some(Unfollowed::new(frontier, Why::Unresolved));
     }
-    (self.depth > 0 || self.header.have > 0 || !self.moov)
+    let ended = if self.mode == MovMode::Avif {
+      self.media_data.is_some()
+    } else {
+      self.moov
+    };
+    (self.depth > 0 || self.header.have > 0 || !ended)
       .then(|| Unfollowed::new(frontier, Why::Truncated))
   }
 
@@ -496,14 +566,15 @@ impl MovWalk {
         Ok(self.own_bytes(bytes, fixed - top.read))
       }
       Role::Entry { .. } => self.header_bytes(pos, bytes),
-      Role::RawEntry | Role::Opaque | Role::MediaData | Role::Record => {
+      Role::RawEntry | Role::Opaque | Role::MediaData | Role::Record | Role::ItemRecord => {
         let index = self.depth - 1;
         self.stack[index].read = self.stack[index].read.saturating_add(bytes.len() as u64);
         Ok(bytes.len())
       }
       Role::Leaf(leaf) => {
-        for &byte in bytes {
-          self.leaf_byte(leaf, pos, byte)?;
+        // Each byte at its own offset: AVIF's extent offset registers there.
+        for (offset, &byte) in bytes.iter().enumerate() {
+          self.leaf_byte(leaf, pos.saturating_add(offset as u64), byte)?;
         }
         Ok(bytes.len())
       }
@@ -676,6 +747,7 @@ impl MovWalk {
       return match &fourcc {
         b"moov" => Role::Boxes { prefix: 0 },
         b"mdat" => Role::MediaData,
+        b"meta" if self.mode == MovMode::Avif => Role::Boxes { prefix: 4 },
         _ => Role::Opaque,
       };
     };
@@ -688,6 +760,13 @@ impl MovWalk {
       (b"stbl", b"stsd") => Role::Boxes { prefix: 8 },
       (b"stbl", b"stts") => Role::Leaf(Leaf::Stts),
       (b"stbl", b"stsz") => Role::Leaf(Leaf::Stsz),
+      (b"stbl", b"stco") if self.mode == MovMode::Avif => Role::Leaf(Leaf::Stco),
+      (b"stbl", b"co64") if self.mode == MovMode::Avif => Role::Leaf(Leaf::Co64),
+      (b"meta", b"iloc") if self.depth == 1 => Role::Leaf(Leaf::Iloc),
+      (b"meta", b"iprp") | (b"iprp", b"ipco") if self.mode == MovMode::Avif => {
+        Role::Boxes { prefix: 0 }
+      }
+      (b"ipco", b"av1C") => Role::ItemRecord,
       (b"stsd", entry) => match self.class {
         Class::Video => Role::Entry { fixed: Some(78) },
         Class::Audio if self.mode == MovMode::Mov => Role::Entry { fixed: None },
@@ -773,10 +852,69 @@ impl MovWalk {
           table.entry[(read - 8) as usize] = byte;
           if read == 11 {
             self.class = match &table.entry[0..4] {
-              b"vide" => Class::Video,
+              // AVIF's image and its alpha plane (`mov_write_hdlr_tag`,
+              // `movenc.c` 3579–3580): visual sample entries.
+              b"vide" | b"pict" | b"auxv" => Class::Video,
               b"soun" => Class::Audio,
               _ => Class::Other,
             };
+          }
+        }
+      }
+      Leaf::Iloc => {
+        // Version 0 of 4-byte offsets and lengths and no base offset, its
+        // items' count, then each item's id, data reference and one extent
+        // — its offset, then its length (3660–3681). Read through
+        // `self.table`, so that the field registers as its byte is read.
+        match read {
+          0..=3 => {}
+          4 | 5 => {
+            if byte != [0x44, 0][(read - 4) as usize] {
+              return Err(Unfollowed::new(pos, Why::Structure));
+            }
+          }
+          6 | 7 => self.table.stated = (self.table.stated << 8) | u64::from(byte),
+          _ => {
+            let (item, at) = ((read - 8) / 14, (read - 8) % 14);
+            let item = usize::try_from(item).unwrap_or(usize::MAX);
+            let items = usize::try_from(self.table.stated).unwrap_or(usize::MAX);
+            if item >= items.min(ITEMS) {
+              return Err(Unfollowed::new(pos, Why::Structure));
+            }
+            if at >= 6 {
+              self.table.entry[((at - 6) % 4) as usize] = byte;
+            }
+            if at == 6 {
+              // The extent offset's field, patched once the payload is
+              // placed: registered as its first byte is read.
+              self.register(pos, 4, FieldKind::Extent(item))?;
+            }
+            if at == 9 || at == 13 {
+              let entry = self.table.entry;
+              let value = u64::from(u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]));
+              let slot = self.items[item].get_or_insert((0, 0));
+              if at == 9 {
+                slot.0 = value;
+              } else {
+                slot.1 = value;
+                self.items_seen = item + 1;
+              }
+            }
+          }
+        }
+      }
+      Leaf::Stco | Leaf::Co64 => {
+        // Version and flags, the count, then the first entry, of 4 bytes
+        // or 8.
+        let width = if leaf == Leaf::Stco { 4 } else { 8 };
+        if (8..8 + width).contains(&read) {
+          self.table.entry[(read - 8) as usize] = byte;
+          if read + 1 == 8 + width {
+            let mut word = [0; 8];
+            word[(8 - width) as usize..].copy_from_slice(&self.table.entry[..width as usize]);
+            if let Some(trak) = self.trak.and_then(|trak| self.traks.get_mut(trak)) {
+              trak.first_chunk = Some(u64::from_be_bytes(word));
+            }
           }
         }
       }
@@ -914,8 +1052,30 @@ impl MovWalk {
           }
         }
       }
+      // MP4's `mdat` is closed by its patch alone, which records it; AVIF's
+      // is written of its size, read as it closes.
       Role::MediaData => {
-        // Closed by its patch alone, which records it.
+        if let (Some(end), Some(start)) = (frame.end, self.mdat) {
+          self.media_data = Some((end.saturating_sub(start), frame.read));
+        }
+      }
+      Role::ItemRecord => {
+        let item = self.item_records;
+        self.item_records += 1;
+        let found = self
+          .handed
+          .get(item)
+          .and_then(Option::as_ref)
+          .and_then(|handed| {
+            let seen = EntrySeen {
+              record: Some((frame.fourcc, frame.read)),
+              ..EntrySeen::default()
+            };
+            judged(handed.entry(0), &seen)
+          });
+        if let Some((_, found)) = found {
+          self.item_found.get_or_insert((item, found));
+        }
       }
       Role::Record if &frame.fourcc == b"lhvC" => self.entry.layers = Some(frame.read),
       Role::Record => {
@@ -1115,6 +1275,12 @@ impl MovWalk {
       FieldKind::Btrt => {
         if word != 20 {
           return Err(rewrite);
+        }
+        Ok(())
+      }
+      FieldKind::Extent(item) => {
+        if let Some(slot) = self.items.get_mut(item).and_then(Option::as_mut) {
+          slot.0 = word;
         }
         Ok(())
       }

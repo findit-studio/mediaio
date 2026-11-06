@@ -93,8 +93,10 @@
 //! The first difference in a fixed order: the tap's own state — a rewrite
 //! it could not follow, a file that ends inside a structure, a panicked
 //! tap; then each track's own box, in the order the file holds them; then
-//! each track's sample descriptions — the first that differs — and its
-//! tables, in track order; then the file's parts. A track's
+//! each track's sample descriptions — the first that differs — its
+//! tables and, of an animated AVIF, its first chunk's offset, in track
+//! order; then AVIF's items' records; then the file's parts: the media
+//! data, and AVIF's first item's location. A track's
 //! omission is named before the file's sizes it shortens, so that the most
 //! specific name wins.
 
@@ -186,6 +188,12 @@ pub enum WrittenPart {
   /// A DVD subtitle track's sample description, the `index`-th, and the
   /// palette its `esds` carries as its decoder-specific information.
   Palette(u32),
+  /// AVIF's item of this number, from 1, as its `iloc` locates it: its
+  /// extent's offset, against the payload's place.
+  ItemLocation(u8),
+  /// An animated AVIF track's chunk offsets: its first, against the
+  /// payload's place.
+  ChunkOffsets,
   /// A track's time-to-sample table: the MOV family's `stts`.
   TimeToSample,
   /// A track's sample sizes: the MOV family's `stsz`.
@@ -203,6 +211,8 @@ impl fmt::Display for WrittenPart {
         return write!(f, "its sample description {index}'s configuration");
       }
       Self::Palette(index) => return write!(f, "its sample description {index}'s palette"),
+      Self::ItemLocation(item) => return write!(f, "item {item}'s location"),
+      Self::ChunkOffsets => "its chunk offsets",
       Self::TimeToSample => "its time-to-sample table",
       Self::SampleSizes => "its sample sizes",
     };
@@ -728,6 +738,12 @@ impl SampleMirror {
   pub(super) const fn reads_cues(&self) -> bool {
     self.cue_track
   }
+
+  /// The bytes of the samples movenc writes, as the sample sizes count
+  /// them: AVIF's payload.
+  pub(super) fn bytes(&self) -> u64 {
+    self.sizes().sum()
+  }
 }
 
 /// What a track's sample descriptions carry that the audit judges, by its
@@ -748,6 +764,10 @@ pub(super) enum Carried {
   /// DVD subtitles' palette: its sixteen colours, as movenc converts them
   /// (`mov_create_dvd_sub_decoder_specific_info`, 8000–8048).
   Palette([u32; 16]),
+  /// AVIF's AV1, whose `av1C` — of its item, and of an animated image's
+  /// sample entry — `ff_isom_write_av1c` writes without the sequence
+  /// header OBU (`mov_write_av1c_tag`, 1572–1581).
+  ItemAv1c,
 }
 
 /// A track's sample descriptions as the muxer hands them to the tap before
@@ -873,6 +893,10 @@ pub(super) fn entry_expected(
     (Carried::Apv, _) => expected.record = exact(b"apvC", 4 + records::apvc_written_len(apv)),
     (Carried::Dec3, _) => expected.record = Some(RecordExpected::Dec3),
     (Carried::Palette(colours), _) => expected.palette = Some(palette_fold(colours)),
+    (Carried::ItemAv1c, None) => {}
+    (Carried::ItemAv1c, Some(config)) => {
+      expected.record = exact(b"av1C", av1c_record_len(config, false));
+    }
     (Carried::Record(writer), Some(config)) => {
       expected.record = match writer {
         Writer::Avcc => exact(b"avcC", records::avcc_written_len(config)),
@@ -888,14 +912,7 @@ pub(super) fn entry_expected(
         // A configuration whose units rest on the trust model, whose
         // length is none of the mirror's: judged by nothing.
         Writer::Lvcc => records::lvcc_written_len(config).and_then(|len| exact(b"lvcC", len)),
-        Writer::Av1c => exact(
-          b"av1C",
-          if av1c_written(config) {
-            av1c_written_len(config) as u64
-          } else {
-            0
-          },
-        ),
+        Writer::Av1c => exact(b"av1C", av1c_record_len(config, true)),
         Writer::Dvc1 if config.is_empty() => None,
         Writer::Dvc1 => exact(b"dvc1", 7 + config.len() as u64),
         Writer::Vpcc { .. } | Writer::Av3c => None,
@@ -903,6 +920,17 @@ pub(super) fn entry_expected(
     }
   }
   expected
+}
+
+/// The bytes `ff_isom_write_av1c` writes of `config`, its sequence header
+/// OBU among them where `sequence` (`av1.c` 398–502): none of one it fails
+/// on ([`av1c_written`]).
+fn av1c_record_len(config: &[u8], sequence: bool) -> u64 {
+  if av1c_written(config) {
+    av1c_written_len(config, sequence) as u64
+  } else {
+    0
+  }
 }
 
 /// A track's `trak` as the muxer expects it, in the order movenc writes
@@ -924,6 +952,7 @@ pub(super) struct ExpectedTrak {
 pub(super) fn mov_verdict(
   audit: &Audit,
   expected: impl Iterator<Item = ExpectedTrak> + Clone,
+  media: Option<u64>,
 ) -> Option<WrittenOtherwise> {
   if let Some(unfollowed) = audit.unfollowed() {
     return Some(WrittenOtherwise::new(
@@ -1008,16 +1037,49 @@ pub(super) fn mov_verdict(
         return Some(WrittenOtherwise::new(trak.track, part, found));
       }
     }
+    // An animated AVIF's first chunk: its samples' first byte, the
+    // payload's (`avif_write_trailer`, 9179–9181).
+    if media.is_some()
+      && let (Some(first), Some(start)) = (seen.first_chunk(), walk.payload_start())
+      && first != start
+    {
+      return Some(WrittenOtherwise::new(
+        trak.track,
+        WrittenPart::ChunkOffsets,
+        Found::Value(Counts::new(first, start)),
+      ));
+    }
+  }
+  // AVIF's items' records, each its track's description.
+  if let Some((item, found)) = walk.item_found() {
+    return Some(WrittenOtherwise::new(
+      Some(TrackIndex::new(item)),
+      WrittenPart::Configuration(0),
+      found,
+    ));
   }
   // The file's parts: the media data's size, against the bytes the sink
-  // took between its header and that size's patch.
-  if let Some((declared, taken)) = walk.media_data()
-    && declared != taken
+  // took between its header and that size's patch — AVIF's, written of
+  // its size, against the bytes its track's samples were written of.
+  if let Some((declared, taken)) = walk.media_data() {
+    let wanted = media.unwrap_or(taken);
+    if declared != wanted {
+      return Some(WrittenOtherwise::new(
+        None,
+        WrittenPart::MediaData,
+        Found::Length(Counts::new(declared, wanted)),
+      ));
+    }
+  }
+  // AVIF's first item, its extent at the payload's first byte (9192–9195).
+  if media.is_some()
+    && let (Some((offset, _)), Some(start)) = (walk.items().next(), walk.payload_start())
+    && offset != start
   {
     return Some(WrittenOtherwise::new(
       None,
-      WrittenPart::MediaData,
-      Found::Length(Counts::new(declared, taken)),
+      WrittenPart::ItemLocation(1),
+      Found::Value(Counts::new(offset, start)),
     ));
   }
   None

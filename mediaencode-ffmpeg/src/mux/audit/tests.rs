@@ -155,11 +155,11 @@ fn a_whole_file_passes_and_its_tables_are_judged() {
   assert_eq!(unfollowed(&sink), None);
   let audit = sink.walked();
   assert_eq!(
-    mov_verdict(&audit, [expected(&[4, 5, 4])].into_iter()),
+    mov_verdict(&audit, [expected(&[4, 5, 4])].into_iter(), None),
     None
   );
   assert_eq!(
-    mov_verdict(&audit, [expected(&[4, 6, 4])].into_iter()),
+    mov_verdict(&audit, [expected(&[4, 6, 4])].into_iter(), None),
     Some(WrittenOtherwise::new(
       Some(TrackIndex::new(0)),
       WrittenPart::SampleSizes,
@@ -167,7 +167,7 @@ fn a_whole_file_passes_and_its_tables_are_judged() {
     ))
   );
   assert_eq!(
-    mov_verdict(&audit, [expected(&[5, 4, 4])].into_iter()),
+    mov_verdict(&audit, [expected(&[5, 4, 4])].into_iter(), None),
     Some(WrittenOtherwise::new(
       Some(TrackIndex::new(0)),
       WrittenPart::SampleSizes,
@@ -195,7 +195,7 @@ fn a_table_or_a_trak_left_out_is_named() {
   let audit = sink.walked();
   assert_eq!(audit.unfollowed(), None);
   assert_eq!(
-    mov_verdict(&audit, [expected(&[4, 4])].into_iter()),
+    mov_verdict(&audit, [expected(&[4, 4])].into_iter(), None),
     Some(WrittenOtherwise::new(
       Some(TrackIndex::new(0)),
       WrittenPart::TimeToSample,
@@ -210,7 +210,7 @@ fn a_table_or_a_trak_left_out_is_named() {
     samples: SampleMirror::default(),
   };
   assert_eq!(
-    mov_verdict(&audit, [expected(&[4, 4]), chapters].into_iter()),
+    mov_verdict(&audit, [expected(&[4, 4]), chapters].into_iter(), None),
     Some(WrittenOtherwise::new(
       None,
       WrittenPart::ChapterTrack,
@@ -218,7 +218,7 @@ fn a_table_or_a_trak_left_out_is_named() {
     ))
   );
   assert_eq!(
-    mov_verdict(&audit, core::iter::empty()),
+    mov_verdict(&audit, core::iter::empty(), None),
     Some(WrittenOtherwise::new(
       None,
       WrittenPart::Structure,
@@ -245,7 +245,7 @@ fn the_mdats_size_is_judged_against_the_payload_taken() {
   let audit = short.walked();
   assert_eq!(audit.unfollowed(), None, "followed: the size judged later");
   assert_eq!(
-    mov_verdict(&audit, [expected(&[36, 36])].into_iter()),
+    mov_verdict(&audit, [expected(&[36, 36])].into_iter(), None),
     Some(WrittenOtherwise::new(
       None,
       WrittenPart::MediaData,
@@ -638,6 +638,7 @@ fn judged_with(sink: &Sink, mode: MovMode, handed: Handed) -> Option<WrittenOthe
   mov_verdict(
     &sink.walked_with(mode, handed),
     [expected(&[4])].into_iter(),
+    None,
   )
 }
 
@@ -1113,4 +1114,204 @@ fn r8_a_record_at_a_trust_stop_is_judged_not_at_all() {
       "{name}: no claim at the trust stop"
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+//  AVIF (A13): its whole file written at the trailer.
+// ---------------------------------------------------------------------------
+
+/// An `iloc` of one item, its extent at `offset`, of `length` bytes
+/// (`mov_write_iloc_tag`, `movenc.c` 3660–3681).
+fn iloc(offset: u32, length: u32) -> Vec<u8> {
+  let mut payload = vec![0, 0, 0, 0, 0x44, 0, 0, 1, 0, 1, 0, 0, 0, 1];
+  payload.extend_from_slice(&offset.to_be_bytes());
+  payload.extend_from_slice(&length.to_be_bytes());
+  boxed(b"iloc", &payload)
+}
+
+/// AVIF's `meta`: its version and flags, then `hdlr`, `pitm`, `iloc` of
+/// one item, `iinf`, and `iprp` of an `ipco` holding the item's `av1C` of
+/// `av1c`; and the `iloc`'s extent offset's place in it, from the `meta`.
+fn avif_meta(offset: u32, length: u32, av1c: &[u8]) -> (Vec<u8>, u64) {
+  let head = [
+    vec![0; 4],
+    hdlr(b"pict"),
+    boxed(b"pitm", &[0, 0, 0, 0, 0, 1]),
+  ]
+  .concat();
+  let extent = 8 + head.len() as u64 + 8 + 14;
+  let ipco = boxed(
+    b"ipco",
+    &[boxed(b"ispe", &[0; 12]), boxed(b"av1C", av1c)].concat(),
+  );
+  let payload = [
+    head,
+    iloc(offset, length),
+    boxed(b"iinf", &[0; 6]),
+    boxed(b"iprp", &[ipco, boxed(b"ipma", &[0; 11])].concat()),
+  ]
+  .concat();
+  (boxed(b"meta", &payload), extent)
+}
+
+/// The walk of an AVIF file, handed `handed` for its track.
+fn avif_walked(sink: &Sink, handed: Option<Handed>) -> Audit {
+  let mut audit = Audit::mov(MovMode::Avif, 2);
+  if let Some(handed) = handed {
+    audit.hand(0, handed);
+  }
+  for (at, bytes) in &sink.runs {
+    audit.took(*at, bytes);
+  }
+  audit
+}
+
+/// A still AVIF of a payload of `payload` bytes, its extent offset written
+/// `offset` — `None`, the payload's place — and its `av1C` `av1c`: the
+/// runs, and the payload's place.
+fn still_avif(payload: usize, offset: Option<u32>, av1c: &[u8]) -> (Sink, u64) {
+  let mut sink = Sink::default();
+  sink.append(&boxed(b"ftyp", b"avifmif1miafMA1B"));
+  let (probe, _) = avif_meta(0, payload as u32, av1c);
+  let start = sink.frontier + probe.len() as u64 + 8;
+  let (meta, _) = avif_meta(offset.unwrap_or(start as u32), payload as u32, av1c);
+  sink.append(&meta);
+  sink.append(&sized(8 + payload as u32, b"mdat", &vec![0x21; payload]));
+  (sink, start)
+}
+
+/// **AVIF's file is walked whole, and its payload, extent and item record
+/// judged** (`avif_write_trailer`, `movenc.c` 9154–9213): a still image
+/// passes; a payload other than the samples' bytes is named by its length,
+/// an extent offset other than the payload's place by its value, and the
+/// item's `av1C` against its track's description.
+#[test]
+fn avifs_file_is_walked_and_its_parts_judged() {
+  let av1c = [0x81, 0, 0, 0];
+  let handed = || {
+    Some(Handed::new(
+      Carried::ItemAv1c,
+      vec![Some(av1c.to_vec())],
+      Vec::new(),
+    ))
+  };
+  let (sink, start) = still_avif(27, None, &av1c);
+  let audit = avif_walked(&sink, handed());
+  assert_eq!(audit.unfollowed(), None);
+  assert_eq!(mov_verdict(&audit, core::iter::empty(), Some(27)), None);
+  assert_eq!(
+    mov_verdict(&audit, core::iter::empty(), Some(28)),
+    Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::MediaData,
+      Found::Length(Counts::new(27, 28))
+    ))
+  );
+  let (moved, _) = still_avif(27, Some(start as u32 + 4), &av1c);
+  assert_eq!(
+    mov_verdict(
+      &avif_walked(&moved, handed()),
+      core::iter::empty(),
+      Some(27)
+    ),
+    Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::ItemLocation(1),
+      Found::Value(Counts::new(start + 4, start))
+    ))
+  );
+  let (cut, _) = still_avif(27, None, &av1c[..2]);
+  assert_eq!(
+    mov_verdict(&avif_walked(&cut, handed()), core::iter::empty(), Some(27)),
+    named(
+      WrittenPart::Configuration(0),
+      Found::Length(Counts::new(2, 4))
+    )
+  );
+}
+
+/// **AVIF's extent offset, written 0 and patched once the payload is
+/// placed, is admitted where it lies** (9200–9210): its `meta` flushed
+/// before the payload, the patch a write of its own after it.
+#[test]
+fn avifs_extent_offset_is_patched_where_it_lies() {
+  let av1c = [0x81, 0, 0, 0];
+  let mut sink = Sink::default();
+  sink.append(&boxed(b"ftyp", b"avifmif1miafMA1B"));
+  let (meta, extent) = avif_meta(0, 27, &av1c);
+  let at = sink.append(&meta);
+  let start = sink.append(&sized(35, b"mdat", &[])) + 8;
+  sink.append(&[0x21; 27]);
+  sink.patch(at + extent, &(start as u32).to_be_bytes());
+  let audit = avif_walked(&sink, None);
+  assert_eq!(audit.unfollowed(), None);
+  assert_eq!(mov_verdict(&audit, core::iter::empty(), Some(27)), None);
+  // In two parts, as a sink takes it.
+  let mut parts = Sink::default();
+  parts.append(&boxed(b"ftyp", b"avifmif1miafMA1B"));
+  let at = parts.append(&meta);
+  parts.append(&sized(35, b"mdat", &[]));
+  parts.append(&[0x21; 27]);
+  let word = (start as u32).to_be_bytes();
+  parts.patch(at + extent, &word[..1]);
+  parts.patch(at + extent + 1, &word[1..]);
+  assert_eq!(avif_walked(&parts, None).unfollowed(), None);
+}
+
+/// **An animated AVIF's first chunk is its payload's first byte**
+/// (9179–9181): a `moov` whose `stco` says so passes; one moved by
+/// `get_moov_size`'s error, taken as the `moov`'s size, is named.
+#[test]
+fn an_animated_avifs_first_chunk_is_judged() {
+  let moov_of = |first: u32| {
+    let stbl = [
+      stsd(&[]),
+      stts(&[(2, 1)]),
+      stsz(&[4, 4]),
+      boxed(
+        b"stco",
+        &[[0, 0, 0, 0, 0, 0, 0, 1].as_slice(), &first.to_be_bytes()].concat(),
+      ),
+    ]
+    .concat();
+    let minf = [boxed(b"vmhd", &[0; 12]), boxed(b"stbl", &stbl)].concat();
+    let mdia = [hdlr(b"pict"), boxed(b"minf", &minf)].concat();
+    let trak = [tkhd(1), boxed(b"mdia", &mdia)].concat();
+    boxed(b"moov", &boxed(b"trak", &trak))
+  };
+  let file = |first: Option<u32>| {
+    let mut sink = Sink::default();
+    sink.append(&boxed(b"ftyp", b"avifmif1miafMA1B"));
+    let (probe, extent) = avif_meta(0, 4, &[0x81, 0, 0, 0]);
+    let start = sink.frontier + probe.len() as u64 + moov_of(0).len() as u64 + 8;
+    let at = sink.append(&probe);
+    sink.append(&moov_of(first.unwrap_or(start as u32)));
+    sink.append(&sized(16, b"mdat", &[0x21; 8]));
+    sink.patch(at + extent, &(start as u32).to_be_bytes());
+    (sink, start)
+  };
+  let mut samples = SampleMirror::default();
+  samples.sample(0, 4);
+  samples.sample(1, 4);
+  samples.end(1);
+  let expected = || {
+    [ExpectedTrak {
+      track: Some(TrackIndex::new(0)),
+      id: 1,
+      samples,
+    }]
+    .into_iter()
+  };
+  let (whole, start) = file(None);
+  let audit = avif_walked(&whole, None);
+  assert_eq!(audit.unfollowed(), None);
+  assert_eq!(mov_verdict(&audit, expected(), Some(8)), None);
+  let (moved, _) = file(Some(start as u32 - 20));
+  assert_eq!(
+    mov_verdict(&avif_walked(&moved, None), expected(), Some(8)),
+    named(
+      WrittenPart::ChunkOffsets,
+      Found::Value(Counts::new(start - 20, start))
+    )
+  );
 }

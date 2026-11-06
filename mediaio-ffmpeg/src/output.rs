@@ -982,6 +982,20 @@ impl<W> Output<W> {
     Ok(f(tap))
   }
 
+  /// Test support: runs `hook` around libavformat's take of each packet
+  /// [`Self::write_packet`] writes — with `true` just before
+  /// `av_interleaved_write_frame`, the packet built, and with `false` as
+  /// it answers — so that a law holds libavutil's allocations to a size
+  /// during a packet's write alone (the write audit's design gate,
+  /// condition 5). Set once: a second is ignored. An output of none locks
+  /// and allocates nothing for it.
+  #[cfg(any(test, feature = "test-support"))]
+  #[doc(hidden)]
+  pub fn set_write_hook(&mut self, hook: impl FnMut(bool) + Send + 'static) {
+    // A second hook is a law's error; the first stands.
+    let _ = self.tap.set_hook(Box::new(hook));
+  }
+
   /// Test support: `change` rewrites the bytes libavformat hands the sink,
   /// in place and keeping their length, before the sink and the tap see
   /// them — libavformat writing otherwise, as a muxer's laws make it. It
@@ -1546,11 +1560,15 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     // SAFETY: `av_packet` owns a live `AVPacket`; `stream_index` is a
     // plain field, set to a stream of this context.
     unsafe { (*av_packet.as_mut_ptr()).stream_index = index };
+    #[cfg(any(test, feature = "test-support"))]
+    self.tap.hook(true);
     // SAFETY: `ctx` is live and writing; `av_packet` is a refcounted
     // packet this call built, which `av_interleaved_write_frame` takes
     // over — it moves the reference into its queue and leaves the packet
     // blank, which then drops here.
     let status = unsafe { av_interleaved_write_frame(self.ctx.as_ptr(), av_packet.as_mut_ptr()) };
+    #[cfg(any(test, feature = "test-support"))]
+    self.tap.hook(false);
     drop(av_packet);
     // A failed write is not continued from: the muxer's state may be one
     // no later write or trailer is safe over (see [the module](self)).
