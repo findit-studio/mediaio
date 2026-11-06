@@ -13037,16 +13037,17 @@ where
       ))
     };
     if walked == Walked::Flac {
-      // Raw FLAC's one audio track.
-      let (track, expected) = self
+      // Raw FLAC's one audio track; of none, which `flac_init` refuses, a
+      // structure no writer makes, never `Ok` ([`audit::flac_verdict`]).
+      let expected = self
         .tracks
         .iter()
         .enumerate()
         .find(|(_, state)| state.stream.is_some() && state.kind == TrackKind::Audio)
-        .map(|(index, state)| (TrackIndex::new(index), state.flac_mask))?;
+        .map(|(index, state)| (TrackIndex::new(index), state.flac_mask));
       return self
         .output
-        .with_tap(|audit: &mut Audit| audit::flac_verdict(audit, track, expected))
+        .with_tap(|audit: &mut Audit| audit::flac_verdict(audit, expected))
         .unwrap_or_else(|_| panicked());
     }
     if walked == Walked::Mkv {

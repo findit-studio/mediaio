@@ -1738,14 +1738,15 @@ pub(super) fn mkv_verdict(
 }
 
 /// The first difference between what the raw FLAC walk read and what the
-/// muxer expects of its `track`: the tap's own state; then the channel mask
-/// entries of its VORBIS_COMMENT — `expected`, their count and the fold of
-/// the last one's bytes — named by their absence, their count, then their
-/// content (`ChannelMask`).
+/// muxer expects of its audio track, `expected` — the track, the channel
+/// mask entries of its VORBIS_COMMENT and the fold of the last one's bytes:
+/// the tap's own state; then those entries, named by their absence, their
+/// count, then their content (`ChannelMask`). A file of no audio track to
+/// judge — which `flac_init` refuses (`flacenc.c` 205–244) — is a structure
+/// no writer makes, named, never passed (the R3 gate's condition 1).
 pub(super) fn flac_verdict(
   audit: &Audit,
-  track: TrackIndex,
-  expected: (u64, u64),
+  expected: Option<(TrackIndex, (u64, u64))>,
 ) -> Option<WrittenOtherwise> {
   if let Some(unfollowed) = audit.unfollowed() {
     return Some(WrittenOtherwise::new(
@@ -1754,6 +1755,13 @@ pub(super) fn flac_verdict(
       Found::Unfollowed(unfollowed),
     ));
   }
+  let Some((track, expected)) = expected else {
+    return Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::Structure,
+      Found::Unfollowed(Unfollowed::new(audit.frontier(), Why::Structure)),
+    ));
+  };
   let (count, fold) = audit.flac_walk()?.masks();
   let found = if count != expected.0 {
     if count == 0 {

@@ -2456,7 +2456,7 @@ fn a_raw_flac_file_and_its_mask_entry_are_followed() {
   let audit = flac_walked(&sink);
   assert_eq!(audit.unfollowed(), None);
   assert_eq!(
-    flac_verdict(&audit, TrackIndex::new(0), mask_expected()),
+    flac_verdict(&audit, Some((TrackIndex::new(0), mask_expected()))),
     None
   );
   sink.patch(8, &[0x22; 20]);
@@ -2487,8 +2487,7 @@ fn raw_flacs_mask_entry_is_judged() {
   let judged = |entries: &[&[u8]]| {
     flac_verdict(
       &flac_walked(&flac_file(&vorbis_comment(entries))),
-      TrackIndex::new(0),
-      mask_expected(),
+      Some((TrackIndex::new(0), mask_expected())),
     )
   };
   let named = |found| {
@@ -2511,8 +2510,7 @@ fn raw_flacs_mask_entry_is_judged() {
   assert_eq!(
     flac_verdict(
       &flac_walked(&flac_file(&vorbis_comment(&[]))),
-      TrackIndex::new(0),
-      (0, CONFIG_SEED)
+      Some((TrackIndex::new(0), (0, CONFIG_SEED)))
     ),
     None,
     "none where none is expected"
@@ -2604,4 +2602,22 @@ fn a_gmhds_placeholder_children_are_followed() {
   let mdia = boxed(b"mdia", &[hdlr(b"meta"), minf].concat());
   whole.append(&boxed(b"moov", &boxed(b"trak", &mdia)));
   assert_eq!(unfollowed(&whole), None, "in-buffer");
+}
+
+/// **A raw FLAC file of no audio track to judge is named, never passed**
+/// (the R3 gate's condition 1): `flac_init` refuses such a context
+/// (`flacenc.c` 205–244), so the road is the verdict's shape alone — a
+/// structure no writer makes, at the frontier.
+#[test]
+fn a_raw_flac_file_of_no_audio_track_is_named() {
+  let sink = flac_file(&vorbis_comment(&[MASK]));
+  let audit = flac_walked(&sink);
+  assert_eq!(
+    flac_verdict(&audit, None),
+    Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::Structure,
+      Found::Unfollowed(Unfollowed::new(sink.frontier, Why::Structure))
+    ))
+  );
 }
