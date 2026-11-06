@@ -47,6 +47,8 @@
 
 use mediaio_ffmpeg::ffi::pix_fmt_sampling;
 
+use super::audit::{CONFIG_SEED, config_fold};
+
 /// The most bytes `init_get_bits8` takes: its bits must stay below
 /// `INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE * 8` (`get_bits.h` 517–550 in
 /// FFmpeg 9.0.1).
@@ -666,10 +668,16 @@ fn avcc_config(config: Config<'_>) -> Wrote {
 /// SPS's second byte, other than 66, 77 and 88 — four bytes and each SPS
 /// extension so (111–134).
 pub(super) fn avcc_written_len(config: &[u8]) -> u64 {
+  avcc_written_len_of(Config::Bytes(config))
+}
+
+/// [`avcc_written_len`] of a configuration read in place: FLV's made one's
+/// (R12).
+pub(super) fn avcc_written_len_of(config: Config<'_>) -> u64 {
   if config.len() <= 6 {
     return 0;
   }
-  if !annex_b(config) {
+  if !config.annex_b() {
     return config.len() as u64;
   }
   let (mut sps, mut pps, mut extensions) = (0_u64, 0_u64, 0_u64);
@@ -677,7 +685,7 @@ pub(super) fn avcc_written_len(config: &[u8]) -> u64 {
   // each SPS's 16-bit length, then the SPS (80–81, 112).
   let mut head = [0_u8; 4];
   let mut filled = 0;
-  for (unit, [first, _]) in walked(nal_units(config)) {
+  for (unit, [first, _]) in walked(config.units()) {
     let bytes = 2 + unit.len() as u64;
     match first & 0x1F {
       7 => {
@@ -812,7 +820,13 @@ fn hvcc_config(config: Config<'_>, complete: bool) -> Wrote {
 /// 23 bytes, and each array of a unit, three and each unit behind its
 /// 16-bit length.
 pub(super) fn hvcc_written_len(config: &[u8]) -> u64 {
-  hvcc_walk(Config::Bytes(config), false).map_or(0, |record| {
+  hvcc_written_len_of(Config::Bytes(config))
+}
+
+/// [`hvcc_written_len`] of a configuration read in place: FLV's made one's
+/// (R12).
+pub(super) fn hvcc_written_len_of(config: Config<'_>) -> u64 {
+  hvcc_walk(config, false).map_or(0, |record| {
     23 + 3 * record.counts.iter().filter(|&&count| count > 0).count() as u64 + record.unit_bytes
   })
 }
@@ -2052,6 +2066,17 @@ pub(super) struct Extracted<'a> {
   kept: &'static [u8],
   /// Its bytes: each set's and its start code's.
   len: usize,
+  /// The fold of those bytes, as FLV compares a new configuration with its
+  /// current one (`flvenc.c` 1250–1264; R12): made in the same pass as its
+  /// length, nothing made.
+  fold: u64,
+}
+
+impl Extracted<'_> {
+  /// Its bytes' count and their fold ([`config_fold`]).
+  pub(super) const fn made(&self) -> (u64, u64) {
+    (self.len as u64, self.fold)
+  }
 }
 
 impl<'a> Extracted<'a> {
@@ -2119,11 +2144,20 @@ pub(super) fn h2645_extracted(
   if sets().next().is_none() || !present(sps) || vps.is_some_and(|vps| !present(vps)) {
     return Ok(None);
   }
+  // Its length and its bytes' fold, one pass: each set behind its start
+  // code.
+  let (len, fold) = sets().fold((0, CONFIG_SEED), |(len, fold), unit| {
+    (
+      len + 4 + unit.raw.len(),
+      config_fold(config_fold(fold, &[0, 0, 0, 1]), unit.raw),
+    )
+  });
   Ok(Some(Extracted {
     bytes,
     units,
     kept,
-    len: sets().map(|unit| 4 + unit.raw.len()).sum(),
+    len,
+    fold,
   }))
 }
 
@@ -2697,15 +2731,24 @@ fn apv_frame_info(header: &[u8]) -> Option<ApvFrameInfo> {
 /// allow ([`lvcc_written_len`]). The write audit judges such a record not
 /// at all (R8).
 pub(super) fn rests_on_trust(writer: Writer, config: &[u8]) -> bool {
-  match writer {
-    Writer::Hvcc { .. } => [false, true]
+  rests_on_trust_of(writer, Config::Bytes(config))
+}
+
+/// [`rests_on_trust`] of a configuration as the stream holds it or as
+/// `extract_extradata` makes it of a packet's units, which FLV writes a
+/// sequence header of (R8, R12): `hvcC`'s and `vvcC`'s of either, the
+/// others' of their bytes alone, which no filter makes.
+pub(super) fn rests_on_trust_of(writer: Writer, config: Config<'_>) -> bool {
+  match (writer, config) {
+    (Writer::Hvcc { .. }, config) => [false, true]
       .into_iter()
-      .any(|lhvc| hvcc_walk(Config::Bytes(config), lhvc).is_ok_and(|record| record.trusted)),
-    Writer::Evcc => evcc_walk(config).1,
-    Writer::Vvcc => vvcc_walk(Config::Bytes(config)).1,
-    Writer::Dvc1 => dvc1_walk(config).1,
-    Writer::Lvcc => lvcc_written_len(config).is_none(),
-    Writer::Avcc | Writer::Vpcc { .. } | Writer::Av1c | Writer::Av3c => false,
+      .any(|lhvc| hvcc_walk(config, lhvc).is_ok_and(|record| record.trusted)),
+    (Writer::Vvcc, config) => vvcc_walk(config).1,
+    (Writer::Evcc, Config::Bytes(config)) => evcc_walk(config).1,
+    (Writer::Dvc1, Config::Bytes(config)) => dvc1_walk(config).1,
+    (Writer::Lvcc, Config::Bytes(config)) => lvcc_written_len(config).is_none(),
+    (Writer::Evcc | Writer::Dvc1 | Writer::Lvcc, Config::Extracted(_))
+    | (Writer::Avcc | Writer::Vpcc { .. } | Writer::Av1c | Writer::Av3c, _) => false,
   }
 }
 

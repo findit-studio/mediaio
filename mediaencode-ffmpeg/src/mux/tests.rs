@@ -1208,6 +1208,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     roll: OpusRoll::default(),
     user_data: 0,
     flags: FlagsMirror::default(),
+    flv: FlvMirror::default(),
   }
 }
 
@@ -4993,7 +4994,7 @@ fn flvs_filter_split_is_held_to_what_libavcodec_allocates() {
 /// of its bits — an HDR content light level's or mastering display's.
 #[test]
 fn flvs_av1_sequence_header_is_counted_as_its_filter_makes_it() {
-  use super::{av1_extracted_record, av1_metadata_global, flv_sequence_header};
+  use super::{av1_extracted_made, av1_metadata_global, flv_sequence_header};
   assert_eq!(
     flv_sequence_header(TrackKind::Video, CodecId::AV1, 0),
     Some(5)
@@ -5028,11 +5029,11 @@ fn flvs_av1_sequence_header_is_counted_as_its_filter_makes_it() {
     0x32, 0x0C, 0x10, 0x00, 0xF3, 0x82, 0x3F, 0xFE, 0x69, 0x83, 0x00, 0x00, 0x05, 0x80,
   ];
   assert_eq!(
-    av1_extracted_record(&[td, sequence, light, t35, unkept, frame].concat()),
+    av1_extracted_made(&[td, sequence, light, t35, unkept, frame].concat()).0,
     4 + 13 + 8,
     "the sequence header and the light level, whole"
   );
-  assert_eq!(av1_extracted_record(&[sequence, frame].concat()), 4 + 13);
+  assert_eq!(av1_extracted_made(&[sequence, frame].concat()).0, 4 + 13);
 }
 
 /// MPEG-TS reads a unit's type as its start code search leaves it, and

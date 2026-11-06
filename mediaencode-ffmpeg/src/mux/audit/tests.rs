@@ -1764,3 +1764,322 @@ fn an_stss_of_part_of_an_entry_is_a_structure() {
     Some(Why::Structure)
   );
 }
+
+// ---------------------------------------------------------------------------
+//  FLV's walk (A22, A26; R10, R11, R12; the design gate's condition 6).
+// ---------------------------------------------------------------------------
+
+/// FLV's file header, of audio and video, and the first PreviousTagSize.
+fn flv_header() -> Vec<u8> {
+  vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0]
+}
+
+/// A tag of `kind` whose header's size reads `size`, holding `data`, then
+/// its PreviousTagSize, of its data and 11.
+fn flv_tag(kind: u8, size: u32, data: &[u8]) -> Vec<u8> {
+  let mut bytes = vec![kind];
+  bytes.extend_from_slice(&size.to_be_bytes()[1..]);
+  bytes.extend_from_slice(&[0; 7]);
+  bytes.extend_from_slice(data);
+  bytes.extend_from_slice(&(data.len() as u32 + 11).to_be_bytes());
+  bytes
+}
+
+/// A tag of `kind` of its true size, holding `data`.
+fn flv_whole(kind: u8, data: &[u8]) -> Vec<u8> {
+  flv_tag(kind, data.len() as u32, data)
+}
+
+/// `onMetaData`'s data: an AMF string, then an array of no entry's count.
+fn on_meta_data() -> Vec<u8> {
+  let mut data = vec![2, 0, 10];
+  data.extend_from_slice(b"onMetaData");
+  data.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 9]);
+  data
+}
+
+/// One AAC track, as the walk is told it: legacy AAC, its sequence header
+/// of 2 bytes before its record.
+const AAC: FlvTrack = FlvTrack {
+  kind: 8,
+  index: 0,
+  header: 2,
+  emptiness: false,
+};
+
+/// The walk of an FLV file of `tracks` and `pre_tags`, over `sink`'s runs.
+fn flv_walked(sink: &Sink, tracks: &[FlvTrack], pre_tags: usize) -> Audit {
+  let mut audit = Audit::flv(tracks, pre_tags);
+  for (at, bytes) in &sink.runs {
+    audit.took(*at, bytes);
+  }
+  audit
+}
+
+/// AAC's track as the muxer expects it: one sequence header of `record`
+/// bytes, and frames of `sizes`.
+fn aac_expected(record: u64, sizes: &[u64]) -> ExpectedFlv {
+  let mut sequences = Runs::default();
+  sequences.push(record, 1);
+  let mut frames = Runs::default();
+  for &size in sizes {
+    frames.push(size, 1);
+  }
+  ExpectedFlv {
+    track: TrackIndex::new(0),
+    sequences: sequences.summary(),
+    records: true,
+    frames: frames.summary(),
+  }
+}
+
+/// An FLV file whole: its header, `onMetaData`, AAC's sequence header of a
+/// 2-byte configuration, and frames of `payloads` bytes, each its 2 flags'
+/// beside: the runs, every size final in the stream.
+fn flv_whole_file(payloads: &[usize]) -> Sink {
+  let mut sink = Sink::default();
+  sink.append(&flv_header());
+  sink.append(&flv_whole(18, &on_meta_data()));
+  sink.append(&flv_whole(8, &[0xAF, 0, 0x12, 0x10]));
+  for &payload in payloads {
+    let mut data = vec![0xAF, 1];
+    data.extend(core::iter::repeat_n(0x21, payload));
+    sink.append(&flv_whole(8, &data));
+  }
+  sink
+}
+
+/// **An FLV file whole passes; its frames and sequence headers are judged**
+/// (A26, A22): each frame's data size — its payload and its 2 flags — and
+/// the sequence header's record; one frame of another size is named by the
+/// frames' sum, one fewer by their count, the record by its length.
+#[test]
+fn an_flv_files_frames_and_sequence_headers_are_judged() {
+  let audit = flv_walked(&flv_whole_file(&[10, 12]), &[AAC], 0);
+  assert_eq!(audit.unfollowed(), None);
+  let judged = |expected: ExpectedFlv| flv_verdict(&audit, [expected].into_iter());
+  assert_eq!(judged(aac_expected(2, &[12, 14])), None);
+  let named = |part, found| Some(WrittenOtherwise::new(Some(TrackIndex::new(0)), part, found));
+  assert_eq!(
+    judged(aac_expected(2, &[12, 15])),
+    named(WrittenPart::Frames, Found::Length(Counts::new(26, 27)))
+  );
+  assert_eq!(
+    judged(aac_expected(2, &[12, 14, 14])),
+    named(WrittenPart::Frames, Found::Count(Counts::new(2, 3)))
+  );
+  assert_eq!(
+    judged(aac_expected(5, &[12, 14])),
+    named(
+      WrittenPart::Configuration(0),
+      Found::Length(Counts::new(2, 5))
+    )
+  );
+}
+
+/// **A placeholder size is closed by its rewrite at the frontier, before its
+/// PreviousTagSize, in parts or whole**: AAC's sequence header written of
+/// size 0, flushed, its data, then its size rewritten — in one write, or in
+/// two — then its PreviousTagSize: followed; a rewrite of another size is a
+/// structure no writer makes.
+#[test]
+fn a_placeholder_size_is_closed_by_its_rewrite() {
+  let file = |parts: &[&[u8]]| {
+    let mut sink = Sink::default();
+    sink.append(&flv_header());
+    let at = sink.append(&flv_tag(8, 0, &[])[..11]);
+    sink.append(&[0xAF, 0, 0x12, 0x10]);
+    let mut field = at + 1;
+    for part in parts {
+      sink.patch(field, part);
+      field += part.len() as u64;
+    }
+    sink.append(&15u32.to_be_bytes());
+    sink
+  };
+  let followed = |sink: &Sink| flv_walked(sink, &[AAC], 0).unfollowed();
+  assert_eq!(followed(&file(&[&[0, 0, 4]])), None);
+  assert_eq!(followed(&file(&[&[0], &[0, 4]])), None, "in two parts");
+  assert_eq!(
+    followed(&file(&[&[0, 0, 5]])).map(|unfollowed| unfollowed.why()),
+    Some(Why::Structure)
+  );
+}
+
+/// **A PreviousTagSize other than its tag's is a structure no writer makes**
+/// (A26's road among them).
+///
+/// PLANT P618: the PreviousTagSize not read.
+#[test]
+fn a_previous_tag_size_off_by_one_is_a_structure() {
+  let mut sink = Sink::default();
+  sink.append(&flv_header());
+  let mut tag = flv_whole(8, &[0xAF, 1, 0x21, 0x21]);
+  let last = tag.len() - 1;
+  tag[last] += 1;
+  let at = sink.append(&tag);
+  assert_eq!(
+    flv_walked(&sink, &[AAC], 0).unfollowed(),
+    Some(Unfollowed::new(at + tag.len() as u64 - 4, Why::Structure))
+  );
+}
+
+/// **A file ending inside a tag is truncated at the tag's offset; a tag of
+/// another type is a structure** — A26's road: a tag's size of 0xFFFFC5,
+/// its flags and nothing after.
+#[test]
+fn an_flv_file_ending_inside_a_tag_is_truncated_at_it() {
+  let mut sink = Sink::default();
+  sink.append(&flv_header());
+  let at = sink.append(&[9, 0xFF, 0xFF, 0xC5, 0, 0, 0, 0, 0, 0, 0, 0x17, 1, 0, 0, 0]);
+  sink.append(&0xFFFF_FFD0_u32.to_be_bytes());
+  assert_eq!(
+    flv_walked(&sink, &[], 0).unfollowed(),
+    Some(Unfollowed::new(at, Why::Truncated))
+  );
+  let mut other = Sink::default();
+  other.append(&flv_header());
+  let at = other.append(&flv_whole(7, &[1, 2, 3]));
+  assert_eq!(
+    flv_walked(&other, &[], 0).unfollowed(),
+    Some(Unfollowed::new(at, Why::Structure))
+  );
+}
+
+/// **R10 — HDR metadata's video tag of size 5 is a placeholder, of both
+/// faces**: its size final in the stream (the in-buffer face) and its size
+/// read as 5 then rewritten after its colorInfo (the flushed face) are each
+/// followed; a video tag of size 5 opening on another byte is final, its
+/// PreviousTagSize of 16 read.
+///
+/// PLANT P630: R10's predicate removed.
+#[test]
+fn r10_hdr_metadatas_size_of_5_is_a_placeholder() {
+  let body = [
+    0xD4, b'h', b'v', b'c', b'1', 2, 0, 9, b'c', b'o', b'l', b'o', b'r', b'I', b'n', b'f', b'o', 3,
+    0, 0, 9,
+  ];
+  let mut whole = Sink::default();
+  whole.append(&flv_header());
+  whole.append(&flv_whole(9, &body));
+  assert_eq!(flv_walked(&whole, &[], 0).unfollowed(), None, "in-buffer");
+  let mut flushed = Sink::default();
+  flushed.append(&flv_header());
+  let at = flushed.append(&flv_tag(9, 5, &[])[..11]);
+  flushed.append(&body);
+  flushed.patch(at + 1, &(body.len() as u32).to_be_bytes()[1..]);
+  flushed.append(&(body.len() as u32 + 11).to_be_bytes());
+  assert_eq!(flv_walked(&flushed, &[], 0).unfollowed(), None, "flushed");
+  let mut final_five = Sink::default();
+  final_five.append(&flv_header());
+  final_five.append(&flv_whole(9, &[0x27, 1, 0, 0, 0]));
+  assert_eq!(flv_walked(&final_five, &[], 0).unfollowed(), None, "final");
+}
+
+/// **R11 — VP6A's pre-tags are read exactly as many as stated**: a header
+/// of one and of two, the walk told so, followed; told one fewer, the
+/// pre-tag is a structure at its offset; told one more, at the first tag's;
+/// a placeholder audio tag opening on 0x00 — a pre-tag the walk was not
+/// told of — a structure at its offset.
+#[test]
+fn r11_vp6as_pre_tags_are_read_as_many_as_stated() {
+  let pre_tag = [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11];
+  let file = |pre_tags: usize| {
+    let mut sink = Sink::default();
+    sink.append(&flv_header());
+    for _ in 0..pre_tags {
+      sink.append(&pre_tag);
+    }
+    sink.append(&flv_whole(18, &on_meta_data()));
+    sink
+  };
+  for count in [1, 2] {
+    assert_eq!(flv_walked(&file(count), &[], count).unfollowed(), None);
+  }
+  assert_eq!(
+    flv_walked(&file(2), &[], 1).unfollowed(),
+    Some(Unfollowed::new(13 + 15, Why::Structure)),
+    "told one fewer"
+  );
+  assert_eq!(
+    flv_walked(&file(1), &[], 2).unfollowed(),
+    Some(Unfollowed::new(13 + 15, Why::Structure)),
+    "told one more"
+  );
+  assert_eq!(
+    flv_walked(&file(1), &[], 0).unfollowed(),
+    Some(Unfollowed::new(13, Why::Structure)),
+    "not told"
+  );
+}
+
+/// **A script tag's provisional size, the design gate's condition 6**: a
+/// TEXT cue's tag written of its payload's size and one, its AMF one to
+/// three bytes longer — the rewrite arriving with fewer than 4 lookahead
+/// bytes held — or shorter — the rewrite arriving before the provisional
+/// end, a data stream's pass-through — each followed; a provisional size
+/// that was the true one, its PreviousTagSize read after it, followed.
+#[test]
+fn a_script_tags_provisional_size_is_held_until_its_rewrite() {
+  let file = |provisional: u32, data: &[u8], rewritten: bool| {
+    let mut sink = Sink::default();
+    sink.append(&flv_header());
+    sink.append(&flv_whole(18, &on_meta_data()));
+    let at = sink.append(&flv_tag(18, provisional, &[])[..11]);
+    sink.append(data);
+    if rewritten {
+      sink.patch(at + 1, &(data.len() as u32).to_be_bytes()[1..]);
+    }
+    sink.append(&(data.len() as u32 + 11).to_be_bytes());
+    sink
+  };
+  let amf = [
+    2, 0, 10, b'o', b'n', b'T', b'e', b'x', b't', b'D', b'a', b't', b'a', 0, 0, 9,
+  ];
+  for longer in 1..=3 {
+    let provisional = amf.len() as u32 - longer;
+    assert_eq!(
+      flv_walked(&file(provisional, &amf, true), &[], 0).unfollowed(),
+      None,
+      "the tail case, {longer} past"
+    );
+  }
+  assert_eq!(
+    flv_walked(&file(amf.len() as u32 + 1, &amf, true), &[], 0).unfollowed(),
+    None,
+    "pass-through"
+  );
+  assert_eq!(
+    flv_walked(&file(amf.len() as u32, &amf, false), &[], 0).unfollowed(),
+    None,
+    "final"
+  );
+}
+
+/// **`onMetaData`'s window**: its count written while it is open and its
+/// duration and file size after it closes are each admitted; a write below
+/// the frontier outside it is a rewrite of no field.
+#[test]
+fn on_meta_datas_window_admits_its_rewrites() {
+  let mut sink = Sink::default();
+  sink.append(&flv_header());
+  let at = sink.append(&flv_tag(18, 0, &[])[..11]);
+  let data = on_meta_data();
+  sink.append(&data);
+  // The array's count, while open.
+  sink.patch(at + 11 + 14, &[0, 0, 0, 2]);
+  sink.patch(at + 1, &(data.len() as u32).to_be_bytes()[1..]);
+  sink.append(&(data.len() as u32 + 11).to_be_bytes());
+  sink.append(&flv_whole(8, &[0xAF, 0, 0x12, 0x10]));
+  // The trailer's duration, inside the closed window.
+  sink.patch(at + 11 + 4, &[1, 2, 3, 4]);
+  assert_eq!(flv_walked(&sink, &[AAC], 0).unfollowed(), None);
+  let mut outside = sink;
+  outside.patch(at + 11 + data.len() as u64 + 6, &[0]);
+  assert_eq!(
+    flv_walked(&outside, &[AAC], 0)
+      .unfollowed()
+      .map(|unfollowed| unfollowed.why()),
+    Some(Why::Rewrite)
+  );
+}

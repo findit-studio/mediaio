@@ -65,7 +65,10 @@
 //!   undefined, its parse indexing its arrays past their end; `dvc1` of a
 //!   sequence header of another profile than the advanced one, left out;
 //!   `lvcC` of a block or a picture the standard does not allow, written
-//!   empty ([`records::rests_on_trust`]).
+//!   empty ([`records::rests_on_trust`]). FLV folds a track's sequence
+//!   headers' records together: a track one of whose configurations rests
+//!   there has its records judged by their count alone, which its header
+//!   writes whatever the record ([`records::rests_on_trust_of`]).
 //! - **VC-1's and TrueHD's sync flags.** movenc derives VC-1's from the
 //!   bitstream after the fact, its scan of each packet able to clear every
 //!   earlier sample's flag (`mov_parse_vc1_frame`, `movenc.c` 6475–6532):
@@ -128,10 +131,13 @@ use super::{
   records::{self, ApvFrameInfo, Writer},
 };
 
+mod flv;
 mod mov;
 #[cfg(test)]
 mod tests;
 
+pub(super) use flv::FlvTrack;
+use flv::FlvWalk;
 use mov::{Described, MovWalk};
 
 /// What FFmpeg wrote otherwise than it was handed, answering success: an
@@ -201,7 +207,10 @@ pub enum WrittenPart {
   /// the configuration it carries: the MOV family's record box — `avcC`,
   /// `hvcC` and `lhvC`, `vvcC`, `evcC`, `lvcC`, `av1C`, `dvc1`, `apvC` — or
   /// E-AC-3's `dec3` in MOV's `wave`; where the descriptions are counted
-  /// otherwise than handed, the first one past the shorter count.
+  /// otherwise than handed, the first one past the shorter count. FLV's: a
+  /// track's sequence headers' records, the `index`-th — their lengths
+  /// summed and folded, a difference named at the first, a count's at the
+  /// first past the shorter.
   Configuration(u32),
   /// A DVD subtitle track's sample description, the `index`-th, and the
   /// palette its `esds` carries as its decoder-specific information.
@@ -220,6 +229,8 @@ pub enum WrittenPart {
   SyncSamples,
   /// A track's samples' dependencies: the MOV family's `sdtp`.
   Dependencies,
+  /// A track's frames: FLV's tags of coded frames, each its data size.
+  Frames,
   /// A track's roll groups: the MOV family's `sgpd` and `sbgp`, AAC's one
   /// group of every sample or Opus's roll distances.
   RollGroups,
@@ -243,13 +254,14 @@ impl fmt::Display for WrittenPart {
       Self::Track => "its track box",
       Self::ChapterTrack => "the chapter track",
       Self::Configuration(index) => {
-        return write!(f, "its sample description {index}'s configuration");
+        return write!(f, "its configuration {index}");
       }
       Self::Palette(index) => return write!(f, "its sample description {index}'s palette"),
       Self::ItemLocation(item) => return write!(f, "item {item}'s location"),
       Self::ChunkOffsets => "its chunk offsets",
       Self::TimeToSample => "its time-to-sample table",
       Self::SampleSizes => "its sample sizes",
+      Self::Frames => "its frames",
       Self::SyncSamples => "its sync samples",
       Self::Dependencies => "its samples' dependencies",
       Self::RollGroups => "its roll groups",
@@ -603,6 +615,8 @@ pub(super) struct Audit {
 enum Walk {
   /// The MOV family's boxes.
   Mov(MovWalk),
+  /// FLV's tags.
+  Flv(FlvWalk),
 }
 
 impl Audit {
@@ -614,6 +628,16 @@ impl Audit {
       frontier: 0,
       unfollowed: None,
       walk: Walk::Mov(MovWalk::new(mode, tracks)),
+    }
+  }
+
+  /// A tap over an FLV file of `tracks` and of `pre_tags` VP6A pre-tags
+  /// (R11): its table allocated here, at open.
+  pub(super) fn flv(tracks: &[FlvTrack], pre_tags: usize) -> Self {
+    Self {
+      frontier: 0,
+      unfollowed: None,
+      walk: Walk::Flv(FlvWalk::new(tracks, pre_tags)),
     }
   }
 
@@ -630,6 +654,7 @@ impl Audit {
     }
     match &self.walk {
       Walk::Mov(walk) => walk.unfinished(self.frontier),
+      Walk::Flv(walk) => walk.unfinished(self.frontier),
     }
   }
 
@@ -637,14 +662,23 @@ impl Audit {
   pub(super) fn mov_walk(&self) -> Option<&MovWalk> {
     match &self.walk {
       Walk::Mov(walk) => Some(walk),
+      Walk::Flv(_) => None,
+    }
+  }
+
+  /// The FLV walk, where this tap walks FLV.
+  pub(super) fn flv_walk(&self) -> Option<&FlvWalk> {
+    match &self.walk {
+      Walk::Flv(walk) => Some(walk),
+      Walk::Mov(_) => None,
     }
   }
 
   /// Takes the sample descriptions of the `place`-th `trak` the file
   /// holds, which the muxer moves here before the trailer writes them (R6).
   pub(super) fn hand(&mut self, place: usize, handed: Handed) {
-    match &mut self.walk {
-      Walk::Mov(walk) => walk.hand(place, handed),
+    if let Walk::Mov(walk) = &mut self.walk {
+      walk.hand(place, handed);
     }
   }
 }
@@ -658,12 +692,14 @@ impl SinkTap for Audit {
     let walked = if at == self.frontier {
       let appended = match &mut self.walk {
         Walk::Mov(walk) => walk.append(at, bytes),
+        Walk::Flv(walk) => walk.append(at, bytes),
       };
       self.frontier = end;
       appended
     } else if end <= self.frontier {
       match &mut self.walk {
         Walk::Mov(walk) => walk.patch(self.frontier, at, bytes),
+        Walk::Flv(walk) => walk.patch(self.frontier, at, bytes),
       }
     } else if at > self.frontier {
       Err(Unfollowed::new(self.frontier, Why::Gap))
@@ -675,6 +711,9 @@ impl SinkTap for Audit {
       let frontier = self.frontier;
       let walked = match &mut self.walk {
         Walk::Mov(walk) => walk
+          .patch(frontier, at, patched)
+          .and_then(|()| walk.append(frontier, appended)),
+        Walk::Flv(walk) => walk
           .patch(frontier, at, patched)
           .and_then(|()| walk.append(frontier, appended)),
       };
@@ -1439,3 +1478,86 @@ pub(super) fn mov_verdict(
   }
   None
 }
+
+/// A track of FLV's as the muxer expects it: its sequence headers' records
+/// — VVC's of their emptiness alone — and its coded frames' data sizes,
+/// each folded ([`Runs`]), the muxer's track among FLV's audio and video
+/// tracks in the order the walk is told them; `records` false where a
+/// configuration of the track's rests on the trust model, its records then
+/// judged by their count alone (R8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ExpectedFlv {
+  pub(super) track: TrackIndex,
+  pub(super) sequences: Summary,
+  pub(super) records: bool,
+  pub(super) frames: Summary,
+}
+
+/// The first difference between what the FLV walk read and what the muxer
+/// expects: the tap's own state; then each track's sequence headers — their
+/// count, named at the first past the shorter; their records' lengths
+/// summed, then folded, named at the first — then its frames: their count,
+/// their data sizes summed, then folded.
+pub(super) fn flv_verdict(
+  audit: &Audit,
+  expected: impl Iterator<Item = ExpectedFlv>,
+) -> Option<WrittenOtherwise> {
+  if let Some(unfollowed) = audit.unfollowed() {
+    return Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::Structure,
+      Found::Unfollowed(unfollowed),
+    ));
+  }
+  let walk = audit.flv_walk()?;
+  for (wanted, seen) in expected.zip(walk.tracks()) {
+    let track = Some(wanted.track);
+    let (written, handed) = (seen.sequences(), wanted.sequences);
+    let first = u32::try_from(written.count.min(handed.count)).unwrap_or(u32::MAX);
+    let found = if written.count != handed.count {
+      Some((
+        WrittenPart::Configuration(first),
+        Found::Count(Counts::new(written.count, handed.count)),
+      ))
+    } else if wanted.records && written.sum != handed.sum {
+      Some((
+        WrittenPart::Configuration(0),
+        Found::Length(Counts::new(written.sum(), handed.sum())),
+      ))
+    } else if wanted.records && written.fold != handed.fold {
+      Some((WrittenPart::Configuration(0), Found::Content))
+    } else {
+      let (written, handed) = (seen.frames(), wanted.frames);
+      if written.count != handed.count {
+        Some((
+          WrittenPart::Frames,
+          Found::Count(Counts::new(written.count, handed.count)),
+        ))
+      } else if written.sum != handed.sum {
+        Some((
+          WrittenPart::Frames,
+          Found::Length(Counts::new(written.sum(), handed.sum())),
+        ))
+      } else {
+        (written.fold != handed.fold).then_some((WrittenPart::Frames, Found::Content))
+      }
+    };
+    if let Some((part, found)) = found {
+      return Some(WrittenOtherwise::new(track, part, found));
+    }
+  }
+  None
+}
+
+/// The fold of a configuration's bytes, a byte at a time — the same over
+/// one buffer as over the pieces it is made of: the muxer's of FLV's
+/// current and new configurations, which FLV compares by size and bytes
+/// (`flvenc.c` 1250–1264; R12).
+pub(super) fn config_fold(state: u64, bytes: &[u8]) -> u64 {
+  bytes
+    .iter()
+    .fold(state, |state, &byte| fold(state, u64::from(byte)))
+}
+
+/// The fold of an empty configuration.
+pub(super) const CONFIG_SEED: u64 = FOLD_SEED;

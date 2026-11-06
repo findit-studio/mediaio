@@ -21411,10 +21411,12 @@ fn long_aac(corpus: &Corpus) -> PathBuf {
 /// `mov_text` in milliseconds and in microseconds, TTML, AAC long enough
 /// that its `moov` passes 32 KiB, chapters — MOV's Nero list beside
 /// libavformat's `©swr` among them — a DASH role in a track's `udta`, and
-/// frames of no duration, whose last libavformat guesses — each finishes
-/// `Ok`, the audit's tap having walked the file. Every other law of this lane writes with the
-/// audit on as well, so that each file one writes whole passes it too:
-/// their passing is the rest of this law.
+/// frames of no duration, whose last libavformat guesses — and into FLV,
+/// H.264 and AAC, HEVC naming its matrix (its HDR metadata's tag, R10),
+/// AV1, VP9, AC-3 and Opus — each finishes `Ok`, the audit's tap having
+/// walked the file. Every other law of this lane writes with the audit on
+/// as well, so that each file one writes whole passes it too: their
+/// passing is the rest of this law.
 ///
 /// PLANT P613: a size of 0 read as final. PLANT P614: the last duration
 /// taken as offered, not handed. PLANT P615: AAC's roll groups not
@@ -21426,15 +21428,16 @@ fn l216_the_write_audit_passes_every_file_ffmpeg_writes_whole() {
     (
       "h264-aac",
       h264_aac(&corpus, "l216-h264-aac.mp4"),
-      &["mp4", "mov", "ipod"][..],
+      &["mp4", "mov", "ipod", "flv"][..],
     ),
     ("hevc", hevc_annexb(&corpus), &["mp4"][..]),
+    ("hevc-bt709", hevc_bt709(&corpus), &["flv"][..]),
     ("av1", av1_mkv(&corpus), &["mp4", "avif"][..]),
     ("vp9", vp9_webm(&corpus), &["mp4"][..]),
     (
       "ac3",
       audio_file(&corpus, "l216.ac3", "ac3"),
-      &["mp4", "mov", "ipod"][..],
+      &["mp4", "mov", "ipod", "flv"][..],
     ),
     (
       "eac3",
@@ -21442,7 +21445,7 @@ fn l216_the_write_audit_passes_every_file_ffmpeg_writes_whole() {
       &["mp4", "mov"][..],
     ),
     ("pcm", pcm_mov(&corpus), &["mp4"][..]),
-    ("opus", opus_mkv(&corpus), &["mp4"][..]),
+    ("opus", opus_mkv(&corpus), &["mp4", "flv"][..]),
     (
       "movtext",
       mov_text_mp4(&corpus),
@@ -21459,6 +21462,31 @@ fn l216_the_write_audit_passes_every_file_ffmpeg_writes_whole() {
         &output(&corpus, &format!("l216-{name}.{container}")),
       );
     }
+  }
+
+  // AV1 and VP9 into FLV, each row restated to name its matrix, which FLV
+  // states and refuses a track of none for (L143).
+  use ffmpeg_next::ffi::AVCodecID as Id;
+  for (name, source, codec) in [
+    ("av1", av1_mkv(&corpus), Id::AV_CODEC_ID_AV1),
+    ("vp9", vp9_webm(&corpus), Id::AV_CODEC_ID_VP9),
+  ] {
+    let (table, packets) = whole_track(&source, TrackKind::Video);
+    let config = stream_extradata_of(&table[0]);
+    let mut muxer = muxer_into(
+      &output(&corpus, &format!("l216-{name}.flv")),
+      ContainerName::new("flv"),
+      vec![restated(&table[0], codec, &config, None, None)],
+    );
+    for packet in &packets {
+      wrote(
+        muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(packet))),
+        "a frame",
+      );
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|fault| panic!("{name} into FLV: {fault:?}"));
   }
 
   // The tap walks from the header on.
@@ -23652,4 +23680,564 @@ fn the_flags_read_back_as_their_mirror_counts_them() {
   }
   muxer.finish().expect("finished, the audit agreeing");
   assert_eq!(written_flags(&target), (vec![1, 7], expected));
+}
+
+// ---------------------------------------------------------------------------
+//  FLV audited (A22, A26; R10, R11, R12).
+// ---------------------------------------------------------------------------
+
+/// Each tag of the FLV file at `path` past its header and pre-tags: its
+/// offset, its type, and its data.
+fn flv_tags(path: &Path) -> Vec<(usize, u8, Vec<u8>)> {
+  let bytes = std::fs::read(path).expect("the file");
+  let mut at = 13;
+  while bytes.get(at..at + 15) == Some(&[8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11][..]) {
+    at += 15;
+  }
+  let mut tags = Vec::new();
+  while at + 11 <= bytes.len() {
+    let size = u32::from_be_bytes([0, bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+    let data = at + 11;
+    let end = (data + size).min(bytes.len());
+    tags.push((at, bytes[at], bytes[data..end].to_vec()));
+    at = data + size + 4;
+  }
+  tags
+}
+
+/// The sequence starts among an FLV file's video tags: each its data.
+fn flv_sequence_starts(path: &Path) -> Vec<Vec<u8>> {
+  flv_tags(path)
+    .into_iter()
+    .filter(|(_, kind, data)| {
+      *kind == 9
+        && match data.first() {
+          // The extended header's packet type, or legacy H.264's.
+          Some(first) if first & 0x80 != 0 => first & 0x0F == 0,
+          Some(_) => data.get(1) == Some(&0),
+          None => false,
+        }
+    })
+    .map(|(_, _, data)| data)
+    .collect()
+}
+
+/// **L234 — A22: a sequence header FLV writes of no record is named**
+/// (findit-studio/mediaio#95). In a process of its own: HEVC of the
+/// corpus's Annex B configuration into FLV, libavutil's allocations capped
+/// at 1 000 bytes around `write_header` (the header hook). Derivation: the
+/// header's other allocations stay under it — the context's tables of a
+/// stream, its dictionary's entries; `ff_isom_write_hvcc`'s Annex B rewrite
+/// opens a dynamic buffer of one block — its I/O context, its state and
+/// 1 024 bytes (`aviobuf.c` 1344–1362) — past it, refused, its failure
+/// ignored (`flvenc.c` 886–899): the sequence header written of no record.
+/// Named: track 0's configuration, its record 0 bytes against the `hvcC`
+/// its uncapped twin writes.
+#[cfg(feature = "test-support")]
+#[test]
+fn l234_a_sequence_header_flv_writes_of_no_record_is_named() {
+  in_its_own_process("l234_in_a_process_of_its_own");
+}
+
+/// L234's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l234_in_a_process_of_its_own() {
+  if !alone_for("l234_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let hevc = hevc_annexb(&corpus);
+  let write = |name: &str, capped: bool| {
+    let (table, packets) = first_track(&hevc, TrackKind::Video, 2);
+    // The row restated to name its matrix, which FLV states (L143).
+    let config = stream_extradata_of(&table[0]);
+    let table = vec![restated(
+      &table[0],
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+      &config,
+      None,
+      None,
+    )];
+    let mut hooks = mediaencode_ffmpeg::mux::OpenHooks::default();
+    if capped {
+      hooks = hooks.with_header(|before| if before { cap(1_000) } else { uncap() });
+    }
+    let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+      File::create(output(&corpus, name)).expect("create"),
+      ContainerName::new("flv"),
+      table,
+      &[],
+      MuxOptions::new(),
+      hooks,
+    )
+    .expect("open");
+    for packet in &packets {
+      wrote(
+        muxer.write_video(VideoTrackPacket::new(TrackIndex::new(0), video_of(packet))),
+        "an HEVC frame",
+      );
+    }
+    muxer.finish()
+  };
+  write("l234-twin.flv", false).expect("the twin, finished");
+  let record = flv_sequence_starts(&output(&corpus, "l234-twin.flv"))[0].len() as u64 - 5;
+  assert!(record > 0, "the premise: an hvcC");
+  let fault = write("l234.flv", true).expect_err("the record left out, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::Configuration(0),
+      Finding::Length(0, record)
+    ))
+  );
+}
+
+/// **L235 — A26: a tag FLV writes of a rewrite that failed is named, the
+/// file unfollowed past it** (findit-studio/mediaio#95). In a process of
+/// its own: H.264 of an Annex B configuration into FLV, its first frame
+/// grown past 4 KiB by filler units, libavutil's allocations capped at
+/// 2 000 bytes around that packet's take (the write hook). Derivation: the
+/// rewrite's dynamic buffer opens — one block, its context, state and
+/// 1 024 bytes — and grows to 1 024 under it; its next growth, to 2 306,
+/// past it, refused; its close then answers −64 bytes and no buffer, which
+/// FLV writes as a tag of a data size of 0xFFFFC5, its five flag bytes and
+/// none of the frame (`flvenc.c` 1318–1355, 1452–1454; `nal.c` 133–144).
+/// Named: the file's structure, the walk ending inside that tag, at its
+/// offset.
+#[cfg(feature = "test-support")]
+#[test]
+fn l235_a_tag_of_a_failed_rewrite_is_named() {
+  in_its_own_process("l235_in_a_process_of_its_own");
+}
+
+/// L235's body, alone in its process.
+#[cfg(feature = "test-support")]
+#[test]
+fn l235_in_a_process_of_its_own() {
+  if !alone_for("l235_in_a_process_of_its_own") {
+    return;
+  }
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, frames, sps, pps) = h264_fixture(&corpus);
+  let config = start_coded(&[&sps, &pps]);
+  let row = restated(
+    &row,
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+    &config,
+    None,
+    None,
+  );
+  let filler = [vec![0x0C], vec![0xFF; 5_000], vec![0x80]].concat();
+  let grown = [frames[0].data().as_ref(), &start_coded(&[&filler])].concat();
+  let target = output(&corpus, "l235.flv");
+  let hooks = mediaencode_ffmpeg::mux::OpenHooks::default()
+    .with_packets(|before| if before { cap(2_000) } else { uncap() });
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(&target).expect("create"),
+    ContainerName::new("flv"),
+    vec![row],
+    &[],
+    MuxOptions::new(),
+    hooks,
+  )
+  .expect("open");
+  wrote(
+    muxer.write_video(VideoTrackPacket::new(
+      TrackIndex::new(0),
+      video_holding(&frames[0], &grown),
+    )),
+    "the grown frame",
+  );
+  let fault = muxer
+    .finish()
+    .expect_err("the tag's rewrite failed, not passed");
+  let bytes = std::fs::read(&target).expect("the file");
+  let at = flv_tags(&target)
+    .into_iter()
+    .find(|(at, kind, _)| *kind == 9 && bytes[at + 1..at + 4] == [0xFF, 0xFF, 0xC5])
+    .map(|(at, ..)| at as u64);
+  assert!(at.is_some(), "the premise: a tag of a size of 0xFFFFC5");
+  assert_eq!(
+    written(&fault),
+    Some((
+      None,
+      WrittenPart::Structure,
+      Finding::Unfollowed(at.expect("the tag"), Why::Truncated)
+    ))
+  );
+}
+
+/// **R11 — a VP6A stream gets FLV's header pre-tag whatever its ticket's
+/// tag** (the coordinator's ruling, as amended; `flv_write_header`,
+/// `flvenc.c` 1096–1104; `init_muxer`, `mux.c` 304–324): a VP6A stream of
+/// a ticket of tag 0 — the base's settle leaves it, libavformat's init makes
+/// it 5 — of VP6's 4 — settle clears it, init makes it 5 — and of 5 — settle
+/// keeps it — into FLV, two frames each: `finish` `Ok`, the audit told one
+/// pre-tag and agreeing; the file holds it at offset 13.
+///
+/// PLANT P631: the pre-tags counted of settle's result alone.
+#[test]
+fn r11_a_vp6a_stream_gets_its_pre_tag_whatever_its_tickets_tag() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (table, frames) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 2);
+  for (name, tag) in [
+    ("r11-tag0.flv", [0, 0, 0, 0]),
+    ("r11-tag4.flv", [4, 0, 0, 0]),
+    ("r11-tag5.flv", [5, 0, 0, 0]),
+  ] {
+    let row = restated(
+      &table[0],
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_VP6A,
+      &[],
+      Some(&tag),
+      None,
+    );
+    let target = output(&corpus, name);
+    let mut muxer = muxer_into(&target, ContainerName::new("flv"), vec![row]);
+    for (index, frame) in frames.iter().enumerate() {
+      let at = index as i64 * 40;
+      wrote(
+        muxer.write_video(video_at(
+          &video_holding(&video_of(frame), &[0x21; 32]),
+          Some(at),
+          at,
+        )),
+        "a VP6A frame",
+      );
+    }
+    muxer
+      .finish()
+      .unwrap_or_else(|fault| panic!("{name}: {fault:?}"));
+    let bytes = std::fs::read(&target).expect("the file");
+    assert_eq!(
+      bytes[13..28],
+      [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11],
+      "{name}: the pre-tag"
+    );
+  }
+}
+
+/// H.264 into FLV at `name`, its configuration `config` — none, under
+/// `extract_extradata` — of `frames`' bytes, each its frame's and side data
+/// beside: `finish` `Ok`, the audit agreeing; the file's sequence starts.
+fn h264_into_flv(
+  corpus: &Corpus,
+  name: &str,
+  config: &[u8],
+  frames: &[(Vec<u8>, Option<Vec<u8>>)],
+) -> Vec<Vec<u8>> {
+  let (row, template, ..) = h264_fixture(corpus);
+  let row = restated(
+    &row,
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+    config,
+    None,
+    None,
+  );
+  let target = output(corpus, name);
+  let mut muxer = muxer_with(&target, ContainerName::new("flv"), vec![row], filters(true));
+  for (index, (bytes, new)) in frames.iter().enumerate() {
+    let at = index as i64 * 40;
+    let mut frame = video_holding(&template[0], bytes);
+    if let Some(new) = new {
+      frame.extra_mut().set_side_data(vec![side(
+        ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+        new,
+      )]);
+    }
+    wrote(
+      muxer.write_video(video_at(&frame, Some(at), at)),
+      "an H.264 frame",
+    );
+  }
+  muxer
+    .finish()
+    .unwrap_or_else(|fault| panic!("{name}: {fault:?}"));
+  flv_sequence_starts(&target)
+}
+
+/// **R12 — FLV writes a sequence header of the caller's new extradata only
+/// where it differs from the current** (the coordinator's ruling;
+/// `flvenc.c` 1250–1264): H.264 of an `avcC` into FLV, its second frame
+/// carrying new extradata equal to it — no sequence header written, the
+/// file's one the header's — and again carrying the `avcC` of another
+/// level — a second; each `finish` `Ok`, the audit agreeing.
+#[test]
+fn r12_the_callers_new_extradata_writes_a_header_only_where_it_differs() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, ..) = h264_fixture(&corpus);
+  let avcc = stream_extradata_of(&row);
+  let mut other = avcc.clone();
+  other[3] = other[3].wrapping_add(1);
+  // The source's frames as it holds them, behind 4-byte lengths, as the
+  // `avcC` says.
+  let (_, packets) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 2);
+  let bytes = |index: usize| video_of(&packets[index]).data().as_ref().to_vec();
+  let equal = h264_into_flv(
+    &corpus,
+    "r12-equal.flv",
+    &avcc,
+    &[(bytes(0), None), (bytes(1), Some(avcc.clone()))],
+  );
+  assert_eq!(equal.len(), 1, "equal: the header's alone");
+  let changed = h264_into_flv(
+    &corpus,
+    "r12-changed.flv",
+    &avcc,
+    &[(bytes(0), None), (bytes(1), Some(other.clone()))],
+  );
+  assert_eq!(changed.len(), 2, "changed: a second");
+}
+
+/// **R12 — `extract_extradata`'s made configurations: a sequence header of
+/// each that differs**: H.264 of no configuration into FLV under the
+/// filter, three frames each opening on its SPS and PPS — the same three
+/// times: the header's sequence start of no record and one of the made
+/// sets; the third frame's PPS changed: one more. Each `finish` `Ok`, the
+/// audit agreeing.
+///
+/// PLANT P632: R12's comparison removed, a header expected at every new
+/// configuration.
+#[test]
+fn r12_extract_extradatas_made_sets_write_a_header_where_they_differ() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (_, frames, sps, pps) = h264_fixture(&corpus);
+  let mut changed_pps = pps.clone();
+  let last = changed_pps.len() - 1;
+  changed_pps[last] ^= 0x01;
+  let carrying = |index: usize, pps: &[u8]| {
+    let frame = frames[index].data().as_ref();
+    let slices: Vec<&[u8]> = nal_units_of(frame)
+      .into_iter()
+      .filter(|unit| unit[0] & 0x1F != 7 && unit[0] & 0x1F != 8)
+      .collect();
+    (start_coded(&[vec![&sps[..], pps], slices].concat()), None)
+  };
+  let repeated = h264_into_flv(
+    &corpus,
+    "r12-repeated.flv",
+    &[],
+    &[carrying(0, &pps), carrying(1, &pps), carrying(2, &pps)],
+  );
+  assert_eq!(repeated.len(), 2, "the header's and the made sets'");
+  let changed = h264_into_flv(
+    &corpus,
+    "r12-changed-sets.flv",
+    &[],
+    &[
+      carrying(0, &pps),
+      carrying(1, &pps),
+      carrying(2, &changed_pps),
+    ],
+  );
+  assert_eq!(changed.len(), 3, "one more of the changed sets");
+}
+
+/// **R12 — the comparison allocates nothing**: H.264 of no configuration
+/// into FLV under the filter, 24 frames each opening on its sets, the PPS
+/// changing at every frame — a sequence header each — or the same at every
+/// frame — none after the first: the bytes their writes after the first
+/// allocate, by this lane's counting allocator, are the same.
+#[test]
+fn r12_the_comparison_allocates_nothing() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, frames, sps, pps) = h264_fixture(&corpus);
+  let mut other = pps.clone();
+  let last = other.len() - 1;
+  other[last] ^= 0x01;
+  let slices: Vec<&[u8]> = nal_units_of(frames[0].data().as_ref())
+    .into_iter()
+    .filter(|unit| unit[0] & 0x1F != 7 && unit[0] & 0x1F != 8)
+    .collect();
+  let carrying = |pps: &[u8]| {
+    video_holding(
+      &frames[0],
+      &start_coded(&[vec![&sps[..], pps], slices.clone()].concat()),
+    )
+  };
+  let allocated_by = |name: &str, changing: bool| {
+    let row = restated(
+      &row,
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264,
+      &[],
+      None,
+      None,
+    );
+    let mut muxer = muxer_with(
+      &output(&corpus, name),
+      ContainerName::new("flv"),
+      vec![row],
+      filters(true),
+    );
+    let packets: Vec<_> = (0..24_i64)
+      .map(|index| {
+        let pps = if changing && index % 2 == 1 {
+          &other
+        } else {
+          &pps
+        };
+        video_at(&carrying(pps), Some(index * 40), index * 40)
+      })
+      .collect();
+    let mut packets = packets.into_iter();
+    wrote(
+      muxer.write_video(packets.next().expect("the first")),
+      "the first frame",
+    );
+    let before = allocated();
+    for packet in packets {
+      wrote(muxer.write_video(packet), "an H.264 frame");
+    }
+    let during = allocated() - before;
+    muxer.finish().expect("finished");
+    during
+  };
+  assert_eq!(
+    allocated_by("r12-alloc-changing.flv", true),
+    allocated_by("r12-alloc-same.flv", false)
+  );
+}
+
+/// **Gate condition 7 — FLV's sequence header of a multitrack audio track
+/// reads back as its mirror counts it** (findit-studio/mediaio#95): two AAC
+/// tracks into FLV — the first's sequence header behind its legacy flags
+/// and packet type, 2 bytes; the second's behind the extended header of a
+/// multitrack — its packet type, its track's type, its FourCC and its
+/// index, 7 bytes (`flvenc.c` 835–856) — each track's sequence starts read
+/// back from the file, not through the audit: their count, and their data
+/// less the bytes the walk is told precede the record, summed, as the
+/// muxer expects each.
+#[cfg(feature = "test-support")]
+#[test]
+fn condition_7_flvs_multitrack_audio_sequence_header_reads_back_as_its_mirror() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = h264_aac(&corpus, "c7-flv-source.mkv");
+  let (audio_table, audio) = first_track(&source, TrackKind::Audio, 3);
+  let aac = stream_extradata_of(&audio_table[0]);
+  let row = || {
+    restated(
+      &audio_table[0],
+      ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_AAC,
+      &aac,
+      None,
+      None,
+    )
+  };
+  let target = output(&corpus, "c7-flv-multitrack.flv");
+  let mut muxer = muxer_into(&target, ContainerName::new("flv"), vec![row(), row()]);
+  for packet in &audio {
+    for track in 0..2 {
+      wrote(
+        muxer.write_audio(AudioTrackPacket::new(
+          TrackIndex::new(track),
+          audio_of(packet),
+        )),
+        "an AAC frame",
+      );
+    }
+  }
+  let expected = muxer.expected_flv_sequences();
+  muxer.finish().expect("finished");
+  // The file's audio sequence starts: each its track's index and its data's
+  // size — legacy AAC's packet type 0; the extended header's own, or a
+  // multitrack's after its type, its FourCC and its index.
+  let starts: Vec<(u8, u64)> = flv_tags(&target)
+    .into_iter()
+    .filter(|(_, kind, _)| *kind == 8)
+    .filter_map(|(_, _, data)| {
+      let first = *data.first()?;
+      let start = match first >> 4 {
+        9 if first & 0x0F == 5 => (data.get(1)? & 0x0F == 0).then(|| data[6]),
+        9 => (first & 0x0F == 0).then_some(0),
+        10 => (data.get(1) == Some(&0)).then_some(0),
+        _ => None,
+      };
+      start.map(|index| (index, data.len() as u64))
+    })
+    .collect();
+  assert_eq!(expected.len(), 2, "the walk told of two audio tracks");
+  for (index, (track, header, count, records, trusted)) in expected.into_iter().enumerate() {
+    assert_eq!(track, TrackIndex::new(index));
+    assert!(!trusted, "track {index}: conforming, its records judged");
+    assert_eq!(
+      header,
+      if index == 0 { 2 } else { 7 },
+      "track {index}: the bytes before the record"
+    );
+    let written: Vec<u64> = starts
+      .iter()
+      .filter(|(at, _)| usize::from(*at) == index)
+      .map(|(_, size)| size - header)
+      .collect();
+    assert_eq!(
+      (written.len() as u64, written.iter().sum::<u64>()),
+      (count, records),
+      "track {index}: the sequence starts, and their records' bytes"
+    );
+  }
+}
+
+/// HEVC naming its matrix, which FLV's metadata states: L216's, a file of
+/// its own.
+#[rustfmt::skip]
+fn hevc_bt709(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "l216-hevc-bt709.mkv", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25:duration=0.2",
+    "-c:v", "libx265", "-x265-params", "bframes=0:log-level=none",
+    "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+  ])
+}
+
+/// **R13 — FLV's made sets past the trust stop turn the track's records
+/// unjudged from there** (the coordinator's ruling R13 on R8 in FLV):
+/// HEVC of no configuration into FLV under `extract_extradata`, three
+/// frames each opening on its VPS, SPS and PPS — the HEVC laws' conforming
+/// SPS twice, then one of 65 short-term reference picture sets, past the
+/// standard's 64, whose `hvcC` FLV writes empty (`hevc.c` 714–716,
+/// 739–740; `flvenc.c` 886–899). The seam after each frame: the header's
+/// sequence start of no record and the made sets', untrusted; the same
+/// sets again, no header more; the third's, trusted from there. `finish`
+/// `Ok`, the file's sequence starts three, the last its 5 bytes of header
+/// alone.
+///
+/// PLANT P633: `trusted` never set — L122 red at its FLV open road.
+#[cfg(feature = "test-support")]
+#[test]
+fn r13_made_sets_past_the_trust_stop_turn_the_track_trusted() {
+  let Some(corpus) = Corpus::new() else { return };
+  let (row, template, ..) = h264_fixture(&corpus);
+  let row = restated(
+    &row,
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC,
+    &[],
+    None,
+    None,
+  );
+  let slice = escaped(&hevc_header(19, 0), &[0xAF, 0x88, 0x42]);
+  let target = output(&corpus, "r13-made-sets.flv");
+  let mut muxer = muxer_with(&target, ContainerName::new("flv"), vec![row], filters(true));
+  let mut seen = Vec::new();
+  for (index, sets) in [1, 1, 65].into_iter().enumerate() {
+    let units = start_coded(&[
+      &hevc_vps(0, None),
+      &hevc_sps(0, 0, sets, None),
+      &hevc_pps(),
+      &slice,
+    ]);
+    let at = index as i64 * 40;
+    wrote(
+      muxer.write_video(video_at(&video_holding(&template[0], &units), Some(at), at)),
+      "an HEVC frame",
+    );
+    let expected = muxer.expected_flv_sequences();
+    seen.push((expected[0].2, expected[0].4));
+  }
+  assert_eq!(seen, [(2, false), (2, false), (3, true)]);
+  muxer.finish().expect("trusted from the third, finished");
+  let starts = flv_sequence_starts(&target);
+  assert_eq!(starts.len(), 3, "the header's, the made sets', the third's");
+  assert_eq!(starts[2].len(), 5, "the third's record written empty");
 }
