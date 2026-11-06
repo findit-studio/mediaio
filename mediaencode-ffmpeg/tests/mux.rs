@@ -21414,8 +21414,8 @@ fn long_aac(corpus: &Corpus) -> PathBuf {
 /// frames of no duration, whose last libavformat guesses — and into FLV,
 /// H.264 and AAC, HEVC naming its matrix (its HDR metadata's tag, R10),
 /// AV1, VP9, AC-3 and Opus; into Matroska, H.264 and AAC, HEVC, AV1, VP9,
-/// Opus and FLAC, and into WebM, AV1, VP9 and Opus — each finishes `Ok`,
-/// the audit's tap having walked the file. Every other law of this lane writes with the audit on
+/// Opus and FLAC, and into WebM, AV1, VP9 and Opus; FLAC into raw FLAC —
+/// each finishes `Ok`, the audit's tap having walked the file. Every other law of this lane writes with the audit on
 /// as well, so that each file one writes whole passes it too: their
 /// passing is the rest of this law.
 ///
@@ -21458,7 +21458,7 @@ fn l216_the_write_audit_passes_every_file_ffmpeg_writes_whole() {
     (
       "flac",
       audio_file(&corpus, "l216.flac", "flac"),
-      &["matroska"][..],
+      &["matroska", "flac"][..],
     ),
     (
       "movtext",
@@ -24483,4 +24483,53 @@ fn l241_matroskas_tracks_is_judged_as_the_trailer_writes_it() {
   let count = mask_count_offset(&output(&corpus, "l241.mkv"));
   flac_into_matroska(&corpus, "l241-header.mkv", Some((count, 1)), None)
     .expect("the header's Tracks planted alone, finished");
+}
+
+// ---------------------------------------------------------------------------
+//  Raw FLAC audited (A23).
+// ---------------------------------------------------------------------------
+
+/// **L238 — A23: raw FLAC's channel mask comment is judged**
+/// (findit-studio/mediaio#95): FLAC of a 2.1 layout into raw FLAC — the
+/// mask entry `flac_init` sets, `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0xb`
+/// (`flacenc.c` 244–259) — the write plant flipping the first byte of the
+/// entry's key in the header's VORBIS_COMMENT, as A23's road leaves the
+/// comment without it. Named: track 0's channel mask, omitted.
+#[cfg(feature = "test-support")]
+#[test]
+fn l238_raw_flacs_mask_comment_is_judged() {
+  let Some(corpus) = Corpus::new() else { return };
+  let layouts = Layouts::of(&corpus);
+  let (table, packets) = whole_track(&layouts.flac, TrackKind::Audio);
+  let key = b"WAVEFORMATEXTENSIBLE_CHANNEL_MASK=";
+  let hooks = mediaencode_ffmpeg::mux::OpenHooks::default().with_plant(move |_, bytes| {
+    if let Some(at) = bytes.windows(key.len()).position(|window| window == key) {
+      bytes[at] ^= 0x01;
+    }
+  });
+  let (mut muxer, _) = FfmpegOwnedMuxer::open_hooked(
+    File::create(output(&corpus, "l238.flac")).expect("create"),
+    ContainerName::new("flac"),
+    table,
+    &[],
+    MuxOptions::new(),
+    hooks,
+  )
+  .expect("open");
+  for packet in &packets {
+    wrote(
+      muxer.write_audio(AudioTrackPacket::new(TrackIndex::new(0), audio_of(packet))),
+      "a FLAC frame",
+    );
+  }
+  let fault = muxer.finish().expect_err("the mask entry gone, not passed");
+  assert_eq!(fault.stage(), MuxStage::Trailer);
+  assert_eq!(
+    written(&fault),
+    Some((
+      Some(TrackIndex::new(0)),
+      WrittenPart::ChannelMask,
+      Finding::Omitted
+    ))
+  );
 }

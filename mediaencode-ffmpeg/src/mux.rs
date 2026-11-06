@@ -654,7 +654,7 @@
 //! | A18 | MP3's ID3v2 frames (`id3v2enc.c` 66–98, 259–329) | each frame made in a dynamic buffer, its growth read as none: a title's frame and the table of contents written empty; a chapter written empty while the tag's size, the writers' own sum (`ff_id3v2_finish`, 421–443), counts its element id, times and title — the reader taking the first audio frames as the tag's; a text frame's open failure taken for no match and written again as a `TXXX` frame | omission and misreport: 0 bytes and a null buffer written as none (85–94, 279–285, 317–323) | bounded exactly at open until R21, MP3 withheld since | a withheld muxer's (Q4), its evidence |
 //! | A21 | Matroska's FLAC channel mask (`matroskaenc.c` 1077–1114) | `av_dict_set` discarded: the comment block of no count and no mask, the layout read back otherwise | misreport: a block of no comment | out of reach: a mask of 18 bits | detected at `finish` by the write audit (#95): the FLAC track's CodecPrivate, read as the trailer writes Tracks again, its comment block's length and bytes against the muxer's ([`WrittenPart::ChannelMask`]) — L236, L241 |
 //! | A22 | FLV's configuration records (`flv_write_codec_header`, `flvenc.c` 807–914) | as A4's, the record written empty | omission, as A4's | the helpers' as A4's, the Annex B rewrite bounded exactly at open (S7, r2); the sequence header's 24-bit size: reachable, bounded exactly at open (S6) | the premise (R21, Q6): after an Annex B buffer's failed close, the walks' arithmetic on the null pointer and `-64` is undefined in ISO C; no memory is read or written, each loop's guard reading `-64`; FLV's record written empty, success answered — detected at `finish` by the write audit (#95): each track's sequence headers, every one FLV writes — the header's and each new configuration's that differs from the current, the caller's or a filter's (R12) — their records' lengths folded against the muxer's, VVC's by their emptiness ([`WrittenPart::Configuration`]) — L234. The remedy, the records built here, is booked (<https://github.com/findit-studio/mediaio/issues/94>) |
-//! | A23 | raw FLAC's channel mask (`flacenc.c` 244–259) | as A21 | misreport, as A21's | out of reach, as A21's | the premise |
+//! | A23 | raw FLAC's channel mask (`flacenc.c` 244–259) | as A21 | misreport, as A21's | out of reach, as A21's | detected at `finish` by the write audit (#95): the VORBIS_COMMENT's channel mask entries, one where `flac_init` sets it, its bytes folded against the muxer's; libavformat's own `encoder` entry outside the contract (letter 1 (b)) ([`WrittenPart::ChannelMask`]) — L238 |
 //! | A25 | MP4's joined TTML (`movenc_ttml.c` 289–317) | its buffer closed unchecked: a packet of a null payload and `-64` bytes written as the sample; its writes' failures, `avio_printf`'s, the buffer's error unread — the document cut | misreport: `avio_write` of `-64` bytes writes none (`movenc.c` 7231), the sample counted of them | bounded: the document ([`PayloadRule::DocumentSize`]) | detected at `finish` by the write audit (#95): the TTML sample's size against the document's exact bytes ([`WrittenPart::SampleSizes`]; [`TtmlCounts`]); the `mdat`'s size against the payload the sink took, short by 64 (F8; [`WrittenPart::MediaData`]) — L218 |
 //! | A26 | FLV's Annex B packets (`flvenc.c` 1318–1327; `nal.c` 133–144) | the rewrite's buffer closed unchecked, `-64` bytes and a null buffer answered: a tag of a 24-bit size of `-59` (1348–1355, 1454) | misreport: the packet's own bytes handed for the null buffer and `-64` written as none (1452) | out of reach: a tag under 2^24 bytes ([`PayloadRule::TagSize`]) | detected at `finish` by the write audit (#95): every tag's PreviousTagSize its size and 11, the walk ending at the file's end — the road's tag of a size of 0xFFFFC5 leaves it inside, named at the tag ([`Why::Truncated`]) — and each track's frames' data sizes folded against the muxer's ([`WrittenPart::Frames`]) — L235 |
 //! | A27 | MP4's HEVC of the `hvc1` tag and an Annex B configuration (`ff_hevc_annexb2mp4`, `hevc.c` 1203–1250) | each packet parsed into a dynamic buffer first, closed unchecked: the frame written as a sample of no bytes (`movenc.c` 7126) | misreport: a sample of no bytes; the walk sums a null pointer and `-64` (`hevc.c` 1220–1221), as A4's, no access | bounded: the rewrite ([`PayloadRule::RewrittenSize`]) | the premise (R21, Q6): the walk's arithmetic on the null pointer and `-64` undefined in ISO C; no memory read or written, its loop's guard reading `-64`; a sample of no bytes written, success answered — detected at `finish` by the write audit (#95): the track's sample sizes against the bytes movenc writes of each ([`WrittenPart::SampleSizes`]; [`mp4_sample_bytes`]) — L224. The remedy, the `hvc1` packets built here, is booked (<https://github.com/findit-studio/mediaio/issues/94>) |
@@ -5538,6 +5538,10 @@ struct TrackState {
   /// Matroska and WebM: what the write audit expects of the track's
   /// CodecPrivate ([`mkv_private`]).
   mkv: MkvPrivate,
+  /// Raw FLAC: the channel mask entries the write audit expects of its
+  /// VORBIS_COMMENT, and the fold of the last one's bytes
+  /// ([`flac_mask_entry`]).
+  flac_mask: (u64, u64),
 }
 
 /// FLV: what the write audit expects of a track's tags, kept at open and at
@@ -11494,12 +11498,14 @@ struct Learned {
 }
 
 /// The write audit's walk of a written file (findit-studio/mediaio#95):
-/// the MOV family's, in its mode, FLV's, or Matroska's and WebM's.
+/// the MOV family's, in its mode, FLV's, Matroska's and WebM's, or raw
+/// FLAC's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Walked {
   Mov(MovMode),
   Flv,
   Mkv,
+  Flac,
 }
 
 /// The FFmpeg muxer, on carrier `C` — see [the module](self).
@@ -11767,6 +11773,7 @@ where
       Audited::Mov(mode) if options.audit => Some(Walked::Mov(mode)),
       Audited::Flv if options.audit => Some(Walked::Flv),
       Audited::Matroska | Audited::WebM if options.audit => Some(Walked::Mkv),
+      Audited::Flac if options.audit => Some(Walked::Flac),
       _ => None,
     };
     // AVIF measures its `moov` in a null buffer of `INT_MAX` bytes at its
@@ -12132,7 +12139,8 @@ where
     // index among its kind's and its sequence header's bytes before its
     // record — and the pre-tags it writes (findit-studio/mediaio#95; R11);
     // of Matroska and WebM, its TrackEntries — a stream's each, but an
-    // attachment's — each the offset its CodecPrivate is folded from.
+    // attachment's — each the offset its CodecPrivate is folded from; of
+    // raw FLAC, none.
     match audit_mode {
       Some(Walked::Mov(mode)) => output.set_tap(Audit::mov(mode, tracks.len() + 1)),
       Some(Walked::Flv) => {
@@ -12177,6 +12185,7 @@ where
           .collect();
         output.set_tap(Audit::mkv(&mkv_tracks))
       }
+      Some(Walked::Flac) => output.set_tap(Audit::flac()),
       None => Ok(()),
     }
     .map_err(|error| MuxFault::new(MuxStage::Open, error))?;
@@ -12215,6 +12224,7 @@ where
       let mut user_data = 0;
       let mut flv = FlvMirror::default();
       let mut mkv = MkvPrivate::Unjudged;
+      let mut flac_mask = (0, CONFIG_SEED);
       let mut ts_pce = Vec::new();
       let stream = match (stream, road) {
         (Some((stream, _)), Road::Timed) => {
@@ -12305,6 +12315,9 @@ where
           if codec.extradata().is_empty() && first_packet_configures(family, audited, codec.codec())
           {
             rules.configuration_absent = true;
+          }
+          if audited == Audited::Flac && kind == TrackKind::Audio {
+            flac_mask = flac_mask_entry(LayoutView::of(tracks[index].side_data().ch_layout()));
           }
           if matches!(audited, Audited::Matroska | Audited::WebM) {
             mkv = mkv_private(
@@ -12467,6 +12480,7 @@ where
         flags: FlagsMirror::default(),
         flv,
         mkv,
+        flac_mask,
       });
     }
 
@@ -13007,6 +13021,19 @@ where
         Found::Unfollowed(Unfollowed::new(at, Why::Panicked)),
       ))
     };
+    if walked == Walked::Flac {
+      // Raw FLAC's one audio track.
+      let (track, expected) = self
+        .tracks
+        .iter()
+        .enumerate()
+        .find(|(_, state)| state.stream.is_some() && state.kind == TrackKind::Audio)
+        .map(|(index, state)| (TrackIndex::new(index), state.flac_mask))?;
+      return self
+        .output
+        .with_tap(|audit: &mut Audit| audit::flac_verdict(audit, track, expected))
+        .unwrap_or_else(|_| panicked());
+    }
     if walked == Walked::Mkv {
       // Matroska's TrackEntries: a stream's each, but an attachment's.
       let entries = self
@@ -16677,6 +16704,24 @@ fn flac_mask_comment(mask: u64) -> (u64, u64) {
   fold = config_fold(fold, &length(entry.len()));
   fold = config_fold(fold, entry);
   (FLAC_HEADER + 4 + block as u64, fold)
+}
+
+/// The channel mask entries raw FLAC's VORBIS_COMMENT holds of a stream
+/// of `layout`, and the fold of the last one's bytes ([`config_fold`]):
+/// one, of its mask ([`flac_mask_text`]), where `flac_init` sets it — a
+/// native layout within `0x3FFFF` FLAC's own order does not name
+/// (`flacenc.c` 244–259; [`flac_comment_layout`]) — else none.
+fn flac_mask_entry(layout: LayoutView<'_>) -> (u64, u64) {
+  match flac_comment_layout(layout) {
+    LayoutReadBack::Native { mask } => {
+      let mut entry = [0_u8; 64];
+      (
+        1,
+        config_fold(CONFIG_SEED, flac_mask_text(&mut entry, mask)),
+      )
+    }
+    _ => (0, CONFIG_SEED),
+  }
 }
 
 /// FLAC's channel mask comment of `mask`, as raw FLAC and Matroska write

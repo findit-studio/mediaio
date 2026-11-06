@@ -2390,3 +2390,164 @@ fn flacs_comment_and_av1s_record_are_judged() {
     ))
   );
 }
+
+// ---------------------------------------------------------------------------
+//  Raw FLAC's walk (A23).
+// ---------------------------------------------------------------------------
+
+/// A metadata block of `kind`, `last` or not, holding `data`.
+fn flac_block(kind: u8, last: bool, data: &[u8]) -> Vec<u8> {
+  let mut bytes = vec![kind | if last { 0x80 } else { 0 }];
+  bytes.extend_from_slice(&u32::try_from(data.len()).expect("a length").to_be_bytes()[1..]);
+  bytes.extend_from_slice(data);
+  bytes
+}
+
+/// A VORBIS_COMMENT's data: a 9-byte vendor and `entries`; of none, the
+/// vendor alone, as an empty dictionary writes it.
+fn vorbis_comment(entries: &[&[u8]]) -> Vec<u8> {
+  let mut data = 9_u32.to_le_bytes().to_vec();
+  data.extend_from_slice(b"Lavf62.3.");
+  if !entries.is_empty() {
+    data.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+      data.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+      data.extend_from_slice(entry);
+    }
+  }
+  data
+}
+
+/// A raw FLAC file: `fLaC`, STREAMINFO, the VORBIS_COMMENT of `comment`,
+/// PADDING last, then two frames.
+fn flac_file(comment: &[u8]) -> Sink {
+  let mut sink = Sink::default();
+  sink.append(b"fLaC");
+  sink.append(&flac_block(0, false, &[0x11; 34]));
+  sink.append(&flac_block(4, false, comment));
+  sink.append(&flac_block(1, true, &[0; 16]));
+  sink.append(&[0xFF, 0xF8, 0x69, 0x08, 0x00, 0x00]);
+  sink.append(&[0xFF, 0xF8, 0x69, 0x08, 0x00, 0x01]);
+  sink
+}
+
+/// The raw FLAC walk over `sink`'s runs.
+fn flac_walked(sink: &Sink) -> Audit {
+  let mut audit = Audit::flac();
+  for (at, bytes) in &sink.runs {
+    audit.took(*at, bytes);
+  }
+  audit
+}
+
+/// The mask entry of a 2.1 layout, and what the muxer expects of it.
+const MASK: &[u8] = b"WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0xb";
+fn mask_expected() -> (u64, u64) {
+  (1, config_fold(CONFIG_SEED, MASK))
+}
+
+/// **A raw FLAC file whole is followed, its mask entry read** (A23): the
+/// vendor, libavformat's `encoder` and the mask entry; STREAMINFO written
+/// again once; twice, or a write in the comment, a rewrite of no field.
+#[test]
+fn a_raw_flac_file_and_its_mask_entry_are_followed() {
+  let comment = vorbis_comment(&[b"encoder=Lavf62.3.100", MASK]);
+  let mut sink = flac_file(&comment);
+  let audit = flac_walked(&sink);
+  assert_eq!(audit.unfollowed(), None);
+  assert_eq!(
+    flac_verdict(&audit, TrackIndex::new(0), mask_expected()),
+    None
+  );
+  sink.patch(8, &[0x22; 20]);
+  sink.patch(28, &[0x22; 14]);
+  assert_eq!(flac_walked(&sink).unfollowed(), None, "STREAMINFO again");
+  let mut twice = Sink {
+    runs: sink.runs.clone(),
+    frontier: sink.frontier,
+  };
+  twice.patch(8, &[0x33; 34]);
+  assert_eq!(
+    flac_walked(&twice).unfollowed(),
+    Some(Unfollowed::new(8, Why::Rewrite))
+  );
+  let mut inside = flac_file(&comment);
+  inside.patch(50, &[0]);
+  assert_eq!(
+    flac_walked(&inside).unfollowed(),
+    Some(Unfollowed::new(50, Why::Rewrite))
+  );
+}
+
+/// **The mask entry is judged by its absence, its count and its content**:
+/// a comment of the vendor alone — A23's road, an empty dictionary —
+/// omitted; two, counted; another mask, by its content.
+#[test]
+fn raw_flacs_mask_entry_is_judged() {
+  let judged = |entries: &[&[u8]]| {
+    flac_verdict(
+      &flac_walked(&flac_file(&vorbis_comment(entries))),
+      TrackIndex::new(0),
+      mask_expected(),
+    )
+  };
+  let named = |found| {
+    Some(WrittenOtherwise::new(
+      Some(TrackIndex::new(0)),
+      WrittenPart::ChannelMask,
+      found,
+    ))
+  };
+  assert_eq!(judged(&[]), named(Found::Omitted));
+  assert_eq!(judged(&[b"encoder=Lavf62.3.100"]), named(Found::Omitted));
+  assert_eq!(
+    judged(&[MASK, MASK]),
+    named(Found::Count(Counts::new(2, 1)))
+  );
+  assert_eq!(
+    judged(&[b"WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0xc"]),
+    named(Found::Content)
+  );
+  assert_eq!(
+    flac_verdict(
+      &flac_walked(&flac_file(&vorbis_comment(&[]))),
+      TrackIndex::new(0),
+      (0, CONFIG_SEED)
+    ),
+    None,
+    "none where none is expected"
+  );
+}
+
+/// **A raw FLAC structure no writer makes, or a file ending inside its
+/// metadata**: an entry's length past its block; the file ending inside
+/// the comment, truncated at its header; a first block other than
+/// STREAMINFO.
+#[test]
+fn a_raw_flac_structure_no_writer_makes_is_named() {
+  let mut comment = vorbis_comment(&[MASK]);
+  let at = comment.len() - MASK.len() - 4;
+  comment[at] += 1;
+  let sink = flac_file(&comment);
+  assert_eq!(
+    flac_walked(&sink)
+      .unfollowed()
+      .map(|unfollowed| unfollowed.why()),
+    Some(Why::Structure)
+  );
+  let mut cut = Sink::default();
+  cut.append(b"fLaC");
+  cut.append(&flac_block(0, false, &[0x11; 34]));
+  let header = cut.append(&flac_block(4, true, &vorbis_comment(&[MASK]))[..20]);
+  assert_eq!(
+    flac_walked(&cut).unfollowed(),
+    Some(Unfollowed::new(header, Why::Truncated))
+  );
+  let mut first = Sink::default();
+  first.append(b"fLaC");
+  first.append(&flac_block(4, true, &vorbis_comment(&[MASK])));
+  assert_eq!(
+    flac_walked(&first).unfollowed(),
+    Some(Unfollowed::new(4, Why::Structure))
+  );
+}

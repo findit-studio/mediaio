@@ -59,7 +59,10 @@ crate moves only when it changes.
   room, Info, Tracks and Tags — each rewritten in order and once, and
   Tracks read as the trailer writes it: an AV1 track's `av1C` as long as
   its writer makes it (`WrittenPart::Configuration`), a FLAC track's
-  channel mask comment (`WrittenPart::ChannelMask`). A `mov_text`
+  channel mask comment (`WrittenPart::ChannelMask`). Then raw FLAC: its
+  STREAMINFO, rewritten once, and its VORBIS_COMMENT's channel mask entry
+  (`WrittenPart::ChannelMask`), libavformat's own `encoder` entry outside
+  the contract. A `mov_text`
   track's tables are read by one rule on both sides, which the end samples
   libavformat's interleaving makes movenc write leave unchanged (the
   coordinator's ruling R5). With the new `test-support` feature,

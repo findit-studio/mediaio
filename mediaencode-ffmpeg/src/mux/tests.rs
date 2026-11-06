@@ -1210,6 +1210,7 @@ fn eac3_track(frame_size: i32) -> TrackState {
     flags: FlagsMirror::default(),
     flv: FlvMirror::default(),
     mkv: MkvPrivate::Unjudged,
+    flac_mask: (0, CONFIG_SEED),
   }
 }
 

@@ -131,12 +131,14 @@ use super::{
   records::{self, ApvFrameInfo, Writer},
 };
 
+mod flac;
 mod flv;
 mod mkv;
 mod mov;
 #[cfg(test)]
 mod tests;
 
+use flac::FlacWalk;
 pub(super) use flv::FlvTrack;
 use flv::FlvWalk;
 pub(super) use mkv::MkvTrack;
@@ -235,7 +237,8 @@ pub enum WrittenPart {
   /// A track's frames: FLV's tags of coded frames, each its data size.
   Frames,
   /// A track's channel mask: FLAC's `WAVEFORMATEXTENSIBLE_CHANNEL_MASK`
-  /// comment, which Matroska writes in the track's CodecPrivate.
+  /// comment, which Matroska writes in the track's CodecPrivate and raw
+  /// FLAC in its VORBIS_COMMENT.
   ChannelMask,
   /// A track's roll groups: the MOV family's `sgpd` and `sbgp`, AAC's one
   /// group of every sample or Opus's roll distances.
@@ -626,6 +629,8 @@ enum Walk {
   Flv(FlvWalk),
   /// Matroska's and WebM's elements.
   Mkv(MkvWalk),
+  /// Raw FLAC's metadata blocks.
+  Flac(FlacWalk),
 }
 
 impl Audit {
@@ -660,6 +665,15 @@ impl Audit {
     }
   }
 
+  /// A tap over a raw FLAC file.
+  pub(super) const fn flac() -> Self {
+    Self {
+      frontier: 0,
+      unfollowed: None,
+      walk: Walk::Flac(FlacWalk::new()),
+    }
+  }
+
   /// The bytes appended so far.
   pub(super) const fn frontier(&self) -> u64 {
     self.frontier
@@ -675,6 +689,7 @@ impl Audit {
       Walk::Mov(walk) => walk.unfinished(self.frontier),
       Walk::Flv(walk) => walk.unfinished(self.frontier),
       Walk::Mkv(walk) => walk.unfinished(self.frontier),
+      Walk::Flac(walk) => walk.unfinished(self.frontier),
     }
   }
 
@@ -682,7 +697,7 @@ impl Audit {
   pub(super) fn mov_walk(&self) -> Option<&MovWalk> {
     match &self.walk {
       Walk::Mov(walk) => Some(walk),
-      Walk::Flv(_) | Walk::Mkv(_) => None,
+      Walk::Flv(_) | Walk::Mkv(_) | Walk::Flac(_) => None,
     }
   }
 
@@ -690,7 +705,7 @@ impl Audit {
   pub(super) fn flv_walk(&self) -> Option<&FlvWalk> {
     match &self.walk {
       Walk::Flv(walk) => Some(walk),
-      Walk::Mov(_) | Walk::Mkv(_) => None,
+      Walk::Mov(_) | Walk::Mkv(_) | Walk::Flac(_) => None,
     }
   }
 
@@ -698,7 +713,15 @@ impl Audit {
   pub(super) fn mkv_walk(&self) -> Option<&MkvWalk> {
     match &self.walk {
       Walk::Mkv(walk) => Some(walk),
-      Walk::Mov(_) | Walk::Flv(_) => None,
+      Walk::Mov(_) | Walk::Flv(_) | Walk::Flac(_) => None,
+    }
+  }
+
+  /// The raw FLAC walk, where this tap walks raw FLAC.
+  pub(super) fn flac_walk(&self) -> Option<&FlacWalk> {
+    match &self.walk {
+      Walk::Flac(walk) => Some(walk),
+      Walk::Mov(_) | Walk::Flv(_) | Walk::Mkv(_) => None,
     }
   }
 
@@ -722,6 +745,7 @@ impl SinkTap for Audit {
         Walk::Mov(walk) => walk.append(at, bytes),
         Walk::Flv(walk) => walk.append(at, bytes),
         Walk::Mkv(walk) => walk.append(at, bytes),
+        Walk::Flac(walk) => walk.append(at, bytes),
       };
       self.frontier = end;
       appended
@@ -730,6 +754,7 @@ impl SinkTap for Audit {
         Walk::Mov(walk) => walk.patch(self.frontier, at, bytes),
         Walk::Flv(walk) => walk.patch(self.frontier, at, bytes),
         Walk::Mkv(walk) => walk.patch(self.frontier, at, bytes),
+        Walk::Flac(walk) => walk.patch(self.frontier, at, bytes),
       }
     } else if at > self.frontier {
       Err(Unfollowed::new(self.frontier, Why::Gap))
@@ -747,6 +772,9 @@ impl SinkTap for Audit {
           .patch(frontier, at, patched)
           .and_then(|()| walk.append(frontier, appended)),
         Walk::Mkv(walk) => walk
+          .patch(frontier, at, patched)
+          .and_then(|()| walk.append(frontier, appended)),
+        Walk::Flac(walk) => walk
           .patch(frontier, at, patched)
           .and_then(|()| walk.append(frontier, appended)),
       };
@@ -1678,4 +1706,40 @@ pub(super) fn mkv_verdict(
       Found::Length(Counts::new(size, taken)),
     )
   })
+}
+
+/// The first difference between what the raw FLAC walk read and what the
+/// muxer expects of its `track`: the tap's own state; then the channel mask
+/// entries of its VORBIS_COMMENT — `expected`, their count and the fold of
+/// the last one's bytes — named by their absence, their count, then their
+/// content (`ChannelMask`).
+pub(super) fn flac_verdict(
+  audit: &Audit,
+  track: TrackIndex,
+  expected: (u64, u64),
+) -> Option<WrittenOtherwise> {
+  if let Some(unfollowed) = audit.unfollowed() {
+    return Some(WrittenOtherwise::new(
+      None,
+      WrittenPart::Structure,
+      Found::Unfollowed(unfollowed),
+    ));
+  }
+  let (count, fold) = audit.flac_walk()?.masks();
+  let found = if count != expected.0 {
+    if count == 0 {
+      Found::Omitted
+    } else {
+      Found::Count(Counts::new(count, expected.0))
+    }
+  } else if fold != expected.1 {
+    Found::Content
+  } else {
+    return None;
+  };
+  Some(WrittenOtherwise::new(
+    Some(track),
+    WrittenPart::ChannelMask,
+    found,
+  ))
 }
