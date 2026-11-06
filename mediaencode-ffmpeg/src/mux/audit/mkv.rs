@@ -554,7 +554,7 @@ impl MkvWalk {
         .regions
         .iter()
         .position(|region| {
-          region.is_some_and(|region| region.at <= pos && pos < region.at + region.len)
+          region.is_some_and(|region| (region.at..region.at + region.len).contains(&pos))
         })
         .ok_or(rewrite)?;
       let Some(region) = self.regions[slot].as_mut() else {

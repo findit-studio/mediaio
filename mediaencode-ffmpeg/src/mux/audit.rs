@@ -640,8 +640,9 @@ pub(super) struct Audit {
 
 /// The walk of a format.
 enum Walk {
-  /// The MOV family's boxes.
-  Mov(MovWalk),
+  /// The MOV family's boxes: a walk far larger than the others' — its
+  /// stack of boxes and its registered fields — boxed, once, at open.
+  Mov(Box<MovWalk>),
   /// FLV's tags.
   Flv(FlvWalk),
   /// Matroska's and WebM's elements.
@@ -658,7 +659,7 @@ impl Audit {
     Self {
       frontier: 0,
       unfollowed: None,
-      walk: Walk::Mov(MovWalk::new(mode, tracks)),
+      walk: Walk::Mov(Box::new(MovWalk::new(mode, tracks))),
     }
   }
 
@@ -713,7 +714,7 @@ impl Audit {
   /// The MOV walk, where this tap walks the MOV family.
   pub(super) fn mov_walk(&self) -> Option<&MovWalk> {
     match &self.walk {
-      Walk::Mov(walk) => Some(walk),
+      Walk::Mov(walk) => Some(walk.as_ref()),
       Walk::Flv(_) | Walk::Mkv(_) | Walk::Flac(_) => None,
     }
   }
